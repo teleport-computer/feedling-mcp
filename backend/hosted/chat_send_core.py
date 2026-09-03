@@ -14,6 +14,7 @@ from __future__ import annotations
 import time
 
 from core import envelope as core_envelope
+from core import chat_images
 from core import wake_bus as core_wake_bus
 
 import db
@@ -28,6 +29,7 @@ from hosted import vision_routing
 from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from proactive import capture_scheduler
 
 
 def _voice_metadata(voice_context: dict | None) -> dict[str, str]:
@@ -68,9 +70,18 @@ def model_api_chat_send_core(
     client_msg_id, client_msg_id_err = chat_idempotency.parse_client_msg_id(payload)
     if client_msg_id_err is not None:
         return client_msg_id_err
+    parsed_images, images_err = hosted_turn._model_api_images_payload(payload)
+    if images_err:
+        return images_err, 400
     image_bytes, image_mime, image_err = hosted_turn._model_api_image_payload(payload)
     if image_err:
         return {"error": "invalid_image", "detail": image_err}, 400
+    image_items: list[tuple[bytes, str]] = []
+    if parsed_images is not None:
+        image_items = parsed_images
+        image_bytes, image_mime = parsed_images[0]
+    elif image_bytes is not None:
+        image_items = [(image_bytes, image_mime)]
     has_image = image_bytes is not None
     file_parse, file_err = hosted_turn._model_api_file_payload(payload)
     if file_err:
@@ -80,6 +91,7 @@ def model_api_chat_send_core(
     if file_parse is not None and file_parse["kind"] == "image":
         image_bytes = file_parse["bytes"]
         image_mime = file_parse["mime"]
+        image_items = [(image_bytes, image_mime)]
         has_image = True
         file_parse = None
     has_file = file_parse is not None
@@ -161,6 +173,7 @@ def model_api_chat_send_core(
                 has_image=has_image,
                 image_bytes=image_bytes,
                 image_mime=image_mime,
+                image_items=image_items,
                 has_file=has_file,
                 file_parse=file_parse,
                 context_refs=context_refs,
@@ -248,7 +261,8 @@ def model_api_chat_send_core(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             status="ok", summary="admission_failopen",
-            detail={"mode": "admit", "error": str(exc)[:120]},
+            detail={"mode": "admit", "reason": "admission_unavailable",
+                    "error_class": type(exc).__name__},
         )
         _admit = True
         _est = 0.0
@@ -263,7 +277,13 @@ def model_api_chat_send_core(
 
     config = hosted_config_store._load_model_api_config(store)
 
-    if has_image:
+    if len(image_items) >= 2:
+        image_items = [
+            (body, "image/jpeg" if mime.lower() == "image/jpg" else mime.lower())
+            for body, mime in image_items
+        ]
+        user_plaintext = chat_images.encode_image_bundle(image_items)
+    elif has_image:
         user_plaintext = image_bytes
     elif has_file:
         user_plaintext = file_parse["bytes"]
@@ -295,6 +315,13 @@ def model_api_chat_send_core(
         extra["client_msg_id"] = client_msg_id
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if len(image_items) >= 2:
+        extra.update({
+            "image_bundle_version": chat_images.CHAT_IMAGE_BUNDLE_VERSION,
+            "image_count": len(image_items),
+            "image_mimes": [mime for _body, mime in image_items],
+            "image_byte_count": sum(len(body) for body, _mime in image_items),
+        })
     if has_image and vision_route_id:
         extra["vision_route_id"] = vision_route_id
     if has_image and message:
@@ -335,6 +362,7 @@ def model_api_chat_send_core(
     # Message INSERT and chat-job enqueue/coalesce land in one transaction.
     _envelope_id = user_env.get("id")
     _trace_id = str(_envelope_id) if isinstance(_envelope_id, str) and _envelope_id else None
+    chat_append_started = time.monotonic()
     try:
         user_row = store.append_chat(
             "user",
@@ -368,6 +396,9 @@ def model_api_chat_send_core(
             detail={"mode": "blocked", "reason": "runtime_control_changed"},
         )
         return {"error": "runtime_control_changed"}, 503
+    chat_append_duration_ms = round(
+        (time.monotonic() - chat_append_started) * 1000.0, 1
+    )
     inserted = not bool(user_row.pop("_client_msg_replayed", False))
     if inserted:
         store.notify_chat_waiters()
@@ -378,7 +409,17 @@ def model_api_chat_send_core(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             turn_id=_turn_id, summary="agent_runtime",
-            detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
+            detail={
+                "mode": "agent_runtime",
+                "has_image": bool(has_image),
+                "has_file": bool(has_file),
+                "chat_append_duration_ms": chat_append_duration_ms,
+                "capture_append_refresh_mode": (
+                    "deferred"
+                    if capture_scheduler.append_refresh_deferred()
+                    else "sync"
+                ),
+            },
         )
     else:
         # The assistant reply may have been posted through another worker since
@@ -399,6 +440,7 @@ def _send_resident(
     has_image: bool,
     image_bytes,
     image_mime,
+    image_items,
     has_file: bool,
     file_parse,
     context_refs,
@@ -476,7 +518,13 @@ def _send_resident(
             ):
                 main_vision_binding = candidate
 
-    if has_image:
+    if len(image_items) >= 2:
+        image_items = [
+            (body, "image/jpeg" if mime.lower() == "image/jpg" else mime.lower())
+            for body, mime in image_items
+        ]
+        user_plaintext = chat_images.encode_image_bundle(image_items)
+    elif has_image:
         user_plaintext = image_bytes
     elif has_file:
         user_plaintext = file_parse["bytes"]
@@ -517,6 +565,13 @@ def _send_resident(
     extra: dict = _voice_metadata(voice_context)
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if len(image_items) >= 2:
+        extra.update({
+            "image_bundle_version": chat_images.CHAT_IMAGE_BUNDLE_VERSION,
+            "image_count": len(image_items),
+            "image_mimes": [mime for _body, mime in image_items],
+            "image_byte_count": sum(len(body) for body, _mime in image_items),
+        })
     if has_image and vision_route_id:
         extra["vision_route_id"] = vision_route_id
     if has_image and main_vision_binding is not None:
@@ -563,6 +618,7 @@ def _send_resident(
     # Resident send with client-msg-id dedup: a re-sent client_msg_id recovers
     # the original row instead of double-inserting.
     inserted = True
+    chat_append_started = time.monotonic()
     if client_msg_id is not None:
         user_row, inserted = store.append_chat_idempotent(
             "user",
@@ -581,6 +637,9 @@ def _send_resident(
             content_type="image" if has_image else ("file" if has_file else "text"),
             extra=extra or None,
         )
+    chat_append_duration_ms = round(
+        (time.monotonic() - chat_append_started) * 1000.0, 1
+    )
     if inserted:
         store.notify_chat_waiters()
 
@@ -589,7 +648,17 @@ def _send_resident(
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
             turn_id=_turn_id, summary="agent_runtime",
-            detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
+            detail={
+                "mode": "agent_runtime",
+                "has_image": bool(has_image),
+                "has_file": bool(has_file),
+                "chat_append_duration_ms": chat_append_duration_ms,
+                "capture_append_refresh_mode": (
+                    "deferred"
+                    if capture_scheduler.append_refresh_deferred()
+                    else "sync"
+                ),
+            },
         )
     else:
         # The assistant reply may have been posted through another worker since

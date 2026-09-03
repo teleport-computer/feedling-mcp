@@ -1,8 +1,12 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Memory（记忆花园）系统说明
 
-> ⚠️ **2026-08-23 起，记忆的判断内核是外部包**（`memgarden`，装自
-> https://github.com/teleport-computer/memgarden 的 Release wheel，版本钉在
-> `backend/requirements.lock`）。下面出现的 `memgarden/...` 路径指的是**那个包里**的文件，
+> ⚠️ **2026-08-23 起，记忆的判断内核是外部包**（`memgarden`，源码在
+> https://github.com/teleport-computer/memgarden ，Apache-2.0；0.12.8 起从 PyPI
+> 安装，版本钉在 `backend/requirements.lock`，和同源的 `agent-protocol-core` 锁步同版本）。下面出现的 `memgarden/...` 路径指的是**那个包里**的文件，
 > 不在本仓库。要改内核逻辑，去那个仓库改、发新版本、再更新这里的 lock。
 > 宿主侧（谁触发、怎么加解密、存哪、identity 装配、trace 落库）仍在本仓库。
 
@@ -123,23 +127,27 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 
 ### 4.2 上下文记忆选择（聊天补记忆，重点）
 
-入口在 `/v1/chat/history`（`backend/enclave_app.py:907` 附近），参数 `context_mode`、`context_trace`。
-核心：`select_context_memories_with_trace()`（`memgarden/scoring/relevance.py:348`（外部包））。
+入口在 `/v1/chat/history`（`backend/enclave/routes/chat.py`），核心是
+`_build_context_memories()` 调用外部包的 `select_context_memories_with_trace()`。
 
-两种模式：
+Resident 与 Hosted Runtime V2 固定使用同一套 `default` 分桶策略：
 
-- **`default`**（MCP / 常驻）：分三桶——
-  - 转折卡（title 以 `转折｜` 开头）按时间倒序 ≤3
-  - 最新创建 ≤2
-  - 与最后一条用户消息**相关性最高** ≤3
-  - 去重后总数 ≤8。
-- **`model_api`**（Hosted API）：严格模式，只收高置信卡（见 §5）。
+- 转折卡按时间倒序 ≤3；
+- 最新创建 ≤2；
+- 与最后一条用户消息相关性最高 ≤3；
+- 去重后总数 ≤8。
+
+`context_mode`、`contextMode` 和 `context_strict` 仍作为兼容 query 参数接收，但不再
+选择不同策略；`context_trace=1` 继续返回不含候选记忆正文的选择 trace（其中仍包含
+用户 query 派生的匹配词）。候选集先在 enclave 内完成生命周期过滤和卡片形状翻译，
+再交给 selector；注入模型的仍是原始卡片形状。
 
 > 相关性**不是向量检索**，而是分层关键词评分。
 
 ### 4.3 相关性评分：`_memory_relevance()`
 
-`memgarden/scoring/relevance.py:191`（外部包），对外封装 `memory_relevance_details()`（`:285`）。分层打分：
+外部包 `memgarden.scoring.relevance` 的 `_memory_relevance()` 负责分层打分，
+`memory_relevance_details()` 是公开封装：
 
 | 匹配类型 | 分数 | 置信度 |
 |---------|------|--------|
@@ -152,7 +160,7 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 | 仅字符二元组相似 | ≤0.16 | weak |
 | 无重叠 | 0.0 | none |
 
-**稀有词 vs 通用词**由两张表区分（`memgarden/scoring/relevance.py:54` 起）：
+**稀有词 vs 通用词**由外部包 `memgarden.scoring.relevance` 的两张表区分：
 
 - `_EN_GENERIC_TERMS`：`project / api / model / memory / task / code …` 等通用英文词，降级为「弱词」，必须组合才有意义。
 - `_ZH_GENERIC_PHRASES`：`项目 / 任务 / 今天 / 东西 …` 等通用中文短语。
@@ -161,37 +169,19 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 
 ---
 
-## 5. `857c09e`：修复 model_api memory retrieval 误命中
+## 5. 相关性评分与通用词降权
 
-**症状**：普通词 "project" 错误命中专有名词卡「TOHO Project」并被塞进上下文。
+历史问题是普通词 "project" 会把专有名词卡「TOHO Project」打成强相关。
 
 **根因**：旧逻辑只要有任意词重叠就给分，阈值 `score ≥ 0.05` 太松。
 
-**修复两处**：
+当前评分层通过以下规则降低这类误命中的排序：
 
-1. **引入通用词表 + 分层评分**（`memgarden/scoring/relevance.py`）
-   - 新增 `_EN_GENERIC_TERMS` / `_ZH_GENERIC_PHRASES`，把通用词降级；
-   - 只有长度 ≥4、完整命中的实体才算 strong；
-   - 用返回详情的 `_memory_relevance()` 取代旧的纯重叠计分。
-
-2. **收紧 model_api 选择阈值**（`backend/app.py:8735`）
-
-   ```python
-   if moment.get("id") in ref_ids:
-       details = {"score": 1.0, "confidence": "strong", "reason": "user_selected_context_ref"}
-   else:
-       details = memory_relevance_details(message, merged)   # app.py:8743
-   score = float(details.get("score") or 0.0)
-   confidence = str(details.get("confidence") or "none")
-   # 旧: score >= 0.05  →  新: 严格门槛
-   if moment.get("id") in ref_ids or (confidence in {"strong", "medium"} and score >= 0.35):
-       candidates.append(...)                                # app.py:8746
-   ```
-
-   即从「任意重叠 ≥0.05」改为「置信度 ∈ {strong, medium} 且 score ≥ 0.35」，
-   用户在本轮显式引用（`ref_ids`）的卡仍强制保留。
-
-3. 新增回归测试 `test_context_memories.py`：验证 "project" 不再单独触发 TOHO Project，多词组合仍正确命中。
+- `_EN_GENERIC_TERMS` / `_ZH_GENERIC_PHRASES` 把通用词降为弱信号；
+- 长实体短语、多词短语和多个稀有词获得更高置信度；
+- 分桶策略仍会独立加入转折卡和最近卡，所以“出现在上下文”不等价于“被相关性命中”；
+- `tests/test_context_memories.py` 分别覆盖相关性 bucket、卡片翻译、生命周期过滤和
+  trace 元数据，避免把打底行为误判为检索误命中。
 
 ---
 
@@ -213,13 +203,8 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 |------|------|
 | 路由 `GET /v1/memory/list` | `backend/app.py:14017` |
 | `db.memory_load` | `backend/db.py:751` |
-| 上下文选择主算法 | `memgarden/scoring/relevance.py:348`（外部包） |
-| 相关性评分核心 | `memgarden/scoring/relevance.py:191`（外部包） |
-| 对外封装 `memory_relevance_details` | `memgarden/scoring/relevance.py:285`（外部包） |
-| 通用词表 | `memgarden/scoring/relevance.py:54`（外部包） / `67` |
-
-### model_api 严格选择（857c09e 修复点）
-| 功能 | 位置 |
-|------|------|
-| 严格阈值选择块 | `backend/app.py:8735–8746` |
-| `memory_relevance_details` import | `backend/app.py:39` |
+| Chat 上下文宿主入口 | `backend/enclave/routes/chat.py::_build_context_memories` |
+| 卡片形状与生命周期适配 | `backend/memory/card_shape.py` |
+| 上下文选择主算法 | `memgarden/scoring/relevance.py`（外部包） |
+| 相关性评分与通用词表 | `memgarden/scoring/relevance.py`（外部包） |
+| 当前回归测试 | `tests/test_context_memories.py`、`tests/test_enclave_context_recall.py` |

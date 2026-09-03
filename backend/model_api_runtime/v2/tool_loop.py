@@ -9,11 +9,18 @@ import json
 import posixpath
 import re
 import time
-from provider_types import ProviderResponse, ToolExchange, ToolResult, ToolSpec
+from provider_types import (
+    ProviderResponse,
+    ToolCall,
+    ToolExchange,
+    ToolResult,
+    ToolSpec,
+)
 from capabilities import registry as cap_registry
 from capabilities import result_budget
 from capabilities import tool_schema
-from agent_protocol_core import protocol_leak
+from agent_protocol_core import protocol_leak, self_thinking
+from chat import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
@@ -54,8 +61,56 @@ DEFAULT_MAX_TOOL_ARGS_CHARS = 16000
 DEFAULT_MAX_TOOL_BATCH_ARGS_CHARS = 64000
 DEFAULT_MAX_NATIVE_ASSISTANT_TURN_CHARS = 65536
 DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS = 8192
+# ``debug_trace._safe_detail`` retains at most 20 keys and 20 list items.  This
+# module stays dependency-clean, so it cannot import debug_trace; a test at the
+# real provider-surface capture point pins both ceilings, including the worker's
+# later ``lane``/``wake_kind`` keys.  We intentionally share the two compact
+# count dictionaries instead of spending the three keys per list required by
+# ``debug_trace.bounded_names``.  A bucket count above its list length is the
+# explicit truncation signal for the emitted platform-name lists.
+_PROVIDER_TOOL_NAME_TRACE_CAP = 20
+REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP = 500
+REJECTED_ASSISTANT_TEXT_CHAR_CAP = 500
+REJECTED_TOOL_CALL_ID_PREFIX = "feedling_rejected_"
+REJECTED_TOOL_NAME_PLACEHOLDER = "feedling_rejected_unknown_tool"
 MIN_TOOL_RESULT_ERROR_QUOTA = 64
 _RESULT_TRUNCATION_MARKER = "...[truncated]"
+_REJECTED_TOOL_ARGS_KEY = "_feedling_rejected_args"
+_UNKNOWN_TOOL_REJECTION_REASON = "unknown_tool"
+_TOOL_WITHDRAWN_REJECTION_REASON = "tool_withdrawn"
+_PROVIDER_CALL_REJECTION_REASON_ASSISTANT_TOOL_TEXT_TOO_LARGE = (
+    "assistant_tool_text_too_large"
+)
+_PROVIDER_CALL_REJECTION_REASON_DUPLICATE_TOOL_CALL_ID = "duplicate_tool_call_id"
+_PROVIDER_CALL_REJECTION_REASON_INVALID_IMAGE_REPLY_BATCH = "invalid_image_reply_batch"
+_PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE = (
+    "invalid_or_over_budget_tool_exchange"
+)
+_PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH = "invalid_stay_silent_batch"
+_PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
+_PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS = (
+    "repeated_invalid_tool_arguments"
+)
+_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID = "missing_tool_call_id"
+_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME = "missing_tool_name"
+_PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION = "mixed_reply_and_mutation"
+_PROVIDER_CALL_REJECTION_REASON_NATIVE_ASSISTANT_TURN_TOO_LARGE = (
+    "native_assistant_turn_too_large"
+)
+_PROVIDER_CALL_REJECTION_REASON_PROVIDER_MEDIA_WITH_TOOL_CALLS = (
+    "provider_media_with_tool_calls"
+)
+_PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED = (
+    "terminal_tool_call_rejected"
+)
+_PROVIDER_CALL_REJECTION_REASON_TOOL_ARGUMENTS_TOO_LARGE = "tool_arguments_too_large"
+_PROVIDER_CALL_REJECTION_REASON_TOOL_BATCH_ARGUMENTS_TOO_LARGE = (
+    "tool_batch_arguments_too_large"
+)
+_PROVIDER_CALL_REJECTION_REASON_TOOL_CALL_BUDGET_EXCEEDED = "tool_call_budget_exceeded"
+_PROVIDER_CALL_REJECTION_REASON_UNAPPROVED_EXTERNAL_URL = "unapproved_external_url"
+_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED = "unclassified_rejection"
+_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION = "工具当前不可用,请用纯文本直接回复"
 MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = "error: mcp_mutation_outcome_unknown"
 MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
@@ -78,32 +133,57 @@ _FILE_DELIVERY_TOOLS = frozenset(
 # These wires accept the OpenAI-style named-function ``tool_choice`` payload.
 # Other providers may expose tools but do not accept this exact forcing shape.
 _NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
-    {"openai", "openrouter", "openai_compatible", "deepseek", "anthropic", "gemini", "bedrock"}
+    {
+        "openai",
+        "openrouter",
+        "openai_compatible",
+        "deepseek",
+        "anthropic",
+        "gemini",
+        "bedrock",
+    }
 )
 _WAKE_REPLY_TOOL = "reply"
 _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     name=_WAKE_REPLY_TOOL,
     description=(
-        "Deliver one non-empty visible reply and end this proactive wake turn. "
-        "Use stay_silent instead when there is nothing worth interrupting the user for."
+        "Reply when you want to speak and end this proactive wake turn. "
+        "Use stay_silent instead when quiet company feels right this time."
     ),
     parameters={
         "type": "object",
         "properties": {
+            "think": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Your thinking in this moment — why you want to speak and what "
+                    "you mean to say. They can open and read this in the app. Write "
+                    "`think` entirely in their language — the language they speak "
+                    "to you — and in your usual voice with them: everyday intent "
+                    "only, with no tool names, parameters, field names, identity "
+                    "cards, or other internal terms."
+                ),
+            },
             "text": {
                 "type": "string",
                 "minLength": 1,
-                "description": "The complete user-visible reply.",
+                "description": (
+                    "The complete message they will see. Speak their language, stay "
+                    "true to your persona, and when you mention time, say it the way "
+                    "it is said where they live — honor the identity contract in "
+                    "your context."
+                ),
             }
         },
-        "required": ["text"],
+        "required": ["think", "text"],
         "additionalProperties": False,
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "The previous proactive-wake response ended without visible text or a tool "
-    "call. End the wake now by calling exactly one offered tool: call reply with "
-    "the complete visible message, or call stay_silent with a non-empty reason."
+    "When you are done looking around, end the wake by calling exactly one of the "
+    "two tools: reply with what you want to say, or stay_silent with a short note "
+    "on why not this time."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
@@ -126,6 +206,7 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "image_safety",
         "language",
         "length",
+        "max_output_tokens",
         "malformed_function_call",
         "max_tokens",
         "other",
@@ -159,11 +240,71 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "none",
         "tool_schema_rejected",
         "final_reply_correction",
-        "invalid_or_over_budget_tool_exchange",
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
+        _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
         "tool_only_stall",
         "other",
     }
 )
+# Provider calls that failed, but for which the loop deliberately made a
+# degraded retry.  These values are mirrored into the plaintext attempt ledger;
+# keep them as producer-owned closed metadata, never exception text.
+_PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES = "tagged_images_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA = "tool_schema_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_REASONS = frozenset({
+    _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES,
+    _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA,
+})
+# Keep the producer inventory separate from the public vocabulary. A regression
+# test compares the two so adding a classification branch cannot silently turn a
+# rejected round into the same empty list used by a healthy round.
+_PROVIDER_CALL_REJECTION_PRODUCER_REASONS = frozenset(
+    {
+        _PROVIDER_CALL_REJECTION_REASON_ASSISTANT_TOOL_TEXT_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_DUPLICATE_TOOL_CALL_ID,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_IMAGE_REPLY_BATCH,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH,
+        _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS,
+        _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
+        _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID,
+        _PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME,
+        _PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION,
+        _PROVIDER_CALL_REJECTION_REASON_NATIVE_ASSISTANT_TURN_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_PROVIDER_MEDIA_WITH_TOOL_CALLS,
+        _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
+        _PROVIDER_CALL_REJECTION_REASON_TOOL_ARGUMENTS_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_TOOL_BATCH_ARGUMENTS_TOO_LARGE,
+        _PROVIDER_CALL_REJECTION_REASON_TOOL_CALL_BUDGET_EXCEEDED,
+        _PROVIDER_CALL_REJECTION_REASON_UNAPPROVED_EXTERNAL_URL,
+        _UNKNOWN_TOOL_REJECTION_REASON,
+        _TOOL_WITHDRAWN_REJECTION_REASON,
+    }
+)
+_PROVIDER_CALL_REJECTION_REASONS = frozenset(
+    _PROVIDER_CALL_REJECTION_PRODUCER_REASONS
+    | {_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED}
+)
+
+
+def _normalize_provider_call_rejection_reasons(values) -> list[str]:
+    """Return unique producer-owned rejection tokens, never arbitrary text."""
+    if not isinstance(values, (list, tuple)):
+        return []
+    return list(
+        dict.fromkeys(
+            value
+            for value in values
+            if isinstance(value, str)
+            and value in _PROVIDER_CALL_REJECTION_REASONS
+        )
+    )
+
+
+def _bounded_provider_tool_names(values) -> tuple[list[str], int]:
+    """Return sorted content-free tool names plus the pre-truncation count."""
+    names = sorted({str(value) for value in (values or ()) if str(value)})
+    return names[:_PROVIDER_TOOL_NAME_TRACE_CAP], len(names)
 
 
 def _catalog():
@@ -268,6 +409,40 @@ _NOT_A_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _IMAGE_NOUN = r"(?:自画像|画像|插画|图片|图像|图)"
+_IDENTITY_WRITE_TOOL_NAMES = frozenset(
+    action
+    for action in cap_registry.WRITE_ACTIONS
+    if action.startswith("identity_")
+)
+
+
+def _identity_write_attempted(transcript) -> bool:
+    """Return whether the turn transcript contains an identity-write call."""
+    return any(
+        call.name in _IDENTITY_WRITE_TOOL_NAMES
+        for item in transcript
+        if isinstance(item, ToolExchange)
+        for call in item.calls
+    )
+
+
+def _identity_write_succeeded(transcript) -> bool:
+    """Return whether a matched identity-write result is classified as success."""
+    from core import chat_activity as _ca
+
+    for item in transcript:
+        if not isinstance(item, ToolExchange):
+            continue
+        results_by_id = {str(result.call_id): result for result in item.results}
+        for call in item.calls:
+            if call.name not in _IDENTITY_WRITE_TOOL_NAMES:
+                continue
+            result = results_by_id.get(str(call.id))
+            if result is not None and _ca.result_code(result.content) == "ok":
+                return True
+    return False
+
+
 _IMAGE_CLAIM_RE = re.compile(
     r"("
     # 图 + (已经) + 完成动词:「图片已经生成」「图片生成好了」
@@ -338,7 +513,12 @@ def _file_suffix_for_requirement(
         return max(matches, key=len)
     if normalized.endswith(".io.html"):
         return ".io.html"
-    return posixpath.splitext(normalized)[1]
+    suffix = posixpath.splitext(normalized)[1]
+    return {
+        ".htm": ".html",
+        ".markdown": ".md",
+        ".yml": ".yaml",
+    }.get(suffix, suffix)
 
 
 def _serialized_chars(value) -> int | None:
@@ -355,6 +535,258 @@ def _serialized_chars(value) -> int | None:
         return None
 
 
+def _tool_args_char_limit(tc: ToolCall, default_limit: int) -> int:
+    """Allow one schema-bounded Canvas body through the generic tool guard."""
+    if (
+        tc.name == "workspace_write"
+        and tc.args_ok
+        and str(tc.args.get("path") or "").strip().casefold().endswith(".io.html")
+        and tool_schema.validate_tool_args(tc.name, tc.args) is None
+    ):
+        serialized_size = _serialized_chars(tc.args)
+        if serialized_size is not None:
+            # The closed tool schema and its capability-level UTF-8 check are
+            # authoritative here. Derive the allowance from this exact parsed
+            # argument object: JSON escaping grows with quote/backslash density,
+            # so a fixed additive allowance would silently narrow the 256KB
+            # source contract when a future output budget reaches that boundary.
+            return max(default_limit, serialized_size)
+    return default_limit
+
+
+@dataclass(frozen=True)
+class _ToolCallRejectionFacts:
+    call_ids: list[str]
+    image_reply_calls: list[ToolCall]
+    stay_silent_calls: list[ToolCall]
+    oversized_tool_exchange: bool
+    over_tool_call_budget: bool
+    malformed: bool
+    truncated_tool_arguments: bool
+    mixed_reply_write: bool
+    invalid_image_batch: bool
+    invalid_silence_batch: bool
+    rejected: bool
+    call_rejection_reasons: list[str]
+    reason_tokens: list[str]
+
+
+def _tool_call_rejection_facts(
+    pr: ProviderResponse,
+    *,
+    tools: list[ToolSpec] | None,
+    raw_finish_reason: str,
+    terminal_text_round: bool,
+    tool_calls_used: int,
+    previous_offered_tool_names: frozenset[str],
+    completed_memory_discovery_tools: set[str],
+    external_content_seen: bool,
+    allowed_fetch_urls: set[str],
+    mutating_mcp_names: set[str],
+    max_tool_args_chars: int,
+    max_tool_batch_args_chars: int,
+    max_native_assistant_turn_chars: int,
+    max_assistant_tool_text_chars: int,
+    max_tool_calls_per_round: int,
+    max_tool_calls_per_turn: int,
+) -> _ToolCallRejectionFacts:
+    """Classify one provider tool batch using content-free closed tokens."""
+    call_ids = [tc.id for tc in pr.tool_calls]
+    argument_sizes = [
+        (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
+        for tc in pr.tool_calls
+    ]
+    argument_limits = [
+        _tool_args_char_limit(tc, max_tool_args_chars)
+        for tc in pr.tool_calls
+    ]
+    batch_arguments_limit = max_tool_batch_args_chars
+    native_assistant_turn_limit = max_native_assistant_turn_chars
+    if (
+        len(pr.tool_calls) == 1
+        and argument_limits
+        and argument_limits[0] > max_tool_args_chars
+    ):
+        batch_arguments_limit = max(batch_arguments_limit, argument_limits[0])
+        native_assistant_turn_limit = max(
+            native_assistant_turn_limit,
+            argument_limits[0] + max_assistant_tool_text_chars + 8192,
+        )
+    native_turn_size = (
+        _serialized_chars(pr.assistant_turn.payload)
+        if pr.assistant_turn is not None
+        else 0
+    )
+    oversized_tool_exchange = (
+        any(
+            size is None or size > limit
+            for size, limit in zip(argument_sizes, argument_limits)
+        )
+        or sum(size or 0 for size in argument_sizes) > batch_arguments_limit
+        or native_turn_size is None
+        or native_turn_size > native_assistant_turn_limit
+        or len(pr.text) > max_assistant_tool_text_chars
+    )
+    over_tool_call_budget = (
+        len(pr.tool_calls) > max_tool_calls_per_round
+        or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
+    )
+    offered_names = {spec.name for spec in (tools or [])}
+    individual_rejection_reasons: list[list[str]] = []
+    for tc in pr.tool_calls:
+        reasons: list[str] = []
+        if not tc.id:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_CALL_ID)
+        if not tc.name:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_MISSING_TOOL_NAME)
+        if not tc.args_ok:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS)
+        if (
+            tc.name not in offered_names
+            and tc.name not in completed_memory_discovery_tools
+        ):
+            reasons.append(
+                _TOOL_WITHDRAWN_REJECTION_REASON
+                if tc.name in previous_offered_tool_names
+                else _UNKNOWN_TOOL_REJECTION_REASON
+            )
+        elif (
+            external_content_seen
+            and tc.name == "web_fetch"
+            and str(tc.args.get("url") or "").strip() not in allowed_fetch_urls
+        ):
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_UNAPPROVED_EXTERNAL_URL)
+        individual_rejection_reasons.append(reasons)
+    # Provider media is terminal output. Do not silently discard or retain
+    # its large inline payload when a broken relay also invents function calls.
+    malformed = (
+        (terminal_text_round and bool(pr.tool_calls))
+        or bool(pr.media)
+        or any(individual_rejection_reasons)
+    )
+    truncated_tool_arguments = provider_client.is_token_limit_stop_reason(
+        raw_finish_reason
+    ) and any(not tc.args_ok for tc in pr.tool_calls)
+    image_reply_calls = [
+        tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
+    ]
+    stay_silent_calls = [
+        tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
+    ]
+    mixed_reply_write = any(
+        tc.name
+        in {
+            tool_schema.FILE_REPLY_TOOL,
+            tool_schema.IMAGE_REPLY_TOOL,
+            tool_schema.STAY_SILENT_TOOL,
+        }
+        for tc in pr.tool_calls
+    ) and any(
+        tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
+        for tc in pr.tool_calls
+    )
+    invalid_image_batch = bool(image_reply_calls) and (
+        len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
+    )
+    invalid_silence_batch = bool(stay_silent_calls) and (
+        len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
+    )
+    duplicate_call_ids = {
+        call_id for call_id in call_ids if call_id and call_ids.count(call_id) > 1
+    }
+    batch_rejection_reasons: list[str] = []
+    if terminal_text_round:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED
+        )
+    if pr.media:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_PROVIDER_MEDIA_WITH_TOOL_CALLS
+        )
+    if mixed_reply_write:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_MIXED_REPLY_AND_MUTATION
+        )
+    if invalid_image_batch:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_INVALID_IMAGE_REPLY_BATCH
+        )
+    if invalid_silence_batch:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_INVALID_STAY_SILENT_BATCH
+        )
+    if over_tool_call_budget:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_TOOL_CALL_BUDGET_EXCEEDED
+        )
+    if sum(size or 0 for size in argument_sizes) > batch_arguments_limit:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_TOOL_BATCH_ARGUMENTS_TOO_LARGE
+        )
+    if native_turn_size is None or native_turn_size > native_assistant_turn_limit:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_NATIVE_ASSISTANT_TURN_TOO_LARGE
+        )
+    if len(pr.text) > max_assistant_tool_text_chars:
+        batch_rejection_reasons.append(
+            _PROVIDER_CALL_REJECTION_REASON_ASSISTANT_TOOL_TEXT_TOO_LARGE
+        )
+    call_rejection_reasons: list[str] = []
+    for tc, argument_size, argument_limit, individual_reasons in zip(
+        pr.tool_calls,
+        argument_sizes,
+        argument_limits,
+        individual_rejection_reasons,
+    ):
+        reasons = list(individual_reasons)
+        if tc.id in duplicate_call_ids:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_DUPLICATE_TOOL_CALL_ID)
+        if argument_size is None or argument_size > argument_limit:
+            reasons.append(_PROVIDER_CALL_REJECTION_REASON_TOOL_ARGUMENTS_TOO_LARGE)
+        reasons.extend(batch_rejection_reasons)
+        call_rejection_reasons.append(
+            ",".join(dict.fromkeys(reasons))
+            or _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
+        )
+    rejected = bool(pr.tool_calls) and (
+        malformed
+        or len(set(call_ids)) != len(call_ids)
+        or mixed_reply_write
+        or invalid_image_batch
+        or invalid_silence_batch
+        or over_tool_call_budget
+        or oversized_tool_exchange
+    )
+    reason_tokens = (
+        _normalize_provider_call_rejection_reasons(
+            [
+                token
+                for joined_reasons in call_rejection_reasons
+                for token in joined_reasons.split(",")
+            ]
+        )
+        if rejected
+        else []
+    )
+    if rejected and not reason_tokens:
+        reason_tokens = [_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED]
+    return _ToolCallRejectionFacts(
+        call_ids=call_ids,
+        image_reply_calls=image_reply_calls,
+        stay_silent_calls=stay_silent_calls,
+        oversized_tool_exchange=oversized_tool_exchange,
+        over_tool_call_budget=over_tool_call_budget,
+        malformed=malformed,
+        truncated_tool_arguments=truncated_tool_arguments,
+        mixed_reply_write=mixed_reply_write,
+        invalid_image_batch=invalid_image_batch,
+        invalid_silence_batch=invalid_silence_batch,
+        rejected=rejected,
+        call_rejection_reasons=call_rejection_reasons,
+        reason_tokens=reason_tokens,
+    )
+
+
 def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TRUNCATION_MARKER) -> str:
     """Deterministically cap one result, including the truncation marker."""
     text = str(content or "")
@@ -363,6 +795,90 @@ def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TR
     if cap <= len(marker):
         return marker[:cap]
     return text[: cap - len(marker)] + marker
+
+
+def _rejected_tool_args(tool_call: ToolCall) -> dict:
+    """Return one bounded, provider-encodable summary of rejected arguments."""
+    if tool_call.args_ok:
+        try:
+            raw = json.dumps(
+                tool_call.args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError):
+            raw = "<unserializable arguments>"
+    else:
+        raw = str(tool_call.args_raw or "<invalid arguments>")
+    best = ""
+    low = 0
+    high = min(len(raw), REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP)
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = _truncate_result_content(raw, midpoint)
+        encoded = {_REJECTED_TOOL_ARGS_KEY: candidate}
+        size = _serialized_chars(encoded)
+        if size is not None and size <= REJECTED_TOOL_ARGS_SUMMARY_CHAR_CAP:
+            best = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return {_REJECTED_TOOL_ARGS_KEY: best}
+
+
+def _rejected_tool_exchange(
+    tool_calls: list[ToolCall],
+    *,
+    assistant_text: str,
+    rejection_reasons: list[str],
+    attempt: int,
+) -> ToolExchange:
+    """Synthesize a bounded, non-executed exchange for one rejected batch.
+
+    Provider-native ids and assistant payloads can themselves be malformed, so
+    neither is retained. The reserved id prefix plus the monotonically
+    increasing provider-attempt number makes every synthetic id distinct within
+    this loop while keeping calls and results exactly paired on every wire.
+    """
+    if len(tool_calls) != len(rejection_reasons):
+        raise ValueError("rejected tool calls and reasons must match")
+    calls: list[ToolCall] = []
+    results: list[ToolResult] = []
+    for index, (tool_call, reason) in enumerate(
+        zip(tool_calls, rejection_reasons)
+    ):
+        call_id = f"{REJECTED_TOOL_CALL_ID_PREFIX}{attempt}_{index}"
+        normalized_reason = str(reason or "tool_call_rejected").strip()
+        calls.append(
+            ToolCall(
+                id=call_id,
+                name=(
+                    str(tool_call.name or "").strip()
+                    or REJECTED_TOOL_NAME_PLACEHOLDER
+                ),
+                args=_rejected_tool_args(tool_call),
+            )
+        )
+        results.append(
+            ToolResult(
+                call_id=call_id,
+                content=(
+                    f"Tool call rejected: {normalized_reason}. No tool was "
+                    f"executed. {_REJECTED_TOOL_PLAIN_TEXT_INSTRUCTION}"
+                ),
+                metadata={"rejected": normalized_reason},
+            )
+        )
+    return ToolExchange(
+        calls=tuple(calls),
+        results=tuple(results),
+        assistant_text=_truncate_result_content(
+            assistant_text,
+            REJECTED_ASSISTANT_TEXT_CHAR_CAP,
+        ),
+        assistant_turn=None,
+    )
 
 
 def _result_quotas(lengths: list[int], batch_cap: int) -> list[int]:
@@ -523,8 +1039,66 @@ class ProviderEmptyReply(RuntimeError):
     """A structurally valid provider success had no foreground-usable output."""
 
 
-class CanvasDeliveryIncomplete(RuntimeError):
+class WakeChoiceInvalid(RuntimeError):
+    """A proactive wake ended without one valid reply/stay_silent decision."""
+
+    reason = "choice_invalid"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
+class ProviderOutputTruncated(RuntimeError):
+    """A provider stopped while serializing a tool call at its output limit."""
+
+    reason = "output_truncated"
+
+    def __init__(self):
+        super().__init__(self.reason)
+
+
+class FileDeliveryIncomplete(RuntimeError):
+    """A requested attachment was saved but still failed bounded delivery."""
+
+
+class ValidatedFinalReply(str):
+    """A sanitized structured reply whose language check budget is settled.
+
+    The worker's ordinary terminal-text path may ask the provider to rewrite a
+    reply that omits its private thinking envelope.  A file completion has
+    already passed through language validation and its bounded correction policy,
+    then is published atomically with the staged attachment. Treating it as
+    ordinary text can replace that settled delivery bubble with a second,
+    wrong-language provider answer. A ``str`` subtype keeps the callback API and
+    test equality stable while preserving that provenance at the worker boundary.
+    """
+
+
+class ValidatedWakeReply(str):
+    """A proactive reply whose text came from the structured ``reply`` tool.
+
+    Non-scheduled wake delivery is fail-closed at the worker boundary: plain
+    provider text, including text accompanying an ordinary tool call, is never
+    authorized to become a bubble.  A ``str`` subtype preserves the callback
+    contract while carrying that provenance through the ordinary final-effect
+    path. ``thinking`` is kept off the string value so it can only reach the
+    separately sealed thinking envelope, never the visible bubble payload.
+    """
+
+    def __new__(cls, text: str, *, thinking: str):
+        value = super().__new__(cls, text)
+        value.thinking = thinking
+        return value
+
+
+class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
     """Canvas source was saved but its card still failed bounded delivery."""
+
+
+def _delivery_incomplete(path: str, reason: str) -> FileDeliveryIncomplete:
+    if str(path or "").strip().casefold().endswith(".io.html"):
+        return CanvasDeliveryIncomplete(reason)
+    return FileDeliveryIncomplete(reason)
 
 
 @dataclass(frozen=True)
@@ -620,6 +1194,13 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     on_stay_silent=None,
+    # Non-scheduled proactive callers enable this for the whole turn. Ordinary
+    # tools remain available while the model gathers context; only the terminal
+    # decision must be exactly one reply/stay_silent tool call. Keeping this
+    # explicit (instead of inferring it from require_reply=False) preserves the
+    # foreground and scheduled contracts, which share this loop but continue to
+    # accept ordinary terminal text.
+    regular_wake_choice_required: bool = False,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
     # not via include_reasoning, and NOT via reasoning_effort either. The model then
@@ -677,6 +1258,7 @@ async def run_tool_loop(
     max_assistant_tool_text_chars: int = DEFAULT_MAX_ASSISTANT_TOOL_TEXT_CHARS,
     prompt_context_window_overrides=None,
     prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
+    file_output_max_tokens: int = provider_client.CHAT_OUTPUT_MAX_TOKENS,
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
@@ -770,9 +1352,17 @@ async def run_tool_loop(
         max_assistant_tool_text_chars,
         name="max_assistant_tool_text_chars",
     )
+    file_output_max_tokens = _positive_limit(
+        file_output_max_tokens,
+        name="file_output_max_tokens",
+    )
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
     ).strip()
+    if regular_wake_choice_required and on_stay_silent is None:
+        raise ValueError(
+            "regular_wake_choice_required requires on_stay_silent"
+        )
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -800,6 +1390,7 @@ async def run_tool_loop(
     transcript: list = []
     replied_intermediate = False
     attempts = 0
+    last_offered_tool_names: frozenset[str] = frozenset()
     tool_calls_used = 0
     consecutive_tool_only_rounds = 0
     terminal_tool_call_retries = 0
@@ -807,9 +1398,10 @@ async def run_tool_loop(
     seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
     force_text_fallback_reason = ""
+    generic_validation_retry_used = False
     empty_response_recovery_used = False
     empty_response_retry_instruction = ""
-    wake_choice_recovery_used = False
+    wake_choice_retry_used = False
     wake_choice_required = False
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
@@ -835,7 +1427,10 @@ async def run_tool_loop(
     private_read_seen = False
     tagged_image_fallback_active = False
     file_requirement_message_state = [
-        dict(message)
+        {
+            **dict(message),
+            "role": str(message.get("role") or "user"),
+        }
         for message in file_requirement_messages
         if isinstance(message, dict)
     ]
@@ -847,12 +1442,93 @@ async def run_tool_loop(
             if str(message.get("role") or "").strip().lower() != "user":
                 continue
             content = message.get("content")
+            if isinstance(content, list):
+                content = "\n".join(
+                    str(part.get("text") or "").strip()
+                    for part in content
+                    if isinstance(part, dict)
+                    and str(part.get("text") or "").strip()
+                )
             if isinstance(content, str) and content.strip():
                 return _truncate_result_content(
                     content.strip(),
                     DEFAULT_TOOL_RESULT_CHAR_CAP,
                 )
         return ""
+
+    def _delivery_control_uses_han(request: str) -> bool:
+        """Keep compact delivery prompts aligned with the visible request."""
+
+        return _delivery_request_writing_system(request) == "han"
+
+    def _delivery_request_writing_system(request: str) -> str:
+        """Classify the conversational shell, not Latin-heavy file terms.
+
+        A Chinese request can contain a long English filename or subject, which
+        makes the shared character-count classifier report ``latin``.  A small
+        Han share can equally be an English request quoting a filename or term,
+        so the compact-delivery override requires at least two Han characters
+        and a 20% share whenever Latin is also present.  Kana keeps Japanese
+        requests out of this Chinese/Latin override.
+        """
+
+        han_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", request))
+        latin_count = len(re.findall(r"[A-Za-z]", request))
+        letter_count = han_count + latin_count
+        strong_han_shell = bool(
+            han_count
+            and re.search(r"[\u3040-\u30ff]", request) is None
+            and (
+                latin_count == 0
+                or (han_count >= 2 and han_count / letter_count >= 0.20)
+            )
+        )
+        if strong_han_shell:
+            return "han"
+        writing_system = language_follow.classify_writing_system(request)
+        if writing_system == "indeterminate":
+            if latin_count:
+                return "latin"
+            if han_count:
+                return "han"
+        return writing_system
+
+    def _delivery_completion_matches_request(
+        request: str, completion_message: str
+    ) -> bool:
+        """Validate the model-authored delivery bubble against the live request."""
+
+        expected = _delivery_request_writing_system(request)
+        actual = language_follow.classify_writing_system(completion_message)
+        if expected == "mixed":
+            return True
+        if expected == "indeterminate":
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", request) is not None:
+                expected = "han"
+            elif re.search(r"[A-Za-z]", request) is not None:
+                expected = "latin"
+            else:
+                return True
+        if actual == expected or actual == "mixed":
+            return True
+        if actual != "indeterminate":
+            return False
+        if expected == "han":
+            return re.search(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", completion_message
+            ) is not None
+        if expected == "latin":
+            return re.search(r"[A-Za-z]", completion_message) is not None
+        return False
+
+    def _compact_delivery_system_prompt(
+        instruction: str, *, require_self_thinking: bool = True
+    ) -> str:
+        """Preserve the normal final-reply contract in compact delivery rounds."""
+
+        if not suppress_native_reasoning or not require_self_thinking:
+            return instruction
+        return instruction.rstrip() + "\n\n" + self_thinking.INSTRUCTION.strip()
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
@@ -880,7 +1556,9 @@ async def run_tool_loop(
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
     image_claim_bounces = 0
+    identity_write_failed_bounces = 0
     image_claim_retry_instruction = ""
+    identity_write_failed_instruction = ""
     file_delivery_fallback_reasoning = ""
     file_delivery_recovery_needed = False
     workspace_write_applied = False
@@ -890,6 +1568,7 @@ async def run_tool_loop(
     compact_delivery_validation_exchange: ToolExchange | None = None
     compact_delivery_mismatch_retry_used = False
     compact_delivery_args_retry_used = False
+    file_delivery_callback_retry_used = False
     compact_delivery_confirmation_needed = False
     # Names keep required schemas visible and completed discovery calls valid in
     # native history. Exact call keys independently decide whether dispatch would
@@ -990,6 +1669,27 @@ async def run_tool_loop(
             emitted = on_provider_call_event(event_kind, detail)
             if inspect.isawaitable(emitted):
                 await emitted
+        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            pass
+
+    async def _emit_provider_tool_surface(
+        detail: dict | None,
+        rejection_reasons=(),
+    ) -> None:
+        """Emit the request surface once its same-round response is classified."""
+        if on_provider_tool_surface is None or detail is None:
+            return
+        try:
+            await on_provider_tool_surface(
+                {
+                    **detail,
+                    "call_rejection_reasons": (
+                        _normalize_provider_call_rejection_reasons(
+                            list(rejection_reasons)
+                        )
+                    ),
+                }
+            )
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
             pass
 
@@ -1106,7 +1806,10 @@ async def run_tool_loop(
                 )
                 transcript.extend(folded)
                 file_requirement_message_state.extend(
-                    dict(message)
+                    {
+                        **dict(message),
+                        "role": str(message.get("role") or "user"),
+                    }
                     for message in folded
                     if isinstance(message, dict)
                 )
@@ -1139,15 +1842,31 @@ async def run_tool_loop(
                         compact_delivery_validation_exchange = None
                         compact_delivery_mismatch_retry_used = False
                         compact_delivery_args_retry_used = False
+                        file_delivery_callback_retry_used = False
                         compact_delivery_confirmation_needed = False
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
         turn_catalog = _turn_catalog()
+        if regular_wake_choice_required:
+            turn_catalog = [
+                spec for spec in turn_catalog if spec.name != _WAKE_REPLY_TOOL
+            ] + [_WAKE_REPLY_TOOL_SPEC]
         wake_choice_tool_available = any(
             spec.name == tool_schema.STAY_SILENT_TOOL for spec in turn_catalog
         )
+        # The last configured provider call is reserved for the structured wake
+        # decision. Protocol fallbacks that would normally disable tools and ask
+        # for terminal text enter the same choice phase instead. This keeps every
+        # active-wake text outlet fail-closed without removing tools from earlier
+        # rounds.
+        if regular_wake_choice_required and not wake_choice_required and (
+            attempts == max_calls - 1 or force_text_fallback
+        ):
+            wake_choice_required = True
+            force_text_fallback = False
+            force_text_fallback_reason = ""
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -1155,7 +1874,11 @@ async def run_tool_loop(
             force_text_fallback
             or final_reply_correction_request is not None
             or compact_delivery_confirmation_needed
-            or (attempts == max_calls - 1 and not wake_choice_required)
+            or (
+                attempts == max_calls - 1
+                and not wake_choice_required
+                and not regular_wake_choice_required
+            )
         )
         terminal_text_round_reason = "none"
         if terminal_text_round:
@@ -1188,6 +1911,7 @@ async def run_tool_loop(
             for instruction in (
                 delivery_retry_instruction,
                 image_claim_retry_instruction,
+                identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 final_reply_correction_instruction,
@@ -1387,6 +2111,36 @@ async def run_tool_loop(
                     }
                 ]
         if wake_choice_required:
+            if provider_name not in _NAMED_TOOL_CHOICE_PROVIDERS:
+                await _trajectory(
+                    "wake_choice_unavailable",
+                    {
+                        "round": attempts + 1,
+                        "action": "fail_wake_choice_unsupported",
+                    },
+                )
+                exc = WakeChoiceInvalid()
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
+            if tool_calls_used >= max_tool_calls_per_turn:
+                await _trajectory(
+                    "wake_choice_unavailable",
+                    {
+                        "round": attempts + 1,
+                        "action": "fail_wake_choice_budget_exhausted",
+                    },
+                )
+                exc = WakeChoiceInvalid()
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise exc
             stay_silent_spec = next(
                 (
                     spec
@@ -1403,7 +2157,7 @@ async def run_tool_loop(
                         "action": "fail_wake_choice_tool_unavailable",
                     },
                 )
-                exc = ProviderEmptyReply("empty_reply")
+                exc = WakeChoiceInvalid()
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -1418,21 +2172,45 @@ async def run_tool_loop(
         if compact_delivery_confirmation_needed:
             compact_delivery_phase = "confirm"
             current_user_request = _latest_user_delivery_request()
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "The work the user asked for was saved and delivered "
-                        "successfully. Finish this turn in your own voice, using the "
-                        "same language as the user's current request below, with "
-                        "that fact available; the user can open the work now."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": current_user_request or "Finish your response to me.",
-                },
-            ]
+            if _delivery_control_uses_han(current_user_request):
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _compact_delivery_system_prompt(
+                            "对方要求的内容已经成功保存并发送。请用你自己的口吻结束本轮，"
+                            "使用与下方当前请求相同的语言，把这件事实自然地告诉对方；"
+                            "文件现在已经可以打开或下载。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": current_user_request or "请完成对我的回复。",
+                    },
+                ]
+            else:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": _compact_delivery_system_prompt(
+                            "The work the user asked for was saved and delivered "
+                            "successfully. Finish this turn in your own voice, using the "
+                            "same language as the user's current request below, with "
+                            "that fact available; the user can open the work now."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            current_user_request or "Finish your response to me."
+                        ),
+                    },
+                ]
+            # The compact confirmation replaces the normal transcript-shaped
+            # messages above. Re-attach bounded correction instructions here;
+            # otherwise a language rewrite is marked as attempted but the
+            # provider never sees the instruction that requested it.
+            if retry_instructions:
+                messages = _with_system_suffix(messages, retry_instructions)
         elif (
             forced_delivery_tool == tool_schema.FILE_REPLY_TOOL
             and workspace_delivery_target is not None
@@ -1440,39 +2218,73 @@ async def run_tool_loop(
             compact_delivery_phase = "send_file"
             target_path, target_revision = workspace_delivery_target
             current_user_request = _latest_user_delivery_request()
-            metadata_instruction = ""
-            if target_path.casefold().endswith(".io.html"):
-                metadata_instruction = (
-                    " This is a Canvas file, so send_file also requires a concise "
-                    "title, subtitle, and completion_message in the language of the "
-                    "user's current request. completion_message is the complete "
-                    "user-visible chat bubble in your own voice; do not default it "
-                    "to English or Chinese. Preserve or change the metadata according "
-                    "to the current user request."
+            use_han_control = _delivery_control_uses_han(current_user_request)
+            metadata_instruction = (
+                (
+                    " send_file 必须同时提供 completion_message，作为发送附件后的"
+                    "完整可见聊天气泡；必须使用中文并保持你自己的口吻。"
                 )
-            request_instruction = (
-                " Current user request: "
-                + json.dumps(current_user_request, ensure_ascii=False)
-                + "."
-                if current_user_request
-                else ""
+                if use_han_control
+                else (
+                    " send_file must also provide completion_message as the complete "
+                    "visible chat bubble after delivery; write it in English and in "
+                    "your own voice."
+                )
+            )
+            if target_path.casefold().endswith(".io.html"):
+                metadata_instruction += (
+                    (
+                        " 这是 Canvas 文件，所以还必须提供简洁的 title 和 subtitle；"
+                        "按照当前请求保留或修改这些元数据。"
+                    )
+                    if use_han_control
+                    else (
+                        " This is a Canvas file, so send_file also requires a concise "
+                        "title and subtitle. Preserve or change that metadata according "
+                        "to the current user request."
+                    )
+                )
+            request_instruction = ""
+            if current_user_request:
+                request_instruction = (
+                    (" 对方当前请求：" if use_han_control else " Current user request: ")
+                    + json.dumps(current_user_request, ensure_ascii=False)
+                    + "。"
+                )
+            delivery_instruction = (
+                (
+                    "作品源文件已经保存。现在调用 send_file 一次完成发送，"
+                    "目标必须完全一致："
+                )
+                if use_han_control
+                else (
+                    "The work's source is already saved. Complete the delivery "
+                    "now by calling send_file once with this exact target: "
+                )
             )
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        "The work's source is already saved. Complete the delivery "
-                        "now by calling send_file once with this exact target: "
+                    "content": _compact_delivery_system_prompt(
+                        delivery_instruction
                         + json.dumps(
                             {"path": target_path, "revision": target_revision},
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )
                         + metadata_instruction
-                        + request_instruction
+                        + request_instruction,
+                        require_self_thinking=False,
                     ),
                 },
-                {"role": "user", "content": "Complete the pending delivery now."},
+                {
+                    "role": "user",
+                    "content": (
+                        "现在完成待发送的文件。"
+                        if use_han_control
+                        else "Complete the pending delivery now."
+                    ),
+                },
             ]
             if compact_delivery_validation_exchange is not None:
                 messages.append(compact_delivery_validation_exchange)
@@ -1482,6 +2294,11 @@ async def run_tool_loop(
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
+        if regular_wake_choice_required:
+            required_schema_names = set(required_schema_names) | {
+                _WAKE_REPLY_TOOL,
+                tool_schema.STAY_SILENT_TOOL,
+            }
         if forced_delivery_tool:
             required_schema_names = set(required_schema_names) | {
                 forced_delivery_tool
@@ -1686,6 +2503,10 @@ async def run_tool_loop(
                 "tail_window": tail_window,
             },
         )
+        previous_offered_tool_names = last_offered_tool_names
+        current_offered_tool_names = frozenset(
+            str(spec.name) for spec in (tools or [])
+        )
         attempts += 1
         _progress("provider_start")
         await _provider_call_event(
@@ -1698,6 +2519,7 @@ async def run_tool_loop(
         )
         provider_call_started_at = time.monotonic()
         provider_error: BaseException | None = None
+        provider_surface_detail: dict | None = None
         try:
             # V2 owns the lane-specific empty-response policy. Let the provider
             # parser return any structurally valid success so an abnormal HTTP
@@ -1709,6 +2531,16 @@ async def run_tool_loop(
                 provider_kwargs["tool_choice"] = "required"
             if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
+            if suppress_native_reasoning and terminal_text_round:
+                # A continuation prefix is safe only once the loop has made
+                # this a text-only terminal request. Live Anthropic testing
+                # showed that adding it to an ordinary tool round can produce
+                # a mismatched </thinking> block or a prefix-only tool turn.
+                # Unsupported provider/model pairs discard this hint in the
+                # payload builder and therefore retain their exact old request.
+                provider_kwargs["assistant_prefill"] = (
+                    provider_client.SELF_THINKING_ASSISTANT_PREFILL
+                )
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (
@@ -1746,13 +2578,14 @@ async def run_tool_loop(
                 # generated document inside workspace_write arguments. The
                 # provider client's historical 700-token default predates V2
                 # tools and truncates even modest documents into malformed
-                # JSON. Use the output budget already reserved by V2's prompt
-                # frontier; wake/child/screen lanes omit on_file_reply and keep
-                # their existing limits unchanged.
+                # JSON. File generation owns a separate output budget: the
+                # prompt frontier's reserve is input accounting, and increasing
+                # it would silently evict otherwise usable history. Wake/child/
+                # screen lanes omit on_file_reply and keep their existing limits.
                 provider_kwargs["max_tokens"] = (
-                    min(prompt_output_reserve_tokens, 512)
+                    min(file_output_max_tokens, 512)
                     if compact_delivery_phase
-                    else prompt_output_reserve_tokens
+                    else file_output_max_tokens
                 )
             if on_provider_tool_surface is not None:
                 candidate_names = {
@@ -1761,34 +2594,56 @@ async def run_tool_loop(
                 sent_names = {str(spec.name) for spec in (tools or [])}
                 mcp_candidate_names = candidate_names & mcp_names
                 mcp_sent_names = sent_names & mcp_names
-                try:
-                    await on_provider_tool_surface(
-                        {
-                            "round": attempts,
-                            "candidate_tool_count": len(candidate_names),
-                            "sent_tool_count": len(sent_names),
-                            "dropped_tool_count": len(candidate_names - sent_names),
-                            "mcp_candidate_tool_count": len(mcp_candidate_names),
-                            "mcp_sent_tool_count": len(mcp_sent_names),
-                            "mcp_dropped_tool_count": len(
-                                mcp_candidate_names - mcp_sent_names
-                            ),
-                            "reason": surface_reason or "none",
-                            "terminal_text_round": terminal_text_round,
-                            "terminal_text_round_reason": (
-                                terminal_text_round_reason
-                            ),
-                            "force_text_fallback_reason": (
-                                force_text_fallback_reason or "none"
-                            ),
-                            "empty_response_recovery": bool(
-                                empty_response_retry_instruction
-                            ),
-                            "wake_choice_required": wake_choice_required,
-                        }
+                provider_surface_detail = {
+                    "round": attempts,
+                    "candidate_tool_count": len(candidate_names),
+                    "sent_tool_count": len(sent_names),
+                    "dropped_tool_count": len(candidate_names - sent_names),
+                    "mcp_candidate_tool_count": len(mcp_candidate_names),
+                    "mcp_sent_tool_count": len(mcp_sent_names),
+                    "mcp_dropped_tool_count": len(
+                        mcp_candidate_names - mcp_sent_names
+                    ),
+                    "reason": surface_reason or "none",
+                    "terminal_text_round": terminal_text_round,
+                    "terminal_text_round_reason": terminal_text_round_reason,
+                    "force_text_fallback_reason": (
+                        force_text_fallback_reason or "none"
+                    ),
+                    "empty_response_recovery": bool(
+                        empty_response_retry_instruction
+                    ),
+                    "wake_choice_required": wake_choice_required,
+                }
+                withdrawn_names = (
+                    previous_offered_tool_names - current_offered_tool_names
+                )
+                platform_tool_names = {spec.name for spec in _catalog()}
+                withdrawn_platform_names, withdrawn_platform_count = (
+                    _bounded_provider_tool_names(
+                        withdrawn_names & platform_tool_names
                     )
-                except Exception:
-                    pass
+                )
+                provider_surface_detail.update(
+                    {
+                        "withdrawn_platform_tool_names": (
+                            withdrawn_platform_names
+                        ),
+                        "withdrawn_tool_counts": {
+                            "platform": withdrawn_platform_count,
+                            "mcp": len(withdrawn_names & mcp_names),
+                            "other": len(
+                                withdrawn_names
+                                - platform_tool_names
+                                - mcp_names
+                            ),
+                        },
+                    }
+                )
+            # Update the history at the exact outbound boundary. Classification
+            # of this response keeps the saved previous set, while a provider
+            # error followed by another loop round still remembers what was sent.
+            last_offered_tool_names = current_offered_tool_names
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
@@ -1807,6 +2662,7 @@ async def run_tool_loop(
                 and getattr(exc, "status_code", None) in {400, 404, 415, 422}
             )
             if tagged_image_rejected:
+                tagged_error_facts = _provider_error_facts(exc)
                 await _trajectory(
                     "provider_error",
                     {
@@ -1814,6 +2670,16 @@ async def run_tool_loop(
                         "error_class": type(exc).__name__,
                         "tools_enabled": tools is not None,
                         "tagged_images_rejected": True,
+                        "status_code": tagged_error_facts["status_code"],
+                        "provider_error_class": tagged_error_facts[
+                            "provider_error_class"
+                        ],
+                        "dur_ms": (
+                            time.monotonic() - provider_call_started_at
+                        ) * 1000,
+                        "fallback_reason": (
+                            _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES
+                        ),
                     },
                 )
                 add_usage(None)
@@ -1854,6 +2720,18 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            tool_schema_rejected = (
+                tools is not None
+                and isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and attempts < max_calls
+                and _is_probably_tool_schema_rejection(exc)
+            )
+            await _emit_provider_tool_surface(provider_surface_detail)
+            provider_error_facts = _provider_error_facts(exc)
+            provider_call_dur_ms = (
+                time.monotonic() - provider_call_started_at
+            ) * 1000
             await _provider_call_event(
                 "error",
                 {
@@ -1862,22 +2740,27 @@ async def run_tool_loop(
                     "model": str(
                         getattr(provider_config, "model", "") or ""
                     ),
-                    **_provider_error_facts(exc),
-                    "dur_ms": (
-                        time.monotonic() - provider_call_started_at
-                    ) * 1000,
+                    **provider_error_facts,
+                    "dur_ms": provider_call_dur_ms,
                 },
             )
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
-            await _trajectory(
-                "provider_error",
-                {
-                    "round": attempts,
-                    "error_class": type(exc).__name__,
-                    "tools_enabled": tools is not None,
-                    "provider_attempt_trace": attempt_trace,
-                },
-            )
+            provider_error_detail = {
+                "round": attempts,
+                "error_class": type(exc).__name__,
+                "tools_enabled": tools is not None,
+                "provider_attempt_trace": attempt_trace,
+                "status_code": provider_error_facts["status_code"],
+                "provider_error_class": provider_error_facts[
+                    "provider_error_class"
+                ],
+                "dur_ms": provider_call_dur_ms,
+            }
+            if tool_schema_rejected:
+                provider_error_detail["fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA
+                )
+            await _trajectory("provider_error", provider_error_detail)
             # TurnMetrics' docstring promises failed provider calls ARE counted
             # (model_calls bumped, just with no token usage) — add_usage(None)
             # before either falling back or propagating.
@@ -1961,13 +2844,7 @@ async def run_tool_loop(
                     "required_file_missing",
                     replied_intermediate,
                 )
-            if (
-                tools is not None
-                and isinstance(exc, provider_client.ProviderError)
-                and exc.status_code in {400, 422}
-                and attempts < max_calls
-                and _is_probably_tool_schema_rejection(exc)
-            ):
+            if tool_schema_rejected:
                 force_text_fallback = True
                 force_text_fallback_reason = "tool_schema_rejected"
                 await _trajectory(
@@ -2038,8 +2915,186 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        regular_terminal_choice_present = bool(
+            regular_wake_choice_required
+            and len(pr.tool_calls) == 1
+            and pr.tool_calls[0].name
+            in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+        )
+        response_tool_call_budget = max_tool_calls_per_turn
+        if (
+            regular_wake_choice_required
+            and not wake_choice_required
+            and not regular_terminal_choice_present
+        ):
+            # Keep one hard-budget slot for reply/stay_silent. Ordinary wake
+            # tools may use the rest, but cannot strand the turn without a
+            # structurally valid terminal decision.
+            response_tool_call_budget -= 1
+        wake_reply_call_present = bool(
+            regular_wake_choice_required
+            and any(tc.name == _WAKE_REPLY_TOOL for tc in pr.tool_calls)
+        )
+        rejection_facts = (
+            _tool_call_rejection_facts(
+                pr,
+                tools=tools,
+                raw_finish_reason=raw_finish_reason,
+                terminal_text_round=terminal_text_round,
+                tool_calls_used=tool_calls_used,
+                previous_offered_tool_names=previous_offered_tool_names,
+                completed_memory_discovery_tools=(
+                    completed_memory_discovery_tools
+                ),
+                external_content_seen=external_content_seen,
+                allowed_fetch_urls=allowed_fetch_urls,
+                mutating_mcp_names=mutating_mcp_names,
+                max_tool_args_chars=max_tool_args_chars,
+                max_tool_batch_args_chars=max_tool_batch_args_chars,
+                max_native_assistant_turn_chars=(
+                    max_native_assistant_turn_chars
+                ),
+                max_assistant_tool_text_chars=max_assistant_tool_text_chars,
+                max_tool_calls_per_round=max_tool_calls_per_round,
+                max_tool_calls_per_turn=response_tool_call_budget,
+            )
+            if pr.tool_calls
+            else None
+        )
+        # Parsed calls with invalid domain arguments are separate from broken
+        # provider protocol (for example ``args_ok=False`` above), but both are
+        # rejected exchanges and must be visible on the same content-free
+        # provider surface. Compute this once before emitting the surface, then
+        # reuse the exact per-call reasons in the rejection transcript below.
+        validation_errors: dict[str, str] = {}
+        if rejection_facts is not None and not rejection_facts.rejected:
+            validation_errors = {
+                tc.id: validation_error
+                for tc in pr.tool_calls
+                if tc.name not in mcp_names
+                and not (
+                    regular_wake_choice_required
+                    and tc.name == _WAKE_REPLY_TOOL
+                )
+                and (
+                    validation_error := tool_schema.validate_tool_args(
+                        tc.name,
+                        tc.args,
+                        live_model_call=(compact_delivery_phase == "send_file"),
+                    )
+                )
+                is not None
+            }
+            if (
+                compact_delivery_phase == "send_file"
+                and _latest_user_delivery_request()
+            ):
+                for tc in pr.tool_calls:
+                    if (
+                        tc.name == tool_schema.FILE_REPLY_TOOL
+                        and tc.id not in validation_errors
+                        and not str(tc.args.get("completion_message") or "").strip()
+                    ):
+                        validation_errors[tc.id] = (
+                            "send_file requires completion_message for the "
+                            "visible delivery bubble"
+                        )
+            if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
+                validation_errors.update(
+                    {
+                        tc.id: (
+                            "pending Canvas delivery requires exactly one "
+                            "send_file call"
+                        )
+                        for tc in pr.tool_calls
+                    }
+                )
+        repeated_generic_validation = bool(
+            validation_errors
+            and compact_delivery_phase != "send_file"
+            and generic_validation_retry_used
+        )
+        schema_rejection_reasons = (
+            [
+                (
+                    _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
+                    if repeated_generic_validation
+                    else _PROVIDER_CALL_REJECTION_REASON_INVALID_TOOL_ARGUMENTS
+                )
+                for _tc in pr.tool_calls
+            ]
+            if validation_errors
+            else []
+        )
+        surface_rejection_reasons = _normalize_provider_call_rejection_reasons(
+            [
+                *(rejection_facts.reason_tokens if rejection_facts is not None else []),
+                *schema_rejection_reasons,
+            ]
+        )
+        surface_exchange_rejected = bool(
+            (rejection_facts is not None and rejection_facts.rejected)
+            or validation_errors
+        )
+        if surface_exchange_rejected and not surface_rejection_reasons:
+            surface_rejection_reasons = [_PROVIDER_CALL_REJECTION_REASON_UNCLASSIFIED]
+        if wake_choice_required or wake_reply_call_present or tools is None:
+            # These branches have their own terminal/empty response contracts;
+            # they never enter the generic rejected-tool-exchange path below.
+            surface_rejection_reasons = []
+        if (
+            terminal_text_round
+            and pr.tool_calls
+            and (tools is not None or pr.text.strip())
+        ):
+            surface_rejection_reasons = _normalize_provider_call_rejection_reasons(
+                [
+                    *surface_rejection_reasons,
+                    _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
+                ]
+            )
+        unavailable_platform_call_labels: list[str] = []
+        unavailable_call_counts = {"platform": 0, "mcp": 0, "other": 0}
+        if rejection_facts is not None:
+            platform_tool_names = {spec.name for spec in _catalog()}
+            for tc, joined_reasons in zip(
+                pr.tool_calls,
+                rejection_facts.call_rejection_reasons,
+            ):
+                reason_tokens = set(joined_reasons.split(","))
+                for reason in (
+                    _TOOL_WITHDRAWN_REJECTION_REASON,
+                    _UNKNOWN_TOOL_REJECTION_REASON,
+                ):
+                    if reason in reason_tokens:
+                        if tc.name in platform_tool_names:
+                            unavailable_call_counts["platform"] += 1
+                            unavailable_platform_call_labels.append(
+                                f"{reason}:{tc.name}"
+                            )
+                        elif tc.name in mcp_names:
+                            unavailable_call_counts["mcp"] += 1
+                        else:
+                            unavailable_call_counts["other"] += 1
+        unavailable_platform_call_labels = sorted(
+            unavailable_platform_call_labels
+        )[:_PROVIDER_TOOL_NAME_TRACE_CAP]
+        if provider_surface_detail is not None:
+            provider_surface_detail.update(
+                {
+                    "unavailable_platform_tool_call_labels": (
+                        unavailable_platform_call_labels
+                    ),
+                    "unavailable_tool_call_counts": unavailable_call_counts,
+                }
+            )
+        await _emit_provider_tool_surface(
+            provider_surface_detail,
+            surface_rejection_reasons,
+        )
 
-        if wake_choice_required:
+        structured_wake_reply = False
+        if wake_choice_required or wake_reply_call_present:
             wake_reply_calls = [
                 tc for tc in pr.tool_calls if tc.name == _WAKE_REPLY_TOOL
             ]
@@ -2054,12 +3109,25 @@ async def run_tool_loop(
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"text"}
+                and set(selected_call.args) <= {"think", "text"}
+                else None
+            )
+            selected_reply_thinking = (
+                selected_call.args.get("think")
+                if selected_call is not None
+                and selected_call.name == _WAKE_REPLY_TOOL
+                and selected_call.args_ok
+                and set(selected_call.args) <= {"think", "text"}
                 else None
             )
             reply_text = (
                 selected_reply_text.strip()
                 if isinstance(selected_reply_text, str)
+                else ""
+            )
+            reply_thinking = (
+                selected_reply_thinking.strip()
+                if isinstance(selected_reply_thinking, str)
                 else ""
             )
             silent_reason = (
@@ -2073,9 +3141,11 @@ async def run_tool_loop(
                 selected_call is not None
                 and selected_call.id
                 and len(wake_reply_calls) == 1
+                and reply_thinking
                 and reply_text
                 and not pr.media
                 and len(reply_text) <= max_assistant_tool_text_chars
+                and tool_calls_used < max_tool_calls_per_turn
             )
             valid_silent_choice = bool(
                 selected_call is not None
@@ -2112,7 +3182,10 @@ async def run_tool_loop(
                 # Any provider text beside the call is only a preamble, exactly
                 # like other tool rounds, and is never published separately.
                 pr = ProviderResponse(
-                    text=reply_text,
+                    text=ValidatedWakeReply(
+                        reply_text,
+                        thinking=reply_thinking,
+                    ),
                     tool_calls=[],
                     usage=pr.usage,
                     raw=pr.raw,
@@ -2120,10 +3193,34 @@ async def run_tool_loop(
                     media=(),
                 )
                 wake_choice_required = False
+                structured_wake_reply = True
             elif valid_silent_choice:
                 wake_choice_required = False
             else:
-                exc = ProviderEmptyReply("empty_reply")
+                can_retry_wake_choice = (
+                    not wake_choice_retry_used
+                    and attempts < max_calls
+                    and tool_calls_used < max_tool_calls_per_turn
+                )
+                if can_retry_wake_choice:
+                    wake_choice_retry_used = True
+                    wake_choice_required = True
+                    reasoning_fragments.clear()
+                    seen_reasoning_fragments.clear()
+                    _progress("wake_choice_retry_boundary")
+                    continue
+                provider_returned_nothing = bool(
+                    not pr.text.strip()
+                    and not pr.tool_calls
+                    and not pr.media
+                    and not upstream_response_envelope
+                    and not str(pr.raw.get("reasoning") or "").strip()
+                )
+                exc = (
+                    ProviderEmptyReply("empty_reply")
+                    if provider_returned_nothing
+                    else WakeChoiceInvalid()
+                )
                 if on_provider_failure is not None:
                     try:
                         await on_provider_failure(exc)
@@ -2132,58 +3229,83 @@ async def run_tool_loop(
                 raise exc
 
         if (
-            not require_reply
-            and on_stay_silent is not None
-            and not pr.text.strip()
+            regular_wake_choice_required
+            and not structured_wake_reply
             and not pr.tool_calls
-            and not pr.media
         ):
             wake_choice_supported = (
                 on_stay_silent is not None
                 and provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
             )
             can_force_wake_choice = (
-                on_stay_silent is not None
-                and not wake_choice_recovery_used
-                and wake_choice_supported
+                wake_choice_supported
                 and wake_choice_tool_available
                 and attempts < max_calls
                 and tool_calls_used < max_tool_calls_per_turn
             )
             if can_force_wake_choice:
                 action = "force_wake_choice"
-            elif wake_choice_required:
-                action = "fail_forced_wake_choice_empty"
             elif not wake_choice_supported:
                 action = "fail_wake_choice_unsupported"
             elif not wake_choice_tool_available:
                 action = "fail_wake_choice_tool_unavailable"
             else:
                 action = "fail_wake_choice_budget_exhausted"
-            await _trajectory(
-                "empty_provider_response",
-                {
-                    "round": attempts,
-                    "reason": "empty_provider_success",
-                    "response_shape": _empty_response_shape(pr),
-                    "action": action,
-                },
+            response_empty = bool(
+                (not pr.text.strip() or upstream_response_envelope)
+                and not pr.media
             )
-            if on_empty_provider_response is not None:
-                try:
-                    await on_empty_provider_response(_empty_response_shape(pr))
-                except Exception:
-                    # Plaintext diagnostics are best-effort and cannot alter
-                    # the recovery/failure decision below.
-                    pass
+            if response_empty:
+                await _trajectory(
+                    "empty_provider_response",
+                    {
+                        "round": attempts,
+                        "reason": (
+                            "upstream_response_envelope"
+                            if upstream_response_envelope
+                            else "empty_provider_success"
+                        ),
+                        "response_shape": _empty_response_shape(pr),
+                        "action": action,
+                    },
+                )
+                if on_empty_provider_response is not None:
+                    try:
+                        await on_empty_provider_response(
+                            _empty_response_shape(pr)
+                        )
+                    except Exception:
+                        # Plaintext diagnostics are best-effort and cannot alter
+                        # the recovery/failure decision below.
+                        pass
+            else:
+                await _trajectory(
+                    "wake_choice_response",
+                    {
+                        "round": attempts,
+                        "choice": "invalid",
+                        "tool_call_count": 0,
+                        "provider_text_present": bool(pr.text.strip()),
+                    },
+                )
             if can_force_wake_choice:
-                wake_choice_recovery_used = True
                 wake_choice_required = True
                 reasoning_fragments.clear()
                 seen_reasoning_fragments.clear()
-                _progress("wake_choice_retry_boundary")
+                _progress("wake_choice_boundary")
                 continue
-            exc = ProviderEmptyReply("empty_reply")
+            provider_returned_nothing = bool(
+                not pr.text.strip()
+                and not pr.tool_calls
+                and not pr.media
+                and not upstream_response_envelope
+                and not str(pr.raw.get("reasoning") or "").strip()
+            )
+            exc = (
+                ProviderEmptyReply("empty_reply")
+                if provider_returned_nothing
+                else WakeChoiceInvalid()
+            )
             if on_provider_failure is not None:
                 try:
                     await on_provider_failure(exc)
@@ -2335,20 +3457,34 @@ async def run_tool_loop(
         # executed. Give transient provider failures a small configurable number of
         # fresh chances, then terminate without returning to tool dispatch or the
         # malformed-exchange fallback.
-        if terminal_text_round and pr.tool_calls and (
-            tools is not None or pr.text.strip()
+        if (
+            terminal_text_round
+            and pr.tool_calls
+            and (tools is not None or pr.text.strip())
         ):
             retrying = (
                 terminal_tool_call_retries < max_terminal_tool_call_retries
                 and attempts < max_calls
             )
+            transcript.append(
+                _rejected_tool_exchange(
+                    pr.tool_calls,
+                    assistant_text=pr.text,
+                    rejection_reasons=[
+                        _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED
+                        for _tool_call in pr.tool_calls
+                    ],
+                    attempt=attempts,
+                )
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
                     "round": attempts,
-                    "reason": "terminal_tool_call_rejected",
+                    "reason": _PROVIDER_CALL_REJECTION_REASON_TERMINAL_TOOL_CALL_REJECTED,
                     "action": "retry" if retrying else "terminate",
                     "retry": terminal_tool_call_retries,
+                    "transcript_appended": True,
                 },
             )
             if retrying:
@@ -2398,6 +3534,30 @@ async def run_tool_loop(
                 # 不打回,谎话直接发给用户 —— codex 审出。)
                 if attempts < max_calls:
                     _progress("image_claim_retry_boundary")
+                    continue
+
+            # D scheme: a structured identity-write attempt that did not produce
+            # a successful result gets one extra provider round. Do not inspect
+            # or classify the model's prose.
+            if (
+                pr.text
+                and identity_write_failed_bounces < 1
+                and _identity_write_attempted(transcript)
+                and not _identity_write_succeeded(transcript)
+            ):
+                identity_write_failed_bounces += 1
+                await _trajectory(
+                    "identity_write_failed_bounced",
+                    {"round": attempts, "text_chars": len(pr.text)},
+                )
+                identity_write_failed_instruction = (
+                    "上一轮你调用了身份写工具,但那次调用**没有成功**"
+                    "(被拒绝、出错或仍在排队),身份没有真的改动。"
+                    "请据实处理:要么重试一次,要么照实告诉他没改成 —— "
+                    "不要把这次未生效的改动说成已经完成。"
+                )
+                if attempts < max_calls:
+                    _progress("identity_write_failed_retry_boundary")
                     continue
 
             requirement_met = (
@@ -2467,6 +3627,9 @@ async def run_tool_loop(
                 file_delivery_recovery_needed = True
                 if not file_delivery_retry_used and attempts < max_calls - 1:
                     file_delivery_retry_used = True
+                    # Reset stale stall history so required write/send recovery
+                    # is not preempted immediately after workspace_write.
+                    consecutive_tool_only_rounds = 0
                     _progress("required_file_retry_boundary")
                     continue
                 await _record_required_file_missing(attempts)
@@ -2618,165 +3781,138 @@ async def run_tool_loop(
                 delivered_media_count=len(pr.media),
             )
 
-        call_ids = [tc.id for tc in pr.tool_calls]
-        argument_sizes = [
-            (_serialized_chars(tc.args) if tc.args_ok else len(str(tc.args_raw or "")))
-            for tc in pr.tool_calls
-        ]
-        native_turn_size = (
-            _serialized_chars(pr.assistant_turn.payload)
-            if pr.assistant_turn is not None
-            else 0
-        )
-        oversized_tool_exchange = (
-            any(size is None or size > max_tool_args_chars for size in argument_sizes)
-            or sum(size or 0 for size in argument_sizes) > max_tool_batch_args_chars
-            or native_turn_size is None
-            or native_turn_size > max_native_assistant_turn_chars
-            or len(pr.text) > max_assistant_tool_text_chars
-        )
-        over_tool_call_budget = (
-            len(pr.tool_calls) > max_tool_calls_per_round
-            or tool_calls_used + len(pr.tool_calls) > max_tool_calls_per_turn
-        )
-        offered_names = {spec.name for spec in tools}
-        # Provider media is terminal output. Do not silently discard or retain
-        # its large inline payload when a broken relay also invents function
-        # calls in the same turn; fall back once with every tool disabled.
-        malformed = (
-            (terminal_text_round and bool(pr.tool_calls))
-            or bool(pr.media)
-            or any(
-                not tc.id
-                or not tc.name
-                or not tc.args_ok
-                or (
-                    tc.name not in offered_names
-                    and tc.name not in completed_memory_discovery_tools
-                )
-                or (
-                    external_content_seen
-                    and tc.name == "web_fetch"
-                    and str(tc.args.get("url") or "").strip()
-                    not in allowed_fetch_urls
-                )
-                for tc in pr.tool_calls
-            )
-        )
-        image_reply_calls = [
-            tc for tc in pr.tool_calls if tc.name == tool_schema.IMAGE_REPLY_TOOL
-        ]
-        stay_silent_calls = [
-            tc for tc in pr.tool_calls if tc.name == tool_schema.STAY_SILENT_TOOL
-        ]
-        mixed_reply_write = any(
-            tc.name in {
-                tool_schema.FILE_REPLY_TOOL,
-                tool_schema.IMAGE_REPLY_TOOL,
-                tool_schema.STAY_SILENT_TOOL,
-            }
-            for tc in pr.tool_calls
-        ) and any(
-            tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
-            for tc in pr.tool_calls
-        )
-        invalid_image_batch = bool(image_reply_calls) and (
-            len(image_reply_calls) != 1 or len(pr.tool_calls) != 1
-        )
-        invalid_silence_batch = bool(stay_silent_calls) and (
-            len(stay_silent_calls) != 1 or len(pr.tool_calls) != 1
-        )
-        if (
-            malformed
-            or len(set(call_ids)) != len(call_ids)
-            or mixed_reply_write
-            or invalid_image_batch
-            or invalid_silence_batch
-            or over_tool_call_budget
-            or oversized_tool_exchange
-        ):
+        assert rejection_facts is not None
+        image_reply_calls = rejection_facts.image_reply_calls
+        stay_silent_calls = rejection_facts.stay_silent_calls
+        malformed = rejection_facts.malformed
+        truncated_tool_arguments = rejection_facts.truncated_tool_arguments
+        mixed_reply_write = rejection_facts.mixed_reply_write
+        over_tool_call_budget = rejection_facts.over_tool_call_budget
+        oversized_tool_exchange = rejection_facts.oversized_tool_exchange
+        call_rejection_reasons = rejection_facts.call_rejection_reasons
+        if rejection_facts.rejected:
             # Invalid, over-budget, and duplicate-id batches are all-or-nothing:
             # executing a valid subset and then asking for a correction can
             # duplicate durable writes on the corrected round. Missing/duplicate
-            # ids also cannot form a provider-native result exchange. Make exactly
-            # one tools-disabled fallback from the original prompt instead.
+            # ids also cannot form a provider-native result exchange. Record one
+            # bounded synthetic rejection and make exactly one text-only fallback.
+            # Wires that require schemas for historical calls may retain the
+            # matching definitions, but tool_choice remains none.
             # An outbound delivery plus either a platform or MCP mutation is
             # rejected for the same reason: the bubble cannot truthfully claim
             # success before the later sink commits. The model may mutate in one
             # round and reply only after observing its result in the next.
+            # A provider that explicitly reports its output-token limit while
+            # returning unparseable tool arguments stopped in the middle of the
+            # JSON payload. Retrying the same artifact with the same budget
+            # cannot repair it and rewrites the real cause as a tool-usage error.
+            # Fail once with content-free evidence; no partial call is executed.
+            if truncated_tool_arguments:
+                await _trajectory(
+                    "provider_output_truncated",
+                    {
+                        "round": attempts,
+                        "reason": "output_truncated",
+                        "finish_reason": provider_client.normalize_stop_reason(
+                            raw_finish_reason
+                        ),
+                        "malformed_tool_arguments": True,
+                        "retry": False,
+                    },
+                )
+                raise ProviderOutputTruncated()
             if attempts >= max_calls:
                 break
+            transcript.append(
+                _rejected_tool_exchange(
+                    pr.tool_calls,
+                    assistant_text=pr.text,
+                    rejection_reasons=call_rejection_reasons,
+                    attempt=attempts,
+                )
+            )
             await _trajectory(
                 "protocol_fallback",
                 {
                     "round": attempts,
-                    "reason": "invalid_or_over_budget_tool_exchange",
+                    "reason": _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
                     "malformed": malformed,
                     "mixed_reply_write": mixed_reply_write,
                     "over_tool_call_budget": over_tool_call_budget,
                     "oversized_tool_exchange": oversized_tool_exchange,
+                    "transcript_appended": True,
                 },
             )
             force_text_fallback = True
             force_text_fallback_reason = (
-                "invalid_or_over_budget_tool_exchange"
+                _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE
             )
             continue
 
         # Parsed calls with invalid domain arguments are not a broken provider
-        # protocol. During the compact Canvas delivery phase, return one native
-        # result per call and let the model correct the metadata once. This is
-        # deliberately separate from the target-mismatch retry: adding a title
-        # or subtitle must not consume the exact path/revision correction.
-        validation_errors = {
-            tc.id: validation_error
-            for tc in pr.tool_calls
-            if tc.name not in mcp_names
-            and (
-                validation_error := tool_schema.validate_tool_args(
-                    tc.name,
-                    tc.args,
-                    live_model_call=(compact_delivery_phase == "send_file"),
-                )
-            )
-            is not None
-        }
-        if compact_delivery_phase == "send_file" and len(pr.tool_calls) != 1:
-            validation_errors.update(
-                {
-                    tc.id: (
-                        "pending Canvas delivery requires exactly one "
-                        "send_file call"
-                    )
-                    for tc in pr.tool_calls
-                }
-            )
+        # protocol. Return one native result per call and let the model correct
+        # the all-or-nothing batch once; no call in the invalid batch is
+        # dispatched. Keep the generic retry separate from compact Canvas
+        # delivery retries so ordinary argument repair cannot consume a pending
+        # file's exact-target or metadata correction.
         if validation_errors:
-            if compact_delivery_phase != "send_file":
+            if repeated_generic_validation:
                 if attempts >= max_calls:
                     break
+                transcript.append(
+                    _rejected_tool_exchange(
+                        pr.tool_calls,
+                        assistant_text=pr.text,
+                        rejection_reasons=schema_rejection_reasons,
+                        attempt=attempts,
+                    )
+                )
                 await _trajectory(
                     "protocol_fallback",
                     {
                         "round": attempts,
-                        "reason": "invalid_or_over_budget_tool_exchange",
-                        "malformed": True,
+                        "reason": (
+                            _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
+                        ),
+                        "malformed": False,
                         "mixed_reply_write": False,
                         "over_tool_call_budget": False,
                         "oversized_tool_exchange": False,
+                        "transcript_appended": True,
                     },
                 )
                 force_text_fallback = True
                 force_text_fallback_reason = (
-                    "invalid_or_over_budget_tool_exchange"
+                    _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS
                 )
                 continue
-            if compact_delivery_args_retry_used:
+            if (
+                compact_delivery_phase == "send_file"
+                and compact_delivery_args_retry_used
+            ):
+                delivery_path = (
+                    workspace_delivery_target[0]
+                    if workspace_delivery_target is not None
+                    else (
+                        workspace_delivery_candidate[0]
+                        if workspace_delivery_candidate is not None
+                        else (
+                            str(pr.tool_calls[0].args.get("path") or "")
+                            if pr.tool_calls
+                            else ""
+                        )
+                    )
+                )
+                canvas_delivery = delivery_path.casefold().endswith(".io.html")
                 await _trajectory(
                     "protocol_fallback",
                     {
                         "round": attempts,
-                        "reason": "repeated_invalid_canvas_delivery_args",
+                        "reason": (
+                            "repeated_invalid_canvas_delivery_args"
+                            if canvas_delivery
+                            else "repeated_invalid_file_delivery_args"
+                        ),
                         "invalid_tool_names": sorted(
                             {
                                 tc.name
@@ -2786,9 +3922,19 @@ async def run_tool_loop(
                         ),
                     },
                 )
-                raise CanvasDeliveryIncomplete("invalid_canvas_delivery_args")
+                raise _delivery_incomplete(
+                    delivery_path,
+                    (
+                        "invalid_canvas_delivery_args"
+                        if canvas_delivery
+                        else "invalid_file_delivery_args"
+                    ),
+                )
 
-            compact_delivery_args_retry_used = True
+            if compact_delivery_phase == "send_file":
+                compact_delivery_args_retry_used = True
+            else:
+                generic_validation_retry_used = True
             tool_calls_used += len(pr.tool_calls)
             validation_results: list[ToolResult] = []
             for tc in pr.tool_calls:
@@ -2827,7 +3973,8 @@ async def run_tool_loop(
                 assistant_turn=pr.assistant_turn,
             )
             transcript.append(validation_exchange)
-            compact_delivery_validation_exchange = validation_exchange
+            if compact_delivery_phase == "send_file":
+                compact_delivery_validation_exchange = validation_exchange
             continue
 
         tool_calls_used += len(pr.tool_calls)
@@ -2886,7 +4033,8 @@ async def run_tool_loop(
             await _tool_event(tc, "tool_call_result", {"result": silent_result})
             return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
-        canvas_completion_message = ""
+        file_completion_message = ""
+        file_completion_validated = False
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
@@ -2949,8 +4097,8 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    raise CanvasDeliveryIncomplete(
-                        "pending_delivery_target_mismatch"
+                    raise _delivery_incomplete(
+                        target_path, "pending_delivery_target_mismatch"
                     )
                 else:
                     compact_delivery_mismatch_retry_used = True
@@ -2980,11 +4128,66 @@ async def run_tool_loop(
                     tc, "tool_call_result", {"result": file_result}
                 )
                 if compact_delivery_mismatch_retry_used:
-                    raise CanvasDeliveryIncomplete(
-                        "existing_delivery_candidate_mismatch"
+                    raise _delivery_incomplete(
+                        target_path, "existing_delivery_candidate_mismatch"
                     )
                 compact_delivery_mismatch_retry_used = True
                 continue
+            completion_message = str(
+                tc.args.get("completion_message") or ""
+            ).strip()
+            thinking_status, _thinking, visible_completion = (
+                self_thinking.strip_all_thinking(completion_message)
+            )
+            if thinking_status == self_thinking.COMPLETE:
+                completion_message = visible_completion
+            elif thinking_status in {self_thinking.SILENT, self_thinking.FAILED}:
+                completion_message = ""
+            current_user_request = _latest_user_delivery_request()
+            if current_user_request and not _delivery_completion_matches_request(
+                current_user_request, completion_message
+            ):
+                if compact_delivery_args_retry_used:
+                    await _trajectory(
+                        "file_completion_language_follow",
+                        {
+                            "round": attempts,
+                            "expected": _delivery_request_writing_system(
+                                current_user_request
+                            ),
+                            "actual": language_follow.classify_writing_system(
+                                completion_message
+                            ),
+                            "outcome": "kept_after_bounded_correction",
+                        },
+                    )
+                else:
+                    required_script = _delivery_request_writing_system(
+                        current_user_request
+                    )
+                    file_result = ToolResult(
+                        call_id=tc.id,
+                        content=(
+                            "error: completion_message language mismatch; no file was "
+                            f"delivered. Rewrite completion_message using {required_script} "
+                            "and call send_file again with the same path and revision. "
+                            "If the current request explicitly requires another language, "
+                            "resubmit the same completion_message unchanged to confirm "
+                            "that choice."
+                        ),
+                    )
+                    reply_results[tc.id] = file_result
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                    await _tool_event(
+                        tc, "tool_call_result", {"result": file_result}
+                    )
+                    compact_delivery_args_retry_used = True
+                    continue
             try:
                 if is_canvas_delivery:
                     await on_file_reply(
@@ -2999,7 +4202,56 @@ async def run_tool_loop(
                 await _tool_event(
                     tc, "tool_call_error", {"error": type(exc).__name__}
                 )
-                raise
+                await _trajectory(
+                    "file_reply_failed",
+                    {
+                        "round": attempts,
+                        "call_id": tc.id,
+                        "canvas": is_canvas_delivery,
+                        "action": (
+                            "fail"
+                            if file_delivery_callback_retry_used
+                            else "retry"
+                        ),
+                    },
+                )
+                file_result = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: file delivery did not complete. Nothing was "
+                        "attached. Create or refresh the requested source with "
+                        "workspace_write, then call send_file again using the "
+                        "returned path and revision."
+                    ),
+                )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
+                if file_delivery_callback_retry_used:
+                    # ``send_file`` is the publication boundary. The workspace
+                    # source may already exist at the selected revision, but
+                    # loading, validating, or staging the attachment can still
+                    # fail. Export the stable path-aware class after one bounded
+                    # correction so the worker/terminal outbox cannot collapse
+                    # this into ``unknown``.
+                    raise _delivery_incomplete(
+                        workspace_path,
+                        "file_delivery_callback_failed",
+                    ) from exc
+                file_delivery_callback_retry_used = True
+                file_delivery_recovery_needed = True
+                if workspace_delivery_target is not None:
+                    # Compact delivery rounds replace the normal transcript;
+                    # carry the native result explicitly so the exact-target
+                    # retry still sees why its previous send_file failed.
+                    compact_delivery_validation_exchange = ToolExchange(
+                        calls=(tc,),
+                        results=(file_result,),
+                        assistant_text=pr.text,
+                        assistant_turn=pr.assistant_turn,
+                    )
+                continue
             delivered_file_suffixes.add(file_suffix)
             workspace_write_applied = False
             workspace_delivery_target = None
@@ -3008,16 +4260,21 @@ async def run_tool_loop(
             compact_delivery_validation_exchange = None
             compact_delivery_mismatch_retry_used = False
             compact_delivery_args_retry_used = False
-            if is_canvas_delivery:
-                canvas_completion_message = str(
-                    tc.args.get("completion_message") or ""
-                ).strip()
+            file_delivery_callback_retry_used = False
+            file_completion_message = (
+                completion_message
+                if is_canvas_delivery or current_user_request
+                else ""
+            )
+            file_completion_validated = bool(
+                file_completion_message and current_user_request
+            )
             requirement_now_met = (
                 bool(delivered_file_suffixes)
                 if not normalized_required_suffixes
                 else normalized_required_suffixes.issubset(delivered_file_suffixes)
             )
-            if requirement_now_met and not canvas_completion_message:
+            if requirement_now_met and not file_completion_message:
                 compact_delivery_confirmation_needed = True
             replied_intermediate = True
             file_result = ToolResult(
@@ -3029,8 +4286,8 @@ async def run_tool_loop(
                 tc, "tool_call_result", {"result": file_result}
             )
 
-        if canvas_completion_message:
-            # Canvas metadata and the visible completion bubble are one model
+        if file_completion_message:
+            # Attachment metadata and the visible completion bubble are one model
             # expression. Publishing the tool-authored bubble here keeps the
             # staged attachment and its text in the same final effect, and avoids
             # a second provider round seeded by runtime-authored English copy.
@@ -3040,13 +4297,18 @@ async def run_tool_loop(
                 {
                     "round": attempts,
                     "final": True,
-                    "text": canvas_completion_message,
-                    "reason": "canvas_tool_completion",
+                    "text": file_completion_message,
+                    "reason": "file_tool_completion",
                 },
             )
             try:
+                reply_text = (
+                    ValidatedFinalReply(file_completion_message)
+                    if file_completion_validated
+                    else file_completion_message
+                )
                 reply_decision = await on_reply(
-                    canvas_completion_message,
+                    reply_text,
                     final=True,
                     reasoning=_merged_reasoning(),
                 )
@@ -3093,7 +4355,7 @@ async def run_tool_loop(
                 raise RuntimeError("unsupported final reply decision")
             else:
                 return LoopOutcome(
-                    canvas_completion_message,
+                    file_completion_message,
                     attempts,
                     "final_text",
                     replied_intermediate,
@@ -3235,7 +4497,19 @@ async def run_tool_loop(
             if tc.name == "web_search":
                 allowed_fetch_urls.update(_search_result_urls(result.content))
             elif tc.name == "web_fetch":
-                allowed_fetch_urls.discard(str(tc.args.get("url") or "").strip())
+                request_url = str(tc.args.get("url") or "").strip()
+                allowed_fetch_urls.discard(request_url)
+                metadata = result.metadata or {}
+                next_offset = metadata.get("web_fetch_next_offset")
+                continuation_urls = metadata.get("web_fetch_continuation_urls")
+                if type(next_offset) is int and isinstance(
+                    continuation_urls, (tuple, list)
+                ):
+                    allowed_fetch_urls.update(
+                        str(url).strip()
+                        for url in continuation_urls
+                        if str(url).strip()
+                    )
         for tc in dispatch_calls:
             discovery_call_key = _memory_discovery_call_key(tc)
             if discovery_call_key is not None:

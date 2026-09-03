@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
@@ -480,7 +481,7 @@ def test_build_openai_compat_payload_shape():
     assert payload["model"] == "m"
     assert payload["stream"] is False
     assert payload["temperature"] == 0.2
-    assert payload["max_tokens"] == 8192  # 上限封顶
+    assert payload["max_tokens"] == pc.CHAT_OUTPUT_MAX_TOKENS
     assert payload["response_format"] == {"type": "json_object"}
     assert payload["x"] == 1
     assert payload["reasoning"] == {"enabled": True, "exclude": False}
@@ -492,6 +493,127 @@ def test_build_openai_compat_payload_shape():
         response_format=None, extra_body=None, include_reasoning=True)
     assert "reasoning" not in p2  # reasoning 注入只对 openrouter
     assert "response_format" not in p2
+
+
+@pytest.mark.parametrize("invalid", [0, -1, None, "not-an-integer"])
+def test_chat_output_budget_rejects_invalid_instead_of_mimicking_empty_reply(
+    invalid,
+):
+    with pytest.raises(ValueError, match="positive integer"):
+        pc.cap_chat_output_tokens(invalid)
+
+
+def test_chat_output_budget_preserves_legal_one_and_shared_ceiling():
+    assert pc.cap_chat_output_tokens(1) == 1
+    assert (
+        pc.cap_chat_output_tokens(pc.CHAT_OUTPUT_MAX_TOKENS * 2)
+        == pc.CHAT_OUTPUT_MAX_TOKENS
+    )
+
+
+def test_all_chat_payload_builders_share_the_output_ceiling():
+    source = Path(pc.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    output_budget_keys = {
+        "max_tokens",
+        "max_output_tokens",
+        "maxTokens",
+        "maxOutputTokens",
+    }
+    discovered_builders: dict[str, bool] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("_build_"):
+            continue
+        string_literals = {
+            child.value
+            for child in ast.walk(node)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        }
+        if not string_literals.intersection(output_budget_keys):
+            continue
+        discovered_builders[node.name] = any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "cap_chat_output_tokens"
+            for child in ast.walk(node)
+        )
+
+    messages = [{"role": "user", "content": "build a file"}]
+    requested = pc.CHAT_OUTPUT_MAX_TOKENS * 2
+    openai_responses, _url, _headers = pc._build_openai_responses_payload(
+        model="gpt-5",
+        base_url="https://api.openai.com/v1",
+        key="k",
+        messages=messages,
+        max_tokens=requested,
+        response_format=None,
+    )
+    openai_compat = pc._build_openai_compat_payload(
+        provider="openrouter",
+        model="m",
+        messages=messages,
+        temperature=None,
+        max_tokens=requested,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+    )
+    anthropic, _url, _headers = pc._build_anthropic_payload(
+        model="claude-sonnet-4-6",
+        base_url="https://api.anthropic.com/v1",
+        key="k",
+        messages=messages,
+        max_tokens=requested,
+        temperature=None,
+        response_format=None,
+        include_reasoning=True,
+    )
+    bedrock, _url, _headers = pc._build_bedrock_payload(
+        model="anthropic.claude-sonnet-4-6",
+        base_url="https://bedrock.example",
+        key="k",
+        messages=messages,
+        max_tokens=requested,
+        temperature=None,
+        response_format=None,
+        include_reasoning=True,
+    )
+    gemini, _url, _headers = pc._build_gemini_payload(
+        model="gemini-2.5-pro",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        key="k",
+        messages=messages,
+        max_tokens=requested,
+        temperature=None,
+        response_format=None,
+        include_reasoning=True,
+    )
+
+    capped_by_builder = {
+        "_build_openai_responses_payload": openai_responses["max_output_tokens"],
+        "_build_openai_compat_payload": openai_compat["max_tokens"],
+        "_build_anthropic_payload": anthropic["max_tokens"],
+        "_build_bedrock_payload": bedrock["inferenceConfig"]["maxTokens"],
+        "_build_gemini_payload": gemini["generationConfig"]["maxOutputTokens"],
+    }
+    assert set(capped_by_builder) == {
+        "_build_openai_responses_payload",
+        "_build_openai_compat_payload",
+        "_build_anthropic_payload",
+        "_build_bedrock_payload",
+        "_build_gemini_payload",
+    }
+    assert discovered_builders == {
+        builder: True for builder in capped_by_builder
+    }
+    assert set(capped_by_builder.values()) == {pc.CHAT_OUTPUT_MAX_TOKENS}
+    assert pc.CHAT_OUTPUT_MAX_TOKENS not in {4096, 8192}
+    assert pc.IMAGE_OUTPUT_MAX_TOKENS == pc.CHAT_OUTPUT_MAX_TOKENS
+    assert anthropic["thinking"]["budget_tokens"] == 1024
+    assert bedrock["additionalModelRequestFields"]["thinking"]["budget_tokens"] == 1024
+    assert gemini["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 1024
 
 
 def test_openai_compat_payload_preserves_forced_tool_choice():
@@ -900,6 +1022,7 @@ def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
         [{"role": "user", "content": [
             {"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcd"}},
+            {"type": "image_url", "image_url": {"url": "data:image/webp;base64,efgh"}},
         ]}],
     )
 
@@ -909,6 +1032,10 @@ def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
     assert content[1] == {
         "type": "image",
         "source": {"type": "base64", "media_type": "image/png", "data": "abcd"},
+    }
+    assert content[2] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/webp", "data": "efgh"},
     }
 
 
@@ -953,6 +1080,7 @@ def test_gemini_chat_completion_maps_image_parts(monkeypatch):
         [{"role": "user", "content": [
             {"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abcd"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,efgh"}},
         ]}],
     )
 
@@ -962,6 +1090,7 @@ def test_gemini_chat_completion_maps_image_parts(monkeypatch):
         "parts": [
             {"text": "look"},
             {"inline_data": {"mime_type": "image/jpeg", "data": "abcd"}},
+            {"inline_data": {"mime_type": "image/png", "data": "efgh"}},
         ],
     }]
 

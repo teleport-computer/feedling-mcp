@@ -26,7 +26,7 @@ def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_actions
     assert all(isinstance(s, ToolSpec) for s in specs)
 
 
-def test_canvas_send_file_requires_metadata_and_model_authored_completion():
+def test_send_file_requires_model_authored_completion_and_canvas_metadata():
     send_file = next(
         spec for spec in tool_schema.build_tool_specs()
         if spec.name == tool_schema.FILE_REPLY_TOOL
@@ -34,12 +34,13 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
     assert send_file.parameters["properties"]["title"]["maxLength"] == 120
     assert send_file.parameters["properties"]["subtitle"]["maxLength"] == 160
     assert send_file.parameters["properties"]["completion_message"]["minLength"] == 1
-    assert "user's current language" in send_file.description
+    assert send_file.parameters["required"] == [
+        "path", "revision", "completion_message",
+    ]
+    assert "language of the user's current request" in send_file.description
 
     base = {"path": "/workspace/接星星.io.html", "revision": 2}
-    assert "requires title, subtitle, and completion_message" in tool_schema.validate_tool_args(
-        "send_file", base
-    )
+    assert "completion_message" in tool_schema.validate_tool_args("send_file", base)
     assert tool_schema.validate_tool_args(
         "send_file",
         {
@@ -49,7 +50,11 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
             "completion_message": "接星星小游戏已经做好，可以直接打开玩了。",
         },
     ) is None
-    assert "only valid for Canvas" in tool_schema.validate_tool_args(
+    assert "completion_message" in tool_schema.validate_tool_args(
+        "send_file",
+        {"path": "/workspace/计划.pdf", "revision": 1},
+    )
+    assert tool_schema.validate_tool_args(
         "send_file",
         {
             "path": "/workspace/计划.pdf",
@@ -58,7 +63,30 @@ def test_canvas_send_file_requires_metadata_and_model_authored_completion():
             "subtitle": "明日安排",
             "completion_message": "计划已经做好。",
         },
-    )
+    ) is None
+
+
+def test_canvas_tool_description_pins_create_boundary_and_constant_backed_limit():
+    description = tool_schema.DESCRIPTIONS[tool_schema.FILE_REPLY_TOOL]
+    workspace_description = tool_schema.DESCRIPTIONS["workspace_write"]
+    limit_kb = tool_schema.SHARED_WORK_MAX_BYTES // 1000
+
+    assert ".io.html" in description
+    assert (
+        "Do not create a Canvas merely to decorate casual conversation, "
+        "emotional support"
+    ) in description
+    assert "briefly offer to make one and wait for the user's answer" not in description
+    assert "do not repeat an offer the user did not take up" not in description
+    assert f"{limit_kb} KB of UTF-8 source" in workspace_description
+    assert tool_schema.validate_tool_args(
+        "workspace_write",
+        {
+            "path": "/workspace/too-large.io.html",
+            "content": "x" * (tool_schema.SHARED_WORK_MAX_BYTES + 1),
+            "expected_revision": 0,
+        },
+    ) == f"Canvas source exceeds the {limit_kb} KB UTF-8 limit"
 
 
 def test_t101_perception_and_screen_gates_reach_final_tool_descriptions():
@@ -97,7 +125,7 @@ def test_screen_read_description_defaults_live_shares_to_pixels():
     assert "Start without include_image" not in description
 
 
-def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
+def test_photo_read_defaults_to_pixels_and_execution_rejects_metadata_only_flag():
     spec = next(
         item for item in tool_schema.build_tool_specs()
         if item.name == "photo_read"
@@ -105,7 +133,7 @@ def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
     include_image = spec.parameters["properties"]["include_image"]
 
     assert include_image["default"] is True
-    assert include_image["enum"] == [True]
+    assert "enum" not in include_image
     assert "Pixels are included by default" in spec.description
     assert tool_schema.validate_tool_args(
         "photo_read", {"photo_id": "p1"}
@@ -113,6 +141,32 @@ def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
     assert "unsupported value" in tool_schema.validate_tool_args(
         "photo_read", {"photo_id": "p1", "include_image": False}
     )
+
+
+def test_all_builtin_tool_schema_enums_contain_only_strings():
+    invalid = []
+
+    def inspect_schema(tool_name, node, path):
+        if isinstance(node, list):
+            for index, child in enumerate(node):
+                inspect_schema(tool_name, child, f"{path}[{index}]")
+            return
+        if not isinstance(node, dict):
+            return
+        if isinstance(node.get("enum"), list):
+            invalid.extend(
+                f"{tool_name}:{path}.enum[{index}]={value!r}"
+                for index, value in enumerate(node["enum"])
+                if not isinstance(value, str)
+            )
+        for key, child in node.items():
+            if key != "enum":
+                inspect_schema(tool_name, child, f"{path}.{key}")
+
+    for spec in tool_schema.build_tool_specs():
+        inspect_schema(spec.name, spec.parameters, "parameters")
+
+    assert invalid == []
 
 
 def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():
@@ -145,7 +199,7 @@ def test_memory_index_exposes_partition_and_sensitivity_filters_without_offset()
     )
 
     assert set(spec.parameters["properties"]) == {
-        "limit", "bucket", "thread", "ambient", "include_sensitive"
+        "limit", "bucket", "thread", "ambient"
     }
     assert "offset" not in spec.parameters["properties"]
     assert tool_schema.validate_tool_args(
@@ -153,6 +207,20 @@ def test_memory_index_exposes_partition_and_sensitivity_filters_without_offset()
     ) is None
     assert "memory_search" in spec.description
     assert "memory_organize" in spec.description
+
+
+def test_web_fetch_exposes_offset_and_honestly_describes_paging():
+    spec = next(
+        item for item in tool_schema.build_tool_specs() if item.name == "web_fetch"
+    )
+    assert set(spec.parameters["properties"]) == {"url", "offset"}
+    assert spec.parameters["required"] == ["url"]
+    assert tool_schema.validate_tool_args(
+        "web_fetch", {"url": "https://example.com", "offset": 100}
+    ) is None
+    assert "possibly truncated" in spec.description
+    assert "offset=next_offset" in spec.description
+    assert "without another network request" in spec.description
 
 
 def test_recent_apps_and_memory_fetch_parity_parameters_are_model_facing():
@@ -451,6 +519,7 @@ def test_identity_patch_description_advertises_list_fields_and_ops():
     assert "boundaries" in d
     assert "only one method" in d
     assert "D4" in d
+    assert ("language_" + "preference") not in d
 
 
 def test_memory_write_reason_and_relative_wake_are_described_and_valid():
@@ -482,7 +551,7 @@ def test_wake_memory_write_surface_removes_only_delete_without_mutating_chat():
 
 def test_memory_search_shares_the_index_filters_it_already_consumes():
     """memory_search 和 memory_index 共用 memory_index_core,那个 core 一直在消费
-    bucket / thread / include_sensitive —— index 的 schema 开了,search 漏了。
+    bucket / thread —— index 的 schema 开了,search 漏了。
 
     后果:搜索不能限定在某个桶或某条线索里,只能拿回宽泛结果自己挑。
     V1 的 `memory-index --query` 本来可以组合这些条件,V2 拆成 search 之后丢了。
@@ -495,11 +564,11 @@ def test_memory_search_shares_the_index_filters_it_already_consumes():
     )
 
     assert set(spec.parameters["properties"]) == {
-        "query", "limit", "bucket", "thread", "include_sensitive"
+        "query", "limit", "bucket", "thread"
     }
     assert tool_schema.validate_tool_args(
         "memory_search",
-        {"query": "骑行", "bucket": "爱好", "thread": "自行车", "include_sensitive": True},
+        {"query": "骑行", "bucket": "爱好", "thread": "自行车"},
     ) is None
 
 

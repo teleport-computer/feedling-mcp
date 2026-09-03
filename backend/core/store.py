@@ -14,12 +14,19 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from typing import Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 from core import config
 from core import envelope as core_envelope
 from core import wake_bus
+from core.store_sections import (
+    SectionSlot,
+    StoreLoadMode,
+    StoreSection,
+    store_load_mode,
+)
 from core.telemetry_logging import stderr_info_logger
 
 log = stderr_info_logger("feedling.chat_sync")
@@ -84,6 +91,46 @@ _HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS = 4
 # outside a load) still broadcast. Thread-local so a load on one thread can't
 # mute a concurrent genuine write on another.
 _reload_guard = threading.local()
+
+ALL_STORE_SECTIONS = frozenset(StoreSection)
+_STORE_LOAD_REASONS = frozenset({
+    "first_use",
+    "ttl",
+    "notify",
+    "reconnect",
+    "manual",
+    "legacy_compat",
+})
+_STORE_LOAD_CACHE_STATES = frozenset({"cold", "stale"})
+_STORE_LOAD_OUTCOMES = frozenset({"applied", "retained", "error"})
+
+
+def _store_load_telemetry(
+    *,
+    section: StoreSection,
+    reason: str,
+    cache_state: str,
+    row_count: int,
+    duration_ms: float,
+    outcome: str,
+) -> None:
+    section_value = StoreSection(section).value
+    if reason not in _STORE_LOAD_REASONS:
+        raise ValueError("invalid store load reason")
+    if cache_state not in _STORE_LOAD_CACHE_STATES:
+        raise ValueError("invalid store load cache state")
+    if outcome not in _STORE_LOAD_OUTCOMES:
+        raise ValueError("invalid store load outcome")
+    log.info(
+        "store_section_load section=%s reason=%s cache_state=%s "
+        "rows=%d duration_ms=%.1f outcome=%s",
+        section_value,
+        reason,
+        cache_state,
+        max(0, int(row_count)),
+        max(0.0, float(duration_ms)),
+        outcome,
+    )
 
 
 def _chat_snapshot_fallback_telemetry(
@@ -249,6 +296,11 @@ class UserStore:
         self.chat_version = 0
         self.chat_max_seq = 0
         self._chat_messages_by_id: dict[str, dict] = {}
+        # False until a bounded, version-consistent DB snapshot has been
+        # installed.  Committed writes must not turn a metadata-only shell
+        # into a partial cache containing only the rows written locally.
+        self._chat_has_complete_snapshot = False
+        self._chat_cache_generation = 0
         self._chat_last_version_check_mono = 0.0
         self.chat_waiters: list[threading.Event] = []
         self.chat_waiters_lock = threading.Lock()
@@ -296,19 +348,125 @@ class UserStore:
         # cache is process-wide. Empty until the user's first request after
         # a process restart.
         self.last_seen_api_key: str = ""
+        self._section_slots = {
+            section: SectionSlot(section) for section in ALL_STORE_SECTIONS
+        }
 
-        # load persistent state (write-on-read normalization must not broadcast)
-        _prev_guard = getattr(_reload_guard, "active", False)
-        _reload_guard.active = True
-        try:
-            self._load_tokens()
-            self._load_push_state()
-            self._load_live_activity_state()
-            self._load_chat()
-            self._load_frames_meta()
-            self._load_world_books()
-        finally:
-            _reload_guard.active = _prev_guard
+    def _section_loader(self, section: StoreSection):
+        def load_frames():
+            with self.frames_lock:
+                return self._load_frames_meta()
+
+        def load_world_books():
+            with self.world_books_lock:
+                return self._load_world_books()
+
+        return {
+            StoreSection.CHAT: self.reload_chat_hot_strict,
+            StoreSection.FRAMES: load_frames,
+            StoreSection.WORLD_BOOKS: load_world_books,
+            StoreSection.TOKENS: self._load_tokens,
+            StoreSection.PUSH_STATE: self._load_push_state,
+            StoreSection.LIVE_ACTIVITY: self._load_live_activity_state,
+        }[section]
+
+    def loaded_sections(self) -> frozenset[StoreSection]:
+        return frozenset(
+            section
+            for section, slot in self._section_slots.items()
+            if slot.has_cache
+        )
+
+    def note_section_change(
+        self,
+        section: StoreSection,
+        *,
+        dirty_version: int | None = None,
+    ) -> bool:
+        """Record a remote mutation without loading a cold section."""
+        return self._section_slots[StoreSection(section)].mark_stale(
+            dirty_version=dirty_version
+        )
+
+    def mark_expired_sections_stale(
+        self,
+        now_mono: float,
+    ) -> frozenset[StoreSection]:
+        expired: set[StoreSection] = set()
+        for section, slot in self._section_slots.items():
+            if (
+                slot.has_cache
+                and float(now_mono) - slot.loaded_at_mono
+                >= STORE_CACHE_TTL_SECONDS
+            ):
+                slot.mark_stale()
+                expired.add(section)
+        return frozenset(expired)
+
+    def _section_row_count(self, section: StoreSection) -> int:
+        return {
+            StoreSection.CHAT: lambda: len(self.chat_messages),
+            StoreSection.FRAMES: lambda: len(self.frames_meta),
+            StoreSection.WORLD_BOOKS: lambda: len(self.world_books),
+            StoreSection.TOKENS: lambda: len(self.tokens),
+            StoreSection.PUSH_STATE: lambda: 1,
+            StoreSection.LIVE_ACTIVITY: lambda: 1,
+        }[section]()
+
+    def ensure_sections(
+        self,
+        sections: Iterable[StoreSection],
+        *,
+        reason: str = "first_use",
+        strict: bool = True,
+        force: bool = False,
+    ) -> bool:
+        if reason not in _STORE_LOAD_REASONS:
+            raise ValueError("invalid store load reason")
+        succeeded = True
+        for section in sorted(
+            {StoreSection(value) for value in sections},
+            key=lambda value: value.value,
+        ):
+            slot = self._section_slots[section]
+            cache_state = "stale" if slot.has_cache else "cold"
+            previous_guard = getattr(_reload_guard, "active", False)
+
+            def guarded_load(section=section, previous_guard=previous_guard):
+                started = time.monotonic()
+                _reload_guard.active = True
+                try:
+                    result = self._section_loader(section)()
+                except Exception:
+                    _store_load_telemetry(
+                        section=section,
+                        reason=reason,
+                        cache_state=cache_state,
+                        row_count=self._section_row_count(section),
+                        duration_ms=(time.monotonic() - started) * 1000.0,
+                        outcome="retained" if slot.has_cache else "error",
+                    )
+                    raise
+                else:
+                    _store_load_telemetry(
+                        section=section,
+                        reason=reason,
+                        cache_state=cache_state,
+                        row_count=self._section_row_count(section),
+                        duration_ms=(time.monotonic() - started) * 1000.0,
+                        outcome="applied",
+                    )
+                    return result
+                finally:
+                    _reload_guard.active = previous_guard
+
+            loaded = slot.ensure(
+                guarded_load,
+                force=force,
+                strict=strict,
+            )
+            succeeded = loaded and succeeded
+        return succeeded
 
     # ------- frames index -------
     def _load_frames_meta(self):
@@ -482,6 +640,12 @@ class UserStore:
             self.chat_max_seq = 0
         if not hasattr(self, "_chat_cache_generation"):
             self._chat_cache_generation = 0
+        if not hasattr(self, "_chat_has_complete_snapshot"):
+            # Lightweight stores built with ``__new__`` predate section slots
+            # and represent an already-populated legacy cache in tests/callers.
+            self._chat_has_complete_snapshot = not hasattr(
+                self, "_section_slots"
+            )
         if not hasattr(self, "_chat_messages_by_id"):
             self._chat_messages_by_id = {}
         if (
@@ -502,6 +666,21 @@ class UserStore:
                 (int(row.get("seq") or 0) for row in self.chat_messages),
                 default=0,
             )
+
+    def chat_cache_loaded(self) -> bool:
+        """Return whether chat rows came from a complete bounded snapshot."""
+        return bool(getattr(self, "_chat_has_complete_snapshot", False))
+
+    def _mark_chat_cache_dirty_locked(
+        self,
+        *,
+        version: int | None = None,
+    ) -> None:
+        """Fence in-flight loads without materializing a cold chat cache."""
+        self._chat_cache_generation += 1
+        slots = getattr(self, "_section_slots", None)
+        if slots is not None:
+            slots[StoreSection.CHAT].mark_stale(dirty_version=version)
 
     def _replace_chat_rows_locked(
         self,
@@ -532,6 +711,7 @@ class UserStore:
             (int(row.get("seq") or 0) for row in self.chat_messages),
             default=0,
         )
+        self._chat_has_complete_snapshot = True
         self._chat_cache_generation = (
             int(getattr(self, "_chat_cache_generation", 0)) + 1
         )
@@ -543,6 +723,9 @@ class UserStore:
         version: int | None = None,
     ) -> None:
         UserStore._ensure_chat_cache_state_locked(self)
+        if not UserStore.chat_cache_loaded(self):
+            UserStore._mark_chat_cache_dirty_locked(self, version=version)
+            return
         by_id = dict(self._chat_messages_by_id)
         for raw in rows:
             incoming = dict(raw)
@@ -565,6 +748,9 @@ class UserStore:
         fields: dict,
     ) -> dict | None:
         UserStore._ensure_chat_cache_state_locked(self)
+        if not UserStore.chat_cache_loaded(self):
+            UserStore._mark_chat_cache_dirty_locked(self)
+            return None
         existing = self._chat_messages_by_id.get(str(msg_id))
         if existing is None:
             return None
@@ -593,6 +779,9 @@ class UserStore:
             return
         with self.chat_lock:
             self._ensure_chat_cache_state_locked()
+            if not self.chat_cache_loaded():
+                self._mark_chat_cache_dirty_locked()
+                return
             if not any(
                 message_id in self._chat_messages_by_id
                 for message_id in removed
@@ -604,6 +793,15 @@ class UserStore:
                 if str(row.get("id") or "") not in removed
             ]
             self._replace_chat_rows_locked(remaining, version=self.chat_version)
+
+    def apply_committed_chat_clear(self) -> None:
+        """Apply an authoritative clear and fence any snapshot already read."""
+        with self.chat_lock:
+            self._ensure_chat_cache_state_locked()
+            self.chat_messages = []
+            self._chat_messages_by_id = {}
+            self.chat_max_seq = 0
+            self._chat_cache_generation += 1
 
     def reload_chat_hot_strict(self) -> list[dict]:
         """Replace only chat state from one version-consistent hot snapshot."""
@@ -804,30 +1002,16 @@ class UserStore:
                     return False
 
     def reload(self):
-        """Re-read this store's cached state from PostgreSQL IN PLACE, keeping
-        the same object identity (and the same waiter lists). Used by the cache
-        TTL / admin eviction so out-of-band DB writes surface without a swap.
-
-        Each collection is reassigned under its own lock. chat_load + a
-        concurrent append() are both serialized on chat_lock, so no append is
-        lost: either reload reads it from the DB, or append re-adds it to the
-        freshly-loaded list.
-
-        Guarded so the loaders' write-on-read normalization doesn't re-broadcast
-        a blob/frames wake (this reload is often itself the result of one)."""
-        _prev_guard = getattr(_reload_guard, "active", False)
-        _reload_guard.active = True
-        try:
-            self._load_chat()
-            with self.frames_lock:
-                self._load_frames_meta()
-            with self.world_books_lock:
-                self._load_world_books()
-            self._load_tokens()
-            self._load_live_activity_state()
-            self._load_push_state()
-        finally:
-            _reload_guard.active = _prev_guard
+        """Refresh only sections previously loaded, preserving object identity."""
+        sections = self.loaded_sections()
+        if not sections:
+            return True
+        return self.ensure_sections(
+            sections,
+            reason="manual",
+            strict=False,
+            force=True,
+        )
 
     def _broadcast_store_change(self, channel: str) -> None:
         """Tell other workers to refresh this user's cached blob-backed state
@@ -934,6 +1118,9 @@ class UserStore:
                 "quoted_memory_ids",
                 "image_mime",
                 "image_byte_count",
+                "image_bundle_version",
+                "image_count",
+                "image_mimes",
                 # Hosted V1 follow-main capability-learning fence. The terminal
                 # reply transaction consumes both fields only for the stable
                 # vision_model_required class; they never alter image routing.
@@ -1017,9 +1204,13 @@ class UserStore:
                 elif key in {
                     "file_byte_count",
                     "image_byte_count",
+                    "image_bundle_version",
+                    "image_count",
                     "reply_part_count",
                 } and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "image_mimes" and isinstance(value, list):
+                    msg[key] = [str(item) for item in value]
                 elif key == "reply_part_index" and isinstance(value, int) and value >= 0:
                     msg[key] = value
                 elif (
@@ -1076,9 +1267,9 @@ class UserStore:
         same atomic transaction. `None` (the default) preserves
         today's `chat_append_strict`/`chat_append` behavior for local cache,
         trim, waiter, and Capture bookkeeping. Cross-worker notification comes
-        from the committed DB v2 trigger. Exact Runtime V2
-        sends only refresh that state; their runner-owned scheduler is the sole
-        capture producer and therefore never appends a legacy proactive job.
+        from the committed DB v2 trigger. Exact Runtime V2 sends defer Capture
+        discovery to their runner-owned scheduler, which is the sole capture
+        producer and therefore never appends a legacy proactive job.
 
         `reply_through_seq` is the V2 final-reply path. It requires
         `strict=True` and no `enqueue`, and commits the deterministic reply row
@@ -1163,6 +1354,9 @@ class UserStore:
                 "quoted_memory_ids",
                 "image_mime",
                 "image_byte_count",
+                "image_bundle_version",
+                "image_count",
+                "image_mimes",
                 # Dedicated visual route proven at image-send time. Runtime V2
                 # resolves this exact caller-owned route so a concurrent Settings
                 # change cannot reroute pixels or expose them to the main model.
@@ -1245,9 +1439,13 @@ class UserStore:
                 elif key in {
                     "file_byte_count",
                     "image_byte_count",
+                    "image_bundle_version",
+                    "image_count",
                     "reply_part_count",
                 } and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "image_mimes" and isinstance(value, list):
+                    msg[key] = [str(item) for item in value]
                 elif key == "reply_part_index" and isinstance(value, int) and value >= 0:
                     msg[key] = value
                 elif (
@@ -1372,6 +1570,7 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
+            defer_to_tick = capture_scheduler.append_refresh_deferred()
             scheduler_owned_capture = bool(
                 strict
                 and (
@@ -1383,8 +1582,14 @@ class UserStore:
                     )
                 )
             )
-            if scheduler_owned_capture:
-                capture_scheduler.refresh_capture_state_from_chat(self, now=msg["ts"])
+            if defer_to_tick:
+                capture_scheduler.record_chat_append(
+                    self, msg, defer_to_tick=True
+                )
+            elif scheduler_owned_capture:
+                capture_scheduler.refresh_capture_state_from_chat(
+                    self, now=msg["ts"]
+                )
             else:
                 capture_scheduler.record_chat_append(self, msg)
         except Exception as e:
@@ -1413,7 +1618,11 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
-            capture_scheduler.record_chat_append(self, cached_reply)
+            capture_scheduler.record_chat_append(
+                self,
+                cached_reply,
+                defer_to_tick=capture_scheduler.append_refresh_deferred(),
+            )
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return cached_reply
@@ -1481,7 +1690,11 @@ class UserStore:
             from proactive import capture_scheduler
 
             for cached in cached_docs:
-                capture_scheduler.record_chat_append(self, cached)
+                capture_scheduler.record_chat_append(
+                    self,
+                    cached,
+                    defer_to_tick=capture_scheduler.append_refresh_deferred(),
+                )
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return parent_doc, cached_docs
@@ -1529,7 +1742,11 @@ class UserStore:
         try:
             from proactive import capture_scheduler
 
-            capture_scheduler.record_chat_append(self, winner)
+            capture_scheduler.record_chat_append(
+                self,
+                winner,
+                defer_to_tick=capture_scheduler.append_refresh_deferred(),
+            )
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return winner, True
@@ -2147,7 +2364,6 @@ def _evict_store(user_id: str) -> bool:
     if store is None:
         return False
     store.reload()
-    store.loaded_at = time.monotonic()
     _wake_store_waiters(store)
     return True
 
@@ -2163,47 +2379,73 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
     store = _cached_store(user_id)
     if store is None:
         return False
-    previous_guard = getattr(_reload_guard, "active", False)
-    _reload_guard.active = True
-    try:
-        if channel == "frames":
-            with store.frames_lock:
-                store._load_frames_meta()
-        elif channel == "blob":
-            with store.world_books_lock:
-                store._load_world_books()
-            store._load_tokens()
-            store._load_live_activity_state()
-            store._load_push_state()
-        elif channel == "proactive":
-            store.notify_proactive_job_waiters()
-        else:
-            return False
-    finally:
-        _reload_guard.active = previous_guard
-    return True
+    sections: set[StoreSection] = set()
+    if channel == "frames":
+        candidates = (StoreSection.FRAMES,)
+    elif channel == "blob":
+        candidates = (
+            StoreSection.WORLD_BOOKS,
+            StoreSection.TOKENS,
+            StoreSection.LIVE_ACTIVITY,
+            StoreSection.PUSH_STATE,
+        )
+    elif channel == "proactive":
+        store.notify_proactive_job_waiters()
+        return True
+    else:
+        return False
+    for section in candidates:
+        if store.note_section_change(section):
+            sections.add(section)
+    if not sections:
+        return True
+    return store.ensure_sections(
+        sections,
+        reason="notify",
+        strict=False,
+    )
 
 
-def get_store(user_id: str) -> UserStore:
+def get_store(
+    user_id: str,
+    *,
+    require: Iterable[StoreSection] = (),
+) -> UserStore:
     now = time.monotonic()
-    do_reload = False
     with _stores_lock:
         store = _stores.get(user_id)
         if store is None:
             store = UserStore(user_id)
-            store.loaded_at = time.monotonic()
             _stores[user_id] = store
-            return store
-        if (now - getattr(store, "loaded_at", now)) >= STORE_CACHE_TTL_SECONDS:
-            # Expired. Claim the reload by stamping loaded_at now (under the
-            # lock) so concurrent callers don't stampede, then refresh the SAME
-            # instance in place outside the lock. In-place refresh keeps object
-            # identity stable: a request that grabbed this store and writes
-            # through it (write-through to the DB + the same in-memory list)
-            # is never shadowed by a freshly-swapped instance.
-            store.loaded_at = time.monotonic()
-            do_reload = True
-    if do_reload:
-        store.reload()
-        _wake_store_waiters(store)
+    expired = store.mark_expired_sections_stale(now)
+    mode = store_load_mode()
+    if mode is StoreLoadMode.LEGACY:
+        store.ensure_sections(
+            ALL_STORE_SECTIONS,
+            reason="ttl" if expired else "legacy_compat",
+            strict=False,
+        )
+    elif require:
+        store.ensure_sections(
+            require,
+            reason="ttl" if expired.intersection(require) else "first_use",
+            strict=True,
+        )
+    return store
+
+
+def get_store_shell_only(user_id: str, *, reason: str) -> UserStore:
+    """Return an unloaded store shell with a mandatory review reason."""
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("shell-only store reason required")
+    return get_store(user_id)
+
+
+def get_store_legacy(user_id: str) -> UserStore:
+    store = get_store(user_id)
+    store.ensure_sections(
+        ALL_STORE_SECTIONS,
+        reason="legacy_compat",
+        strict=False,
+    )
     return store

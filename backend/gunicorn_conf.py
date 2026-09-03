@@ -94,7 +94,7 @@ def on_starting(server):
     # DB migration single-point (master, once, before fork). See module docstring:
     # this is the only place the schema is upgraded — workers never run alembic.
     import db
-    db.init_schema()
+    db.init_schema(tee_auto_migrate=True)
     from hosted import config_store
     try:
         policy_result = config_store.reconcile_hosted_runtime_policy()

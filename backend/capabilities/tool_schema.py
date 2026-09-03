@@ -33,11 +33,12 @@ from perception.agent_fields import (
     AGENT_SIGNAL_FIELDS,
     FAST_AGENT_PERCEPTION_SIGNALS,
 )
-from perception_kernel import prompts as perception_prompts
+from perceptkit import prompts as perception_prompts
 
 STAY_SILENT_TOOL = "stay_silent"
 FILE_REPLY_TOOL = "send_file"
 SHARED_WORK_MAX_BYTES = 256_000
+_SHARED_WORK_MAX_KB = SHARED_WORK_MAX_BYTES // 1000
 IMAGE_REPLY_TOOL = "generate_image"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
@@ -49,7 +50,7 @@ _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"}
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
-_TRUE_BOOL = {"type": "boolean", "enum": [True], "default": True}
+_BOOL_DEFAULT_TRUE = {"type": "boolean", "default": True}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
 _IDENTITY_DIMENSION = {
@@ -179,14 +180,13 @@ PARAMS: dict[str, dict] = {
             "bucket": _STR,
             "thread": _STR,
             "ambient": _BOOL,
-            "include_sensitive": _BOOL,
         },
         "required": [],
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
     # limit (passed through like index).
     # memory.search 和 memory.index 走同一个 memory_index_core，那个 core 一直在
-    # 消费 bucket / thread / include_sensitive；index 的 schema 开了这几个、search
+    # 消费 bucket / thread；index 的 schema 开了这两个、search
     # 漏了，于是搜索没法限定在某个桶或线索里。V1 的 `memory-index --query` 本来
     # 能组合这些条件。ambient 刻意不开：search 强制带 query，走 exact-query 分支，
     # ambient_top_n 不参与候选限制，开了也是哑参数。
@@ -197,7 +197,6 @@ PARAMS: dict[str, dict] = {
             "limit": _INT,
             "bucket": _STR,
             "thread": _STR,
-            "include_sensitive": _BOOL,
         },
         "required": ["query"],
     },
@@ -333,7 +332,10 @@ PARAMS: dict[str, dict] = {
     # params.get("include_image") (bool).
     "photo_read": {
         "type": "object",
-        "properties": {"photo_id": _STR, "include_image": _TRUE_BOOL},
+        "properties": {
+            "photo_id": _STR,
+            "include_image": _BOOL_DEFAULT_TRUE,
+        },
         "required": ["photo_id"],
     },
 
@@ -344,10 +346,10 @@ PARAMS: dict[str, dict] = {
         "properties": {"query": _STR, "limit": _INT},
         "required": ["query"],
     },
-    # web.fetch: params: {"url": str} — per module docstring.
+    # web.fetch: params: {"url": str, "offset": int?} — per module docstring.
     "web_fetch": {
         "type": "object",
-        "properties": {"url": _STR},
+        "properties": {"url": _STR, "offset": _INT},
         "required": ["url"],
     },
 
@@ -439,7 +441,7 @@ PARAMS: dict[str, dict] = {
                 ),
             },
         },
-        "required": ["path", "revision"],
+        "required": ["path", "revision", "completion_message"],
     },
     IMAGE_REPLY_TOOL: {
         "type": "object",
@@ -502,7 +504,7 @@ DESCRIPTIONS: dict[str, str] = {
                        "introduce yourself. Put any of these inside a 'patch' object: "
                        "string fields agent_name, self_introduction, category, "
                        "user_preferred_name, agent_role, tone_style, "
-                       "custom_persona_prompt, language_preference, relationship_anchor; "
+                       "custom_persona_prompt, relationship_anchor; "
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
@@ -547,8 +549,8 @@ DESCRIPTIONS: dict[str, str] = {
                      "talk, and do not resume an earlier answered memory workflow unless "
                      "the current message explicitly asks. Browse memory-card summaries, "
                      "optionally filtered by one exact "
-                     "bucket or thread and capped by limit. Set ambient/include_sensitive "
-                     "only when that broader or sensitive recall is genuinely needed. "
+                     "bucket or thread and capped by limit. Set ambient only when broader "
+                     "recall is genuinely needed. "
                      "Do not indiscriminately pull "
                      "the whole Garden. For an open-ended overview, inspect the returned "
                      "total/returned counts and browse bucket by bucket (or thread by "
@@ -718,7 +720,11 @@ DESCRIPTIONS: dict[str, str] = {
                    "native vision observer and returns an untrusted visual_observation "
                    "instead of a local image_file path."),
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
-    "web_fetch": "Fetch a specific URL and return its main text content. Use when the user provides a link, or to read a page found through web_search.",
+    "web_fetch": ("Fetch a specific URL and return a possibly truncated page of its "
+                  "main text. The result reports offset, returned_chars, total_chars, "
+                  "has_more, and next_offset. When has_more is true, call web_fetch "
+                  "again in the same turn with the same URL and offset=next_offset; "
+                  "continuations reuse the retained page without another network request."),
     "schedule_wake": ("Schedule a future self-wake at an ISO timestamp or a relative "
                       "time such as 'in 2 hours', '+30m', or '两小时后', with optional "
                       "timezone, reason, and repeat ('daily' every 24 hours or "
@@ -743,7 +749,8 @@ DESCRIPTIONS: dict[str, str] = {
                         "to create. Generated files must use /workspace/<filename>; "
                         "never write them under /artifacts or /skills because those "
                         "namespaces are read-only. A .io.html Canvas must be no "
-                        "larger than 256 KB of UTF-8 source; keep it compact and use "
+                        f"larger than {_SHARED_WORK_MAX_KB} KB of UTF-8 source; "
+                        "keep it compact and use "
                         "CSS or SVG instead of embedding large base64 raster assets."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
@@ -751,15 +758,16 @@ DESCRIPTIONS: dict[str, str] = {
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
     STAY_SILENT_TOOL: (
-        "Choose not to send a proactive message on this wake. Give one short, "
-        "specific reason based on the current attention facts. This is a successful, "
-        "auditable outcome, not an error."
+        "Sit this one out. Say briefly why — maybe they are busy, you just talked, "
+        "or the moment is better left quiet. This is good company, not an error."
     ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
         "A self-contained .io.html target is presented by IO as an interactive "
         "Canvas. Choose it when you have decided an experience belongs in the "
-        "conversation. Put everything the work needs inline so it opens offline. "
+        "conversation. Do not create a Canvas merely to decorate casual conversation, "
+        "emotional support, or a question better answered directly in chat. Put "
+        "everything the work needs inline so it opens offline. "
         "Let the user experience the work itself, and discuss its source only if "
         "they ask. "
         "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
@@ -775,14 +783,9 @@ DESCRIPTIONS: dict[str, str] = {
         "user never needs to know /workspace or provide an internal path. Create "
         "or update the file with workspace_write first, wait for that tool result, "
         "then call send_file in a later round with the exact returned revision. "
-        "For every .io.html Canvas, title, subtitle, and completion_message are "
-        "required. Generate all three in the user's current language, following the "
-        "language used or explicitly requested in the current request; "
-        "subtitle is one concise line describing what the Canvas contains, and "
-        "completion_message is the complete visible chat bubble confirming delivery "
-        "in your own voice. When revising a Canvas, preserve its current "
-        "title and subtitle unless the user asks to change them, and update either "
-        "when the new content makes it useful. "
+        "Every send_file call requires completion_message, the complete visible "
+        "delivery bubble, in the language of the user's current request. For "
+        ".io.html, also provide a concise title and subtitle in that language. "
         "Do not call this merely because a conversational answer contains a list "
         "or structured text. Host filesystem paths and /artifacts, /skills, or "
         "/memory entries are not accepted."
@@ -931,6 +934,12 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
     error = _validate_value(args, schema, path="args")
     if error:
         return error
+    if name == "photo_read" and args.get("include_image") is False:
+        # Gemini's function-declaration enum only accepts strings, so the
+        # provider-facing schema cannot express a true-only boolean without
+        # making an OpenAI-compatible Gemini route reject the whole catalog.
+        # Keep the execution contract authoritative at the local argument gate.
+        return "args.include_image has unsupported value"
     if name == "identity_patch":
         # Run the SAME merge the capability runs, so a call that validates here can't
         # quietly lose a field later. Import direction is safe: registry already pulls
@@ -1026,7 +1035,7 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
             path.endswith(".io.html")
             and len(content.encode("utf-8")) > SHARED_WORK_MAX_BYTES
         ):
-            return "Canvas source exceeds the 256 KB UTF-8 limit"
+            return f"Canvas source exceeds the {_SHARED_WORK_MAX_KB} KB UTF-8 limit"
     if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
         return "task requires a non-empty prompt"
     if name == FILE_REPLY_TOOL and not str(args.get("path") or "").strip():
@@ -1061,15 +1070,8 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
                 return str(exc)
             if not isinstance(completion_message, str) or not completion_message.strip():
                 return "invalid completion_message"
-        elif (
-            title is not None
-            or subtitle is not None
-            or completion_message is not None
-        ):
-            return (
-                "send_file title, subtitle, and completion_message are only valid "
-                "for Canvas files"
-            )
+        # Providers may populate optional schema fields even when they are not
+        # relevant. Non-Canvas delivery safely ignores Canvas presentation data.
     if name == IMAGE_REPLY_TOOL and not str(args.get("prompt") or "").strip():
         return "generate_image requires a non-empty prompt"
     if name == MCP_TOOL_SEARCH_TOOL:

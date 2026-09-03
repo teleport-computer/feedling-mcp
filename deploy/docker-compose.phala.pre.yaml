@@ -142,7 +142,6 @@ services:
       <<: &enclave-environment
         FEEDLING_DATA_DIR: "/data"
         FEEDLING_FLASK_URL: "http://backend:5001"
-        MEMORY_READSIDE_FOR_MODEL_API: "true"
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it
@@ -315,6 +314,9 @@ services:
       # Backend owns capture admission/triggers; serve-worker executes the lane.
       # Keep both deployment gates aligned. User consent remains independent.
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Foreground Chat defaults to tick-owned Capture discovery. Set sync as
+      # an emergency rollback without reverting the durable-seq/Clear fences.
+      FEEDLING_CAPTURE_APPEND_REFRESH_MODE: "${FEEDLING_CAPTURE_APPEND_REFRESH_MODE:-deferred}"
       # Backend owns the V2-cutover profile trigger; serve-worker executes it.
       # Keep both copies aligned and normal-on.
       FEEDLING_V2_PROFILE_ENABLED: "1"

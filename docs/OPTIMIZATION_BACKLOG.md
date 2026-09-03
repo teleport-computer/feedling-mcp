@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 优化清单（技术债 backlog）
 
 > 基于 2026-06-10 的代码现状梳理（branch: test）。按"结构性瓶颈 → 性能 →
@@ -123,6 +127,12 @@ verify 回包 gate 竞态等三层修复曾处于"已修未部署"状态，确�
 `db.py` 有 `log_trim`，但需确认 proactive_decisions、perception_events
 等高频 stream 都有 trim 调用点，否则慢性膨胀。
 
+- 2026-08-27（T337）逐调用点查过一次：`log_trim` / `log_prune_older_than` 覆盖
+  proactive_jobs、device_events、gate_decisions、gate_reviews、tracking_events、
+  notices、diagnostics、wake_discarded_draft；**`memory_capture_jobs` 和
+  `memory_changes` 都没有任何 trim 调用点**。前者已从管理端取数里整片删除
+  （它没有消费者），后者仍在被实时读，见 #17。
+
 ### #14 hosted tick 全量 UserStore 饿加载 ✅ 已完成（2026-06-19, dc4138f）
 
 - **来源**：2026-06-11 hosted proactive code review。
@@ -211,3 +221,16 @@ verify 回包 gate 竞态等三层修复曾处于"已修未部署"状态，确�
 - **能力协商**：extension 实际可用后才声明 `agent_image_generation_v1`。继续保留
   “专用生图模型优先 → resident 原生能力 → 添加生图模型卡片”的路由顺序，并补
   PI/Codex/Claude 等不同 CLI、工具缺失、鉴权失败和产物未送达的端到端测试。
+
+### #17 管理端 `memory_changes` 仍是全舰队无界扫描 ⬜ P2 · 待 prod 复测再定
+
+- **来源**：2026-08-27 T337。该单把管理端用户列表的假分页改成真分页（记忆分面、
+  屏幕帧、bootstrap_events 三片只对当前页读），但**没有解决这一条**。
+- **现状**：`memory.changes` 是 `sort=memory` 排序元组的第二元——排序决定谁进这一页，
+  所以它必须对**全舰队**计算，不能随页读。它落在 `user_logs` 上、以
+  `memory_changes` 为条件的 `GROUP BY`，而这条流**没有任何 trim**（见 #13），
+  所以随用户历史无界增长。
+- **方向**：若 prod 复测显示它仍是瓶颈，做 per-user 累计器（seq 水位 + 计数），
+  **不做成日格表**——它和 lane 日格不同形，不该伪装成同一种东西。
+- **不做的前提**：本批的 buffers 测量来自隔离环境热缓存，不是毫秒，prod 未验证；
+  在拿到一次 prod 复测之前，不以“已经够快了”为由关掉这条。

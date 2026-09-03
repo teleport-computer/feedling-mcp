@@ -17,6 +17,7 @@ from core.reqctx import request
 
 import db
 import debug_trace
+import provider_attempt_ledger
 from core.store import UserStore
 from urllib.parse import urlencode
 import html
@@ -28,17 +29,19 @@ from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
 from notices import catalog as notices_catalog
+from notices import status_reason as notices_status_reason
 from notices import core as notices_core
 from proactive import service as proactive_service
 from screen import screen_read_core
 from bootstrap import gates as boot_gates
 from core import store as core_store
+from core.store_sections import StoreSection
 from core import util as core_util
 from identity import service as identity_service
 from memory import dream_trace as memory_dream_trace
 
 
-_PROVIDER_ATTEMPT_STREAM = "provider_attempts"
+_PROVIDER_ATTEMPT_STREAM = provider_attempt_ledger.STREAM
 _PROVIDER_ATTEMPT_DETAIL_LIMIT = 200
 _NOTICE_SUMMARY_LIMIT = 20
 _DATA_TRACK_USER_ID_RE = re.compile(r"^usr_[0-9a-f]{16}$")
@@ -216,12 +219,17 @@ def _memory_stats(store: UserStore) -> dict:
         if isinstance(j, dict)
     ]
     actions_written = 0
+    invalid_actions_written = 0
     for job in capture_jobs:
         if not isinstance(job, dict):
             continue
         try:
-            actions_written += int(job.get("actions_written") or 0)
-        except (TypeError, ValueError):
+            parsed_actions = int(job.get("actions_written") or 0)
+            if parsed_actions < 0:
+                raise ValueError("negative_actions_written")
+            actions_written += parsed_actions
+        except (TypeError, ValueError, OverflowError):
+            invalid_actions_written += 1
             continue
     return {
         "total": counts["total"],
@@ -235,6 +243,10 @@ def _memory_stats(store: UserStore) -> dict:
         "capture_jobs_by_status": _count_rows(capture_jobs, "status"),
         "capture_jobs_by_mode": _count_rows(capture_jobs, "mode"),
         "capture_actions_written": actions_written,
+        "capture_actions_written_status": (
+            "invalid" if invalid_actions_written else "ok"
+        ),
+        "capture_actions_written_invalid_rows": invalid_actions_written,
         "last_capture_at": core_util._epoch_to_iso(max(capture_epochs, default=0)),
         "first_created_at": core_util._epoch_to_iso(min([e for e in created_epochs if e], default=0)),
         "last_created_at": core_util._epoch_to_iso(max(created_epochs, default=0)),
@@ -282,28 +294,37 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
     )
     skipped: dict[str, int] = {}
     applied = {"added": 0, "superseded": 0}
+    invalid_count_fields: list[str] = []
     rows: list[dict] = []
     for job in jobs:
         result = job.get("capture_result") or {}
         for reason, count in (result.get("skipped") or {}).items():
             try:
-                skipped[str(reason)] = skipped.get(str(reason), 0) + max(
-                    0, int(count or 0)
+                parsed_count = int(count or 0)
+                if parsed_count < 0:
+                    raise ValueError("negative_skipped_count")
+                skipped[str(reason)] = (
+                    skipped.get(str(reason), 0) + parsed_count
                 )
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                invalid_count_fields.append(f"skipped.{str(reason)[:80]}")
                 continue
         for action in applied:
             try:
-                applied[action] += max(
-                    0, int((result.get("applied") or {}).get(action) or 0)
+                parsed_count = int(
+                    (result.get("applied") or {}).get(action) or 0
                 )
-            except (TypeError, ValueError):
+                if parsed_count < 0:
+                    raise ValueError("negative_applied_count")
+                applied[action] += parsed_count
+            except (TypeError, ValueError, OverflowError):
+                invalid_count_fields.append(f"applied.{action}")
                 continue
         if len(rows) < limit:
             rows.append({
                 "job_id": str(job.get("job_id") or ""),
                 "status": str(job.get("status") or ""),
-                "status_reason": str(job.get("status_reason") or ""),
+                "status_reason": notices_status_reason.sanitize_status_reason(job.get("status_reason")),
                 "updated_at": str(
                     job.get("updated_at")
                     or job.get("ts")
@@ -319,6 +340,8 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
         "jobs_total": len(jobs),
         "applied": applied,
         "skipped": skipped,
+        "counts_status": "invalid" if invalid_count_fields else "ok",
+        "invalid_count_fields": sorted(set(invalid_count_fields)),
         "jobs": rows,
     }
 
@@ -367,16 +390,20 @@ def _proactive_stats(store: UserStore) -> dict:
         outcome_class = notices_catalog.v1_proactive_outcome_class(
             status, reason
         )
+        # Classification above reads the raw reason; only the exposed key is
+        # sanitized. Sanitizing before `v1_proactive_outcome_class` would
+        # silently reclassify every reason it matches exactly.
+        shown = notices_status_reason.sanitize_status_reason(reason) or "unknown"
         if outcome_class == "operational_failure":
             fail_lanes[lane] += 1
-            failed_reasons[reason] = failed_reasons.get(reason, 0) + 1
+            failed_reasons[shown] = failed_reasons.get(shown, 0) + 1
         elif outcome_class == "control":
             control_lanes[lane] += 1
-            control_reasons[reason] = control_reasons.get(reason, 0) + 1
+            control_reasons[shown] = control_reasons.get(shown, 0) + 1
         elif outcome_class == "user_unavailable":
             user_unavailable_lanes[lane] += 1
-            user_unavailable_reasons[reason] = (
-                user_unavailable_reasons.get(reason, 0) + 1
+            user_unavailable_reasons[shown] = (
+                user_unavailable_reasons.get(shown, 0) + 1
             )
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
@@ -513,6 +540,7 @@ def _history_import_stats(store: UserStore) -> dict:
         "job_id": latest.get("job_id", ""),
         "status": latest.get("status", ""),
         "phase": latest.get("phase", ""),
+        "failed_phase": latest.get("failed_phase", ""),
         "phase_label": latest.get("phase_label", ""),
         "progress": latest.get("progress", 0),
         "created_at": latest.get("created_at", ""),
@@ -622,13 +650,25 @@ def _data_track_iso(value) -> str:
     return str(value or "")
 
 
-def _data_track_count_dict(raw: dict | None) -> dict:
+def _data_track_count_dict(
+    raw: dict | None,
+    *,
+    invalid_fields: list[str] | None = None,
+    field_prefix: str = "",
+) -> dict:
     out: dict[str, int] = {}
     for key, value in (raw or {}).items():
         try:
-            out[str(key or "unknown")] = int(value or 0)
+            parsed = int(value or 0)
+            if parsed < 0:
+                raise ValueError("negative_count")
+            out[str(key or "unknown")] = parsed
         except Exception:
             out[str(key or "unknown")] = 0
+            if invalid_fields is not None:
+                invalid_fields.append(
+                    f"{field_prefix}.{str(key or 'unknown')}".strip(".")
+                )
     return out
 
 
@@ -653,20 +693,27 @@ def _validated_dau_day(value: str) -> str:
     return raw
 
 
-def _default_usage_histogram_day(rows: list[dict]) -> str:
+def _default_usage_histogram_day(
+    rows: list[dict], *, invalid_days: list[str] | None = None,
+) -> str:
     """Latest completed Beijing day present in the DAU table, or yesterday."""
     today = datetime.now(_SHANGHAI_TZ).date()
+    selected = ""
     for row in rows:
         raw = str(row.get("day") or "").strip()
         if not _DAU_DAY_RE.fullmatch(raw):
+            if raw and invalid_days is not None:
+                invalid_days.append(raw[:40])
             continue
         try:
             candidate = date.fromisoformat(raw)
         except ValueError:
+            if invalid_days is not None:
+                invalid_days.append(raw[:40])
             continue
-        if candidate < today:
-            return candidate.isoformat()
-    return (today - timedelta(days=1)).isoformat()
+        if candidate < today and not selected:
+            selected = candidate.isoformat()
+    return selected or (today - timedelta(days=1)).isoformat()
 
 
 def _bj_iso(value) -> str:
@@ -718,15 +765,47 @@ def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
     aggregation). ``last_at`` is a server ingest epoch; keep it raw for the
     Shanghai-day DAU roll-up and also expose an ISO string for display."""
     au = dict(snap.get("app_usage") or {})
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    invalid_fields: list[str] = []
     try:
         last_epoch = float(au.get("last_at") or 0) or 0.0
     except (TypeError, ValueError):
         last_epoch = 0.0
+        invalid_fields.append("last_at")
+    if last_epoch and (
+        not math.isfinite(last_epoch) or last_epoch < 0
+    ):
+        last_epoch = 0.0
+        invalid_fields.append("last_at")
+    if last_epoch:
+        try:
+            datetime.fromtimestamp(last_epoch, _SHANGHAI_TZ)
+        except (ValueError, OverflowError, OSError):
+            last_epoch = 0.0
+            invalid_fields.append("last_at")
+
+    def _count(name: str) -> int:
+        raw = au.get(name)
+        try:
+            parsed = int(raw or 0)
+            if parsed < 0:
+                raise ValueError("negative_count")
+            return parsed
+        except (TypeError, ValueError, OverflowError):
+            invalid_fields.append(name)
+            return 0
+
     return {
-        "foreground_sec": int(au.get("foreground_sec") or 0),
-        "sessions": int(au.get("sessions") or 0),
+        "foreground_sec": _count("foreground_sec"),
+        "sessions": _count("sessions"),
         "last_at_epoch": last_epoch,
         "last_at": _data_track_iso(last_epoch) if last_epoch else "",
+        "fields_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
+        "invalid_fields": sorted(set(invalid_fields)),
     }
 
 
@@ -766,12 +845,44 @@ def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
     return d1 == d2
 
 
+def _data_track_snapshot_unread(snapshot: dict) -> bool:
+    """Whether a snapshot producer explicitly reported that its read failed.
+
+    Older and focused test fixtures may omit ``snapshot_read_status``; absence
+    alone is not rewritten as a failure here. The endpoint layer supplies an
+    explicit ``unavailable`` status when a real snapshot result lacks it.
+    """
+    status = snapshot.get("snapshot_read_status")
+    if not isinstance(status, dict):
+        return False
+    level = str(status.get("level") or "").strip().lower()
+    return bool(level and level != "ok")
+
+
+def _data_track_breakdowns_state(snapshot: dict) -> tuple[bool, bool]:
+    """Return ``(unknown, omitted)`` for legacy background breakdowns."""
+    raw = snapshot.get("legacy_background_breakdowns_status")
+    normalized = str(raw or "").strip().lower()
+    unknown = (
+        _data_track_snapshot_unread(snapshot)
+        or not isinstance(raw, str)
+        or normalized not in {"available", "omitted"}
+    )
+    return unknown, normalized == "omitted"
+
+
 def _data_track_memory_from_snapshot(snap: dict) -> dict:
     memory = dict(snap.get("memory") or {})
     extra = dict(snap.get("memory_extra") or {})
     log_counts = dict(snap.get("log_counts") or {})
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
+    invalid_fields: list[str] = []
     by_type = {typ: 0 for typ in memory_service.MEMORY_TYPES}
-    by_type.update(_data_track_count_dict(memory.get("by_type")))
+    by_type.update(_data_track_count_dict(
+        memory.get("by_type"), invalid_fields=invalid_fields,
+        field_prefix="memory.by_type",
+    ))
     by_tab = {"story": 0, "about_me": 0, "ta_thinking": 0}
     for mem_type, count in by_type.items():
         tab = memory_service.TAB_FOR_TYPE.get(mem_type, "unknown")
@@ -780,27 +891,69 @@ def _data_track_memory_from_snapshot(snap: dict) -> dict:
         "total": int(memory.get("total") or 0),
         "by_tab": by_tab,
         "by_type": by_type,
-        "by_source": _data_track_count_dict(memory.get("by_source")),
+        "by_source": _data_track_count_dict(
+            memory.get("by_source"), invalid_fields=invalid_fields,
+            field_prefix="memory.by_source",
+        ),
         "changes": int((snap.get("logs") or {}).get("memory_changes", {}).get("count") or 0),
-        "changes_by_action": _data_track_count_dict(log_counts.get("changes_by_action")),
-        "changes_by_capture_mode": _data_track_count_dict(log_counts.get("changes_by_capture_mode")),
+        "changes_by_action": _data_track_count_dict(
+            log_counts.get("changes_by_action"), invalid_fields=invalid_fields,
+            field_prefix="memory.changes_by_action",
+        ),
+        "changes_by_capture_mode": _data_track_count_dict(
+            log_counts.get("changes_by_capture_mode"), invalid_fields=invalid_fields,
+            field_prefix="memory.changes_by_capture_mode",
+        ),
+        "changes_breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
         "capture_jobs": int(extra.get("capture_jobs") or 0),
-        "capture_jobs_by_status": _data_track_count_dict(log_counts.get("capture_jobs_by_status")),
-        "capture_jobs_by_mode": _data_track_count_dict(log_counts.get("capture_jobs_by_mode")),
+        "capture_jobs_by_status": _data_track_count_dict(
+            log_counts.get("capture_jobs_by_status"), invalid_fields=invalid_fields,
+            field_prefix="memory.capture_jobs_by_status",
+        ),
+        "capture_jobs_by_mode": _data_track_count_dict(
+            log_counts.get("capture_jobs_by_mode"), invalid_fields=invalid_fields,
+            field_prefix="memory.capture_jobs_by_mode",
+        ),
         "capture_actions_written": int(extra.get("capture_actions_written") or 0),
+        "capture_breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
         "last_capture_at": _data_track_iso(extra.get("last_capture_ts")),
         "first_created_at": _data_track_iso(memory.get("first_created_at")),
         "last_created_at": _data_track_iso(memory.get("last_created_at")),
         "earliest_occurred_at": _data_track_iso(memory.get("earliest_occurred_at")),
         "latest_occurred_at": _data_track_iso(memory.get("latest_occurred_at")),
+        "counts_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
+        "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
 def _data_track_chat_from_snapshot(snap: dict) -> dict:
     chat = dict(snap.get("chat") or {})
-    by_role = _data_track_count_dict(chat.get("by_role"))
-    by_source = _data_track_count_dict(chat.get("by_source"))
-    by_content_type = _data_track_count_dict(chat.get("by_content_type"))
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    invalid_fields: list[str] = []
+    by_role = _data_track_count_dict(
+        chat.get("by_role"), invalid_fields=invalid_fields,
+        field_prefix="chat.by_role",
+    )
+    by_source = _data_track_count_dict(
+        chat.get("by_source"), invalid_fields=invalid_fields,
+        field_prefix="chat.by_source",
+    )
+    by_content_type = _data_track_count_dict(
+        chat.get("by_content_type"), invalid_fields=invalid_fields,
+        field_prefix="chat.by_content_type",
+    )
     user_messages = int(chat.get("user_messages") or by_role.get("user", 0))
     agent_messages = int(
         chat.get("agent_messages")
@@ -824,6 +977,12 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
         "last_user_at": _data_track_iso(chat.get("last_user_ts")),
         "last_agent_at": _data_track_iso(chat.get("last_agent_ts")),
         "proactive_last_at": _data_track_iso(chat.get("proactive_last_ts")),
+        "counts_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
+        "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
@@ -929,18 +1088,37 @@ def _connection_health(route: str, access_modes: list, chat: dict) -> dict:
 def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     extra = dict(snap.get("proactive_extra") or {})
-    status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
-    kind_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_by_kind")))
-    raw_fail_kinds = _data_track_count_dict(extra.get("jobs_failed_by_kind"))
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
+    invalid_fields: list[str] = []
+
+    def counts(value, name: str) -> dict:
+        return _data_track_count_dict(
+            value, invalid_fields=invalid_fields, field_prefix=name,
+        )
+    status_counts = counts(extra.get("jobs_by_status"), "proactive.jobs_by_status")
+    kind_lanes = _bucket_proactive_kinds(
+        counts(extra.get("jobs_by_kind"), "proactive.jobs_by_kind")
+    )
+    raw_fail_kinds = counts(
+        extra.get("jobs_failed_by_kind"), "proactive.jobs_failed_by_kind"
+    )
     fail_lanes = _bucket_proactive_kinds(raw_fail_kinds)
     control_lanes = _bucket_proactive_kinds(
-        _data_track_count_dict(extra.get("jobs_control_by_kind"))
+        counts(extra.get("jobs_control_by_kind"), "proactive.jobs_control_by_kind")
     )
     user_unavailable_lanes = _bucket_proactive_kinds(
-        _data_track_count_dict(extra.get("jobs_user_unavailable_by_kind"))
+        counts(
+            extra.get("jobs_user_unavailable_by_kind"),
+            "proactive.jobs_user_unavailable_by_kind",
+        )
     )
-    live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
-    alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
+    live_status_counts = counts(
+        extra.get("live_activity_status"), "proactive.live_activity_status"
+    )
+    alert_status_counts = counts(
+        extra.get("alert_status"), "proactive.alert_status"
+    )
     decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
     decision_true = int(extra.get("decision_true") or 0)
     delivered = (
@@ -948,7 +1126,11 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         + alert_status_counts.get("delivered", 0)
         + alert_status_counts.get("logged_only", 0)
     )
-    failed_reasons = _data_track_count_dict(extra.get("jobs_failed_by_reason"))
+    # The DB aggregates group by the raw reason, so redaction happens here and
+    # the raw keys that collapse together must have their counts summed.
+    failed_reasons = notices_status_reason.sanitize_reason_counts(
+        counts(extra.get("jobs_failed_by_reason"), "proactive.jobs_failed_by_reason")
+    )
     failed = (
         sum(fail_lanes.values())
         if raw_fail_kinds
@@ -980,9 +1162,17 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
         "job_failed_reasons": failed_reasons,
-        "job_control_reasons": _data_track_count_dict(extra.get("jobs_control_by_reason")),
-        "job_user_unavailable_reasons": _data_track_count_dict(
-            extra.get("jobs_user_unavailable_by_reason")
+        "job_control_reasons": notices_status_reason.sanitize_reason_counts(counts(
+            extra.get("jobs_control_by_reason"), "proactive.jobs_control_by_reason"
+        )),
+        "job_user_unavailable_reasons": notices_status_reason.sanitize_reason_counts(counts(
+            extra.get("jobs_user_unavailable_by_reason"),
+            "proactive.jobs_user_unavailable_by_reason",
+        )),
+        "breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
         ),
         "proactive_messages": int(chat.get("proactive_messages") or 0),
         "delivery_signals": delivered,
@@ -990,6 +1180,12 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "alert_status": alert_status_counts,
         "device_events": int(logs.get("device_events", {}).get("count") or 0),
         "last_at": core_util._epoch_to_iso(last_at),
+        "counts_status": (
+            "unknown" if snapshot_unread else (
+                "invalid" if invalid_fields else "ok"
+            )
+        ),
+        "invalid_count_fields": sorted(set(invalid_fields)),
     }
 
 
@@ -997,22 +1193,58 @@ def _data_track_tracking_from_snapshot(snap: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     counts = dict(snap.get("log_counts") or {})
     tracking = logs.get("tracking_events", {}) or {}
-    return {
+    invalid_fields: list[str] = []
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
+    result = {
         "events": int(tracking.get("count") or 0),
-        "by_type": _data_track_count_dict(counts.get("tracking_by_type")),
+        "by_type": _data_track_count_dict(
+            counts.get("tracking_by_type"), invalid_fields=invalid_fields,
+            field_prefix="tracking.by_type",
+        ),
         "last_at": _data_track_iso(tracking.get("last_ts")),
+        "breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
     }
+    result["counts_status"] = (
+        "unknown" if snapshot_unread else (
+            "invalid" if invalid_fields else "ok"
+        )
+    )
+    result["invalid_count_fields"] = sorted(set(invalid_fields))
+    return result
 
 
 def _data_track_bootstrap_from_snapshot(snap: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     counts = dict(snap.get("log_counts") or {})
     bootstrap = logs.get("bootstrap_events", {}) or {}
-    return {
+    invalid_fields: list[str] = []
+    snapshot_unread = _data_track_snapshot_unread(snap)
+    legacy_status_unknown, legacy_status_omitted = _data_track_breakdowns_state(snap)
+    result = {
         "events": int(bootstrap.get("count") or 0),
-        "by_type": _data_track_count_dict(counts.get("bootstrap_by_type")),
+        "by_type": _data_track_count_dict(
+            counts.get("bootstrap_by_type"), invalid_fields=invalid_fields,
+            field_prefix="bootstrap.by_type",
+        ),
         "last_at": _data_track_iso(bootstrap.get("last_ts")),
+        "breakdowns_status": (
+            "unknown" if legacy_status_unknown else (
+                "omitted" if legacy_status_omitted else "available"
+            )
+        ),
     }
+    result["counts_status"] = (
+        "unknown" if snapshot_unread else (
+            "invalid" if invalid_fields else "ok"
+        )
+    )
+    result["invalid_count_fields"] = sorted(set(invalid_fields))
+    return result
 
 
 def _data_track_history_import_from_snapshot(snap: dict) -> dict:
@@ -1024,6 +1256,7 @@ def _data_track_history_import_from_snapshot(snap: dict) -> dict:
         "job_id": latest.get("job_id", ""),
         "status": latest.get("status", ""),
         "phase": latest.get("phase", ""),
+        "failed_phase": latest.get("failed_phase", ""),
         "phase_label": latest.get("phase_label", ""),
         "progress": latest.get("progress", 0),
         "created_at": latest.get("created_at", ""),
@@ -1066,6 +1299,7 @@ def _data_track_fast_validation(
     memory_total = int(memory.get("total") or 0)
     has_memories = memory_total > 0
     identity_written = identity is not None
+    consumer_poll_status = "not_applicable"
 
     if route == "model_api":
         # Hosted: "connection" = the backend actually produced a hosted reply.
@@ -1085,10 +1319,20 @@ def _data_track_fast_validation(
         norm_route = "official_import"
     else:  # resident / self-host
         consumer = consumer_state or {}
-        try:
-            age_sec = time.time() - float(consumer.get("last_poll_epoch") or 0)
-        except Exception:
+        raw_poll_epoch = consumer.get("last_poll_epoch")
+        if raw_poll_epoch in (None, "", 0):
             age_sec = None
+            consumer_poll_status = "missing"
+        else:
+            try:
+                parsed_poll_epoch = float(raw_poll_epoch)
+                if not math.isfinite(parsed_poll_epoch) or parsed_poll_epoch < 0:
+                    raise ValueError("invalid_poll_epoch")
+                age_sec = time.time() - parsed_poll_epoch
+                consumer_poll_status = "ok"
+            except (TypeError, ValueError, OverflowError):
+                age_sec = None
+                consumer_poll_status = "invalid"
         consumer_ok = (
             bool(consumer.get("official"))
             and age_sec is not None
@@ -1115,6 +1359,7 @@ def _data_track_fast_validation(
         "route": norm_route,
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
+        "consumer_poll_status": consumer_poll_status,
     }
 
 
@@ -1123,6 +1368,7 @@ def _effective_responder(
     route: str,
     consumer_state: dict | None,
     runtime: dict | None,
+    snapshot_read_status: dict | None = None,
     now_epoch: float | None = None,
 ) -> dict:
     """Classify who can answer, keeping current facts separate from samples.
@@ -1142,9 +1388,17 @@ def _effective_responder(
     runtime_state = str(
         runtime_data.get("hosted_runtime_state") or "resident"
     ).strip().lower()
+    read_status = (
+        snapshot_read_status if isinstance(snapshot_read_status, dict) else {}
+    )
+    read_level = str(read_status.get("level") or "").strip().lower()
+    read_failed = bool(read_level and read_level != "ok")
 
     raw_pollers = state.get("poll_consumers")
     pollers = raw_pollers if isinstance(raw_pollers, dict) else {}
+    invalid_poll_identities: list[str] = []
+    if raw_pollers is not None and not isinstance(raw_pollers, dict):
+        invalid_poll_identities.append("poll_consumers")
     # Backward compatibility for states written before poll_consumers existed.
     if not pollers and state.get("last_poll_epoch"):
         consumer_id = str(state.get("consumer_id") or "")
@@ -1168,11 +1422,22 @@ def _effective_responder(
     poll_observations = []
     for identity, value in pollers.items():
         if not isinstance(value, dict):
+            invalid_poll_identities.append(str(identity))
             continue
-        try:
-            last_epoch = float(value.get("last_poll_epoch") or 0)
-        except (TypeError, ValueError):
+        raw_last_epoch = value.get("last_poll_epoch")
+        last_poll_status = "missing"
+        if raw_last_epoch in (None, "", 0):
             last_epoch = 0.0
+        else:
+            try:
+                last_epoch = float(raw_last_epoch)
+                if not math.isfinite(last_epoch) or last_epoch < 0:
+                    raise ValueError("invalid_poll_epoch")
+                last_poll_status = "ok"
+            except (TypeError, ValueError, OverflowError):
+                last_epoch = 0.0
+                last_poll_status = "invalid"
+                invalid_poll_identities.append(str(identity))
         age_sec = max(0.0, now - last_epoch) if last_epoch > 0 else None
         responder = str(value.get("responder") or "")
         if responder not in {"hosted_v1", "hosted_v2", "resident"}:
@@ -1190,6 +1455,7 @@ def _effective_responder(
                 "responder": responder,
                 "last_poll_at": str(value.get("last_poll_at") or ""),
                 "last_poll_epoch": last_epoch,
+                "last_poll_status": last_poll_status,
                 "age_sec": int(age_sec) if age_sec is not None else None,
                 "recent": bool(
                     age_sec is not None
@@ -1213,7 +1479,13 @@ def _effective_responder(
     detected = set(current)
     detected.update(item["responder"] for item in recent_polls)
 
-    if v2_owned:
+    if read_failed:
+        # Every positive/negative responder fact above comes from the same DB
+        # snapshot. A failed read is a third bucket, not evidence that nobody
+        # currently owns or polls the user.
+        effective = "unknown"
+        basis = "snapshot_read_failed"
+    elif v2_owned:
         effective = "hosted_v2"
         basis = "v2_runtime_ownership"
     elif v1_lease_active:
@@ -1241,6 +1513,7 @@ def _effective_responder(
 
     return {
         "effective_responder": effective,
+        "read_status": "read_failed" if read_failed else "ok",
         "runtime_state": runtime_state,
         "basis": basis,
         "mismatch": bool(mismatch_reasons),
@@ -1248,6 +1521,17 @@ def _effective_responder(
         "current_control_plane": sorted(current),
         "poll_observations": poll_observations,
         "recent_poll_observations": recent_polls,
+        "poll_evidence_status": (
+            "unknown" if read_failed else (
+                "invalid" if invalid_poll_identities
+                else "ok" if any(
+                    item.get("last_poll_status") == "ok"
+                    for item in poll_observations
+                )
+                else "missing"
+            )
+        ),
+        "invalid_poll_identities": sorted(set(invalid_poll_identities)),
         "criteria": (
             "current: live agent_runtime_instances lease => hosted_v1; "
             "v2_runtime_state v2/draining => hosted_v2. "
@@ -1258,6 +1542,11 @@ def _effective_responder(
 
 
 def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
+    snap = dict(snap)
+    snap.setdefault(
+        "snapshot_read_status",
+        {"level": "unavailable", "message": "取数状态缺失"},
+    )
     user_id = str(user_entry.get("user_id") or "")
     blobs = dict(snap.get("blobs") or {})
     route_data = blobs.get("onboarding_route") or {}
@@ -1335,6 +1624,9 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
             "next_action": validation.get("next_action", ""),
             "steps": [],
             "stuck_for_sec": stuck_for_sec,
+            "consumer_poll_status": validation.get(
+                "consumer_poll_status", "not_applicable"
+            ),
         },
         "last_activity_at": core_util._epoch_to_iso(latest_epoch),
         "chat": chat,
@@ -1357,6 +1649,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
             else None
         ),
         runtime=snap.get("responder_runtime"),
+        snapshot_read_status=snap.get("snapshot_read_status"),
     )
     return row
 
@@ -1420,11 +1713,16 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
 
 def _notice_summaries(user_id: str, *, limit: int = _NOTICE_SUMMARY_LIMIT) -> list[dict]:
     """Return recent notice metadata using an explicit content-free allowlist."""
-    def _count(value) -> int:
+    def _count(value) -> tuple[int, str]:
+        if value in (None, ""):
+            return 0, "missing"
         try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
+            parsed = int(value)
+            if parsed < 0:
+                raise ValueError("negative_occurrences")
+            return parsed, "ok"
+        except (TypeError, ValueError, OverflowError):
+            return 0, "invalid"
 
     def _last_ts(row: dict) -> float:
         return float(core_util._to_epoch(row.get("last_ts")) or 0)
@@ -1435,16 +1733,18 @@ def _notice_summaries(user_id: str, *, limit: int = _NOTICE_SUMMARY_LIMIT) -> li
         key=_last_ts,
         reverse=True,
     )[: max(0, int(limit))]
-    return [
-        {
+    out = []
+    for row in rows:
+        occurrences, occurrences_status = _count(row.get("occurrences"))
+        out.append({
             "error_class": str(row.get("error_class") or "")[:160],
             "blame": str(row.get("blame") or "")[:80],
             "severity": str(row.get("severity") or "")[:40],
-            "occurrences": _count(row.get("occurrences")),
+            "occurrences": occurrences,
+            "occurrences_status": occurrences_status,
             "last_ts": _last_ts(row),
-        }
-        for row in rows
-    ]
+        })
+    return out
 
 
 def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) -> dict:
@@ -1479,11 +1779,18 @@ def _runtime_summary(store: UserStore) -> dict:
            "driver": "", "driver_lens": _DRIVER_LENS, "codex_transport": "",
            "cli_cmd_custom": False, "reasoning_effort": "",
            "context_window_configured": 0, "context_window_tokens": 0,
-           "context_window_source": ""}
+           "context_window_source": "", "config_status": "ok",
+           "driver_status": "not_applicable"}
     try:
         from hosted import config_store as _cfg_store
-        cfg = _cfg_store._load_model_api_config(store) or {}
+        cfg = _cfg_store._load_model_api_config(store)
     except Exception:
+        out["config_status"] = "unavailable"
+        return out
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, Mapping):
+        out["config_status"] = "invalid"
         return out
     provider = str(cfg.get("provider") or "")
     out.update({
@@ -1501,7 +1808,9 @@ def _runtime_summary(store: UserStore) -> dict:
             out["driver"] = _cutover.driver_for_provider(provider)
             out["codex_transport"] = _cutover.codex_transport(provider)
         except Exception:
-            pass
+            out["driver_status"] = "unavailable"
+        else:
+            out["driver_status"] = "ok"
         # Only a configured route has a budget. Resolving one for an empty
         # provider/model still returns the deployment default, which would
         # print a concrete window for a user who has no model route at all —
@@ -1579,9 +1888,14 @@ def _provider_attempts_detail(store: UserStore) -> dict:
         _PROVIDER_ATTEMPT_STREAM,
         limit=_PROVIDER_ATTEMPT_DETAIL_LIMIT + 1,
     )
+    attempts = rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:]
     return {
+        "user_id": store.user_id,
         "coverage": "provider_runtime_and_model_api_probes",
-        "attempts": rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:],
+        "attempts": attempts,
+        # Counts cover the same explicit recent-attempt window returned below;
+        # they are not presented as all-time totals.
+        "fallback_counts": provider_attempt_ledger.summarize_fallbacks(attempts),
         "has_more": len(rows) > _PROVIDER_ATTEMPT_DETAIL_LIMIT,
     }
 
@@ -1695,18 +2009,39 @@ def _v2_wake_schedule_detail(user_id: str, settings: dict | None) -> dict:
             "blocked_by": ["no_schedule_row"],
             "note": "该用户尚未被 V2 调度器接管过（无 v2_wake_schedule 行）",
         }
+    if not isinstance(row, dict):
+        return {
+            "present": True,
+            "fields_status": "invalid",
+            "field_status": {"schedule_row": "invalid"},
+            "error": "schedule_row_invalid",
+        }
+    if not isinstance(diagnosis, dict):
+        diagnosis = {}
+
+    field_status: dict[str, str] = {}
 
     def _epoch(key: str) -> float:
-        try:
-            return float(row.get(key) or 0.0)
-        except (TypeError, ValueError):
+        raw = row.get(key)
+        if raw in (None, ""):
+            field_status[key] = "missing"
             return 0.0
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            field_status[key] = "invalid"
+            return 0.0
+        if not math.isfinite(parsed) or parsed < 0:
+            field_status[key] = "invalid"
+            return 0.0
+        field_status[key] = "ok"
+        return parsed
 
     def _iso(key: str) -> str:
         value = _epoch(key)
         return _data_track_iso(value) if value else ""
 
-    return {
+    out = {
         "present": True,
         "now": _data_track_iso(time.time()),
         # ⚠️ 只列 `v2_wake_schedule` **真实存在**的列。我第一版凭印象写了
@@ -1727,15 +2062,20 @@ def _v2_wake_schedule_detail(user_id: str, settings: dict | None) -> dict:
         # 空列表 = 现在就该到期。非空 = 这些条件挡着,判据与调度器同源。
         "blocked_by": list(diagnosis.get("blocked_by") or []),
     }
+    out["field_status"] = field_status
+    out["fields_status"] = (
+        "invalid" if "invalid" in field_status.values() else "ok"
+    )
+    return out
 
 
 def _v2_profile_detail(user_id: str) -> dict:
     """Return the Runtime V2 profile's content-free support metadata only.
 
-    The encrypted ``memory`` / ``user`` envelope bodies are deliberately not
-    copied, validated, or decrypted here.  Keep this as an explicit allowlist:
-    a future field added to the stored profile must not automatically become
-    visible through the admin detail endpoint.
+    The producer validates the stored document shape.  Encrypted ``memory`` /
+    ``style`` envelope bodies are still never copied or decrypted here.  Keep
+    the returned projection as an explicit allowlist: a future producer field
+    must not automatically become visible through the admin detail endpoint.
     """
     try:
         from model_api_runtime.v2 import profile_store as _v2_profile_store
@@ -1745,31 +2085,23 @@ def _v2_profile_detail(user_id: str) -> dict:
             _v2_profile_store.PROFILE_BLOB_KIND,
         )
     except Exception:  # noqa: BLE001 — observability must never 500 the page
-        return {"state": "read_error"}
+        return {"state": "read_error", "document_status": "unavailable"}
 
     if document is None:
-        return {"state": "missing"}
-    if not isinstance(document, dict):
-        return {"state": "read_error"}
+        return {"state": "missing", "document_status": "missing"}
+    try:
+        document = _v2_profile_store.validate_profile_document(document)
+    except _v2_profile_store.ProfileStorageError as exc:
+        # The producer already owns the full storage schema.  Reusing it here
+        # prevents admin from maintaining a weaker copy where malformed counts
+        # quietly become zero.  Its errors are content-free stable codes.
+        return {
+            "state": "read_error",
+            "document_status": "invalid",
+            "invalid_reason": str(exc)[:160],
+        }
 
     state = str(document.get("state") or "")
-    if state not in {"ok", "pending", "degraded", "empty"}:
-        return {"state": "read_error"}
-
-    def _count(value) -> int:
-        if isinstance(value, bool):
-            return 0
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    def _retry_at(value) -> float:
-        try:
-            parsed = float(value or 0)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-        return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
 
     source = document.get("source")
     if not isinstance(source, dict):
@@ -1786,23 +2118,26 @@ def _v2_profile_detail(user_id: str) -> dict:
         style = document.get("user")
     if not isinstance(style, dict):
         style = {}
-    style_chars = _count(style.get("chars"))
+    style_chars = int(style.get("chars") or 0)
 
     return {
         "state": state,
-        "memory_chars": _count(memory.get("chars")),
+        "document_status": "ok",
+        "memory_chars": int(memory.get("chars") or 0),
         "style_chars": style_chars,
         # One-version compatibility alias for external admin consumers.
         "user_chars": style_chars,
         "source": {
-            "card_count": _count(source.get("card_count")),
+            "card_count": int(source.get("card_count") or 0),
             "max_updated_at": str(source.get("max_updated_at") or ""),
             "generated_at": str(source.get("generated_at") or ""),
         },
         "last_attempt": {
             "reject_code": str(last_attempt.get("reject_code") or "")[:160],
-            "attempts": _count(last_attempt.get("attempts")),
-            "retry_not_before": _retry_at(last_attempt.get("retry_not_before")),
+            "attempts": int(last_attempt.get("attempts") or 0),
+            "retry_not_before": float(
+                last_attempt.get("retry_not_before") or 0.0
+            ),
         },
         "disabled": document.get("disabled") is True,
     }
@@ -1810,7 +2145,14 @@ def _v2_profile_detail(user_id: str) -> dict:
 
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
-    store = core_store.get_store(user_id)
+    store = core_store.get_store(
+        user_id,
+        require={
+            StoreSection.CHAT,
+            StoreSection.TOKENS,
+            StoreSection.WORLD_BOOKS,
+        },
+    )
     route_data = db.get_blob(store.user_id, "onboarding_route") or {}
     route = onboarding._load_onboarding_route(store)
     access_modes = registry._public_access_mode_state(dict(user_entry), route)
@@ -1912,6 +2254,14 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
             maximum=90,
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
+        detail_snapshot_status = dict(
+            detail_snapshot.get("snapshot_read_status") or {
+                "level": "unavailable",
+                "message": "取数状态缺失",
+            }
+        )
+        detail_snapshot["snapshot_read_status"] = detail_snapshot_status
+        row["snapshot_read_status"] = detail_snapshot_status
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
         row["screen_frames"] = _data_track_screen_frames_from_snapshot(
             detail_snapshot
@@ -1928,12 +2278,18 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
                 else None
             ),
             runtime=detail_snapshot.get("responder_runtime"),
+            snapshot_read_status=detail_snapshot_status,
         )
-        row["daily_usage"] = db.admin_data_track_user_daily_usage(
-            user_id=user_id,
-            days=daily_days,
-            tz="Asia/Shanghai",
-        )
+        try:
+            row["daily_usage"] = db.admin_data_track_user_daily_usage(
+                user_id=user_id,
+                days=daily_days,
+                tz="Asia/Shanghai",
+            )
+            row["daily_usage_query"] = "ok"
+        except db.AdminDataTrackDailyUsageReadError:
+            row["daily_usage"] = []
+            row["daily_usage_query"] = "failed"
         row["daily_usage_days"] = daily_days
         row["runtime"] = _runtime_summary(store)
         row["model_api_routes"] = _model_api_route_summaries(user_id)
@@ -2018,6 +2374,11 @@ def _data_track_request_filters() -> dict:
     raw_runtime_state = (request.args.get("runtime_state") or "").strip().lower()
     if raw_runtime_state not in {"", "v2", "draining", "resident"}:
         raw_runtime_state = ""
+    raw_human_activity = (
+        request.args.get("human_activity") or "all"
+    ).strip().lower()
+    if raw_human_activity not in {"all", "active", "inactive"}:
+        raw_human_activity = "all"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -2037,6 +2398,14 @@ def _data_track_request_filters() -> dict:
         "view": raw_view,
         "runtime_state": raw_runtime_state,
         "days": read_int("days", 30, 1, 1000),
+        # Query-time cohort control: the product question is whether failures
+        # are concentrated in abandoned accounts.  The activity definition is
+        # never welded into the rollup itself; callers choose a window and the
+        # only signal is chat.last_user_at (not last_activity_at, which includes
+        # the very background work being diagnosed).
+        "human_activity": raw_human_activity,
+        "human_days": read_int("human_days", 7, 1, 3650),
+        "lane_days": read_int("lane_days", 7, 1, 90),
     }
 
 
@@ -2080,6 +2449,101 @@ def _data_track_apply_runtime_filter(rows: list[dict], runtime_state: str) -> li
         if str((row.get("responder") or {}).get("runtime_state") or "resident")
         .strip().lower() == selected
     ]
+
+
+def _data_track_apply_human_filter(rows: list[dict], selected: str) -> list[dict]:
+    cohort = str(selected or "all").strip().lower()
+    if cohort not in {"active", "inactive"}:
+        return rows
+    return [
+        row for row in rows
+        if str((row.get("human_activity") or {}).get("state") or "inactive")
+        == cohort
+    ]
+
+
+def _background_lane_empty() -> dict:
+    return {
+        "completed": 0,
+        "failed": 0,
+        "expired": 0,
+        "superseded": 0,
+        "operational_failures": 0,
+        "control_outcomes": 0,
+        "user_unavailable": 0,
+        "terminal_attempts": 0,
+        "failure_rate": None,
+        "failure_codes": {},
+    }
+
+
+def _background_lanes_for_user(
+    report: dict, *, user_id: str, route: str
+) -> dict:
+    raw_users = report.get("users") if isinstance(report, dict) else {}
+    raw = (
+        raw_users.get(user_id)
+        if isinstance(raw_users, dict) and isinstance(raw_users.get(user_id), dict)
+        else {}
+    )
+    lanes = raw.get("lanes") if isinstance(raw.get("lanes"), dict) else {}
+    coverage_by_route = (
+        report.get("coverage_by_route")
+        if isinstance(report.get("coverage_by_route"), dict) else {}
+    )
+    raw_routes = raw.get("routes") if isinstance(raw.get("routes"), dict) else {}
+    # The primary lane totals combine every execution family observed for the
+    # user in this window, so their coverage must do the same. Always union the
+    # current runtime family: after a resident -> V2 switch, old resident cells
+    # cannot make an as-yet-unmeasured model_api path look healthy.
+    coverage_routes = sorted(
+        {str(value) for value in raw_routes} | {str(route)}
+    )
+    route_coverage = {
+        value: dict(coverage_by_route.get(value) or {
+            "level": "unavailable",
+            "message": f"{value} 无覆盖证据",
+        })
+        for value in coverage_routes
+    }
+    rank = {
+        "green": 0,
+        "partial": 1,
+        "unavailable": 2,
+        "timeout": 3,
+        "read_error": 4,
+    }
+    coverage_level = max(
+        (str(value.get("level") or "unavailable")
+         for value in route_coverage.values()),
+        key=lambda value: rank.get(value, rank["unavailable"]),
+    )
+    if len(route_coverage) == 1:
+        coverage = dict(next(iter(route_coverage.values())))
+    else:
+        coverage = {
+            "level": coverage_level,
+            "message": "；".join(
+                f"{value}={details.get('level') or 'unavailable'}"
+                for value, details in route_coverage.items()
+            ),
+        }
+    return {
+        "window": dict(report.get("window") or {}),
+        "read_status": dict(report.get("read_status") or {}),
+        "coverage_route": route,
+        "coverage_routes": coverage_routes,
+        "coverage_by_route": route_coverage,
+        "coverage": dict(coverage),
+        "lanes": {
+            lane: dict(lanes.get(lane) or _background_lane_empty())
+            for lane in ("heartbeat", "capture")
+        },
+        # A user can cross routes during the selected window. Preserve the
+        # route split for investigation while keeping the two primary cells
+        # above easy to sort/render.
+        "routes": dict(raw.get("routes") or {}),
+    }
 
 
 def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> None:
@@ -2139,7 +2603,28 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     with registry._users_lock:
         users = [dict(u) for u in registry._users if u.get("user_id")]
     users = _data_track_filter_users(users, filters)
-    snapshot = db.admin_data_track_snapshot([str(u.get("user_id") or "") for u in users])
+    user_ids = [str(u.get("user_id") or "") for u in users]
+    snapshot = db.admin_data_track_snapshot(
+        user_ids,
+        # Fleet-wide users *and* summary paths must stay bounded. One-user
+        # detail bypasses this payload and keeps the legacy breakdowns through
+        # admin_data_track_snapshot's default True.
+        include_legacy_background=False,
+        # Same reason, one layer down: the memory breakdowns are per-row
+        # rendering only, and each one costs another detoast pass of every
+        # encrypted card in the fleet. They are re-read for the page below.
+        include_memory_breakdowns=False,
+        # Screen frames likewise: every field is per-row or detail-page, and
+        # latest_ts is not one of _latest_epoch's inputs, so no fleet-wide
+        # consumer reads this aggregate. Re-read for the page below.
+        include_screen_frames=False,
+        # And bootstrap_events, which has no fleet-wide reader at all. See
+        # db._PAGED_LOG_STREAMS for why it qualifies — in particular why it may
+        # leave the fleet-wide _latest_epoch inputs, and why memory_capture_jobs
+        # is dropped outright instead of being re-read per page.
+        include_paged_log_streams=False,
+    )
+    human_cutoff = time.time() - int(filters.get("human_days") or 7) * 86400
     rows = []
     for u in users:
         uid = str(u.get("user_id") or "")
@@ -2150,6 +2635,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         health = dict(snapshot.get(uid, {}).get("provider_health") or {})
         row.update(
             {
+                "snapshot_read_status": dict(
+                    snapshot.get(uid, {}).get("snapshot_read_status") or {
+                        "level": "unavailable",
+                        "message": "取数状态缺失",
+                    }
+                ),
                 "provider_state": str(
                     health.get("provider_state") or "ok"
                 ),
@@ -2164,11 +2655,30 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
                 ),
             }
         )
+        if include_users:
+            last_user_epoch = core_util._to_epoch(
+                (row.get("chat") or {}).get("last_user_at")
+            )
+            row["human_activity"] = {
+                "state": (
+                    "active"
+                    if last_user_epoch and last_user_epoch >= human_cutoff
+                    else "inactive"
+                ),
+                "basis": "chat.last_user_at",
+                "days": int(filters.get("human_days") or 7),
+                "last_user_at": str(
+                    (row.get("chat") or {}).get("last_user_at") or ""
+                ),
+            }
         rows.append(row)
     rows = _data_track_apply_runtime_filter(
         rows, str(filters.get("runtime_state") or "")
     )
     rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
+    rows = _data_track_apply_human_filter(
+        rows, str(filters.get("human_activity") or "all")
+    )
     _data_track_sort_rows(rows, str(filters.get("sort") or ""), str(filters.get("dir") or "desc"))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
     incomplete = max(0, len(rows) - completed)
@@ -2181,6 +2691,9 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     proactive_jobs = 0
     proactive_messages = 0
     proactive_failed = 0
+    # This fleet-wide payload deliberately omits the legacy JSON breakdowns;
+    # one-user detail is the only path where that all-history contract remains.
+    proactive_breakdown_states: set[str] = set()
     # Ground-truth activation funnel — derived from REAL behaviour (memory
     # written / messages sent / replies received / recency), independent of the
     # onboarding-stage label. This is the trustworthy usage view: a user who has
@@ -2218,7 +2731,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         memory_total += row["memory"]["total"]
         proactive_jobs += row["proactive"]["jobs"]
         proactive_messages += row["proactive"]["proactive_messages"]
-        proactive_failed += row["proactive"]["failed_jobs"]
+        proactive_breakdown_state = str(
+            row["proactive"].get("breakdowns_status") or "unknown"
+        )
+        proactive_breakdown_states.add(proactive_breakdown_state)
+        if proactive_breakdown_state == "available":
+            proactive_failed += row["proactive"]["failed_jobs"]
         if row.get("provider_state") == "needs_user_action":
             provider_needs_user_action += 1
         if int(row["memory"].get("total") or 0) > 0:
@@ -2276,6 +2794,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         lane="chat",
         within_days=int(filters.get("days") or 30),
     )
+    proactive_breakdowns_status = (
+        "unknown"
+        if "unknown" in proactive_breakdown_states
+        or not proactive_breakdown_states <= {"available", "omitted"}
+        else "available"
+        if proactive_breakdown_states == {"available"}
+        else "omitted"
+    )
     # 聊天数字的覆盖范围。顶层一份，**不进每个用户行**：那份返回按 user_id 键控，
     # 加非 uid 的键会让调用方拿到一个假用户；每行各存一份既冗余，又会让人以为
     # 覆盖是 per-user 的。complete=False 时页面必须显示缺口——一个数字旁边没有
@@ -2314,7 +2840,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "memory_avg_per_user": (memory_total / len(rows)) if rows else 0,
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
-        "proactive_failed_total": proactive_failed,
+        "proactive_failed_total": (
+            proactive_failed
+            if proactive_breakdowns_status == "available"
+            else None
+        ),
+        "proactive_breakdowns_status": proactive_breakdowns_status,
         "provider_needs_user_action": provider_needs_user_action,
         "app_usage": {
             "foreground_sec_total": au_fg_total,
@@ -2333,12 +2864,103 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             "sort": filters.get("sort", ""),
             "dir": filters.get("dir", "desc"),
             "runtime_state": filters.get("runtime_state", ""),
+            "human_activity": filters.get("human_activity", "all"),
+            "human_days": int(filters.get("human_days") or 7),
+            "lane_days": int(filters.get("lane_days") or 7),
         },
     }
     if include_users:
         offset = int(filters.get("offset") or 0)
         limit = int(filters.get("limit") or 100)
-        payload["users"] = rows[offset:offset + limit]
+        page = rows[offset:offset + limit]
+        # The per-user lane scan grows with the number of ids handed to it, so it
+        # runs on the page only. Nothing upstream reads background_lanes — no
+        # filter, no sort key, no summary aggregate — and the fleet-level fields
+        # below come from the ids-independent watermark table.
+        page_ids = [str(r.get("user_id") or "") for r in page]
+        background_report = db.admin_background_lane_users(
+            page_ids,
+            days=int(filters.get("lane_days") or 7),
+        )
+        # Same pushdown for the memory breakdowns. The row is rebuilt through
+        # the one mapper rather than patched field by field, so the page result
+        # is field-identical to what the fleet-wide read produced.
+        memory_breakdowns, memory_read_status = db.admin_memory_breakdowns(page_ids)
+        # And the same for screen frames. broadcast_stalled is derived from the
+        # frame recency *and* the broadcast report, so the row is rebuilt from
+        # the still-fleet-wide screen_broadcast half plus the page-scoped
+        # counters rather than patched field by field.
+        screen_frames, screen_read_status = db.admin_screen_frames(page_ids)
+        paged_logs, logs_read_status = db.admin_paged_log_streams(page_ids)
+        for row in page:
+            uid = str(row.get("user_id") or "")
+            snap = snapshot.get(uid) or {}
+            base_read_status = dict(
+                snap.get("snapshot_read_status") or {
+                    "level": "unavailable",
+                    "message": "取数状态缺失",
+                }
+            )
+
+            def lane_snap(read_status: dict) -> dict:
+                """Attach the status for the exact read feeding one mapper."""
+                out = dict(snap)
+                if base_read_status.get("level") != "ok":
+                    out["snapshot_read_status"] = base_read_status
+                else:
+                    out["snapshot_read_status"] = dict(read_status)
+                return out
+
+            breakdown = memory_breakdowns.get(uid)
+            memory_snap = lane_snap(memory_read_status)
+            if breakdown:
+                memory_snap["memory"] = {
+                    **(snap.get("memory") or {}),
+                    **breakdown,
+                }
+            row["memory"] = _data_track_memory_from_snapshot(memory_snap)
+            frames = screen_frames.get(uid)
+            if frames:
+                row["screen_frames"] = _data_track_screen_frames_from_snapshot({
+                    **lane_snap(screen_read_status),
+                    "screen_frames": frames,
+                })
+            logs = paged_logs.get(uid)
+            logs_snap = lane_snap(logs_read_status)
+            if logs:
+                logs_snap["logs"] = {**(snap.get("logs") or {}), **logs}
+            row["bootstrap_events"] = _data_track_bootstrap_from_snapshot(logs_snap)
+            for status in (memory_read_status, screen_read_status, logs_read_status):
+                if status.get("level") != "ok":
+                    row["snapshot_read_status"] = dict(status)
+            runtime_state = str(
+                (row.get("responder") or {}).get("runtime_state") or "resident"
+            ).strip().lower()
+            # lane_daily_rollup.route is the execution family, not the account's
+            # onboarding selection. Hosted V2/draining work freezes into
+            # model_api; resident and hosted-V1 work freezes into resident.
+            coverage_route = (
+                "model_api" if runtime_state in {"v2", "draining"}
+                else "resident"
+            )
+            row["background_lanes"] = _background_lanes_for_user(
+                background_report,
+                user_id=str(row.get("user_id") or ""),
+                route=coverage_route,
+            )
+        payload["background_lane_window"] = {
+            "window": dict(background_report.get("window") or {}),
+            "read_status": dict(background_report.get("read_status") or {}),
+            "coverage_by_route": dict(
+                background_report.get("coverage_by_route") or {}
+            ),
+            "denominator": "completed + operational_failures",
+            "excluded": (
+                "control_outcomes, user_unavailable, superseded, expired; "
+                "nonterminal jobs are reported by the separate stuck metric"
+            ),
+        }
+        payload["users"] = page
         payload["pagination"] = {
             "limit": limit,
             "offset": offset,
@@ -2667,7 +3289,7 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
     "stop_reason": frozenset({
         "", "blocklist", "content_filter", "end_turn", "function_call",
         "image_safety", "language", "length", "malformed_function_call",
-        "max_tokens", "other", "pause_turn", "prohibited_content",
+        "max_output_tokens", "max_tokens", "other", "pause_turn", "prohibited_content",
         "recitation", "refusal", "safety", "spii", "stop",
         "stop_sequence", "tool_calls", "tool_use",
     }),
@@ -2679,6 +3301,18 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
 _SILENT_REPLY_PUBLIC_ENUMS = {
     "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
     "cause": frozenset({"suppressed", "empty_response"}),
+}
+_PROTOCOL_FRAGMENT_PUBLIC_ENUMS = {
+    "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
+    "evidence": frozenset({
+        "head_in_reasoning", "joined_known_protocol", "orphan_json_tail",
+        "tool_call_tail", "transport_cut", "upstream_response_envelope",
+    }),
+    "stop_reason": _EMPTY_RESPONSE_PUBLIC_ENUMS["stop_reason"],
+}
+_TRANSPORT_CUT_PUBLIC_ENUMS = {
+    "lane": _EMPTY_RESPONSE_PUBLIC_ENUMS["lane"],
+    "stop_reason": frozenset({"length", "max_output_tokens", "max_tokens"}),
 }
 
 _MODEL_CALL_TRACE_TYPES = frozenset({
@@ -2700,10 +3334,6 @@ _LANGUAGE_FOLLOW_PUBLIC_ENUMS = {
         "indeterminate",
     }),
     "outcome": frozenset({"match", "mismatch", "skip"}),
-    "correction_outcome": frozenset({
-        "corrected", "kept_original_still_mismatch", "retry_error",
-        "retry_empty", "skipped",
-    }),
     "lane": frozenset({"chat", "wake"}),
 }
 
@@ -2797,31 +3427,91 @@ _TRACE_PUBLIC_FAILURE_CODE = object()  # 值必须命中产生方显式导出
 # `wake_failed:providererror` 等真实码因此可见,未知后缀仍保持遮蔽。
 
 
+def _load_jobs_store_failure_codes() -> set[str]:
+    from model_api_runtime.v2 import jobs_store as jobs_store
+
+    return set().union(
+        jobs_store.CONTROL_OUTCOME_CODES,
+        jobs_store.JOB_FAILURE_CODES,
+        jobs_store.SAFETY_SUPPRESSION_CODES,
+        jobs_store.TIMEOUT_OUTCOME_CODES,
+    )
+
+
+def _load_worker_failure_codes() -> set[str]:
+    from model_api_runtime.v2 import worker
+
+    return set(worker.PUBLIC_FAILURE_CODES)
+
+
+def _load_voice_failure_codes() -> set[str]:
+    from voice import error_codes
+
+    return set(error_codes.VOICE_GATEWAY_ERROR_CODES)
+
+
+_FAILURE_VOCABULARY_LOADERS = (
+    ("jobs_store", _load_jobs_store_failure_codes),
+    ("worker", _load_worker_failure_codes),
+    ("voice", _load_voice_failure_codes),
+)
+
+
+def _failure_vocabulary() -> tuple[frozenset[str], frozenset[str]]:
+    """Return codes plus producer sources that could not be loaded.
+
+    Only a complete read is cached.  A partial import is a legitimate degraded
+    admin response (some deployments may omit an optional producer), but it is
+    never promoted to the process-wide complete vocabulary: refresh/retry can
+    recover without restarting the process and every consumer can expose which
+    source was unavailable.
+    """
+    global _KNOWN_FAILURE_CODES_CACHE
+    if _KNOWN_FAILURE_CODES_CACHE is not None:
+        return _KNOWN_FAILURE_CODES_CACHE, frozenset()
+
+    codes: set[str] = set()
+    unavailable_sources: set[str] = set()
+    for source, loader in _FAILURE_VOCABULARY_LOADERS:
+        try:
+            loaded = loader()
+            codes.update(str(code) for code in loaded)
+        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
+            unavailable_sources.add(source)
+            continue
+
+    result = frozenset(codes)
+    if not unavailable_sources:
+        _KNOWN_FAILURE_CODES_CACHE = result
+    return result, frozenset(unavailable_sources)
+
+
 def _known_failure_codes() -> frozenset:
     """产生方**显式导出**的失败码集合,从模块读,管理端不抄也不推断。"""
-    global _KNOWN_FAILURE_CODES_CACHE
-    if _KNOWN_FAILURE_CODES_CACHE is None:
-        codes: set[str] = set()
-        try:
-            from model_api_runtime.v2 import jobs_store as _js
-            codes |= set(_js.CONTROL_OUTCOME_CODES)
-            codes |= set(_js.JOB_FAILURE_CODES)
-            codes |= set(_js.SAFETY_SUPPRESSION_CODES)
-            codes |= set(_js.TIMEOUT_OUTCOME_CODES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            pass
-        try:
-            from model_api_runtime.v2 import worker as _worker
-            codes |= set(_worker.PUBLIC_FAILURE_CODES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            pass
-        try:
-            from voice import error_codes as _voice_error_codes
-            codes |= set(_voice_error_codes.VOICE_GATEWAY_ERROR_CODES)
-        except Exception:  # noqa: BLE001 — 观测面永不因导入失败而 500
-            pass
-        _KNOWN_FAILURE_CODES_CACHE = frozenset(codes)
-    return _KNOWN_FAILURE_CODES_CACHE
+    codes, _unavailable_sources = _failure_vocabulary()
+    return codes
+
+
+def _failure_vocabulary_observability() -> dict:
+    _codes, unavailable_sources = _failure_vocabulary()
+    return {
+        "status": "partial" if unavailable_sources else "ok",
+        "unavailable_sources": sorted(unavailable_sources),
+    }
+
+
+def _render_failure_vocabulary_warning(observability: dict) -> str:
+    """Render a partial producer vocabulary as an instrument failure."""
+    if observability.get("status") == "ok":
+        return ""
+    missing = ", ".join(
+        str(value) for value in observability.get("unavailable_sources", [])
+    ) or "unknown"
+    return (
+        "<div class='note-box bad'><b>失败码词表仅部分可用。</b>"
+        f"未加载来源：{html.escape(missing)}；other 可能是量具缺口，"
+        "不能读成真实未分类。</div>"
+    )
 
 
 _KNOWN_FAILURE_CODES_CACHE = None
@@ -3021,6 +3711,24 @@ def _debug_event_public_json(
                 if isinstance(value, str) and value in allowed_values:
                     public_detail[key] = value
     if (
+        ev.get("type") == "reply.protocol_fragment_suppressed"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        for key, allowed_values in _PROTOCOL_FRAGMENT_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
+        ev.get("type") == "reply.transport_cut_observed"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        for key, allowed_values in _TRANSPORT_CUT_PUBLIC_ENUMS.items():
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed_values:
+                public_detail[key] = value
+    if (
         ev.get("type") == "reply.language_follow"
         and isinstance(raw_detail, dict)
         and isinstance(public_detail, dict)
@@ -3093,6 +3801,25 @@ def _debug_event_public_json(
             )
         ):
             public_detail["components"] = [dict(item) for item in components]
+    if (
+        ev.get("type") == "mcp.surface.provider"
+        and isinstance(raw_detail, dict)
+        and isinstance(public_detail, dict)
+    ):
+        # This list is emitted only after the same provider round has been
+        # classified. Expose it only when the whole value is the producer's
+        # already-normalized, deduplicated closed vocabulary.
+        from model_api_runtime.v2 import tool_loop as v2_tool_loop
+
+        rejection_reasons = raw_detail.get("call_rejection_reasons")
+        if (
+            isinstance(rejection_reasons, list)
+            and v2_tool_loop._normalize_provider_call_rejection_reasons(
+                rejection_reasons
+            )
+            == rejection_reasons
+        ):
+            public_detail["call_rejection_reasons"] = list(rejection_reasons)
     if (
         ev.get("type") == "mcp.roundtrip.provider"
         and isinstance(raw_detail, dict)
@@ -3185,6 +3912,27 @@ DEBUG_TRACE_CANDIDATE_CAP = 5_000
 DEBUG_TRACE_SIBLING_CAP = 5_000
 DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS = 2_000
 DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC = 1.0
+DEBUG_TRACE_DB_TOTAL_TIMEOUT_SEC = 2.75
+_DEBUG_TRACE_DB_DEADLINE_RESERVE_SEC = 0.05
+
+
+def _debug_db_limits(deadline: float) -> tuple[float, int]:
+    """Fit the next pool checkout and statement inside one request budget."""
+    remaining = float(deadline) - time.monotonic()
+    connection_timeout = min(
+        DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
+        max(0.01, remaining / 4),
+    )
+    statement_seconds = (
+        remaining - connection_timeout - _DEBUG_TRACE_DB_DEADLINE_RESERVE_SEC
+    )
+    if statement_seconds <= 0:
+        raise TimeoutError("debug database deadline exhausted")
+    statement_timeout_ms = min(
+        DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        max(1, int(statement_seconds * 1000)),
+    )
+    return connection_timeout, statement_timeout_ms
 
 
 def _normalize_debug_event_durations(events: list[dict]) -> None:
@@ -3196,6 +3944,7 @@ def _normalize_debug_event_durations(events: list[dict]) -> None:
 def _data_track_debug_flat_payload(
     *,
     trace_vocabulary,
+    failure_vocabulary: dict,
     filters: dict,
     limit: int,
     offset: int,
@@ -3208,9 +3957,11 @@ def _data_track_debug_flat_payload(
     q: str,
     since_epoch: float,
     live_users: dict[str, dict],
+    db_deadline: float,
 ) -> dict:
     """Build the flat firehose without materialising 50k wide rows in Python."""
     offset = min(max(0, int(offset)), DEBUG_TRACE_CANDIDATE_CAP)
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     result = db.query_trace_events_flat_page(
         user_id=user_filter,
         trace_id_contains=trace_filter,
@@ -3221,8 +3972,8 @@ def _data_track_debug_flat_payload(
         limit=limit,
         offset=offset,
         candidate_limit=DEBUG_TRACE_CANDIDATE_CAP,
-        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
-        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
     )
     # The extra row is a deterministic regression anchor: changing the DB call
     # back to the old 50k fetch, or fetching exactly ``limit`` and guessing
@@ -3237,6 +3988,7 @@ def _data_track_debug_flat_payload(
         )
         for event in events_out
     ))
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     sibling_rows, sibling_truncated = db.query_trace_event_turn_rows(
         turn_keys=page_ids,
         user_id=user_filter,
@@ -3246,8 +3998,8 @@ def _data_track_debug_flat_payload(
         since_epoch=since_epoch,
         candidate_limit=DEBUG_TRACE_CANDIDATE_CAP,
         sibling_limit=DEBUG_TRACE_SIBLING_CAP,
-        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
-        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
     )
     _normalize_debug_event_durations(sibling_rows)
     turns_out = _debug_trace_group_turns(
@@ -3276,8 +4028,13 @@ def _data_track_debug_flat_payload(
             {"user_id": user_filter, "events": 0, "last_ts": 0},
         )
     user_ids = sorted(user_stats)
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     trace_flags = db.get_blobs_for_users(
-        user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB]
+        user_ids,
+        [debug_trace.DEBUG_TRACE_FLAG_BLOB],
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
+        raise_on_error=True,
     )
     user_rows = []
     for uid in user_ids:
@@ -3351,6 +4108,7 @@ def _data_track_debug_flat_payload(
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
+            "failure_vocabulary": failure_vocabulary,
         },
         "pagination": pagination,
         "users": user_rows,
@@ -3360,7 +4118,9 @@ def _data_track_debug_flat_payload(
 
 
 def _data_track_debug_payload() -> dict:
+    db_deadline = time.monotonic() + DEBUG_TRACE_DB_TOTAL_TIMEOUT_SEC
     trace_vocabulary = _trace_vocabulary()
+    failure_vocabulary = _failure_vocabulary_observability()
     filters = _data_track_request_filters()
     limit = int(filters.get("limit") or 100)
     offset = int(filters.get("offset") or 0)
@@ -3401,6 +4161,7 @@ def _data_track_debug_payload() -> dict:
     if mode == "flat":
         return _data_track_debug_flat_payload(
             trace_vocabulary=trace_vocabulary,
+            failure_vocabulary=failure_vocabulary,
             filters=filters,
             limit=limit,
             offset=offset,
@@ -3413,12 +4174,14 @@ def _data_track_debug_payload() -> dict:
             q=q,
             since_epoch=since_epoch,
             live_users=live_users,
+            db_deadline=db_deadline,
         )
 
     # Direct table scan is bounded and filter-aware. Crucially, it begins from
     # trace rows rather than the live account registry, so an exact deleted uid
     # remains reachable for the 30-day incident window (T184 D7).
     scan_limit = DEBUG_TRACE_CANDIDATE_CAP
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
     all_events_raw = db.query_trace_events(
         user_id=user_filter,
         trace_id_contains=trace_filter,
@@ -3426,8 +4189,8 @@ def _data_track_debug_payload() -> dict:
         q=q,
         since_epoch=since_epoch,
         limit=scan_limit,
-        connection_timeout=DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC,
-        statement_timeout_ms=DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS,
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
     )
     # ⭐ 归一化放在**事件刚进来的这一刻**,而不是任何一个出口。
     #
@@ -3447,7 +4210,14 @@ def _data_track_debug_payload() -> dict:
         if event.get("user_id")
     }
     user_ids = sorted(set(live_users) | event_user_ids)
-    trace_flags = db.get_blobs_for_users(user_ids, [debug_trace.DEBUG_TRACE_FLAG_BLOB])
+    connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
+    trace_flags = db.get_blobs_for_users(
+        user_ids,
+        [debug_trace.DEBUG_TRACE_FLAG_BLOB],
+        connection_timeout=connection_timeout,
+        statement_timeout_ms=statement_timeout_ms,
+        raise_on_error=True,
+    )
 
     all_events = list(all_events_raw)
     user_rows: dict[str, dict] = {}
@@ -3550,6 +4320,7 @@ def _data_track_debug_payload() -> dict:
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
+            "failure_vocabulary": failure_vocabulary,
         },
         "pagination": pagination,
         "users": users_out,
@@ -3564,12 +4335,21 @@ def _data_track_dau_payload() -> dict:
     raw_day = str(request.args.get("day") or "").strip()
     requested_day = _validated_dau_day(raw_day) if raw_day else ""
     snapshot = db.admin_dau_snapshot_bounds()
-    rows = db.admin_data_track_dau(
-        since_epoch=float(filters.get("since_epoch") or 0),
-        days=days,
-        tz="Asia/Shanghai",
+    try:
+        rows = db.admin_data_track_dau(
+            since_epoch=float(filters.get("since_epoch") or 0),
+            days=days,
+            tz="Asia/Shanghai",
+        )
+        dau_query_status = "ok"
+    except db.AdminDataTrackDauReadError:
+        rows = []
+        dau_query_status = "failed"
+    invalid_days: list[str] = []
+    default_histogram_day = _default_usage_histogram_day(
+        rows, invalid_days=invalid_days,
     )
-    histogram_day = requested_day or _default_usage_histogram_day(rows)
+    histogram_day = requested_day or default_histogram_day
     usage_histogram = db.admin_data_track_usage_histogram(
         day=histogram_day,
         tz="Asia/Shanghai",
@@ -3611,6 +4391,11 @@ def _data_track_dau_payload() -> dict:
             for row in rows
         ],
         "usage_histogram": usage_histogram,
+        "observability": {
+            "dau_query": dau_query_status,
+            "day_values": "invalid" if invalid_days else "ok",
+            "invalid_day_rows": len(invalid_days),
+        },
         "definition": {
             "dau": "DAU = 使用 DAU: distinct users with an app_session_end (foreground app open) on the Beijing day. Chat DAU / Tracking DAU are looser breakdowns.",
             "excluded": "Agent/openclaw messages, proactive writes, and verify_ping synthetic messages are excluded.",
@@ -5030,6 +5815,10 @@ def _render_runtime_health_page(
     是 None（各自独立的失败域，见 admin_core）：取不到时对应区块显「暂不可用」，
     不得把 None 渲染成 0——0 是"确认过是零"。
     """
+    failure_vocabulary = _failure_vocabulary_observability()
+    failure_vocabulary_warning = _render_failure_vocabulary_warning(
+        failure_vocabulary
+    )
     service_level, service_reasons = _runtime_service_level(payload, delivery)
     if delivery is None and service_level == "ok":
         service_level = "warn"
@@ -5385,6 +6174,7 @@ def _render_runtime_health_page(
   <h1>Runtime 健康</h1>
   <div class="muted">Generated {html.escape(_bj_iso(payload.get("generated_at")))}. Metadata only; encrypted content is not read or rendered.</div>
   {_render_data_track_view_nav("runtime")}
+  {failure_vocabulary_warning}
   <div class="sortbar">{window_links}</div>
   <h2>状态拆分</h2>
   {split_health}
@@ -5548,6 +6338,36 @@ def _ops_import_level(report: dict | None) -> tuple[str, list[str]]:
     return level, reasons
 
 
+def _chat_missing_split(delivery: dict) -> tuple[int, int, int]:
+    """把「completed 无 applied」拆成 (判得了的红, 判不了的, 本就不欠回复的).
+
+    三个桶，因为这个总量里混了三种东西：
+
+    1. **红** —— 证据本该在、也没人删过它 ⇒ 干净的缺陷信号。
+    2. **判不了** —— Clear Chat 整表删掉 ``v2_effect_outbox`` 却保留
+       ``agent_jobs``，于是一个历史上真的送达过的 job 会退化成「无证据」，
+       **与真缺陷在这张表上完全同形**。算进红等于把合规删除报成缺陷，算进绿
+       等于用不确定性洗白真缺陷 ⇒ 只能单列。
+    3. **本就不欠** —— 这条 job 按其完成路径结构上就不产生 final effect
+       （空 coalesced / 迟到输入交接 / legacy final 重生）。它进红是**假红**，
+       而假红正是本单要治的病。
+
+    SQL 侧已经把三者做成互斥（benign 优先于 shadowed），所以这里是纯算术，
+    不会两处各减一次把红减成负数。仍然 clamp：上游口径万一漂了，宁可少报红
+    也不要报出一个负数把整页读者带偏。
+
+    判决与页面共用这一处派生 —— 两边各算一次就迟早会漂成两个口径。
+    """
+    missing = int(delivery.get("completed_without_final_applied") or 0)
+    benign = int(delivery.get("completed_without_final_applied_benign") or 0)
+    shadowed = int(
+        delivery.get("completed_without_final_applied_clear_shadowed") or 0
+    )
+    benign = max(0, min(benign, missing))
+    shadowed = max(0, min(shadowed, missing - benign))
+    return missing - benign - shadowed, shadowed, benign
+
+
 def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
     if report is None:
         return "unknown", ["聊天统计暂不可用"]
@@ -5569,11 +6389,19 @@ def _ops_chat_level(report: dict | None) -> tuple[str, list[str]]:
             level = "bad"
         if failure_rate >= 0.05:
             reasons.append(f"chat 终态未成功率 {failure_rate * 100:.1f}%")
-    missing = int(delivery.get("completed_without_final_applied") or 0)
+    unshadowed, shadowed, _benign = _chat_missing_split(delivery)
     reconciliation = int(delivery.get("final_reconciliation_jobs") or 0)
-    if missing:
+    if unshadowed:
         level = "bad"
-        reasons.append(f"{missing} 个 completed 没有 final reply server-applied 证据")
+        reasons.append(
+            f"{unshadowed} 个 completed 没有 final reply server-applied 证据"
+            "（且无 Clear Chat 痕）"
+        )
+    if shadowed:
+        reasons.append(
+            f"{shadowed} 个 completed 判不了：证据本该在，但落在该用户一次 "
+            "Clear Chat 之前，已被合规删除"
+        )
     if reconciliation:
         level = "bad"
         reasons.append(f"{reconciliation} 个 final reply 需要人工 reconcile")
@@ -5900,6 +6728,7 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
             f"<td class='{evidence_cls}'>{evidence_text}</td>"
             f"<td>{_fmt_count(row.get('memory_action_count'))} / {'有' if row.get('has_identity_evidence') else '无'}</td>"
             f"{_failure_code_cell(row.get('error_code'), missing='—')}"
+            f"<td><code>{html.escape(str(row.get('failed_phase') or '—'))}</code></td>"
             f"<td>{html.escape(_ops_time(row.get('created_at')))}</td>"
             f"<td>{html.escape(_ops_time(row.get('updated_at')))}</td>"
             "</tr>"
@@ -5926,10 +6755,10 @@ def _render_imports_page(report: dict | None, *, within_hours: int) -> str:
       {_render_metric('完成 p50', _fmt_duration_sec(report.get('p50_complete_sec')))}
       {_render_metric('完成 p95', _fmt_duration_sec(report.get('p95_complete_sec')))}
     </section>
-    <div class="note-box"><b>两种成功不能混：</b>Terminal done 只表示 reducer 把 job 置为完成；Artifact 证据通过则按任务模式检查 durable ledger 中的 identity / memory 写入证据。当前仍不是独立的 artifact-attempt 账本：合法的 nameless / fresh-start 完成可能被保守标为“证据不足”，不会假绿。页面不读取导入正文、模型输出或任意 exception 尾部。</div>
+    <div class="note-box"><b>两种成功不能混：</b>Terminal done 只表示 reducer 把 job 置为完成；这里的 Artifact 证据通过仍是兼容旧 job 的最终快照分类，合法的 nameless / fresh-start 完成可能被保守标为“证据不足”。新的逐 attempt 账本在事件路径表按北京日展示，只覆盖生效后，不能回填旧 job。页面不读取导入正文、模型输出或任意 exception 尾部。</div>
     <h2>最近任务</h2>
-    <div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>模式</th><th>状态</th><th>Artifact 证据</th><th>Memory / Identity</th><th>安全失败码</th><th>创建 UTC</th><th>更新 UTC</th></tr></thead>
-    <tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='9' class='muted'>窗口内无任务。</td></tr>"}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>User</th><th>Job</th><th>模式</th><th>状态</th><th>Artifact 证据</th><th>Memory / Identity</th><th>安全失败码</th><th>失败阶段</th><th>创建 UTC</th><th>更新 UTC</th></tr></thead>
+    <tbody>{''.join(recent_rows) if recent_rows else "<tr><td colspan='10' class='muted'>窗口内无任务。</td></tr>"}</tbody></table></div>
     <h2>失败原因 Top</h2>
     <div class="table-wrap"><table><thead><tr><th>安全失败码</th><th>次数</th></tr></thead><tbody>{failure_rows or "<tr><td colspan='2' class='muted'>窗口内无失败。</td></tr>"}</tbody></table></div>
     """
@@ -5945,6 +6774,22 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
     delivery = report.get("reply_delivery") or {}
     failure_delivery = report.get("failure_delivery") or {}
     reply_quality = report.get("reply_quality") or {}
+    # 「未知不会显示成 0」是这一页的成文契约：总量取不到时两格都必须是 —，
+    # 遮蔽数取不到时只有那一格是 —（红仍按整个总量报，方向偏红不偏绿）。
+    _missing_total = delivery.get("completed_without_final_applied")
+    _missing_shadowed = delivery.get(
+        "completed_without_final_applied_clear_shadowed"
+    )
+    _missing_benign = delivery.get("completed_without_final_applied_benign")
+    _red, _undecidable, _benign = _chat_missing_split(delivery)
+    missing_red = _fmt_count(None if _missing_total is None else _red)
+    missing_undecidable = _fmt_count(
+        None if _missing_total is None or _missing_shadowed is None
+        else _undecidable
+    )
+    missing_benign = _fmt_count(
+        None if _missing_total is None or _missing_benign is None else _benign
+    )
     failure_rows = "".join(
         "<tr>"
         f"{_failure_code_cell(row.get('code'))}"
@@ -5988,7 +6833,9 @@ def _render_chat_reliability_page(report: dict | None, *, within_hours: int) -> 
       {_render_metric('仍在飞', _fmt_count(outcomes.get('in_flight')))}
       {_render_metric('Final pending', _fmt_count(delivery.get('final_pending_jobs')))}
       {_render_metric('需 reconcile', _fmt_count(delivery.get('final_reconciliation_jobs')))}
-      {_render_metric('Completed 无 applied', _fmt_count(delivery.get('completed_without_final_applied')))}
+      {_render_metric('Completed 无 applied（判红）', f"{missing_red} / 涉及 {_fmt_count(delivery.get('completed_without_final_applied_users'))} 用户（去重，仅判红）")}
+      {_render_metric('其中判不了（Clear Chat 已删证据）', missing_undecidable)}
+      {_render_metric('其中本就不欠回复（已交接/空回合）', missing_benign)}
       {_render_metric('失败 fallback 已投递', _fmt_count(failure_delivery.get('fallback_reply_delivered')))}
       {_render_metric('失败 fallback 待投递', _fmt_count(failure_delivery.get('fallback_reply_pending')))}
       {_render_metric('≥2 条可见回复的回合', f"{_fmt_count(reply_quality.get('multi_reply_turns'))} / {_fmt_ratio(reply_quality.get('multi_reply_turn_rate'))}")}
@@ -7815,6 +8662,29 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         if pager_links:
             pager = f"<div class='pager'>{''.join(pager_links)}</div>"
     rows_html = []
+
+    def background_cell(row: dict, lane: str, label: str) -> str:
+        block = row.get("background_lanes") or {}
+        read_status = block.get("read_status") or {}
+        coverage = block.get("coverage") or {}
+        counts = (block.get("lanes") or {}).get(lane) or {}
+        if str(read_status.get("level") or "ok") != "ok":
+            return f"{label} 取数失败"
+        terminal = int(counts.get("terminal_attempts") or 0)
+        failures = int(counts.get("operational_failures") or 0)
+        completed = int(counts.get("completed") or 0)
+        rate = counts.get("failure_rate")
+        rate_text = f"{float(rate) * 100:.0f}%" if rate is not None else "—"
+        coverage_mark = (
+            ""
+            if coverage.get("level") == "green"
+            else f" · 覆盖{html.escape(str(coverage.get('level') or 'unknown'))}"
+        )
+        return (
+            f"{label} {rate_text}"
+            f"（成{completed}/故{failures}/分母{terminal}）{coverage_mark}"
+        )
+
     for row in users:
         onboarding = row["onboarding"]
         stage = onboarding["stage"]
@@ -7825,7 +8695,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         principal = str(access.get("principal_id") or row.get("principal_id") or "")
         principal_short = f"{principal[:12]}…" if len(principal) > 12 else principal
         onb_mem, live_mem = _memory_source_split(row["memory"].get("by_source"))
-        pro = row["proactive"]
+        human = row.get("human_activity") or {}
         conn = row.get("connection") or {}
         conn_status = conn.get("status", "")
         conn_cls = "warn" if conn_status in ("offline", "stalled") else ("ok" if conn_status == "ok" else "muted")
@@ -7860,16 +8730,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
             f"<td>{row['chat']['total']} <span class='muted'>u{row['chat']['user_messages']} / a{row['chat']['agent_messages']}</span></td>"
             f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
             f"<br><span class='muted'>onb {onb_mem} / live {live_mem}</span></td>"
-            f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
-            f"<br><span class='muted'>心跳 总{pro.get('heartbeat_jobs', 0)} "
-            f"/ 失败{pro.get('heartbeat_failed', 0)} "
-            f"/ 控制{pro.get('heartbeat_control', 0)} "
-            f"/ 用户侧{pro.get('heartbeat_user_unavailable', 0)}; "
-            f"屏幕 总{pro.get('screen_jobs', 0)} "
-            f"/ 失败{pro.get('screen_failed', 0)} "
-            f"/ 控制{pro.get('screen_control', 0)} "
-            f"/ 用户侧{pro.get('screen_user_unavailable', 0)}</span></td>"
-            f"<td>{html.escape(_bj_iso(row.get('last_activity_at')))}</td>"
+            f"<td>{background_cell(row, 'heartbeat', '心跳')}"
+            f"<br><span class='muted'>{background_cell(row, 'capture', 'capture')}</span></td>"
+            f"<td>{html.escape(_bj_iso(human.get('last_user_at')) or '从未')}"
+            f"<br><span class='muted'>{html.escape(str(human.get('state') or 'inactive'))}"
+            f" · {int(human.get('days') or 0)}d · chat.last_user_at</span></td>"
             "</tr>"
         )
     fn = summary.get("activation_funnel", {})
@@ -7971,6 +8836,27 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         "“已激活”仍按有记忆或发过消息的行为口径。Token 与模型用量已移到独立页面，避免把只统计 chat lane 的旧 rollup 误称为全站用量。"
         f" <a href='{html.escape(_usage_page_href(), quote=True)}'>打开 Token 与模型</a>。</div>"
     )
+    human_filter_links = []
+    selected_human = str(filters.get("human_activity") or "all")
+    for cohort, label in (
+        ("all", "全部真人活跃状态"),
+        ("active", "窗口内发过消息"),
+        ("inactive", "窗口内未发消息 / 从未发过"),
+    ):
+        cls = "sort-button active" if selected_human == cohort else "sort-button"
+        href = _data_track_page_href(
+            view="users", human_activity=cohort, offset=0
+        )
+        human_filter_links.append(
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
+        )
+    human_filter_section = (
+        "<h2>真人活跃筛选</h2>"
+        f"<div class='sortbar'>{''.join(human_filter_links)}</div>"
+        f"<div class='muted'>窗口={int(filters.get('human_days') or 7)} 天；"
+        "只看 <code>chat.last_user_at</code>。后台心跳、capture、memory 写入不会把废号变成活跃号。"
+        "可用 <code>human_days</code> 改窗口，不把判活阈值焊死进冻结定义。</div>"
+    )
     # App 使用时长(iOS app_session_end 事件聚合 · summary['app_usage'] 由 db 层填充)。
     au = summary.get("app_usage") or {}
     if au.get("sessions_total"):
@@ -8042,6 +8928,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  {_render_funnel(funnel, compact=False)}
 	  {accounting_details}
 		  {runtime_population_section}
+		  {human_filter_section}
 		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <form class="toolbar" method="get" action="/admin/data-track/users">
@@ -8052,16 +8939,15 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  </form>
 	  <div class="toolbar"><input id="q" placeholder="筛选 UID、route、runtime state、stage"></div>
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
-	  <div class="note-box"><b>Proactive 失败口径（Resident / V1）</b><br>
-	  总数=该 lane 的全史 <code>proactive_jobs</code> 全状态记录，不是失败率分母；
-	  失败=<code>status=failed</code> 且不属于明确用户侧七码，未知/未登记原因仍算我方失败；
-	  控制=<code>status=skipped</code>（含 <code>heartbeat_throttled</code>），不算失败；
-	  用户侧=明确额度、Key 或模型不存在；<code>expired</code> 沿用 V1 既有口径不计。
-	  本列不含 Runtime V2 用户，V2 请看 Runtime 值班台；两边表、窗口、总体与键空间不同，不可横向对数。</div>
+	  <div class="note-box"><b>后台道按用户失败率</b><br>
+	  数据来自冻结 <code>lane_daily_rollup</code>，默认最近 {int(filters.get('lane_days') or 7)} 个完整北京日；
+	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；
+	  pending/claimed/running 不塞进失败率，另由 stuck 指标负责。覆盖不完整时格子明确标 partial，
+	  不会把未量到的 0 冒充健康。可用 <code>lane_days</code> 改窗口。</div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <div class="table-wrap"><table id="users">
-    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>Proactive 心跳/屏幕（全史四分法）</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Onboarding route</th><th>实际 Runtime</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Chat 累计发生</th><th>Memory</th><th>后台道失败率（按用户）</th><th>Last human message</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table></div>
 </main>
@@ -8089,6 +8975,21 @@ def _render_data_track_dau_page(payload: dict) -> str:
     histogram_buckets = list(histogram.get("buckets") or [])
     histogram_total = int(histogram.get("total_users") or 0)
     definition = payload.get("definition", {})
+    observability = payload.get("observability") or {}
+    query_warning = (
+        "<div style='background:#fff0f0;border:1px solid #d88;"
+        "border-radius:8px;padding:10px 12px;margin:12px 0;color:#8a1f1f'>"
+        "DAU 查询失败；下方空表不代表这段时间确实无人活跃。"
+        "</div>"
+        if observability.get("dau_query") == "failed" else ""
+    )
+    day_warning = (
+        "<div style='background:#fff8e8;border:1px solid #e3bd7a;"
+        "border-radius:8px;padding:10px 12px;margin:12px 0;color:#8a4a00'>"
+        "DAU 行里有 day 值读不出来；所选分布日可能是回退值，不代表坏行不存在。"
+        "</div>"
+        if observability.get("day_values") == "invalid" else ""
+    )
     api_qs = _data_track_qs(
         view=None,
         q=None,
@@ -8251,6 +9152,8 @@ def _render_data_track_dau_page(payload: dict) -> str:
   <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. DAU timezone: {html.escape(summary["timezone"])}.</div>
   <div class="muted">Showing {html.escape(str(summary["days_returned"]))} active days. Since {html.escape(str(filters.get("since") or "all time"))}; days limit {html.escape(str(filters.get("days") or 30))}.</div>
   {_render_data_track_view_nav("dau")}
+  {query_warning}
+  {day_warning}
   <section class="metrics">{metrics}</section>
   <h2>使用时长分布 · {html.escape(histogram_day or "n/a")}</h2>
   <div class="toolbar">{''.join(histogram_days)}</div>
@@ -9348,6 +10251,8 @@ _DEBUG_STEP_LABELS = {
     "provider.empty_response": ("🕳️", "空回复诊断"),
     "reply.silent_by_choice": ("🤫", "主动静默 · 模型选择"),
     "reply.silent_empty_response": ("🕳️", "主动静默 · 空响应"),
+    "reply.protocol_fragment_suppressed": ("🛡️", "回复安全 · 协议残片已压制"),
+    "reply.transport_cut_observed": ("✂️", "Provider 输出截断 · 仅观测"),
     "mcp.surface.resolved": ("🧩", "MCP 工具面"),
     "mcp.surface.provider": ("🧩", "MCP Provider 实收工具面"),
     "mcp.roundtrip.provider": ("🔁", "Provider 本轮往返"),
@@ -9448,6 +10353,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
     summary = payload["summary"]
     trace_vocabulary_status = str(
         (payload.get("observability") or {}).get("trace_vocabulary") or "unavailable"
+    )
+    failure_vocabulary = (
+        (payload.get("observability") or {}).get("failure_vocabulary") or {}
     )
     trace_public_fields = _trace_public_fields(
         vocabulary=(
@@ -9656,12 +10564,25 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
-    vocabulary_warning = (
-        "<div class='observability-warning'>Trace 词表暂不可用；"
-        "后台任务 lane / enqueue reason 闭集字段未展示，"
-        "不能读成“事件没有这些字段”。</div>"
-        if trace_vocabulary_status != "ok"
-        else ""
+    vocabulary_warnings = []
+    if trace_vocabulary_status != "ok":
+        vocabulary_warnings.append(
+            "Trace 词表暂不可用；后台任务 lane / enqueue reason 闭集字段未展示，"
+            "不能读成“事件没有这些字段”。"
+        )
+    if str(failure_vocabulary.get("status") or "partial") != "ok":
+        missing = ", ".join(
+            str(value) for value in failure_vocabulary.get(
+                "unavailable_sources", []
+            )
+        ) or "unknown"
+        vocabulary_warnings.append(
+            "失败码词表仅部分可用；未加载来源："
+            f"{missing}。相关失败码可能被归入 other，不能读成“没有该类失败”。"
+        )
+    vocabulary_warning = "".join(
+        f"<div class='observability-warning'>{html.escape(message)}</div>"
+        for message in vocabulary_warnings
     )
     refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
 
@@ -9893,21 +10814,44 @@ _EVENT_MASTER_PATHS = tuple(
 )
 _EVENT_MASTER_ACTIONS = (
     {"key": "onboarding_job", "label": "入驻蒸馏 · 整单",
-     "desc": "一次 history import job 的整体终态；身份卡/记忆/问候不是独立 attempt。"},
+     "desc": "一次 history import job 的整体终态；不可替代下方各 artifact attempt。"},
     {"key": "onboarding_identity", "label": "入驻蒸馏 · 身份卡写入",
-     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+     "desc": "逐次记录真实身份卡写入 attempt；生效日前历史不可回填。",
+     "distillation_kind": "onboarding", "distillation_artifact": "identity"},
     {"key": "onboarding_memory", "label": "入驻蒸馏 · 长期记忆写入",
-     "desc": "当前 job 只保留最终汇总，无法把这一件 artifact 单独作为分母。"},
+     "desc": "逐次记录真实长期记忆写入 attempt；前台/后台写入各算一次。",
+     "distillation_kind": "onboarding", "distillation_artifact": "memory"},
     {"key": "onboarding_history", "label": "入驻蒸馏 · 历史聊天落库",
      "desc": "历史聊天当前仅作为蒸馏输入，不写入 chat_messages。", "na": True},
     {"key": "onboarding_greeting", "label": "入驻蒸馏 · 首次问候写入",
-     "desc": "问候与整单共用一个终态，没有独立失败账本。"},
+     "desc": "逐次记录首次问候的真实落库边界。",
+     "distillation_kind": "onboarding", "distillation_artifact": "greeting"},
+    {"key": "onboarding_persona", "label": "入驻蒸馏 · Persona 写入",
+     "desc": "逐次记录 persona artifact；高优先级旧值保留单列 outcome。",
+     "distillation_kind": "onboarding", "distillation_artifact": "persona"},
+    {"key": "onboarding_voice", "label": "入驻蒸馏 · Voice 写入",
+     "desc": "逐次记录 voice artifact 的真实写入边界。",
+     "distillation_kind": "onboarding", "distillation_artifact": "voice"},
+    {"key": "onboarding_profile", "label": "入驻蒸馏 · Profile 写入",
+     "desc": "逐次记录 profile CAS 的产生方 outcome。",
+     "distillation_kind": "onboarding", "distillation_artifact": "profile"},
     {"key": "redistill_identity", "label": "二次蒸馏 · 身份卡写入",
-     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+     "desc": "逐次记录身份卡更新，并保留 locked/no-write 等产生方 outcome。",
+     "distillation_kind": "redistill", "distillation_artifact": "identity"},
     {"key": "redistill_memory", "label": "二次蒸馏 · 长期记忆写入",
-     "desc": "终态会覆盖原 phase，当前不能定位到这一级。"},
+     "desc": "逐次记录长期记忆追加，不用整单终态反推。",
+     "distillation_kind": "redistill", "distillation_artifact": "memory"},
     {"key": "redistill_history", "label": "二次蒸馏 · 历史聊天落库",
      "desc": "二次蒸馏不执行历史聊天落库。", "na": True},
+    {"key": "redistill_persona", "label": "二次蒸馏 · Persona 写入",
+     "desc": "逐次记录 persona artifact，不从整单事件估算。",
+     "distillation_kind": "redistill", "distillation_artifact": "persona"},
+    {"key": "redistill_voice", "label": "二次蒸馏 · Voice 写入",
+     "desc": "逐次记录 voice artifact，不从整单事件估算。",
+     "distillation_kind": "redistill", "distillation_artifact": "voice"},
+    {"key": "redistill_profile", "label": "二次蒸馏 · Profile 写入",
+     "desc": "逐次记录 profile CAS 的产生方 outcome。",
+     "distillation_kind": "redistill", "distillation_artifact": "profile"},
     {"key": "chat_job", "label": "正常聊天 · 整个回复任务",
      "desc": "V2 以 chat job 终态计；resident 回复和 V1 没有同源冻结格。",
      "runtime_metrics": {"runtime_v2": ("chat", None)}},
@@ -9947,7 +10891,9 @@ _EVENT_MASTER_ACTIONS = (
 )
 
 
-def _event_path_master_payload(frozen: dict) -> dict:
+def _event_path_master_payload(
+    frozen: dict, distillation: dict | None = None,
+) -> dict:
     """Build the frozen access-path table and runtime-family diagnostic."""
 
     def unavailable(*, coverage="red", detail=""):
@@ -10081,6 +11027,63 @@ def _event_path_master_payload(frozen: dict) -> dict:
             "concentration": counts.get("concentration"),
         }
 
+    distillation_report = distillation if isinstance(distillation, dict) else {}
+    distillation_windows = {
+        int(window.get("day_count") or 0): window
+        for window in distillation_report.get("windows") or []
+        if isinstance(window, dict)
+    }
+
+    def distillation_cell(action: dict, raw_window: dict, *, paths: list[str]) -> dict:
+        read_status = distillation_report.get("read_status") or {}
+        read_level = str(read_status.get("level") or "ok")
+        if read_level != "ok":
+            return {
+                "state": read_level, "coverage": read_level,
+                "message": str(read_status.get("message") or "取数失败（记了，但这里读不出来）"),
+                "detail": "artifact attempt 账本读取失败；不是 0 次",
+            }
+        day_count = int(raw_window.get("day_count") or 0)
+        window = distillation_windows.get(day_count)
+        if not window:
+            return unavailable(
+                detail="artifact attempt 冻结器尚未建立生效水位；不是 0 次"
+            )
+        coverage = str(window.get("coverage") or "red")
+        if coverage != "green":
+            return {
+                "state": "coverage_gap", "coverage": coverage,
+                "message": "当前窗口不可计算",
+                "covered_days": int(window.get("covered_days") or 0),
+                "required_days": day_count,
+                "effective_from": window.get("effective_from"),
+            }
+        kind = str(action.get("distillation_kind") or "")
+        artifact = str(action.get("distillation_artifact") or "")
+        artifact_cells = (
+            ((window.get("cells") or {}).get(kind) or {}).get(artifact) or {}
+        )
+        succeeded = failed = no_write = 0
+        outcomes: dict[str, int] = {}
+        for path in paths:
+            raw = artifact_cells.get(path) or {}
+            succeeded += int(raw.get("succeeded") or 0)
+            failed += int(raw.get("failed") or 0)
+            no_write += int(raw.get("no_write") or 0)
+            for outcome, count in (raw.get("outcomes") or {}).items():
+                outcomes[str(outcome)] = outcomes.get(str(outcome), 0) + int(count or 0)
+        return {
+            "state": "metric", "coverage": "green",
+            "success": succeeded, "failure": failed,
+            "denominator": succeeded + failed,
+            "no_write": no_write,
+            "outcomes": outcomes,
+            "denominator_rule": (
+                "artifact terminal succeeded + failed；not-provided / preserved / "
+                "locked / skipped 等 no-write 单列剔除；每次真实写入调用各算一次"
+            ),
+        }
+
     path_windows = []
     runtime_windows = []
     for raw_window in frozen.get("windows", []):
@@ -10095,6 +11098,11 @@ def _event_path_master_payload(frozen: dict) -> dict:
                         "state": "not_applicable", "coverage": "black",
                         "message": "N/A（产品当前不执行）",
                     }
+                    continue
+                if action.get("distillation_artifact"):
+                    path_cells[path] = distillation_cell(
+                        action, raw_window, paths=[path]
+                    )
                     continue
                 runtime = (
                     "runtime_v2" if path == "apikey_v2" else "runtime_v1"
@@ -10123,6 +11131,19 @@ def _event_path_master_payload(frozen: dict) -> dict:
                         "state": "not_applicable", "coverage": "black",
                         "message": "N/A（产品当前不执行）",
                     }
+                    continue
+                if action.get("distillation_artifact"):
+                    runtime_paths = (
+                        ["apikey_v2"]
+                        if runtime == "runtime_v2"
+                        else [
+                            path for path, _label in _EVENT_MASTER_PATHS
+                            if path != "apikey_v2"
+                        ]
+                    )
+                    runtime_cells[runtime] = distillation_cell(
+                        action, raw_window, paths=runtime_paths
+                    )
                     continue
                 mapping = (action.get("runtime_metrics") or {}).get(runtime)
                 probe_level = (action.get("runtime_probe") or {}).get(runtime)
@@ -10202,6 +11223,7 @@ def _event_path_master_payload(frozen: dict) -> dict:
         "access_gap": (
             "接入路径取冻结时快照，不是事件发生时快照；历史不回填。"
             "每列只从页面标出的生效日起可读，之前不可用不等于 0。"
+            + (" " + str(distillation_report.get("history_note") or "")).rstrip()
         ),
         "self_deployed": "自建判据 = 无 active tested hosted route + connected resident binding",
     }
@@ -10233,7 +11255,8 @@ def _data_track_events_payload() -> dict:
     day = _validated_dau_day(raw_day) if raw_day else _events_today()
     raw = db.admin_events_overview(day=day)
     frozen_master = _event_path_master_payload(
-        db.admin_event_path_rollup_windows(tz="Asia/Shanghai")
+        db.admin_event_path_rollup_windows(tz="Asia/Shanghai"),
+        db.admin_distillation_artifact_rollup_windows(tz="Asia/Shanghai"),
     )
     import_overall = db.admin_history_import_job_rolling_windows()
 
@@ -10396,6 +11419,7 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
         denominator = int(cell.get("denominator") or 0)
         success = int(cell.get("success") or 0)
         failure = int(cell.get("failure") or 0)
+        no_write = int(cell.get("no_write") or 0)
         rule = str(cell.get("denominator_rule") or "")
         if denominator:
             success_rate = success / denominator * 100
@@ -10403,6 +11427,11 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
             headline = (
                 f"{mark} <b>{success_rate:.1f}% 成功</b> · "
                 f"<b>{failure_rate:.1f}% 失败</b>"
+            )
+        elif no_write:
+            headline = (
+                f"{mark} <b>0 次进入成败分母</b> · "
+                f"no-write {no_write} 次单列"
             )
         else:
             headline = f"{mark} <b>0 次终态作业</b> · 成功/失败率 —"
@@ -10416,9 +11445,18 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
             )
         if int(cell.get("control_outcomes") or 0):
             excluded += f" · control {int(cell['control_outcomes'])}（剔除）"
+        if no_write:
+            excluded += f" · no-write {no_write}（单列剔除）"
+        outcomes = cell.get("outcomes") if isinstance(cell.get("outcomes"), dict) else {}
+        outcome_detail = ""
+        if outcomes:
+            outcome_detail = " · outcome " + ", ".join(
+                f"{key}={int(value or 0)}"
+                for key, value in sorted(outcomes.items())
+            )
         detail = (
             f"分母={denominator}（成功 {success} + 失败 {failure}；"
-            f"{rule}）{excluded}{controls}"
+            f"{rule}）{excluded}{controls}{outcome_detail}"
             f"{_concentration_line(cell.get('concentration'))}"
         )
         return (f"<td>{headline}<div class='evt-cell-scope'>"
@@ -10569,8 +11607,10 @@ def _render_history_import_overall(report: dict) -> str:
     calculated_at = _bj_iso(report.get("calculated_at"))
     level = str(report.get("coverage") or "red")
     mark = _EVENT_COVERAGE_MARK.get(level, "🔴")
-    reason = str(report.get("reason") or
-                 "无路径快照、未物理冻结；T247 补")
+    reason = str(report.get("reason") or (
+        "整单 history job 无事件时路径快照且未物理冻结；"
+        "artifact 分步账本是另一口径，仅覆盖生效后"
+    ))
     rows = []
     for window in report.get("windows") or []:
         completed = int(window.get("completed") or 0)
@@ -11044,6 +12084,7 @@ def _render_screen_frames(user: dict) -> str:
 def _render_user_daily_usage(user: dict) -> str:
     rows = list(user.get("daily_usage") or [])
     days = int(user.get("daily_usage_days") or len(rows) or 14)
+    query_failed = user.get("daily_usage_query") == "failed"
     window_total = sum(int(row.get("foreground_sec") or 0) for row in rows)
     window_sessions = sum(int(row.get("sessions") or 0) for row in rows)
     all_time = user.get("app_usage") or {}
@@ -11073,31 +12114,44 @@ def _render_user_daily_usage(user: dict) -> str:
             "</div>"
         )
     action = f"/admin/data-track/users/{quote(str(user.get('user_id') or ''))}"
+    summary_html = (
+        "<div class='data-quality-warning'><strong>最近使用时长查询失败</strong>："
+        "下方不展示零值；这不代表该用户最近确实没有打开 App。</div>"
+        if query_failed else (
+            "<div class='daily-summary'>"
+            f"<b>窗口合计 {html.escape(_fmt_duration_sec(window_total))}</b>"
+            f" · {window_sessions} 次会话"
+            f"；全时段合计 <b>{html.escape(_fmt_duration_sec(all_time_total))}</b>"
+            f" · {all_time_sessions} 次会话"
+            "</div>"
+        )
+    )
+    usage_html = (
+        ""
+        if query_failed else (
+            "<section class='daily-usage'>"
+            + (
+                "".join(daily_rows)
+                if daily_rows
+                else "<div class='muted'>暂无使用时长数据。</div>"
+            )
+            + "</section>"
+            "<div class='muted daily-note'>"
+            "按北京日统计 app_session_end；没有上报的日期明确显示“未打开”。"
+            "前台被强杀会漏报，因此时长略偏低估。"
+            "</div>"
+        )
+    )
     return (
         f"<h2 class='daily-heading'>最近 {days} 天使用时长</h2>"
-        "<div class='daily-summary'>"
-        f"<b>窗口合计 {html.escape(_fmt_duration_sec(window_total))}</b>"
-        f" · {window_sessions} 次会话"
-        f"；全时段合计 <b>{html.escape(_fmt_duration_sec(all_time_total))}</b>"
-        f" · {all_time_sessions} 次会话"
-        "</div>"
-        f"<form class='daily-controls' method='get' action='{html.escape(action, quote=True)}'>"
+        + summary_html
+        + f"<form class='daily-controls' method='get' action='{html.escape(action, quote=True)}'>"
         f"<input name='admin_key' type='hidden' value='{html.escape(request.args.get('admin_key', ''), quote=True)}'>"
         f"<input name='events_limit' type='hidden' value='{int((user.get('tracking') or {}).get('events_limit') or 50)}'>"
         f"<label>天数 <input name='days' type='number' min='1' max='90' value='{days}'></label>"
         "<button type='submit'>更新</button>"
         "</form>"
-        "<section class='daily-usage'>"
-        + (
-            "".join(daily_rows)
-            if daily_rows
-            else "<div class='muted'>暂无使用时长数据。</div>"
-        )
-        + "</section>"
-        "<div class='muted daily-note'>"
-        "按北京日统计 app_session_end；没有上报的日期明确显示“未打开”。"
-        "前台被强杀会漏报，因此时长略偏低估。"
-        "</div>"
+        + usage_html
     )
 
 
@@ -11165,6 +12219,98 @@ def _render_user_recent_jobs(user: dict) -> str:
     )
 
 
+def _render_data_quality_warnings(user: dict) -> str:
+    """Render only explicit parse/read failures; legitimate missing stays quiet."""
+    warnings: list[str] = []
+
+    snapshot_status = (
+        user.get("snapshot_read_status")
+        if isinstance(user.get("snapshot_read_status"), dict) else {}
+    )
+    snapshot_level = str(snapshot_status.get("level") or "").strip().lower()
+    if snapshot_level and snapshot_level != "ok":
+        warnings.append(
+            str(snapshot_status.get("message") or "取数失败（记了，但这里读不出来）")
+        )
+
+    memory = user.get("memory") if isinstance(user.get("memory"), dict) else {}
+    if memory.get("capture_actions_written_status") == "invalid":
+        warnings.append("memory capture 的 actions_written 有坏值，合计只是已读下限。")
+    if memory.get("counts_status") in {"invalid", "unknown"}:
+        warnings.append("memory snapshot 的计数字段有坏值，0 不代表真实为零。")
+    capture = (
+        user.get("memory_capture_validation")
+        if isinstance(user.get("memory_capture_validation"), dict) else {}
+    )
+    if capture.get("counts_status") == "invalid":
+        warnings.append("memory capture validation 有坏计数，applied/skipped 只是已读下限。")
+
+    for key, label in (
+        ("chat", "chat snapshot"),
+        ("proactive", "proactive snapshot"),
+        ("tracking", "tracking snapshot"),
+        ("bootstrap_events", "bootstrap snapshot"),
+    ):
+        block = user.get(key) if isinstance(user.get(key), dict) else {}
+        if block.get("counts_status") in {"invalid", "unknown"}:
+            warnings.append(f"{label} 有坏计数，页面中的 0 不是可信测量。")
+
+    app_usage = (
+        user.get("app_usage") if isinstance(user.get("app_usage"), dict) else {}
+    )
+    if app_usage.get("fields_status") in {"invalid", "unknown"}:
+        warnings.append("App usage 有字段读不出来，0/空时间不是“没有使用”。")
+
+    onboarding = (
+        user.get("onboarding") if isinstance(user.get("onboarding"), dict) else {}
+    )
+    if onboarding.get("consumer_poll_status") == "invalid":
+        warnings.append("resident consumer 的 last_poll_epoch 读不出来，不能判为未轮询。")
+    responder = (
+        user.get("responder") if isinstance(user.get("responder"), dict) else {}
+    )
+    if responder.get("poll_evidence_status") == "invalid":
+        warnings.append("responder poll 证据有坏时间，recent/none 结论不完整。")
+    elif responder.get("poll_evidence_status") == "unknown":
+        warnings.append("responder poll 证据暂不可读，不能判为确实没有轮询证据。")
+
+    notices = user.get("notice_summaries") or []
+    if any(
+        isinstance(row, dict) and row.get("occurrences_status") == "invalid"
+        for row in notices
+    ):
+        warnings.append("notice occurrences 有坏值，显示的 0 不是“没有发生”。")
+
+    runtime = user.get("runtime") if isinstance(user.get("runtime"), dict) else {}
+    if runtime.get("config_status") == "unavailable":
+        warnings.append("runtime config 暂不可读，空 provider/model 不代表未配置。")
+    elif runtime.get("config_status") == "invalid":
+        warnings.append("runtime config 形状无效，空 provider/model 不代表未配置。")
+    if runtime.get("driver_status") == "unavailable":
+        warnings.append("runtime driver/transport 推导失败，空值不代表 legacy。")
+
+    wake = (
+        user.get("v2_wake_schedule")
+        if isinstance(user.get("v2_wake_schedule"), dict) else {}
+    )
+    if wake.get("fields_status") == "invalid":
+        warnings.append("V2 wake schedule 有坏时间，空时钟不代表未设置。")
+
+    profile = (
+        user.get("v2_profile") if isinstance(user.get("v2_profile"), dict) else {}
+    )
+    if profile.get("document_status") == "invalid":
+        warnings.append("V2 profile 文档未通过 producer schema，0 chars/count 不可信。")
+    elif profile.get("document_status") == "unavailable":
+        warnings.append("V2 profile 暂不可读，不能当成缺失或空 profile。")
+
+    return "".join(
+        "<div class='data-quality-warning'><strong>观测数据异常</strong>："
+        f"{html.escape(message)}</div>"
+        for message in warnings
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -11189,6 +12335,7 @@ def _render_user_detail_page(user: dict) -> str:
         if mismatch
         else ""
     )
+    data_quality_warnings = _render_data_quality_warnings(user)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -11227,6 +12374,7 @@ def _render_user_detail_page(user: dict) -> str:
     .runtime-user-jobs th,.runtime-user-jobs td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }}
     .runtime-user-jobs th {{ color:var(--muted); font-size:12px; }}
     .responder-alert {{ margin:10px 0; padding:11px 13px; color:#8f1711; background:#fff0ee; border:2px solid #c62f25; border-radius:8px; }}
+    .data-quality-warning {{ margin:10px 0; padding:11px 13px; color:#8a4a00; background:#fff8e8; border:1px solid #e3bd7a; border-radius:8px; }}
   </style>
 </head>
 <body>
@@ -11246,6 +12394,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(user.get('last_provider_error_class') or 'none')}</div><div class="label">latest provider error</div></div>
     <div class="card"><div class="value">{html.escape(responder_name)}</div><div class="label">effective responder</div></div>
   </section>
+  {data_quality_warnings}
   {responder_notice}
   <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
   {_render_screen_frames(user)}

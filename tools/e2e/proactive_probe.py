@@ -7,6 +7,7 @@ while waiting for asynchronous evidence to become visible.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -28,6 +29,8 @@ _RESULTS = {
 }
 _AGENT_ROLES = {"agent", "openclaw", "assistant"}
 _MODEL_TIMEOUT = float(os.environ.get("FEEDLING_DEEP_MODEL_TIMEOUT", "240"))
+_COLLISION_CLOCK_SKEW_SEC = 5.0
+_COLLISION_SETTLE_SEC = 1.0
 
 
 class _ProbeIssue(RuntimeError):
@@ -97,19 +100,151 @@ def _message_ts(message: dict) -> float:
         return 0.0
 
 
-def _wait_for_agent(c, since: float, *, timeout: float = _MODEL_TIMEOUT) -> dict:
-    deadline = time.time() + timeout
+def _wake_job_id(job: dict) -> str:
+    return str(job.get("id") or job.get("job_id") or "").strip()
+
+
+def _wake_terminal_state(user: dict, job_id: str) -> tuple[str, str]:
+    """Classify one exact V2 wake without treating silence as disappearance."""
+    recent = user.get("v2_recent_jobs")
+    activity = user.get("v2_wake_activity")
+    if not isinstance(recent, dict) or recent.get("error"):
+        return "unavailable", "v2_recent_jobs is unavailable"
+    if not isinstance(activity, dict) or activity.get("error"):
+        return "unavailable", "v2_wake_activity is unavailable"
+
+    wanted = str(job_id)
+    silences = [
+        row for row in (activity.get("recent_silences") or [])
+        if isinstance(row, dict) and str(row.get("job_id") or "") == wanted
+    ]
+    if silences:
+        return "silent", str(silences[0].get("reason") or "explicit sleep")
+
+    failures = [
+        row for row in (activity.get("recent_failures") or [])
+        if isinstance(row, dict) and str(row.get("job_id") or "") == wanted
+    ]
+    if failures:
+        row = failures[0]
+        return "failed", str(row.get("reason") or row.get("status") or "failed")
+
+    jobs = [
+        row for row in (recent.get("jobs") or [])
+        if isinstance(row, dict) and str(row.get("job_id") or "") == wanted
+    ]
+    if not jobs:
+        return "pending", "job not visible yet"
+    status = str(jobs[0].get("status") or "").strip().lower()
+    if status in {"failed", "expired"}:
+        return "failed", status
+    if status == "completed":
+        return "completed_without_output", "completed without visible reply or explicit sleep"
+    return "pending", status or "unknown"
+
+
+def _wait_for_wake_delivery(
+    c,
+    since: float,
+    job_id: str,
+    *,
+    action: str,
+    timeout: float | None = None,
+) -> dict:
+    """Wait for a bubble while preserving terminal failure and legal sleep."""
+    budget = _MODEL_TIMEOUT if timeout is None else max(0.0, float(timeout))
+    deadline = time.time() + budget
+    terminal_state = "pending"
+    terminal_detail = "job not visible yet"
     while time.time() < deadline:
         rows = _history(c, since)
         candidates = [
-            row
-            for row in rows
+            row for row in rows
             if str(row.get("role") or "") in _AGENT_ROLES and _message_ts(row) > since
         ]
         if candidates:
             return min(candidates, key=_message_ts)
+
+        terminal_state, terminal_detail = _wake_terminal_state(_admin_user(c), job_id)
+        if terminal_state == "silent":
+            raise _ProbeIssue(
+                "BLOCKED_EVIDENCE",
+                f"{action}: wake job={job_id} legally slept ({terminal_detail})",
+            )
+        if terminal_state == "failed":
+            raise _ProbeIssue(
+                "PRODUCT_FAIL",
+                f"{action}: wake job={job_id} failed ({terminal_detail})",
+            )
+        if terminal_state == "unavailable":
+            raise _ProbeIssue("BLOCKED_EVIDENCE", f"{action}: {terminal_detail}")
         time.sleep(2)
-    raise _ProbeIssue("AGENT_ERROR", f"no agent message within {timeout:.0f}s")
+
+    if terminal_state == "completed_without_output":
+        raise _ProbeIssue(
+            "PRODUCT_FAIL",
+            f"{action}: wake job={job_id} {terminal_detail}",
+        )
+    raise _ProbeIssue(
+        "AGENT_ERROR",
+        f"{action}: wake job={job_id} produced no auditable outcome within {budget:.0f}s",
+    )
+
+
+def _collision_window_sec() -> float:
+    raw = os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise _ProbeIssue("AGENT_ERROR", "invalid proactive chat collision window") from exc
+    if not math.isfinite(value):
+        raise _ProbeIssue("AGENT_ERROR", "invalid proactive chat collision window")
+    return max(0.0, value)
+
+
+def _wait_out_chat_collision(c, *, window: float | None = None) -> float:
+    """Leave no recent user turn that can suppress a weak-wake reply."""
+    guard = _collision_window_sec() if window is None else max(0.0, float(window))
+    now = time.time()
+    rows = _history(c, now - guard - _COLLISION_CLOCK_SKEW_SEC)
+    latest_user = max(
+        (_message_ts(row) for row in rows if str(row.get("role") or "") == "user"),
+        default=0.0,
+    )
+    wait = max(
+        0.0,
+        latest_user + guard + _COLLISION_CLOCK_SKEW_SEC + _COLLISION_SETTLE_SEC - now,
+    )
+    if wait:
+        time.sleep(wait)
+    return wait
+
+
+def _wait_for_proactive_reply(
+    c,
+    proactive_job_id: str,
+    since: float,
+    *,
+    timeout: float | None = None,
+) -> dict:
+    """Wait for the exact legacy/resident proactive job's published reply."""
+    budget = _MODEL_TIMEOUT if timeout is None else max(0.0, float(timeout))
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        rows = _history(c, since)
+        replies = [
+            row for row in rows
+            if str(row.get("role") or "") in _AGENT_ROLES
+            and str(row.get("proactive_job_id") or "") == proactive_job_id
+        ]
+        if replies:
+            return min(replies, key=_message_ts)
+        time.sleep(2)
+    raise _ProbeIssue(
+        "PRODUCT_FAIL",
+        f"scheduled job={proactive_job_id} produced no correlated must-deliver reply "
+        f"within {budget:.0f}s",
+    )
 
 
 def _wait_for_correlated_reply(c, user_message_id: str, since: float) -> tuple[dict, list[dict]]:
@@ -216,7 +351,6 @@ def _install_quality_identity(c) -> None:
             "主动开口时称呼用户七七，并自然包含短语‘此刻陪你’；"
             "用一到两句简体中文，提到当前采用上海时区，不提模型、供应商或系统。"
         ),
-        "language_preference": "zh-Hans",
         "signature": ["此刻陪你"],
         "dimensions": [{"name": "温和", "value": 82, "description": "具体而不打扰"}],
     }, action="proactive quality")
@@ -242,14 +376,38 @@ def _admin_user(c) -> dict:
 def _case_user_turn_priority(c) -> str:
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
-    started = time.time()
+    collision_wait = _wait_out_chat_collision(c)
+
+    control_started = time.time()
+    control_wake = _body(
+        c.post("/v1/proactive/tick", json={"force": True}),
+        expected=(200,),
+        action="enqueue priority control wake",
+    )
+    control_job = control_wake.get("job")
+    control_job_id = _wake_job_id(control_job) if isinstance(control_job, dict) else ""
+    if not control_job_id or control_job.get("lane") != "manual_wake":
+        raise _ProbeIssue("PRODUCT_FAIL", f"priority control wake not admitted: {control_wake}")
+    control_reply = _wait_for_wake_delivery(
+        c,
+        control_started,
+        control_job_id,
+        action="priority no-competition control",
+    )
+    _decrypt(c, control_reply, action="priority control reply")
+
+    # History timestamps are server-owned; carry the completed control reply
+    # forward so modest client/server clock skew cannot re-count it as the
+    # competing wake in the treatment half.
+    started = max(time.time(), _message_ts(control_reply))
     wake = _body(
         c.post("/v1/proactive/tick", json={"force": True}),
         expected=(200,),
         action="enqueue priority wake",
     )
     job = wake.get("job")
-    if not isinstance(job, dict) or job.get("lane") != "manual_wake":
+    job_id = _wake_job_id(job) if isinstance(job, dict) else ""
+    if not job_id or job.get("lane") != "manual_wake":
         raise _ProbeIssue("PRODUCT_FAIL", f"manual wake not admitted to V2: {wake}")
     sent_at, user_id = _send_hosted(
         c,
@@ -280,28 +438,33 @@ def _case_user_turn_priority(c) -> str:
             "PRODUCT_FAIL",
             f"wake produced {len(earlier_agent)} agent message(s) before the user reply",
         )
-    return f"correlated user reply arrived before any uncorrelated wake output; wake_job={job.get('id')}"
+    return (
+        "no-competition wake delivered, then correlated user reply arrived before "
+        f"any competing wake output; control_job={control_job_id}; wake_job={job_id}; "
+        f"collision_wait={collision_wait:.1f}s"
+    )
 
 
 def _case_proactive_message_quality(c) -> str:
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
-    context_ts, context_id = _send_hosted(
-        c,
-        "这是一次短暂测试：请在下一次主动开口时用简体中文称呼我七七，"
-        "包含原样短语‘此刻陪你’，并明确提到上海时区；现在只确认收到。",
-    )
-    context_reply, _rows = _wait_for_correlated_reply(c, context_id, context_ts)
-    _decrypt(c, context_reply, action="proactive quality setup reply")
+    collision_wait = _wait_out_chat_collision(c)
     started = time.time()
     wake = _body(
         c.post("/v1/proactive/tick", json={"force": True}),
         expected=(200,),
         action="enqueue quality wake",
     )
-    if not isinstance(wake.get("job"), dict):
+    job = wake.get("job")
+    job_id = _wake_job_id(job) if isinstance(job, dict) else ""
+    if not job_id or job.get("lane") != "manual_wake":
         raise _ProbeIssue("PRODUCT_FAIL", f"quality wake was not enqueued: {wake}")
-    reply = _wait_for_agent(c, started)
+    reply = _wait_for_wake_delivery(
+        c,
+        started,
+        job_id,
+        action="proactive quality",
+    )
     text = _decrypt(c, reply, action="proactive quality")
     required = [value for value in ("七七", "此刻陪你") if value not in text]
     if required:
@@ -319,7 +482,60 @@ def _case_proactive_message_quality(c) -> str:
     agents = [row for row in rows if str(row.get("role") or "") in _AGENT_ROLES]
     if len(agents) != 1:
         raise _ProbeIssue("PRODUCT_FAIL", f"one wake produced {len(agents)} agent messages")
-    return f"decryptable zh-Hans persona/timezone message; chars={len(text)}; no spam"
+    return (
+        f"decryptable zh-Hans persona/timezone message; job={job_id}; "
+        f"chars={len(text)}; no spam; collision_wait={collision_wait:.1f}s"
+    )
+
+
+def _case_scheduled_must_deliver(c) -> str:
+    _install_quality_identity(c)
+    _save_settings(c, {"timezone": "UTC", "scheduled": True})
+    due = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    scheduled = _body(
+        c.post("/v1/proactive/scheduled/actions", json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": due,
+                "tz": "UTC",
+                "note": "这是定时必达探针：到时间后请发一条简短提醒。",
+            }],
+        }),
+        expected=(200,),
+        action="schedule must-deliver wake",
+    )
+    results = scheduled.get("results")
+    row = results[0] if isinstance(results, list) and results and isinstance(results[0], dict) else {}
+    timer_id = str(row.get("timer_id") or "")
+    if row.get("status") != "scheduled" or not timer_id:
+        raise _ProbeIssue("PRODUCT_FAIL", f"must-deliver wake was not scheduled: {scheduled}")
+
+    started = time.time()
+    fired = _body(
+        c.post("/v1/proactive/scheduled/fire", json={}),
+        expected=(200,),
+        action="fire must-deliver wake",
+    )
+    fire_rows = fired.get("results") or []
+    jobs = fired.get("jobs") or []
+    fire_row = fire_rows[0] if fire_rows and isinstance(fire_rows[0], dict) else {}
+    job = jobs[0] if len(jobs) == 1 and isinstance(jobs[0], dict) else {}
+    proactive_job_id = str(job.get("job_id") or "")
+    if (
+        int(fired.get("queued") or 0) != 1
+        or len(fire_rows) != 1
+        or fire_row.get("status") != "fired"
+        or str(fire_row.get("timer_id") or "") != timer_id
+        or not proactive_job_id
+    ):
+        raise _ProbeIssue("PRODUCT_FAIL", f"must-deliver wake did not fire exactly once: {fired}")
+
+    reply = _wait_for_proactive_reply(c, proactive_job_id, started)
+    text = _decrypt(c, reply, action="scheduled must-deliver")
+    return (
+        f"scheduled must-deliver produced one correlated decryptable reply; "
+        f"timer={timer_id}; job={proactive_job_id}; chars={len(text)}"
+    )
 
 
 def _case_wake_coalescing(c) -> str:
@@ -506,8 +722,9 @@ def run_proactive_probe(c, cfg) -> dict:
     """Return the deep.py proactive result contract for one configured account."""
     cfg = cfg if isinstance(cfg, dict) else {}
     cases = [
-        _case("user_turn_priority", lambda: _case_user_turn_priority(c)),
         _case("proactive_message_quality", lambda: _case_proactive_message_quality(c)),
+        _case("user_turn_priority", lambda: _case_user_turn_priority(c)),
+        _case("scheduled_must_deliver", lambda: _case_scheduled_must_deliver(c)),
     ]
     if bool(cfg.get("run_invariants")):
         cases.extend([

@@ -1,12 +1,25 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # 感知 prompt 资产清单
 
-这是感知内核提取重构（`.superpowers/sdd/2026-08-19-perception-extraction-step1/`）
-的地基文档：列出当前散落在 V1/V2 两条 runtime 里、和「感知」直接相关的 prompt 文本，
-标注它们各自属于内核还是 runtime，供后续任务对号入座地搬。
+> ⚠️ **2026-08-26 起，本文档下面提到的 `perception_kernel.*` 全部改名为
+> `perceptkit.*`**——内核已经从 `backend/perception_kernel/` 搬成外部包
+> `perceptkit`（装自 https://github.com/teleport-computer/perceptkit 的 Release
+> wheel，版本钉在 `backend/requirements.lock`；发布前的挂起状态见
+> `docs/NOTES-perceptkit-swap.md`）。`backend/perception_kernel/` 目录本身已删除，
+> 表里出现的所有 `perception_kernel.xxx` 路径只是历史记录，读作
+> `perceptkit.xxx`（外部包）即可，指代关系不变。
+
+这是 Perception prompt 的现行 owner 清单：列出 V1/V2 两条 runtime 中和「感知」直接
+相关的文本、内核常量与挂载协议。提取工作已经完成；下表用于防止后续修改重新制造
+重复字面量，或把 runtime 的 role/安全协议误搬进纯内核。表中的行号是提取期定位快照，
+核对现状时以模块和稳定符号为准。
 
 ## 判定规则
 
-**跟「怎么读感知」有关的 → 内核**（perception kernel，本次要提取出去的部分）：
+**跟「怎么读感知」有关的 → 内核**（`perception_kernel.prompts`）：
 如何解读 `perception_glance` / `presence_hints` / 跨域看板、什么时候该说话/该沉默、
 怎么把感知事实自然用进回答而不是逐项播报——这是"感知判断"本身的说明书，与哪条
 runtime、哪种传输协议无关。

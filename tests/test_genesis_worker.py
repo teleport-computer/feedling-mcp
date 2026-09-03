@@ -61,6 +61,10 @@ class _Resp:
             raise RuntimeError(f"http_{self.status_code}")
 
 
+def _store_shell(user_id: str, **_kwargs):
+    return types.SimpleNamespace(user_id=user_id)
+
+
 def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list[str], blobs: dict | None = None):
     apply_payloads = []
     minted = []
@@ -68,7 +72,7 @@ def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list
     chunks = [_chunk(idx) for idx in range(len(chunk_texts))]
     plaintext_by_id = {f"chunk-{idx}": text for idx, text in enumerate(chunk_texts)}
 
-    monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
+    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no fail")))
     monkeypatch.setattr(
@@ -220,7 +224,7 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     apply_payloads = []
     minted = []
 
-    monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
+    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no fail")))
     monkeypatch.setattr(
@@ -782,13 +786,14 @@ def test_fact_write_rewrites_person_references_but_preserves_product_terms():
 
 
 # ---------------------------------------------------------------------------
-# B2 (reverses I7): the onboarding distiller can now also produce the 5
+# B2 (reverses I7): the onboarding distiller can now also produce the 4
 # user-layer identity fields — _fact_write must carry them from the model's
 # per-batch `identity` output into the aggregated final identity dict, and
 # _identity_only / _fact_write_output_empty must treat them as real signal.
 # ---------------------------------------------------------------------------
 
 def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
+    retired_field = "language_" + "preference"
     class FakeLLM:
         def complete(self, **kwargs):
             text = json.dumps({
@@ -797,7 +802,7 @@ def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
                     "agent_name": "Mira", "dimensions": [],
                     "user_preferred_name": "Seven",
                     "custom_persona_prompt": "始终用第二人称、简短直接。",
-                    "language_preference": "中文",
+                    retired_field: "中文",
                     "relationship_anchor": "大学室友",
                     "stable_definitions": ["老板=我上司", "  ", "deadline 一律北京时间"],
                 },
@@ -812,7 +817,7 @@ def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
     identity = output["identity"]
     assert identity["user_preferred_name"] == "Seven"
     assert identity["custom_persona_prompt"] == "始终用第二人称、简短直接。"
-    assert identity["language_preference"] == "中文"
+    assert retired_field not in identity
     assert identity["relationship_anchor"] == "大学室友"
     # blank entries dropped, real ones kept
     assert identity["stable_definitions"] == ["老板=我上司", "deadline 一律北京时间"]
@@ -1074,7 +1079,7 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
 def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     failures = []
     trace_events = []
-    monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
+    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error, **_kwargs: failures.append((job_id, error)))
     monkeypatch.setattr(
@@ -1105,7 +1110,7 @@ def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
 
 def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):
     failures = []
-    monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
+    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error, **_kwargs: failures.append((job_id, error)))
     monkeypatch.setattr(
@@ -1261,7 +1266,7 @@ def test_reap_stale_atomically_fails_then_syncs_blobs(monkeypatch):
         return list(reaped_rows)
 
     monkeypatch.setattr(worker.db, "genesis_reap_stale_processing_jobs", fake_reap)
-    monkeypatch.setattr(worker, "get_store", lambda uid: types.SimpleNamespace(user_id=uid))
+    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
     blobs = []
     monkeypatch.setattr(
         worker.service,
@@ -1285,7 +1290,7 @@ def test_reap_stale_blob_sync_failure_still_counts_job_reaped(monkeypatch):
         {"user_id": "usr_b", "job_id": "job_b"},
     ]
     monkeypatch.setattr(worker.db, "genesis_reap_stale_processing_jobs", lambda *a, **k: list(reaped_rows))
-    monkeypatch.setattr(worker, "get_store", lambda uid: types.SimpleNamespace(user_id=uid))
+    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
     synced = []
 
     def flaky_blob(store, job, status):

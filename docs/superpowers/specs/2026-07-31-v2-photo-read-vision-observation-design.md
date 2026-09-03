@@ -1,10 +1,30 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Runtime V2 `photo_read` Vision Observation Design
+
+**Status: implemented; the observation and isolation boundary remains current.**
+
+> **CURRENT-STATE NOTE (2026-08-27):** The original opt-in
+> `include_image=true` contract was tightened on 2026-08-18: Runtime V2 stored
+> `photo_read` is now visual by default, and `include_image=false` is rejected
+> instead of producing a metadata-only read. The durable decision remains that
+> a photo wake never auto-opens pixels; only a model-selected `photo_read`
+> crosses the decrypt/observer boundary, base64 never enters the provider-visible
+> tool result, and hosted assembly owns route selection outside the V2 core.
+> Current authority is `backend/capabilities/photo.py`,
+> `backend/capabilities/tool_schema.py`,
+> `backend/model_api_runtime/v2/executor.py`, worker/serve-worker assembly,
+> `tests/test_capabilities_tool_schema.py`,
+> `tests/test_v2_dispatch_tool_calls.py`, and the stable error registry in
+> `docs/API_ERRORS.md`. Detailed routing and fallback behavior below is the
+> 2026-07 design baseline where it differs from those owners.
 
 ## Goal
 
-Fix Hosted Runtime V2 so a model that chooses to call
-`photo_read(include_image=true)` receives a real visual observation derived from
-the decrypted photo instead of only `has_image` and MIME metadata.
+Hosted Runtime V2 gives a model-selected `photo_read` a real visual observation
+derived from the decrypted photo instead of only `has_image` and MIME metadata.
 
 This change is backend-only. It does not change the iOS permission UI, does not
 auto-open every newly uploaded photo, and does not change Hosted V1/VPS
@@ -17,13 +37,15 @@ The existing pull-on-demand interaction remains authoritative:
 1. A `photo_added` wake gives the main model the new photo ID and bounded rough
    metadata.
 2. The main model decides whether the photo is worth inspecting.
-3. Only a call to `photo_read` with `include_image=true` decrypts pixels and
-   incurs a visual-model request.
+3. Only a call to `photo_read` decrypts pixels and incurs a visual-model request.
+   Omitting `include_image` means `true`; an explicit `false` is rejected by the
+   current tool schema.
 4. The main model receives the resulting observation as untrusted data and
    decides whether to speak or remain silent.
 
-Calling `photo_read` without `include_image=true` remains metadata-only and
-must not invoke a visual provider.
+`photo_recent` is the metadata-only surface. Once the model chooses
+`photo_read`, the read is visual; callers cannot downgrade it to metadata-only
+with `include_image=false`.
 
 ## Architecture
 
@@ -38,9 +60,9 @@ blob-stripping invariant.
 
 ### Observation boundary
 
-The V2 executor recognizes a successful `photo_read(include_image=true)` result
-with an image payload and calls an injected photo-observer dependency before it
-constructs the provider-visible `ToolResult`.
+The V2 executor recognizes a successful `photo_read` result with an image
+payload and calls an injected photo-observer dependency before it constructs
+the provider-visible `ToolResult`.
 
 The observer follows the current visual routing policy:
 
@@ -106,10 +128,10 @@ existing visual trust boundary.
 
 Add regression coverage proving:
 
-1. `photo_read(include_image=false)` returns metadata and never calls the
-   observer.
-2. `photo_read(include_image=true)` carries decrypted pixels to the injected
-   observer and returns a provider-visible observation without base64.
+1. `photo_read` defaults `include_image` to `true`, while an explicit `false`
+   is rejected before dispatch.
+2. `photo_read` carries decrypted pixels to the injected observer and returns
+   a provider-visible observation without base64.
 3. A selected dedicated vision route is preferred over the main route.
 4. Without a dedicated route, the active main provider configuration is used.
 5. Dedicated-route failure does not fall through to the main route and exposes

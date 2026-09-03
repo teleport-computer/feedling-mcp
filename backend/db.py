@@ -75,6 +75,11 @@ HEALTH_DB_STATEMENT_TIMEOUT_MS = 1000
 # connections, while keeping concurrent health requests bounded.
 HEALTH_DB_POOL_MIN_SIZE = 1
 HEALTH_DB_POOL_MAX_SIZE = 2
+TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS = 180.0
+TEE_PRIMARY_TCP_USER_TIMEOUT_MS = 30000
+# A sync cursor ahead of the server clock cannot match any valid log row. Do
+# not turn client clock skew or corrupted cursors into a cold RDS scan.
+LOG_READ_FUTURE_CURSOR_TOLERANCE_SECONDS = 5.0
 
 
 def _database_url() -> str:
@@ -100,6 +105,35 @@ def database_schema() -> str:
     if value not in {"rds", "tee"}:
         raise RuntimeError("FEEDLING_DATABASE_SCHEMA must be 'rds' or 'tee'")
     return value
+
+
+def _database_connection_kwargs() -> dict:
+    """Connection options shared by pools and dedicated LISTEN connections.
+
+    A promoted TEE primary crosses the Phala direct-TLS gateway. The gateway can
+    silently retire long-lived sockets; TCP keepalives make idle connections
+    observable before the next request borrows them. RDS keeps its historical
+    options unchanged.
+    """
+    kwargs = {"autocommit": True}
+    if database_schema() == "tee":
+        kwargs.update(
+            {
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+                "tcp_user_timeout": TEE_PRIMARY_TCP_USER_TIMEOUT_MS,
+            }
+        )
+    return kwargs
+
+
+def _database_pool_lifetime_kwargs() -> dict:
+    if database_schema() == "tee":
+        return {"max_lifetime": TEE_PRIMARY_POOL_MAX_LIFETIME_SECONDS}
+    return {}
 
 
 def _pool_max_size() -> int:
@@ -148,8 +182,9 @@ def get_pool() -> ConnectionPool:
                 max_size=_pool_max_size(),
                 timeout=10,
                 max_idle=300,
-                kwargs={"autocommit": True},
+                kwargs=_database_connection_kwargs(),
                 open=True,
+                **_database_pool_lifetime_kwargs(),
             )
     return _pool
 
@@ -167,8 +202,9 @@ def get_health_pool() -> ConnectionPool:
                 max_size=HEALTH_DB_POOL_MAX_SIZE,
                 timeout=HEALTH_DB_ACQUIRE_TIMEOUT_SECONDS,
                 max_idle=300,
-                kwargs={"autocommit": True},
+                kwargs=_database_connection_kwargs(),
                 open=True,
+                **_database_pool_lifetime_kwargs(),
             )
     return _health_pool
 
@@ -209,40 +245,44 @@ _TEE_PRIMARY_TRIGGERS = {
 }
 
 
-def init_schema() -> None:
+def init_schema(*, tee_auto_migrate: bool = False) -> None:
     """Bring the selected database schema to a safe application state.
 
-    The historical ``rds`` mode runs ``alembic upgrade head``.  A promoted TEE
-    database is different: its owner-only migration chain has already run in a
-    dedicated workflow, while application processes connect as the non-DDL
-    ``app`` role.  ``tee`` mode therefore performs a read-only, fail-closed head
-    assertion and must never run the RDS chain against that database.
+    The historical ``rds`` mode always runs its Alembic chain. A promoted
+    ``tee`` database upgrades only when a real process startup explicitly sets
+    ``tee_auto_migrate``; preflight callers retain their read-only head and
+    trigger assertions. In TEE-primary mode, the app role inherits the database
+    owner role so its primary DSN can apply the TEE chain without receiving an
+    owner credential.
     """
     if database_schema() == "tee":
         import alembic_tee
 
-        expected_heads = {alembic_tee.current_head()}
-        with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
-            actual_heads = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT version_num FROM alembic_tee_version"
-                ).fetchall()
-            }
-            enabled_triggers = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT tgname FROM pg_trigger "
-                    "WHERE NOT tgisinternal AND tgenabled = 'O' "
-                    "AND tgname = ANY(%s)",
-                    (list(_TEE_PRIMARY_TRIGGERS),),
-                ).fetchall()
-            }
+        with _schema_lock:
+            if tee_auto_migrate:
+                alembic_tee.upgrade_head()
+            expected_heads = {alembic_tee.current_head()}
+            with psycopg.connect(_database_url(), autocommit=True) as conn:
+                actual_heads = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT version_num FROM alembic_tee_version"
+                    ).fetchall()
+                }
+                enabled_triggers = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT tgname FROM pg_trigger "
+                        "WHERE NOT tgisinternal AND tgenabled = 'O' "
+                        "AND tgname = ANY(%s)",
+                        (list(_TEE_PRIMARY_TRIGGERS),),
+                    ).fetchall()
+                }
         if actual_heads != expected_heads:
             raise RuntimeError(
                 "TEE database schema is not at the application head: "
                 f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
-                "run the owner-only alembic_tee migration workflow before startup"
+                "automatic TEE startup migration did not converge"
             )
         if enabled_triggers != _TEE_PRIMARY_TRIGGERS:
             raise RuntimeError(
@@ -251,7 +291,8 @@ def init_schema() -> None:
                 f"actual={sorted(enabled_triggers)}; run "
                 "admin.phase4_cutover --apply --confirm-writes-frozen before startup"
             )
-        log.info("[db] TEE schema at head (read-only assertion: %s)",
+        mode = "automatic Alembic upgrade" if tee_auto_migrate else "read-only assertion"
+        log.info("[db] TEE schema at head (%s: %s)", mode,
                  ",".join(sorted(actual_heads)))
         return
 
@@ -348,7 +389,7 @@ def listen_connection() -> "psycopg.Connection":
     holds exactly one of these per worker, outside the request pool, and blocks
     on ``conn.notifies()`` — so it never consumes a pool slot. Raises on connect
     failure; the caller's reconnect loop handles it."""
-    return psycopg.connect(_database_url(), autocommit=True)
+    return psycopg.connect(_database_url(), **_database_connection_kwargs())
 
 
 # ---------------------------------------------------------------------------
@@ -703,15 +744,72 @@ def insert_user(entry: dict) -> None:
     mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
-def upsert_user(entry: dict) -> None:
+def upsert_user(
+    entry: dict, *, seed_web_settings_on_insert: bool = False
+) -> bool | None:
     """Insert-or-update one user document from the in-memory user dict (the
-    source of truth after the caller mutates it under _users_lock)."""
+    source of truth after the caller mutates it under _users_lock).
+
+    ``seed_web_settings_on_insert`` is registration-only.  It writes the
+    enabled-by-default web preference in the same transaction, but only when
+    this call actually inserted the users row.  A retry that collides with an
+    existing row must never create or overwrite that blob: the account may be
+    an old no-blob user, or may already have explicitly switched web off.
+
+    The ordinary branch intentionally remains the exact historical upsert.
+    ``persist_user`` is the shared funnel for every account edit, so changing
+    its conflict update into a no-op would silently stop all existing-user
+    preference and key changes from reaching PostgreSQL.
+    """
     sql = ("INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
            "ON CONFLICT (user_id) DO UPDATE SET created_at = EXCLUDED.created_at, doc = EXCLUDED.doc")
+    if not seed_web_settings_on_insert:
+        with get_pool().connection() as conn:
+            conn.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+        from tee_shadow import mirror
+        mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+        return None
+
+    params = (entry["user_id"], entry.get("created_at"), Jsonb(entry))
+    insert_if_new_sql = (
+        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id) DO NOTHING RETURNING user_id"
+    )
+    seed_sql = (
+        "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id, kind) DO NOTHING"
+    )
+    seed_params = (
+        entry["user_id"],
+        "web_settings",
+        Jsonb({"version": 1, "enabled": True}),
+    )
     with get_pool().connection() as conn:
-        conn.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+        with conn.transaction():
+            created = conn.execute(insert_if_new_sql, params).fetchone() is not None
+            if created:
+                conn.execute(seed_sql, seed_params)
+            else:
+                # Preserve the old conflict-update semantics for a registration
+                # retry while deliberately leaving every existing blob alone.
+                conn.execute(sql, params)
     from tee_shadow import mirror
-    mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+    # Preserve the historic independent parameter construction for the shadow
+    # connection instead of reusing the primary connection's wrapper objects.
+    mirror.execute(
+        sql,
+        (entry["user_id"], entry.get("created_at"), Jsonb(entry)),
+    )
+    if created:
+        mirror.execute(
+            seed_sql,
+            (
+                entry["user_id"],
+                "web_settings",
+                Jsonb({"version": 1, "enabled": True}),
+            ),
+        )
+    return created
 
 
 def compare_and_set_user(
@@ -1191,8 +1289,31 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     today = datetime.now(zone).date()
     day_start, _ = _lane_rollup_day_bounds(today, zone)
     cutoff = day_start.timestamp()
-    sums = ", ".join(f"SUM({k})::int" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    sums = ", ".join(f"SUM({k})::int AS {k}" for k in _CHAT_SNAPSHOT_COUNT_KEYS)
+    count_columns = ", ".join(
+        f"counts.{key}" for key in _CHAT_SNAPSHOT_COUNT_KEYS
+    )
+    time_columns = ", ".join(
+        f"counts.{key}"
+        for key in (
+            "first_ts", "last_ts", "proactive_last_ts",
+            "last_user_ts", "last_agent_ts",
+        )
+    )
+    closed_dimensions = ", ".join(
+        f"('{target}', {target})"
+        for _field, target, _predicate in _CHAT_ROLLUP_DIST_FIELDS
+    )
+    live_dimensions = ", ".join(
+        "(" + ", ".join((
+            f"'{target}'",
+            f"COALESCE(NULLIF(doc->>'{field}', ''), 'unknown')",
+            predicate.removeprefix(" AND ") if predicate else "TRUE",
+        )) + ")"
+        for field, target, predicate in _CHAT_ROLLUP_DIST_FIELDS
+    )
     acc: dict[str, dict] = {}
+    proactive_acc: dict[str, dict[str, dict[str, int]]] = {}
 
     # ⚠️ 两段的边界必须**互斥**：格子取 day < today，实时窗取 ts >= today 起点。
     # 少了这个 day 上界，任何落在今天或之后的格子会被两边各数一次。冻结器只冻
@@ -1200,11 +1321,40 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
     # 写出来才是。（本条是测试种子用了未来时刻、把这个重叠暴露出来后补的。）
     for row in conn.execute(
         f"""
-        SELECT user_id, {sums},
-               MIN(first_ts), MAX(last_ts), MAX(proactive_last_ts),
-               MAX(last_user_ts), MAX(last_agent_ts)
-        FROM chat_daily_rollup WHERE user_id = ANY(%s) AND day < %s
-        GROUP BY user_id
+        WITH selected AS MATERIALIZED (
+            SELECT *
+            FROM chat_daily_rollup
+            WHERE user_id = ANY(%s) AND day < %s
+        ), counts AS (
+            SELECT user_id, {sums},
+                   MIN(first_ts) AS first_ts,
+                   MAX(last_ts) AS last_ts,
+                   MAX(proactive_last_ts) AS proactive_last_ts,
+                   MAX(last_user_ts) AS last_user_ts,
+                   MAX(last_agent_ts) AS last_agent_ts
+            FROM selected
+            GROUP BY user_id
+        ), distribution_counts AS (
+            SELECT user_id, src, k, SUM(raw::int)::int AS v
+            FROM selected,
+            LATERAL (
+                VALUES {closed_dimensions}
+            ) AS dimensions(src, doc),
+            LATERAL jsonb_each_text(doc) AS entries(k, raw)
+            GROUP BY user_id, src, k
+        ), distributions AS (
+            SELECT user_id, jsonb_object_agg(src, buckets) AS folded
+            FROM (
+                SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
+                FROM distribution_counts
+                GROUP BY user_id, src
+            ) per_dimension
+            GROUP BY user_id
+        )
+        SELECT counts.user_id, {count_columns}, {time_columns},
+               COALESCE(distributions.folded, '{{}}'::jsonb)
+        FROM counts
+        LEFT JOIN distributions USING (user_id)
         """,
         (ids, today.isoformat()),
     ).fetchall():
@@ -1214,38 +1364,48 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
         for offset, key in enumerate(("first_ts", "last_ts", "proactive_last_ts",
                                       "last_user_ts", "last_agent_ts")):
             cell[key] = row[1 + n + offset]
-        acc[str(row[0])] = cell
-
-    for uid, folded in conn.execute(
-        """
-        SELECT user_id, jsonb_object_agg(src, buckets)
-        FROM (
-            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
-            FROM (
-                SELECT user_id, src, k, SUM(raw::int)::int AS v
-                FROM chat_daily_rollup,
-                LATERAL (VALUES ('by_role', by_role), ('by_source', by_source),
-                                ('by_content_type', by_content_type)) AS d(src, doc),
-                LATERAL jsonb_each_text(doc) AS e(k, raw)
-                WHERE user_id = ANY(%s) AND day < %s
-                GROUP BY user_id, src, k
-            ) per_key
-            GROUP BY user_id, src
-        ) per_src
-        GROUP BY user_id
-        """,
-        (ids, today.isoformat()),
-    ).fetchall():
-        cell = acc.setdefault(str(uid), {})
+        folded = dict(row[1 + n + 5] or {})
         for key in _CHAT_SNAPSHOT_DIST_KEYS:
-            cell[key] = dict((folded or {}).get(key) or {})
+            cell[key] = dict(folded.get(key) or {})
+        acc[str(row[0])] = cell
+        proactive = {
+            key: {str(k): int(v) for k, v in (folded.get(key) or {}).items()}
+            for key in ("live_activity_status", "alert_status")
+        }
+        if any(proactive.values()):
+            proactive_acc[str(row[0])] = proactive
 
     # 当天还没冻结的那一段：单次有界查询，窗口就是今天。
     for row in conn.execute(
         f"""
-        SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
-        FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
-        GROUP BY user_id
+        WITH live AS MATERIALIZED (
+            SELECT *
+            FROM {_chat_rollup_source('user_id = ANY(%s) AND ts >= %s')} src
+        ), counts AS (
+            SELECT user_id,{_CHAT_ROLLUP_COUNTS_SELECT}
+            FROM live
+            GROUP BY user_id
+        ), distribution_counts AS (
+            SELECT user_id, dimension, value, COUNT(*)::int AS v
+            FROM live
+            CROSS JOIN LATERAL (
+                VALUES {live_dimensions}
+            ) AS dimensions(dimension, value, included)
+            WHERE included
+            GROUP BY user_id, dimension, value
+        ), distributions AS (
+            SELECT user_id, jsonb_object_agg(dimension, buckets) AS folded
+            FROM (
+                SELECT user_id, dimension, jsonb_object_agg(value, v) AS buckets
+                FROM distribution_counts
+                GROUP BY user_id, dimension
+            ) per_dimension
+            GROUP BY user_id
+        )
+        SELECT counts.user_id, {count_columns}, {time_columns},
+               COALESCE(distributions.folded, '{{}}'::jsonb)
+        FROM counts
+        LEFT JOIN distributions USING (user_id)
         """,
         (ids, cutoff, ids, cutoff),
     ).fetchall():
@@ -1261,19 +1421,16 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
             live = row[2 + n + offset]
             if live is not None and (cell.get(key) is None or live > cell[key]):
                 cell[key] = live
-
-    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[:3]:
-        for uid, value, count in conn.execute(
-            f"""
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
-            GROUP BY user_id, value
-            """,
-            (field, ids, cutoff, ids, cutoff),
-        ).fetchall():
-            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
-            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+        folded = dict(row[1 + n + 5] or {})
+        for key in _CHAT_SNAPSHOT_DIST_KEYS:
+            bucket = cell.setdefault(key, {})
+            for value, count in (folded.get(key) or {}).items():
+                bucket[str(value)] = bucket.get(str(value), 0) + int(count)
+        proactive = proactive_acc.setdefault(str(row[0]), {})
+        for key in ("live_activity_status", "alert_status"):
+            bucket = proactive.setdefault(key, {})
+            for value, count in (folded.get(key) or {}).items():
+                bucket[str(value)] = bucket.get(str(value), 0) + int(count)
 
     for uid, cell in acc.items():
         if not cell.get("total"):
@@ -1287,59 +1444,7 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
                     "last_user_ts", "last_agent_ts"):
             cell.setdefault(key, None)
         ensure(out, uid)["chat"] = cell
-
-
-def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None:
-    """proactive_extra 的两个 status 分布：冻结格子 + 今天实时窗。
-
-    与 ``_chat_rollup_into`` 分开只是因为它们挂在 ``proactive_extra`` 而不是
-    ``chat`` 下；口径、边界（day < today / ts >= today 起点）、来源（live ∪
-    archive）三者完全一致，共用同一组常量。
-    """
-    zone = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(zone).date()
-    day_start, _ = _lane_rollup_day_bounds(today, zone)
-    cutoff = day_start.timestamp()
-    acc: dict[str, dict[str, dict[str, int]]] = {}
-
-    for uid, folded in conn.execute(
-        """
-        SELECT user_id, jsonb_object_agg(src, buckets)
-        FROM (
-            SELECT user_id, src, jsonb_object_agg(k, v) AS buckets
-            FROM (
-                SELECT user_id, src, k, SUM(raw::int)::int AS v
-                FROM chat_daily_rollup,
-                LATERAL (VALUES ('live_activity_status', live_activity_status),
-                                ('alert_status', alert_status)) AS d(src, doc),
-                LATERAL jsonb_each_text(doc) AS e(k, raw)
-                WHERE user_id = ANY(%s) AND day < %s
-                GROUP BY user_id, src, k
-            ) per_key
-            GROUP BY user_id, src
-        ) per_src
-        GROUP BY user_id
-        """,
-        (ids, today.isoformat()),
-    ).fetchall():
-        by = acc.setdefault(str(uid), {})
-        for key, buckets in (folded or {}).items():
-            by[str(key)] = {str(k): int(v) for k, v in (buckets or {}).items()}
-
-    for field, target, extra in _CHAT_ROLLUP_DIST_FIELDS[3:]:
-        for uid, value, count in conn.execute(
-            f"""
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM {_chat_rollup_source(f'user_id = ANY(%s) AND ts >= %s{extra}')} src
-            GROUP BY user_id, value
-            """,
-            (field, ids, cutoff, ids, cutoff),
-        ).fetchall():
-            bucket = acc.setdefault(str(uid), {}).setdefault(target, {})
-            bucket[str(value)] = bucket.get(str(value), 0) + int(count)
-
-    for uid, by in acc.items():
+    for uid, by in proactive_acc.items():
         if not any(by.values()):
             continue
         extra_block = ensure(out, uid).setdefault("proactive_extra", {})
@@ -1348,7 +1453,255 @@ def _chat_proactive_status_into(conn, ids: list[str], out: dict, ensure) -> None
                 extra_block[key] = buckets
 
 
-def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
+_ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
+
+
+class AdminDataTrackDauReadError(RuntimeError):
+    """The DAU query failed; callers must not present that as a true empty set."""
+
+
+class AdminDataTrackDailyUsageReadError(RuntimeError):
+    """A user's daily usage query failed; zero-filled days would be misleading."""
+
+
+@contextmanager
+def _admin_data_track_connection():
+    """Lease one bounded admin connection without poisoning the shared pool."""
+    with get_pool().connection(
+        timeout=_ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+    ) as conn:
+        # Pool connections are autocommit, so SET LOCAL/set_config(..., true)
+        # would expire at the end of that one statement. Use a session setting
+        # for this lease and always reset it before returning the connection.
+        conn.execute(
+            f"SET statement_timeout = '{_ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'"
+        )
+        try:
+            yield conn
+        finally:
+            try:
+                conn.execute("RESET statement_timeout")
+            except Exception:  # noqa: BLE001 — pool discards broken sessions
+                pass
+
+
+# user_logs streams read per page rather than fleet-wide.
+#
+# bootstrap_events qualifies twice over: `events` reaches no summary, sort key
+# or filter (the bootstrap_events argument _data_track_fast_validation declares
+# is not read in its body), and `last_at` is a _latest_epoch input that is
+# structurally always NULL — neither write site passes a ts. That premise is
+# guarded by test_bootstrap_events_are_written_without_a_ts; if it ever goes
+# red, the fleet-wide last_activity_at behind active_1d/3d stops seeing this
+# stream and this pushdown has to be revisited.
+#
+# memory_capture_jobs is deliberately absent rather than paged: nothing reads
+# the generic count/last_ts pair on the fleet row or the detail page
+# (memory.capture_jobs comes from memory_extra, and the by_status/by_mode
+# breakdowns from the legacy-background query), and the stream has no
+# log_trim/log_prune_older_than anywhere — so paging it would keep an unbounded
+# GROUP BY alive for no consumer, and, sharing this query with bootstrap_events,
+# could time the bootstrap read out and mark a readable row degraded.
+_PAGED_LOG_STREAMS = ("bootstrap_events",)
+
+
+def _paged_log_streams_into(conn, ids: list[str], out: dict, ensure) -> None:
+    rows = conn.execute(
+        """
+        SELECT user_id, stream, COUNT(*)::int, MAX(ts)
+        FROM user_logs
+        WHERE user_id = ANY(%s) AND stream = ANY(%s)
+        GROUP BY user_id, stream
+        """,
+        (ids, list(_PAGED_LOG_STREAMS)),
+    ).fetchall()
+    for uid, stream, count, max_ts in rows:
+        ensure(out, uid).setdefault("logs", {})[stream] = {
+            "count": count,
+            "last_ts": max_ts,
+        }
+
+
+def admin_paged_log_streams(
+    user_ids: list[str],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """The _PAGED_LOG_STREAMS slice for one page of users.
+
+    Returns ``({user_id: {stream: {count, last_ts}}}, read_status)`` — the same
+    shape admin_data_track_snapshot used to embed under ``logs``, so the caller
+    can merge it back and reuse the one mapping implementation.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    ok: dict[str, str] = {"level": "ok", "message": ""}
+    if not ids:
+        return {}, ok
+
+    def ensure(bucket: dict[str, dict], uid: str) -> dict:
+        return bucket.setdefault(uid, {})
+
+    out: dict[str, dict] = {}
+    try:
+        with _admin_data_track_connection() as conn:
+            _paged_log_streams_into(conn, ids, out, ensure)
+    except Exception as e:
+        log.error("[db] admin_paged_log_streams failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        return {}, {"level": level, "message": message}
+    return {uid: (data.get("logs") or {}) for uid, data in out.items()}, ok
+
+
+def _screen_frames_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """Per-user screen-frame counters — page-scoped, never fleet-wide.
+
+    Every field below lands on the user's own row (data_track.py's
+    _data_track_screen_frames_from_snapshot) or on the detail page; none of
+    them reaches the fleet summary, a sort key or a filter, and ``latest_ts``
+    in particular is not one of _latest_epoch's inputs, so it does not feed
+    last_activity_at / active_1d / active_3d.
+    """
+    rows = conn.execute(
+        """
+        SELECT user_id,
+               COUNT(*)::int AS total,
+               MAX(ts) AS latest_ts,
+               COUNT(*) FILTER (
+                 WHERE body_key IS NULL
+               )::int AS inline_count,
+               COUNT(*) FILTER (
+                 WHERE body_key IS NOT NULL
+               )::int AS r2_count
+        FROM frame_envelopes
+        WHERE user_id = ANY(%s)
+        GROUP BY user_id
+        """,
+        (ids,),
+    ).fetchall()
+    for uid, total, latest_ts, inline_count, r2_count in rows:
+        ensure(out, uid)["screen_frames"] = {
+            "total": total,
+            "latest_ts": latest_ts,
+            "inline_count": inline_count,
+            "r2_count": r2_count,
+        }
+
+
+def admin_screen_frames(
+    user_ids: list[str],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Screen-frame counters for one page of users.
+
+    Returns ``({user_id: {total, latest_ts, inline_count, r2_count}},
+    read_status)`` — the per-user half is the same shape
+    admin_data_track_snapshot used to embed, so the caller can merge it back
+    into a snapshot and reuse the one mapping implementation. The read status
+    is returned rather than swallowed: before the pushdown a failure here
+    surfaced through snapshot_read_status, and a read failure must not become
+    an indistinguishable row of zeroes.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    ok: dict[str, str] = {"level": "ok", "message": ""}
+    if not ids:
+        return {}, ok
+
+    def ensure(bucket: dict[str, dict], uid: str) -> dict:
+        return bucket.setdefault(uid, {})
+
+    out: dict[str, dict] = {}
+    try:
+        with _admin_data_track_connection() as conn:
+            _screen_frames_into(conn, ids, out, ensure)
+    except Exception as e:
+        log.error("[db] admin_screen_frames failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        return {}, {"level": level, "message": message}
+    return {uid: (data.get("screen_frames") or {}) for uid, data in out.items()}, ok
+
+
+def _memory_breakdowns_into(conn, ids: list[str], out: dict, ensure) -> None:
+    """Per-user memory breakdowns — page-scoped, never fleet-wide.
+
+    ``memory_moments.doc`` is an encrypted card large enough to live out of
+    line, so every additional ``doc->`` expression costs another detoast pass
+    over the whole matched set: on a 25.9k-row fixture the four-expression
+    aggregate read 310,819 buffers where a bare ``COUNT(*)`` read 320. None of
+    the fields below reaches fleet summary, sort or filters — data_track.py
+    renders them on the user's own row, and the detail page computes its own
+    via _memory_stats — so they are read for the current page only.
+    """
+    rows = conn.execute(
+        """
+        SELECT user_id,
+               MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
+               MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
+               MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
+        FROM memory_moments
+        WHERE user_id = ANY(%s)
+        GROUP BY user_id
+        """,
+        (ids,),
+    ).fetchall()
+    for uid, first_created_at, earliest_occurred_at, latest_occurred_at in rows:
+        memory = ensure(out, uid).setdefault("memory", {})
+        memory["first_created_at"] = first_created_at or ""
+        memory["earliest_occurred_at"] = earliest_occurred_at or ""
+        memory["latest_occurred_at"] = latest_occurred_at or ""
+
+    for field, target in (("type", "by_type"), ("source", "by_source")):
+        rows = conn.execute(
+            """
+            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                   COUNT(*)::int
+            FROM memory_moments
+            WHERE user_id = ANY(%s)
+            GROUP BY user_id, value
+            """,
+            (field, ids),
+        ).fetchall()
+        for uid, value, count in rows:
+            memory = ensure(out, uid).setdefault("memory", {})
+            memory.setdefault(target, {})[value] = count
+
+
+def admin_memory_breakdowns(
+    user_ids: list[str],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Memory breakdowns for one page of users.
+
+    Returns ``({user_id: {by_type, by_source, first_created_at,
+    earliest_occurred_at, latest_occurred_at}}, read_status)`` — the per-user
+    half is the same shape admin_data_track_snapshot used to embed, so the
+    caller can merge it back into a snapshot and reuse the one mapping
+    implementation. The read status is returned rather than swallowed: before
+    the pushdown a failure here surfaced through snapshot_read_status, and a
+    read failure must not become an indistinguishable row of zeroes.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    ok: dict[str, str] = {"level": "ok", "message": ""}
+    if not ids:
+        return {}, ok
+
+    def ensure(bucket: dict[str, dict], uid: str) -> dict:
+        return bucket.setdefault(uid, {})
+
+    out: dict[str, dict] = {}
+    try:
+        with _admin_data_track_connection() as conn:
+            _memory_breakdowns_into(conn, ids, out, ensure)
+    except Exception as e:
+        log.error("[db] admin_memory_breakdowns failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        return {}, {"level": level, "message": message}
+    return {uid: (data.get("memory") or {}) for uid, data in out.items()}, ok
+
+
+def admin_data_track_snapshot(
+    user_ids: list[str],
+    *,
+    include_legacy_background: bool = True,
+    include_memory_breakdowns: bool = True,
+    include_screen_frames: bool = True,
+    include_paged_log_streams: bool = True,
+) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
     This is deliberately SQL-aggregate based: admin dashboards must not pull
@@ -1364,37 +1717,21 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
         return out.setdefault(uid, {})
 
     out: dict[str, dict] = {
-        uid: {"app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None}}
+        uid: {
+            "app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None},
+            "legacy_background_breakdowns_status": (
+                "available" if include_legacy_background else "omitted"
+            ),
+            "snapshot_read_status": {"level": "ok", "message": ""},
+        }
         for uid in ids
     }
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             _chat_rollup_into(conn, ids, out, ensure)
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS total,
-                       MAX(ts) AS latest_ts,
-                       COUNT(*) FILTER (
-                         WHERE body_key IS NULL
-                       )::int AS inline_count,
-                       COUNT(*) FILTER (
-                         WHERE body_key IS NOT NULL
-                       )::int AS r2_count
-                FROM frame_envelopes
-                WHERE user_id = ANY(%s)
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, total, latest_ts, inline_count, r2_count in rows:
-                ensure(out, uid)["screen_frames"] = {
-                    "total": total,
-                    "latest_ts": latest_ts,
-                    "inline_count": inline_count,
-                    "r2_count": r2_count,
-                }
+            if include_screen_frames:
+                _screen_frames_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1416,14 +1753,16 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "broadcast_active_ts": active_ts,
                 }
 
+            # ``total`` and ``last_created_at`` are the only two memory fields a
+            # fleet-wide consumer reads: total feeds the summary and the memory
+            # sort key, last_created_at is laundered through _latest_epoch into
+            # last_activity_at and then active_1d/3d. Everything else is
+            # per-row rendering and moved to _memory_breakdowns_into.
             rows = conn.execute(
                 """
                 SELECT user_id,
                        COUNT(*)::int AS total,
-                       MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
-                       MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
-                       MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
-                       MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
+                       MAX(NULLIF(doc->>'created_at', '')) AS last_created_at
                 FROM memory_moments
                 WHERE user_id = ANY(%s)
                 GROUP BY user_id
@@ -1435,26 +1774,14 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "total": row[1],
                     "by_type": {},
                     "by_source": {},
-                    "first_created_at": row[2] or "",
-                    "last_created_at": row[3] or "",
-                    "earliest_occurred_at": row[4] or "",
-                    "latest_occurred_at": row[5] or "",
+                    "first_created_at": "",
+                    "last_created_at": row[2] or "",
+                    "earliest_occurred_at": "",
+                    "latest_occurred_at": "",
                 }
 
-            for field, target in (("type", "by_type"), ("source", "by_source")):
-                rows = conn.execute(
-                    """
-                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                           COUNT(*)::int
-                    FROM memory_moments
-                    WHERE user_id = ANY(%s)
-                    GROUP BY user_id, value
-                    """,
-                    (field, ids),
-                ).fetchall()
-                for uid, value, count in rows:
-                    memory = ensure(out, uid).setdefault("memory", {})
-                    memory.setdefault(target, {})[value] = count
+            if include_memory_breakdowns:
+                _memory_breakdowns_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1462,9 +1789,8 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 FROM user_logs
                 WHERE user_id = ANY(%s)
                   AND stream IN (
-                    'memory_changes', 'memory_capture_jobs', 'gate_decisions',
-                    'proactive_jobs', 'device_events', 'tracking_events',
-                    'bootstrap_events'
+                    'memory_changes', 'gate_decisions',
+                    'proactive_jobs', 'device_events', 'tracking_events'
                   )
                 GROUP BY user_id, stream
                 """,
@@ -1475,6 +1801,15 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "count": count,
                     "last_ts": max_ts,
                 }
+
+            # memory_changes stays here on a harder criterion than "feeds the
+            # summary": it is the second element of the memory sort tuple in
+            # _data_track_sort_rows, so it is part of a full-set ordering. The
+            # four remaining streams are per-user trimmed, and all of them are
+            # read fleet-wide (proactive_jobs/gate_decisions through the
+            # proactive sort tuple, tracking_events through _latest_epoch).
+            if include_paged_log_streams:
+                _paged_log_streams_into(conn, ids, out, ensure)
 
             rows = conn.execute(
                 """
@@ -1503,150 +1838,161 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "last_at": last_at,
                 }
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS decisions,
-                       COUNT(*) FILTER (
-                         WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
-                       )::int AS decision_true
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, decisions, decision_true in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).update({
-                    "decisions": decisions,
-                    "decision_true": decision_true,
-                })
+            if include_legacy_background:
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COUNT(*)::int AS decisions,
+                           COUNT(*) FILTER (
+                             WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
+                           )::int AS decision_true
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, decisions, decision_true in rows:
+                    ensure(out, uid).setdefault("proactive_extra", {}).update({
+                        "decisions": decisions,
+                        "decision_true": decision_true,
+                    })
 
-            rows = conn.execute(
-                """
-                SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
-                       COUNT(*)::int
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
-                GROUP BY user_id, status
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, status, count in rows:
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
+                rows = conn.execute(
+                    """
+                    SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                    GROUP BY user_id, status
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, status, count in rows:
+                    ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
-            # Seven 2026-08-21: V1 has its own status_reason keyspace.  Read
-            # the exact producer-owned exemption set so db.py does not copy
-            # seven strings or merge them with V2 last_error codes.
-            v1_user_unavailable = list(
-                notices_catalog.USER_UNAVAILABLE_V1_REASONS
-            )
+                # Seven 2026-08-21: V1 has its own status_reason keyspace.  Read
+                # the exact producer-owned exemption set so db.py does not copy
+                # seven strings or merge them with V2 last_error codes.
+                v1_user_unavailable = list(
+                    notices_catalog.USER_UNAVAILABLE_V1_REASONS
+                )
 
-            # Split proactive jobs by lane (heartbeat vs screen-share vs other).
-            # The persisted job doc carries job_kind / wake_kind / trigger; group
-            # by the first non-empty of those and let the caller bucket the raw
-            # kind strings (data_track._classify_proactive_kind).
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COALESCE(
-                         NULLIF(doc->>'job_kind', ''),
-                         NULLIF(doc->>'wake_kind', ''),
-                         NULLIF(doc->>'trigger', ''),
-                         'unknown'
-                       ) AS kind,
-                       COUNT(*)::int AS total,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'failed'
-                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
-                                         'unknown') <> ALL(%s::text[])))::int
-                         AS operational_failed,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'skipped'))::int AS control,
-                       (COUNT(*) FILTER (
-                          WHERE doc->>'status' = 'failed'
-                            AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
-                                         'unknown') = ANY(%s::text[])))::int
-                         AS user_unavailable
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
-                GROUP BY user_id, kind
-                """,
-                (v1_user_unavailable, v1_user_unavailable, ids),
-            ).fetchall()
-            for uid, kind, total, failed, control, user_unavailable in rows:
-                pex = ensure(out, uid).setdefault("proactive_extra", {})
-                pex.setdefault("jobs_by_kind", {})[kind] = total
-                pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
-                pex.setdefault("jobs_control_by_kind", {})[kind] = control
-                pex.setdefault("jobs_user_unavailable_by_kind", {})[
-                    kind
-                ] = user_unavailable
+                # These three GROUP BY queries are intentionally detail-only.
+                # The users index used to run them over every retained V1 log on
+                # every request; at production cardinality that path reached the
+                # 240s server boundary.  The index now reads bounded immutable
+                # lane cells via admin_background_lane_users instead.
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COALESCE(
+                             NULLIF(doc->>'job_kind', ''),
+                             NULLIF(doc->>'wake_kind', ''),
+                             NULLIF(doc->>'trigger', ''),
+                             'unknown'
+                           ) AS kind,
+                           COUNT(*)::int AS total,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'failed'
+                                AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                             'unknown') <> ALL(%s::text[])))::int
+                             AS operational_failed,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'skipped'))::int AS control,
+                           (COUNT(*) FILTER (
+                              WHERE doc->>'status' = 'failed'
+                                AND COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''),
+                                             'unknown') = ANY(%s::text[])))::int
+                             AS user_unavailable
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                    GROUP BY user_id, kind
+                    """,
+                    (v1_user_unavailable, v1_user_unavailable, ids),
+                ).fetchall()
+                for uid, kind, total, failed, control, user_unavailable in rows:
+                    pex = ensure(out, uid).setdefault("proactive_extra", {})
+                    pex.setdefault("jobs_by_kind", {})[kind] = total
+                    pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+                    pex.setdefault("jobs_control_by_kind", {})[kind] = control
+                    pex.setdefault("jobs_user_unavailable_by_kind", {})[
+                        kind
+                    ] = user_unavailable
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       CASE
-                         WHEN doc->>'status' = 'skipped' THEN 'control'
-                         WHEN COALESCE(
-                           NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
-                         ) = ANY(%s::text[]) THEN 'user_unavailable'
-                         ELSE 'operational_failure'
-                       END AS outcome_class,
-                       COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
-                       COUNT(*)::int
-                FROM user_logs
-                WHERE user_id = ANY(%s)
-                  AND stream = 'proactive_jobs'
-                  AND doc->>'status' IN ('failed', 'skipped')
-                GROUP BY user_id, outcome_class, reason
-                """,
-                (v1_user_unavailable, ids),
-            ).fetchall()
-            reason_fields = {
-                "operational_failure": "jobs_failed_by_reason",
-                "control": "jobs_control_by_reason",
-                "user_unavailable": "jobs_user_unavailable_by_reason",
-            }
-            for uid, outcome_class, reason, count in rows:
-                field = reason_fields[str(outcome_class)]
-                ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
-                    field, {}
-                )[reason] = count
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           CASE
+                             WHEN doc->>'status' = 'skipped' THEN 'control'
+                             WHEN COALESCE(
+                               NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown'
+                             ) = ANY(%s::text[]) THEN 'user_unavailable'
+                             ELSE 'operational_failure'
+                           END AS outcome_class,
+                           COALESCE(NULLIF(BTRIM(doc->>'status_reason'), ''), 'unknown') AS reason,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s)
+                      AND stream = 'proactive_jobs'
+                      AND doc->>'status' IN ('failed', 'skipped')
+                    GROUP BY user_id, outcome_class, reason
+                    """,
+                    (v1_user_unavailable, ids),
+                ).fetchall()
+                reason_fields = {
+                    "operational_failure": "jobs_failed_by_reason",
+                    "control": "jobs_control_by_reason",
+                    "user_unavailable": "jobs_user_unavailable_by_reason",
+                }
+                for uid, outcome_class, reason, count in rows:
+                    field = reason_fields[str(outcome_class)]
+                    ensure(out, uid).setdefault("proactive_extra", {}).setdefault(
+                        field, {}
+                    )[reason] = count
+            else:
+                for uid in ids:
+                    ensure(out, uid)["legacy_background_breakdowns_status"] = "omitted"
 
             # ⚠️ 这两个维度**必须**走格子，不能留原来的全史 GROUP BY。
             # 把它们冻进格子却仍从 chat_messages 现算，等于新增列只写不读、
             # 端点照样随全史增长——那正是本期要消灭的东西（codex2 2026-08-19
             # 逮到我就是这么写的：写侧改了、读侧一行没动）。
-            _chat_proactive_status_into(conn, ids, out, ensure)
+            if include_legacy_background:
+                rows = conn.execute(
+                    """
+                    SELECT user_id,
+                           COUNT(*)::int AS capture_jobs,
+                           COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
+                           MAX(ts) AS last_capture_ts
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, capture_jobs, actions_written, last_ts in rows:
+                    ensure(out, uid).setdefault("memory_extra", {}).update({
+                        "capture_jobs": capture_jobs,
+                        "capture_actions_written": actions_written,
+                        "last_capture_ts": last_ts,
+                    })
 
-            rows = conn.execute(
-                """
-                SELECT user_id,
-                       COUNT(*)::int AS capture_jobs,
-                       COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
-                       MAX(ts) AS last_capture_ts
-                FROM user_logs
-                WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
-            for uid, capture_jobs, actions_written, last_ts in rows:
-                ensure(out, uid).setdefault("memory_extra", {}).update({
-                    "capture_jobs": capture_jobs,
-                    "capture_actions_written": actions_written,
-                    "last_capture_ts": last_ts,
-                })
-
-            for stream, field, out_key in (
-                ("memory_changes", "action", "changes_by_action"),
-                ("memory_changes", "capture_mode", "changes_by_capture_mode"),
-                ("memory_capture_jobs", "status", "capture_jobs_by_status"),
-                ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
-                ("tracking_events", "type", "tracking_by_type"),
-                ("bootstrap_events", "event_type", "bootstrap_by_type"),
-            ):
+            detail_breakdowns = ()
+            if include_legacy_background:
+                # Every entry below groups an unbounded retained stream by a
+                # JSON field. They are useful on one-user detail, but none is
+                # rendered by the users/summary surfaces. Keep all of them out
+                # of the fleet-wide path rather than merely hiding the result.
+                detail_breakdowns = (
+                    ("memory_changes", "action", "changes_by_action"),
+                    ("memory_changes", "capture_mode", "changes_by_capture_mode"),
+                    ("memory_capture_jobs", "status", "capture_jobs_by_status"),
+                    ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
+                    ("tracking_events", "type", "tracking_by_type"),
+                    ("bootstrap_events", "event_type", "bootstrap_by_type"),
+                )
+            for stream, field, out_key in detail_breakdowns:
                 rows = conn.execute(
                     """
                     SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
@@ -1825,6 +2171,12 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 ensure(out, uid)["history_import"] = doc
     except Exception as e:
         log.error("[db] admin_data_track_snapshot failed: %s", e)
+        level, message = _admin_event_read_failure(e)
+        for uid in ids:
+            ensure(out, uid)["snapshot_read_status"] = {
+                "level": level,
+                "message": message,
+            }
     return out
 
 
@@ -1848,53 +2200,68 @@ def _dau_row(row) -> dict:
     }
 
 
-def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
-    """Return daily active-user aggregates, preferring immutable snapshots.
+def _admin_data_track_dau_rows(
+    conn,
+    *,
+    since: float,
+    scan_since: float,
+    boundary_day: str,
+    day_limit: int,
+    tz: str,
+):
+    """Run the established DAU aggregate with an independently proven bound.
 
-    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
-    before the snapshot boundary remain live. If ``since_epoch`` cuts through
-    a frozen day, that day also falls back to live data so the existing exact
-    timestamp-filter contract is preserved. Every row exposes ``frozen``.
-
-    DAU is intentionally user-initiated activity only: user chat messages plus
-    client tracking events. Agent replies, proactive writes, and synthetic
-    verify pings are excluded so automated reply loops cannot inflate activity.
+    ``since`` remains the public exact-filter contract. ``scan_since`` and
+    ``boundary_day`` only discard days that the preceding boundary query proved
+    cannot enter the final ``LIMIT``. Keeping these two concepts separate is
+    what lets an intraday ``since`` continue to invalidate a whole-day frozen
+    row without making the live scan unbounded again.
     """
-    day_limit = max(1, min(int(days or 30), 1000))
-    since = float(since_epoch or 0.0)
-    try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
+    chat_bound = " AND c.ts >= %s" if scan_since > 0 else ""
+    tracking_bound = " AND l.ts >= %s" if scan_since > 0 else ""
+    frozen_bounds = ""
+    frozen_params: list[object] = []
+    if since > 0:
+        frozen_bounds += " AND first_ts >= %s"
+        frozen_params.append(since)
+    if boundary_day:
+        frozen_bounds += " AND day >= %s"
+        frozen_params.append(boundary_day)
+
+    sql = f"""
                 WITH active AS (
-                    SELECT user_id, ts, 'chat' AS source
-                    FROM chat_messages
-                    WHERE doc->>'role' = 'user'
-                      AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                      AND (%s = 0 OR ts >= %s)
+                    SELECT c.user_id, c.ts, 'chat' AS source
+                    FROM users u
+                    JOIN chat_messages c ON c.user_id = u.user_id
+                    WHERE c.doc->>'role' = 'user'
+                      AND COALESCE(c.doc->>'source', '')
+                          NOT IN ('verify_ping', 'resident_maintenance')
+                      {chat_bound}
 
                     UNION ALL
 
-                    SELECT user_id, ts, 'tracking' AS source
-                    FROM user_logs
-                    WHERE stream = 'tracking_events'
-                      AND ts IS NOT NULL
-                      AND (%s = 0 OR ts >= %s)
+                    SELECT l.user_id, l.ts, 'tracking' AS source
+                    FROM users u
+                    JOIN user_logs l ON l.user_id = u.user_id
+                    WHERE l.stream = 'tracking_events'
+                      AND l.ts IS NOT NULL
+                      {tracking_bound}
                 ),
                 usage_events AS (
                     SELECT
-                        user_id,
-                        ts,
+                        l.user_id,
+                        l.ts,
                         CASE
-                          WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                          THEN (doc->'payload'->>'duration_sec')::bigint
+                          WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{{1,10}}$'
+                          THEN (l.doc->'payload'->>'duration_sec')::bigint
                           ELSE 0
                         END AS duration_sec
-                    FROM user_logs
-                    WHERE stream = 'tracking_events'
-                      AND doc->>'type' = 'app_session_end'
-                      AND ts IS NOT NULL
-                      AND (%s = 0 OR ts >= %s)
+                    FROM users u
+                    JOIN user_logs l ON l.user_id = u.user_id
+                    WHERE l.stream = 'tracking_events'
+                      AND l.doc->>'type' = 'app_session_end'
+                      AND l.ts IS NOT NULL
+                      {tracking_bound}
                 ),
                 daily AS (
                     SELECT
@@ -1960,7 +2327,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                            median_user_sec
                     FROM dau_daily_snapshot
                     WHERE active_events > 0
-                      AND (%s = 0 OR first_ts >= %s)
+                      {frozen_bounds}
                 ),
                 merged AS (
                     SELECT f.*, TRUE AS frozen FROM frozen_rows f
@@ -1976,13 +2343,169 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 FROM merged
                 ORDER BY day DESC
                 LIMIT %s
+                """
+    live_params = [scan_since] * (3 if scan_since > 0 else 0)
+    return conn.execute(
+        sql,
+        (*live_params, tz, tz, tz, *frozen_params, day_limit),
+    ).fetchall()
+
+
+def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Return daily active-user aggregates, preferring immutable snapshots.
+
+    A completed day uses ``dau_daily_snapshot`` once frozen. Today and days
+    before the snapshot boundary remain live. If ``since_epoch`` cuts through
+    a frozen day, that day also falls back to live data so the existing exact
+    timestamp-filter contract is preserved. Every row exposes ``frozen``.
+
+    DAU is intentionally user-initiated activity only: user chat messages plus
+    client tracking events. Agent replies, proactive writes, and synthetic
+    verify pings are excluded so automated reply loops cannot inflate activity.
+
+    The first query finds the oldest day that can survive the requested
+    ``LIMIT`` using only activity timestamps and frozen-day metadata. The
+    expensive per-user/session aggregates then start at that boundary. This
+    preserves "latest N days with activity" across calendar gaps; a fixed
+    N-calendar-day cutoff would silently drop valid rows for a sparse fleet.
+    """
+    day_limit = max(1, min(int(days or 30), 1000))
+    since = float(since_epoch or 0.0)
+    chat_since = " AND c.ts >= s.since_epoch" if since > 0 else ""
+    tracking_since = " AND l.ts >= s.since_epoch" if since > 0 else ""
+    snapshot_since = " AND snap.first_ts >= s.since_epoch" if since > 0 else ""
+
+    try:
+        with _admin_data_track_connection() as conn:
+            boundary = conn.execute(
+                f"""
+                WITH RECURSIVE settings AS (
+                    SELECT %s::text AS tz,
+                           %s::integer AS day_limit,
+                           %s::double precision AS since_epoch
+                ), chat_days(user_id, day, cutoff, depth) AS (
+                    SELECT u.user_id, hit.day, hit.cutoff, 1
+                    FROM users u
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(c.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(c.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM chat_messages c
+                        WHERE c.user_id = u.user_id
+                          AND c.doc->>'role' = 'user'
+                          AND COALESCE(c.doc->>'source', '')
+                              NOT IN ('verify_ping', 'resident_maintenance')
+                          {chat_since}
+                        ORDER BY c.ts DESC
+                        LIMIT 1
+                    ) hit
+                    UNION
+                    SELECT prior.user_id, hit.day, hit.cutoff, prior.depth + 1
+                    FROM chat_days prior
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(c.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(c.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM chat_messages c
+                        WHERE c.user_id = prior.user_id
+                          AND c.ts < prior.cutoff
+                          AND c.doc->>'role' = 'user'
+                          AND COALESCE(c.doc->>'source', '')
+                              NOT IN ('verify_ping', 'resident_maintenance')
+                          {chat_since}
+                        ORDER BY c.ts DESC
+                        LIMIT 1
+                    ) hit
+                    WHERE prior.depth < s.day_limit
+                ), tracking_days(user_id, day, cutoff, depth) AS (
+                    SELECT u.user_id, hit.day, hit.cutoff, 1
+                    FROM users u
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(l.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(l.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM user_logs l
+                        WHERE l.user_id = u.user_id
+                          AND l.stream = 'tracking_events'
+                          AND l.ts IS NOT NULL
+                          {tracking_since}
+                        ORDER BY l.ts DESC
+                        LIMIT 1
+                    ) hit
+                    UNION
+                    SELECT prior.user_id, hit.day, hit.cutoff, prior.depth + 1
+                    FROM tracking_days prior
+                    CROSS JOIN settings s
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            to_char(timezone(s.tz, to_timestamp(l.ts)), 'YYYY-MM-DD') AS day,
+                            EXTRACT(EPOCH FROM (
+                                date_trunc('day', timezone(s.tz, to_timestamp(l.ts)))
+                                AT TIME ZONE s.tz
+                            ))::double precision AS cutoff
+                        FROM user_logs l
+                        WHERE l.user_id = prior.user_id
+                          AND l.stream = 'tracking_events'
+                          AND l.ts IS NOT NULL
+                          AND l.ts < prior.cutoff
+                          {tracking_since}
+                        ORDER BY l.ts DESC
+                        LIMIT 1
+                    ) hit
+                    WHERE prior.depth < s.day_limit
+                ), active_days AS (
+                    SELECT day FROM chat_days
+                    UNION
+                    SELECT day FROM tracking_days
+                    UNION
+                    SELECT snap.day
+                    FROM dau_daily_snapshot snap
+                    CROSS JOIN settings s
+                    WHERE snap.active_events > 0
+                      {snapshot_since}
+                ), limited_days AS (
+                    SELECT day
+                    FROM active_days
+                    ORDER BY day DESC
+                    LIMIT (SELECT day_limit FROM settings)
+                )
+                SELECT MIN(limited_days.day),
+                       EXTRACT(EPOCH FROM (
+                           MIN(limited_days.day)::date::timestamp AT TIME ZONE settings.tz
+                       ))::double precision
+                FROM settings
+                LEFT JOIN limited_days ON TRUE
+                GROUP BY settings.tz
                 """,
-                (since, since, since, since, since, since, tz, tz, tz, since, since, day_limit),
-            ).fetchall()
+                (tz, day_limit, since),
+            ).fetchone()
+            boundary_day = str(boundary[0] or "") if boundary else ""
+            boundary_epoch = float(boundary[1] or 0.0) if boundary else 0.0
+            scan_since = max(since, boundary_epoch)
+            rows = _admin_data_track_dau_rows(
+                conn,
+                since=since,
+                scan_since=scan_since,
+                boundary_day=boundary_day,
+                day_limit=day_limit,
+                tz=tz,
+            )
         return [_dau_row(row) for row in rows]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
-        return []
+        raise AdminDataTrackDauReadError("admin data-track DAU query failed") from e
 
 
 def _admin_utc_text_timestamp_sql(
@@ -2349,26 +2872,8 @@ def admin_data_track_user_daily_usage(
     except (TypeError, ValueError):
         day_limit = 14
 
-    # Keep the read-helper fail-soft contract while still returning the useful
-    # zero-filled shape if PostgreSQL is temporarily unavailable.
     try:
-        zone = ZoneInfo(tz)
-    except Exception:
-        zone = ZoneInfo("Asia/Shanghai")
-    today = datetime.now(zone).date()
-    empty = [
-        {
-            "day": (today - timedelta(days=offset)).isoformat(),
-            "foreground_sec": 0,
-            "sessions": 0,
-            "max_session_sec": 0,
-        }
-        for offset in range(day_limit)
-    ]
-    empty.reverse()
-
-    try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             rows = conn.execute(
                 """
                 WITH local_clock AS (
@@ -2448,7 +2953,9 @@ def admin_data_track_user_daily_usage(
             day_limit,
             e,
         )
-        return empty
+        raise AdminDataTrackDailyUsageReadError(
+            "admin data-track daily usage query failed"
+        ) from e
 
 
 def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
@@ -5346,6 +5853,218 @@ def freeze_completed_resident_lane_days(*, now_epoch: float | None = None,
         return []
 
 
+# --- Distillation artifact attempts -> immutable Beijing-day cells ---------
+
+_DISTILLATION_ROLLUP_MAX_DAYS_PER_TICK = 45
+
+
+def _distillation_freeze_day(
+    conn, *, day: date, zone: ZoneInfo, mirror_batch: list | None = None,
+) -> int:
+    start, end = _lane_rollup_day_bounds(day, zone)
+    rows = conn.execute(
+        """
+        SELECT access_path, distill_kind, artifact, outcome, terminal_result,
+               COUNT(*)::bigint
+        FROM distillation_artifact_attempts
+        WHERE finished_at >= %s AND finished_at < %s
+        GROUP BY access_path, distill_kind, artifact, outcome, terminal_result
+        ORDER BY access_path, distill_kind, artifact, outcome, terminal_result
+        """,
+        (start, end),
+    ).fetchall()
+    sql = """
+        INSERT INTO distillation_artifact_daily_rollup
+            (day, access_path, distill_kind, artifact, outcome,
+             terminal_result, attempts)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+    """
+    day_s = day.isoformat()
+    for access_path, kind, artifact, outcome, terminal_result, attempts in rows:
+        params = (
+            day_s, access_path, kind, artifact, outcome, terminal_result,
+            int(attempts),
+        )
+        conn.execute(sql, params)
+        if mirror_batch is not None:
+            mirror_batch.append((sql, params))
+    return len(rows)
+
+
+def freeze_completed_distillation_days(
+    *, now_epoch: float | None = None, tz: str = "Asia/Shanghai",
+) -> list[str]:
+    """Freeze only post-deployment attempts; historical jobs are not backfilled.
+
+    The first tick records today's Beijing date as ``effective_from`` and an
+    empty through-day immediately before it.  That explicit waterline lets the
+    reader distinguish pre-ledger history from a measured zero.
+    """
+    try:
+        zone = ZoneInfo(tz)
+        now = (
+            datetime.fromtimestamp(float(now_epoch), zone)
+            if now_epoch is not None else datetime.now(zone)
+        )
+        last_completed = (now - timedelta(hours=4)).date() - timedelta(days=1)
+        frozen: list[str] = []
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT effective_from, through_day "
+                "FROM distillation_rollup_watermark "
+                "WHERE scope = 'artifact_attempts'"
+            ).fetchone()
+            if row is None:
+                effective = now.date()
+                through = effective - timedelta(days=1)
+                sql = """
+                    INSERT INTO distillation_rollup_watermark
+                        (scope, effective_from, through_day)
+                    VALUES ('artifact_attempts', %s, %s)
+                    ON CONFLICT (scope) DO NOTHING
+                """
+                params = (effective.isoformat(), through.isoformat())
+                conn.execute(sql, params)
+                from tee_shadow import mirror
+                mirror.execute(sql, params)
+                return []
+            effective = date.fromisoformat(str(row[0]))
+            cursor = max(
+                effective,
+                date.fromisoformat(str(row[1])) + timedelta(days=1),
+            )
+            watermark_sql = """
+                UPDATE distillation_rollup_watermark
+                SET through_day = %s, frozen_at = now()
+                WHERE scope = 'artifact_attempts'
+            """
+            from tee_shadow import mirror
+            steps = 0
+            while (
+                cursor <= last_completed
+                and steps < _DISTILLATION_ROLLUP_MAX_DAYS_PER_TICK
+            ):
+                mirror_batch: list[tuple[str, tuple]] = []
+                _distillation_freeze_day(
+                    conn, day=cursor, zone=zone, mirror_batch=mirror_batch
+                )
+                params = (cursor.isoformat(),)
+                conn.execute(watermark_sql, params)
+                mirror_batch.append((watermark_sql, params))
+                mirror.execute_many(mirror_batch)
+                frozen.append(cursor.isoformat())
+                cursor += timedelta(days=1)
+                steps += 1
+        return frozen
+    except Exception as exc:  # noqa: BLE001 -- scheduler failure domain
+        log.error("[db] freeze_completed_distillation_days failed: %s", exc)
+        return []
+
+
+def admin_distillation_artifact_rollup_windows(
+    *, through_day: str = "", tz: str = "Asia/Shanghai",
+) -> dict:
+    """Read 1/7 closed Beijing-day artifact-attempt windows.
+
+    Counts are returned only with their coverage. Consumers must reject a
+    partial window instead of treating the missing pre-ledger days as zero.
+    """
+    zone = ZoneInfo(tz)
+    raw_end = str(through_day or "").strip()
+    if raw_end:
+        try:
+            end_day = date.fromisoformat(raw_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"admin_distillation_artifact_rollup_windows: bad day {raw_end!r}"
+            ) from exc
+    else:
+        end_day = datetime.now(zone).date() - timedelta(days=1)
+    try:
+        with _admin_data_track_connection() as conn:
+            wm = conn.execute(
+                "SELECT effective_from, through_day, frozen_at "
+                "FROM distillation_rollup_watermark "
+                "WHERE scope = 'artifact_attempts'"
+            ).fetchone()
+            rows = conn.execute(
+                """
+                SELECT day, access_path, distill_kind, artifact, outcome,
+                       terminal_result, attempts
+                FROM distillation_artifact_daily_rollup
+                WHERE day >= %s AND day <= %s
+                ORDER BY day, access_path, distill_kind, artifact, outcome
+                """,
+                ((end_day - timedelta(days=6)).isoformat(), end_day.isoformat()),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        level, message = _admin_event_read_failure(exc)
+        return {
+            "read_status": {"level": level, "message": message},
+            "history_backfill": "unavailable",
+            "windows": [],
+        }
+
+    effective = date.fromisoformat(str(wm[0])) if wm else None
+    frozen_through = date.fromisoformat(str(wm[1])) if wm else None
+
+    def window(day_count: int) -> dict:
+        start_day = end_day - timedelta(days=day_count - 1)
+        covered_start = max(start_day, effective) if effective else None
+        covered_end = min(end_day, frozen_through) if frozen_through else None
+        covered_days = (
+            (covered_end - covered_start).days + 1
+            if covered_start and covered_end and covered_end >= covered_start
+            else 0
+        )
+        level = (
+            "green" if covered_days == day_count
+            else "yellow" if covered_days
+            else "red"
+        )
+        cells: dict[str, dict] = {}
+        for raw in rows:
+            raw_day = date.fromisoformat(str(raw[0]))
+            if not start_day <= raw_day <= end_day:
+                continue
+            path, kind, artifact = str(raw[1]), str(raw[2]), str(raw[3])
+            outcome, terminal = str(raw[4]), str(raw[5])
+            count = int(raw[6] or 0)
+            cell = (
+                cells.setdefault(kind, {})
+                .setdefault(artifact, {})
+                .setdefault(path, {
+                    "succeeded": 0, "failed": 0, "no_write": 0,
+                    "outcomes": {},
+                })
+            )
+            cell[terminal] += count
+            cell["outcomes"][outcome] = cell["outcomes"].get(outcome, 0) + count
+        return {
+            "day_count": day_count,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "coverage": level,
+            "covered_days": covered_days,
+            "effective_from": effective.isoformat() if effective else None,
+            "through_day": frozen_through.isoformat() if frozen_through else None,
+            "cells": cells,
+        }
+
+    return {
+        "read_status": {"level": "ok", "message": ""},
+        "history_backfill": "unavailable",
+        "history_note": (
+            "artifact attempt 账本只覆盖生效日之后；历史 job 无 attempt 边界，"
+            "不可回填，生效日前无数据不等于 0"
+        ),
+        "effective_from": effective.isoformat() if effective else None,
+        "through_day": frozen_through.isoformat() if frozen_through else None,
+        "windows": [window(1), window(7)],
+    }
+
+
 # 删号后的格子处置（Seven 2026-08-18 拍板）：匿名化归并——既非级联删除（会让
 # 冻结的历史聚合数字事后变动），也非带 id 永久保留（0021 先例是匿名 cohort，
 # 与逐用户行不等价，codex2 审出）。归并目标行 user_id='deleted'。
@@ -6281,6 +7000,197 @@ def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
     return "read_error", "取数失败（记了，但这里读不出来）"
 
 
+def admin_background_lane_users(
+    user_ids: list[str], *, days: int = 7, tz: str = "Asia/Shanghai"
+) -> dict:
+    """Bounded per-user heartbeat/capture outcomes from immutable day cells.
+
+    The old users index issued several whole-history GROUP BY queries over
+    ``user_logs`` for every page load and reached the production server's 240s
+    boundary.  This reader scans only completed Beijing-day cells.  Counts and
+    coverage stay separate so an unmeasured zero cannot look healthy.
+    """
+    ids = list(dict.fromkeys(str(uid) for uid in user_ids if str(uid)))
+    day_count = max(1, min(int(days or 7), 90))
+    zone = ZoneInfo(tz)
+    end_day = datetime.now(zone).date() - timedelta(days=1)
+    start_day = end_day - timedelta(days=day_count - 1)
+
+    def empty_coverage(level: str, message: str = "") -> dict[str, dict]:
+        return {
+            route: {
+                "level": level,
+                "message": message,
+                "backfill_from": None,
+                "through_day": None,
+                "outcomes_from": None,
+                "required_start_day": start_day.isoformat(),
+                "required_end_day": end_day.isoformat(),
+            }
+            for route in ("resident", "model_api")
+        }
+
+    base = {
+        "window": {
+            "timezone": tz,
+            "days": day_count,
+            "start_day": start_day.isoformat(),
+            "end_day": end_day.isoformat(),
+            "open_day_excluded": True,
+        },
+        "coverage_by_route": empty_coverage("unavailable"),
+        "users": {},
+        "read_status": {"level": "ok", "message": ""},
+    }
+    try:
+        with _admin_data_track_connection() as conn:
+            # ids is empty when the caller asks for a page past the end or the
+            # filters matched nothing.  The watermark read below does not depend
+            # on ids, so coverage still has to be measured; only the per-user
+            # scan is skipped.
+            rows = conn.execute(
+                """
+                WITH selected AS (
+                  SELECT user_id, route, lane, completed, failed, expired,
+                         superseded, operational_failures, control_outcomes,
+                         user_unavailable, failure_codes
+                  FROM lane_daily_rollup
+                  WHERE user_id = ANY(%s)
+                    AND day >= %s AND day <= %s
+                    AND lane IN ('heartbeat', 'capture')
+                ), totals AS (
+                  SELECT user_id, route, lane,
+                         coalesce(sum(completed), 0)::bigint AS completed,
+                         coalesce(sum(failed), 0)::bigint AS failed,
+                         coalesce(sum(expired), 0)::bigint AS expired,
+                         coalesce(sum(superseded), 0)::bigint AS superseded,
+                         coalesce(sum(operational_failures), 0)::bigint
+                           AS operational_failures,
+                         coalesce(sum(control_outcomes), 0)::bigint
+                           AS control_outcomes,
+                         coalesce(sum(user_unavailable), 0)::bigint
+                           AS user_unavailable
+                  FROM selected
+                  GROUP BY user_id, route, lane
+                ), code_counts AS (
+                  SELECT s.user_id, s.route, s.lane, code.key AS code,
+                         coalesce(sum(
+                           CASE WHEN code.value ~ '^[0-9]+$'
+                                THEN code.value::bigint ELSE 0 END
+                         ), 0)::bigint AS count
+                  FROM selected s
+                  CROSS JOIN LATERAL jsonb_each_text(s.failure_codes) AS code
+                  GROUP BY s.user_id, s.route, s.lane, code.key
+                ), codes AS (
+                  SELECT user_id, route, lane,
+                         jsonb_object_agg(code, count) AS failure_codes
+                  FROM code_counts
+                  GROUP BY user_id, route, lane
+                )
+                SELECT t.user_id, t.route, t.lane, t.completed, t.failed,
+                       t.expired, t.superseded, t.operational_failures,
+                       t.control_outcomes, t.user_unavailable,
+                       coalesce(c.failure_codes, '{}'::jsonb)
+                FROM totals t
+                LEFT JOIN codes c USING (user_id, route, lane)
+                ORDER BY t.user_id, t.route, t.lane
+                """,
+                (ids, start_day.isoformat(), end_day.isoformat()),
+            ).fetchall() if ids else []
+            watermarks = {
+                str(row[0]): {
+                    "backfill_from": str(row[1]) if row[1] is not None else None,
+                    "through_day": str(row[2]) if row[2] is not None else None,
+                    "outcomes_from": str(row[3]) if row[3] is not None else None,
+                }
+                for row in conn.execute(
+                    "SELECT route, backfill_from, through_day, outcomes_from "
+                    "FROM lane_rollup_watermark "
+                    "WHERE route IN ('resident','model_api')"
+                ).fetchall()
+            }
+    except Exception as exc:  # noqa: BLE001 — admin evidence degrades closed
+        level, message = _admin_event_read_failure(exc)
+        log.error("[db] admin_background_lane_users failed: %s", exc)
+        base["read_status"] = {"level": level, "message": message}
+        base["coverage_by_route"] = empty_coverage(level, message)
+        return base
+
+    coverage: dict[str, dict] = {}
+    for route in ("resident", "model_api"):
+        wm = watermarks.get(route)
+        if wm is None:
+            coverage[route] = empty_coverage("unavailable")[route]
+            continue
+        complete = (
+            bool(wm.get("backfill_from"))
+            and bool(wm.get("through_day"))
+            and bool(wm.get("outcomes_from"))
+            and str(wm["backfill_from"]) <= start_day.isoformat()
+            and str(wm["outcomes_from"]) <= start_day.isoformat()
+            and str(wm["through_day"]) >= end_day.isoformat()
+        )
+        coverage[route] = {
+            "level": "green" if complete else "partial",
+            "message": "" if complete else "窗口仅部分落入冻结/分类覆盖范围",
+            **wm,
+            "required_start_day": start_day.isoformat(),
+            "required_end_day": end_day.isoformat(),
+        }
+
+    users: dict[str, dict] = {}
+    for row in rows:
+        uid, route, lane = str(row[0]), str(row[1]), str(row[2])
+        completed = int(row[3] or 0)
+        operational = int(row[7] or 0)
+        denominator = completed + operational
+        lane_row = {
+            "completed": completed,
+            "failed": int(row[4] or 0),
+            "expired": int(row[5] or 0),
+            "superseded": int(row[6] or 0),
+            "operational_failures": operational,
+            "control_outcomes": int(row[8] or 0),
+            "user_unavailable": int(row[9] or 0),
+            "terminal_attempts": denominator,
+            "failure_rate": operational / denominator if denominator else None,
+            "failure_codes": {
+                str(code): int(count or 0)
+                for code, count in dict(row[10] or {}).items()
+            },
+        }
+        user = users.setdefault(uid, {"routes": {}, "lanes": {}})
+        user["routes"].setdefault(route, {})[lane] = dict(lane_row)
+        combined = user["lanes"].setdefault(
+            lane,
+            {
+                "completed": 0, "failed": 0, "expired": 0,
+                "superseded": 0, "operational_failures": 0,
+                "control_outcomes": 0, "user_unavailable": 0,
+                "terminal_attempts": 0, "failure_rate": None,
+                "failure_codes": {},
+            },
+        )
+        for field in (
+            "completed", "failed", "expired", "superseded",
+            "operational_failures", "control_outcomes", "user_unavailable",
+            "terminal_attempts",
+        ):
+            combined[field] += lane_row[field]
+        for code, count in lane_row["failure_codes"].items():
+            combined["failure_codes"][code] = (
+                combined["failure_codes"].get(code, 0) + count
+            )
+        combined["failure_rate"] = (
+            combined["operational_failures"] / combined["terminal_attempts"]
+            if combined["terminal_attempts"] else None
+        )
+
+    base["coverage_by_route"] = coverage
+    base["users"] = users
+    return base
+
+
 def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                              start_day: date, end_day: date,
                              day_count: int) -> dict[str, dict]:
@@ -6877,7 +7787,10 @@ def admin_history_import_job_rolling_windows() -> dict:
         return {
             "calculated_at": calculated_at.isoformat(),
             "coverage": level,
-            "reason": f"{message}；无路径快照、未物理冻结；T247 补",
+            "reason": (
+                f"{message}；整单 history job 无事件时路径快照且未物理冻结；"
+                "artifact 分步账本是另一口径，仅覆盖生效后"
+            ),
             "windows": [],
         }
 
@@ -6901,7 +7814,10 @@ def admin_history_import_job_rolling_windows() -> dict:
     return {
         "calculated_at": calculated_at.isoformat(),
         "coverage": "red",
-        "reason": "无路径快照、未物理冻结；T247 补",
+        "reason": (
+            "整单 history job 无事件时路径快照且未物理冻结；"
+            "artifact 分步账本是另一口径，仅覆盖生效后"
+        ),
         "windows": windows,
     }
 
@@ -6993,13 +7909,22 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         # the exact failure this function was changed to remove.
         raise ValueError(f"admin_events_overview: bad day {want_day!r}, want YYYY-MM-DD")
 
+    def _day_bound(*, epoch: bool, end: bool) -> str:
+        day_expr = (
+            f"('{want_day}'::date + 1)" if end else f"'{want_day}'::date"
+        )
+        bound = f"({day_expr}::timestamp AT TIME ZONE '{zone}')"
+        return f"EXTRACT(EPOCH FROM {bound})" if epoch else bound
+
     def _day_filter(ts_expr: str, *, epoch: bool = True) -> str:
         """SQL predicate scoping one row's time column to ``want_day`` in ``tz``.
 
         ``epoch=True`` for the numeric ``ts`` columns (user_logs / chat_messages),
-        False for a real timestamptz (genesis_import_jobs.created_at). Same
-        bucketing idiom as admin_data_track_dau, so this board and the DAU chart
-        can never disagree about which day a row belongs to.
+        False for a real timestamptz (genesis_import_jobs.created_at). The
+        calendar bounds are constants on the right-hand side, leaving the table
+        column bare so PostgreSQL can use its timestamp indexes. Applying
+        ``to_char(timezone(...))`` to every row preserved the same result but
+        forced a broad scan before it could reject out-of-day history.
 
         ``want_day``/``zone`` are inlined rather than bound because these SQL
         strings are assembled by f-string in the callers below; both are stripped
@@ -7007,9 +7932,9 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
         (``_valid_day``), so no caller-controlled text reaches SQL."""
         if not want_day:
             return ""
-        stamp = f"to_timestamp({ts_expr})" if epoch else f"({ts_expr})"
-        return (f" AND to_char(timezone('{zone}', {stamp}), "
-                f"'YYYY-MM-DD') = '{want_day}'")
+        start = _day_bound(epoch=epoch, end=False)
+        end = _day_bound(epoch=epoch, end=True)
+        return f" AND {ts_expr} >= {start} AND {ts_expr} < {end}"
 
     def _run(key, sql):
         try:
@@ -7067,12 +7992,14 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
                percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur
         FROM (
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
-          FROM user_logs l
+          FROM users u
+          JOIN user_logs l ON l.user_id = u.user_id
           WHERE l.stream = 'memory_capture_jobs'
             {_day_filter('l.ts')}
           UNION ALL
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
-          FROM user_logs l
+          FROM users u
+          JOIN user_logs l ON l.user_id = u.user_id
           WHERE l.stream = 'proactive_jobs'
             AND COALESCE(l.doc->>'job_kind','') IN ('memory_capture','memory_dream','memory_migrate')
             {_day_filter('l.ts')}
@@ -7106,16 +8033,60 @@ def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
     # 4) 回复消息: 真回复率 + 兜底率 + 回复延迟(中位)。real_replies 排除
     #    agent_initiated_proactive(主动消息不是"对用户的回复")。latency = 每条真回复
     #    与其前一条用户消息的时间差(窗口配对)。
-    #    日期过滤只能加在 paired 之外：窗口函数要回看"这条回复之前的那条用户消息"，
-    #    在 CTE 里就按天切会让每天 0 点后的第一条回复找不到它的问句(last_user_ts 为
-    #    NULL)，于是被算成"没有真回复"——把跨零点的正常对话统计成故障。
-    rows = _run("reply", f"""
-        {_EVENTS_ROUTES_CTE}, paired AS (
-          SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
-            MAX(CASE WHEN c.doc->>'role' IN ('user','human') AND COALESCE(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') THEN c.ts END)
+    #
+    #    日期过滤不能只加在 paired 外层：那会先给全历史跑窗口函数，再扔掉窗外行。
+    #    也不能只把当天行塞进窗口：零点后的第一条回复可能在回答前一天的最后一条
+    #    用户消息。day_rows + 每位当天活跃用户的一条 prior_user_rows 是窗口计算的
+    #    最小充分输入；外层仍只统计当天行，口径与原全史窗口逐字相同。
+    if want_day:
+        reply_pairing_ctes = f"""
+        , day_rows AS MATERIALIZED (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src
+          FROM chat_messages c
+          WHERE TRUE {_day_filter('c.ts')}
+        ), relevant_users AS MATERIALIZED (
+          SELECT DISTINCT user_id FROM day_rows
+        ), prior_user_rows AS (
+          SELECT DISTINCT ON (c.user_id)
+                 c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src
+          FROM chat_messages c
+          JOIN relevant_users u ON u.user_id = c.user_id
+          WHERE c.ts < {_day_bound(epoch=True, end=False)}
+            AND c.doc->>'role' IN ('user','human')
+            AND COALESCE(c.doc->>'source','')
+                NOT IN ('verify_ping','resident_maintenance')
+          ORDER BY c.user_id, c.ts DESC
+        ), pairing_source AS (
+          SELECT * FROM prior_user_rows
+          UNION ALL
+          SELECT * FROM day_rows
+        ), paired AS (
+          SELECT c.user_id, c.ts, c.role, c.src,
+            MAX(CASE WHEN c.role IN ('user','human')
+                          AND c.src NOT IN ('verify_ping','resident_maintenance')
+                     THEN c.ts END)
+              OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+          FROM pairing_source c
+        )
+        """
+    else:
+        reply_pairing_ctes = """
+        , paired AS (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role,
+                 COALESCE(c.doc->>'source','') AS src,
+            MAX(CASE WHEN c.doc->>'role' IN ('user','human')
+                          AND COALESCE(c.doc->>'source','')
+                              NOT IN ('verify_ping','resident_maintenance')
+                     THEN c.ts END)
               OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
           FROM chat_messages c
         )
+        """
+    rows = _run("reply", f"""
+        {_EVENTS_ROUTES_CTE}
+        {reply_pairing_ctes}
         SELECT COALESCE(r.route,'resident') AS route,
                (COUNT(*) FILTER (WHERE p.role IN ('user','human') AND p.src NOT IN ('verify_ping','resident_maintenance')))::int AS user_msgs,
                (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
@@ -7393,13 +8364,6 @@ def _blob_revision(doc) -> int:
     return int(raw)
 
 
-def _next_blob_revision(doc) -> int:
-    revision = _blob_revision(doc)
-    if revision >= 999_999_999_999_999_999:
-        raise RuntimeError("blob mirror revision exhausted")
-    return revision + 1
-
-
 def get_blob_strict(user_id: str, kind: str):
     """Return a blob or ``None`` for a genuine miss; propagate DB failures."""
     with get_pool().connection() as conn:
@@ -7422,6 +8386,10 @@ def get_blob(user_id: str, kind: str):
 def get_blobs_for_users(
     user_ids: list[str],
     kinds: list[str],
+    *,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+    raise_on_error: bool = False,
 ) -> dict[tuple[str, str], object]:
     """Return singleton blobs for a set of users and kinds in one DB round trip.
 
@@ -7436,16 +8404,27 @@ def get_blobs_for_users(
     if not ids or not wanted_kinds:
         return {}
     try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                "SELECT user_id, kind, doc FROM user_blobs "
-                "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
-                (ids, wanted_kinds),
-            ).fetchall()
+        connection_kwargs = (
+            {"timeout": float(connection_timeout)}
+            if connection_timeout is not None else {}
+        )
+        with get_pool().connection(**connection_kwargs) as conn:
+            timeout_scope = (
+                _local_statement_timeout(conn, int(statement_timeout_ms))
+                if statement_timeout_ms is not None else nullcontext()
+            )
+            with timeout_scope:
+                rows = conn.execute(
+                    "SELECT user_id, kind, doc FROM user_blobs "
+                    "WHERE user_id = ANY(%s) AND kind = ANY(%s)",
+                    (ids, wanted_kinds),
+                ).fetchall()
         return {(str(user_id), str(kind)): doc for user_id, kind, doc in rows}
     except Exception as e:
         log.error("[db] get_blobs_for_users(%d users,%d kinds) failed: %s",
                   len(ids), len(wanted_kinds), e)
+        if raise_on_error:
+            raise
         return {}
 
 
@@ -7827,9 +8806,22 @@ TRACE_OUTCOME_CLASSES = frozenset({
     "user_unavailable",
 })
 TRACE_OUTCOME_DEFAULT = "operational_failure"
+TRACE_OUTCOME_PROVENANCE_FIELD = "outcome_class_provenance"
+TRACE_OUTCOME_PROVENANCE_VALUES = frozenset({
+    "explicit", "missing", "normalized_invalid",
+})
 _TRACE_EVENTS_RETENTION_DAYS = 30
 _TRACE_EVENTS_MIN_FUTURE_DAYS = 7
 _TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
+
+
+def _normalize_trace_outcome_class(value: object) -> tuple[str, str]:
+    if value is None or value == "":
+        return TRACE_OUTCOME_DEFAULT, "missing"
+    candidate = str(value)
+    if candidate in TRACE_OUTCOME_CLASSES:
+        return candidate, "explicit"
+    return TRACE_OUTCOME_DEFAULT, "normalized_invalid"
 
 
 def insert_trace_events_strict(
@@ -7855,10 +8847,11 @@ def insert_trace_events_strict(
             event_ts = float(raw.get("ts") or time.time())
         except (TypeError, ValueError) as exc:
             raise ValueError("trace event ts must be numeric") from exc
-        detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
-        outcome_class = str(raw.get("outcome_class") or TRACE_OUTCOME_DEFAULT)
-        if outcome_class not in TRACE_OUTCOME_CLASSES:
-            outcome_class = TRACE_OUTCOME_DEFAULT
+        detail = dict(raw.get("detail")) if isinstance(raw.get("detail"), dict) else {}
+        outcome_class, outcome_provenance = _normalize_trace_outcome_class(
+            raw.get("outcome_class")
+        )
+        detail[TRACE_OUTCOME_PROVENANCE_FIELD] = outcome_provenance
         normalized.append((
             uid,
             event_ts,
@@ -8090,8 +9083,11 @@ def query_trace_events_flat_page(
         since_epoch=since_epoch,
         candidate_limit=candidate_limit,
     )
-    metadata_statement = ctes + (
-        "SELECT"
+    statement = ctes + (
+        ", page AS MATERIALIZED ("
+        " SELECT f.id,f.ts FROM filtered f"
+        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+        ") SELECT"
         " (SELECT count(*) FROM filtered) AS events_total,"
         " (SELECT count(*) FROM selected_turns) AS turns_total,"
         " (SELECT count(*) FROM selected_turns WHERE terminal_status='stalled') AS stalled_turns,"
@@ -8104,27 +9100,47 @@ def query_trace_events_flat_page(
         " COALESCE((SELECT array_agg(DISTINCT subsystem ORDER BY subsystem)"
         "           FROM candidate WHERE subsystem<>''),ARRAY[]::text[]) AS subsystems,"
         " COALESCE((SELECT array_agg(DISTINCT lower(status) ORDER BY lower(status))"
-        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses"
-    )
-    page_statement = ctes + (
-        "SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
-        " FROM filtered f JOIN trace_events e ON e.id=f.id AND e.ts=f.ts"
-        " ORDER BY f.ts DESC,f.id DESC OFFSET %s LIMIT %s"
+        "           FROM candidate WHERE status<>''),ARRAY[]::text[]) AS statuses,"
+        + ",".join(
+            f"event.{column} AS event_{column}"
+            for column in _TRACE_EVENT_COLUMNS
+        )
+        + " FROM (SELECT 1) anchor LEFT JOIN LATERAL ("
+        " SELECT " + ",".join("e." + column for column in _TRACE_EVENT_COLUMNS) +
+        " FROM page p JOIN trace_events e ON e.id=p.id AND e.ts=p.ts"
+        " ORDER BY p.ts DESC,p.id DESC"
+        ") event ON TRUE"
+        " ORDER BY event.ts DESC NULLS LAST,event.id DESC NULLS LAST"
     )
     connection_kwargs = {"timeout": float(connection_timeout)}
     with get_pool().connection(**connection_kwargs) as conn:
         with _local_statement_timeout(conn, statement_timeout_ms):
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    metadata_statement,
-                    [*cte_params, int(candidate_limit)],
+                    statement,
+                    [
+                        *cte_params,
+                        bounded_offset,
+                        bounded_limit + 1,
+                        int(candidate_limit),
+                    ],
                 )
-                metadata = dict(cur.fetchone() or {})
-                cur.execute(
-                    page_statement,
-                    [*cte_params, bounded_offset, bounded_limit + 1],
-                )
-                rows = [dict(row) for row in cur.fetchall()]
+                result_rows = [dict(row) for row in cur.fetchall()]
+
+    metadata_keys = (
+        "events_total", "turns_total", "stalled_turns", "error_turns",
+        "scan_truncated", "users", "subsystems", "statuses",
+    )
+    first = result_rows[0] if result_rows else {}
+    metadata = {key: first.get(key) for key in metadata_keys}
+    rows = [
+        {
+            column: result_row.get(f"event_{column}")
+            for column in _TRACE_EVENT_COLUMNS
+        }
+        for result_row in result_rows
+        if result_row.get("event_id") is not None
+    ]
 
     for row in rows:
         timestamp = row.get("ts")
@@ -9699,8 +10715,9 @@ def recent_genesis_import_health(
     ``artifact_verified``.  The former is a reducer lifecycle fact; the latter
     is conservative evidence from the durable ledger that the job produced the
     artifact its mode called for.  This avoids turning a terminal row into a
-    false-green import result while we still lack a dedicated per-attempt
-    artifact-verification ledger.
+    false-green import result. This legacy final-snapshot classifier remains
+    separate from the post-rollout per-attempt artifact ledger: it can describe
+    older jobs conservatively, but must not be relabeled as attempt evidence.
 
     The returned failure code is derived in SQL from at most the first two
     snake-case error segments.  Free-form exception text is neither returned
@@ -9827,6 +10844,7 @@ def recent_genesis_import_health(
                   has_source_material,
                   memory_action_count,
                   identity_status,
+                  failed_phase,
                   created_at, updated_at, completed_at,
                   CASE
                     WHEN status='failed' AND
@@ -9989,6 +11007,9 @@ def genesis_reclaim_orphaned_processing_jobs(
     safe_limit = max(1, min(int(limit or 1), 200))
     live = list(dict.fromkeys(str(w) for w in (live_worker_ids or []) if str(w)))
     _UPDATE_SET = (
+        "failed_phase = CASE WHEN {j}.received_chunks > 0 THEN {j}.failed_phase "
+        "ELSE COALESCE(NULLIF({j}.output->>'stage', ''), "
+        "NULLIF({j}.status, 'failed'), NULLIF({j}.failed_phase, '')) END, "
         "status = CASE WHEN {j}.received_chunks > 0 THEN 'uploaded' ELSE 'failed' END, "
         "error = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE %s END, "
         "worker_claimed_by = CASE WHEN {j}.received_chunks > 0 THEN '' ELSE {j}.worker_claimed_by END, "
@@ -10127,6 +11148,9 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = COALESCE(NULLIF(j.output->>'stage', ''),
+                                        NULLIF(j.status, 'failed'),
+                                        NULLIF(j.failed_phase, '')),
                 status = 'failed',
                 error = %s,
                 updated_at = now()
@@ -10150,7 +11174,10 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
         # exact rows the primary reaped rather than re-picking independently.
         placeholders = ", ".join(["(%s, %s)"] * len(out))
         mirror_sql = (
-            "UPDATE genesis_import_jobs SET status = 'failed', error = %s, updated_at = now() "
+            "UPDATE genesis_import_jobs SET "
+            "failed_phase = COALESCE(NULLIF(output->>'stage', ''), "
+            "NULLIF(status, 'failed'), NULLIF(failed_phase, '')), "
+            "status = 'failed', error = %s, updated_at = now() "
             f"WHERE (user_id, job_id) IN ({placeholders})"
         )
         mirror_params = (error[:1000],) + tuple(
@@ -10181,6 +11208,9 @@ def genesis_fail_stale_plaintext_job(
     safe_sec = max(60, int(older_than_sec or 0))
     sql = """
         UPDATE genesis_import_jobs SET
+            failed_phase = COALESCE(NULLIF(output->>'stage', ''),
+                                    NULLIF(status, 'failed'),
+                                    NULLIF(failed_phase, '')),
             status = 'failed',
             error = %s,
             updated_at = now()
@@ -10205,7 +11235,10 @@ def genesis_fail_stale_plaintext_job(
     if result is not None:
         from tee_shadow import mirror
         mirror.execute(
-            "UPDATE genesis_import_jobs SET status='failed', error=%s, updated_at=now() "
+            "UPDATE genesis_import_jobs SET "
+            "failed_phase=COALESCE(NULLIF(output->>'stage',''), "
+            "NULLIF(status,'failed'), NULLIF(failed_phase,'')), "
+            "status='failed', error=%s, updated_at=now() "
             "WHERE user_id=%s AND job_id=%s AND status='processing' "
             "AND COALESCE(metadata->>'ingest', '')='plaintext' "
             "AND COALESCE(metadata->>'plaintext_worker_instance', '')=%s",
@@ -10262,6 +11295,10 @@ def genesis_reap_stale_resident_jobs(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = CASE WHEN j.resident_attempts < %s THEN j.failed_phase
+                    ELSE COALESCE(NULLIF(j.output->>'stage', ''),
+                                  NULLIF(j.status, 'failed'),
+                                  NULLIF(j.failed_phase, '')) END,
                 status = CASE WHEN j.resident_attempts < %s THEN 'awaiting_resident' ELSE 'failed' END,
                 error = CASE WHEN j.resident_attempts < %s THEN '' ELSE %s END,
                 resident_consumer_id = '',
@@ -10272,7 +11309,7 @@ def genesis_reap_stale_resident_jobs(
             WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
             RETURNING j.*
             """,
-            (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
+            (safe_sec, safe_limit, safe_max, safe_max, safe_max, error[:1000]),
         )
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
@@ -10317,6 +11354,9 @@ def genesis_reap_stale_unclaimed_jobs(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE genesis_import_jobs AS j SET
+                failed_phase = COALESCE(NULLIF(j.output->>'stage', ''),
+                                        NULLIF(j.status, 'failed'),
+                                        NULLIF(j.failed_phase, '')),
                 status = 'failed',
                 error = %s,
                 updated_at = now()
@@ -10512,6 +11552,7 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
         """
         UPDATE genesis_import_jobs SET
             status = 'uploaded',
+            failed_phase = '',
             finalized_at = COALESCE(finalized_at, now()),
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
@@ -10540,6 +11581,11 @@ def genesis_set_job_status(
     sql = (
         """
         UPDATE genesis_import_jobs SET
+            failed_phase = CASE WHEN %s = 'failed'
+                THEN COALESCE(NULLIF(output->>'stage', ''),
+                              NULLIF(status, 'failed'),
+                              NULLIF(failed_phase, ''))
+                ELSE failed_phase END,
             status = %s,
             error = %s,
             output = COALESCE(%s::jsonb, output),
@@ -10550,6 +11596,7 @@ def genesis_set_job_status(
         """
     )
     params = (
+        status,
         status,
         error[:1000],
         Jsonb(output) if output is not None else None,
@@ -10574,12 +11621,62 @@ def genesis_set_job_status(
     from tee_shadow import mirror
     mirror.execute(sql, (
         status,
+        status,
         error[:1000],
         Jsonb(output) if output is not None else None,
         processed_chunks,
         user_id,
         job_id,
     ))
+    return result
+
+
+def distillation_start_artifact_attempt(
+    *, attempt_id: str, user_id: str, job_id: str, flow: str,
+    distill_kind: str, artifact: str, access_path: str,
+) -> dict | None:
+    """Append the start boundary for one real artifact write attempt.
+
+    There is intentionally no uniqueness constraint on ``job_id + artifact``:
+    foreground/background passes and retries are separate attempts, and a later
+    success must never overwrite an earlier failure.
+    """
+    sql = """
+        INSERT INTO distillation_artifact_attempts
+            (attempt_id, user_id, job_id, flow, distill_kind, artifact,
+             access_path)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (attempt_id) DO NOTHING
+        RETURNING *
+    """
+    params = (
+        str(attempt_id), str(user_id), str(job_id), str(flow),
+        str(distill_kind), str(artifact), str(access_path),
+    )
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return result
+
+
+def distillation_finish_artifact_attempt(
+    attempt_id: str, *, outcome: str, terminal_result: str,
+) -> dict | None:
+    """Close exactly one attempt; a second close cannot rewrite its evidence."""
+    sql = """
+        UPDATE distillation_artifact_attempts SET
+            outcome = %s, terminal_result = %s, finished_at = now()
+        WHERE attempt_id = %s AND finished_at IS NULL
+        RETURNING *
+    """
+    params = (str(outcome), str(terminal_result), str(attempt_id))
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
     return result
 
 
@@ -10960,15 +12057,6 @@ def chat_poll_candidates_strict(
             (user_id, float(since), float(redelivery_floor), bounded),
         ).fetchall()
     return [_chat_project_row(row) for row in rows]
-
-
-def chat_load_recent(user_id: str, limit: int) -> list[dict]:
-    """Legacy best-effort wrapper around :func:`chat_load_recent_strict`."""
-    try:
-        return chat_load_recent_strict(user_id, limit)
-    except Exception as e:
-        log.error("[db] chat_load_recent(%s,%s) failed: %s", user_id, limit, e)
-        return []
 
 
 def chat_history_page_strict(
@@ -11594,7 +12682,10 @@ def chat_capture_messages_after_seq(
 
     Eligibility is filtered in SQL *before* LIMIT. Filtering a newest raw
     window in Python can permanently hide an older uncaptured live row behind
-    a long run of synthetic/import records.
+    a long run of synthetic/import records.  This trigger-discovery read is
+    metadata-only on purpose: Capture workers fetch the encrypted transcript
+    separately, so returning the full ``doc`` here would retransmit ciphertext
+    on every append/scheduler tick merely to count turns and identify the edge.
     """
     cursor_seq = int(after_seq)
     bounded = max(1, min(int(limit), 1000))
@@ -11605,8 +12696,9 @@ def chat_capture_messages_after_seq(
         return []
     with get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT seq,msg_id,ts,doc FROM ("
-            " SELECT seq,msg_id,ts,doc FROM chat_messages "
+            "SELECT seq,msg_id,ts,role,source FROM ("
+            " SELECT seq,msg_id,ts,doc->>'role' AS role,"
+            " COALESCE(doc->>'source','') AS source FROM chat_messages "
             " WHERE user_id=%s AND seq>%s "
             " AND doc->>'role' IN ('user','openclaw') "
             " AND COALESCE(doc->>'source','')=ANY(%s::text[]) "
@@ -11616,13 +12708,30 @@ def chat_capture_messages_after_seq(
         ).fetchall()
     return [
         {
-            **dict(row[3] or {}),
             "id": str(row[1]),
             "ts": float(row[2]),
             "seq": int(row[0]),
+            "role": str(row[3] or ""),
+            "source": str(row[4] or ""),
         }
         for row in rows
     ]
+
+
+def chat_user_turn_count_strict(user_id: str) -> int:
+    """Return the durable count of chat rows whose role is exactly ``user``.
+
+    Dream scheduling needs one scalar ledger value, not a retained chat
+    snapshot.  Keeping the predicate identical to its former in-memory count
+    preserves behavior while making cold metadata-only stores correct.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role'='user'",
+            (str(user_id),),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def chat_seqs_after_seq(
@@ -15806,27 +16915,6 @@ def memory_load(user_id: str) -> list[dict]:
         return []
 
 
-def memory_profile_source_snapshot(user_id: str) -> dict:
-    """Content-free Memory Garden fingerprint used by profile refresh policy.
-
-    The profile generator itself still reads/decrypts every eligible card
-    through the enclave readside.  This aggregate is deliberately DB-only so a
-    normal chat turn can decide whether a seven-day-old profile is stale
-    without disclosing or loading any card plaintext.
-    """
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT count(*)::bigint, "
-            "COALESCE(max(doc->>'updated_at'), '') "
-            "FROM memory_moments WHERE user_id=%s",
-            (str(user_id),),
-        ).fetchone()
-    return {
-        "card_count": int(row[0]) if row and row[0] is not None else 0,
-        "max_updated_at": str(row[1] or "") if row else "",
-    }
-
-
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
     """Single-row upsert. Returns True iff the write committed — callers that
     advance state on success (e.g. memory.upgrade / migration) MUST check it."""
@@ -17155,7 +18243,7 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
 
 
 def log_append(user_id: str, stream: str, doc: dict,
-               ts: float | None = None, item_key: str | None = None) -> None:
+               ts: float | None = None, item_key: str | None = None) -> bool:
     sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
            "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
     try:
@@ -17163,9 +18251,9 @@ def log_append(user_id: str, stream: str, doc: dict,
             row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
     except Exception as e:
         log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
-        return
+        return False
     if row is None:
-        return
+        return False
     # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
     # VALUE): user_logs.seq is GENERATED ALWAYS AS IDENTITY, so a plain INSERT
     # on the TEE side would mint its own, independent seq and break the
@@ -17179,6 +18267,7 @@ def log_append(user_id: str, stream: str, doc: dict,
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
     mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+    return True
 
 
 def log_append_numbered(
@@ -17238,19 +18327,43 @@ def log_read(user_id: str, stream: str, limit: int = 100, since_epoch: float = 0
     the newest ``limit`` rows (still chronological). ``since_epoch`` filters on
     the ts column (rows with NULL ts are excluded when since_epoch is set)."""
     try:
+        if since_epoch and since_epoch > time.time() + LOG_READ_FUTURE_CURSOR_TOLERANCE_SECONDS:
+            return []
         params: list = [user_id, stream]
         where = "user_id = %s AND stream = %s"
         if since_epoch:
-            where += " AND ts > %s"
             params.append(since_epoch)
         if limit and limit > 0:
-            sql = (
-                f"SELECT doc FROM (SELECT doc, seq FROM user_logs WHERE {where} "
-                f"ORDER BY seq DESC LIMIT %s) t ORDER BY seq ASC"
-            )
+            if since_epoch:
+                # Do not let PostgreSQL satisfy the seq ordering first then
+                # filter ts from a potentially huge user stream. Materializing
+                # this bounded time window makes the existing
+                # logs_stream_ts_idx the access path, while the outer query
+                # retains the historical newest-N / ascending-seq contract.
+                sql = (
+                    "WITH time_window AS MATERIALIZED ("
+                    "  SELECT doc, seq FROM user_logs "
+                    "  WHERE user_id = %s AND stream = %s AND ts > %s"
+                    ") "
+                    "SELECT doc FROM (SELECT doc, seq FROM time_window "
+                    "ORDER BY seq DESC LIMIT %s) t ORDER BY seq ASC"
+                )
+            else:
+                sql = (
+                    f"SELECT doc FROM (SELECT doc, seq FROM user_logs WHERE {where} "
+                    f"ORDER BY seq DESC LIMIT %s) t ORDER BY seq ASC"
+                )
             params.append(limit)
         else:
-            sql = f"SELECT doc FROM user_logs WHERE {where} ORDER BY seq ASC"
+            if since_epoch:
+                sql = (
+                    "WITH time_window AS MATERIALIZED ("
+                    "  SELECT doc, seq FROM user_logs "
+                    "  WHERE user_id = %s AND stream = %s AND ts > %s"
+                    ") SELECT doc FROM time_window ORDER BY seq ASC"
+                )
+            else:
+                sql = f"SELECT doc FROM user_logs WHERE {where} ORDER BY seq ASC"
         with get_pool().connection() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [r[0] for r in rows]
@@ -17332,6 +18445,27 @@ def log_trim(user_id: str, stream: str, max_rows: int,
     mirror.execute(sql, params)
 
 
+def log_clear(user_id: str, stream: str) -> bool:
+    """Delete one user's entire append-log stream from primary and TEE.
+
+    This is deliberately narrower than accepting an arbitrary predicate: callers
+    use it only when a whole bounded stream has reached its semantic terminal
+    state. Return whether the primary delete completed so best-effort callers can
+    avoid claiming that a clear happened when the database write failed.
+    """
+    sql = "DELETE FROM user_logs WHERE user_id = %s AND stream = %s"
+    params = (user_id, stream)
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(sql, params)
+    except Exception as e:
+        log.error("[db] log_clear(%s,%s) failed: %s", user_id, stream, e)
+        return False
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return True
+
+
 def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None:
     """Delete rows whose ts is older than the cutoff. Rows with NULL ts are
     kept (those streams don't carry an epoch ts)."""
@@ -17368,6 +18502,7 @@ def delete_user_data(user_id: str) -> None:
         "v2_conversation_summary_segments",
         "v2_conversation_summary",
         "v2_turn_metrics",
+        "v2_trajectory_events",
         "chat_message_archive",
         "chat_messages",
         "memory_moments",
@@ -17378,6 +18513,7 @@ def delete_user_data(user_id: str) -> None:
         "perception_items",
         "perception_daily",
         "perception_signal_state_v2",
+        "distillation_artifact_attempts",
         "genesis_import_chunks",
         "genesis_import_outputs",
         "genesis_import_jobs",

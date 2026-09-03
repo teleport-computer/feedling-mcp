@@ -208,6 +208,68 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     assert _job_row(job_id)[0] == "completed"
 
 
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_lane_ignores_content_block_metadata_for_language(monkeypatch, lane):
+    """Both V2 call sites must pass only the user's text into language choice."""
+    uid = f"u_x_block_language_{lane}"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    row = {
+        "id": "m-block",
+        "seq": 1,
+        "ts": 1.0,
+        "role": "user",
+        "raw_role": "user",
+        "source": "chat",
+        "capture_eligible": True,
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }
+    seen = {}
+
+    def _fake_prompt(**kwargs):
+        seen["locale"] = kwargs["locale"]
+        seen["window"] = (
+            kwargs.get("window") or kwargs.get("recent_conversations") or ""
+        )
+        return "prompt"
+
+    async def _fake_extract(**_kwargs):
+        return [], None
+
+    monkeypatch.setattr(
+        worker,
+        "build_capture_prompt" if lane == "capture" else "build_dream_prompt",
+        _fake_prompt,
+    )
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    deps = _deps(
+        read_tail=lambda _uid, _after, _limit: [row],
+        read_compaction_tail_after_seq=lambda _uid, _after, _limit, **_kw: [row],
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert seen["locale"] == "zh-Hans"
+    assert "我今天很难过" in seen["window"]
+    assert "image_url" not in seen["window"]
+
+
 def test_dream_lifecycle_trace_correlates_model_and_write_outcome(monkeypatch):
     uid = "u_x_dream_trace"
     _seed_v2(uid)

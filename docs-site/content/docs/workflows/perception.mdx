@@ -1,6 +1,8 @@
 ---
 title: Perception workflow
 description: Report current context, read the freshness-gated snapshot, and upload encrypted photos.
+document_lifecycle: current
+canonical_owner: self
 ---
 
 Perception accepts sparse device context. A report can contain one or more of
@@ -227,7 +229,9 @@ Proactive runtime and temporal context is labeled as application data rather
 than presented as a new user message. An ordinary heartbeat does not call the
 model until the account has genuine conversation history. Once history exists,
 heartbeat and screen-watch moments leave speaking and staying silent as equal
-model choices; scheduled reminders remain explicit delivery requests.
+model choices. The terminal choice is structured as either `reply` (with separate
+thinking and visible-message fields) or `stay_silent`; scheduled reminders remain
+explicit delivery requests.
 
 ## Collection items
 
@@ -277,6 +281,31 @@ as provided rather than as a v1 encrypted envelope. Do not upload raw health or
 other sensitive content through it unless that storage exposure is acceptable
 for your threat model. New sensitive-signal integrations should use encrypted
 `context_snapshot` envelopes.
+
+## Digest freshness
+
+`GET /v1/agent/perception/digest` compares daily history to identify notable
+numeric changes. A trend entry includes `current` only while that field's most
+recent device report is within the signal TTL. When the report is stale, the
+same entry remains available with `last_known` and `as_of` instead; its
+baseline, delta, and direction are unchanged. `as_of` uses the user's reported
+timezone, or includes a `UTC` suffix when the timezone is missing or invalid.
+
+The rule applies to both the top-level `changes` list and
+`domains.health.notable`. It does not change the real-time perception snapshot
+or its existing TTL filtering.
+
+```json
+{
+  "signal": "health_vitals",
+  "field": "step_count",
+  "last_known": 1800.0,
+  "as_of": "2026-08-25 23:41",
+  "baseline_median": 1000.0,
+  "delta": 800.0,
+  "direction": "up"
+}
+```
 
 ## App-open / app-close shortcuts
 
@@ -517,4 +546,11 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 ```
 
 The `decrypt_path` is user-scoped and must be called with an authorized
-credential. It is not a public object URL.
+credential. It is not a public object URL. Encrypted photo envelopes are
+decrypted inside the enclave. When content encryption is effectively off, a
+strict `body_b64` plaintext photo is validated and decoded inside the managed
+service boundary; only recognized image signatures are accepted, and that
+plaintext path never falls through to enclave decryption. VLM captioning of
+plaintext visual frames is currently unavailable; the managed service returns
+`frame_plaintext_caption_unsupported` instead of forwarding plaintext to the
+enclave.

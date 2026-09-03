@@ -156,6 +156,17 @@ def test_all_deploy_yaml_files_have_unique_mapping_keys():
         load_yaml_strict(path.read_text(), source_name=str(path.relative_to(ROOT)))
 
 
+@pytest.mark.parametrize("path", INGRESS_COMPOSES)
+def test_backend_wires_capture_append_refresh_rollback(path):
+    compose = load_yaml_strict(
+        path.read_text(), source_name=str(path.relative_to(ROOT))
+    )
+
+    assert compose["services"]["backend"]["environment"][
+        "FEEDLING_CAPTURE_APPEND_REFRESH_MODE"
+    ] == "${FEEDLING_CAPTURE_APPEND_REFRESH_MODE:-deferred}"
+
+
 def test_ci_runs_the_strict_deploy_yaml_gate():
     path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = load_yaml_strict(
@@ -202,8 +213,8 @@ def test_test_environment_uses_literal_three_pool_runtime_values():
         assert retired not in environment
 
 
-def test_test_environment_attests_incremental_chat_sync_with_256_row_hot_cache():
-    """Removing either literal would silently restore legacy 5k reloads."""
+def test_test_environment_attests_lazy_store_with_incremental_chat_sync():
+    """TEST must preserve the reviewed lazy Store rollout controls."""
     path = ROOT / "deploy" / "docker-compose.phala.test.yaml"
     compose = load_yaml_strict(
         path.read_text(),
@@ -214,12 +225,14 @@ def test_test_environment_attests_incremental_chat_sync_with_256_row_hot_cache()
         environment = compose["services"][service_name]["environment"]
         assert environment["FEEDLING_CHAT_SYNC_MODE"] == "incremental"
         assert environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"] == "256"
+        assert environment["FEEDLING_STORE_LOAD_MODE"] == "lazy"
         assert "${" not in environment["FEEDLING_CHAT_SYNC_MODE"]
         assert "${" not in environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"]
+        assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]
 
 
-def test_prod_environment_attests_incremental_chat_sync_with_256_row_hot_cache():
-    """PROD must not silently fall back to legacy 5k chat reloads."""
+def test_prod_environment_keeps_legacy_store_with_incremental_256_row_chat():
+    """PROD must keep the reviewed rollback while TEST continues lazy validation."""
     path = ROOT / "deploy" / "docker-compose.phala.yaml"
     compose = load_yaml_strict(
         path.read_text(),
@@ -230,8 +243,10 @@ def test_prod_environment_attests_incremental_chat_sync_with_256_row_hot_cache()
         environment = compose["services"][service_name]["environment"]
         assert environment["FEEDLING_CHAT_SYNC_MODE"] == "incremental"
         assert environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"] == "256"
+        assert environment["FEEDLING_STORE_LOAD_MODE"] == "legacy"
         assert "${" not in environment["FEEDLING_CHAT_SYNC_MODE"]
         assert "${" not in environment["FEEDLING_CHAT_HOT_CACHE_LIMIT"]
+        assert "${" not in environment["FEEDLING_STORE_LOAD_MODE"]
 
 
 def _ingress_entrypoint(path: Path) -> str:

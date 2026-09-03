@@ -495,13 +495,13 @@ tab 概念，`below_floor` 的三个 per-tab key 仅为响应形状兼容保留�
 **检索（喂给 agent 的上下文怎么选）**：`memgarden/scoring/relevance.py`（外部包），
 纯函数、不依赖向量库——
 
-- resident 路径（宽松）：最多 3 张转折卡（标题前缀 `转折｜`，最新
-  优先）+ 2 张最近创建 + 3 张与最新用户消息相关，按 id 去重、总数封顶 8。
-- 托管 model_api 路径（严格）：记忆只是**候选**而非平台注入的真相——
-  实体/短语命中才能入选，泛词（"project"、"项目"、"今天"这类中英停用词
-  和工程常用词）只能作为辅助信号，不能单独召回 persona 卡，避免
-  "普通的 project 一词召回 TOHO Project 专属记忆"式误命中。相关性用
-  字符 bigram Jaccard 等轻量文本特征算。
+- Resident 与 Hosted Runtime V2 使用同一套分桶策略：最多 3 张转折卡、2 张
+  最近创建、3 张与最新用户消息相关，按 id 去重、总数封顶 8。
+- `context_mode` / `context_strict` 仅作为兼容 query 参数接收，不再切换策略。
+- 相关性使用实体、短语、稀有词和字符 bigram 等轻量文本特征；泛词会被降权，
+  但转折卡和最近卡属于独立的打底 bucket，不能把“进入上下文”都解释成相关性命中。
+
+完整链路、trace 和兼容边界见 `docs/MEMORY.md`。
 
 注意这一步发生在**enclave/托管运行时解密之后**的明文上（选择逻辑独立成
 模块正是为了不带 nacl 依赖就能单测）。
@@ -577,8 +577,9 @@ lint / dcap ┘
 - **审计 CLI**：`tools/audit_live_cvm.py`——逐行镜像 iOS 审计卡的检查
   （quote 解析、度量、链上授权、证书 pin），任何人可对生产 CVM 复跑。
 - **DCAP 解析器**：`tools/dcap/` Python 参考实现 + 单测。
-- **信封往返测试**：`tools/v1_envelope_roundtrip_test.py` 等，保证
-  Python / iOS / enclave 三方加密实现一致。
+- **信封往返测试**：pytest 互操作守卫持续校验工具侧 BoxSeal 与当前
+  backend/enclave 协议一致；`tools/v1_envelope_roundtrip_test.py` 和
+  `tools/frame_envelope_roundtrip_test.py` 再对本地 chat/frame 服务链路做端到端验证。
 - **运维工具**：`tools/recover_orphan_accounts.py`（重装铸新账号的孤儿
   数据合并，dry-run 优先）、`tools/check_chat_pipeline.py`（链路健康
   检查）。

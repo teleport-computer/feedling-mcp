@@ -81,7 +81,11 @@ def _quiet_response_side_effects(monkeypatch):
     monkeypatch.setattr(core_store.wake_bus, "notify", lambda *args: None)
     from proactive import capture_scheduler
 
-    monkeypatch.setattr(capture_scheduler, "record_chat_append", lambda *args: {})
+    monkeypatch.setattr(
+        capture_scheduler,
+        "record_chat_append",
+        lambda *args, **_kwargs: {},
+    )
 
 
 def test_v1_text_and_file_followup_commit_as_one_ordered_reply(

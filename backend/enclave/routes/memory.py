@@ -50,8 +50,7 @@ async def v1_memory_index(request: Request):
             decrypt_candidates, user_id or "", content_sk,
             item_builder=builder)
         items = readside.memory_index_filter_items(items, payload)
-        if not bool(payload.get("include_sensitive", False)):
-            items = [i for i in items if not i.get("is_sensitive")]
+        items = [readside.memory_public_item(item) for item in items]
         items = items[:effective_limit]
         for item in items:
             item.pop("_search_content", None)
@@ -85,23 +84,14 @@ async def v1_memory_fetch(request: Request):
         items, unavailable_ids = readside.decrypt_readside_items(
             moments[:effective_limit], user_id or "", content_sk,
             item_builder=readside.build_memory_fetch_item)
-        blocked_sensitive_ids: list[str] = []
-        if not bool(payload.get("include_sensitive", False)):
-            allowed = []
-            for item in items:
-                if item.get("is_sensitive"):
-                    blocked_sensitive_ids.append(str(item.get("id") or ""))
-                else:
-                    allowed.append(item)
-            items = allowed
-        return items, unavailable_ids, blocked_sensitive_ids
+        items = [readside.memory_public_item(item) for item in items]
+        return items, unavailable_ids
 
-    items, unavailable_ids, blocked_sensitive_ids = await anyio.to_thread.run_sync(_work)
+    items, unavailable_ids = await anyio.to_thread.run_sync(_work)
     return JSONResponse({
         "user_id": user_id,
         "items": items,
         "unavailable_ids": unavailable_ids,
-        "blocked_sensitive_ids": [mid for mid in blocked_sensitive_ids if mid],
     })
 
 
@@ -112,7 +102,7 @@ async def v1_memory_list(request: Request):
 
     Query params:
       since (ISO string, optional): pass-through to /v1/memory/list
-      limit (int, default 50, max 200)
+      limit (int, default 50, max 500; out-of-range values are rejected)
     """
     ctx = auth.extract_auth(request)
     user_id, error = await auth.resolve_read_caller(ctx)

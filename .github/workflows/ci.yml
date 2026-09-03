@@ -371,6 +371,7 @@ jobs:
           tests/test_seed_user_cleanup.py
           tests/test_multi_tenant_isolation.py
           tests/test_asgi_admin.py
+          tests/test_asgi_chat_remaining.py
           tests/test_asgi_cors.py
           tests/test_notification_sound_payload.py
           tests/openapi/test_public_openapi.py
@@ -394,6 +395,8 @@ jobs:
             tests/test_perception_ingress_v2.py \
             tests/test_ios_perception_contract_v2.py \
             tests/test_perception.py \
+            tests/test_health_measurement.py \
+            tests/test_perception_health_measurement_wiring.py \
             tests/test_proactive_jobs.py \
             tests/test_proactive_gate_eval.py \
             tests/test_screen_caption_backend.py \
@@ -414,11 +417,14 @@ jobs:
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_garden_language_flip.py \
+            tests/test_reply_language.py \
+            tests/test_chat_language_follow_module.py \
             tests/test_pr_branch_flow.py \
             tests/test_pi_mcp_bridge.py \
             tests/test_v2_cache_retry_metrics.py \
             tests/test_v2_screen_chat.py \
             tests/test_v2_serve_worker_screen_frames.py \
+            tests/test_v2_user_triage.py \
             tests/test_v2_wake_tool_loop.py \
             -v
 
@@ -455,8 +461,7 @@ jobs:
           python -m pytest \
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
-            tests/test_route_b_card_shape_recall.py \
-            tests/test_route_b_sensitive_gate.py \
+            tests/test_context_memories.py \
             tests/test_memory_injection_observability.py \
             tests/test_memgarden_is_a_real_dependency.py \
             tests/test_card_leak_signals_wired.py \
@@ -466,19 +471,75 @@ jobs:
             tests/test_memgarden_prompt_params.py \
             tests/test_memgarden_storage_port.py \
             tests/test_memgarden_dreaming.py \
+            tests/test_self_thinking_prompt_probe.py \
+            tests/test_self_thinking_instruction.py \
+            tests/test_aup_gate_probe.py \
             -v
 
-      - name: Perception kernel unit tests
+      - name: Perception prompt golden test
         env:
           PYTHONPATH: backend
         run: |
           python -m pytest \
-            tests/test_perception_kernel_catalog.py \
-            tests/test_perception_kernel_projection.py \
-            tests/test_perception_kernel_purity.py \
-            tests/test_perception_kernel_wake.py \
             tests/test_perception_prompt_golden.py \
             -v
+
+      - name: Perception trend model dispatch unit tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_perception_trend_dispatch.py \
+            -v
+
+      - name: E2E probe unit tests (deterministic, no live environment)
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_e2e_deep_probes.py \
+            -v
+
+      # PerceptKit（感知内核的外部包）在 io 侧的接线。三个文件要真库：
+      # 它们不走 conftest 的 DATABASE_URL，而是自己按 PERCEPTKIT_TEST_PG 连，
+      # 因为验的就是真事务边界、并发下只有一个胜者、崩溃恢复 ——
+      # 这三类在内存实现上**永远是绿的**（内存天然原子、天然无并发），
+      # 拿内存跑等于没跑。所以这里单开一个库，不借 conftest 那个。
+      #
+      # 🔴 最后那句 `-p no:cacheprovider ... | tee` + 通过数下限不是装饰：
+      # 没有 PERCEPTKIT_TEST_PG 时这批**不会报错，会安静地 skip**，
+      # 而「跳过了」和「跑过了没问题」在 CI 日志里长得一模一样。
+      # 这个仓库有过这种前科（conftest 无库时静默丢掉整批 DB 模块，
+      # 报 391 passed 而真实是 2440）。所以这里对通过数设下限。
+      - name: PerceptKit adapter + conformance suite
+        env:
+          PGPASSWORD: postgres
+          PERCEPTKIT_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/perceptkit_ci"
+          PYTHONPATH: backend
+        run: |
+          psql -h 127.0.0.1 -U postgres -tAc \
+            "SELECT 1 FROM pg_database WHERE datname='perceptkit_ci'" | grep -q 1 \
+            || psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE perceptkit_ci"
+          python -m pytest \
+            tests/test_perceptkit_postgres.py \
+            tests/test_perceptkit_retention.py \
+            tests/test_perceptkit_compare.py \
+            tests/test_perceptkit_shadow_sensitive.py \
+            tests/test_perceptkit_producers.py \
+            tests/test_perceptkit_readback.py \
+            tests/test_perceptkit_wakes.py \
+            tests/test_perceptkit_report.py \
+            tests/test_perceptkit_backfill.py \
+            tests/test_perceptkit_trend_read.py \
+            tests/test_perceptkit_ios_adapter.py \
+            tests/test_perceptkit_worker.py \
+            -v | tee /tmp/perceptkit-pytest.log
+          passed=$(grep -oE '[0-9]+ passed' /tmp/perceptkit-pytest.log | tail -1 | grep -oE '^[0-9]+')
+          echo "PerceptKit: ${passed:-0} passed"
+          if [ "${passed:-0}" -lt 90 ]; then
+            echo "通过数过低（${passed:-0}）—— 多半是没连上库、整批被 skip 了，而不是真的只有这么多"
+            exit 1
+          fi
 
       - name: Repository truth-map unit tests
         run: |
@@ -486,6 +547,52 @@ jobs:
             tests/test_current_state_docs.py \
             tests/test_document_lifecycle.py \
             tests/test_repository_inventory.py \
+            -v
+
+      - name: Store invalidation regression suite
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_store_cache.py \
+            tests/test_blob_wake.py \
+            tests/test_wake_bus.py \
+            -v
+
+      - name: Genesis worker regression suite
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_genesis_worker.py \
+            tests/test_genesis_reclaim_worker.py \
+            -v
+
+      - name: Redis retirement and recovery asset guards
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_redis_client_retirement.py \
+            tests/test_redis_cvm_config.py \
+            -v
+
+      - name: Envelope round-trip tool drift guards
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_v1_envelope_roundtrip_tool.py \
+            tests/test_frame_envelope_roundtrip_tool.py \
+            -v
+
+      - name: Test-harness teardown guard
+        # FEEDLING_TEST_PG is deliberately absent: this file guards the
+        # no-Postgres path of tests/conftest.py itself, and its fake admin
+        # connection records statements instead of executing them.
+        run: |
+          python -m pytest \
+            tests/test_conftest_teardown.py \
             -v
 
       - name: Guard top-level pytest discovery coverage
@@ -611,7 +718,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (72 files)
+      - name: Run CI security tier 2 (73 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -641,7 +748,7 @@ jobs:
             tests/test_enclave_http_client_reuse.py \
             tests/test_enclave_route_error_helpers.py \
             tests/test_enclave_route_errors.py \
-            tests/test_enclave_routeb_readside.py \
+            tests/test_enclave_context_recall.py \
             tests/test_enclave_routes_chat.py \
             tests/test_enclave_routes_envelope.py \
             tests/test_enclave_routes_frames.py \
@@ -657,6 +764,7 @@ jobs:
             tests/test_genesis_identity_field_lock.py \
             tests/test_genesis_lightweight_identity.py \
             tests/test_genesis_notice.py \
+            tests/test_genesis_import_capture_mode.py \
             tests/test_genesis_v2_orchestration.py \
             tests/test_health_route_isolation.py \
             tests/test_history_import_identity.py \
@@ -745,6 +853,7 @@ jobs:
             tests/test_tee_replication_workflow_guard.py \
             tests/test_tee_requeue.py \
             tests/test_tee_requeue_coverage.py \
+            tests/test_tee_app_role_ddl_contract.py \
             tests/test_tee_primary_startup.py \
             tests/test_tee_schema.py \
             tests/test_tee_snapshot.py \
@@ -778,6 +887,8 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_store_sections.py \
+            tests/test_store_load_contract.py \
             tests/test_agent_mailbox_post.py \
             tests/test_release_pin_cas.py \
             tests/test_frame_r2_deploy_config.py \
@@ -790,6 +901,10 @@ jobs:
             tests/test_runtime_reconciler.py \
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
+            tests/test_chat_images.py \
+            tests/test_v2_multimodal_e2e.py \
+            tests/test_v2_serve_worker_images.py \
+            tests/test_v2_worker_images.py \
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
@@ -799,10 +914,15 @@ jobs:
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_provider_client.py \
+            tests/test_provider_assistant_prefill.py \
+            tests/test_provider_tools_gemini.py \
             tests/test_capability_web.py \
+            tests/test_web_fetch_result_budget.py \
+            tests/test_web_search_duckduckgo.py \
             tests/test_image_generation_model.py \
             tests/test_perception_tool_surface_contract.py \
             tests/test_v2_tool_trace_privacy.py \
+            tests/test_capabilities_chat.py \
             tests/test_capabilities_memory.py \
             tests/test_chat_activity_projection.py \
             tests/test_capabilities_tool_schema.py \
@@ -831,6 +951,7 @@ jobs:
             tests/test_v2_usage_rollup.py \
             tests/test_admin_proactive_observability.py \
             tests/test_wake_support_indexes_migration.py \
+            tests/test_account_recover_challenges_migration.py \
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
@@ -838,6 +959,9 @@ jobs:
             tests/test_chat_incremental_sync.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
+            tests/test_distillation_ledger.py \
+            tests/test_e2e_tools.py \
+            tests/test_e2e_p0_fallback_gate.py \
             tests/test_data_track_snapshot_golden.py \
             tests/test_v2_general_watchdog_budget.py \
             tests/test_v2_jobs_store.py \
@@ -849,9 +973,11 @@ jobs:
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
             tests/test_contract_rejection_stats.py \
+            tests/test_admin_data_quality_status.py \
             tests/test_data_track_runtime_view.py \
             tests/test_data_track_ops_views.py \
             tests/test_ops_dashboard_queries.py \
+            tests/test_data_track_chat_clear_shadow.py \
             tests/test_v2_runtime_health.py \
             tests/test_v2_scheduler_wiring.py \
             tests/test_v2_screen_watch_gate.py \
@@ -873,6 +999,7 @@ jobs:
             tests/test_t210_wake_sentinel_suppression.py \
             tests/test_v2_turn_budget_defaults.py \
             tests/test_v2_tool_loop_mcp.py \
+            tests/test_v2_subagents.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_wake_mcp.py \
             tests/test_v2_worker_tool_loop.py \
@@ -885,6 +1012,9 @@ jobs:
             tests/test_v2_extraction.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
+            tests/test_v2_extract_session.py \
+            tests/test_garden_component_parity.py \
+            tests/test_orchestration_is_not_reimplemented.py \
             tests/test_backfill_chat_bodies_to_plaintext.py \
             tests/test_byok_plaintext_read_routing.py \
             tests/test_content_encryption_preference.py \
@@ -899,11 +1029,18 @@ jobs:
             tests/test_uploaded_envelope_gate.py \
             tests/test_write_side_format_routing.py \
             tests/test_admin_debug_turn_view.py \
+            tests/test_admin_data_track_detail_read_failure.py \
+            tests/test_admin_data_track_detail_read_failure_html.py \
+            tests/test_admin_data_track_status_label_tristate.py \
             tests/test_data_track_debug.py \
+            tests/test_data_track.py \
+            tests/test_provider_attempt_ledger.py \
+            tests/test_tool_schema_rejection_probe.py \
             tests/test_admin_discarded_reason.py \
             tests/test_admin_concentration.py \
             tests/test_admin_concentration_e2e.py \
             tests/test_admin_genesis_unavailable.py \
+            tests/test_v2_capture_batch_protocol.py \
             -v
 
       - name: Upload execution evidence (report only)
@@ -1131,9 +1268,21 @@ jobs:
         # 这个 job 平时不装依赖。但语言 eval 要 import io 的判定函数，而它现在
         # 从 memgarden 取判据 —— 所以至少得有这两个包。只装它们，不装整个
         # requirements：eval 本身不碰 DB / 网络，几秒就装完。
+        #
+        # 取行的正则要跟 requirements.lock 里的**钉法**一致。0.12.9 之前钉的是
+        # Release 的 wheel URL(`memgarden @ https://...`),现在是 PyPI 版本号
+        # (`memgarden==0.12.9`)。写死其中一种,换钉法时这一步会 grep 到空文件、
+        # 然后 `pip install` 空清单直接退 1 —— 报错跟真正的原因毫无关系
+        # (2026-08-31 踩过,合 test 时 CI 就这么红的,部署被连带跳过)。
+        # 两种都收,以后再换也不会炸。
         run: |
-          grep -A1 -E '^memgarden @|^agent-protocol-core @' backend/requirements.lock \
-            | grep -v '^--$' > /tmp/kernel-req.txt
+          grep -A3 -E '^(memgarden|agent-protocol-core)( @|==)' backend/requirements.lock \
+            | grep -vE '^--$|^\s+#' > /tmp/kernel-req.txt
+          test -s /tmp/kernel-req.txt || {
+            echo "::error::在 backend/requirements.lock 里没找到 memgarden / agent-protocol-core —— 钉法是不是又变了?"
+            exit 1
+          }
+          cat /tmp/kernel-req.txt
           pip install --require-hashes -r /tmp/kernel-req.txt
 
       - name: 花园语言判定 eval
@@ -1410,8 +1559,8 @@ jobs:
           retention-days: 90
 
       # TEST can promote its owner-migrated TEE database to DATABASE_URL. The
-      # app role cannot run DDL, so prove both the migration head and the real
-      # application startup contract before either CVM is mutated.
+      # CI never executes TEE DDL. Verify the application connection can run the
+      # startup migration against the same database before either CVM is mutated.
       - name: Prepare TEST TEE schema preflight credentials
         if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
@@ -1446,7 +1595,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.TEST_FEEDLING_TEE_DUAL_WRITE }}
         run: python deploy/check-database-topology.py
 
-      - name: Require TEST TEE schema at release head before mutating either CVM
+      - name: Validate TEST TEE startup migration authorization before mutating either CVM
         if: ${{ vars.TEST_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
           TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
@@ -1455,14 +1604,8 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${TEST_DSN}&sslrootcert=/tmp/test-tee-ca.crt"
           python - <<'PY'
           import os
-          import sys
           import psycopg
-          from alembic.config import Config
-          from alembic.script import ScriptDirectory
 
-          cfg = Config("backend/alembic_tee/alembic.ini")
-          cfg.set_main_option("script_location", "backend/alembic_tee")
-          expected = set(ScriptDirectory.from_config(cfg).get_heads())
           fingerprint_sql = (
               "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
               "inet_server_port()"
@@ -1470,38 +1613,40 @@ jobs:
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
               owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
-              actual = {
-                  str(row[0])
-                  for row in conn.execute(
-                      "SELECT version_num FROM alembic_tee_version"
-                  ).fetchall()
-              }
           with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
               app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              app_can_migrate = bool(
+                  conn.execute(
+                      "SELECT pg_has_role(current_user, 'feedling_owner', 'member')"
+                  ).fetchone()[0]
+              )
+          if owner_user != "feedling_owner":
+              print(
+                  "::error::TEST_TEE_MIGRATION_DSN must use the feedling_owner "
+                  f"role; got {owner_user!r}. No TEST CVM was changed."
+              )
+              raise SystemExit(1)
           if owner_fingerprint != app_fingerprint:
               print(
                   "::error::TEST_DATABASE_URL and TEST_TEE_MIGRATION_DSN must "
                   "target the same database. No TEST CVM was changed."
               )
               raise SystemExit(1)
-          print(f"TEST TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
-          if actual != expected:
+          if app_user != "app":
               print(
-                  "::error title=TEST TEE schema migration required::"
-                  f"expected {sorted(expected)}, got {sorted(actual)}; "
-                  "run the TEE migrate workflow for test, then rerun failed jobs. "
+                  "::error::TEST_DATABASE_URL must use the TEE app role; "
+                  f"got {app_user!r}. "
                   "No TEST CVM was changed."
               )
               raise SystemExit(1)
-
-          sys.path.insert(0, "backend")
-          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
-          os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]
-
-          import db
-
-          db.init_schema()
-          print("TEST TEE application startup contract: ok")
+          if not app_can_migrate:
+              print(
+                  "::error::TEST_DATABASE_URL app role must inherit feedling_owner "
+                  "for TEE startup migrations. No TEST CVM was changed."
+              )
+              raise SystemExit(1)
+          print("TEST TEE startup migration authorization: ok")
           PY
 
       - name: Require both Runtime V2 images before mutating either CVM
@@ -1700,7 +1845,7 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
         run: python deploy/check-database-topology.py
 
-      - name: Require PROD TEE schema at release head before mutating any CVM
+      - name: Validate PROD TEE startup migration authorization before mutating any CVM
         if: ${{ steps.prod_release_config.outputs.database_schema == 'tee' }}
         env:
           PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
@@ -1709,14 +1854,8 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${PROD_DSN}&sslrootcert=/tmp/prod-tee-ca.crt"
           python - <<'PY'
           import os
-          import sys
           import psycopg
-          from alembic.config import Config
-          from alembic.script import ScriptDirectory
 
-          cfg = Config("backend/alembic_tee/alembic.ini")
-          cfg.set_main_option("script_location", "backend/alembic_tee")
-          expected = set(ScriptDirectory.from_config(cfg).get_heads())
           fingerprint_sql = (
               "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
               "inet_server_port()"
@@ -1724,15 +1863,14 @@ jobs:
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
               owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
-              actual = {
-                  str(row[0])
-                  for row in conn.execute(
-                      "SELECT version_num FROM alembic_tee_version"
-                  ).fetchall()
-              }
           with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
               app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
               app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              app_can_migrate = bool(
+                  conn.execute(
+                      "SELECT pg_has_role(current_user, 'feedling_owner', 'member')"
+                  ).fetchone()[0]
+              )
           if owner_user != "feedling_owner":
               print(
                   "::error::PROD_TEE_MIGRATION_DSN must use the feedling_owner "
@@ -1751,24 +1889,14 @@ jobs:
                   f"got {app_user!r}. No production CVM was changed."
               )
               raise SystemExit(1)
-          print(f"PROD TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
-          if actual != expected:
+          if not app_can_migrate:
               print(
-                  "::error title=PROD TEE schema migration required::"
-                  f"expected {sorted(expected)}, got {sorted(actual)}; "
-                  "run the TEE migrate workflow for prod, then rerun failed jobs. "
+                  "::error::DATABASE_URL app role must inherit feedling_owner "
+                  "for TEE startup migrations. "
                   "No production CVM was changed."
               )
               raise SystemExit(1)
-
-          sys.path.insert(0, "backend")
-          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
-          os.environ["DATABASE_URL"] = os.environ["APP_DATABASE_URL"]
-
-          import db
-
-          db.init_schema()
-          print("PROD TEE application startup contract: ok")
+          print("PROD TEE startup migration authorization: ok")
           PY
 
       - name: Build and verify the production E2B template
@@ -1965,12 +2093,8 @@ jobs:
           fi
           exit "$missing"
 
-      # PRE can run with the owner-migrated TEE database as DATABASE_URL.  The
-      # app role deliberately cannot run DDL and startup fails closed when the
-      # database is behind the release head.  Check that contract before
-      # `phala deploy`; otherwise a push containing a new alembic_tee revision
-      # replaces the healthy CVM first and only discovers the missing owner
-      # migration while backend and serve-worker restart-loop.
+      # CI never executes TEE DDL. Verify the application connection can run the
+      # startup migration against the same database before either CVM is mutated.
       - name: Prepare PRE TEE schema preflight credentials
         if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
@@ -2005,47 +2129,57 @@ jobs:
           FEEDLING_TEE_DUAL_WRITE: ${{ secrets.PRE_FEEDLING_TEE_DUAL_WRITE }}
         run: python deploy/check-database-topology.py
 
-      - name: Require PRE TEE schema at release head before mutating either CVM
+      - name: Validate PRE TEE startup migration authorization before mutating either CVM
         if: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA == 'tee' }}
         env:
           PRE_DSN: ${{ secrets.PRE_TEE_MIGRATION_DSN }}
+          APP_DATABASE_URL: ${{ secrets.PRE_DATABASE_URL }}
         run: |
           export TEE_MIGRATION_DATABASE_URL="${PRE_DSN}&sslrootcert=/tmp/pre-tee-ca.crt"
           python - <<'PY'
           import os
-          import sys
           import psycopg
-          from alembic.config import Config
-          from alembic.script import ScriptDirectory
 
-          cfg = Config("backend/alembic_tee/alembic.ini")
-          cfg.set_main_option("script_location", "backend/alembic_tee")
-          expected = set(ScriptDirectory.from_config(cfg).get_heads())
+          fingerprint_sql = (
+              "SELECT current_database(), COALESCE(inet_server_addr()::text, ''), "
+              "inet_server_port()"
+          )
           with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as conn:
-              actual = {
-                  str(row[0])
-                  for row in conn.execute(
-                      "SELECT version_num FROM alembic_tee_version"
-                  ).fetchall()
-              }
-          print(f"PRE TEE schema: expected={sorted(expected)} actual={sorted(actual)}")
-          if actual != expected:
+              owner_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              owner_user = str(conn.execute("SELECT current_user").fetchone()[0])
+          with psycopg.connect(os.environ["APP_DATABASE_URL"]) as conn:
+              app_fingerprint = tuple(conn.execute(fingerprint_sql).fetchone())
+              app_user = str(conn.execute("SELECT current_user").fetchone()[0])
+              app_can_migrate = bool(
+                  conn.execute(
+                      "SELECT pg_has_role(current_user, 'feedling_owner', 'member')"
+                  ).fetchone()[0]
+              )
+          if owner_user != "feedling_owner":
               print(
-                  "::error title=PRE TEE schema migration required::"
-                  f"expected {sorted(expected)}, got {sorted(actual)}; "
-                  "run the TEE migrate workflow for pre, then rerun failed jobs. "
-                  "No PRE CVM was changed."
+                  "::error::PRE_TEE_MIGRATION_DSN must use the feedling_owner "
+                  f"role; got {owner_user!r}. No PRE CVM was changed."
               )
               raise SystemExit(1)
-
-          sys.path.insert(0, "backend")
-          os.environ["FEEDLING_DATABASE_SCHEMA"] = "tee"
-          os.environ["DATABASE_URL"] = os.environ["TEE_MIGRATION_DATABASE_URL"]
-
-          import db
-
-          db.init_schema()
-          print("PRE TEE application startup contract: ok")
+          if owner_fingerprint != app_fingerprint:
+              print(
+                  "::error::PRE_DATABASE_URL and PRE_TEE_MIGRATION_DSN must "
+                  "target the same database. No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          if app_user != "app":
+              print(
+                  "::error::PRE_DATABASE_URL must use the TEE app role; "
+                  f"got {app_user!r}. No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          if not app_can_migrate:
+              print(
+                  "::error::PRE_DATABASE_URL app role must inherit feedling_owner "
+                  "for TEE startup migrations. No PRE CVM was changed."
+              )
+              raise SystemExit(1)
+          print("PRE TEE startup migration authorization: ok")
           PY
 
       - name: Build and verify the content-addressed E2B template

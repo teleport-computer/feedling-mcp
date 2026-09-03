@@ -80,16 +80,14 @@ def test_buckets_do_not_appear_in_the_basis() -> None:
 
 # ---------------------------------------------------------------- 证据的优先级
 
-def test_explicit_preference_beats_everything() -> None:
-    """用户明说要中文，就是中文 —— 哪怕他最近在写英文邮件、设备是英文的。
-
-    这是他自己的设置，不是我们可以推翻的推断。
-    """
+def test_retired_preference_no_longer_beats_written_language() -> None:
+    """旧卡里的已退役字段只是未知元数据，Garden 只看当前书写证据。"""
+    retired_field = "language_" + "preference"
     got = infer_garden_language(
-        {"language_preference": "zh-Hans"},
+        {retired_field: "zh-Hans"},
         written=EN_SAMPLE, locale="en", existing_buckets="Work、Health",
     )
-    assert got == "zh-Hans"
+    assert got == "en"
 
 
 def test_what_they_write_beats_device_locale() -> None:
@@ -144,3 +142,23 @@ def test_lookalike_roles_do_not_count_as_the_person() -> None:
     """role 判断要精确匹配 —— "user_proxy" 之类不是本人。"""
     written = user_written_text([{"role": "user_proxy", "content": EN_SAMPLE}])
     assert written == ""
+
+
+def test_content_block_metadata_cannot_flip_chinese_writing_to_english() -> None:
+    """Only text blocks are writing evidence; image protocol keys are not."""
+    writing = "我今天很难过"
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": writing},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }]
+
+    written = user_written_text(messages)
+
+    assert written == writing
+    assert infer_garden_language({}, written=written) == "zh-Hans"

@@ -21,6 +21,9 @@ from proactive import capture_jobs
 
 DREAM_STATE_KIND = "dream_state"
 DREAM_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
+# One hour keeps a stalled scheduler visible within a bounded diagnostic window
+# while collapsing a stable 45-second client poll to at most 24 traces/user/day.
+DREAM_TRACE_HEARTBEAT_SEC = 3600.0
 
 
 def _env_float(name: str, default: float, *, lo: float = 0.0, hi: float = 7 * 86400.0) -> float:
@@ -71,6 +74,11 @@ def _now_iso(now: float | None = None) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _trace_now() -> float:
+    """Use server time; the scheduler's decision ``now`` may come from a client."""
+    return time.time()
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -106,6 +114,8 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "pending_dream_key": str(doc.get("pending_dream_key") or "")[:240],
         "dream_fail_streak": max(0, _safe_int(doc.get("dream_fail_streak"), 0)),
         "last_dream_failed_at": _safe_float(doc.get("last_dream_failed_at"), 0.0),
+        "last_dream_trace_reason": str(doc.get("last_dream_trace_reason") or "")[:120],
+        "last_dream_trace_at": _safe_float(doc.get("last_dream_trace_at"), 0.0),
         "updated_at": str(doc.get("updated_at") or "")[:80],
     }
 
@@ -145,22 +155,14 @@ def _within_night_window(store, *, now: float) -> bool:
 
 
 def _live_user_turn_count(store) -> int:
-    chat_messages = getattr(store, "chat_messages", None)
-    if not isinstance(chat_messages, list):
-        return 0
-    chat_lock = getattr(store, "chat_lock", None)
-    if chat_lock is not None:
-        with chat_lock:
-            messages = [dict(msg) for msg in chat_messages if isinstance(msg, Mapping)]
-    else:
-        messages = [dict(msg) for msg in chat_messages if isinstance(msg, Mapping)]
-    return sum(1 for msg in messages if str(msg.get("role") or "").strip() == "user")
+    return db.chat_user_turn_count_strict(store.user_id)
 
 
 def _dream_snapshot(store) -> dict[str, Any]:
     """取花园形状。**「什么算种子卡」「签名怎么算」已搬进内核** —— 那是 Garden
-    内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）与拼上 io 侧的
-    对话轮数。见 memgarden/dreaming.py 的模块说明。
+    内部结构的知识；这里只负责取数（查库、按归属和可见性过滤）。对话轮数只在
+    真正准备入队时再查，避免稳定用户每个 scheduler tick 都扫描聊天历史。
+    见 memgarden/dreaming.py 的模块说明。
     """
     all_moments = [
         dict(moment)
@@ -187,7 +189,6 @@ def _dream_snapshot(store) -> dict[str, Any]:
     return {
         "card_count": snap.card_count,
         "seed_card_count": snap.seed_card_count,
-        "turn_count": _live_user_turn_count(store),
         "signature": snap.signature,
         "last_until": last_until,
     }
@@ -220,31 +221,50 @@ def tick_memory_dream(
     store, *, now: float | None = None, force: bool = False,
     submit: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """做梦判定 —— 外层只负责留痕，判定逻辑一行没动（见 `_tick_memory_dream`）。
+    """做梦判定 —— 外层只负责有界留痕，判定逻辑一行没动（见 `_tick_memory_dream`）。
 
     2026-08-17 补：此前 7 种早退理由全是裸 return，服务端查不到「为什么没做梦」。
     实测代价：某用户六天没做过梦，从日志里完全看不出是没攒够卡、还是被夜间
     窗口挡住、还是失败退避 —— 只能去猜。
     """
+    now_ts = time.time() if now is None else float(now)
     started = time.monotonic()
-    outcome = _tick_memory_dream(store, now=now, force=force, submit=submit)
+    outcome = _tick_memory_dream(store, now=now_ts, force=force, submit=submit)
+    trace_now = _trace_now()
     try:
         _emit_dream_trace(store, outcome, duration_ms=(time.monotonic() - started) * 1000.0,
-                          forced=bool(force))
+                          forced=bool(force), now=trace_now)
     except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
         pass
     return outcome
 
 
 def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
-                      forced: bool) -> None:
-    """一条内容无关的做梦判定记录。卡片正文、摘要一律不进。"""
+                      forced: bool, now: float) -> None:
+    """状态变化、实际入队或每小时心跳时记录；卡片正文、摘要一律不进。"""
     snapshot = outcome.get("snapshot") if isinstance(outcome.get("snapshot"), Mapping) else {}
     enqueued = bool(outcome.get("enqueued"))
     reason = str(outcome.get("reason") or ("enqueued" if enqueued else "unknown"))
+    state = _state_doc(outcome.get("state"))
+    last_reason = str(state.get("last_dream_trace_reason") or "")
+    last_emitted_at = _safe_float(state.get("last_dream_trace_at"), 0.0)
+    heartbeat_due = (
+        last_emitted_at <= 0.0
+        or float(now) - last_emitted_at >= DREAM_TRACE_HEARTBEAT_SEC
+    )
+    if not (enqueued or reason != last_reason or heartbeat_due):
+        return
+    emission = (
+        "enqueued"
+        if enqueued
+        else "reason_changed"
+        if reason != last_reason
+        else "heartbeat"
+    )
     detail = {
         "enqueued": enqueued,
         "reason": reason,
+        "emission": emission,
         "forced": forced,
         "counts": {
             # 「攒够没」这个判据的两个输入 —— 没有它们就说不清为什么没触发
@@ -261,8 +281,18 @@ def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
         store, subsystem="memory", type="memory.dream.tick", actor="backend",
         status="ok" if (enqueued or reason in _EXPECTED_SKIP_REASONS) else "warning",
         summary=("已排入做梦" if enqueued else f"未做梦：{reason}"),
-        explain="每次做梦判定都留一条。计数与理由落库，卡片内容不落库。",
+        explain="实际入队、状态变化或每小时心跳时留一条。计数与理由落库，卡片内容不落库。",
         detail=detail,
+    )
+    # Merge only the trace cursor. A full blob rewrite here could resurrect a
+    # stale sibling field (for example pending_dream_key) from this tick's read.
+    db.patch_blob_strict(
+        store.user_id,
+        DREAM_STATE_KIND,
+        {
+            "last_dream_trace_reason": reason,
+            "last_dream_trace_at": float(now),
+        },
     )
 
 
@@ -303,9 +333,7 @@ def _tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
-    turn_count = max(0, int(snapshot.get("turn_count") or 0))
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
-    new_turns = max(0, turn_count - last_turn_count)
 
     # 「值不值得整理」的判据在内核 —— 只数种子卡、比指纹，不看时间不看内容。
     # 这里保留的是「能不能 / 什么时候」那半（上面的开关/防重/夜间窗口/失败退避，
@@ -332,7 +360,7 @@ def _tick_memory_dream(
             "job": None,
             "snapshot": snapshot,
             "new_cards": new_cards,
-            "new_turns": new_turns,
+            "new_turns": 0,
         }
     last_completed = _safe_float(state.get("last_dream_completed_at"), 0.0)
     if last_completed and not force and now_ts - last_completed < min_interval_sec():
@@ -346,9 +374,16 @@ def _tick_memory_dream(
             "job": None,
             "snapshot": snapshot,
             "new_cards": new_cards,
-            "new_turns": new_turns,
+            "new_turns": 0,
         }
 
+    # Chat turns do not decide whether a dream is needed. Count them only for
+    # a real enqueue candidate, where they remain part of the legacy job stats
+    # and idempotency material without creating a periodic history-sized read.
+    turn_count = max(0, _live_user_turn_count(store))
+    snapshot = dict(snapshot)
+    snapshot["turn_count"] = turn_count
+    new_turns = max(0, turn_count - last_turn_count)
     key = dream_key_for_snapshot(state, snapshot)
     trigger = "force_dream" if force else "nightly_dream"
     # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为

@@ -91,7 +91,8 @@ def test_no_render_site_puts_a_row_field_into_a_bare_code_cell():
     #    (同 Supervisor 2026-08-22 对 actionlint 基线的口径:基线必须可审,
     #     既有条目要写明为何保留,否则它退化成没人敢动也没人知道为什么的清单。)
     NOT_A_FAILURE_CODE = {
-        "job_id",   # 任务标识,不是失败原因;它永远不会取值 runtime_failed
+        "job_id",       # 任务标识,不是失败原因;它永远不会取值 runtime_failed
+        "failed_phase", # 受控生产阶段名,不是被净化/丢弃的自由文本失败原因
     }
 
     bypass = sorted(found - NOT_A_FAILURE_CODE)

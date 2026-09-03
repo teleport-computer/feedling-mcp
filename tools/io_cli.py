@@ -551,8 +551,6 @@ def cmd_memory_index(args):
         payload["query"] = args.query
     if args.ambient:
         payload["ambient"] = True
-    if args.include_sensitive:
-        payload["include_sensitive"] = True
     status, body = _http_json("POST", f"{api_url}/v1/memory/index", auth, payload=payload)
     if status == 200:
         _emit({"ok": True, **body})
@@ -972,7 +970,6 @@ _STRING_FIELDS: tuple[str, ...] = (
     "agent_role",
     "tone_style",
     "custom_persona_prompt",
-    "language_preference",
     "relationship_anchor",
 )
 
@@ -1970,7 +1967,6 @@ def main():
     mi.add_argument("--thread", default="", help="filter by thread/dimension tag")
     mi.add_argument("--query", default="", help="free-text relevance query")
     mi.add_argument("--ambient", action="store_true", help="ambient (background) selection mode")
-    mi.add_argument("--include-sensitive", dest="include_sensitive", action="store_true", help="include cards marked sensitive")
     mi.set_defaults(func=cmd_memory_index)
 
     mf = sub.add_parser("memory-fetch", help="Verbatim decrypted memory cards by id.")
@@ -2117,8 +2113,6 @@ def main():
                     help="系统蒸馏出的语气/风格描述")
     iw.add_argument("--custom-persona-prompt", dest="custom_persona_prompt", default=None,
                     help="用户手写的人设覆盖指令,优先级高于 --tone-style")
-    iw.add_argument("--language-preference", dest="language_preference", default=None,
-                    help="回复使用的语言偏好")
     iw.add_argument("--relationship-anchor", dest="relationship_anchor", default=None,
                     help="关系锚点描述文本")
     iw.add_argument("--relationship-days", dest="relationship_days", type=int, default=None,

@@ -36,10 +36,15 @@ canonical_owner: self
 | `thinking_envelope_missing_fields` | 400 | — | 同上，thinking 信封 | |
 | `anchor_required` | 400 | — | 记忆动作缺 anchor（detail.mem_type） | |
 | `service_busy` | 503 | system | db 连接池耗尽，可退避重试 | ✅ |
+| `data_track_query_timeout` | 503 | system | admin data-track 查询超过 HTTP 或 PostgreSQL 预算 | |
 | `service_unavailable` | 503 | system | admin token 未配置 | ✅ |
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |
 | `invalid_image` | 400 | — | 图片校验失败 | ✅ |
+| `invalid_images` | 400 | — | `images` 不是数组 | |
+| `image_payload_conflict` | 400 | — | 单图字段与 `images` 同时出现 | ✅ |
+| `image_list_empty` | 400 | — | `images` 是空数组 | ✅ |
+| `image_count_exceeds_limit` | 400 | — | `images` 超过 9 项；响应带 `max_images: 9` | ✅ |
 | `unsupported_file_type` | 400 | — | 聊天文件上传：文件类型不支持（heic/.doc/.xls/二进制）；detail 说明类型，hint 建议格式 | ✅ |
 | `invalid_file` | 400 | — | 聊天文件上传：file_b64 缺失/空/非法 base64 | ✅ |
 
@@ -66,6 +71,7 @@ canonical_owner: self
 | `model_api_not_tested` | 400 | user_provider | 已配置但未通过测试 | ✅ |
 | `model_api_config_invalid` | 400 | user_provider | | ✅ |
 | `model_api_key_decrypt_failed` | 400 | system | | ✅ |
+| `image_generation_key_decrypt_failed` | 409 | user_provider | `POST /v1/image-generation/generate` 无法解开已固定生图路由的 provider key；不会据此改写 route health | ✅ |
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
 | `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
 | `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
@@ -131,6 +137,8 @@ canonical_owner: self
 | `already_answered` | 409 | — | 静默处理，不弹窗 | ✅ |
 | `content_pk_fpr_mismatch` | 409 | — | 信封封的钥 ≠ 当前注册内容钥（写手 whoami 缓存陈旧）；带 `current_public_key_fpr`/`envelope_content_pk_fpr`，写手应刷新 whoami 重封重试 | |
 | `message_not_found` | 404 | — | | ✅ |
+| `invalid_canvas_filename` | 400 | — | Canvas 活内容读取只接受原始 `.io.html` basename；拒绝路径、穿越、控制字符和改写后的名字 | |
+| `workspace_entry_not_found` | 404 | — | Canvas 对应的当前 workspace 条目不存在；客户端可回退消息附件正文 | |
 | `user_message_envelope_failed` | 409 | — | | ✅ |
 | `confirmation_required` | 400 | — | 清空聊天 / 账号重置缺确认字段 | |
 | `chat_clear_failed` | 500 | system | | |
@@ -169,6 +177,22 @@ canonical_owner: self
 | `unsupported_memory_action` | 400 | — | | |
 | `memory_action_failed` | — | — | `_execute_memory_actions` 的兜底默认值（正常路径下单个 action 总会带自己的 `error`，状态码随子 action） | |
 | `db_write_failed` | 500 | system | | |
+
+### readside（`/v1/memory/index`、`/v1/memory/fetch`）
+
+`memory_readside_core` 抛的 `RuntimeError` / `ValueError` 曾以 `str(e)` 原样回传，
+其中 `enclave_http_<code>:<resp.text[:180]>` 会把 enclave 的响应体带出去。现在响应体
+只取下表这个闭集：消息**在闭集里**才原样回传，否则收敛为通用码。细分类改由
+debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游原文）。
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*` 及任何未知消息）；分诊看 `detail.upstream` | |
+| `memory_load_failed` | 503 | system | `memory/service.py` 载入 moments 失败 | |
+| `enclave_unavailable` | 503 | system | 未配置 `FEEDLING_ENCLAVE_URL` | |
+| `api_key_unavailable` | 503 | system | 既无 api_key 也无 runtime token | |
+| `enclave_invalid_readside_response` | 503 | system | enclave 返回的不是 JSON 对象 | |
+| `request_invalid` | 400 | — | `/fetch` 的 `ValueError` 且消息不在闭集内（`except ValueError` 也会接住调用树里任意 stdlib ValueError，其消息可能带被解析的明文） | |
 
 ## 身份（identity 路由 + identity action）
 
@@ -327,6 +351,13 @@ canonical_owner: self
 |---|---|---|---|---|
 | `device_already_enrolled` | 409 | — | 同一设备已在中继注册过（enroll 幂等冲突） | |
 
+## 屏幕与照片读取
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `frame_plaintext_invalid` | 502 | system | 已存明文视觉正文既不是 JSON 屏幕帧，也不是支持的原始图片格式；不得回退 enclave | |
+| `frame_plaintext_caption_unsupported` | — | system | `screen.read` 的 VLM caption 暂不处理明文视觉帧；不得把明文帧转发给 enclave | |
+
 ---
 
 ## 已知问题（登记备查，非本次任务修复范围）
@@ -342,9 +373,9 @@ canonical_owner: self
   memory_core.py×2、actions.py×1）。
 - `worldbook/worldbook_core.py::_request_envelope` / `_validate_envelope`
   同样是自由文本消息，未收敛。
-- `screen/screen_read_core.py`（`/v1/screen/*` 的实际 HTTP 路由层）全部错误
-  也是自由文本（`"not found"` / `"bad filename"` 等），未收敛，故本表未列出
-  对应 slug 行。
+- `screen/screen_read_core.py`（`/v1/screen/*` 的实际 HTTP 路由层）除
+  `frame_plaintext_invalid` 外仍有自由文本错误（`"not found"` / `"bad filename"`
+  等），未收敛，故本表未逐项列出。
 
 ---
 

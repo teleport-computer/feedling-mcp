@@ -1738,6 +1738,141 @@ def _dream_test_memory(user_id: str, memory_id: str, *, occurred_at: str = "2026
     }
 
 
+def _install_dream_trace_harness(monkeypatch, *, initial_state=None):
+    state = proactive_dream_scheduler._state_doc(initial_state or {})
+    current = {"enqueued": False, "reason": "night_not_due"}
+    clock = {"now": 0.0}
+    events = []
+
+    class _TraceStore:
+        user_id = "usr_dream_trace_rate_limit"
+
+    def fake_tick(store, *, now, force, submit):
+        return {
+            "enqueued": current["enqueued"],
+            "reason": current["reason"],
+            "state": dict(state),
+            "job": None,
+            "snapshot": {},
+        }
+
+    def fake_trace_event(store, **event):
+        events.append(event)
+
+    def fake_patch_blob_strict(user_id, kind, patch, **kwargs):
+        assert user_id == _TraceStore.user_id
+        assert kind == proactive_dream_scheduler.DREAM_STATE_KIND
+        state.update(patch)
+        return dict(state)
+
+    monkeypatch.setattr(proactive_dream_scheduler, "_tick_memory_dream", fake_tick)
+    monkeypatch.setattr(
+        proactive_dream_scheduler,
+        "_trace_now",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        proactive_dream_scheduler.debug_trace,
+        "trace_event",
+        fake_trace_event,
+    )
+    monkeypatch.setattr(
+        proactive_dream_scheduler.db,
+        "patch_blob_strict",
+        fake_patch_blob_strict,
+    )
+    return _TraceStore(), current, state, events, clock
+
+
+def test_dream_trace_repeated_steady_reason_emits_once(monkeypatch):
+    store, current, state, events, clock = _install_dream_trace_harness(monkeypatch)
+    current["reason"] = "night_not_due"
+
+    for now in (1000.0, 1001.0, 1002.0, 1003.0, 1004.0):
+        clock["now"] = now
+        proactive_dream_scheduler.tick_memory_dream(store, now=now)
+
+    assert len(events) == 1
+    assert events[0]["detail"]["emission"] == "reason_changed"
+    assert state["last_dream_trace_reason"] == "night_not_due"
+    assert state["last_dream_trace_at"] == 1000.0
+
+
+def test_dream_trace_reason_change_emits_immediately(monkeypatch):
+    store, current, state, events, clock = _install_dream_trace_harness(
+        monkeypatch,
+        initial_state={
+            "last_dream_trace_reason": "night_not_due",
+            "last_dream_trace_at": 1000.0,
+        },
+    )
+    current["reason"] = "no_memory_cards"
+    clock["now"] = 1001.0
+
+    proactive_dream_scheduler.tick_memory_dream(store, now=1001.0)
+
+    assert len(events) == 1
+    assert events[0]["detail"]["emission"] == "reason_changed"
+    assert state["last_dream_trace_reason"] == "no_memory_cards"
+
+
+def test_dream_trace_enqueued_always_emits(monkeypatch):
+    store, current, _, events, clock = _install_dream_trace_harness(
+        monkeypatch,
+        initial_state={
+            "last_dream_trace_reason": "enqueued",
+            "last_dream_trace_at": 1000.0,
+        },
+    )
+    current.update({"enqueued": True, "reason": "enqueued"})
+    clock["now"] = 1001.0
+
+    proactive_dream_scheduler.tick_memory_dream(store, now=1001.0)
+
+    assert len(events) == 1
+    assert events[0]["detail"]["emission"] == "enqueued"
+
+
+def test_dream_trace_hourly_heartbeat_preserves_liveness(monkeypatch):
+    store, current, state, events, clock = _install_dream_trace_harness(
+        monkeypatch,
+        initial_state={
+            "last_dream_trace_reason": "night_not_due",
+            "last_dream_trace_at": 1000.0,
+        },
+    )
+    current["reason"] = "night_not_due"
+
+    clock["now"] = 1000.0 + proactive_dream_scheduler.DREAM_TRACE_HEARTBEAT_SEC - 1.0
+    proactive_dream_scheduler.tick_memory_dream(
+        store,
+        now=1000.0 + proactive_dream_scheduler.DREAM_TRACE_HEARTBEAT_SEC - 1.0,
+    )
+    clock["now"] = 1000.0 + proactive_dream_scheduler.DREAM_TRACE_HEARTBEAT_SEC
+    proactive_dream_scheduler.tick_memory_dream(
+        store,
+        now=1000.0 + proactive_dream_scheduler.DREAM_TRACE_HEARTBEAT_SEC,
+    )
+
+    assert len(events) == 1
+    assert events[0]["detail"]["emission"] == "heartbeat"
+    assert events[0]["explain"] == (
+        "实际入队、状态变化或每小时心跳时留一条。计数与理由落库，卡片内容不落库。"
+    )
+    assert state["last_dream_trace_at"] == 4600.0
+
+
+def test_dream_trace_heartbeat_cursor_uses_server_time(monkeypatch):
+    store, current, state, events, clock = _install_dream_trace_harness(monkeypatch)
+    current["reason"] = "night_not_due"
+    clock["now"] = 2000.0
+
+    proactive_dream_scheduler.tick_memory_dream(store, now=9_999_999_999.0)
+
+    assert len(events) == 1
+    assert state["last_dream_trace_at"] == 2000.0
+
+
 def test_dream_tick_threshold_single_flight_and_ambient_off_poll(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
@@ -1807,11 +1942,17 @@ def test_dream_tick_respects_dream_enabled_switch(tmp_path, monkeypatch):
     assert disabled["enqueued"] is False
     assert disabled["reason"] == "dream_disabled"
     assert _memory_dream_jobs(store) == []
+    disabled_state = proactive_dream_scheduler.load_dream_state(store)
+    assert disabled_state["last_dream_trace_reason"] == "dream_disabled"
+    assert disabled_state["last_dream_trace_at"] > 0.0
 
     store.save_proactive_settings({"dream_enabled": True})
     enabled = proactive_dream_scheduler.tick_memory_dream(store, now=1001.0)
     assert enabled["enqueued"] is True
     assert enabled["job"]["job_kind"] == "memory_dream"
+    assert proactive_dream_scheduler.load_dream_state(store)[
+        "last_dream_trace_reason"
+    ] == "enqueued"
 
 
 def test_dream_enqueue_idempotent_by_key_and_single_flight(tmp_path, monkeypatch):
@@ -1955,12 +2096,23 @@ def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
             _capture_test_envelope(user_id, f"msg-dream-{i}"),
         )
 
+    def fail_if_full_history_count_runs(_user_id):
+        raise AssertionError("already-dreamed ticks must not count full chat history")
+
+    monkeypatch.setattr(
+        proactive_dream_scheduler.db,
+        "chat_user_turn_count_strict",
+        fail_if_full_history_count_runs,
+    )
+
     second = proactive_dream_scheduler.tick_memory_dream(store, now=2000.0)
 
     assert second["enqueued"] is False
     assert second["reason"] == "already_dreamed"
     assert second["new_cards"] == 0
-    assert second["new_turns"] == 30
+    # This diagnostic is intentionally deferred until an enqueue candidate;
+    # stable ticks must remain independent of chat-history size.
+    assert second["new_turns"] == 0
     assert len(_memory_dream_jobs(store)) == 1
 
 
@@ -1978,12 +2130,21 @@ def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkey
     store = core_store.get_store(user_id)
 
     msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_dedupe"))
-    first_jobs = _memory_capture_jobs(store)
-    assert len(first_jobs) == 1
-    assert first_jobs[0]["trigger"] == "turn_backstop"
+    assert _memory_capture_jobs(store) == []
 
     client = make_client()
     headers = {"X-API-Key": api_key}
+    first = client.post(
+        "/v1/capture/tick",
+        headers=headers,
+        json={"now": float(msg["ts"]) + 1.0},
+    )
+    first_jobs = _memory_capture_jobs(store)
+    assert first.status_code == 200
+    assert first.get_json()["enqueued"] is True
+    assert len(first_jobs) == 1
+    assert first_jobs[0]["trigger"] == "turn_backstop"
+
     background = client.post(
         "/v1/device/events",
         headers=headers,
@@ -2028,9 +2189,12 @@ def test_capture_quiet_tick_noops_without_new_messages(tmp_path, monkeypatch):
     assert _memory_capture_jobs(core_store.get_store(user_id)) == []
 
 
-def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
+def test_capture_tick_enqueues_resident_turn_backstop_before_quiet_timeout(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "2")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "1200")
     monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
     store = core_store.UserStore("usr_capture_turn_backstop")
     seed_user(store.user_id)
@@ -2038,9 +2202,17 @@ def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
     store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_1"))
     assert _memory_capture_jobs(store) == []
 
-    store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_2"))
+    msg = store.append_chat(
+        "user", "chat", _capture_test_envelope(store.user_id, "msg_turn_2")
+    )
+    assert _memory_capture_jobs(store) == []
+
+    result = proactive_capture_scheduler.tick_quiet_capture(
+        store, now=float(msg["ts"]) + 1.0
+    )
     jobs = _memory_capture_jobs(store)
 
+    assert result["enqueued"] is True
     assert len(jobs) == 1
     assert jobs[0]["trigger"] == "turn_backstop"
     assert jobs[0]["window"]["until_message_id"] == "msg_turn_2"

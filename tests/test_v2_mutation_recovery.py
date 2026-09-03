@@ -114,7 +114,14 @@ async def _load_mcp(turn, *_args, **_kwargs):
     return turn
 
 
-def _fake_envelope(store, plaintext: bytes, *, item_id=None):
+def _fake_envelope(
+    store,
+    plaintext: bytes,
+    *,
+    item_id=None,
+    content_kind: str = "text",
+):
+    assert content_kind in {"text", "binary"}
     return (
         {
             "v": 1,

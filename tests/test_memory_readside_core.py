@@ -149,7 +149,7 @@ def test_index_core_prefilters_sorts_caps_and_reports_card_count(monkeypatch):
 
     assert captured["api_key"] == "key_core"
     assert captured["operation"] == "index"
-    assert captured["payload"]["include_sensitive"] is False
+    assert "include_sensitive" not in captured["payload"]
     assert len(captured["ids"]) == 50
     assert captured["ids"][:2] == ["high_new", "open_old"]
     assert body["user_card_count"] == 62
@@ -352,6 +352,144 @@ def test_fetch_core_splits_missing_unavailable_and_preserves_order(monkeypatch):
     assert [item["id"] for item in body["items"]] == ["ok_a", "ok_b"]
     assert body["missing_ids"] == ["missing", "other_user"]
     assert body["unavailable_ids"] == ["local", "archived", "superseded"]
+    assert body["truncation"] == {
+        "truncated": False,
+        "requested_count": 7,
+        "processed_count": 7,
+        "omitted_count": 0,
+    }
+
+
+def test_fetch_core_reports_limit_truncation_instead_of_silent_slicing(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    moments = [_moment(f"card_{index}") for index in range(3)]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+
+    def fake_enclave(_api_key, candidates, *, operation, payload=None):
+        return {
+            "items": [{"id": moment["id"], "summary": moment["id"]} for moment in candidates],
+            "unavailable_ids": [],
+        }
+
+    body = readside_core.memory_fetch_core(
+        store,
+        "key_core",
+        {"ids": ["card_0", "card_1", "card_2"], "limit": 2},
+        post_enclave=fake_enclave,
+    )
+
+    assert [item["id"] for item in body["items"]] == ["card_0", "card_1"]
+    assert body["truncation"] == {
+        "truncated": True,
+        "requested_count": 3,
+        "processed_count": 2,
+        "omitted_count": 1,
+    }
+    for requested_count in (1, 2):
+        boundary = readside_core.memory_fetch_core(
+            store,
+            "key_core",
+            {
+                "ids": [f"card_{index}" for index in range(requested_count)],
+                "limit": 2,
+            },
+            post_enclave=fake_enclave,
+        )
+        assert boundary["truncation"] == {
+            "truncated": False,
+            "requested_count": requested_count,
+            "processed_count": requested_count,
+            "omitted_count": 0,
+        }
+
+
+def test_fetch_core_explicit_quote_includes_archived_and_superseded(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(user_id="usr_core")
+    moments = [
+        _moment("current"),
+        _moment("archived", archived=True),
+        _moment("superseded", status="superseded"),
+    ]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+    captured = {}
+
+    def fake_enclave(_api_key, candidates, *, operation, payload=None):
+        captured["ids"] = [moment["id"] for moment in candidates]
+        captured["payload"] = dict(payload or {})
+        return {
+            "items": [
+                {
+                    "id": moment["id"],
+                    "summary": moment["id"],
+                    # Simulate an older enclave during a rolling deploy. The
+                    # backend must not let retired metadata recreate the API.
+                    "is_sensitive": moment["id"] == "current",
+                    "sensitivity_class": "private" if moment["id"] == "current" else "",
+                }
+                for moment in candidates
+            ],
+            "unavailable_ids": [],
+        }
+
+    body = readside_core.memory_fetch_core(
+        store,
+        "key_core",
+        {
+            "ids": ["current", "archived", "superseded"],
+            "include_archived": True,
+            "include_superseded": True,
+        },
+        post_enclave=fake_enclave,
+    )
+
+    assert captured["ids"] == ["current", "archived", "superseded"]
+    assert captured["payload"] == {
+        "ids": ["current", "archived", "superseded"],
+        "limit": 1000,
+    }
+    assert [item["id"] for item in body["items"]] == captured["ids"]
+    assert all("is_sensitive" not in item for item in body["items"])
+    assert all("sensitivity_class" not in item for item in body["items"])
+    assert body["missing_ids"] == []
+    assert body["unavailable_ids"] == []
+
+
+def test_fetch_core_ignores_legacy_classification_in_plaintext_tier(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    legacy = _plaintext_moment("plain_legacy", "private")
+    legacy["body"] = __import__("json").dumps({
+        "summary": "private",
+        "content": "private body",
+        "bucket": "未分类",
+        "threads": [],
+        "is_sensitive": True,
+        "sensitivity_class": "private",
+        "sensitive_scope": "old_scope",
+    })
+    monkeypatch.setattr(
+        readside_core.memory_service, "_load_moments", lambda _store: [legacy]
+    )
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda *_args: None)
+
+    body = readside_core.memory_fetch_core(
+        store,
+        None,
+        {"ids": ["plain_legacy"]},
+        post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("plaintext tier must not call enclave")
+        ),
+    )
+
+    assert [item["id"] for item in body["items"]] == ["plain_legacy"]
+    assert all(
+        key not in body["items"][0]
+        for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+    )
+    assert body["unavailable_ids"] == []
 
 
 class _FakeResp:

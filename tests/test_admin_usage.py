@@ -47,6 +47,24 @@ from conftest import seed_user  # noqa: E402
 
 
 NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
+_EXCLUSIVE_PYTEST_MESSAGE = (
+    "本文件断言全局用户口径,必须独占一次 pytest 调用,"
+    "见 ci.yml 的 Run admin usage snapshot suite"
+    "。本次调用中排在本文件之后的测试未执行"
+)
+
+
+@pytest.fixture(autouse=True)
+def _require_exclusive_pytest_invocation(request):
+    this_file = Path(__file__).resolve()
+    has_other_test_file = any(
+        Path(item.path).resolve() != this_file for item in request.session.items
+    )
+    if not has_other_test_file:
+        return
+
+    request.session.shouldstop = _EXCLUSIVE_PYTEST_MESSAGE
+    pytest.fail(_EXCLUSIVE_PYTEST_MESSAGE, pytrace=False)
 
 
 def _load_usage_scale_harness():

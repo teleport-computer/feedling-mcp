@@ -41,7 +41,7 @@ def _trace_with_content() -> dict:
         ],
         "rejected_sample": [
             {"id": "m_9", "reason": "no_query_overlap", "summary": SECRET},
-            {"id": "m_8", "reason": "sensitive_not_allowed_for_query", "summary": "敏感卡"},
+            {"id": "m_8", "reason": "below_threshold:weak_match", "summary": "弱匹配卡"},
             {"id": "m_7", "reason": "no_query_overlap", "summary": "又一张"},
         ],
     }
@@ -121,7 +121,7 @@ def test_candidate_pool_and_index_count_are_both_kept():
 def test_rejected_reasons_are_counted_by_kind():
     reasons = _record()["rejected_reasons"]
     assert reasons["no_query_overlap"] == 2
-    assert reasons["sensitive_not_allowed_for_query"] == 1
+    assert reasons["below_threshold:weak_match"] == 1
 
 
 def test_bucket_breakdown_shows_which_bucket_each_card_came_from():

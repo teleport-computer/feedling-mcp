@@ -24,6 +24,7 @@ sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
+from memory import memory_core  # noqa: E402
 from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
@@ -213,7 +214,8 @@ def test_public_operation_and_parameter_inventory(
     # validators; only the two config mutations carry request bodies.
     # The authenticated resident generation exchange adds one prompt-bearing
     # operation.
-    assert len(operations) == 176
+    # GET /v1/chat/workspace/body adds one bodyless Canvas live-read operation.
+    assert len(operations) == 177
     assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
@@ -222,7 +224,7 @@ def test_public_operation_and_parameter_inventory(
     header_operations = {
         key for key, operation in operations.items() if _parameters(operation, "header")
     }
-    assert len(query_operations) == 33
+    assert len(query_operations) == 34
     assert header_operations == set(EXPECTED_HEADER_OPERATIONS)
 
     for key, expected_names in EXPECTED_HEADER_OPERATIONS.items():
@@ -369,6 +371,10 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     ]
     assert include_reasoning["type"] == "boolean"
     assert include_reasoning["default"] is False
+    images = schemas["HostedChatSendRequest"]["properties"]["images"]
+    assert images["minItems"] == 1
+    assert images["maxItems"] == 9
+    assert images["items"] == {"$ref": "#/components/schemas/ChatImageInput"}
 
     response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
     assert "resident_maintenance" in response_sources
@@ -399,12 +405,51 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     assert history_query["limit"]["schema"]["maximum"] == 200
     assert history_query["include_image_bodies"]["deprecated"] is True
 
+    canvas_operation = operations[("get", "/v1/chat/workspace/body")]
+    canvas_query = _parameters(canvas_operation, "query")
+    assert set(canvas_query) == {"filename"}
+    assert canvas_query["filename"]["required"] is True
+    assert canvas_query["filename"]["schema"]["maxLength"] == 120
+    assert canvas_operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/CanvasWorkspaceBodyResponse"}
+    canvas_response = schemas["CanvasWorkspaceBodyResponse"]
+    assert set(canvas_response["required"]) == {
+        "filename", "revision", "mime_type", "envelope"
+    }
+    assert canvas_response["properties"]["envelope"] == {
+        "$ref": "#/components/schemas/EncryptedEnvelope"
+    }
+
+    memory_query = _parameters(
+        operations[("get", "/v1/memory/list")], "query"
+    )
+    assert memory_query["limit"]["schema"]["maximum"] == (
+        memory_core.MEMORY_LIST_MAX_LIMIT
+    )
+    assert memory_query["limit"]["schema"]["default"] == (
+        memory_core.MEMORY_LIST_DEFAULT_LIMIT
+    )
+
     memory_id = _parameters(operations[("get", "/v1/memory/get")], "query")["id"]
     assert memory_id["required"] is True
     memory_delete_id = _parameters(
         operations[("delete", "/v1/memory/delete")], "query"
     )["id"]
     assert memory_delete_id["required"] is True
+
+    memory_index_properties = set(schemas["MemoryIndexRequest"]["properties"])
+    memory_fetch_properties = set(schemas["MemoryFetchRequest"]["properties"])
+    retired_memory_fields = {
+        "include_sensitive",
+        "user_explicit_selection",
+        "is_sensitive",
+        "sensitivity_class",
+        "sensitive_scope",
+    }
+    assert memory_index_properties.isdisjoint(retired_memory_fields)
+    assert memory_fetch_properties.isdisjoint(retired_memory_fields)
+    assert retired_memory_fields.isdisjoint(json.dumps(public_schema).split('"'))
 
     perception_query = _parameters(
         operations[("get", "/v1/perception/app_open")], "query"
@@ -773,6 +818,16 @@ def test_runner_health_503_description_covers_bounded_probe_deadline(
 
     assert "503" not in operations[("get", "/healthz")]["responses"]
     assert "three-second health-check deadline" in runner_description
+
+
+def test_runner_health_documents_cached_degraded_and_unknown_observations(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    responses = operations[("get", "/healthz/runner")]["responses"]
+
+    assert "cached heartbeat snapshot" in responses["200"]["description"]
+    assert '"status": "degraded"' in responses["200"]["description"]
+    assert '"status": "unknown"' in responses["503"]["description"]
 
 
 def test_sensitive_control_planes_enforce_api_key_in_backend(

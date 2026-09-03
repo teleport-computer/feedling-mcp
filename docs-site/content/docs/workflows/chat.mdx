@@ -1,6 +1,8 @@
 ---
 title: Chat workflow
 description: Send hosted messages or run the encrypted resident consumer loop.
+document_lifecycle: current
+canonical_owner: self
 ---
 
 Feedling exposes two chat paths with different responsibilities.
@@ -13,6 +15,27 @@ Feedling exposes two chat paths with different responsibilities.
 The hosted path is asynchronous. A successful send is always `202`, even when
 the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
+
+An IO Canvas card may outlive the Chat attachment that first published it.
+Authenticated clients can read the current Canvas source with
+`GET /v1/chat/workspace/body?filename=<original-file_name>`. The endpoint accepts
+only the original `.io.html` basename from the Chat row, derives the private
+`/workspace` path server-side, and performs an exact case- and
+Unicode-normalization-sensitive lookup. It returns the current revision and the
+opaque shared `envelope`; encrypted accounts open it with the same content key
+used for Chat, while plaintext-tier accounts receive the standard `body` shape.
+A `404 workspace_entry_not_found` is a normal compatibility signal: clients
+should fall back to `GET /v1/chat/messages/{message_id}/body` so historical
+cards whose live workspace entry is unavailable remain readable.
+
+Backend workers create metadata-only per-user Store shells and load an in-memory
+section only when a path explicitly needs that projection. Chat history,
+resident long-poll selection, and Hosted Runtime V2 prompt-tail assembly remain
+bounded PostgreSQL reads; they do not load the worker's Chat hot snapshot merely
+to obtain user identity, locks, or waiters. PostgreSQL remains authoritative,
+and cross-worker notifications are latency hints that wake pollers and refresh
+only projections already loaded in that worker. Message ordering, clear
+semantics, API responses, and encryption behavior do not change.
 
 ## Scheduled reminders
 
@@ -98,7 +121,7 @@ does not add a second UTC clock representation.
 
 ### 1. Send the turn
 
-At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
+At least one of `message`, `image_b64`, `images`, or `file_b64` is required. `message` is
 limited to 12,000 characters. `context_refs` accepts at most eight references;
 currently memory references are the useful public form.
 
@@ -139,6 +162,13 @@ For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
   "context_refs": []
 }
 ```
+
+To send multiple images, use `images` with one to nine `{image_b64,
+image_mime}` objects. Do not combine `images` with the legacy `image_b64` or
+`image_base64` fields. An empty list returns `image_list_empty`; mixing the two
+forms returns `image_payload_conflict`; more than nine returns
+`image_count_exceeds_limit` with `max_images: 9`. A one-item `images` request is
+stored through the same legacy single-image path.
 
 ### Image model selection
 

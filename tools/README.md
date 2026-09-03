@@ -4,8 +4,14 @@ canonical_owner: self
 ---
 # tools/
 
-Operator-facing utilities for Feedling. Each entry is independent — none
-of these are imported by the backend at runtime.
+Most operator-facing utilities in this directory are independent of the
+backend's long-lived runtime. The documented resident-runtime companions are
+exceptions: `chat_resident_consumer.py`, `io_cli.py`, `io_cli_catalog.py`, the
+user-MCP helpers, and the Pi bridge are executed or imported by the resident or
+hosted agent-runner path.
+
+For the full owner/lifecycle inventory of every tracked `tools/`, `scripts/`,
+and `ops/` path, see [`docs/repository-cleanup/tool-script-inventory.md`](../docs/repository-cleanup/tool-script-inventory.md).
 
 ## `chat_resident_consumer.py` — independent resident chat bridge
 
@@ -48,6 +54,15 @@ whether agent tools exist in some other surface.
    back to `/v1/chat/response`.
 5. Maintains a checkpoint file so it never re-processes old messages
    after restart.
+
+### Maintainer boundary
+
+`chat_resident_consumer.py` is intentionally one directly distributed script:
+the VPS service, VPS P0 harness, self-update/re-exec path, test import seams,
+and hosted agent-runner image all depend on that shape. Do not split it into
+new Python modules as a cleanup change. See the
+[resident consumer source map](../docs/repository-cleanup/resident-consumer-source-map.md)
+for the protected contracts, navigation symbols, and deletion evidence gates.
 
 `/v1/chat/poll` is a responder endpoint. It claims a short lease on each
 user message so two auto-reply surfaces do not both answer the same IO turn.
@@ -693,9 +708,12 @@ live in `tools/dcap/test_dcap_parse.py`.
 
 | Tool | Verifies |
 |---|---|
-| `v1_envelope_roundtrip_test.py` | Python `build_envelope` + iOS-style unseal produce identical plaintext |
-| `frame_envelope_roundtrip_test.py` | Frame envelope variant (image bytes) round-trips |
+| `v1_envelope_roundtrip_test.py` | Current backend/iOS-compatible BoxSeal interop plus local chat envelope write/read/decrypt |
+| `frame_envelope_roundtrip_test.py` | Current backend/iOS-compatible BoxSeal plus local encrypted frame ingest/persistence |
 | `e2e_encryption_test.py` | Full end-to-end: write encrypted, fetch via enclave decrypt proxy, read back plaintext |
 
-These are correctness tests. Run them after touching `content_encryption.py`
-on either side.
+The BoxSeal contract is also covered without live services by
+`tests/test_v1_envelope_roundtrip_tool.py` and
+`tests/test_frame_envelope_roundtrip_tool.py`. Run those drift guards first,
+then run the matching local-service tool after touching envelope crypto or
+ingest behavior.

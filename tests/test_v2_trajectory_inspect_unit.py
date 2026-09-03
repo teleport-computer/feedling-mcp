@@ -8,6 +8,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from core import envelope as core_envelope
+from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import trajectory
 from model_api_runtime.v2 import trajectory_inspect
 
@@ -15,6 +17,48 @@ from model_api_runtime.v2 import trajectory_inspect
 def _encoded(kind: str, payload: dict) -> bytes:
     value, _truncated, _size = trajectory.encode_payload(kind, payload)
     return value
+
+
+def test_production_deps_open_plaintext_trajectory_payload(monkeypatch):
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-secret")
+    encoded = _encoded("provider_response", {"choices": []})
+    envelope = {
+        "body": jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+        + base64.b64encode(encoded).decode("ascii"),
+        "id": "trajectory-event-1",
+        "owner_user_id": "u1",
+        "visibility": "shared",
+    }
+
+    deps = trajectory_inspect._production_deps()
+    token = deps.mint_token("u1")
+
+    assert deps.decrypt("u1", envelope, token) == encoded
+
+
+def test_production_deps_keep_sealed_precedence_for_hybrid_envelope(monkeypatch):
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-secret")
+    sealed_encoded = _encoded("provider_response", {"source": "sealed"})
+    stale_plaintext = _encoded("provider_response", {"source": "plaintext"})
+    envelope = {
+        "body_ct": "ciphertext",
+        "body": jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+        + base64.b64encode(stale_plaintext).decode("ascii"),
+        "owner_user_id": "u1",
+    }
+
+    def open_sealed(candidate, api_key, *, purpose, runtime_token):
+        assert candidate == envelope
+        assert api_key is None
+        assert purpose == "runtime_v2_trajectory_break_glass"
+        assert runtime_token
+        return sealed_encoded
+
+    monkeypatch.setattr(core_envelope, "read_envelope_body", open_sealed)
+    deps = trajectory_inspect._production_deps()
+    token = deps.mint_token("u1")
+
+    assert deps.decrypt("u1", envelope, token) == sealed_encoded
 
 
 def _deps(*, events: list[dict] | None = None, source: dict | None = None):
@@ -155,6 +199,87 @@ def test_audit_failure_blocks_decryption(monkeypatch):
             deps=deps,
         )
     assert calls == []
+
+
+def test_invalid_trajectory_bytes_are_reported_as_decode_failure(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED", "1")
+    deps, calls = _deps()
+    deps = trajectory_inspect.InspectDeps(
+        source_job=deps.source_job,
+        capture_state=deps.capture_state,
+        list_events=deps.list_events,
+        append_audit=deps.append_audit,
+        authorize_success=deps.authorize_success,
+        mint_token=deps.mint_token,
+        decrypt=lambda _uid, _envelope, _token: b"not-a-trajectory-payload",
+    )
+
+    with pytest.raises(
+        trajectory_inspect.TrajectoryInspectError,
+        match="trajectory_decode_failed",
+    ):
+        trajectory_inspect.inspect_trajectory(
+            user_id="u1",
+            job_id=7,
+            operator_id="alice@example.com",
+            reason_code="debug",
+            case_ref="DBG-8",
+            deps=deps,
+        )
+
+    assert calls[-1] == ("audit", "failed", "trajectory_decode_failed")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "missing-trajectory-prefix",
+        jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX + "not-base64!",
+    ],
+)
+def test_invalid_plaintext_envelope_is_reported_as_decrypt_failure(
+    monkeypatch,
+    body,
+):
+    monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED", "1")
+    production = trajectory_inspect._production_deps()
+    rows = [
+        {
+            "event_index": 0,
+            "payload_envelope": {
+                "body": body,
+                "id": "trajectory-event-1",
+                "owner_user_id": "u1",
+                "visibility": "shared",
+            },
+            "truncated": False,
+        }
+    ]
+    deps, calls = _deps(events=rows)
+    deps = trajectory_inspect.InspectDeps(
+        source_job=deps.source_job,
+        capture_state=deps.capture_state,
+        list_events=deps.list_events,
+        append_audit=deps.append_audit,
+        authorize_success=deps.authorize_success,
+        mint_token=deps.mint_token,
+        decrypt=production.decrypt,
+    )
+
+    with pytest.raises(
+        trajectory_inspect.TrajectoryInspectError,
+        match="trajectory_decrypt_failed",
+    ):
+        trajectory_inspect.inspect_trajectory(
+            user_id="u1",
+            job_id=7,
+            operator_id="alice@example.com",
+            reason_code="debug",
+            case_ref="DBG-9",
+            deps=deps,
+        )
+
+    assert calls[-1] == ("audit", "failed", "trajectory_decrypt_failed")
 
 
 def test_chunked_trajectory_is_fully_paged_and_reassembled(monkeypatch):

@@ -15,6 +15,36 @@ def test_upsert_user_dual_writes(backend_env, monkeypatch):
     assert _tee("SELECT count(*) FROM users WHERE user_id='usr_dw1'")[0][0] == 1
 
 
+def test_registration_web_seed_mirrors_only_for_a_primary_insert(
+    backend_env, monkeypatch
+):
+    monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
+
+    new_uid = "usr_dw_web_seed_new"
+    assert db.upsert_user(
+        {"user_id": new_uid, "label": "new"},
+        seed_web_settings_on_insert=True,
+    ) is True
+    assert _tee(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind='web_settings'",
+        (new_uid,),
+    ) == [({"version": 1, "enabled": True},)]
+
+    old_uid = "usr_dw_web_seed_old"
+    db.insert_user({"user_id": old_uid, "label": "before"})
+    assert db.upsert_user(
+        {"user_id": old_uid, "label": "after"},
+        seed_web_settings_on_insert=True,
+    ) is False
+    assert _tee(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind='web_settings'",
+        (old_uid,),
+    ) == []
+    assert _tee("SELECT doc->>'label' FROM users WHERE user_id=%s", (old_uid,)) == [
+        ("after",)
+    ]
+
+
 def test_log_append_dual_writes(backend_env, monkeypatch):
     monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
     seed_user("usr_dw2")

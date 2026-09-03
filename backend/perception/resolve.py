@@ -131,10 +131,18 @@ def resolve_time(value, config: dict) -> dict:
 
 
 def resolve_battery(value, config: dict) -> dict:
-    """`battery` data: {level, charging} → battery_level / charging."""
+    """`battery` data: {level, charging, low_power_mode} → the three state fields.
+
+    ``low_power_mode`` arrives only from clients new enough to send it; older
+    ones leave it None, which reads as "we don't know", not "it's off".
+    """
     if not isinstance(value, dict):
         return {}
-    return {"battery_level": value.get("level"), "charging": value.get("charging")}
+    return {
+        "battery_level": value.get("level"),
+        "charging": value.get("charging"),
+        "low_power_mode": value.get("low_power_mode"),
+    }
 
 
 def resolve_broadcast(value, config: dict) -> dict:

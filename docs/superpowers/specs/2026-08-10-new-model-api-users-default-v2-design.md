@@ -1,7 +1,11 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # 新注册 Model API 用户默认进入 Runtime V2 — 设计 spec
 
 日期：2026-08-10
-状态：已批准，待实现
+状态：已批准并实现；当前运行状态与后续修订以 docs/CURRENT_STATE.md 和现行 runbook 为准
 适用范围：Hosted Model API 路线；resident 与 official import 不参与
 
 ## 1. 背景与目标

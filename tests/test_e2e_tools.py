@@ -9,7 +9,7 @@ from nacl.public import PrivateKey
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.e2e import config, hosted, p0
+from tools.e2e import config, hosted, p0, processing_probe
 from tools.e2e.client import E2EClient, TEST_API, _refuse_prod
 
 from conftest import capture_sleeps
@@ -475,6 +475,189 @@ def test_hosted_hard_step_marks_account_for_preservation(monkeypatch) -> None:
     assert fake.reason.startswith("setup:")
 
 
+@pytest.mark.parametrize(
+    (
+        "status",
+        "windows_done",
+        "setup_ok",
+        "first_estimate_status",
+        "commit_has_job",
+        "second_estimate_status",
+        "poll_error",
+        "expect_preserved",
+    ),
+    [
+        ("failed", 14, True, 201, True, 201, "", True),
+        ("done", 24, True, 201, True, 201, "", False),
+        ("done", 24, True, 201, True, 500, "", True),
+        ("done", 24, True, 500, True, 201, "", True),
+        ("done", 24, True, 201, True, 201, "poll timed out after 1800s", True),
+        ("done", 24, False, 201, True, 201, "", True),
+        ("done", 24, True, 201, False, 201, "", True),
+    ],
+)
+def test_processing_probe_preserves_failure_evidence_on_every_exit(
+    monkeypatch,
+    status: str,
+    windows_done: int,
+    setup_ok: bool,
+    first_estimate_status: int,
+    commit_has_job: bool,
+    second_estimate_status: int,
+    poll_error: str,
+    expect_preserved: bool,
+) -> None:
+    from tools.e2e.config import HostedCell
+
+    class FakeClient:
+        def __init__(self):
+            self.cell = ""
+            self.locators: list[tuple[str, str]] = []
+            self.preserved_reason = ""
+            self.estimate_calls = 0
+            self.estimate_contents: list[str] = []
+            self.commit_calls = 0
+            self.get_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def configure_failure_evidence(self, *, cell, artifacts=None):
+            self.cell = cell
+
+        def record_failure_locator(self, kind, value):
+            self.locators.append((kind, value))
+
+        def preserve_failure(self, reason):
+            self.preserved_reason = reason
+
+        def post(self, path, *, json):
+            if path == "/v1/model_api/setup":
+                test_status = "ok" if setup_ok else "failed"
+                return FakeResponse(200, {"config": {"test_status": test_status}})
+            if path == "/v1/genesis/imports/plaintext/estimate":
+                self.estimate_calls += 1
+                self.estimate_contents.append(str(json.get("content") or ""))
+                if self.estimate_calls == 1 and first_estimate_status != 201:
+                    return FakeResponse(
+                        first_estimate_status,
+                        {"error": "staged_import_create_failed:OperationalError"},
+                    )
+                if self.estimate_calls == 2 and second_estimate_status != 201:
+                    return FakeResponse(
+                        second_estimate_status,
+                        {"error": "staged_import_create_failed:OperationalError"},
+                    )
+                return FakeResponse(201, {
+                    "staged_id": f"staged-{self.estimate_calls}",
+                    "materials": [{"kind": kind} for kind in processing_probe.EXPECTED_KINDS],
+                    "est_total_tokens": 215_219,
+                    "recommended_model": "fast-model",
+                })
+            if path == "/v1/genesis/imports/plaintext/commit":
+                self.commit_calls += 1
+                if self.commit_calls == 1:
+                    job = {"job_id": "genesis_failure_site"} if commit_has_job else {}
+                    return FakeResponse(201, {"job": job})
+                return FakeResponse(409, {
+                    "error": "import_job_active",
+                    "active_job_id": "genesis_failure_site",
+                })
+            raise AssertionError(path)
+
+        def get(self, path):
+            assert path == "/v1/genesis/imports/genesis_failure_site"
+            self.get_calls += 1
+            return FakeResponse(200, {
+                "job_id": "genesis_failure_site",
+                "status": "processing" if self.get_calls == 1 else status,
+                "identity_ready": True,
+                "materials": [
+                    {
+                        "kind": kind,
+                        "status": (
+                            "failed"
+                            if kind == "chat_history" and status == "failed"
+                            else "done"
+                        ),
+                        "windows_done": windows_done if kind == "chat_history" else 1,
+                        "windows_total": 24 if kind == "chat_history" else 1,
+                        "cards": 3,
+                    }
+                    for kind in processing_probe.EXPECTED_KINDS
+                ],
+            })
+
+    fake = FakeClient()
+    monkeypatch.setattr(processing_probe.E2EClient, "provision", lambda **_kw: fake)
+    if poll_error:
+        def fail_poll(*_args, **_kwargs):
+            raise RuntimeError(poll_error)
+
+        monkeypatch.setattr(processing_probe, "_poll", fail_poll)
+    capture_sleeps(monkeypatch, processing_probe)
+    cell = HostedCell(
+        "relay-openai-compatible",
+        "openai_compatible",
+        "KEY",
+        [],
+        base_url_env="BASE",
+    )
+
+    result = processing_probe.run_processing_cell(
+        cell,
+        {"KEY": "secret", "BASE": "https://relay.test/v1", "E2E_RELAY_MODEL": "model"},
+        large=True,
+    )
+
+    assert fake.cell == "processing:relay-openai-compatible"
+    assert fake.locators == (
+        [("job_id", "genesis_failure_site")]
+        if setup_ok and first_estimate_status == 201 and commit_has_job
+        else []
+    )
+    if not setup_ok:
+        assert fake.estimate_contents == []
+    elif first_estimate_status != 201 or not commit_has_job:
+        assert len(fake.estimate_contents) == 1
+        assert len(fake.estimate_contents[0]) > len(processing_probe.HISTORY_SMALL)
+    else:
+        assert fake.estimate_contents[1] == fake.estimate_contents[0]
+    assert bool(fake.preserved_reason) is expect_preserved
+    cases = {case["name"]: case for case in result["cases"]}
+    if not setup_ok:
+        assert cases["setup"]["result"] == processing_probe.PRODUCT_FAIL
+        assert "estimate_contract" not in cases
+        assert "setup=PRODUCT_FAIL" in fake.preserved_reason
+        assert "uncreated" in fake.preserved_reason
+    elif first_estimate_status != 201:
+        assert cases["estimate_contract"]["result"] == processing_probe.PRODUCT_FAIL
+        assert "commit" not in cases
+        assert "estimate_contract=PRODUCT_FAIL" in fake.preserved_reason
+    elif not commit_has_job:
+        assert cases["commit"]["result"] == processing_probe.PRODUCT_FAIL
+        assert "concurrent_commit_409" not in cases
+        assert "commit=PRODUCT_FAIL" in fake.preserved_reason
+        assert "uncreated" in fake.preserved_reason
+    elif poll_error:
+        assert cases["poll"]["result"] == processing_probe.BLOCKED_EVIDENCE
+        assert "job_done" not in cases
+        assert "poll=BLOCKED_EVIDENCE" in fake.preserved_reason
+    else:
+        assert (cases["job_done"]["result"] == processing_probe.PASS) is (
+            status == "done"
+        )
+        assert (
+            cases["all_windows_processed"]["result"] == processing_probe.PASS
+        ) is (windows_done == 24)
+        assert (
+            cases["concurrent_commit_409"]["result"] == processing_probe.PASS
+        ) is (second_estimate_status == 201)
+
+
 def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
     """200/404 → entry removed; 401 / transport error / bad JSON / non-test URL
     → kept, sweep continues, exit 1."""
@@ -525,6 +708,150 @@ def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
     assert not any("api.feedling.app/v1" in u and "test-api" not in u for u in posted)
 
 
+def test_cleanup_orphans_preserves_failure_site_within_retention(
+    monkeypatch, tmp_path,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_recent_failure"
+    site.mkdir(parents=True)
+    (orphans / "usr_recent_failure.json").write_text(_json.dumps({
+        "api_url": TEST_API,
+        "user_id": "usr_recent_failure",
+        "api_key": "key-recent-failure",
+    }))
+    (site / "evidence.json").write_text(_json.dumps({
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS / 2)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
+        "user_id": "usr_recent_failure",
+    }))
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
+
+    posts: list[str] = []
+    monkeypatch.setattr(httpx, "post", lambda url, **_kw: posts.append(url))
+
+    assert p0._cleanup_orphans() == 1
+    assert posts == []
+    assert (orphans / "usr_recent_failure.json").exists()
+    assert site.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    ["unreadable", "negative_retention", "user_id_mismatch"],
+)
+def test_cleanup_orphans_fails_closed_on_invalid_failure_evidence(
+    monkeypatch, tmp_path, invalid_evidence,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_unreadable_failure"
+    site.mkdir(parents=True)
+    orphan = orphans / "usr_unreadable_failure.json"
+    orphan.write_text(_json.dumps({
+        "api_url": TEST_API,
+        "user_id": "usr_unreadable_failure",
+        "api_key": "key-unreadable-failure",
+    }))
+    evidence = {
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS + 1)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
+        "user_id": "usr_unreadable_failure",
+    }
+    if invalid_evidence == "unreadable":
+        (site / "evidence.json").write_text("{not json")
+    else:
+        if invalid_evidence == "negative_retention":
+            evidence["retention_days"] = -1
+        else:
+            evidence["user_id"] = "usr_different_failure"
+        (site / "evidence.json").write_text(_json.dumps(evidence))
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
+
+    posts: list[str] = []
+
+    def fake_post(url, **_kw):
+        posts.append(url)
+        return FakeResponse(200, {"deleted": True})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    assert p0._cleanup_orphans() == 1
+    assert posts == []
+    assert orphan.exists()
+    assert site.exists()
+
+
+def test_cleanup_orphans_fails_closed_on_orphan_user_id_mismatch(
+    monkeypatch, tmp_path,
+) -> None:
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    import tools.e2e.client as client_mod
+
+    orphans = tmp_path / "orphans"
+    failures = tmp_path / "failures"
+    orphans.mkdir()
+    site = failures / "usr_manifest_name"
+    site.mkdir(parents=True)
+    orphan = orphans / "usr_manifest_name.json"
+    orphan.write_text(_json.dumps({
+        "api_url": TEST_API,
+        "user_id": "usr_manifest_body",
+        "api_key": "key-mismatched-orphan",
+    }))
+    (site / "evidence.json").write_text(_json.dumps({
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS / 2)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
+        "user_id": "usr_manifest_name",
+    }))
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", orphans)
+    monkeypatch.setattr(client_mod, "_FAILURES_DIR", failures)
+    monkeypatch.setattr(p0, "_ADMIN_TOKEN_FILE", tmp_path / "missing-admin-token")
+
+    posts: list[str] = []
+
+    def fake_post(url, **_kw):
+        posts.append(url)
+        return FakeResponse(200, {"deleted": True})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    assert p0._cleanup_orphans() == 1
+    assert posts == []
+    assert orphan.exists()
+    assert site.exists()
+
+
 def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
     monkeypatch, tmp_path,
 ) -> None:
@@ -543,8 +870,11 @@ def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
         "api_url": TEST_API, "user_id": "usr_expired", "api_key": "key-expired",
     }))
     (site / "evidence.json").write_text(_json.dumps({
-        "created_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(),
-        "retention_days": 7,
+        "created_at": (
+            datetime.now(timezone.utc)
+            - timedelta(days=p0.FAILURE_RETENTION_DAYS + 1)
+        ).isoformat(),
+        "retention_days": p0.FAILURE_RETENTION_DAYS,
         "user_id": "usr_expired",
     }))
     token_file = tmp_path / "admin-token"

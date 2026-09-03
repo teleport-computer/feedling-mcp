@@ -26,7 +26,7 @@ def test_no_flask_imports_in_backend():
 def test_enclave_package_imports_clean():
     sys.path.insert(0, str(BACKEND))
     for mod in ("enclave.config", "enclave.keys", "enclave.attestation",
-                "enclave.state", "enclave.envelope", "enclave.visual",
+                "enclave.state", "enclave.envelope", "core.visual",
                 "enclave.readside", "enclave.backend_client", "enclave.auth",
                 "enclave.routes", "enclave.serving", "enclave.asgi_worker"):
         __import__(mod)

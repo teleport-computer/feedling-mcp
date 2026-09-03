@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import pathlib
 import sys
@@ -13,8 +14,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import subagents  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
+from capabilities import web as cap_web  # noqa: E402
+from capabilities.types import ok  # noqa: E402
 import provider_client  # noqa: E402
-from provider_types import ToolCall  # noqa: E402
+from provider_types import ToolCall, ToolExchange  # noqa: E402
 
 
 def _call(call_id: str, prompt: str, **extra) -> ToolCall:
@@ -41,6 +44,7 @@ def test_task_batch_runs_in_parallel_and_preserves_provider_order() -> None:
         subagents.run_task_batch(
             [_call("first", "one"), _call("second", "two")],
             run_child=child,
+            propagated_exception_types=(),
             max_parallel_tasks=2,
         )
     )
@@ -69,6 +73,7 @@ def test_task_batch_isolates_failure_and_deadline() -> None:
                 _call("timed-out", "slow"),
             ],
             run_child=child,
+            propagated_exception_types=(),
             child_deadline_sec=0.01,
         )
     )
@@ -81,6 +86,30 @@ def test_task_batch_isolates_failure_and_deadline() -> None:
         "error": "subagent_deadline_exceeded",
     }
     assert "private" not in str(bodies)
+
+
+def test_task_batch_propagates_configured_fatal_exception() -> None:
+    class FatalChildSignal(RuntimeError):
+        pass
+
+    async def child(_task):
+        raise FatalChildSignal("stop parent")
+
+    with pytest.raises(FatalChildSignal, match="stop parent"):
+        asyncio.run(
+            subagents.run_task_batch(
+                [_call("fatal", "stop")],
+                run_child=child,
+                propagated_exception_types=(FatalChildSignal,),
+            )
+        )
+
+
+def test_task_batch_requires_an_explicit_control_flow_policy() -> None:
+    parameter = inspect.signature(subagents.run_task_batch).parameters[
+        "propagated_exception_types"
+    ]
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_shared_budget_reserves_concurrent_calls_and_refunds_reported_usage() -> None:
@@ -128,6 +157,7 @@ def test_task_result_is_bounded_valid_json() -> None:
         subagents.run_task_batch(
             [_call("one", "inspect")],
             run_child=child,
+            propagated_exception_types=(),
             child_result_char_cap=256,
         )
     )
@@ -152,7 +182,13 @@ def test_task_batch_rejects_invalid_task_contract(call) -> None:
         return subagents.ChildTaskResult(summary="unexpected")
 
     with pytest.raises(subagents.SubagentBatchError):
-        asyncio.run(subagents.run_task_batch([call], run_child=child))
+        asyncio.run(
+            subagents.run_task_batch(
+                [call],
+                run_child=child,
+                propagated_exception_types=(),
+            )
+        )
 
 
 def test_task_batch_rejects_oversized_batch_before_execution() -> None:
@@ -168,6 +204,7 @@ def test_task_batch_rejects_oversized_batch_before_execution() -> None:
             subagents.run_task_batch(
                 [_call("one", "a"), _call("two", "b")],
                 run_child=child,
+                propagated_exception_types=(),
                 max_tasks_per_round=1,
             )
         )
@@ -313,6 +350,104 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
     assert all(event[2]["call_id"] == "child-read" for event in child_tool_events)
 
 
+def test_worker_child_read_failure_reaches_child_model_and_continues(
+    monkeypatch,
+) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+    provider_messages = []
+
+    async def fake_provider(_config, messages, *, tools=None, **kwargs):
+        provider_messages.append(list(messages))
+        if len(provider_messages) == 1:
+            return {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "child-read",
+                        "name": "workspace_read",
+                        "args": {"path": "/artifacts/report.txt"},
+                    }
+                ],
+                "usage": {},
+            }
+        return {
+            "reply": "I continued without the unavailable artifact.",
+            "tool_calls": [],
+            "usage": {},
+        }
+
+    async def failed_dispatch(*_args, **_kwargs):
+        raise worker.RecoverablePlatformReadError("private read failure")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker.v2_executor, "dispatch_tool_calls", failed_dispatch)
+    dispatcher = worker._make_task_batch_dispatcher(
+        disabled_web_tool_names=frozenset(),
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+
+    (result,) = asyncio.run(dispatcher([_call("parent", "Inspect the artifact.")]))
+
+    assert json.loads(result.content)["summary"] == (
+        "I continued without the unavailable artifact."
+    )
+    exchange = next(
+        item for item in provider_messages[1] if isinstance(item, ToolExchange)
+    )
+    assert exchange.results[0].content == worker._PLATFORM_READ_FAILED
+    assert "private read failure" not in exchange.results[0].content
+
+
+def test_worker_child_lost_lease_still_reaches_parent(monkeypatch) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+
+    async def fake_provider(_config, _messages, *, tools=None, **kwargs):
+        return {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "child-read",
+                    "name": "workspace_read",
+                    "args": {"path": "/artifacts/report.txt"},
+                }
+            ],
+            "usage": {},
+        }
+
+    async def lost_lease(*_args, **_kwargs):
+        raise worker.LostJobLease("lease lost in child")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker.v2_executor, "dispatch_tool_calls", lost_lease)
+    dispatcher = worker._make_task_batch_dispatcher(
+        disabled_web_tool_names=frozenset(),
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+
+    with pytest.raises(worker.LostJobLease, match="lease lost in child"):
+        asyncio.run(dispatcher([_call("parent", "Inspect the artifact.")]))
+
+
 def test_worker_subagent_budget_is_shared_across_parent_task_batches(
     monkeypatch,
 ) -> None:
@@ -364,6 +499,86 @@ def test_worker_subagent_budget_is_shared_across_parent_task_batches(
     assert len(provider_calls) == 1
 
 
+def test_worker_child_fetch_continuations_cannot_fill_gate_ahead_of_owner(
+    monkeypatch,
+) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+    url = "https://example.com/large"
+    provider_round = 0
+    fetch_results = []
+    loader_calls = 0
+
+    async def fake_provider(_config, _messages, *, tools=None, **kwargs):
+        nonlocal provider_round
+        provider_round += 1
+        if provider_round == 1:
+            calls = [{
+                "id": "search",
+                "name": "web_search",
+                "args": {"query": "large article"},
+            }]
+            return {"reply": "", "tool_calls": calls, "usage": {}}
+        if provider_round == 2:
+            calls = [
+                {
+                    "id": f"continuation-{index}",
+                    "name": "web_fetch",
+                    "args": {"url": url, "offset": index * 100},
+                }
+                for index in range(1, 5)
+            ]
+            calls.append({
+                "id": "owner", "name": "web_fetch", "args": {"url": url}
+            })
+            return {"reply": "", "tool_calls": calls, "usage": {}}
+        return {"reply": "complete", "tool_calls": [], "usage": {}}
+
+    real_run_capability = cap_registry.run_capability
+
+    def fake_run_capability(name, store, **kwargs):
+        if name == "web_search":
+            return ok(data={"query": "large article", "results": [{"url": url}]})
+        result = real_run_capability(name, store, **kwargs)
+        if name == "web_fetch":
+            fetch_results.append(result.to_dict())
+        return result
+
+    def fake_fetch_document(request_url):
+        nonlocal loader_calls
+        loader_calls += 1
+        return cap_web._FetchDocument(
+            url=request_url,
+            text="evidence " * 100,
+            source_truncated=False,
+        )
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(cap_registry, "run_capability", fake_run_capability)
+    monkeypatch.setattr(cap_web, "_fetch_document", fake_fetch_document)
+    monkeypatch.setattr(worker.kill_switch, "web_halted", lambda: (False, False))
+
+    dispatcher = worker._make_task_batch_dispatcher(
+        disabled_web_tool_names=frozenset(),
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(4),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+    (result,) = asyncio.run(dispatcher([_call("parent", "read the article")]))
+
+    assert json.loads(result.content)["status"] == "completed", result.content
+    assert len(fetch_results) == 5
+    assert all(fetch_result["ok"] is True for fetch_result in fetch_results)
+    assert loader_calls == 1
+
+
 def test_worker_child_private_read_blocks_later_outbound_web(
     monkeypatch,
 ) -> None:
@@ -373,6 +588,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         api_key="sk-parent-route",
     )
     offered = []
+    tool_choices = []
     responses = iter(
         [
             {
@@ -407,6 +623,7 @@ def test_worker_child_private_read_blocks_later_outbound_web(
 
     async def fake_provider(_config, _messages, *, tools=None, **kwargs):
         offered.append(tools)
+        tool_choices.append(kwargs.get("tool_choice"))
         return next(responses)
 
     capability_calls = []
@@ -466,7 +683,11 @@ def test_worker_child_private_read_blocks_later_outbound_web(
     assert capability_calls == ["workspace_read"]
     assert {spec.name for spec in offered[0]} == worker._SUBAGENT_ALLOWED_TOOLS
     assert {spec.name for spec in offered[1]}.isdisjoint({"web_search", "web_fetch"})
-    assert {spec.name for spec in offered[2]} == {"workspace_read"}
+    # The rejected call is recorded in native provider history, so compatible
+    # wires retain both referenced schemas on the terminal correction round.
+    # `tool_choice=none` is the execution fence: neither schema can dispatch.
+    assert {spec.name for spec in offered[2]} == {"workspace_read", "web_search"}
+    assert tool_choices == [None, None, "none"]
 
 
 def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(

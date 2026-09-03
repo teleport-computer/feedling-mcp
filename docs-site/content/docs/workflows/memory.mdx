@@ -1,6 +1,8 @@
 ---
 title: Memory workflow
 description: Store encrypted memory cards, inspect the index, and fetch selected content.
+document_lifecycle: current
+canonical_owner: self
 ---
 
 Memory separates ciphertext storage from enclave-authorized read projections.
@@ -57,6 +59,16 @@ later full-Garden refresh.
 
 `local_only` records can be stored and synchronized, but the enclave has no
 wrapped key for them, so they are unavailable from `index` and `fetch`.
+
+`memory/fetch` resolves IDs against the full Garden rather than an index or
+ranking window. Its response separates `missing_ids` from `unavailable_ids` and
+always includes a `truncation` object with requested, processed, and omitted
+counts. Do not treat a shorter `items` array as proof that every requested ID was
+processed. `include_archived` and `include_superseded` expose those lifecycle
+states when explicitly requested. All shared cards otherwise use the same read
+contract for direct fetch, ambient recall, profile refresh, Dream, and Capture.
+Legacy card-classification keys in stored envelopes are ignored and are not
+returned by `index` or `fetch`.
 
 Runtime V2's `memory_index` tool accepts `bucket` and `thread` filters in
 addition to `limit`, matching the resident CLI's partitioned browsing path.
@@ -137,13 +149,12 @@ before encryption is:
   "summary": "The user prefers a quiet start to the morning.",
   "content": "Coffee after 08:30, no meetings in the first half hour.",
   "bucket": "preferences",
-  "threads": ["morning-routine", "work-style"],
-  "is_sensitive": false
+  "threads": ["morning-routine", "work-style"]
 }
 ```
 
 Do not send this plaintext object to `/v1/memory/add`. Encrypt its serialized
-bytes and send the resulting envelope. Ordering and classification metadata is
+bytes and send the resulting envelope. Ordering and lifecycle metadata is
 intentionally visible outside the ciphertext.
 
 ```http
@@ -229,8 +240,7 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "ambient": false,
   "ambient_top_n": 20,
   "bucket": "preferences",
-  "thread": "morning-routine",
-  "include_sensitive": false
+  "thread": "morning-routine"
 }
 ```
 
@@ -254,7 +264,6 @@ response's effective `limit` and `truncated` values.
       "created_at": "2026-07-13T12:31:02.125000",
       "updated_at": "",
       "last_referenced_at": "",
-      "is_sensitive": false,
       "score": 0.5
     }
   ],
@@ -302,8 +311,7 @@ X-API-Key: YOUR_FEEDLING_API_KEY
       "occurred_at": "2026-07-13T12:30:00Z",
       "created_at": "2026-07-13T12:31:02.125000",
       "updated_at": "",
-      "last_referenced_at": "",
-      "is_sensitive": false
+      "last_referenced_at": ""
     }
   ],
   "missing_ids": ["mom_missing"],
@@ -313,14 +321,8 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 
 `missing_ids` are not owned by the user or do not exist. `unavailable_ids` are
 known records that cannot be returned under some archive, supersession, or
-encryption rules. These arrays do **not** currently exhaust every requested ID
-that was not returned: an enclave-blocked sensitive ID can be absent from
-`items`, `missing_ids`, and `unavailable_ids` at the same time. Compare requested
-IDs with returned item IDs and treat any unaccounted-for ID as not available.
-
-The public fetch path does not currently honor an `include_sensitive` request
-field. Do not send it or assume sensitive content will be returned merely
-because it was requested.
+encryption rules. Compare requested IDs with returned item IDs and treat any
+unaccounted-for ID as not available.
 
 ## 4. Apply a batch of memory actions
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import math
 import time
 from datetime import datetime
@@ -30,7 +31,7 @@ from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_
 # 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
 # _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 
-from . import catalog, history, permissions, resolve, store
+from . import catalog, health_measurement, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
 from .ios_contract_v2 import (
     ENCRYPTED_SIGNAL_KEYS_V2,
@@ -86,7 +87,9 @@ def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
         user_store = user_or_store
         if isinstance(user_or_store, str):
             from core import store as core_store  # lazy
-            user_store = core_store.get_store(user_or_store)
+            user_store = core_store.get_store_shell_only(
+                user_or_store, reason="perception runtime fence is DB-backed"
+            )
 
         from hosted import config_store as hosted_config_store  # lazy
 
@@ -183,6 +186,31 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
         }, ts)
     except Exception as e:  # observability must never break ingest
         log.warning("perception decrypt-failure audit write failed for %s: %s", user_id, e)
+
+
+def _record_unavailable_observation_v2(user_id: str, key: str, ts: float) -> None:
+    """Record UNAVAILABLE observation state (task 4 — distinct from "queried,
+    no sample") for every measurement group of a health signal whose envelope
+    just failed to decrypt. Best-effort/non-fatal, same rationale as
+    ``_record_decrypt_failure_v2``: this is Tier 2 bookkeeping, it must never
+    take down ingest.
+
+    Uses today's fallback date (there is no measurement time available on a
+    failed decrypt) and deliberately does NOT force the `_ts_kind` cutover —
+    see ``health_measurement.apply_unavailable``."""
+    groups = health_measurement.MEASUREMENT_GROUPS.get(key)
+    if not groups or not hasattr(store, "merge_perception_daily"):
+        return
+    try:
+        date = _local_date(ts, stable_context_timezone(user_id))
+        for group in groups:
+            store.merge_perception_daily(
+                user_id, date, key,
+                lambda prev, _g=group: health_measurement.apply_unavailable(prev, group=_g),
+                ts,
+            )
+    except Exception as e:
+        log.warning("perception_daily unavailable-state rollup failed for %s key=%s: %s", user_id, key, e)
 
 
 def _decrypted_location_anchor_id_v2(plaintext: Any) -> str:
@@ -340,6 +368,7 @@ def _ingest_snapshot_v2_inner(
     now = _coerce_ts(client_ts)
     storage_items: list[dict] = []
     location_anchor_observations: list[tuple[str, Any]] = []
+    shadow_decrypted: list[tuple[str, Any]] = []
     results: dict[str, str] = {}
 
     for item in (items or []):
@@ -408,8 +437,16 @@ def _ingest_snapshot_v2_inner(
                     # server-owned baseline.
                     if key == "location_signal":
                         location_anchor_observations.append((key, values))
+                    # Held, not fired: the shadow compares against the live
+                    # state, and the live path has not written this report yet
+                    # -- that happens below, after this loop. Comparing here
+                    # reads the *previous* report's state and calls every
+                    # field the kit just learned "only_kit".
+                    if key in _PERCEPTKIT_DECRYPTED_ENTRIES:
+                        shadow_decrypted.append((key, values))
                 else:
                     _record_decrypt_failure_v2(user_id, key, err, now)
+                    _record_unavailable_observation_v2(user_id, key, now)
             else:
                 storage_items.append(item)
             continue
@@ -417,6 +454,15 @@ def _ingest_snapshot_v2_inner(
 
     if storage_items:
         results.update(_ingest_snapshot_storage_only(user_id, storage_items, client_ts=client_ts))
+        # PerceptKit shadow. Runs beside the live path, writes only to the
+        # kit's own tables, and cannot raise -- see perceptkit_adapter.shadow.
+        # It is handed the already-decrypted items, so it costs no extra
+        # enclave calls. Nothing below reads its result.
+        _perceptkit_shadow(user_id, storage_items, client_ts=client_ts)
+    for key, values in shadow_decrypted:
+        _perceptkit_shadow_call(_PERCEPTKIT_DECRYPTED_ENTRIES[key], user_id,
+                                values, **({"occurred_at": now}
+                                           if key == "location_signal" else {}))
     for key, plaintext in location_anchor_observations:
         if results.get(key) != "accepted":
             continue
@@ -434,7 +480,57 @@ def _ingest_snapshot_v2_inner(
     return results
 
 
+
+_log = logging.getLogger(__name__)
+
+#: Decrypted signals the shadow takes a second look at, and which entry point
+#: each goes to. Location resolves to a city and a Wi-Fi anchor; calendar and
+#: reminders take the source-mirror path rather than the signal path (§7.13).
+#: All three are handed the plaintext the live path already decrypted, so they
+#: cost no extra enclave call.
+_PERCEPTKIT_DECRYPTED_ENTRIES = {
+    "location_signal": "observe_location",
+    "calendar_next_event": "mirror_calendar",
+    "reminders": "mirror_reminders",
+}
+
+
+def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> None:
+    """Fire the PerceptKit shadow run. Import is local and failure is swallowed.
+
+    Local import keeps the kit off the module-import path of the live service:
+    if the package is missing or a version is skewed, perception reports keep
+    working and only the shadow goes quiet.
+    """
+    _perceptkit_shadow_call("observe", user_id, storage_items, client_ts=client_ts)
+
+
+def _perceptkit_shadow_call(entry: str, *args, **kwargs) -> None:
+    """Call one shadow entry point. Import is local and failure is swallowed.
+
+    Local import keeps the kit off the module-import path of the live service:
+    if the package is missing or a version is skewed, perception keeps working
+    and only the shadow goes quiet.
+
+    Every perception entry point routes through here, so a new one costs one
+    line and inherits the guarantee -- rather than each growing its own
+    try/except that is one edit away from not having it.
+    """
+    try:
+        from .perceptkit_adapter import shadow
+        getattr(shadow, entry)(*args, **kwargs)
+    except Exception as exc:                       # noqa: BLE001 -- deliberate
+        # Swallowed, but never silently: a shadow that stops running and says
+        # nothing is indistinguishable from a shadow that runs and finds
+        # nothing, and the second one is the whole point of having it.
+        _log.warning("perceptkit shadow %s could not start (request unaffected): %s",
+                     entry, exc)
+
+
 def ingest_device_event_v2(user_id: str, event: dict) -> dict:
+    _perceptkit_shadow_call("observe_device_event", user_id,
+                            event if isinstance(event, dict) else {},
+                            occurred_at=float((event or {}).get("ts") or _now()))
     observations = device_event_observations_v2(event if isinstance(event, dict) else {})
     submitted = 0
     for observation in observations:
@@ -500,6 +596,10 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
     input_fields: dict[str, list] = {}   # input_name -> output fields it proposed
     wake_pending: list[tuple] = []       # (cap_key, debounce, field, old, new)
     hist_obs: dict[str, dict] = {}       # catalog signal key -> resolved values (for Tier 2)
+    hist_raw: dict[str, Any] = {}        # catalog signal key -> RAW reported mapping (pre-resolver;
+                                          # carries the optional measurement-metadata fields that
+                                          # resolvers/output-filtering would otherwise drop)
+    hist_null_keys: set[str] = set()     # historized signals reported as null this pass
     tz_seen: str | None = None
 
     for input_name, value, msg in pairs:
@@ -526,6 +626,8 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
             for fname in sig.outputs:
                 patch[fname] = _cell(None, now, msg)
                 fields.append(fname)
+            if history.is_historized(key):
+                hist_null_keys.add(key)
         else:
             # Resolve raw -> label (raw discarded) or store as-is.
             if sig.resolver:
@@ -566,6 +668,8 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
                 tz_seen = resolved.get("timezone") or tz_seen
             if history.is_historized(key) and isinstance(resolved, dict):
                 hist_obs[key] = dict(resolved)
+                if key in health_measurement.MEASUREMENT_GROUPS and isinstance(value, Mapping):
+                    hist_raw[key] = value
         input_fields[input_name] = fields
 
     # Atomic ts-guarded write under a row lock: a field is persisted only if its
@@ -590,18 +694,56 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
     # Only for signals that actually wrote a field this report (skips stale/older).
     # Best-effort: history is Tier 2 and must NEVER break Tier 1 state ingest, so
     # the whole block is guarded (also tolerates stores without the daily helper).
-    if hist_obs and hasattr(store, "merge_perception_daily"):
+    if (hist_obs or hist_null_keys) and hasattr(store, "merge_perception_daily"):
         try:
-            local_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
-            for sig_key, obs in hist_obs.items():
+            fallback_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
+            for sig_key in (set(hist_obs) | hist_null_keys):
                 outs = catalog.SIGNALS[sig_key].outputs if sig_key in catalog.SIGNALS else ()
                 if not any(f in written for f in outs):
                     continue
-                store.merge_perception_daily(
-                    user_id, local_date, sig_key,
-                    lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
-                    now,
+                obs = hist_obs.get(sig_key)
+                groups = health_measurement.MEASUREMENT_GROUPS.get(sig_key)
+                raw = hist_raw.get(sig_key)
+                metas = (
+                    health_measurement.extract_group_metadata(sig_key, raw)
+                    if (groups and raw is not None) else []
                 )
+                measurement_aware = any(m.is_measurement_aware for m in metas)
+
+                if not groups or not measurement_aware:
+                    # Legacy path — byte-identical to pre-batch2 behavior. A
+                    # null observation (hist_null_keys only) is intentionally
+                    # skipped here: NO_OBSERVATION/UNAVAILABLE bookkeeping is
+                    # scoped to measurement-aware signals for now (see
+                    # docs/NOTES-measured-at-ingest.md, "known limitations").
+                    if obs is None:
+                        continue
+                    store.merge_perception_daily(
+                        user_id, fallback_date, sig_key,
+                        lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
+                        now,
+                    )
+                    continue
+
+                # Measurement-aware: per-group date attribution + dedup +
+                # observed-state, one merge_perception_daily call per distinct
+                # attributed date (a report can legitimately span more than
+                # one day's rollup, e.g. one group backfilled, one live).
+                meta_by_group = {m.group.name: m for m in metas}
+                for group in groups:
+                    meta = meta_by_group.get(group.name) or health_measurement.GroupMeta(group)
+                    target_date = health_measurement.attributed_date(meta, fallback=fallback_date)
+                    field_values = {f: (obs or {}).get(f) for f in group.fields}
+                    key_for_group = health_measurement.identity_key(sig_key, meta)
+                    store.merge_perception_daily(
+                        user_id, target_date, sig_key,
+                        lambda prev, _s=sig_key, _g=group, _fv=field_values, _k=key_for_group, _t=now:
+                            health_measurement.apply_group_update(
+                                prev, signal=_s, group=_g, field_values=_fv,
+                                identity_key=_k, ts=_t,
+                            ),
+                        now,
+                    )
         except Exception as e:
             log.warning("perception_daily history rollup failed (non-fatal): %s", e)
 
@@ -649,7 +791,9 @@ def _app_proactive_settings(user_id: str) -> dict:
     user_state). Lazy import like _fire_wake; failures mean "no block" so a
     broken app layer can't silently kill perception observability."""
     from core import store as core_store  # lazy; assembly loads core first
-    return core_store.get_store(user_id).load_proactive_settings()
+    return core_store.get_store_shell_only(
+        user_id, reason="proactive settings are a direct blob read"
+    ).load_proactive_settings()
 
 
 def _wake_block_reason(user_id: str) -> str:
@@ -717,7 +861,9 @@ def _settings_v2_for_user(user_id: str):
 
 def _proactive_activation_ready(user_id: str) -> bool:
     from core import store as core_store  # lazy
-    return core_store.get_store(user_id).proactive_activation_ready()
+    return core_store.get_store_shell_only(
+        user_id, reason="activation readiness uses direct DB/blob helpers"
+    ).proactive_activation_ready()
 
 
 _LEGACY_WAKE_TRIGGER_BY_CAPABILITY = {
@@ -759,14 +905,39 @@ def _legacy_wake_control_decision(user_id: str, cap_key: str, new_value=None):
     )
 
 
-def _submit_wake_event_v2_compat(event) -> None:
+def _perceptkit_owns_wakes() -> bool:
+    """kit 是不是接管了唤醒投递。
+
+    读不出来时返回 False（= 老路照投）。「开关读不出来」几乎一定是配置问题，
+    那时候维持切换前的行为最不意外 —— 而且少叫一次用户不会知道，
+    多叫一次他会。
+    """
+    try:
+        from .perceptkit_adapter import shadow
+        return shadow.wakes_enabled()
+    except Exception:                              # noqa: BLE001
+        return False
+
+
+def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
     """Compatibility output: V2 differ event -> old proactive job queue.
 
     The wake has already been mechanically selected by PerceptionDifferV2. This
     function only applies the V2 switch gate and writes a legacy job so the
     existing hosted/resident consumers can pick it up during the strangler
     migration.
+
+    🔴 **两条路不能同时投递。** kit 接管唤醒之后，老路的 differ 仍然照常算
+    （它的结论要留着对照），但**不再落地成打扰** —— 否则同一次「回到家」会
+    排两条 job，用户被提醒两遍。kit 走 ``from_kit=True`` 直接放行。
+
+    挡在这里而不是挡在 differ：差异要继续算、继续记，只是不投递。
     """
+    if not from_kit and _perceptkit_owns_wakes():
+        log.info("perceptkit owns wakes; live trigger=%s not delivered",
+                 getattr(event, "trigger", "?"))
+        return False
+
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
 
     settings = _settings_v2_for_user(event.user_id)
@@ -788,7 +959,7 @@ def _submit_wake_event_v2_compat(event) -> None:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return
+        return False
     if not decision.accepted:
         store.append_event(event.user_id, {
             "cap": "runtime_v2",
@@ -800,7 +971,7 @@ def _submit_wake_event_v2_compat(event) -> None:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return
+        return False
     wake_capability = _RUNTIME_V2_WAKE_CAPABILITY_BY_TRIGGER.get(
         str(event.trigger or "").strip().lower(), ""
     )
@@ -828,7 +999,7 @@ def _submit_wake_event_v2_compat(event) -> None:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return
+        return False
     store.append_event(event.user_id, {
         "cap": "runtime_v2",
         "type": "wake",
@@ -842,6 +1013,7 @@ def _submit_wake_event_v2_compat(event) -> None:
         "ts": now,
     }, now)
     _fire_wake_event_v2(event)
+    return True
 
 
 def _fire_wake_event_v2(event) -> None:
@@ -855,7 +1027,9 @@ def _fire_wake_event_v2(event) -> None:
         from hosted import config_store as hosted_config_store  # lazy
         from model_api_runtime.v2 import jobs_store  # lazy
         from proactive import service as proactive_service  # lazy
-        s = core_store.get_store(event.user_id)
+        s = core_store.get_store_shell_only(
+            event.user_id, reason="V2 perception enqueue uses durable helpers"
+        )
         if not event.manual and not s.proactive_activation_ready():
             return
         # Strict fence before selecting the queue. A failed control-plane read
@@ -1015,7 +1189,9 @@ def _fire_wake(
         from core import store as core_store  # lazy
         from core import util as core_util  # lazy
         from proactive import service as proactive_service  # lazy
-        s = core_store.get_store(user_id)
+        s = core_store.get_store_shell_only(
+            user_id, reason="legacy perception enqueue is a cold-safe write"
+        )
         if not s.proactive_activation_ready():
             return
         job = {
@@ -1075,26 +1251,95 @@ def stable_context_locale(user_id: str) -> str | None:
     return None
 
 
-def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
-    now = now or _now()
-    state = store.get_state(user_id)
-    snap: dict = {}
+#: kit 当主、老路当参照。**默认开**，出问题设成 0 立刻回到老路 ——
+#: 它是回滚闸，不是等人来开的门。关掉之后行为和切换之前逐字节一致。
+PERCEPTKIT_PRIMARY_FLAG = "FEEDLING_PERCEPTKIT_PRIMARY"
+
+
+def _perceptkit_primary() -> bool:
+    return (os.environ.get(PERCEPTKIT_PRIMARY_FLAG, "1") or "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _wanted_snapshot_fields(*, include_query_tools: bool) -> dict[str, float]:
+    """这次快照该出现哪些字段，各自的过期秒数是多少。
+
+    过期判据仍然按**老路的目录**算。切换要换的是数据来源，不是「什么算过期」;
+    两件事一起改，出了问题分不清是谁的。
+    """
+    wanted: dict[str, float] = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
         if not cap or not (cap.context_field or (include_query_tools and cap.query_tool)):
             continue
         for f in sig.outputs:
-            if f == "user_state":
-                continue
-            cell = state.get(f)
-            if not isinstance(cell, dict):
-                snap[f] = None
-                continue
-            if f not in _STABLE_CONTEXT_FIELDS and (now - float(cell.get("ts") or 0)) > sig.ttl_sec:
-                snap[f] = None  # stale -> agent treats as "don't infer"
-            else:
-                snap[f] = cell.get("v")  # null cell -> None (= no permission now)
+            if f != "user_state":
+                wanted[f] = sig.ttl_sec
+    return wanted
+
+
+def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
+    now = now or _now()
+    state = store.get_state(user_id)
+    wanted = _wanted_snapshot_fields(include_query_tools=include_query_tools)
+
+    if _perceptkit_primary():
+        merged = _perceptkit_snapshot(user_id, state, wanted=wanted, now=now)
+        if merged is not None:
+            return merged
+
+    snap: dict = {}
+    for field, ttl in wanted.items():
+        cell = state.get(field)
+        if not isinstance(cell, dict):
+            snap[field] = None
+            continue
+        if field not in _STABLE_CONTEXT_FIELDS and (now - float(cell.get("ts") or 0)) > ttl:
+            snap[field] = None  # stale -> agent treats as "don't infer"
+        else:
+            snap[field] = cell.get("v")  # null cell -> None (= no permission now)
     return snap
+
+
+def _perceptkit_snapshot(user_id: str, state: dict, *, wanted: dict, now: float):
+    """用 kit 的结果拼这份快照；kit 供不上的字段仍从 ``state`` 读。
+
+    返回 None = 这次没用上 kit，调用方走原来的老路。**任何异常都返回 None** ——
+    读感知快照是每次唤醒、每次对话都要走的路，为了一个数据来源的切换让它
+    报错，是自己给自己制造事故。
+    """
+    try:
+        # 测试会把 `store` 换成内存假实现来隔离。那时候去读真库，等于让一个
+        # 自以为完全隔离的测试**读到上一次跑留下的行** —— 而且时好时坏。
+        # 数据来源要跟着 store 一起被替换掉，否则这层就是个隔离漏洞。
+        if getattr(store, "__name__", "") != "perception.store":
+            return None
+
+        import db
+
+        from .perceptkit_adapter import compare, readback
+
+        signals = sorted(compare.COMPARABLE)
+        with db.get_pool().connection() as conn:
+            conn.autocommit = True
+            from .perceptkit_adapter.storage import PostgresStorage
+            current = PostgresStorage(conn).get_current(
+                subject_id=user_id, signals=signals)
+        snap, sources, conflicts = readback.merged_snapshot(
+            state, current, wanted=wanted, now=now,
+            stable_fields=_STABLE_CONTEXT_FIELDS,
+        )
+        summary = readback.summarize(sources, conflicts)
+        # 冲突逐条打出来（带字段名和两个值）。只报数量的日志等于说
+        # 「有问题」然后不说是什么。
+        if conflicts:
+            _log.warning("perceptkit primary: %s", summary)
+        else:
+            _log.info("perceptkit primary: %s", summary)
+        return snap
+    except Exception as exc:                       # noqa: BLE001 -- deliberate
+        _log.warning("perceptkit primary fell back to the live path: %s", exc)
+        return None
 
 
 def _merged_app_events(
@@ -1296,14 +1541,12 @@ def photo_evaluate(user_id: str, metadata: dict,
                    content_envelope: dict | None = None,
                    exif_gps: dict | None = None,
                    meta_envelope: dict | None = None) -> tuple[dict, int]:
-    """Single-step photo ingest: evaluate metadata AND (if usable) store the
-    encrypted image in one call.
+    """Single-step photo ingest: evaluate metadata and store the image envelope.
 
-    V2 does not hard-block sensitive scene hints. The ciphertext goes into the
-    screen-frame envelope channel (reuses the enclave's existing frame-decrypt
-    path); the backend never sees plaintext. frame_id == photo_id ==
-    content_envelope.id. Optional meta_envelope is stored encrypted and returned
-    only on the single-photo content read path.
+    V2 does not hard-block sensitive scene hints. Sealed and plaintext-binary
+    bodies share the screen-frame channel and its shape-aware read path.
+    frame_id == photo_id == content_envelope.id. Optional meta_envelope is stored
+    and returned only on the single-photo content read path.
     """
     now = _now()
     metadata = metadata or {}
@@ -1319,7 +1562,7 @@ def photo_evaluate(user_id: str, metadata: dict,
     if not content_envelope:
         return {"error": "content_envelope_required"}, 400
 
-    # Store ciphertext in the frame channel + metadata as a confirmed item.
+    # Store the visual envelope in the frame channel + metadata as a confirmed item.
     stored = store.put_photo_envelope(user_id, photo_id, now, content_envelope)
     if stored is False:
         # Do not confirm metadata without durable pixels. iOS keeps its cursor
@@ -1358,8 +1601,40 @@ def photo_evaluate(user_id: str, metadata: dict,
             )
     else:
         _maybe_wake(user_id, "photos", catalog.PHOTO_CLUSTER_SEC, "photo_id", None, photo_id, now)
+
+    # PerceptKit. After the pixels are durably stored: a photo whose storage
+    # failed is not a photo the user added.
+    #
+    # The identity is the device's stable one, NOT photo_id. photo_id is the
+    # content envelope's id -- a fresh value per upload, by design, because it
+    # keys one blob of ciphertext. Using it here means the same photo sent
+    # twice arrives as two different photos, and `photo_library_added` keeps
+    # its daily counts forever: the number is wrong permanently, nothing
+    # reports it, and re-running the day cannot repair it because the second
+    # contribution looks exactly as legitimate as the first.
+    #
+    # Falls back to photo_id for clients that do not send one yet. That is the
+    # old behaviour, not a fix -- those clients still double-count on retry.
+    _perceptkit_shadow_call(
+        "observe_photo", user_id, _photo_identity(metadata, photo_id),
+        occurred_at=now)
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
             "sensitive": sensitive, "status": "stored"}, 200
+
+
+def _photo_identity(metadata: dict, fallback: str) -> str:
+    """The device's stable id for this photo, or the envelope id if absent.
+
+    Bounded and type-checked because this endpoint is public: an unbounded
+    string here would go straight into an identity column and a dedupe key.
+    Anything unusable falls back rather than being truncated -- a truncated
+    identity silently merges two different photos into one, which is the same
+    class of wrong as duplicating one, just in the other direction.
+    """
+    raw = metadata.get("source_event_id")
+    if isinstance(raw, str) and 0 < len(raw) <= 128 and raw.strip() == raw:
+        return raw
+    return fallback
 
 
 def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
@@ -1372,9 +1647,9 @@ def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
 
 def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
     """Permission + status gate for one confirmed photo. Returns metadata and the
-    frame_id; the caller decrypts pixels via the enclave's existing
-    /v1/screen/frames/<frame_id>/decrypt path. The backend never holds plaintext
-    pixels — only the enclave decrypts."""
+    frame_id; the caller reads pixels through the shape-aware
+    /v1/screen/frames/<frame_id>/decrypt path. Sealed bodies are decrypted by the
+    enclave; plaintext-binary bodies are validated and decoded locally."""
     now = _now()
     doc = store.item_get(user_id, "photo", photo_id, now=now)
     if not doc or doc.get("status") != "confirmed":
@@ -1493,6 +1768,8 @@ def _record_app_event(user_id: str, app: str, category: str | None,
             "app_state": _cell("foreground", now, None),
         })
         store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
+    _perceptkit_shadow_call("observe_app_event", user_id, app, category,
+                            action="close" if closing else "open", occurred_at=now)
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
 
 

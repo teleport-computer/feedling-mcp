@@ -12,10 +12,180 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Chat now accepts up to nine images in one user turn.** Use the new
+  `images` array for multi-image messages; the existing `image_b64` and
+  `image_mime` single-image fields remain compatible. Empty arrays, mixed old
+  and new image forms, and batches over nine are rejected explicitly instead
+  of being truncated.
+
+- **Plaintext perception photos can now be read through the same authorized
+  photo workflow as encrypted photos.** The frame reader recognizes raw JPEG,
+  PNG, WebP, HEIC, and AVIF plaintext bodies in addition to JSON screen-frame
+  bundles. Plaintext visual bodies never fall through to enclave decryption;
+  malformed stored plaintext now returns `frame_plaintext_invalid`.
+
+- **Canvas viewers can now fetch the current workspace revision instead of
+  remaining pinned to the attachment published in an older Chat message.**
+  `GET /v1/chat/workspace/body` accepts the original `.io.html` `file_name`,
+  resolves it inside the authenticated user's workspace, and returns the
+  current shared envelope. Matching is exact and case-sensitive; invalid paths
+  are rejected, and a missing live entry returns a compatibility-friendly 404
+  so clients can retain the historical message-body fallback.
+
+- **Dedicated image generation now returns an actionable credential-decryption
+  error instead of a generic HTTP 500.** A known saved-envelope or key-decoding
+  failure returns HTTP 409 with `image_generation_key_decrypt_failed`, without
+  marking the provider route unhealthy. Enclave availability failures remain a
+  retryable `image_generation_unavailable` HTTP 503, while unexpected local
+  programming errors remain visible as server failures.
+
+- **Runner fleet health no longer converts brief PostgreSQL latency into a false
+  runner-down result.** After a successful observation, `GET /healthz/runner`
+  can return HTTP 200 with `status: degraded` from the last verified heartbeat
+  snapshot while that heartbeat remains inside the existing freshness window.
+  The snapshot never extends that window: without fresh proof the endpoint
+  still returns HTTP 503, but marks the fleet `unknown` rather than claiming it
+  is down. Failed probes use a bounded retry backoff, and late executor failures
+  are consumed without producing unobserved-Future warnings.
+
+- **Runtime V2 now structurally starts verified provider continuations with the
+  required `<think>` tag on text-only terminal requests.** The omitted prefix is
+  restored before the existing thinking parser runs. A normal provider stop
+  without a closing thinking tag preserves the ordinary reply and existing
+  bounded-correction behavior, while token-limited or stop-unknown fragments
+  remain fail-closed. Capability is gated by provider and model from live
+  request/response evidence; unknown custom endpoints and providers or model
+  generations that reject or ignore assistant continuation keep their previous
+  prompt and bounded-correction behavior.
+  Tool and image rounds are unchanged.
+
+- **A scheduled reminder that cannot be safely resumed after foreground Chat
+  preempts it now reports the existing `platform_execution_timeout` class
+  instead of `unknown`.** Pristine reminders still return to the queue, the
+  failure remains attributed to the system, and the localized scheduled-failure
+  message is unchanged.
+
+- **Chat writes no longer wait for Memory Capture discovery queries.** Resident
+  and Runtime V2 now reconcile the durable Capture frontier on the existing
+  periodic tick, including the turn-count backstop, so Capture can begin up to
+  one scheduler cadence later without delaying message acceptance. Operators
+  can temporarily restore the previous synchronous behavior with
+  `FEEDLING_CAPTURE_APPEND_REFRESH_MODE=sync`; Chat route traces now report the
+  append duration and active refresh mode for rollout comparison.
+
+- **Hosted Runtime V2 now retries a failed file-publication boundary once.** If
+  attaching a requested Canvas or downloadable file fails after `send_file`,
+  Chat asks the model to refresh the workspace source and deliver the exact
+  revision again instead of ending the turn immediately. If that bounded retry
+  also fails, the terminal reply now identifies an incomplete Canvas or file
+  delivery in the user's language instead of showing the generic runtime
+  fallback.
+
+- **Hosted Runtime V2 file-capable Chat now has an independent 32,768-token
+  output budget across OpenAI Responses, OpenAI-compatible, Anthropic, Bedrock,
+  and Gemini providers.** The existing 4,096-token prompt-output reserve and
+  input frontier are unchanged. If a provider explicitly reaches its output
+  limit while returning malformed tool arguments, Runtime V2 stops after that
+  provider call, does not execute or deliver the incomplete file, and reports a
+  localized output-limit error instead of retrying at the same budget.
+
+- Agents running on the pi driver, whether hosted or self-hosted, can now inspect
+  images pulled during a turn by `screen-read --include-image`,
+  `photo-read --include-image`, or `chat-image`. The pi runtime keeps its
+  read-only file tool active so the returned `image_file` becomes a real image
+  attachment; its edit and write tools remain disabled. Images attached to the
+  current message continue to use pi's native image-input path.
+
+- Resident V1 proactive wakes now apply the same private-thinking enablement as
+  foreground Chat while preserving their optional, rather than mandatory,
+  thinking behavior. When used, the entire private block follows the user's
+  language and stays in the agent's own inner voice instead of becoming an
+  assessment of the user or a plan for them.
+
+- Provider responses that report an expired account or plan now use the
+  actionable `provider_account_expired` error class and tell the user to renew
+  or restore service with the provider. Bare HTTP `403` authentication failures
+  are no longer misclassified as transient empty replies; generic credential
+  failures continue to use `auth_invalid`.
+
+- Memory cards no longer expose or honor `is_sensitive`, `sensitivity_class`,
+  `sensitive_scope`, `include_sensitive`, or `user_explicit_selection`.
+  All shared cards are eligible for direct fetch, ambient recall, profile
+  refresh, Dream, and Capture under the same contract. Existing stored labels
+  are ignored; this change does not delete cards or proactively rewrite
+  production rows. A card's retired labels disappear if it is naturally
+  rewritten later.
+
+- **New accounts now start with managed web access enabled.** Registration
+  atomically creates `web_settings` with `enabled: true`. Existing accounts are
+  not migrated: an older account with no settings blob still reads as disabled,
+  and an explicit `enabled: false` is never overwritten by registration retries
+  or import/recovery flows. The independent operator halts continue to override
+  an enabled account before any search or fetch reaches the network.
+
+- **Hosted Runtime V2 can continue reading a large `web_fetch` result without
+  fetching the URL again.** Results now report `total_chars`, `offset`,
+  `returned_chars`, `next_offset`, `has_more`, and `source_truncated`, with up to
+  8,000 serialized characters per page. Calling the same URL with
+  `offset=next_offset` in the same tool-loop attempt reuses a bounded,
+  user-isolated retained page; a continuation cache miss fails explicitly and
+  never hides another outbound request. The stateless Runtime V1 HTTP endpoint
+  returns the first page only. A successful-status DuckDuckGo response that is
+  missing the real results container is now a retryable upstream failure rather
+  than a silent empty result.
+
+- `GET /v1/memory/list` now rejects page sizes outside its documented
+  `1`–`500` range with `400 invalid limit` instead of silently reducing an
+  oversized request to 500. Valid page sizes, cursor pagination, ordering, and
+  the default page size are unchanged. Chat's automatic memory-recall pool now
+  defaults to the full supported 500-card page; its operator setting forwards
+  positive integers unchanged so an unsupported value is rejected explicitly
+  by the same endpoint instead of being silently reduced inside the enclave.
+  Chat history remains best-effort: invalid operator configuration or a rejected
+  page size omits automatic memories for that round and returns a content-free
+  failed `context_memory_log` rather than failing the history request. Candidate
+  processing runs on every non-probe `/v1/chat/history`; in a local stub-decrypt
+  benchmark, increasing an actually full pool from 200 to 500 moved p95 from
+  about 21 ms to 52 ms (excluding TDX crypto, database, and network time).
+
+- Memory Garden synchronization and explicit Chat references no longer depend
+  on a 200-card candidate window. Memory list ordering now uses parsed
+  `occurred_at` with parsed `created_at` as fallback and can continue from a
+  valid cursor after its anchor is archived, superseded, or deleted. Exact
+  fetches report structured truncation counts; a Garden reference may include
+  archived or superseded content, while an unresolved
+  reference gives the model a generic unavailable notice instead of inviting it
+  to guess the missing card.
+
+- Worker-local user state is now metadata-first: obtaining user identity,
+  locks, or Chat waiters no longer eagerly loads Chat, frames, World Books,
+  tokens, push state, and Live Activity state. Paths that need an in-memory
+  projection declare that section explicitly, while history, resident poll,
+  and Hosted Runtime V2 prompt-tail reads continue to use bounded PostgreSQL
+  queries. Cross-worker notifications refresh only projections already loaded
+  in that worker and still wake parked pollers. PostgreSQL authority, public API
+  schemas, encryption, trust boundaries, and deployment topology are unchanged.
+
+- Perception digest trend entries now distinguish fresh readings from stale
+  daily rollups. Fresh entries retain `current`; stale entries retain the trend
+  as `last_known` with a user-local `as_of` time (or an explicitly labeled UTC
+  time when no valid timezone is available). Freshness uses each signal's
+  catalog TTL and applies identically to top-level `changes` and
+  `domains.health.notable`. Real-time perception snapshots are unchanged.
+
 - Runtime V2 Canvas updates now carry the current user request into the compact
   card-delivery step, make one bounded correction when title or subtitle metadata
   is invalid, and report an incomplete card delivery as a Canvas delivery issue
   instead of a model connection failure.
+
+- **Hosted Runtime V2 Chat now receives the same localized reply-language
+  policy as proactive wakes.** The account locale or archive language supplies
+  the default while a clearly different latest user message can still select
+  its own language. Generic degraded replies and catalog-backed terminal errors,
+  including provider credentials, quota, compatibility, context, and timeout
+  failures, now follow the same English or Simplified Chinese default instead
+  of always falling back to Chinese; self-hosted deployments can override the
+  two generic copies separately.
 
 - **Hosted Runtime V2 Chat now makes one bounded correction attempt when a
   final reply omits its self-authored thinking block.** The correction is
@@ -62,16 +232,14 @@ change must not be interpreted as an API guarantee.
   falls back to the system notification sound without a per-account backend
   preference or uploaded audio.
 
-- **Hosted proactive wakes now make an explicit speak-or-sleep choice after an
-  empty model round.** The first round still receives the full wake tool surface.
-  If it ends without visible text or a tool call, including after earlier tool
-  work in the same turn, Runtime V2 spends one attempt from the existing turn
-  budget on only `reply` and `stay_silent` and requires one of them. A selected
-  `stay_silent` completes the wake with its auditable reason; the existing
-  thinking-only silence form remains supported. Providers that cannot enforce
-  the choice, exhausted turns, and invalid forced responses fail through the
-  existing `empty_reply` outcome instead of being accepted as unclassified
-  silence.
+- **Hosted proactive wakes now finish with an explicit speak-or-sleep choice as
+  their normal flow.** Earlier rounds retain the full wake tool surface so the
+  companion can look around before deciding. A spoken result must use `reply`
+  with separate thinking and visible-message fields; quiet company uses
+  `stay_silent` with an auditable reason. Invalid or missing choices fail silently
+  with a dedicated `choice_invalid` outcome, while a genuinely blank provider
+  response remains `empty_reply`; free-form text is never used as a rescue
+  message. Scheduled reminders keep their existing must-deliver flow.
 
 - **Dedicated image observation now has a bounded, exact-main recovery path.**
   Rate limiting, temporary unavailability, an empty observation, or an explicitly

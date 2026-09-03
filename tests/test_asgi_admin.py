@@ -17,11 +17,15 @@ from the query string). Covers:
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
+import inspect
 import itertools
 import json
 import re
 import sys
+import textwrap
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -159,6 +163,68 @@ def test_debug_query_timeout_and_pool_busy_have_distinct_503s(env, monkeypatch):
     assert (status, payload) == (503, {"error": "service_busy"})
 
 
+def test_debug_trace_flag_read_timeout_is_a_503(env, monkeypatch):
+    """The deliberate flag-read fail-closed contract reaches the HTTP route."""
+    registry._users[:] = [
+        {"user_id": "user_a", "principal_id": "p_a"},
+    ]
+    event = {
+        "ts": 100,
+        "user_id": "user_a",
+        "subsystem": "agent",
+        "type": "agent.reply",
+        "actor": "backend",
+        "status": "ok",
+        "summary": "",
+        "explain": "agent.reply",
+        "trace_id": "t-flag-timeout",
+        "turn_id": "t-flag-timeout",
+        "job_id": "",
+        "dur_ms": None,
+        "detail": {},
+        "content_excerpt": {},
+    }
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_events_flat_page",
+        lambda **_kwargs: {
+            "events_total": 1,
+            "turns_total": 1,
+            "stalled_turns": 0,
+            "error_turns": 0,
+            "scan_truncated": False,
+            "users": [{"user_id": "user_a", "events": 1, "last_ts": 100}],
+            "subsystems": ["agent"],
+            "statuses": ["ok"],
+            "rows": [event],
+        },
+    )
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_event_turn_rows",
+        lambda **_kwargs: ([event], False),
+    )
+    calls = []
+
+    def fail_flag_read(_user_ids, _kinds, **kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("trace flag read timed out")
+
+    monkeypatch.setattr(data_track.db, "get_blobs_for_users", fail_flag_read)
+
+    status, payload = _asgi_json(
+        "GET",
+        "/v1/admin/data-track/debug?mode=flat&user_id=user_a",
+        headers=_admin(),
+    )
+
+    assert (status, payload) == (503, {"error": "debug_query_timeout"})
+    assert len(calls) == 1
+    assert calls[0]["raise_on_error"] is True
+    assert calls[0]["connection_timeout"] > 0
+    assert calls[0]["statement_timeout_ms"] > 0
+
+
 def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
     monkeypatch.setattr(admin_asgi, "DEBUG_TRACE_REQUEST_TIMEOUT_SEC", 0.05)
 
@@ -175,6 +241,71 @@ def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
 
     assert (status, payload) == (503, {"error": "debug_query_timeout"})
     assert elapsed < 1.0
+
+
+def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
+    handlers = (
+        admin_asgi.data_track_summary,
+        admin_asgi.data_track_users,
+        admin_asgi.data_track_dau,
+        admin_asgi.data_track_events,
+        admin_asgi.data_track_growth,
+        admin_asgi.data_track_verdicts,
+        admin_asgi.data_track_user,
+        admin_asgi.data_track_page,
+        admin_asgi.data_track_user_lookup,
+        admin_asgi.data_track_user_page,
+    )
+
+    assert admin_asgi.DATA_TRACK_REQUEST_TIMEOUT_SEC == (
+        db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+    )
+    for handler in handlers:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        bounded_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "_run_data_track_db"
+        ]
+        raw_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "threadpool"
+            and node.func.attr == "run_db"
+        ]
+        assert len(bounded_calls) == 1, handler.__name__
+        assert raw_calls == [], handler.__name__
+
+
+def test_t428_data_track_deadline_returns_503_without_waiting_for_db(
+    env, monkeypatch
+):
+    release = threading.Event()
+    safety_release = threading.Timer(1.0, release.set)
+
+    def slow_summary(_query):
+        release.wait(1.0)
+        return {"too_late": True}
+
+    monkeypatch.setattr(admin_asgi, "DATA_TRACK_REQUEST_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(admin_asgi.admin_core, "summary_payload", slow_summary)
+    safety_release.start()
+    started = time.monotonic()
+    try:
+        status, payload = _asgi_json(
+            "GET", "/v1/admin/data-track/summary", headers=_admin()
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        safety_release.cancel()
+
+    assert (status, payload) == (503, {"error": "data_track_query_timeout"})
+    assert elapsed < 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +400,7 @@ def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
             "original_chars": len(raw_content),
             "truncated_chars": len(raw_content) - 5000,
         },
+        db.TRACE_OUTCOME_PROVENANCE_FIELD: "missing",
     }
     assert secret not in json.dumps(payload, ensure_ascii=False)
 
@@ -687,6 +819,7 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
         "lane": "dream",
         "status": "failed",
         "failure_code": "upstream_unavailable",
+        "failure_code_provenance": "explicit",
         "duration_ms": 289000,
         "provider": "openai",
         "model": "gpt-5.5",
@@ -702,6 +835,7 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
     assert status == 200
     assert second["pagination"]["has_more"] is False
     assert second["jobs"][0]["failure_code"] == "runtime_failed"
+    assert second["jobs"][0]["failure_code_provenance"] == "normalized_invalid"
     assert second["jobs"][0]["duration_ms"] == 25000
     rendered = json.dumps([first, second])
     for forbidden in ("prompt", "reply", "content", "body", "NEVER RETURN"):
@@ -746,6 +880,7 @@ def test_metadata_projection_rejects_unexpected_content_fields():
             "user_id": "usr_safe",
             "status": "failed",
             "failure_code": "no_json_object",
+            "failure_code_provenance": "explicit",
             "duration_ms": 42,
             "provider": "openai",
             "model": "gpt-5.5",
@@ -756,6 +891,64 @@ def test_metadata_projection_rejects_unexpected_content_fields():
     assert set(card) == memory_metadata.CARD_FIELDS
     assert set(job) == memory_metadata.DREAM_JOB_FIELDS
     assert "SECRET" not in json.dumps([card, job])
+
+    unmeasured_job = memory_metadata.dream_job_metadata_from_row(
+        {
+            "job_id": 8,
+            "user_id": "usr_safe",
+            "status": "failed",
+            "failure_code": "runtime_failed",
+            "duration_ms": 1,
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "memory_card_count_now": 0,
+        }
+    )
+    assert unmeasured_job["failure_code_provenance"] == "unmeasured"
+
+
+def test_admin_failure_code_fallback_has_provenance_without_new_public_code(
+    env,
+    caplog,
+):
+    uid, _key = _register()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,last_error,created_at,finished_at) VALUES "
+            "(%s,'dream','failed','runtime_failed',now()-interval '2 seconds',now()),"
+            "(%s,'dream','failed','PRIVATE FREE TEXT',now()-interval '1 second',now())",
+            (uid, uid),
+        )
+
+    status, body = _asgi_json(
+        "GET",
+        f"/v1/admin/memory-dream-jobs?user_id={uid}&status=failed&limit=10",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert {
+        (job["failure_code"], job["failure_code_provenance"])
+        for job in body["jobs"]
+    } == {
+        ("runtime_failed", "explicit"),
+        ("runtime_failed", "normalized_invalid"),
+    }
+    assert "PRIVATE FREE TEXT" not in json.dumps(body)
+
+    with caplog.at_level("WARNING", logger=memory_metadata.log.name):
+        assert memory_metadata._safe_failure_code("PRIVATE FREE TEXT") == (
+            "runtime_failed"
+        )
+    assert "field=admin_failure_code fallback=runtime_failed" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=memory_metadata.log.name):
+        assert memory_metadata._safe_failure_code("runtime_failed") == (
+            "runtime_failed"
+        )
+    assert "field=admin_failure_code" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #

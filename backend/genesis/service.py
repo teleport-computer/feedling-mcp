@@ -12,8 +12,11 @@ from datetime import datetime, date
 from typing import Any
 
 import httpx
+import psycopg
+from psycopg_pool import PoolClosed, PoolTimeout, TooManyRequests
 
 import db
+import distillation_ledger
 
 log = logging.getLogger(__name__)
 from bootstrap import gates as boot_gates
@@ -40,6 +43,10 @@ GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
 GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
 GENESIS_PROFILE_REF = f"user_blob:{v2_profile_store.PROFILE_BLOB_KIND}"
+_STAGED_DB_WRITE_ATTEMPTS = 3
+_STAGED_DB_RETRY_BACKOFF_SEC = 0.1
+_STAGED_DB_ERROR_DETAIL_MAX = 240
+_STAGED_DB_NON_RETRYABLE_ERRORS = (PoolClosed, PoolTimeout, TooManyRequests)
 PERSONA_SOURCE_PRIORITY = {
     "ai_persona": 100,
     "merged": 100,
@@ -554,6 +561,54 @@ def _staged_blob_kind(staged_id: str) -> str:
     return f"{GENESIS_STAGED_BLOB_PREFIX}{safe_staged_id}"
 
 
+def _staged_db_error_detail(exc: BaseException) -> str:
+    """Keep a bounded connection diagnostic without credentials or newlines."""
+    detail = " ".join(str(exc or "").split())
+    detail = re.sub(
+        r"(?i)\b(password|pass|token|api[_-]?key|secret)\s*[:=]\s*[^\s,;]+",
+        r"\1=<redacted>",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(postgres(?:ql)?://)[^@\s]+@",
+        r"\1<redacted>@",
+        detail,
+    )
+    return (detail or type(exc).__name__)[:_STAGED_DB_ERROR_DETAIL_MAX]
+
+
+def _write_genesis_staged_blob(user_id: str, kind: str, doc: dict) -> None:
+    """Retry a connection-level staged-payload write on a fresh pool checkout.
+
+    Large plaintext estimates produce a correspondingly large encrypted JSONB
+    document.  A broken PostgreSQL connection may fail while sending it, or after
+    the server committed but before the client received the acknowledgement.
+    Replaying this exact ``INSERT .. ON CONFLICT DO UPDATE`` document is idempotent,
+    so a small connection-only retry closes both cases without retrying validation,
+    envelope construction, or any provider work.
+    """
+    for attempt in range(1, _STAGED_DB_WRITE_ATTEMPTS + 1):
+        try:
+            db.set_blob_strict_mirrored(user_id, kind, doc)
+            return
+        except _STAGED_DB_NON_RETRYABLE_ERRORS:
+            # Pool lifecycle/capacity failures already include the pool's own
+            # checkout timeout. Repeating them here would turn one saturated
+            # 10-second wait into three and hold the request worker even longer.
+            raise
+        except psycopg.OperationalError as exc:
+            log.warning(
+                "genesis staged payload DB write failed attempt=%d/%d "
+                "code=operational_error detail=%s",
+                attempt,
+                _STAGED_DB_WRITE_ATTEMPTS,
+                _staged_db_error_detail(exc),
+            )
+            if attempt >= _STAGED_DB_WRITE_ATTEMPTS:
+                raise
+            time.sleep(_STAGED_DB_RETRY_BACKOFF_SEC * attempt)
+
+
 def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: int) -> str:
     if not isinstance(payload, dict):
         raise ValueError("json_object_required")
@@ -569,7 +624,7 @@ def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: i
         store, raw, item_id=f"genesis_staged_{staged_id}")
     if envelope is None:
         raise RuntimeError(f"genesis_staged_envelope_failed:{err}")
-    db.set_blob_strict_mirrored(store.user_id, _staged_blob_kind(staged_id), {
+    _write_genesis_staged_blob(store.user_id, _staged_blob_kind(staged_id), {
         "v": 1,
         "staged_id": staged_id,
         "content_envelope": envelope,
@@ -1291,12 +1346,12 @@ def _identity_payload_from_output(output: dict) -> dict | None:
     user_name = sanitize_user_name(identity.get("user_preferred_name"))
     if user_name != "TA":
         payload["user_preferred_name"] = user_name
-    # B2: the 4 remaining user-layer fields (D1) — GROUNDED, so absence/empty in
+    # B2: the 3 remaining user-layer fields (D1) — GROUNDED, so absence/empty in
     # `identity` (the distiller's own output) just means no signal, never invented
     # here. Same 1200/240 cap convention as the rest of this module (relationship_anchor/
     # tone_style/custom_persona_prompt get the long-text cap).
-    for key in ("custom_persona_prompt", "language_preference", "relationship_anchor"):
-        value = _text(identity.get(key), 1200 if key in {"relationship_anchor", "custom_persona_prompt"} else 240)
+    for key in ("custom_persona_prompt", "relationship_anchor"):
+        value = _text(identity.get(key), 1200)
         if value:
             payload[key] = value
     stable_defs = identity.get("stable_definitions")
@@ -1307,7 +1362,7 @@ def _identity_payload_from_output(output: dict) -> dict | None:
             payload["stable_definitions"] = clean_defs
     has_user_layer_signal = bool(
         payload.get("user_preferred_name") or payload.get("custom_persona_prompt")
-        or payload.get("language_preference") or payload.get("relationship_anchor")
+        or payload.get("relationship_anchor")
         or payload.get("stable_definitions")
     )
     if not payload["agent_name"] and not payload["dimensions"] and not has_user_layer_signal:
@@ -1350,7 +1405,7 @@ def _identity_replace_payload_has_content(payload: dict) -> bool:
     """True iff `payload` carries ANY writable profile signal — dimensions, or
     any card_policy PROFILE_FIELDS entry (agent_name/self_introduction/category/
     signature, but ALSO tone_style/agent_role/custom_persona_prompt/
-    language_preference/relationship_anchor/do_not_say/boundaries/
+    relationship_anchor/do_not_say/boundaries/
     stable_definitions/user_preferred_name).
 
     Reuses identity_service._IDENTITY_PROFILE_FIELDS (== card_policy.PROFILE_FIELDS)
@@ -1502,12 +1557,12 @@ def init_identity_if_absent(
     merged_payload["dimensions"] = payload["dimensions"]
     if payload.get("category"):
         merged_payload["category"] = payload["category"]
-    # B2: thread the 5 user-layer fields the distiller may have derived (GROUNDED —
+    # B2: thread the 4 user-layer fields the distiller may have derived (GROUNDED —
     # `payload` only carries a key here when `_identity_payload_from_output` found
     # explicit material signal for it). Previously `user_preferred_name` was already
     # computed above but silently dropped here — this fixes that alongside adding
-    # the other 4.
-    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+    # the other 3.
+    for key in ("user_preferred_name", "custom_persona_prompt",
                 "relationship_anchor", "stable_definitions"):
         if payload.get(key):
             merged_payload[key] = payload[key]
@@ -1875,10 +1930,12 @@ def replace_identity_preserving_anchor(
         return "identity_write_conflict"
 
 
-def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
+def _write_persona_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str, str]:
     content, prompt_version = _persona_content_from_output(output)
     if not content:
-        return "", ""
+        return "", "", "not_provided"
     digest = _sha256_hex(content.encode("utf-8"))
     source_family = _persona_source_family_from_output(output)
     source_kind = _text(output.get("source_kind"), 80)
@@ -1890,7 +1947,11 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
         except Exception:
             existing_priority = 0
         if existing_priority > new_priority:
-            return GENESIS_PERSONA_REF, str(existing.get("sha256") or "")
+            return (
+                GENESIS_PERSONA_REF,
+                str(existing.get("sha256") or ""),
+                "preserved",
+            )
     now = _now_iso()
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
@@ -1913,13 +1974,27 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
         "created_at": now,
         "updated_at": now,
     })
-    return GENESIS_PERSONA_REF, digest
+    return GENESIS_PERSONA_REF, digest, "written"
 
 
-def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
+def write_persona_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str]:
+    """Persist persona and classify the outcome at its producer boundary."""
+    with distillation_ledger.ArtifactAttempt(
+        store, job_id, "persona"
+    ) as attempt:
+        ref, digest, outcome = _write_persona_artifact(store, job_id, output)
+        attempt.finish(outcome)
+    return ref, digest
+
+
+def _write_voice_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str, str]:
     voice_doc = _safe_voice_workset(output)
     if not voice_doc:
-        return "", ""
+        return "", "", "not_provided"
     raw = json.dumps(voice_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = _sha256_hex(raw)
     now = _now_iso()
@@ -1946,7 +2021,17 @@ def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[s
         "created_at": now,
         "updated_at": now,
     })
-    return GENESIS_VOICE_REF, digest
+    return GENESIS_VOICE_REF, digest, "written"
+
+
+def write_voice_artifact(
+    store: UserStore, job_id: str, output: dict,
+) -> tuple[str, str]:
+    """Persist voice and classify the outcome at its producer boundary."""
+    with distillation_ledger.ArtifactAttempt(store, job_id, "voice") as attempt:
+        ref, digest, outcome = _write_voice_artifact(store, job_id, output)
+        attempt.finish(outcome)
+    return ref, digest
 
 
 def render_genesis_profile_source(output: dict) -> tuple[str, int, bool]:
@@ -2004,7 +2089,7 @@ def _profile_output_from_reducer(output: dict) -> dict:
     }
 
 
-def write_profile_artifact(
+def _write_profile_artifact(
     store: UserStore,
     job_id: str,
     output: dict,
@@ -2065,6 +2150,27 @@ def write_profile_artifact(
     return GENESIS_PROFILE_REF, digest, result.status
 
 
+def write_profile_artifact(
+    store: UserStore,
+    job_id: str,
+    output: dict,
+    api_key: str | None,
+    *,
+    runtime_token: str = "",
+) -> tuple[str, str, str]:
+    """Persist profile and preserve the CAS producer's exact outcome."""
+    with distillation_ledger.ArtifactAttempt(store, job_id, "profile") as attempt:
+        ref, digest, outcome = _write_profile_artifact(
+            store,
+            job_id,
+            output,
+            api_key,
+            runtime_token=runtime_token,
+        )
+        attempt.finish(outcome or "not_provided")
+    return ref, digest, outcome
+
+
 def apply_reducer_output(
     store: UserStore,
     api_key: str | None,
@@ -2088,7 +2194,6 @@ def apply_reducer_output(
     # run (notices emitted with dedupe_key="genesis:{job_id}:partial" also
     # match the "genesis:" prefix used here).
     notices.resolve(store, "genesis:")
-    memory_count, memory_results = apply_memory_outputs(store, api_key, output)
     # apply_memory_outputs has no job_id in its signature (many other call sites
     # depend on its (count, results) 2-tuple return, incl. direct unpack in
     # tests/test_genesis_service.py — widening it would ripple through those).
@@ -2100,14 +2205,23 @@ def apply_reducer_output(
     if raw_items is None:
         raw_items = output.get("facts")
     raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    dropped = raw_count - memory_count
+    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as memory_attempt:
+        memory_count, memory_results = apply_memory_outputs(store, api_key, output)
+        dropped = raw_count - memory_count
+        memory_attempt.finish(
+            "not_provided" if raw_count == 0
+            else "partial" if dropped > 0
+            else "written"
+        )
     if dropped > 0:
         notices.emit(store, source="genesis", error_class="genesis_partial",
                      blame="system", severity="warning",
                      user_text=catalog.user_text_for("genesis_partial"),
                      detail=f"dropped {dropped} card(s)",
                      dedupe_key=f"genesis:{job_id}:partial")
-    identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
+    with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as identity_attempt:
+        identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
+        identity_attempt.finish(identity_status)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
     voice_ref, voice_sha = write_voice_artifact(store, job_id, output)
     profile_ref, profile_sha, profile_status = write_profile_artifact(

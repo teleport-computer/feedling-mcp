@@ -23,6 +23,17 @@ doing more work.
 
 Correctness-sensitive reads do not depend on cache freshness. Verify uses exact ping/reply lookups, resident poll selects bounded durable unanswered candidates before its atomic claim, and Runtime V2 freezes prompt membership by sequence. Chat envelopes remain opaque to this synchronization layer, and telemetry contains no message documents, ciphertext, keys, or connection strings.
 
+Worker-local per-user state is metadata-first. Creating a user Store allocates
+identity, locks, section state, and waiters without reading PostgreSQL; a caller
+that truly needs an in-memory Chat, frame, World Book, token, push, or Live
+Activity projection explicitly loads only that section. History pagination,
+resident poll, and Runtime V2 prompt-tail reads continue to use bounded durable
+queries, so obtaining a waiter or user-scoped lock does not fetch a Chat hot
+snapshot. Notifications mark or refresh only sections already loaded in that
+worker, while still waking parked pollers. This changes query timing and worker
+cache shape only: PostgreSQL authority, API behavior, encryption, isolation,
+trust boundaries, and deployment topology are unchanged.
+
 Feedling separates ciphertext persistence from authorized decryption and agent
 execution. Managed production uses a main confidential VM for the public API and
 trusted-decrypt service, separate confidential-VM capacity for hosted agents,
@@ -811,6 +822,17 @@ read, Hosted Runtime V2 removes web and `task` for the remainder of the turn
 while user-configured MCP remains available, including mutations. Numeric
 health snapshot/trend reads remain compatible with outbound work.
 
+Managed web access also has two independent account/control layers. Accounts
+created after the default-on rollout receive an explicit `web_settings` blob;
+older accounts with no blob remain disabled, and saved explicit choices are not
+rewritten. Per-tool operator halts are evaluated after the account choice and
+still fail closed before outbound I/O. Within Hosted Runtime V2, a large
+`web_fetch` document may be retained only for one chat, wake, or child tool-loop
+attempt so `offset` continuations do not repeat the request. That cache is never
+global or cross-user, has both URL-count and retained-character ceilings, and is
+discarded before any job retry. A continuation miss fails visibly rather than
+performing a hidden refetch.
+
 ### Runtime V2 prompt caching
 
 Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills` are
@@ -881,24 +903,34 @@ an external package (`memgarden`, Apache-2.0, source at
 `github.com/teleport-computer/memgarden`). It is not vendored into this
 repository.
 
-It is installed at image build time from a versioned GitHub Release wheel pinned
-by sha256 in `backend/requirements.lock`, alongside its only non-stdlib
-dependency (`agent-protocol-core`). The installed bytes therefore end up inside
-the measured image like any other dependency, and the compose hash published
-on-chain covers them.
+Managed images install it at build time from a versioned GitHub Release wheel
+pinned by sha256 in `backend/requirements.lock`, alongside its only non-stdlib
+dependency (`agent-protocol-core`). The hash-locked build constrains the wheel
+bytes accepted as image input. The separately published on-chain compose hash
+binds the deployment YAML and its image tag/configuration; because the manifest
+does not pin an image digest, that compose hash does not by itself attest the
+image bytes or the wheel bytes inside them.
 
 What the hash pin does and does not establish:
 
 | | |
 | --- | --- |
 | Guaranteed | The wheel installed in a build is byte-identical to the reviewed artifact. Replacing the Release asset under the same URL fails the build rather than silently swapping the package. |
-| Not guaranteed | That those bytes were produced from the source at the public tag. The tag is not signed and there is no build provenance attestation yet, so a repository administrator could publish a wheel that does not match the tagged source. |
+| Best-effort evidence, not a hard gate | CI downloads both locked wheels and asks GitHub to verify their artifact attestations against the `teleport-computer/memgarden` repository. The check is deliberately `continue-on-error`, so a missing credential or attestation-service outage remains visible in the job summary but does not block a release. Deployment therefore must not claim provenance as an unconditional guarantee. |
 
 Two operational consequences follow. A cold build now requires egress to
 `github.com` and `release-assets.githubusercontent.com`; if the Release asset is
 deleted, builds fail loudly rather than falling back. And upgrading the kernel is
 a deliberate, reviewable change: a new Release, a new URL and hash in the lock,
 and a normal pull request.
+
+The user-VPS resident self-updater is a different supply chain: it follows
+`backend/requirements.txt` from the checked-out release and runs ordinary
+`pip -r` before re-exec. It does not enforce the managed image's
+`requirements.lock` hashes, and an install failure is currently non-fatal to
+the re-exec path. Requirements changes must therefore remain compatible with
+checkout/re-exec on existing VPS installations; managed-image hash and compose
+evidence must not be presented as a VPS guarantee.
 
 The kernel is pure judgment: no network, no database, no filesystem, and no
 access to plaintext beyond the strings the host passes in. Encryption, key
@@ -966,7 +998,18 @@ per-backend-worker executor with two worker threads and a four-call outstanding
 admission cap, separate from ordinary ASGI blocking work. Connection acquisition
 and health SQL each have a one-second bound, and the route has a three-second
 deadline, so business-thread saturation cannot leave the runner probe queued
-until an external monitor times out.
+until an external monitor times out. Each worker retains only the public fields
+from its latest successful heartbeat observation. If a later database probe
+times out or fails while that snapshot still proves the expected fleet is within
+the existing heartbeat freshness window, the route returns HTTP 200 with
+top-level `status: degraded` and `checks.runner_fleet.source: cached` with the
+current `checks.runner_fleet.probe_reason`.
+The snapshot is re-evaluated against the current clock on every fallback, so it
+cannot extend the runner's freshness window. Once no still-fresh proof exists,
+the route returns HTTP 503 with runner status `unknown`; only a successful
+database observation that proves count or freshness drift reports the runner as
+`down`. A per-worker 15-second failure backoff prevents repeated monitor traffic
+from filling the isolated executor with duplicate database probes.
 
 `/healthz` still does not, by itself, complete an enclave decrypt, verify a live
 runner, call a model provider, test object storage, start the screen WebSocket,

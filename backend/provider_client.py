@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -63,10 +63,16 @@ _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
 _MAX_PG_BIGINT = (1 << 63) - 1
-# The chat wires cap max_tokens at 8192 when they encode the payload; image
-# bytes are billed against that same completion budget, so image requests ask
-# for the ceiling rather than a text-sized slice.
-IMAGE_OUTPUT_MAX_TOKENS = 8192
+# One provider-neutral ceiling for every chat payload builder. File-capable V2
+# turns may place a complete generated document inside tool-call arguments, so
+# the historical 8192-token wire clamp truncated otherwise valid calls before
+# the runtime could validate or save them. Keep the provider encoders on one
+# constant: a per-wire literal lets one relay appear fixed while other wires
+# silently retain the old limit.
+CHAT_OUTPUT_MAX_TOKENS = 32768
+# Generated image bytes are billed against the same completion budget. Ask for
+# the live chat-wire ceiling instead of maintaining a second stale copy.
+IMAGE_OUTPUT_MAX_TOKENS = CHAT_OUTPUT_MAX_TOKENS
 # One wall-clock budget for every link in a single image response, so a handful
 # of slow links cannot each add a fresh fetch deadline to the turn.
 IMAGE_LINK_TOTAL_DEADLINE_SECONDS = 45.0
@@ -84,6 +90,23 @@ def is_token_limit_stop_reason(value: Any) -> bool:
         "max_tokens",
         "max_output_tokens",
     }
+
+
+def cap_chat_output_tokens(value: Any) -> int:
+    """Clamp to the ceiling; reject invalid/non-positive budgets with ValueError.
+
+    Rewriting a caller bug to one token is indistinguishable from an empty
+    provider reply and wrongly attributes the failure to the provider.
+    """
+    try:
+        requested = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "chat output token budget must be a positive integer"
+        ) from exc
+    if requested <= 0:
+        raise ValueError("chat output token budget must be a positive integer")
+    return min(requested, CHAT_OUTPUT_MAX_TOKENS)
 
 
 def classify_provider_error(exc: BaseException) -> str:
@@ -1326,6 +1349,115 @@ def _synthesized_assistant_payload(exchange: ToolExchange, wire: str):
     raise ProviderError(f"unknown tool exchange wire: {wire}")
 
 
+SELF_THINKING_ASSISTANT_PREFILL = "<think>"
+
+
+def _model_supports_assistant_prefill(provider: str, model: str) -> bool:
+    """Return only capabilities demonstrated on the provider's live wire.
+
+    Assistant-role history is not itself evidence of continuation semantics:
+    OpenAI Chat/Responses, DeepSeek, and sampled custom relays all accepted the
+    final assistant item while generating a fresh answer. Keep this allowlist
+    model-specific because newer generations on the same provider can reject
+    the exact request shape accepted by older ones.
+    """
+    normalized_provider = normalize_provider(provider)
+    normalized_model = str(model or "").strip().lower()
+    claude_45 = bool(
+        re.search(
+            r"(?:^|/)claude-(?:haiku|sonnet|opus)-4(?:[.-])5(?:[-.]|$)",
+            normalized_model,
+        )
+    )
+    gemini_continuation = bool(
+        re.search(r"(?:^|/)gemini-(?:2[.]5|3[.]1)(?:[-.]|$)", normalized_model)
+    )
+    if normalized_provider == "anthropic":
+        return claude_45
+    if normalized_provider == "gemini":
+        return gemini_continuation
+    if normalized_provider == "openrouter":
+        return (
+            normalized_model.startswith("anthropic/") and claude_45
+        ) or (
+            normalized_model.startswith("google/") and gemini_continuation
+        )
+    return False
+
+
+def _effective_assistant_prefill(
+    *,
+    provider: str,
+    model: str,
+    requested: str,
+    tools: "list[ToolSpec] | None" = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    allow_image_output: bool = False,
+) -> str:
+    """Gate continuation by provider/model and by a text-only request shape."""
+    prefill = str(requested or "")
+    if prefill != SELF_THINKING_ASSISTANT_PREFILL:
+        return ""
+    if allow_image_output:
+        return ""
+    if tools:
+        choice_disables_tools = tool_choice == "none" or tool_choice == {
+            "type": "none"
+        }
+        if not choice_disables_tools or normalize_provider(provider) == "gemini":
+            return ""
+    if not _model_supports_assistant_prefill(provider, model):
+        return ""
+    return prefill
+
+
+def _assistant_prefill_message(wire: str, text: str) -> dict[str, Any]:
+    """Encode one assistant continuation prefix for a provider-native wire."""
+    if wire == "openai_chat":
+        return {"role": "assistant", "content": text}
+    if wire == "anthropic":
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        }
+    if wire == "gemini":
+        return {"role": "model", "parts": [{"text": text}]}
+    raise ProviderError(f"unsupported assistant prefill wire: {wire}")
+
+
+def _reconstruct_assistant_prefill(
+    text: str,
+    prefill: str,
+    *,
+    stop_reason: str = "",
+) -> str:
+    """Restore an omitted prefix without turning a normal reply into thinking.
+
+    Continuation-capable providers omit the supplied prefix from their response,
+    but a request can still finish with an ordinary answer instead of continuing
+    it.  A closing ``</think>`` is structural proof that continuation happened.
+    Otherwise, an explicit non-token-limit stop preserves the provider text and
+    lets the existing ABSENT correction path handle it.  Token-limit and missing
+    stop signals stay fail-closed: prefixing a truncated/unknown fragment keeps
+    private partial thinking out of the visible reply.
+    """
+    reply = str(text or "")
+    if not prefill:
+        return reply
+    if not reply:
+        return ""
+    stripped = reply.lstrip()
+    if stripped.startswith(prefill):
+        return prefill + stripped[len(prefill) :]
+    if re.search(r"<\s*/\s*think\s*>", reply, re.IGNORECASE):
+        return prefill + reply
+    if normalize_stop_reason(stop_reason) and not is_token_limit_stop_reason(
+        stop_reason
+    ):
+        return reply
+    return prefill + reply
+
+
 def _assistant_payload_for_wire(exchange: ToolExchange, wire: str):
     _validate_tool_exchange(exchange)
     native = exchange.assistant_turn
@@ -1813,6 +1945,17 @@ _GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset({
     "additionalProperties",
     "enforceItemBounds",
 })
+_GEMINI_SCHEMA_DEFINITION_KEYS = frozenset({"$defs", "definitions"})
+_GEMINI_SCHEMA_LOOSENING_KEYS = frozenset({
+    "dependentSchemas",
+    "patternProperties",
+})
+_GEMINI_REJECTED_SCHEMA_KEYS = (
+    _GEMINI_UNSUPPORTED_SCHEMA_KEYS
+    | _GEMINI_SCHEMA_DEFINITION_KEYS
+    | _GEMINI_SCHEMA_LOOSENING_KEYS
+    | {"$ref"}
+)
 _SCHEMA_MAP_KEYS = frozenset({
     "$defs",
     "definitions",
@@ -1826,20 +1969,156 @@ _OPAQUE_SCHEMA_VALUE_KEYS = frozenset({
     "example",
     "examples",
 })
+_GEMINI_MAX_REF_DEPTH = 64
+_GEMINI_MAX_REF_EXPANSIONS = 256
 
 
-def _adapt_tool_schema_gemini(schema: Any) -> Any:
-    """Return a Gemini-compatible copy of one JSON Schema node.
+class _GeminiSchemaRefFallback(Exception):
+    """Signal that a schema must retain the adapter's pre-expansion behavior."""
 
-    Gemini's function-declaration schema is narrower than JSON Schema.  In
-    particular, its v1beta endpoint rejects ``additionalProperties`` and our
-    local-only ``enforceItemBounds`` marker, and accepts enum members only as
-    strings.  Keep every other constraint intact: this is a wire adapter, not a
-    replacement for the source schema or the server-side argument validator.
 
-    Schema maps need special handling because their keys are parameter names,
-    not schema keywords.  A tool is therefore still allowed to have a property
-    literally named ``additionalProperties`` or ``enum``.
+def _resolve_local_schema_ref_gemini(root: dict[Any, Any], ref: str) -> Any:
+    """Resolve a supported local definitions reference from *root*."""
+    if ref == "#" or not ref.startswith("#/"):
+        raise _GeminiSchemaRefFallback
+
+    pointer = unquote(ref[1:])
+    raw_tokens = pointer[1:].split("/")
+    tokens: list[str] = []
+    for raw_token in raw_tokens:
+        token = ""
+        index = 0
+        while index < len(raw_token):
+            char = raw_token[index]
+            if char != "~":
+                token += char
+                index += 1
+                continue
+            if index + 1 >= len(raw_token) or raw_token[index + 1] not in "01":
+                raise _GeminiSchemaRefFallback
+            token += "~" if raw_token[index + 1] == "0" else "/"
+            index += 2
+        tokens.append(token)
+
+    if len(tokens) < 2 or tokens[0] not in _GEMINI_SCHEMA_DEFINITION_KEYS:
+        raise _GeminiSchemaRefFallback
+
+    target: Any = root
+    for token in tokens:
+        if isinstance(target, dict) and token in target:
+            target = target[token]
+            continue
+        if isinstance(target, list) and token.isdecimal():
+            item_index = int(token)
+            if item_index < len(target):
+                target = target[item_index]
+                continue
+        raise _GeminiSchemaRefFallback
+    if not isinstance(target, dict):
+        raise _GeminiSchemaRefFallback
+    return target
+
+
+def _inline_tool_schema_refs_gemini(
+    schema: Any,
+    *,
+    root: dict[Any, Any],
+    ref_stack: tuple[str, ...] = (),
+    ref_count: list[int] | None = None,
+) -> Any:
+    """Inline supported local refs and remove declarations Gemini rejects."""
+    if not isinstance(schema, dict):
+        return copy.deepcopy(schema)
+    if ref_count is None:
+        ref_count = [0]
+
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        if (
+            not isinstance(ref, str)
+            or ref in ref_stack
+            or len(ref_stack) >= _GEMINI_MAX_REF_DEPTH
+            or ref_count[0] >= _GEMINI_MAX_REF_EXPANSIONS
+        ):
+            raise _GeminiSchemaRefFallback
+        ref_count[0] += 1
+        target = _resolve_local_schema_ref_gemini(root, ref)
+        expanded_target = _inline_tool_schema_refs_gemini(
+            target,
+            root=root,
+            ref_stack=(*ref_stack, ref),
+            ref_count=ref_count,
+        )
+        siblings = {key: value for key, value in schema.items() if key != "$ref"}
+        expanded_siblings = _inline_tool_schema_refs_gemini(
+            siblings,
+            root=root,
+            ref_stack=ref_stack,
+            ref_count=ref_count,
+        )
+        if expanded_siblings:
+            return {"allOf": [expanded_target, expanded_siblings]}
+        return expanded_target
+
+    expanded: dict[Any, Any] = {}
+    for key, value in schema.items():
+        if key in _GEMINI_SCHEMA_DEFINITION_KEYS:
+            continue
+        if key in _GEMINI_SCHEMA_LOOSENING_KEYS:
+            # Dropping these constraints is conservative at the provider wire:
+            # it can admit more candidate arguments, never reject a valid one.
+            # The server-side tool validator remains authoritative.
+            continue
+        if key == "enum":
+            # Enum members are application values, not child schemas. The
+            # established sanitizer below still removes non-string enums.
+            expanded[key] = copy.deepcopy(value)
+            continue
+        if key in _OPAQUE_SCHEMA_VALUE_KEYS:
+            expanded[key] = copy.deepcopy(value)
+            continue
+        if key == "properties" and isinstance(value, dict):
+            expanded[key] = {
+                name: _inline_tool_schema_refs_gemini(
+                    child_schema,
+                    root=root,
+                    ref_stack=ref_stack,
+                    ref_count=ref_count,
+                )
+                for name, child_schema in value.items()
+            }
+            continue
+        if isinstance(value, dict):
+            expanded[key] = _inline_tool_schema_refs_gemini(
+                value,
+                root=root,
+                ref_stack=ref_stack,
+                ref_count=ref_count,
+            )
+        elif isinstance(value, list):
+            expanded[key] = [
+                _inline_tool_schema_refs_gemini(
+                    item,
+                    root=root,
+                    ref_stack=ref_stack,
+                    ref_count=ref_count,
+                )
+                if isinstance(item, dict)
+                else copy.deepcopy(item)
+                for item in value
+            ]
+        else:
+            expanded[key] = copy.deepcopy(value)
+    return expanded
+
+
+def _adapt_tool_schema_gemini_legacy(schema: Any) -> Any:
+    """Apply the pre-ref-expansion Gemini schema adaptation rules.
+
+    This helper deliberately retains the old recursion and output shape. It is
+    also the fail-safe for cyclic, external, root, over-deep, or unresolved
+    references, where silently changing the schema would be less safe than the
+    adapter's previous provider-rejection behavior.
     """
     if not isinstance(schema, dict):
         return copy.deepcopy(schema)
@@ -1859,15 +2138,15 @@ def _adapt_tool_schema_gemini(schema: Any) -> Any:
             continue
         if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
             adapted[key] = {
-                name: _adapt_tool_schema_gemini(child_schema)
+                name: _adapt_tool_schema_gemini_legacy(child_schema)
                 for name, child_schema in value.items()
             }
             continue
         if isinstance(value, dict):
-            adapted[key] = _adapt_tool_schema_gemini(value)
+            adapted[key] = _adapt_tool_schema_gemini_legacy(value)
         elif isinstance(value, list):
             adapted[key] = [
-                _adapt_tool_schema_gemini(item)
+                _adapt_tool_schema_gemini_legacy(item)
                 if isinstance(item, dict)
                 else copy.deepcopy(item)
                 for item in value
@@ -1875,6 +2154,31 @@ def _adapt_tool_schema_gemini(schema: Any) -> Any:
         else:
             adapted[key] = copy.deepcopy(value)
     return adapted
+
+
+def _adapt_tool_schema_gemini(schema: Any) -> Any:
+    """Return a Gemini-compatible copy of one JSON Schema node.
+
+    Gemini's function-declaration schema is narrower than JSON Schema.  In
+    particular, its v1beta endpoint rejects JSON Schema references and
+    definition maps in addition to ``additionalProperties`` and our local-only
+    ``enforceItemBounds`` marker. Resolve supported local definition refs before
+    applying the established sanitizer. Keep every other safe constraint intact:
+    this is a wire adapter, not a replacement for the source schema or the
+    server-side argument validator.
+
+    Schema maps need special handling because their keys are parameter names,
+    not schema keywords.  A tool is therefore still allowed to have a property
+    literally named ``$ref``, ``additionalProperties``, or ``enum``.
+    """
+    if not isinstance(schema, dict):
+        return copy.deepcopy(schema)
+
+    try:
+        expanded = _inline_tool_schema_refs_gemini(schema, root=schema)
+    except _GeminiSchemaRefFallback:
+        expanded = schema
+    return _adapt_tool_schema_gemini_legacy(expanded)
 
 
 def _encode_tools_gemini(tools) -> list[dict]:
@@ -2340,7 +2644,7 @@ def _build_openai_responses_payload(
     payload: dict[str, Any] = {
         "model": model,
         "input": input_items,
-        "max_output_tokens": max(1, min(int(max_tokens), 8192)),
+        "max_output_tokens": cap_chat_output_tokens(max_tokens),
         "store": False,
     }
     if include_reasoning:
@@ -2505,13 +2809,14 @@ def _build_openai_compat_payload(
     prompt_cache_key: str = "",
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     encoded_messages = _encode_messages_openai_chat(messages)
     payload: dict[str, Any] = {
         "model": model,
         "messages": encoded_messages,
         "stream": False,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
+        "max_tokens": cap_chat_output_tokens(max_tokens),
     }
     # temperature is OPTIONAL on this wire: the Claude 5 / GPT-5 generation rejects
     # it outright ("`temperature` is deprecated for this model" → 400). Relays pool
@@ -2544,6 +2849,13 @@ def _build_openai_compat_payload(
                 payload["messages"] = _mark_openai_chat_cache_breakpoint(
                     encoded_messages
                 )
+    # ``assistant_prefill`` is already capability-gated once by the dispatcher.
+    # Builders only encode the effective value so payload and parser cannot
+    # diverge if runtime model mapping changes later.
+    if assistant_prefill:
+        payload["messages"].append(
+            _assistant_prefill_message("openai_chat", assistant_prefill)
+        )
     return payload
 
 
@@ -3216,6 +3528,7 @@ def _parse_openai_compat_body(
     provider: str,
     model: str,
     require_reply: bool,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     try:
         body = resp.json()
@@ -3238,14 +3551,18 @@ def _parse_openai_compat_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
+    reply = _extract_reply(
+        body, required=require_reply and not tool_calls and not media
+    )
+    stop_reason = _extract_openai_compatible_stop_reason(body)
     return {
-        "reply": _extract_reply(
-            body, required=require_reply and not tool_calls and not media
+        "reply": _reconstruct_assistant_prefill(
+            reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_openai_compatible_reasoning(body),
         "usage": _normalize_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
-        "stop_reason": _extract_openai_compatible_stop_reason(body),
+        "stop_reason": stop_reason,
         "provider": provider,
         "model": model,
         "tool_calls": tool_calls,
@@ -3358,6 +3675,7 @@ def _build_anthropic_payload(
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
     tool_choice: str | dict[str, Any] | None = None,
+    assistant_prefill: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     cacheable_system_parts = [
         _content_text(message.get("content"))
@@ -3370,7 +3688,7 @@ def _build_anthropic_payload(
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
         system = f"{system}\n\n{json_instruction}".strip()
-    capped_max_tokens = max(1, min(int(max_tokens), 8192))
+    capped_max_tokens = cap_chat_output_tokens(max_tokens)
     payload: dict[str, Any] = {
         "model": model,
         "messages": provider_messages,
@@ -3418,6 +3736,10 @@ def _build_anthropic_payload(
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
     # above; top-level cache_control is not part of the Messages API schema.
+    if assistant_prefill:
+        payload["messages"].append(
+            _assistant_prefill_message("anthropic", assistant_prefill)
+        )
 
     url = f"{base_url.rstrip('/')}/messages"
     headers = {
@@ -3433,19 +3755,24 @@ def _parse_anthropic_body(
     *,
     model: str,
     require_reply: bool,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     # See _parse_openai_compat_body: a pure tool-call response has no reply text
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_anthropic(body)
     content = body.get("content")
+    reply = _extract_anthropic_reply(
+        body, required=require_reply and not tool_calls
+    )
+    stop_reason = str(body.get("stop_reason") or "").strip()
     return {
-        "reply": _extract_anthropic_reply(
-            body, required=require_reply and not tool_calls
+        "reply": _reconstruct_assistant_prefill(
+            reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_anthropic_reasoning(body),
         "usage": _normalize_usage("anthropic", body.get("usage")),
         "raw_id": body.get("id", ""),
-        "stop_reason": str(body.get("stop_reason") or "").strip(),
+        "stop_reason": stop_reason,
         "provider": "anthropic",
         "model": model,
         "tool_calls": tool_calls,
@@ -3610,7 +3937,7 @@ def _build_bedrock_payload(
     if json_instruction:
         system_parts.append(json_instruction)
 
-    capped_max_tokens = max(1, min(int(max_tokens), 8192))
+    capped_max_tokens = cap_chat_output_tokens(max_tokens)
     inference_config: dict[str, Any] = {"maxTokens": capped_max_tokens}
     thinking_enabled = (
         include_reasoning
@@ -3836,10 +4163,11 @@ def _build_gemini_payload(
     tools: "list[ToolSpec] | None" = None,
     allow_image_output: bool = False,
     tool_choice: str | dict[str, Any] | None = None,
+    assistant_prefill: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
-        "maxOutputTokens": max(1, min(int(max_tokens), 8192)),
+        "maxOutputTokens": cap_chat_output_tokens(max_tokens),
     }
     if temperature is not None:
         generation_config["temperature"] = temperature
@@ -3868,6 +4196,10 @@ def _build_gemini_payload(
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [tool_choice["function"]["name"]]}}
         elif tool_choice == "required":
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
+    if assistant_prefill:
+        payload["contents"].append(
+            _assistant_prefill_message("gemini", assistant_prefill)
+        )
 
     url = f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent"
     headers = {
@@ -3882,6 +4214,7 @@ def _parse_gemini_body(
     *,
     model: str,
     require_reply: bool,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     # See _parse_openai_compat_body: a pure tool-call response has no reply text
     # and must not be rejected — require reply only when no tool_calls are present.
@@ -3893,14 +4226,18 @@ def _parse_gemini_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
+    reply = _extract_gemini_reply(
+        body, required=require_reply and not tool_calls and not media
+    )
+    stop_reason = _extract_gemini_stop_reason(body)
     return {
-        "reply": _extract_gemini_reply(
-            body, required=require_reply and not tool_calls and not media
+        "reply": _reconstruct_assistant_prefill(
+            reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_gemini_reasoning(body),
         "usage": _normalize_usage("gemini", body.get("usageMetadata")),
         "raw_id": body.get("responseId", ""),
-        "stop_reason": _extract_gemini_stop_reason(body),
+        "stop_reason": stop_reason,
         "provider": "gemini",
         "model": model,
         "tool_calls": tool_calls,
@@ -4636,6 +4973,7 @@ async def _chat_completion_async_impl(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     tool_choice: str | dict[str, Any] | None = None,
+    assistant_prefill: str = "",
     _attempt_trace: list[dict[str, Any]] | None,
     allow_image_output: bool = False,
 ) -> dict[str, Any]:
@@ -4646,6 +4984,14 @@ async def _chat_completion_async_impl(
     key = (config.api_key or "").strip()
     if not key:
         raise ProviderError("api_key required")
+    effective_prefill = _effective_assistant_prefill(
+        provider=provider,
+        model=request_model,
+        requested=assistant_prefill,
+        tools=tools,
+        tool_choice=tool_choice,
+        allow_image_output=allow_image_output,
+    )
 
     # anthropic / gemini / openai-responses 各自的编解码与同步版共享单实现
     # （_build_<wire>_payload / _parse_<wire>_body），这里只保留 async
@@ -4759,6 +5105,7 @@ async def _chat_completion_async_impl(
             tools=tools,
             prompt_cache_key=config.prompt_cache_key,
             tool_choice=tool_choice,
+            assistant_prefill=effective_prefill,
         )
 
         async def post_anthropic(request_payload: dict[str, Any]) -> httpx.Response:
@@ -4814,7 +5161,12 @@ async def _chat_completion_async_impl(
             raise ProviderError("provider returned non-json response") from e
         if not isinstance(body, dict):
             raise ProviderError("provider returned non-object response")
-        result = _parse_anthropic_body(body, model=model, require_reply=require_reply)
+        result = _parse_anthropic_body(
+            body,
+            model=model,
+            require_reply=require_reply,
+            assistant_prefill=effective_prefill,
+        )
         return _with_request_diagnostics(
             result,
             initial_payload=payload,
@@ -4914,6 +5266,7 @@ async def _chat_completion_async_impl(
             tools=tools,
             allow_image_output=allow_image_output,
             tool_choice=tool_choice,
+            assistant_prefill=effective_prefill,
         )
         async def post_gemini(request_payload: dict[str, Any]) -> httpx.Response:
             try:
@@ -4940,7 +5293,12 @@ async def _chat_completion_async_impl(
             raise ProviderError("provider returned non-json response") from e
         if not isinstance(body, dict):
             raise ProviderError("provider returned non-object response")
-        return _parse_gemini_body(body, model=model, require_reply=require_reply)
+        return _parse_gemini_body(
+            body,
+            model=model,
+            require_reply=require_reply,
+            assistant_prefill=effective_prefill,
+        )
 
     if provider == "openai" and _openai_uses_responses_for_reasoning(request_model):
         payload, url, headers = _build_openai_responses_payload(
@@ -5037,6 +5395,7 @@ async def _chat_completion_async_impl(
         prompt_cache_key=config.prompt_cache_key,
         tool_choice=tool_choice,
         allow_image_output=allow_image_output,
+        assistant_prefill=effective_prefill,
     )
 
     async def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
@@ -5091,7 +5450,11 @@ async def _chat_completion_async_impl(
         _raise_for_provider_status(resp)
 
     result = _parse_openai_compat_body(
-        resp, provider=provider, model=request_model, require_reply=require_reply
+        resp,
+        provider=provider,
+        model=request_model,
+        require_reply=require_reply,
+        assistant_prefill=effective_prefill,
     )
     return _with_request_diagnostics(
         result,
@@ -5115,6 +5478,7 @@ async def chat_completion_async(
     tools: "list[ToolSpec] | None" = None,
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    assistant_prefill: str = "",
 ) -> dict[str, Any]:
     """Native async completion, optionally retaining every HTTP attempt.
 
@@ -5140,6 +5504,7 @@ async def chat_completion_async(
             tools=tools,
             tool_choice=tool_choice,
             allow_image_output=allow_image_output,
+            assistant_prefill=assistant_prefill,
             _attempt_trace=attempt_trace,
         )
     except Exception as exc:  # noqa: BLE001 -- annotate and preserve original

@@ -1,4 +1,17 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # Memory Garden 内核提取 · 方向
+
+> **CURRENT-STATE NOTE（2026-08-27）**：本文保留内核/IO 分层的长期设计理由；正文中的
+> 本地目录、行号、分支和“本批”范围是提取期快照。内核后来重命名为 `memgarden`，并在
+> `4d25dbfb` 改为 hash-pinned 外部 wheel，仓库不再 vendoring 源码。当前实现与供应链事实
+> 以 public architecture、`backend/requirements.lock`、CI 和
+> `tests/test_memgarden_is_a_real_dependency.py` 为准。
+>
+> **仍未实施的原始范围**：通用 storage adapter 切流以及 CLI/MCP 壳没有随核心提取交付。
+> 它们不是当前运行时能力；只有新的产品需求、owner 和独立计划成立后才重新进入 backlog。
 
 > 承接《记忆组件化与外部记忆库接入方案》。
 > **本批范围:把 Memory Garden 提取成 IO 内部共用的内核。第三方记忆库接入不在本批。**

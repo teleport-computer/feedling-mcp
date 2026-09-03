@@ -487,7 +487,10 @@ class CpuRecorder:
         remaining = deadline - self._docker_monotonic()
         if remaining <= 0:
             raise TimeoutError("docker_cycle_timeout")
-        return min(self.docker_cycle_timeout_sec, remaining)
+        request_timeout = float(
+            getattr(self.client, "timeout_sec", self.docker_cycle_timeout_sec)
+        )
+        return min(request_timeout, self.docker_cycle_timeout_sec, remaining)
 
     def run_forever(self) -> None:
         deadline = self._monotonic()

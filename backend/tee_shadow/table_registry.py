@@ -97,6 +97,18 @@ REGISTRY: dict[str, Entry] = {
         "resident_* 四列当前既不热路径双写也不扶正（T150 待设计决定）",
     ),
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
+    "distillation_artifact_attempts": Entry(
+        MIRROR,
+        "蒸馏 artifact 逐次账本；无内容、追加 start 后原地闭合 terminal outcome",
+    ),
+    "distillation_artifact_daily_rollup": Entry(
+        MIRROR,
+        "蒸馏 artifact 北京日冻结格；只覆盖新账本生效后，历史明确不回填",
+    ),
+    "distillation_rollup_watermark": Entry(
+        MIRROR,
+        "蒸馏冻结格独立生效/完成水位；防止生效日前缺失被读成 0",
+    ),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
     "lane_daily_rollup": Entry(
@@ -235,6 +247,69 @@ REGISTRY: dict[str, Entry] = {
         SNAPSHOT,
         "V2 感知去重基线，频繁原地 UPDATE；只含 HMAC 指纹、事件标识与时间戳，明文整表收敛",
     ),
+
+    # PerceptKit 的十一张表。TEE 迁移链（0040）会建它们，所以 required_in_tee，
+    # 但影子期不复制数据 —— 理由逐条写在下面。
+    "perceptkit_ingest_receipt": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_observation": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_current": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_daily_aggregate": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_dedupe_identity": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_rule_state": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_event_outbox": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_wake_receipt": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_calendar_mirror": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_reminder_mirror": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_sync_state": Entry(
+        SKIP,
+        "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_shadow_divergence": Entry(
+        SKIP,
+        "影子比对的计数账：kit 的结论和活路径的结论逐字段比出来的判定与计数。纯诊断，切换之后也不该复制——它记的是两条路的差异，不是用户的事实。",
+        required_in_tee=True,
+    ),
     "provider_health": Entry(SNAPSHOT, "provider 健康状态，UPDATE 密集，明文"),
     "retention_cohort_snapshot": Entry(
         SNAPSHOT, "留存 cohort 快照，批量写，明文；T149/A：TEE 0004 派生漏 2 条 RDS CHECK"),
@@ -348,6 +423,12 @@ REGISTRY: dict[str, Entry] = {
         "且过期即删，不搬 RDS 历史；TEE-primary 后由当前主库本地产生",
         required_in_tee=True,
     ),
+    "account_recover_challenges": Entry(
+        SKIP,
+        "账号恢复挑战，TTL 300 秒；verify 成功走原子 DELETE ... RETURNING 单次消费，"
+        "过期/被顶替的旧挑战由下一次 create_challenge 清理——不是持久用户资产，复制"
+        "只会制造不可消费的陈旧哈希，且没必要把恢复凭据哈希材料扩散到第二个存储",
+    ),
     "bak_20260710_usr450_blobs": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
     "bak_20260710_usr450_chat": Entry(
@@ -377,6 +458,12 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "copytext_meta": ("id",),
     "genesis_import_jobs": ("user_id", "job_id"),
     "genesis_import_outputs": ("user_id", "job_id", "output_type"),
+    "distillation_artifact_attempts": ("attempt_id",),
+    "distillation_artifact_daily_rollup": (
+        "day", "access_path", "distill_kind", "artifact", "outcome",
+        "terminal_result",
+    ),
+    "distillation_rollup_watermark": ("scope",),
     "notify_relay_configs": ("auth_token",),
     "notify_relay_logs": ("id",),
     "lane_daily_rollup": (

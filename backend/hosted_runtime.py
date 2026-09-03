@@ -16,7 +16,6 @@ IDENTITY_STRING_FIELDS = (
     "user_preferred_name",
     "agent_role",
     "tone_style",
-    "language_preference",
     "relationship_anchor",
 )
 IDENTITY_LIST_FIELDS = (

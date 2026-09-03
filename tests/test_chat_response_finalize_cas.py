@@ -176,7 +176,7 @@ def test_chat_core_two_workers_one_reply_and_winner_only_side_effects(
     monkeypatch.setattr(
         capture_scheduler,
         "record_chat_append",
-        lambda *args: captures.append(args) or {},
+        lambda *args, **_kwargs: captures.append(args) or {},
     )
     monkeypatch.setattr(
         chat_core.push_service,

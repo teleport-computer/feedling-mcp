@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
 from agent_runtime import spawners  # noqa: E402
+from capabilities import tool_schema  # noqa: E402
+from model_api_runtime.v2 import context as v2_context  # noqa: E402
 
 import io_cli_catalog  # noqa: E402  (sibling under tools/, same convention as spawners' lazy import)
 
@@ -72,12 +74,33 @@ def test_rendered_prompt_documents_all_new_verbs():
 def test_rendered_prompt_documents_canvas_delivery_contract():
     files = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
     prompt = files["/h/agent-tools-prompt.md"]
+    normalized_prompt = re.sub(r"\s+", " ", prompt)
 
     assert ".io.html" in prompt
     assert "--title <short title>" in prompt
     assert "--subtitle <one-line description>" in prompt
     assert "user's current language" in prompt
-    assert "256000 bytes" in prompt
+    # V1's prompt is static Markdown, so derive the expected value from V2's
+    # canonical limit: changing the authority must make this parity guard fail
+    # until the shipped V1 copy is updated too.
+    assert f"{tool_schema.SHARED_WORK_MAX_BYTES} bytes" in prompt
+    assert "briefly offer to make one and wait for the user's answer" in normalized_prompt
+    assert "casual conversation, emotional support" in normalized_prompt
+    assert "do not repeat an offer the user did not take up" in normalized_prompt
+
+
+def test_canvas_offer_boundary_exists_on_both_v1_and_v2_policy_surfaces():
+    files = spawners.agent_home_files("/h", driver="claude", provider="anthropic")
+    v1_prompt = re.sub(r"\s+", " ", files["/h/agent-tools-prompt.md"])
+    v2_prompt = v2_context.CHAT_SYSTEM_PROMPT
+
+    # This guards presence on both independently authored language surfaces. It
+    # intentionally cannot prove that future English and Chinese edits remain
+    # semantically equivalent.
+    assert "briefly offer to make one and wait for the user's answer" in v1_prompt
+    assert "do not repeat an offer the user did not take up" in v1_prompt
+    assert "先简短提议制作，等对方答复后再做" in v2_prompt
+    assert "对方没有接受的提议不要重复" in v2_prompt
 
 
 def test_fallback_send_file_documents_canvas_display_fields():
@@ -212,7 +235,7 @@ def test_fallback_identity_write_covers_full_flag_surface():
     expected_flags = (
         "--agent-name", "--self-introduction", "--category",
         "--user-preferred-name", "--agent-role", "--tone-style",
-        "--custom-persona-prompt", "--language-preference",
+        "--custom-persona-prompt",
         "--relationship-anchor", "--signature",
         "--add-signature", "--remove-signature", "--replace-signatures",
         "--add-boundary", "--remove-boundary", "--replace-boundaries",

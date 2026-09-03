@@ -14,7 +14,6 @@ tests/test_api_errors_doc.py
 tests/test_asgi_accounts_remaining.py
 tests/test_asgi_agent.py
 tests/test_asgi_bootstrap_post.py
-tests/test_asgi_chat_remaining.py
 tests/test_asgi_client_disconnect.py
 tests/test_asgi_content.py
 tests/test_asgi_copytext.py
@@ -39,14 +38,12 @@ tests/test_asgi_worker_limits.py
 tests/test_backend_worker_count.py
 tests/test_backfill_chat_images.py
 tests/test_backfill_frames.py
-tests/test_blob_wake.py
 tests/test_bootstrap_gate_host_route.py
 tests/test_bootstrap_gates.py
 tests/test_bootstrap_status_verify_ping.py
 tests/test_branch_flow_guard.py
 tests/test_bucket_lang_normalize.py
 tests/test_bucket_language_normalize.py
-tests/test_capabilities_chat.py
 tests/test_capabilities_registry.py
 tests/test_capabilities_types.py
 tests/test_capability_html_extract.py
@@ -75,9 +72,7 @@ tests/test_chat_turn_activity_unit.py
 tests/test_chat_turn_activity_v2.py
 tests/test_chat_turn_failure_fields.py
 tests/test_consumer_state_cas.py
-tests/test_context_memories.py
 tests/test_copytext.py
-tests/test_data_track.py
 tests/test_dau_snapshot_scheduler.py
 tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
@@ -87,8 +82,6 @@ tests/test_dream_card_render_bucket.py
 tests/test_dream_status.py
 tests/test_e2b_template_contract.py
 tests/test_e2e_deep_claude.py
-tests/test_e2e_deep_probes.py
-tests/test_e2e_tools.py
 tests/test_error_slug_convergence.py
 tests/test_exception_handlers.py
 tests/test_expected_consumer_commit.py
@@ -106,11 +99,9 @@ tests/test_genesis_failure_codes.py
 tests/test_genesis_floor_note.py
 tests/test_genesis_foreground.py
 tests/test_genesis_foreground_worker.py
-tests/test_genesis_import_capture_mode.py
 tests/test_genesis_keep_all.py
 tests/test_genesis_llm_client.py
 tests/test_genesis_prompts.py
-tests/test_genesis_reclaim_worker.py
 tests/test_genesis_resident_claim.py
 tests/test_genesis_resident_endpoints.py
 tests/test_genesis_resident_lease.py
@@ -120,7 +111,6 @@ tests/test_genesis_service.py
 tests/test_genesis_terms_note.py
 tests/test_genesis_unclaimed_reaper.py
 tests/test_genesis_v2_e2e.py
-tests/test_genesis_worker.py
 tests/test_genesis_worker_claim.py
 tests/test_genesis_worker_claim_migration.py
 tests/test_gunicorn_conf.py
@@ -173,7 +163,6 @@ tests/test_proactive_multi_trigger_burst.py
 tests/test_proactive_poll_core.py
 tests/test_prod_runner_health_config.py
 tests/test_provider_async_native.py
-tests/test_provider_attempt_ledger.py
 tests/test_provider_catalog_unit.py
 tests/test_provider_client_async.py
 tests/test_provider_client_async_reliable.py
@@ -185,7 +174,6 @@ tests/test_provider_tool_transcript_wire.py
 tests/test_provider_tools_acceptance.py
 tests/test_provider_tools_anthropic.py
 tests/test_provider_tools_bedrock.py
-tests/test_provider_tools_gemini.py
 tests/test_provider_tools_no_reply_text.py
 tests/test_provider_tools_openai.py
 tests/test_provider_tools_wire.py
@@ -194,13 +182,10 @@ tests/test_provider_usage.py
 tests/test_providers_manual.py
 tests/test_push_skips_deleted_account.py
 tests/test_recover_orphan_survivor.py
-tests/test_redis_cvm_config.py
-tests/test_redis_pool.py
 tests/test_redistill_server_merge.py
 tests/test_registry_db_fallback.py
 tests/test_relationship_days.py
 tests/test_repair_v2_bricked_frontier.py
-tests/test_reply_language.py
 tests/test_request_id.py
 tests/test_resident_maintenance.py
 tests/test_retention_daily.py
@@ -209,7 +194,6 @@ tests/test_scene_fields.py
 tests/test_self_thinking_parse.py
 tests/test_semantic_analysis.py
 tests/test_spawners_catalog.py
-tests/test_store_cache.py
 tests/test_test_runner_health_config.py
 tests/test_user_timezone.py
 tests/test_users_channel_broadcast.py
@@ -218,7 +202,6 @@ tests/test_users_reload_targeted.py
 tests/test_v2_admission.py
 tests/test_v2_bounded_tail_degrade.py
 tests/test_v2_capacity_health.py
-tests/test_v2_capture_batch_protocol.py
 tests/test_v2_capture_lifecycle.py
 tests/test_v2_chat_clear_fence.py
 tests/test_v2_child_supervisor.py
@@ -245,7 +228,6 @@ tests/test_v2_kill_switch_web.py
 tests/test_v2_live_genesis_workers.py
 tests/test_v2_local_sandbox.py
 tests/test_v2_manual_wake_bridge.py
-tests/test_v2_multimodal_e2e.py
 tests/test_v2_no_cursor_ts.py
 tests/test_v2_no_dispatch_tiering.py
 tests/test_v2_optional_anchor.py
@@ -267,11 +249,9 @@ tests/test_v2_seq_cursor_migration.py
 tests/test_v2_serve_worker_consent.py
 tests/test_v2_serve_worker_extraction.py
 tests/test_v2_serve_worker_genesis.py
-tests/test_v2_serve_worker_images.py
 tests/test_v2_sink_retryable.py
 tests/test_v2_status_poll.py
 tests/test_v2_status_stream.py
-tests/test_v2_subagents.py
 tests/test_v2_summary_frontier_unit.py
 tests/test_v2_summary_store.py
 tests/test_v2_tail_anchor_store.py
@@ -284,7 +264,6 @@ tests/test_v2_wake_success.py
 tests/test_v2_web_gate.py
 tests/test_v2_worker_files.py
 tests/test_v2_worker_heartbeat.py
-tests/test_v2_worker_images.py
 tests/test_v2_workspace_db.py
 tests/test_v2_workspace_parallel_sink.py
 tests/test_v2_workspace_unit.py
@@ -292,7 +271,6 @@ tests/test_verify_loop_cross_worker.py
 tests/test_vision_model_v2.py
 tests/test_vision_observer.py
 tests/test_vision_observer_zero_roster.py
-tests/test_wake_bus.py
 tests/test_web_exec_routes.py
 tests/test_web_execution_core.py
 tests/test_web_settings_backfill.py

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import re
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -36,7 +38,6 @@ from memory import memory_core  # noqa: E402
 from memory import routes_asgi as memory_asgi  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 import memory_readside_core  # noqa: E402
-from memgarden import timestamps as memory_timestamps  # noqa: E402
 
 _SECRET = "test-runtime-secret"
 
@@ -284,22 +285,21 @@ def test_list_cursor_paginates_221_cards_without_duplicates_or_omissions(
     assert {card["id"] for card in pages[2]["moments"]} >= {"mem_219", "mem_220"}
 
 
-def test_list_without_cursor_preserves_legacy_first_page(
+def test_list_without_cursor_uses_server_display_order(
     list_route_store, monkeypatch
 ):
     cards = _pagination_cards()
     monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
-    legacy_order = sorted(
-        cards,
-        key=lambda card: memory_timestamps.sort_key(card.get("occurred_at")),
-        reverse=True,
-    )
 
     status, body = _asgi("GET", "/v1/memory/list?limit=100")
 
     assert status == 200
-    assert body["moments"] == legacy_order[:100]
-    assert body["total"] == len(legacy_order)
+    # Independent oracle: this fixture is generated newest-first and its only
+    # timestamp tie (98...102) has the same ascending ID order as the contract.
+    assert [moment["id"] for moment in body["moments"]] == [
+        f"mem_{index:03d}" for index in range(100)
+    ]
+    assert body["total"] == len(cards)
     assert body["next_cursor"]
 
 
@@ -322,17 +322,35 @@ def test_list_total_is_independent_of_cursor_and_limit(
 
 
 def test_list_default_and_max_page_sizes(list_route_store, monkeypatch):
-    cards = _pagination_cards(501)
+    max_limit = memory_core.MEMORY_LIST_MAX_LIMIT
+    cards = _pagination_cards(max_limit + 1)
     monkeypatch.setattr(memory_service, "_load_moments", lambda _store: cards)
 
     default_status, default_page = _asgi("GET", "/v1/memory/list")
-    capped_status, capped_page = _asgi("GET", "/v1/memory/list?limit=999")
+    max_status, max_page = _asgi(
+        "GET", f"/v1/memory/list?limit={max_limit}"
+    )
 
-    assert default_status == capped_status == 200
-    assert len(default_page["moments"]) == 50
-    assert len(capped_page["moments"]) == 500
-    assert default_page["total"] == capped_page["total"] == 501
-    assert default_page["next_cursor"] and capped_page["next_cursor"]
+    assert default_status == max_status == 200
+    assert len(default_page["moments"]) == memory_core.MEMORY_LIST_DEFAULT_LIMIT
+    assert len(max_page["moments"]) == max_limit
+    assert default_page["total"] == max_page["total"] == len(cards)
+    assert default_page["next_cursor"] and max_page["next_cursor"]
+
+
+def test_list_rejects_limit_above_declared_max(list_route_store, monkeypatch):
+    max_limit = memory_core.MEMORY_LIST_MAX_LIMIT
+    monkeypatch.setattr(
+        memory_service,
+        "_load_moments",
+        lambda _store: pytest.fail("invalid limit must fail before loading memories"),
+    )
+
+    status, body = _asgi(
+        "GET", f"/v1/memory/list?limit={max_limit + 1}"
+    )
+
+    assert (status, body) == (400, {"error": "invalid limit"})
 
 
 @pytest.mark.parametrize(
@@ -348,20 +366,28 @@ def test_list_rejects_invalid_cursor_with_400(
     assert (status, body) == (400, {"error": "invalid cursor"})
 
 
-def test_list_rejects_well_formed_cursor_without_matching_anchor(
+def test_list_continues_after_cursor_anchor_disappears(
     list_route_store, monkeypatch
 ):
-    monkeypatch.setattr(
-        memory_service, "_load_moments", lambda _store: _pagination_cards()
+    cards = _pagination_cards()
+    ordered = memory_core._sort_memory_list(cards)
+    current = list(cards)
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: current)
+
+    first_status, first = _asgi("GET", "/v1/memory/list?limit=100")
+    assert first_status == 200
+    vanished_id = first["moments"][-1]["id"]
+    current[:] = [card for card in current if card["id"] != vanished_id]
+
+    status, body = _asgi(
+        "GET", f"/v1/memory/list?limit=100&cursor={first['next_cursor']}"
     )
-    forged = memory_core._encode_memory_list_cursor({
-        "id": "mem_not_present",
-        "occurred_at": "2026-08-18T08:00:00Z",
-    })
 
-    status, body = _asgi("GET", f"/v1/memory/list?cursor={forged}")
-
-    assert (status, body) == (400, {"error": "invalid cursor"})
+    assert status == 200
+    assert [card["id"] for card in body["moments"]] == [
+        card["id"] for card in ordered[100:200]
+    ]
+    assert vanished_id not in {card["id"] for card in body["moments"]}
 
 
 def test_get_missing_id_400_parity(user):
@@ -447,7 +473,328 @@ def test_index_database_failure_is_503_not_an_empty_success(user, monkeypatch):
     assert (status, body) == (503, {"error": "memory_load_failed"})
     assert events[-1]["type"] == "memory.index.called"
     assert events[-1]["status"] == "failed"
-    assert events[-1]["detail"]["reason"] == "memory_load_failed"
+    # Both lanes now carry a closed category rather than the exception text. The
+    # response above still names ``memory_load_failed`` because that message is a
+    # member of ``_CLOSED_READSIDE_ERRORS`` -- a fixed literal, not upstream text.
+    # The messages that *do* carry upstream payload collapse instead; see
+    # ``test_readside_503_body_never_carries_the_enclave_response_text``.
+    assert events[-1]["detail"]["reason"] == "readside_unavailable"
+    assert events[-1]["detail"]["error_class"] == "RuntimeError"
+    assert events[-1]["detail"]["upstream"] == "memory_load_failed"
+
+
+# --------------------------------------------------------------------------- #
+# readside error contract (T351)
+#
+# ``memory_readside_core.post_enclave_readside`` raises
+# ``RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")``, so the
+# enclave's own response body rides inside the exception message. The trace lane
+# already reduced that to a closed category; the response lane returned
+# ``str(e)`` verbatim. These tests pin the response lane closed and pin the
+# triage signal to the place it moved to.
+#
+# The leaky message is *produced by the shipped function* rather than written out
+# here: a literal would keep passing if the producer's format changed, which is
+# the failure mode where the guard silently stops guarding.
+# --------------------------------------------------------------------------- #
+
+_ENCLAVE_CANARY = "SYNTHETIC-CANARY-9f3a decrypt_failed: owner mismatch"
+
+# The members below are spelled out here, in the test, rather than read back out
+# of ``memory_core``. An earlier version looped over the production frozensets,
+# which meant deleting a member deleted its assertion along with it -- the suite
+# stayed green while the contract shrank. An inventory that derives from the
+# thing it is checking cannot detect a removal, so it has to be an independent
+# statement of what we promise; then adding, dropping or misspelling a member is
+# red, and every change to the closed set is a deliberate edit in two places.
+_EXPECTED_CLOSED_READSIDE_ERRORS = {
+    "api_key_unavailable",
+    "enclave_invalid_readside_response",
+    "enclave_unavailable",
+    "memory_load_failed",
+}
+_EXPECTED_CLOSED_REQUEST_ERRORS = {
+    "ids must be a list of non-empty strings",
+    "invalid limit",
+}
+# The *pairs*, in order, not just the labels. Pinning only the label set leaves
+# the prefixes free: renaming the ``enclave_http_429`` prefix to
+# ``enclave_http_4299`` keeps every label intact, so a set comparison stays
+# green while real 429s silently demote to ``enclave_http_4xx``. Order is part
+# of the contract too -- the table is first-match-wins and the specific codes
+# only work because they precede the ``enclave_http_4`` catch-all.
+_EXPECTED_UPSTREAM_SIGNALS = (
+    ("enclave_http_401", "enclave_http_401"),
+    ("enclave_http_403", "enclave_http_403"),
+    ("enclave_http_404", "enclave_http_404"),
+    ("enclave_http_408", "enclave_http_408"),
+    ("enclave_http_429", "enclave_http_429"),
+    ("enclave_http_4", "enclave_http_4xx"),
+    ("enclave_http_5", "enclave_http_5xx"),
+    ("enclave_http_", "enclave_http_other"),
+    ("enclave_error:", "enclave_error"),
+    ("enclave_unavailable", "enclave_unavailable"),
+    ("api_key_unavailable", "api_key_unavailable"),
+    ("enclave_invalid_readside_response", "enclave_invalid_readside_response"),
+    ("memory_load_failed", "memory_load_failed"),
+)
+_EXPECTED_UPSTREAM_LABELS = {label for _prefix, label in _EXPECTED_UPSTREAM_SIGNALS}
+# What the doc promises a caller can receive. The two generic codes are not
+# exception messages, so they are in neither closed set, but they are the most
+# load-bearing rows in the table: they are what everything else collapses to.
+_EXPECTED_READSIDE_DOC_SLUGS = _EXPECTED_CLOSED_READSIDE_ERRORS | {
+    "readside_unavailable",
+    "request_invalid",
+}
+
+
+def _enclave_error_from_producer(monkeypatch, status_code: int, body_text: str):
+    """Drive the real producer to a >=400 response and return what it raised."""
+
+    class _Resp:
+        status_code = 0
+        text = ""
+
+        def json(self):  # pragma: no cover - never reached on the >=400 path
+            return {}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            resp = _Resp()
+            resp.status_code = status_code
+            resp.text = body_text
+            return resp
+
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave.invalid:5003")
+    monkeypatch.setattr(memory_readside_core.httpx, "Client", _Client)
+    with pytest.raises(RuntimeError) as caught:
+        memory_readside_core.post_enclave_readside(
+            "ak_synthetic", [], operation="index")
+    return caught.value
+
+
+def test_the_enclave_body_really_does_ride_inside_the_exception(monkeypatch):
+    """Positive control for the tests below.
+
+    If the producer ever stops embedding ``resp.text``, the leak tests would pass
+    for a reason that has nothing to do with ``memory_core`` -- green because
+    there was nothing to leak. This fails first in that case.
+    """
+    err = _enclave_error_from_producer(monkeypatch, 403, _ENCLAVE_CANARY)
+    assert _ENCLAVE_CANARY in str(err), (
+        "the producer no longer embeds the enclave response body; the response-"
+        "contract tests below are no longer exercising a real leak")
+
+
+@pytest.mark.parametrize("route,payload,event_type", [
+    ("/v1/memory/index", {}, "memory.index.called"),
+    ("/v1/memory/index", {"query": "synthetic"}, "memory.search.called"),
+    ("/v1/memory/fetch", {"ids": ["m-synthetic"]}, "memory.fetch.called"),
+])
+def test_readside_503_body_never_carries_the_enclave_response_text(
+    user, monkeypatch, route, payload, event_type,
+):
+    """The invariant, anchored on absence of the text -- not on a status code.
+
+    Asserting ``503`` or ``{"error": <some slug>}`` would have been green before
+    this change too, since the pre-fix body was ``str(e)`` with a 503 beside it.
+    """
+    _uid, api_key = user
+    events = []
+    err = _enclave_error_from_producer(monkeypatch, 403, _ENCLAVE_CANARY)
+
+    def boom(*a, **k):
+        raise err
+
+    monkeypatch.setattr(memory_readside_core, "memory_index_core", boom)
+    monkeypatch.setattr(memory_readside_core, "memory_fetch_core", boom)
+    monkeypatch.setattr(
+        memory_core.debug_trace, "trace_event",
+        lambda _store, **event: events.append(event))
+
+    status, body = _asgi("POST", route, headers=_headers(api_key), json_body=payload)
+
+    assert status == 503
+    serialized = json.dumps(body)
+    assert _ENCLAVE_CANARY not in serialized
+    assert "owner mismatch" not in serialized
+    assert "decrypt_failed" not in serialized
+    assert "SYNTHETIC-CANARY-9f3a" not in serialized
+    # Nothing from the exception message survives anywhere in the body, not just
+    # under the key we happen to expect it under.
+    assert str(err) not in serialized
+    assert body == {"error": "readside_unavailable"}
+
+    # ...and the triage that used to live in the body is now in the trace.
+    assert events[-1]["type"] == event_type
+    assert events[-1]["detail"]["upstream"] == "enclave_http_403"
+    assert _ENCLAVE_CANARY not in json.dumps(events[-1])
+
+
+def _readside_failure(monkeypatch, api_key, message: str):
+    """Drive one readside RuntimeError; return (status, body, triage label)."""
+    events = []
+
+    def boom(*a, **k):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(memory_readside_core, "memory_index_core", boom)
+    monkeypatch.setattr(
+        memory_core.debug_trace, "trace_event",
+        lambda _store, **event: events.append(event))
+    status, body = _asgi(
+        "POST", "/v1/memory/index", headers=_headers(api_key), json_body={})
+    return status, body, events[-1]["detail"]["upstream"]
+
+
+def test_every_upstream_signal_is_reachable(user, monkeypatch):
+    """Each row must be the winner for at least one message.
+
+    The equality check above pins the table's contents; this pins that the
+    lookup still agrees with it. A prefix typo (``enclave_http_429`` ->
+    ``enclave_http_4299``) leaves every label in place, so a set -- or even a
+    tuple -- comparison against a *mutated* production table is not enough on
+    its own: the probes have to be built from the test-side inventory and
+    actually executed. Probing with the bare prefix is deliberate; because the
+    table is first-match-wins and ordered specific-to-general, a prefix that no
+    longer wins its own probe has been shadowed or misspelled.
+    """
+    _uid, api_key = user
+
+    for prefix, label in _EXPECTED_UPSTREAM_SIGNALS:
+        status, _body, actual = _readside_failure(monkeypatch, api_key, prefix)
+        assert status == 503, prefix
+        assert actual == label, f"{prefix!r} mapped to {actual!r}, expected {label!r}"
+
+
+def test_upstream_status_is_mapped_through_a_table_not_passed_through(
+    user, monkeypatch,
+):
+    """A bounded value is not automatically a safe one.
+
+    The enclave is an upstream, so its status code is external input. The signal
+    is a label looked up in ``_UPSTREAM_SIGNALS``, so a code we never listed --
+    including a non-standard one -- lands on a bucket rather than being echoed.
+    """
+    _uid, api_key = user
+
+    def run(message: str) -> str:
+        status, body, label = _readside_failure(monkeypatch, api_key, message)
+        # None of the messages below are closed-set members, so each one must
+        # also collapse to the generic code in the response body.
+        assert (status, body) == (503, {"error": "readside_unavailable"}), message
+        return label
+
+    # Realistic messages, i.e. prefix plus the payload the producer appends.
+    assert run("enclave_http_401:synthetic") == "enclave_http_401"
+    assert run("enclave_http_403:synthetic") == "enclave_http_403"
+    assert run("enclave_http_404:synthetic") == "enclave_http_404"
+    assert run("enclave_http_408:synthetic") == "enclave_http_408"
+    assert run("enclave_http_429:synthetic") == "enclave_http_429"
+    assert run("enclave_http_503:synthetic") == "enclave_http_5xx"
+    # Non-standard vendor code: bucketed, never echoed.
+    assert run("enclave_http_499:synthetic") == "enclave_http_4xx"
+    assert run("enclave_http_299:synthetic") == "enclave_http_other"
+    # A code-shaped string that is not a code at all.
+    assert run("enclave_http_<script>:synthetic") == "enclave_http_other"
+    assert run("enclave_error:ConnectTimeout") == "enclave_error"
+    # A message from outside the known vocabulary degrades, it does not pass.
+    assert run("psycopg2 could not connect to host db-internal-7") == "unknown"
+
+    assert "unknown" not in _EXPECTED_UPSTREAM_LABELS
+
+
+def test_the_closed_sets_are_exactly_the_documented_inventory():
+    """Pin the membership itself, not just the behaviour of whoever is a member.
+
+    Every other test here drives the contract through the app, so it can only
+    check the members that exist. This one is the anchor: it fails if the
+    production sets and the inventory above disagree in either direction, which
+    is what makes a silent removal impossible.
+    """
+    assert set(memory_core._CLOSED_READSIDE_ERRORS) == _EXPECTED_CLOSED_READSIDE_ERRORS
+    assert set(memory_core._CLOSED_REQUEST_ERRORS) == _EXPECTED_CLOSED_REQUEST_ERRORS
+    # Tuple equality, so prefixes and their order are pinned as well as labels.
+    assert memory_core._UPSTREAM_SIGNALS == _EXPECTED_UPSTREAM_SIGNALS
+    # The two sets must stay disjoint: a request-shaped message that is also a
+    # readside literal would get a 400 and a 503 depending on which lane raised.
+    assert not (_EXPECTED_CLOSED_READSIDE_ERRORS & _EXPECTED_CLOSED_REQUEST_ERRORS)
+
+
+def test_the_readside_contract_is_documented():
+    """A closed set the caller cannot look up is not a contract."""
+    doc = Path(__file__).parent.parent / "docs" / "API_ERRORS.md"
+    slugs = set(re.findall(r"^\| `([a-z][a-z0-9_]+)` \|", doc.read_text(encoding="utf-8"), re.M))
+    missing = _EXPECTED_READSIDE_DOC_SLUGS - slugs
+    assert not missing, f"API_ERRORS.md 缺 readside slug: {sorted(missing)}"
+
+
+def test_closed_readside_messages_are_not_collapsed(user, monkeypatch):
+    """The mirror case: this is a redaction, not a blanket flattening.
+
+    Without this, replacing every 503 body with one constant would also pass the
+    leak test above while destroying a contract callers already depend on.
+    """
+    _uid, api_key = user
+
+    def run(message: str):
+        def boom(*a, **k):
+            raise RuntimeError(message)
+
+        monkeypatch.setattr(memory_readside_core, "memory_index_core", boom)
+        monkeypatch.setattr(
+            memory_core.debug_trace, "trace_event", lambda _store, **event: None)
+        return _asgi(
+            "POST", "/v1/memory/index", headers=_headers(api_key), json_body={})
+
+    for message in sorted(_EXPECTED_CLOSED_READSIDE_ERRORS):
+        assert run(message) == (503, {"error": message}), message
+
+
+def test_fetch_value_error_is_adjudicated_too(user, monkeypatch):
+    """The ValueError branch is not innocent by default.
+
+    ``except ValueError`` catches more than the readside's own literals: any
+    stdlib ValueError raised anywhere under the call lands here, and
+    ``json.JSONDecodeError`` is a ValueError whose message is built from the
+    document being parsed -- which on this lane is decrypted user plaintext.
+    """
+    _uid, api_key = user
+
+    def run(exc: Exception):
+        def boom(*a, **k):
+            raise exc
+
+        monkeypatch.setattr(memory_readside_core, "memory_fetch_core", boom)
+        monkeypatch.setattr(
+            memory_core.debug_trace, "trace_event", lambda _store, **event: None)
+        return _asgi(
+            "POST", "/v1/memory/fetch", headers=_headers(api_key),
+            json_body={"ids": ["m-synthetic"]})
+
+    # Known closed literals keep their contract.
+    for message in sorted(_EXPECTED_CLOSED_REQUEST_ERRORS):
+        assert run(ValueError(message)) == (400, {"error": message}), message
+
+    # Anything else collapses, including the JSONDecodeError shape.
+    status, body = run(ValueError("SYNTHETIC-VE-CANARY invalid literal: 'hunter2'"))
+    assert (status, body) == (400, {"error": "request_invalid"})
+    assert "hunter2" not in json.dumps(body)
+    assert "SYNTHETIC-VE-CANARY" not in json.dumps(body)
+
+    decode_error = json.JSONDecodeError("Expecting value", "SYNTHETIC-PLAINTEXT", 0)
+    status, body = run(decode_error)
+    assert (status, body) == (400, {"error": "request_invalid"})
+    assert "SYNTHETIC-PLAINTEXT" not in json.dumps(body)
 
 
 def test_index_invalid_limit_400_parity(user):

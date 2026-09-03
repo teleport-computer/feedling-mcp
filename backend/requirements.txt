@@ -95,23 +95,56 @@ reportlab==5.0.0
 # (no system deps).
 Pillow>=11,<13
 
-# DEPRECATED 2026-08-20：TEE Redis CVM 已暂停，客户端入口固定拒绝构造。
-# 依赖暂留给保留实现与退役门禁测试；重新接入必须另开 spec（见
-# docs/REDIS_USAGE.md），不得直接调用现有模块。模块只用跨
-# 4.5–6.x 稳定的 async API（redis.asyncio.Redis 的 ssl_ca_certs/max_connections
-# 等 + aclose/close 兜底），故 range 放宽。
-redis>=5,<7
-
 # 记忆的编辑判断内核 —— 从本仓库提取出去的独立库（Apache-2.0，公开仓库）。
 #
-# 为什么走 GitHub Release 的 wheel URL 而不是 PyPI：
-#   1. PyPI 上 memory-garden 已被一个同领域的项目占用，我们叫 memgarden；
-#      发 PyPI 是后续的事，Release 先跑通接入。
-#   2. 本镜像用 `pip install --require-hashes`，每个依赖都必须有 sha256。
-#      git+ 依赖给不出稳定 wheel 哈希，Release 上的固定 wheel 可以 —— 这也是
-#      compose 哈希上链所要求的「构建可复现」。
+# 0.12.8 起走 PyPI。之前钉的是 GitHub Release 的 wheel URL，原因是
+# PyPI 上 memory-garden 这个名字被一个同领域项目占了、我们还没发；现在以
+# memgarden 这个名字发出去了，那条理由不再成立。
 #
-# 升级 = 换 URL 里的版本号 + 重新 `uv pip compile --generate-hashes`。
-# 别写成 @main 或分支名：那样构建就不可复现了，整条证明链失效。
-memgarden @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/memgarden-0.2.0-py3-none-any.whl
-agent-protocol-core @ https://github.com/teleport-computer/memgarden/releases/download/v0.2.0/agent_protocol_core-0.2.0-py3-none-any.whl
+# memgarden 现在是**零依赖**的（2026-09-02 起）。原来跟它锁步的
+# agent-protocol-core 已经搬进 backend/agent_protocol_core/ —— 那里面装的是
+# io 自己的思维链实现（人格文案、屏幕监看说辞、FEEDLING_ 开关），本来就不该
+# 跟着一个公开的记忆库一起发。
+#
+# 本镜像用 `pip install --require-hashes`，升级 = 改这里的版本号 +
+# 重新 `uv pip compile --generate-hashes`（命令见 deploy/BUILD.md）。
+#
+# 🔴 升版本 = 同时接收**其他人**合进 memgarden main 的改动
+#
+# memgarden 是团队共享的仓库，发版是从 main 的当前状态切的 —— 不是从「谁改了
+# 什么」切的。所以把这里从 X 升到 Y，io 拿到的是 X..Y 区间里**所有人**的改动，
+# 不只是你要的那一个。
+#
+# 而且 `agent-protocol-core` 和 `memgarden` 在**同一个仓库**里（`self_thinking`
+# 在前者）。io 两个都装，所以只碰了 core 的改动也会跟着进来。
+#
+# 升之前先看一眼区间：
+#
+#     git -C <memgarden checkout> log --oneline vX..vY
+#
+# 实例（2026-08-30）：为了发自己的修复从 0.12.0 升到 0.12.8，顺带带进了别人的
+# self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
+# 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
+# 不知道。
+memgarden==0.15.0
+
+# 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
+# memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
+# compose 哈希上链要求构建可复现）。
+# 0.2.0 把八个纯函数模块搬进了 perceptkit.algorithms（见该包 CHANGELOG），
+# 所以这条 pin 和本分支的 import 是一起改的：装着 0.1.0 的环境跑本分支会在
+# import 时就炸。release 已发（2026-08-31，tag v0.2.0，commit f591a80）。
+#
+# 0.2.5 → 0.2.7（2026-09-02，外部审查那一轮）。这次同样是 pin 和代码一起改，
+# 装着 0.2.4 跑本分支会在 import 时就炸（缺 StoragePort.list_events /
+# delete_aggregates、缺 PerceptionKit.run_retention）。区间里的三件事：
+#
+#   0.2.5  终态事件查得到（新增 list_events 端口）；翻页 offset 真的下推到存储；
+#          照片每日新增数不再永远是 1（daily_total 取 max → occurrence_count 求和）
+#   0.2.6  清理有了统一入口 run_retention + delete_aggregates 端口；
+#          重算时同一源事实只留最高修订，不再把错值和改正值一起折进去
+#   0.2.7  跳过原因带稳定 code，文案归宿主（本文件的 retention.py 用它渲染英文）
+#
+# ⚠️ 0.2.5 那条照片计数的修复会**改变已有数字的含义**：历史上被写成 1 的日子
+# 修不回来（明细只留 7 天，更早的连重算的原料都没有），从上线那天起才对。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.7/perceptkit-0.2.7-py3-none-any.whl

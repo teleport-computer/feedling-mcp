@@ -662,7 +662,7 @@ def apply_outputs(
         debug_trace.trace_event(
             store, subsystem="genesis", type="genesis.outputs.applied", actor="backend",
             job_id=job_id, status="failed", summary="apply failed",
-            detail={"reason": f"{type(e).__name__}:{str(e)[:80]}"})
+            detail={"reason": "apply_failed", "error_class": type(e).__name__})
         failed = service.mark_failed(
             store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}", exc=e,
         )

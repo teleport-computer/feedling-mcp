@@ -114,22 +114,38 @@ def _spec(
 
 def _chat_specs() -> tuple[ErrorSpec, ...]:
     return (
+        _spec("image_payload_conflict", "chat", "request", "user_environment", "一次只能使用单图字段或多图字段，请勿同时发送。", en="Send either the single-image fields or images, not both."),
+        _spec("image_list_empty", "chat", "request", "user_environment", "图片列表不能为空。", en="The images list must not be empty."),
+        _spec("image_count_exceeds_limit", "chat", "request", "user_environment", "一次最多发送 9 张图片。", en="You can send at most 9 images in one message."),
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
-        _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
-        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|provider_http_40[13]"),
-        _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
-        _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", matcher=r"missing the \{message\} placeholder"),
+        _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
+        _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
+        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b40[13]\b|provider_http_40[13]"),
+        _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", en="The model name is unavailable. Check the model name in Settings.", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
+        _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", en="The Agent launch command is invalid because it is missing the {message} placeholder. Fix AGENT_CLI_CMD.", matcher=r"missing the \{message\} placeholder"),
         _spec("vision_model_required", "vision", "vision_model", "user_provider", "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型", en="Your current model can't process images, so it didn't receive this picture. Switch models, or add a dedicated vision model in Settings.", matcher=r"unknown variant `image_url`, expected `text`|no endpoints found that support image input"),
-        _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
-        _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
+        _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", en="The current model does not support a capability used by this request. Choose another model or adjust it in Settings.", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
+        _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", en="This conversation is too long for the model's context window. Shorten it and try again.", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
         _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=r"content_filter|content policy|safety|blocked by"),
         _spec("rate_limited", "chat", "provider", "provider_transient", "模型服务限流了，稍等几分钟再试。", matcher=r"\b429\b|provider_http_429|too many requests|rate.?limit"),
         _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason"),
         _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。"),
-        _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。"),
+        _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。", en="Your model service did not respond in time. Check the provider's stability before trying again."),
+        _spec("provider_output_truncated", "chat", "provider", "provider_transient", "模型在写完文件前达到了输出上限，未发送不完整的文件。可缩小内容后重试，或换用输出上限更高的模型。", en="The model reached its output limit before finishing the file, so the incomplete file was not sent. Try a smaller version or a model with a higher output limit.", matcher=r"\bprovider_output_truncated\b"),
         _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
+        _spec("file_delivery_incomplete", "chat", "delivery", "system", "文件内容已经保存，但附件发送没有完成。请稍后再试。", en="The file was saved, but its attachment was not delivered. Please try again later.", matcher=r"\bfile_delivery_incomplete\b"),
         _spec("canvas_file_delivery_incomplete", "chat", "delivery", "system", "画布内容已经保存，但卡片更新没有完成。请稍后再试。", en="The Canvas content was saved, but its card update did not finish. Please try again later.", matcher=r"\bcanvas_file_delivery_incomplete\b"),
-        _spec("reply_parse_failed", "chat", "provider", "system", "系统处理回复时出了问题，我们会尽快排查。"),
+        _spec(
+            "reply_parse_failed",
+            "chat",
+            "provider",
+            "system",
+            "系统处理回复时出了问题，我们会尽快排查。请再发一次。",
+            en=(
+                "Something went wrong while we processed the reply. "
+                "We're looking into it — please send it again."
+            ),
+        ),
         _spec("unknown", "chat", "provider", "system", "连接模型服务时出了问题。"),
         _spec(UNREGISTERED_ERROR_CLASS, "chat", "contract", "system", "系统返回了未注册的错误分类，我们已记录并会尽快排查。", en="The runtime returned an unregistered error classification. We recorded it for investigation."),
     )
@@ -137,8 +153,8 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
 
 def _platform_specs() -> tuple[ErrorSpec, ...]:
     return (
-        _spec("platform_queue_timeout", "platform", "platform", "system", "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。"),
-        _spec("platform_execution_timeout", "platform", "platform", "system", "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。"),
+        _spec("platform_queue_timeout", "platform", "platform", "system", "这条消息没有及时开始处理，也没有生成回复。请稍后再试，不要连续发送。", en="This message did not start processing in time, so no reply was generated. Try again later and avoid sending it repeatedly."),
+        _spec("platform_execution_timeout", "platform", "platform", "system", "这轮回复因系统执行异常没有完成，也不会重复生成回复。请稍后再试，不要连续发送。", en="This reply did not finish because of a system execution error, and it will not be generated again automatically. Try again later and avoid sending it repeatedly."),
     )
 
 
@@ -191,6 +207,7 @@ def _image_generation_specs() -> tuple[ErrorSpec, ...]:
         ("image_generation_quota_insufficient", "user_provider", "生图模型服务额度不足，充值后再试。", "The image generation service has insufficient quota. Add credit and try again."),
         ("image_generation_model_not_found", "user_provider", "当前生图模型不可用，请到设置里更换模型。", "The image generation model is unavailable. Choose another model in Settings."),
         ("image_generation_model_not_ready", "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。", "The image generation model isn't ready. Save it again or choose another model in Settings."),
+        ("image_generation_key_decrypt_failed", "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。", "The image generation model isn't ready. Save it again or choose another model in Settings."),
         ("image_generation_rate_limited", "provider_transient", "生图模型请求太多，请稍等几分钟再试。", "The image generation service is rate limited. Try again in a few minutes."),
         ("image_generation_unavailable", "provider_transient", "生图模型暂时无法连接，请稍后重试。", "The image generation service is temporarily unavailable. Try again later."),
         ("image_generation_invalid_output", "provider_transient", "生图模型没有返回有效图片，请重试或更换模型。", "The image generation model returned no valid image. Try again or choose another model."),
@@ -303,6 +320,9 @@ def consumer_specs() -> tuple[ErrorSpec, ...]:
         spec
         for spec in public_specs()
         if spec.domain in {"chat", "platform", "vision", "image_generation"}
+        # Request validation failures are returned directly by the hosted API;
+        # they never enter the resident's agent-error classifier.
+        and spec.family != "request"
         and spec.code != "image_generation_internal_error"
     )
 

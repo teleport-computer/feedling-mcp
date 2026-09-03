@@ -10,7 +10,7 @@ from typing import Literal
 PoolName = Literal["foreground", "wake", "heavy"]
 
 _FOREGROUND_LANES = frozenset({"chat", "manual_wake"})
-_WAKE_LANES = frozenset({"heartbeat", "scheduled", "screen_watch"})
+_WAKE_POOL_LANES = frozenset({"heartbeat", "scheduled", "screen_watch"})
 _HEAVY_LANES = frozenset(
     {"dream", "capture", "maintenance", "trajectory_review"}
 )
@@ -59,7 +59,7 @@ class RuntimePoolConfig:
             for index in range(foreground_slots)
         )
         slots.extend(
-            SlotSpec("wake", index, _WAKE_LANES, 240.0, 900.0)
+            SlotSpec("wake", index, _WAKE_POOL_LANES, 240.0, 900.0)
             for index in range(wake_slots)
         )
         for index in range(heavy_slots):

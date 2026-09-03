@@ -12,7 +12,10 @@ from asgi_test_client import _AsgiTestClient  # noqa: E402
 from enclave import auth as enclave_auth  # noqa: E402
 from enclave import backend_client, envelope as envmod, keys  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
+from enclave.readside import MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
+from enclave.routes import chat as enclave_chat  # noqa: E402
+from core import chat_images  # noqa: E402
 
 
 @pytest.fixture()
@@ -36,6 +39,38 @@ def _wire(monkeypatch, messages, moments=None):
     async def fake_sk():
         return object()
     monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+
+def test_multi_image_history_returns_and_omits_each_image(monkeypatch):
+    bundle = chat_images.encode_image_bundle([
+        (b"one", "image/jpeg"), (b"two", "image/png")
+    ])
+    row = {
+        "id": "m-images", "role": "user", "ts": 1.0, "v": 1,
+        "content_type": "image", "visibility": "shared",
+        "owner_user_id": "usr_a", "body_ct": "cipher",
+        "image_bundle_version": 1, "image_count": 2,
+        "image_mimes": ["image/jpeg", "image/png"],
+    }
+    monkeypatch.setattr(envmod, "read_envelope", lambda *_args: bundle)
+    messages, errors = enclave_chat._decrypt_history_items([row], "usr_a", object())
+    assert errors == []
+    assert messages[0]["images"] == [
+        {"image_b64": base64.b64encode(b"one").decode(), "image_mime": "image/jpeg"},
+        {"image_b64": base64.b64encode(b"two").decode(), "image_mime": "image/png"},
+    ]
+
+    omitted = {**row, "body_omitted": True, "body_omitted_reason": "image_body"}
+    omitted.pop("body_ct")
+    messages, errors = enclave_chat._decrypt_history_items(
+        [omitted], "usr_a", object()
+    )
+    assert errors == []
+    assert messages[0]["images"] == [
+        {"image_omitted": True, "image_mime": "image/jpeg"},
+        {"image_omitted": True, "image_mime": "image/png"},
+    ]
+    assert all("image_b64" not in item for item in messages[0]["images"])
 
 
 def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):
@@ -77,6 +112,130 @@ def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):
     assert "memlist_fetch" in order and "decrypt_end" in order
     assert order.index("memlist_fetch") < order.index("decrypt_end"), \
         f"memory/list 没有与解密并行: {order}"
+
+
+def test_quoted_memory_uses_exact_fetch_outside_default_candidate_pool(
+    client, monkeypatch
+):
+    seen: dict = {}
+    quoted_id = f"quoted_{MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT + 1}"
+    quoted_title = f"第 {MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT + 1} 张"
+    message = {
+        "id": "m1",
+        "role": "user",
+        "ts": 1.0,
+        "v": 1,
+        "source": "ios",
+        "K_enclave": "x",
+        "body_ct": "x",
+        "nonce": "x",
+        "owner_user_id": "usr_a",
+        "quoted_memory_ids": quoted_id,
+    }
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            return {"messages": [message], "total": 1}
+        if path == "/v1/memory/list":
+            seen["list_limit"] = (params or {}).get("limit")
+            return {
+                "moments": [
+                    {"id": f"candidate_{index:03d}", "K_enclave": "x"}
+                    for index in range(MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT)
+                ],
+                "total": MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT + 1,
+            }
+        raise AssertionError(path)
+
+    async def fake_backend_post(path, headers, payload):
+        seen["fetch_path"] = path
+        seen["fetch_payload"] = dict(payload)
+        return {
+            "items": [{
+                "id": quoted_id,
+                "title": quoted_title,
+                "description": "精确引用可见",
+                "type": "fact",
+            }],
+            "missing_ids": [],
+            "unavailable_ids": [],
+        }
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    monkeypatch.setattr(backend_client, "backend_post", fake_backend_post)
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: b"question")
+
+    async def fake_sk():
+        return object()
+
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    response = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+
+    assert response.status_code == 200
+    quoted = response.get_json()["messages"][0]["quoted_memories"]
+    assert quoted[0]["id"] == quoted_id
+    assert quoted[0]["text"] == f"{quoted_title}\n精确引用可见"
+    assert seen["list_limit"] == str(MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT)
+    assert seen["fetch_path"] == "/v1/memory/fetch"
+    assert seen["fetch_payload"] == {
+        "ids": [quoted_id],
+        "limit": 1,
+        "include_archived": True,
+        "include_superseded": True,
+    }
+
+
+def test_quoted_memory_fetch_failure_returns_generic_unavailable_marker(
+    client, monkeypatch
+):
+    message = {
+        "id": "m1",
+        "role": "user",
+        "ts": 1.0,
+        "v": 1,
+        "source": "ios",
+        "K_enclave": "x",
+        "body_ct": "x",
+        "nonce": "x",
+        "owner_user_id": "usr_a",
+        "quoted_memory_ids": "gone",
+    }
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            return {"messages": [message], "total": 1}
+        if path == "/v1/memory/list":
+            return {"moments": [], "total": 0}
+        raise AssertionError(path)
+
+    async def failed_backend_post(path, headers, payload):
+        raise RuntimeError("fetch unavailable")
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    monkeypatch.setattr(backend_client, "backend_post", failed_backend_post)
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: b"question")
+
+    async def fake_sk():
+        return object()
+
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    response = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+
+    assert response.status_code == 200
+    message_out = response.get_json()["messages"][0]
+    assert "quoted_memory_ids" not in message_out
+    assert "quoted_memories" not in message_out
+    assert message_out["quoted_memory_status"] == {
+        "requested": 1,
+        "resolved": 0,
+        "unavailable": 1,
+    }
 
 
 def test_history_head_supported(client, monkeypatch):

@@ -2,8 +2,7 @@
 
 No I/O, no DB, no LLM calls — just deterministic message-list construction
 from a system prompt, an optional **untrusted** conversation summary, a
-verbatim message tail, and an optional untrusted runtime-data block. It depends
-only on stdlib and pure shared chat helpers.
+verbatim message tail, and an optional untrusted runtime-data block.
 
 提示词语言固定分四层：
 
@@ -22,12 +21,13 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from chat.reply_language import infer_reply_language_policy, local_time_labels
+from chat.reply_language import infer_reply_language, local_time_labels
+from core import util as core_util
 from agent_protocol_core import self_thinking
 import worldbook_match
 from voice.message_filter import VOICE_CALL_RECORD_ROLE, conversation_rows
 from identity import card_policy
-from perception_kernel import prompts as perception_prompts
+from perceptkit import prompts as perception_prompts
 
 
 def _join_policy_blocks(*blocks: str) -> str:
@@ -272,7 +272,13 @@ _CHAT_FILE_BOUNDARY_POLICY = (
 
 _CHAT_CANVAS_POLICY = (
     "当一个小型交互体验比普通聊天更适合表达对方的想法时，你也可以主动选择制作 Canvas。"
-    "把它写成一个完整、离线、自包含的 UTF-8 文件，路径使用 "
+    # The next two sentences are the equivalent Chinese rendering of the
+    # authoritative V1 Canvas boundary in agent_tools_prompt.md:49-53. Keep
+    # both surfaces in sync when that product policy changes.
+    "如果对方没有要求制作，而一个小型交互体验可能确实有帮助、但是否合适还不确定，"
+    "先简短提议制作，等对方答复后再做。不要仅为了装饰闲聊、情绪支持，或本可直接在"
+    "对话中回答的问题而制作或提议这种体验；对方没有接受的提议不要重复。"
+    "把 Canvas 写成一个完整、离线、自包含的 UTF-8 文件，路径使用 "
     "/workspace/<安全文件名>.io.html；HTML、CSS、JavaScript 和数据都必须内联。"
     "用对方当前回复语言写简洁的 <title>，IO 会把它作为卡片标题；更新已有 Canvas 时"
     "保留原路径，只有对方要求重命名时才修改 <title>。除非对方询问，否则请谈论体验本身，"
@@ -345,18 +351,18 @@ _FILE_CREATE_RE = re.compile(
 )
 _FILE_DESIRE_RE = re.compile(
     r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*(?:"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)|"
     r"[^。！？\n]{0,32}?(?:文档|文件|附件|报告|计划书|清单|表格|简历))|"
     r"\b(?:i want|i need|i would like|i'd like)\s+(?:a\s+|an\s+)?"
-    r"(?:(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)\b|"
+    r"(?:(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)\b|"
     r"[^.!?\n]{0,48}?\b(?:document|file|attachment|report|plan|checklist|"
     r"spreadsheet|resume)\b))"
 )
 _FILE_EXPLICIT_REQUEST_RE = re.compile(
     r"(?:(?:帮我|替我|为我)(?:生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
-    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)|"
     r"我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)|"
     r"\b(?:create|generate|make|produce|export|save|convert)\b.{0,40}\bfor me\b|"
     r"\b(?:send|give|provide) me\b)"
 )
@@ -380,12 +386,12 @@ _FILE_CANCEL_RE = re.compile(
 _FILE_NEGATED_FORMAT_RE = re.compile(
     r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?\s*"
     r"(?:生成|创建|制作|导出|发送|发|提供)?\s*"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)"
     r"\s*(?:格式|文档|文件)?|"
     r"\b(?:do not|don't|no need to)\s+"
     r"(?:(?:create|generate|make|export|send|provide)\s+)?"
     r"(?:(?:a|an|any|the)\s+)?"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|tsv|html|json|xml|yaml|yml|rtf|svg)"
     r"(?:\s+(?:format|document|file))?\b)"
 )
 _FILE_ADDITIVE_RE = re.compile(
@@ -413,11 +419,13 @@ _FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (".md", re.compile(r"(?:\.md\b|\bmarkdown\b|markdown\s*文档|md\s*文档)")),
     (".txt", re.compile(r"(?:\.txt\b|\btxt\b|纯文本(?:文档|文件)?)")),
     (".csv", re.compile(r"(?:\.csv\b|\bcsv\b)")),
+    (".tsv", re.compile(r"(?:\.tsv\b|\btsv\b)")),
     (".html", re.compile(r"(?:\.html?\b|\bhtml\b)")),
     (".json", re.compile(r"(?:\.json\b|\bjson\b)")),
     (".xml", re.compile(r"(?:\.xml\b|\bxml\b)")),
-    (".yaml", re.compile(r"(?:\.ya?ml\b|\byaml\b)")),
+    (".yaml", re.compile(r"(?:\.ya?ml\b|\bya?ml\b)")),
     (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
+    (".svg", re.compile(r"(?:\.svg\b|\bsvg\b)")),
 )
 
 # Conservative completion guard for explicit image-creation requests. The model
@@ -499,24 +507,6 @@ def ordered_reply_tail(
     return ordered
 
 
-def text_of(content: Any) -> str:
-    """Extract the human-readable text from a tail row's ``content``.
-
-    ``content`` is either a plain string, or an OpenAI-style content-block list
-    (``[{"type":"text","text":...}, {"type":"image_url", ...}]``) once the worker
-    has injected images. Mirrors ``provider_client._content_text`` but is
-    replicated here to keep this module stdlib-only (dependency direction).
-    """
-    if isinstance(content, list):
-        parts = [
-            str(p.get("text") or "").strip()
-            for p in content
-            if isinstance(p, dict) and str(p.get("text") or "").strip()
-        ]
-        return "\n".join(parts).strip()
-    return str(content or "").strip()
-
-
 def _required_file_suffixes_for_text(normalized: str) -> tuple[str, ...] | None:
     intent_scope = _FILE_NEGATED_FORMAT_RE.sub(" ", normalized)
     has_action = bool(
@@ -562,7 +552,7 @@ def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
         if _norm_role(message.get("role")) != "user":
             continue
         normalized = unicodedata.normalize(
-            "NFKC", text_of(message.get("content"))
+            "NFKC", core_util.text_of(message.get("content"))
         ).casefold()
         if not normalized.strip():
             continue
@@ -793,13 +783,11 @@ def build_temporal_context(
     now_value = float(now_ts)
     now_utc = datetime.fromtimestamp(now_value, tz=timezone.utc)
     now_local = now_utc.astimezone(zone)
-    language_policy = infer_reply_language_policy(
-        {},
-        [],
+    reply_language = infer_reply_language(
         locale=str(locale or ""),
         archive_language=str(archive_language or ""),
     )
-    labels = local_time_labels(now_local, language_policy)
+    labels = local_time_labels(now_local, reply_language)
 
     last_ts = _finite_timestamp(last_user_message_ts)
     last_sent_at = (

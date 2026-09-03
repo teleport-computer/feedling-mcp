@@ -148,20 +148,80 @@ async def _handshake(client, target, send_headers, *,
     return session
 
 
+def _resource_metadata(resource: dict) -> str:
+    uri = str(resource.get("uri") or "unknown")
+    mime_type = str(resource.get("mimeType") or "unknown")
+    return (
+        f"uri={json.dumps(uri, ensure_ascii=False)} "
+        f"mimeType={json.dumps(mime_type, ensure_ascii=False)}"
+    )
+
+
 def _content_text(content) -> str:
-    """Flatten an MCP tool-result content array to text. Non-text blocks (image,
-    resource) are noted but not inlined — the model gets the text parts."""
+    """Flatten the MCP 2025-06-18 ``ContentBlock`` union for the model."""
     if isinstance(content, str):
         return content
     parts: list[str] = []
     for block in content or []:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "text":
+        block_type = block.get("type")
+        if block_type == "text":
             parts.append(str(block.get("text") or ""))
-        elif block.get("type"):
-            parts.append(f"[{block.get('type')} content omitted]")
+        elif block_type == "resource":
+            resource = block.get("resource")
+            if not isinstance(resource, dict):
+                parts.append("[resource content unavailable: invalid resource metadata]")
+                continue
+            metadata = _resource_metadata(resource)
+            if isinstance(resource.get("text"), str):
+                parts.append(
+                    f"[embedded resource: {metadata}]\n{resource['text']}"
+                )
+            elif isinstance(resource.get("blob"), str):
+                parts.append(f"[binary resource omitted: {metadata}]")
+            else:
+                parts.append(f"[resource content unavailable: {metadata}]")
+        elif block_type == "resource_link":
+            parts.append(
+                "[resource link; content not embedded by server: "
+                f"{_resource_metadata(block)}]"
+            )
+        elif block_type in {"image", "audio"}:
+            mime_type = block.get("mimeType")
+            suffix = (
+                f": mimeType={json.dumps(str(mime_type), ensure_ascii=False)}"
+                if mime_type else ""
+            )
+            parts.append(f"[{block_type} binary content omitted{suffix}]")
+        elif block_type:
+            parts.append(f"[{block_type} content not inlined]")
     return "\n".join(p for p in parts if p)
+
+
+def _structured_content_text(structured_content, content_text: str) -> str:
+    """Render spec-defined structured output without duplicating wrappers."""
+    if not isinstance(structured_content, dict):
+        return ""
+    try:
+        content_json = json.loads(content_text) if content_text else None
+    except (TypeError, ValueError):
+        content_json = None
+    if content_json == structured_content:
+        return ""
+    if (
+        set(structured_content) == {"result"}
+        and isinstance(structured_content["result"], str)
+        and structured_content["result"] == content_text
+    ):
+        return ""
+    rendered = json.dumps(
+        structured_content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"[structured content]\n{rendered}"
 
 
 def _wants_sse(mcp_transport) -> bool:
@@ -270,9 +330,15 @@ def _call_result(body: dict) -> dict:
     if "error" in body:
         return {"is_error": True, "text": json.dumps(body["error"])[:2000]}
     result = body.get("result") or {}
+    content_text = _content_text(result.get("content"))
+    structured_text = _structured_content_text(
+        result.get("structuredContent"), content_text
+    )
     return {
         "is_error": bool(result.get("isError")),
-        "text": _content_text(result.get("content"))[:20000],
+        "text": "\n".join(
+            part for part in (content_text, structured_text) if part
+        )[:20000],
     }
 
 

@@ -1,3 +1,8 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
+
 # tools/e2e — 发版 P0 冒烟（一键）
 
 `docs/testing/RELEASE_TESTING_PROTOCOL.md` §3 的可执行实现。**只打 test 环境**
@@ -11,7 +16,7 @@ python3 tools/e2e/p0.py --list                 # 看格子和 key 就位情况
 python3 tools/e2e/p0.py                        # 全量（无 key 的格子自动 SKIP）
 python3 tools/e2e/p0.py --only vps-claude-code # 只跑指定格子
 python3 tools/e2e/p0.py --cleanup-expired-failures # P0 值班人清理满七天的失败现场
-python3 tools/e2e/p0.py --cleanup-orphans      # 立即清理所有遗留账号
+python3 tools/e2e/p0.py --cleanup-orphans      # 清理遗留账号（保留期内 FAIL 现场除外）
 ```
 
 退出码：0 = 无硬失败（skip/warn 允许），1 = 有 FAIL（发版阻断）。
@@ -22,6 +27,8 @@ python3 tools/e2e/p0.py --cleanup-orphans      # 立即清理所有遗留账号
 诊断快照及 job/trace 定位符；最终 provider 输入继续只存在服务器端加密
 trajectory 中，不额外复制一份明文。七天清理由当班 P0 operator 执行；有本地
 admin token 时，清理器必须从 admin 用户接口复核 404 后才删除本地现场。
+`--cleanup-orphans` 也会在删号前检查该保留窗口：窗口内的 FAIL 账号与现场
+一并保留；现场 manifest 损坏或无法读取时也拒绝删号。
 
 ## key 池
 
@@ -55,11 +62,30 @@ E2E_KEY_DEEPSEEK=sk-…
 |---|---|---|
 | `repeat_wake_probe.py` | 重复定时提醒：fire 后自动续排 +24h、用**已 fired 的旧 id** 能整串取消、同刻同 repeat 去重、一次性提醒不续排 | 动 `scheduled_wake_v2` / `schedule_wake` 工具面时 |
 | `card_gate_probe.py` | 记忆卡内容闸不误杀真卡 | 动 capture/dream 判据时 |
+| `garden_language_probe.py` | 中文花园不会因一轮英文输入翻成英文 | 动花园语言判据、花园编排或 `memgarden` pin 时 |
 | `temporal_probe.py` | 模型真的读到了注入的时间锚点 | 动 V2 上下文组装时 |
 | `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
 | `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
 | `provider_response_envelope_probe.py` | 上游完整响应包装器不会进入 V2 气泡，且只触发一次有界纠正 | 动 provider 回复解析、V2 tool loop 或最终回复闸时 |
 | `wake_tool_markup_probe.py` | V2 manual wake 的工具标记在封装前剥离，用户私钥解密后只见正文 | 动 V2 wake 最终回复闸时 |
+| `aup_gate_probe.py` | 陪伴提示词（`self_thinking.INSTRUCTION`）没有被上游 AUP 闸拦下，**且当轮证明过自己还有判别力** | bump `agent_protocol_core` / `memgarden` pin，或改 `self_thinking` 文案时 |
+
+`aup_gate_probe` 的四个坑（写新探针时同样适用）：
+- **必须喂生产同形提示词，不能喂裸 INSTRUCTION。** 该闸对文本**非单调**：同一段
+  文案单独喂被拒、放进完整提示词里反而放行。
+- **提示词的每一段都现场从生产件重建，一个快照都不存。** 初版把 io_cli 目录、
+  MEMORY READ 段、FILE DELIVERY 段、回复语言规则存成 fixture；上真检查时
+  **三段全和分支对不上**（目录少两个参数、memory/file 段长度不符、回复语言整段改过措辞）。
+  ⇒ **快照必漂，而漂了不会有人发现**。现在这四段每轮由 `io_cli_catalog.build_catalog`、
+  consumer 的两个 block 函数、`reply_language_system_line` 现生成。
+  唯一手抄生产的是拼接胶水（`\n` 的个数），已在代码里点名。
+- **对照组必须与被测对象不同。** 第一版草稿里 live 与 canary 是同一段文本，于是它
+  **从未证明过自己能输出 PASS**——一个恒红的量具也能通过那种自测。现在 `control/distinct`
+  这一格会当场拒跑。
+- **灵敏度取决于跑在什么环境。** 裸 CI runner 上同一段文案可能根本不被拒。`canary/discriminating`
+  就是环境自检：canary 没被拒 ⇒ **这个环境测不了这件事**，换环境重跑，
+  别把它读成"我们没事"。退出码按 `deep.py` 的 qualification 口径：**默认任一非 PASS 都 rc=1**，
+  `--diagnostic` 才容忍 BLOCKED_EVIDENCE。探针自身的回归在 `tests/test_aup_gate_probe.py`。
 
 `repeat_wake_probe` 的两个坑（写新探针时同样适用）：
 - `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），

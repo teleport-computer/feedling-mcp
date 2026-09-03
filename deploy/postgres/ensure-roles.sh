@@ -81,7 +81,7 @@ ensure_role() {  # $1=role $2=password $3=extra grant SQL（可空）
     fi
 }
 
-# app：业务 CRUD，非 owner（DDL 会被拒 → Phase 1 负向验收）
+# app：业务访问与启动期 Alembic；继承 owner 以便在 TEE-primary 模式迁移。
 #
 # TRUNCATE 是 PostgreSQL 里独立于 DML 四件套的一项权限，必须显式授予：
 # SNAPSHOT lane（tee_shadow/snapshot.py）用 TRUNCATE+COPY 在单个事务里做整表原子
@@ -92,7 +92,8 @@ ensure_role() {  # $1=role $2=password $3=extra grant SQL（可空）
 # 破坏力等价，不构成实质提权；而按 lane 逐表授权会在将来某张表被改判进 SNAPSHOT
 # 时静默失效。
 ensure_role app "${APP_DB_PASSWORD}" \
-  "GRANT USAGE ON SCHEMA public TO app;
+  "GRANT \\\"${POSTGRES_USER}\\\" TO app;
+   GRANT USAGE ON SCHEMA public TO app;
    GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public TO app;
    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO app;
    ALTER DEFAULT PRIVILEGES FOR ROLE \\\"${POSTGRES_USER}\\\" IN SCHEMA public

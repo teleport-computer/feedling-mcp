@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client
+from agent_protocol_core import self_thinking
 import conftest
 import db
 from provider_types import ProviderMedia, ToolExchange, ToolResult
@@ -27,6 +28,7 @@ from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
 from model_api_runtime.v2 import context as v2_context
 from capabilities import tool_schema
+from core.downloadable_reply import sanitize_downloadable_reply
 
 
 _PROVIDER = provider_client.ProviderConfig(
@@ -100,6 +102,7 @@ def _run_loop(
     trajectory_events=None,
     tool_events=None,
     build_messages=None,
+    suppress_native_reasoning=False,
 ):
     calls = []
     replies = []
@@ -152,6 +155,7 @@ def _run_loop(
             fold_new_messages=no_fold,
             add_usage=lambda usage: None,
             max_calls=max_calls,
+            suppress_native_reasoning=suppress_native_reasoning,
             on_trajectory_event=(
                 record_trajectory if trajectory_events is not None else None
             ),
@@ -202,7 +206,10 @@ def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default
     )
 
     assert default_max == 700
-    assert seen_kwargs == [{"require_reply": False, "max_tokens": 4096}]
+    assert seen_kwargs == [{
+        "require_reply": False,
+        "max_tokens": provider_client.CHAT_OUTPUT_MAX_TOKENS,
+    }]
 
     seen_kwargs.clear()
     asyncio.run(
@@ -238,7 +245,11 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.md", "revision": 2},
+                        "args": {
+                            "path": "/workspace/计划.md",
+                            "revision": 2,
+                            "completion_message": "文件已经发给你了。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -260,6 +271,79 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
         ("f1", "send_file", "tool_call_started"),
         ("f1", "send_file", "tool_call_result"),
     ]
+
+
+def test_chinese_file_delivery_uses_chinese_compact_control_messages(monkeypatch):
+    files = []
+    request = (
+        "请生成并发送一个中文纯文本文件，文件名为中文附件，"
+        "正文写这是中文测试，请发送真实附件。"
+    )
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-cn",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/中文附件.txt",
+                        "content": "这是中文测试。",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-cn",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/中文附件.txt",
+                        "revision": 1,
+                        "completion_message": "中文附件已经生成，可以下载了。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".txt",),
+        file_requirement_messages=[{"role": "user", "content": request}],
+        max_calls=4,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [("/workspace/中文附件.txt", 1)]
+    assert replies == [("中文附件已经生成，可以下载了。", True)]
+    assert outcome.stop_reason == "final_text"
+    assert "现在调用 send_file" in messages_seen[1][0]["content"]
+    assert request in messages_seen[1][0]["content"]
+    assert "completion_message" in messages_seen[1][0]["content"]
+    assert "必须使用中文" in messages_seen[1][0]["content"]
+    assert self_thinking.INSTRUCTION.strip() not in messages_seen[1][0]["content"]
+    assert len(messages_seen) == 2
 
 
 def test_canvas_send_file_delivers_model_authored_display_metadata(monkeypatch):
@@ -319,7 +403,11 @@ def test_required_file_turn_offers_only_delivery_pipeline_tools(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/summary.md", "revision": 1},
+                        "args": {
+                            "path": "/workspace/summary.md",
+                            "revision": 1,
+                            "completion_message": "文档已生成。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -382,7 +470,11 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/a.md", "revision": 1},
+                        "args": {
+                            "path": "/workspace/a.md",
+                            "revision": 1,
+                            "completion_message": "File delivered.",
+                        },
                     },
                 ],
                 "usage": {},
@@ -417,8 +509,18 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
         ("help me make a checklist for packing", None),
         ("给我一个报告", None),
         ("请根据你对我们的记忆，整理一份 Markdown文档，并提供下载。", (".md",)),
+        ("将我们的记忆总结一下，生成一份Md 文档发给我", (".md",)),
         ("把 Markdown 文件转换成 Word 文档", (".docx",)),
         ("把Markdown文件转成Word文档", (".docx",)),
+        ("生成一份纯文本 TXT 文件", (".txt",)),
+        ("导出 CSV 文件", (".csv",)),
+        ("生成 TSV 文件", (".tsv",)),
+        ("生成 JSON 文件", (".json",)),
+        ("生成 XML 文件", (".xml",)),
+        ("生成 YML 文件", (".yaml",)),
+        ("生成 HTML 文件", (".html",)),
+        ("生成 RTF 文件", (".rtf",)),
+        ("生成 SVG 文件", (".svg",)),
         ("Word 和 PDF 有什么区别？", None),
         ("请帮我看看这个 Word 文档", None),
         ("如何创建 Word 文档？", None),
@@ -437,6 +539,228 @@ def test_required_file_suffixes_detects_clear_file_intent(text, expected):
     assert v2_context.required_file_suffixes(
         [{"role": "user", "content": text}]
     ) == expected
+
+
+@pytest.mark.parametrize(
+    ("suffix", "required_suffix"),
+    [
+        (".md", ".md"),
+        (".markdown", ".md"),
+        (".txt", ".txt"),
+        (".csv", ".csv"),
+        (".tsv", ".tsv"),
+        (".json", ".json"),
+        (".xml", ".xml"),
+        (".yaml", ".yaml"),
+        (".yml", ".yaml"),
+        (".html", ".html"),
+        (".htm", ".html"),
+        (".rtf", ".rtf"),
+        (".svg", ".svg"),
+        (".docx", ".docx"),
+        (".pdf", ".pdf"),
+    ],
+)
+def test_non_canvas_file_delivery_ignores_canvas_optional_fields(
+    monkeypatch,
+    suffix,
+    required_suffix,
+):
+    files = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    path = f"/workspace/文件测试{suffix}"
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": path,
+                        "content": "# 文件测试\n",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send",
+                    "name": "send_file",
+                    "args": {
+                        "path": path,
+                        "revision": 1,
+                        "title": "文件测试",
+                        "subtitle": "一份测试文件",
+                        "completion_message": "文件已经做好。",
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "文件已经生成，可以下载了。",
+                "tool_calls": [],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(required_suffix,),
+        max_calls=5,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [(path, 1)]
+    assert replies == [("文件已经生成，可以下载了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_file_marker_without_staged_attachment_is_not_a_download_link():
+    cleaned, removed = sanitize_downloadable_reply(
+        "文件已经生成：[file: 小林与小凛的记忆总结.md]",
+        attachment_staged=False,
+    )
+
+    assert removed is True
+    assert "[file:" not in cleaned
+
+
+def test_file_marker_with_staged_attachment_becomes_plain_confirmation():
+    cleaned, removed = sanitize_downloadable_reply(
+        "文件已经生成：[file: 小林与小凛的记忆总结.md]",
+        attachment_staged=True,
+    )
+
+    assert removed is True
+    assert cleaned == "文件已生成，可在下方下载。"
+
+
+def test_required_file_recovery_resets_tool_only_stall_before_delivery(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        results = []
+        for call in tool_calls:
+            if call.name == "workspace_write":
+                results.append(ToolResult(
+                    call_id=call.id,
+                    content=(
+                        "ok: workspace_write applied at revision 1; use the same "
+                        "path and revision 1 with send_file"
+                    ),
+                    metadata={"workspace_revision": 1},
+                ))
+            else:
+                results.append(ToolResult(call_id=call.id, content="ok"))
+        return results
+
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "index-1",
+                    "name": "memory_index",
+                    "args": {"limit": 1},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "index-2",
+                    "name": "memory_index",
+                    "args": {"limit": 20},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "fetch-1",
+                    "name": "memory_fetch",
+                    "args": {"ids": ["memory-1"]},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "这是记忆总结，但附件还没有生成。",
+                "tool_calls": [],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-1",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/小林与小凛的记忆总结.md",
+                        "content": "# 小林与小凛的记忆总结",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-1",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/小林与小凛的记忆总结.md",
+                        "revision": 1,
+                        "completion_message": "Markdown 文档已经发给你了。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".md",),
+        file_requirement_messages=[{
+            "role": "user",
+            "content": "将我们的记忆总结一下，生成一份Md 文档发给我",
+        }],
+        max_calls=8,
+        trajectory_events=trajectory_events,
+    )
+
+    assert "workspace_write" not in calls[3]
+    assert calls[4] == ("workspace_write",)
+    assert calls[5] == ("send_file",)
+    assert files == [("/workspace/小林与小凛的记忆总结.md", 1)]
+    assert replies == [("Markdown 文档已经发给你了。", True)]
+    assert outcome.stop_reason == "final_text"
+    assert all(
+        kind != "required_file_missing" for kind, _payload in trajectory_events
+    )
 
 
 @pytest.mark.parametrize(
@@ -540,12 +864,187 @@ def test_model_selected_shared_work_uses_compact_delivery_after_large_write(
     assert len(str(messages_seen[1])) < 2_000
     assert "记忆知识图谱.io.html" in str(messages_seen[1])
     assert "completion_message" in str(messages_seen[1])
-    assert "do not default it to English or Chinese" in str(messages_seen[1])
+    assert "write it in English" in str(messages_seen[1])
     assert "The work the user asked for was saved" not in str(messages_seen)
     assert len(messages_seen) == 2
     assert all(
         kind != "required_file_missing" for kind, _payload in trajectory_events
     )
+
+
+def test_chinese_canvas_compact_delivery_preserves_requested_card_metadata(
+    monkeypatch,
+):
+    files = []
+    request = (
+        "请生成并发送一个 Canvas，文件名为修前基线-中文.io.html。"
+        "附件卡标题使用中文 Canvas 基线，副标题使用交互测试，并用中文回复。"
+    )
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-cn-canvas",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/修前基线-中文.io.html",
+                        "content": "<main>中文 Canvas 基线</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-cn-canvas",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/修前基线-中文.io.html",
+                        "revision": 1,
+                        "title": "中文 Canvas 基线",
+                        "subtitle": "交互测试",
+                        "completion_message": "中文 Canvas 已经生成，可以直接打开。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=[{"role": "user", "content": request}],
+        max_calls=3,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [
+        (
+            "/workspace/修前基线-中文.io.html",
+            1,
+            "中文 Canvas 基线",
+            "交互测试",
+        )
+    ]
+    assert replies == [("中文 Canvas 已经生成，可以直接打开。", True)]
+    assert outcome.stop_reason == "final_text"
+    compact_prompt = messages_seen[1][0]["content"]
+    assert request in compact_prompt
+    assert "completion_message" in compact_prompt
+    assert "title 和 subtitle" in compact_prompt
+    assert self_thinking.INSTRUCTION.strip() not in compact_prompt
+
+
+def test_canvas_delivery_validates_language_when_request_is_multimodal(
+    monkeypatch,
+):
+    files = []
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    outcome, calls, replies, _messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-canvas",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/board.io.html",
+                        "content": "<main>Canvas board</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-canvas-wrong-language",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/board.io.html",
+                        "revision": 1,
+                        "title": "Canvas board",
+                        "subtitle": "Interactive board",
+                        "completion_message": "画布已经生成，可以直接打开。",
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-canvas-corrected",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/board.io.html",
+                        "revision": 1,
+                        "title": "Canvas board",
+                        "subtitle": "Interactive board",
+                        "completion_message": (
+                            "<think>private delivery reasoning</think>"
+                            "Your canvas is ready to open."
+                        ),
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Build me a canvas board, reply in English.",
+                },
+            ],
+        }],
+        max_calls=4,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1:] == [("send_file",), ("send_file",)]
+    assert files == [
+        (
+            "/workspace/board.io.html",
+            1,
+            "Canvas board",
+            "Interactive board",
+        )
+    ]
+    assert replies == [("Your canvas is ready to open.", True)]
+    assert outcome.stop_reason == "final_text"
 
 
 def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
@@ -628,16 +1127,14 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
         ("/workspace/小游戏.io.html", 2, "星光方块", "今晚一起玩")
     ]
     assert user_request in str(messages_seen[1])
-    assert "title, subtitle, and completion_message" in str(messages_seen[1])
+    assert "completion_message" in str(messages_seen[1])
+    assert "title 和 subtitle" in str(messages_seen[1])
     validation_exchange = messages_seen[2][-1]
     assert isinstance(validation_exchange, ToolExchange)
     assert [result.call_id for result in validation_exchange.results] == [
         "missing-metadata"
     ]
-    assert (
-        "requires title, subtitle, and completion_message"
-        in validation_exchange.results[0].content
-    )
+    assert "completion_message" in validation_exchange.results[0].content
     assert [event[2] for event in tool_events if event[0] == "missing-metadata"] == [
         "tool_call_started",
         "tool_call_result",
@@ -648,6 +1145,236 @@ def test_canvas_update_compact_delivery_preserves_request_and_corrects_metadata(
     )
     assert len(messages_seen) == 3
     assert replies == [("已经按你的要求更新好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_generic_validation_retry_does_not_consume_canvas_delivery_retry(
+    monkeypatch,
+):
+    files = []
+    initial_messages = [{"role": "user", "content": "先帮我整理思路"}]
+    late_canvas_request = [{
+        "role": "user",
+        "content": "请把它做成中文 Canvas。",
+    }]
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1"
+                    if call.name == "workspace_write"
+                    else "tool-observation"
+                ),
+                metadata=(
+                    {"workspace_revision": 1}
+                    if call.name == "workspace_write"
+                    else None
+                ),
+            )
+            for call in tool_calls
+        ]
+
+    outcome, _calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "先搜索",
+                "tool_calls": [{
+                    "id": "generic-invalid",
+                    "name": "memory_search",
+                    "args": {},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-canvas",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/retry-isolation.io.html",
+                        "content": "<main>isolation</main>",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "canvas-invalid",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/retry-isolation.io.html",
+                        "revision": 1,
+                        "title": "纠错隔离",
+                        "subtitle": "镜像 A",
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "canvas-corrected",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/retry-isolation.io.html",
+                        "revision": 1,
+                        "title": "纠错隔离",
+                        "subtitle": "镜像 A",
+                        "completion_message": "中文 Canvas 已经做好了。",
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        fold_batches=[late_canvas_request],
+        max_calls=5,
+        build_messages=lambda transcript: list(transcript),
+    )
+
+    generic_exchange = next(
+        item for item in messages_seen[1]
+        if isinstance(item, ToolExchange)
+        and item.calls[0].id == "generic-invalid"
+    )
+    assert "invalid args for memory_search" in generic_exchange.results[0].content
+    canvas_exchange = next(
+        item for item in messages_seen[3]
+        if isinstance(item, ToolExchange)
+        and item.calls[0].id == "canvas-invalid"
+    )
+    assert "completion_message" in canvas_exchange.results[0].content
+    assert files == [(
+        "/workspace/retry-isolation.io.html",
+        1,
+        "纠错隔离",
+        "镜像 A",
+    )]
+    assert replies == [("中文 Canvas 已经做好了。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_send_file_validation_retry_does_not_consume_generic_validation_retry(
+    monkeypatch,
+):
+    files = []
+    trajectory_events = []
+    tool_events = []
+    initial_messages = [{"role": "user", "content": "给我一个 Word 文档"}]
+    cancellation = [{"role": "user", "content": "不用文件了，直接回答"}]
+
+    async def on_file(path, revision, *, title="", subtitle=""):
+        files.append((path, revision, title, subtitle))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1"
+                    if call.name == "workspace_write"
+                    else "tool-observation"
+                ),
+                metadata=(
+                    {"workspace_revision": 1}
+                    if call.name == "workspace_write"
+                    else None
+                ),
+            )
+            for call in tool_calls
+        ]
+
+    outcome, _calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-before-cancel",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/cancelled.docx",
+                        "content": "# cancelled",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "delivery-invalid",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/cancelled.docx",
+                        "revision": 1,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "搜索",
+                "tool_calls": [{
+                    "id": "generic-after-cancel",
+                    "name": "memory_search",
+                    "args": {},
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "generic-corrected",
+                    "name": "memory_search",
+                    "args": {"query": "纠错隔离"},
+                }],
+                "usage": {},
+            },
+            {"reply": "搜索完成。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".docx",),
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        fold_batches=[[], cancellation],
+        max_calls=6,
+        trajectory_events=trajectory_events,
+        tool_events=tool_events,
+        build_messages=lambda transcript: list(transcript),
+    )
+
+    assert [event[2] for event in tool_events if event[0] == "delivery-invalid"] == [
+        "tool_call_started",
+        "tool_call_result",
+    ]
+    assert any(
+        kind == "tool_batch_validation_failed"
+        and payload["calls"][0].id == "delivery-invalid"
+        for kind, payload in trajectory_events
+    )
+    assert [
+        event[2] for event in tool_events if event[0] == "generic-after-cancel"
+    ] == ["tool_call_started", "tool_call_result"]
+    assert any(
+        kind == "tool_batch_validation_failed"
+        and payload["calls"][0].id == "generic-after-cancel"
+        and "invalid args for memory_search" in payload["results"][0].content
+        for kind, payload in trajectory_events
+    )
+    assert files == []
+    assert replies == [("搜索完成。", True)]
     assert outcome.stop_reason == "final_text"
 
 
@@ -848,6 +1575,78 @@ def test_pending_canvas_delivery_rejects_wrong_target_then_delivers_exact_one(
     assert files == [("/workspace/panel.io.html", 1)]
     assert replies == [("新版面板已经准备好了。", True)]
     assert outcome.stop_reason == "final_text"
+
+
+def test_repeated_ordinary_file_target_mismatch_is_not_a_canvas_failure(
+    monkeypatch,
+):
+    async def on_file(path, revision):
+        raise AssertionError("a mismatched file must not be delivered")
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content="ok: workspace_write applied at revision 1",
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    with pytest.raises(
+        tool_loop.FileDeliveryIncomplete,
+        match="pending_delivery_target_mismatch",
+    ) as failure:
+        _run_loop(
+            monkeypatch,
+            [
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                        "id": "write",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/notes.md",
+                            "content": "# Notes",
+                            "expected_revision": 0,
+                        },
+                    }],
+                    "usage": {},
+                },
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                    "id": "wrong-file-1",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/other.md",
+                        "revision": 9,
+                        "completion_message": "The file is ready.",
+                    },
+                    }],
+                    "usage": {},
+                },
+                {
+                    "reply": "",
+                    "tool_calls": [{
+                    "id": "wrong-file-2",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/other.md",
+                        "revision": 9,
+                        "completion_message": "The file is ready.",
+                    },
+                    }],
+                    "usage": {},
+                },
+            ],
+            on_file_reply=on_file,
+            dispatch=dispatch,
+            required_file_suffixes=(".md",),
+            max_calls=4,
+        )
+
+    assert not isinstance(failure.value, tool_loop.CanvasDeliveryIncomplete)
 
 
 def test_io_html_satisfies_generic_html_delivery_requirement(monkeypatch):
@@ -1142,7 +1941,11 @@ def test_empty_file_requirement_requires_any_downloadable_file(monkeypatch):
                 "tool_calls": [{
                     "id": "f1",
                     "name": "send_file",
-                    "args": {"path": "/workspace/工作清单.md", "revision": 1},
+                    "args": {
+                        "path": "/workspace/工作清单.md",
+                        "revision": 1,
+                        "completion_message": "工作清单已经发给你了。",
+                    },
                 }],
                 "usage": {},
             },
@@ -1204,12 +2007,15 @@ def test_late_folded_word_request_enables_file_completion_guard(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "revision": 1,
+                            "completion_message": "Word 文档已发给你。",
+                        },
                     }
                 ],
                 "usage": {},
             },
-            {"reply": "Word 文档已发给你。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
         file_requirement_messages=initial_messages,
@@ -1275,7 +2081,10 @@ def test_late_cancellation_discards_an_already_staged_file(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "revision": 1,
+                        },
                     }
                 ],
                 "usage": {},
@@ -1328,7 +2137,11 @@ def test_required_word_file_retries_plain_text_until_docx_is_delivered(monkeypat
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "revision": 1,
+                            "completion_message": "Word 文档已经发给你了。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -1431,7 +2244,11 @@ def test_required_word_file_rejects_markdown_substitution(monkeypatch):
                     {
                         "id": "f1",
                         "name": "send_file",
-                        "args": {"path": "/workspace/计划.md", "revision": 1},
+                        "args": {
+                            "path": "/workspace/计划.md",
+                            "revision": 1,
+                            "completion_message": "已经发给你了。",
+                        },
                     }
                 ],
                 "usage": {},
@@ -1548,6 +2365,39 @@ def test_workspace_file_result_bounds_content_and_sanitizes_name():
         )
 
 
+@pytest.mark.parametrize(
+    ("name", "expected_mime"),
+    [
+        ("file.md", "text/markdown"),
+        ("file.markdown", "text/markdown"),
+        ("file.txt", "text/plain"),
+        ("file.csv", "text/csv"),
+        ("file.tsv", "text/tab-separated-values"),
+        ("file.json", "application/json"),
+        ("file.xml", "application/xml"),
+        ("file.yaml", "application/yaml"),
+        ("file.yml", "application/yaml"),
+        ("file.html", "text/html"),
+        ("file.htm", "text/html"),
+        ("file.rtf", "text/rtf"),
+        ("file.svg", "image/svg+xml"),
+    ],
+)
+def test_workspace_text_download_uses_filename_mime(name, expected_mime):
+    result = worker._workspace_file_reply_from_result(
+        {
+            "path": f"/workspace/{name}",
+            "content": "test content\n",
+            # workspace_write stores editable source as Markdown-like text.
+            "mime_type": "text/markdown",
+        }
+    )
+
+    assert result.name == name
+    assert result.mime_type == expected_mime
+    assert result.data == b"test content\n"
+
+
 def test_workspace_write_rejects_oversized_shared_work_source():
     error = tool_schema.validate_tool_args(
         "workspace_write",
@@ -1592,6 +2442,53 @@ def test_workspace_canvas_file_result_preserves_display_metadata(monkeypatch):
             },
             title="接星星",
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "mime_type", "data"),
+    [
+        ("修前基线-中文.md", "text/markdown", b"# baseline\n"),
+        ("修前基线-中文.docx", document_render.DOCX_MIME, b"PK\x03\x04\xff\x00"),
+        ("修前基线-中文.pdf", document_render.PDF_MIME, b"%PDF-1.7\n\xff"),
+        (
+            "修前基线-中文.io.html",
+            "text/html",
+            b"<html><body>Canvas baseline</body></html>",
+        ),
+    ],
+)
+def test_workspace_file_effect_seals_all_attachment_formats_as_binary(
+    monkeypatch,
+    name,
+    mime_type,
+    data,
+):
+    captured = {}
+
+    def build_envelope(_store, plaintext, **kwargs):
+        captured["plaintext"] = plaintext
+        captured.update(kwargs)
+        return {"id": "b" * 32}, ""
+
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        build_envelope,
+    )
+    reply = worker.WorkspaceFileReply(
+        path=f"/workspace/{name}",
+        name=name,
+        mime_type=mime_type,
+        data=data,
+    )
+
+    effect = worker._build_encrypted_file_reply_effect_payload(
+        object(), reply, effect_id=f"effect-{name}"
+    )
+
+    assert captured["plaintext"] == reply.data
+    assert captured["content_kind"] == "binary"
+    assert effect["message_extra"]["file_name"] == name
 
 
 def test_workspace_file_result_renders_real_word_and_pdf_documents():
@@ -2099,7 +2996,12 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
     job = jobs_store.claim_next_job("download-worker")
     assert job is not None and job["id"] == job_id
 
-    def build_envelope(store, plaintext, *, item_id=None):
+    envelope_kinds = []
+
+    def build_envelope(
+        store, plaintext, *, item_id=None, content_kind="text"
+    ):
+        envelope_kinds.append(content_kind)
         return (
             {
                 "v": 1,
@@ -2203,6 +3105,7 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
     assert loaded == [
         (user_id, "rt-download", "/workspace/report.md", 4),
     ]
+    assert envelope_kinds.count("binary") == 1
 
     store = core_store.get_store(user_id)
     store.reload()

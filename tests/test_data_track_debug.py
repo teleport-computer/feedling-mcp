@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -40,7 +43,7 @@ def _patch_blob_reads(monkeypatch, blobs: dict) -> None:
     monkeypatch.setattr(
         data_track.db,
         "get_blobs_for_users",
-        lambda user_ids, kinds: {
+        lambda user_ids, kinds, **_kwargs: {
             (uid, kind): blobs[(uid, kind)]
             for uid in user_ids
             for kind in kinds
@@ -346,7 +349,7 @@ def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
             "logs": {"proactive_jobs": {"count": 5, "last_ts": 100}},
             "proactive_extra": {
                 "jobs_by_status": {"failed": 3, "expired": 2},
-                "jobs_failed_by_reason": {"model_timeout": 2, "unknown": 1},
+                "jobs_failed_by_reason": {"provider_timeout": 2, "unknown": 1},
             },
         },
         {},
@@ -354,7 +357,97 @@ def test_fast_proactive_snapshot_keeps_expired_out_of_failed_count():
 
     assert proactive["failed_jobs"] == 3
     assert proactive["jobs_by_status"]["expired"] == 2
-    assert proactive["job_failed_reasons"] == {"model_timeout": 2, "unknown": 1}
+    assert proactive["job_failed_reasons"] == {"provider_timeout": 2, "unknown": 1}
+
+
+def test_fast_proactive_snapshot_redacts_provider_error_bodies_in_reasons():
+    """T344: the V2 snapshot path is the one that served the real leak.
+
+    The DB aggregate groups by the raw ``status_reason``, so an embedded
+    provider error body both exposed a key-management URL *and* split one
+    failure mode into a bucket per occurrence. Redaction happens at this
+    boundary, which means the collapsed buckets must be summed here too.
+    """
+    # Synthetic URL: the production one must never be written down.
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    proactive = data_track._data_track_proactive_from_snapshot(
+        {
+            "logs": {"proactive_jobs": {"count": 6, "last_ts": 100}},
+            "proactive_extra": {
+                "jobs_by_status": {"failed": 6},
+                "jobs_failed_by_reason": {
+                    f"provider_timeout: 402 #0 {secret_url}": 1,
+                    f"provider_timeout: 402 #1 {secret_url}": 1,
+                    "content_filtered": 3,
+                    "reply_parse_failed": 1,
+                },
+            },
+        },
+        {},
+    )
+
+    assert secret_url not in json.dumps(proactive)
+    assert proactive["job_failed_reasons"] == {
+        "provider_timeout:<redacted>": 2,
+        # Declared reasons stay distinguishable from each other: telling one
+        # failure mode apart from another is the point of this dashboard.
+        "content_filtered": 3,
+        "reply_parse_failed": 1,
+    }
+    assert proactive["failed_jobs"] == 6
+
+
+def test_fast_proactive_snapshot_redacts_control_reasons():
+    """T344: the control bucket, which shipped unguarded the first time.
+
+    codex removed the redaction from ``job_control_reasons`` in an isolated
+    worktree and the suite stayed green — only the failed-reason branch had a
+    case. Control is the ``skipped`` status, whose reason is producer free text
+    exactly like the failed one, and it reads the same column of the same table.
+    """
+    secret_url = "https://openrouter.invalid/settings/keys/key-id-must-not-leak"
+    raw_control = {
+        f"ambient_disabled: skipped #0 {secret_url}": 2,
+        f"ambient_disabled: skipped #1 {secret_url}": 1,
+        "heartbeat_throttled": 4,
+    }
+    proactive = data_track._data_track_proactive_from_snapshot(
+        {
+            "logs": {"proactive_jobs": {"count": 7, "last_ts": 100}},
+            "proactive_extra": {
+                "jobs_by_status": {"skipped": 7},
+                "jobs_control_by_reason": raw_control,
+            },
+        },
+        {},
+    )
+
+    assert secret_url not in json.dumps(proactive)
+    assert proactive["job_control_reasons"] == {
+        "ambient_disabled:<redacted>": 3,
+        "heartbeat_throttled": 4,
+    }
+    # Collapsing buckets must not lose jobs — conservation is why the counts are
+    # summed rather than overwritten.
+    assert sum(proactive["job_control_reasons"].values()) == sum(
+        raw_control.values()
+    )
+
+
+def test_user_unavailable_bucket_cannot_carry_free_text_by_construction():
+    """T344: why the third bucket has no leak case, stated rather than assumed.
+
+    A job reaches ``job_user_unavailable_reasons`` only by matching Seven's V1
+    set *exactly* — ``v1_proactive_outcome_class`` on the live path and
+    ``= ANY(...)`` in the DB aggregate. So every key in that bucket is a
+    declared reason and redaction there is a no-op today. That holds only while
+    the whole set stays declared; if a reason is added to Seven's set without
+    being declared, this bucket starts redacting real signal and this fails.
+    """
+    from notices import catalog, status_reason
+
+    for reason in catalog.USER_UNAVAILABLE_V1_REASONS:
+        assert status_reason.sanitize_status_reason(reason) == reason
 
 
 def test_trace_vocabulary_failure_is_explicit_retried_and_not_cached(monkeypatch):
@@ -404,7 +497,8 @@ def test_debug_payload_rejects_empty_producer_trace_vocabulary(monkeypatch):
         with bind("view=debug&user_id=user_a"):
             payload = data_track._data_track_debug_payload()
 
-        assert payload["observability"] == {"trace_vocabulary": "unavailable"}
+        assert payload["observability"]["trace_vocabulary"] == "unavailable"
+        assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
         assert data_track._TRACE_VOCABULARY_CACHE is None
 
 
@@ -441,7 +535,8 @@ def test_debug_payload_marks_trace_vocabulary_failure_without_negative_caching(
     with bind("view=debug&mode=timeline&user_id=user_a"):
         payload = data_track._data_track_debug_payload()
 
-    assert payload["observability"] == {"trace_vocabulary": "unavailable"}
+    assert payload["observability"]["trace_vocabulary"] == "unavailable"
+    assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
     assert payload["turns"][0]["lane"] == ""
     assert data_track._TRACE_VOCABULARY_CACHE is None
 
@@ -500,7 +595,8 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
         "turns",
         "events",
     }
-    assert payload["observability"] == {"trace_vocabulary": "ok"}
+    assert payload["observability"]["trace_vocabulary"] == "ok"
+    assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
     assert set(payload["summary"]) == {
         "generated_at",
         "users_scanned",
@@ -538,7 +634,8 @@ def test_blank_flat_payload_does_not_append_zero_event_live_users(monkeypatch):
     with bind("view=debug"):
         payload = data_track._data_track_debug_payload()
 
-    assert payload["observability"] == {"trace_vocabulary": "ok"}
+    assert payload["observability"]["trace_vocabulary"] == "ok"
+    assert payload["observability"]["failure_vocabulary"]["status"] == "ok"
     assert payload["users"] == []
 
 
@@ -615,7 +712,9 @@ def test_flat_payload_fetches_page_lookahead_not_the_old_full_scan(monkeypatch):
         return [], True
 
     monkeypatch.setattr(data_track.db, "query_trace_event_turn_rows", sibling_rows)
-    monkeypatch.setattr(data_track.db, "get_blobs_for_users", lambda *_a: {})
+    monkeypatch.setattr(
+        data_track.db, "get_blobs_for_users", lambda *_a, **_kwargs: {}
+    )
 
     with bind("view=debug&mode=flat&limit=2"):
         payload = data_track._data_track_debug_payload()
@@ -630,6 +729,77 @@ def test_flat_payload_fetches_page_lookahead_not_the_old_full_scan(monkeypatch):
     assert payload["summary"]["scan_truncated"] is True
 
 
+@pytest.mark.parametrize("mode", ["flat", "timeline"])
+def test_debug_payload_propagates_bounded_trace_flag_read_failure(
+    monkeypatch, mode,
+):
+    """A trace-flag read failure is an explicit /debug failure contract.
+
+    Returning an empty flag map would falsely report that tracing is disabled.
+    Both debug query modes must share one deadline across their bounded reads,
+    request fail-closed flag lookup, and propagate its error; the ASGI route's
+    TimeoutError test pins the resulting 503 mapping.
+    """
+    with registry._users_lock:
+        registry._users[:] = [
+            {"user_id": "user_a", "principal_id": "p_a"},
+        ]
+
+    event = _event(100, "user_a", "agent.reply", trace_id="t-flag-read")
+    monkeypatch.setattr(data_track.db, "query_trace_events", lambda **_kwargs: [event])
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_events_flat_page",
+        lambda **_kwargs: {
+            "events_total": 1,
+            "turns_total": 1,
+            "stalled_turns": 0,
+            "error_turns": 0,
+            "scan_truncated": False,
+            "users": [{"user_id": "user_a", "events": 1, "last_ts": 100}],
+            "subsystems": ["agent"],
+            "statuses": ["ok"],
+            "rows": [event],
+        },
+    )
+    monkeypatch.setattr(
+        data_track.db,
+        "query_trace_event_turn_rows",
+        lambda **_kwargs: ([event], False),
+    )
+    calls = []
+
+    def failing_flag_read(_user_ids, _kinds, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("raise_on_error"):
+            raise TimeoutError("trace flag read timed out")
+        return {}
+
+    monkeypatch.setattr(data_track.db, "get_blobs_for_users", failing_flag_read)
+    real_limits = data_track._debug_db_limits
+    deadlines = []
+
+    def record_deadline(deadline):
+        deadlines.append(deadline)
+        return real_limits(deadline)
+
+    monkeypatch.setattr(data_track, "_debug_db_limits", record_deadline)
+
+    with bind(f"view=debug&mode={mode}&user_id=user_a"):
+        with pytest.raises(TimeoutError, match="trace flag read timed out"):
+            data_track._data_track_debug_payload()
+
+    # Every bounded read in one request spends from the same wall-clock budget.
+    # Do not pin the exact read count: adding another bounded read is safe as
+    # long as it consumes the original request deadline instead of refreshing it.
+    assert len(deadlines) >= 2
+    assert len(set(deadlines)) == 1
+    assert len(calls) == 1
+    assert calls[0]["raise_on_error"] is True
+    assert 0 < calls[0]["connection_timeout"] <= 1.0
+    assert 0 < calls[0]["statement_timeout_ms"] <= 2_000
+
+
 def test_debug_trace_query_limits_have_literal_policy_anchors():
     # These independent literals intentionally survive mutations of the source
     # constants; every query-shape test derives its runtime input from them.
@@ -637,6 +807,21 @@ def test_debug_trace_query_limits_have_literal_policy_anchors():
     assert data_track.DEBUG_TRACE_SIBLING_CAP == 5_000
     assert data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS == 2_000
     assert data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC == 1.0
+    assert data_track.DEBUG_TRACE_DB_TOTAL_TIMEOUT_SEC == 2.75
+
+
+def test_debug_query_limits_shrink_against_one_deadline(monkeypatch):
+    clock = iter((100.0, 102.5, 102.74))
+    monkeypatch.setattr(data_track.time, "monotonic", lambda: next(clock))
+
+    first = data_track._debug_db_limits(102.75)
+    second = data_track._debug_db_limits(102.75)
+
+    assert first == pytest.approx((0.6875, 2_000))
+    assert second[0] == pytest.approx(0.0625)
+    assert second[1] == 137
+    with pytest.raises(TimeoutError, match="deadline exhausted"):
+        data_track._debug_db_limits(102.75)
 
 
 def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeypatch):
@@ -676,6 +861,77 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
     assert "#event-" in html
     assert "#turn-" in html
     assert "Trace 词表暂不可用" not in html
+
+
+def test_debug_page_renders_protocol_suppression_without_reply_content(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_protocol", "principal_id": "p_protocol"}]
+
+    private_reply = "PRIVATE_PROTOCOL_FRAGMENT_MUST_NOT_RENDER"
+    event = _event(
+        101,
+        "user_protocol",
+        "reply.protocol_fragment_suppressed",
+        trace_id="t-protocol",
+        status="error",
+        detail={
+            "lane": "heartbeat",
+            "evidence": "tool_call_tail",
+            "stop_reason": "",
+            "transport_cut": False,
+            "final": True,
+        },
+        content_excerpt={},
+    )
+    event["private_reply"] = private_reply
+    _patch_blob_reads(monkeypatch, {
+        ("user_protocol", "trace_events"): {"events": [event]},
+    })
+
+    html = admin_core.page_html(
+        "view=debug&mode=timeline&user_id=user_protocol&trace_id=t-protocol"
+    )
+
+    assert "回复安全 · 协议残片已压制" in html
+    assert "tool_call_tail" in html
+    assert "heartbeat" in html
+    assert private_reply not in html
+
+
+def test_debug_page_renders_transport_cut_as_distinct_content_free_observation(
+    monkeypatch,
+):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_cut", "principal_id": "p_cut"}]
+
+    private_reply = "PRIVATE_TRUNCATED_REPLY_MUST_NOT_RENDER"
+    event = _event(
+        102,
+        "user_cut",
+        "reply.transport_cut_observed",
+        trace_id="t-cut",
+        status="warning",
+        detail={
+            "lane": "heartbeat",
+            "stop_reason": "max_output_tokens",
+            "final": True,
+        },
+        content_excerpt={},
+    )
+    event["private_reply"] = private_reply
+    _patch_blob_reads(monkeypatch, {
+        ("user_cut", "trace_events"): {"events": [event]},
+    })
+
+    html = admin_core.page_html(
+        "view=debug&mode=timeline&user_id=user_cut&trace_id=t-cut"
+    )
+
+    assert "Provider 输出截断 · 仅观测" in html
+    assert "max_output_tokens" in html
+    assert "heartbeat" in html
+    assert "协议残片已压制" not in html
+    assert private_reply not in html
 
 
 def test_debug_page_renders_trace_vocabulary_unavailable_as_a_warning(monkeypatch):

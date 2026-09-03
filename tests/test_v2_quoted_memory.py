@@ -61,12 +61,13 @@ def _stub_cards(monkeypatch, items: list[dict], calls: list | None = None):
 def test_quoted_card_is_expanded_into_the_message(monkeypatch):
     """引用的卡要变成模型看得见的文字,前置在用户那句话之前。"""
     _stub_decrypt(monkeypatch)
+    calls: list = []
     _stub_cards(monkeypatch, [{
         "id": "mem_1",
         "type": "fact",
         "summary": "hx 是 router-teamwork 全栈",
         "content": "hx 负责 router-teamwork 的全栈开发,含 CLI 和 MCP 集成。",
-    }])
+    }], calls)
 
     rows = _tail("u1", [_row("m1", quoted="mem_1")])
 
@@ -76,6 +77,12 @@ def test_quoted_card_is_expanded_into_the_message(monkeypatch):
     assert content.rstrip().endswith("你怎么看待这个"), "用户原话必须在最后"
     # 原始 id 字段不该继续留在给模型的行上
     assert "quoted_memory_ids" not in rows[0]
+    assert calls == [{
+        "ids": ["mem_1"],
+        "limit": 1,
+        "include_archived": True,
+        "include_superseded": True,
+    }]
 
 
 def test_no_quote_means_no_memory_lookup(monkeypatch):
@@ -97,7 +104,54 @@ def test_unresolvable_id_does_not_break_the_turn(monkeypatch):
 
     rows = _tail("u1", [_row("m1", quoted="mem_gone")])
 
-    assert rows[0]["content"] == "你怎么看待这个"
+    content = rows[0]["content"]
+    assert "currently unavailable or have been updated" in content
+    assert "Do not guess" in content
+    assert content.rstrip().endswith("你怎么看待这个")
+
+
+def test_partial_quote_hit_injects_card_and_generic_unavailable_note(monkeypatch):
+    _stub_decrypt(monkeypatch)
+    _stub_cards(monkeypatch, [{
+        "id": "mem_ok",
+        "type": "fact",
+        "summary": "可用卡",
+        "content": "可用正文",
+    }])
+
+    content = _tail(
+        "u1", [_row("m1", quoted="mem_ok,mem_gone")]
+    )[0]["content"]
+
+    assert "(id=mem_ok)" in content
+    assert "可用正文" in content
+    assert "currently unavailable or have been updated" in content
+    assert "mem_gone" not in content
+
+
+def test_quote_limit_is_per_message_not_global_history_window(monkeypatch):
+    _stub_decrypt(monkeypatch)
+    ids = [f"mem_{index}" for index in range(12)]
+    calls: list = []
+    _stub_cards(
+        monkeypatch,
+        [{"id": mid, "type": "fact", "summary": mid, "content": f"body {mid}"}
+         for mid in ids],
+        calls,
+    )
+    rows = [
+        _row(f"row_{group}", quoted=",".join(ids[group * 4:(group + 1) * 4]))
+        for group in range(3)
+    ]
+
+    expanded = _tail("u1", rows)
+
+    assert calls[0]["ids"] == ids
+    assert calls[0]["limit"] == 12
+    for group, row in enumerate(expanded):
+        for mid in ids[group * 4:(group + 1) * 4]:
+            assert f"(id={mid})" in row["content"]
+        assert "currently unavailable" not in row["content"]
 
 
 def test_quote_block_does_not_teach_v2_an_op_its_schema_rejects(monkeypatch):

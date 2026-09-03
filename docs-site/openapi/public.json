@@ -151,7 +151,7 @@
         "operationId": "runner_healthz_healthz_runner_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "The runner fleet is healthy according to a live database observation, or a transient probe failure was covered by a cached heartbeat snapshot that is still within the configured freshness window. The cached case has top-level \"status\": \"degraded\" and identifies the probe failure under \"runner_fleet\".",
             "content": {
               "application/json": {
                 "schema": {
@@ -171,7 +171,7 @@
             }
           },
           "503": {
-            "description": "The aggregate runner fleet is unhealthy, unavailable, or misconfigured, or its isolated probe exceeded its three-second health-check deadline. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\" and a down \"runner_fleet\" entry under \"checks\".",
+            "description": "The aggregate runner fleet is unhealthy, unavailable, or misconfigured, or its isolated probe exceeded its three-second health-check deadline. The body has the same shape as the 200 response, with top-level \"status\": \"unhealthy\". A successful observation that proves fleet drift reports runner_fleet \"status\": \"down\"; an unavailable observation with no still-fresh cached proof reports \"status\": \"unknown\" instead of claiming the runner is down.",
             "content": {
               "application/json": {
                 "schema": {
@@ -770,7 +770,7 @@
         "operationId": "web_fetch_exec_v1_agent_web_fetch_post",
         "responses": {
           "200": {
-            "description": "The capability envelope. Always HTTP 200 — inspect `ok`. On success `data` holds `{url, text, truncated}`; otherwise `error.code` explains the refusal (disabled, rate-limited, invalid/blocked url, operator halt, or upstream status).",
+            "description": "The capability envelope. Always HTTP 200 — inspect `ok`. On success `data` holds `{url, total_chars, offset, returned_chars, next_offset, has_more, source_truncated, text}`; otherwise `error.code` explains the refusal (disabled, rate-limited, invalid/blocked url, operator halt, or upstream status).",
             "content": {
               "application/json": {
                 "schema": {
@@ -804,7 +804,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch one absolute http(s) URL and return its readable text (HTML is reduced to the main article; JSON, plain text, and source are returned as-is), size-capped with a data.truncated flag. SSRF-guarded: private/loopback/link-local targets are refused and every redirect hop is independently re-validated (max 5). Cloud-only: requires a hosted per-user runtime token carrying the `web` scope — long-term api-key auth is refused with 403 (self-hosted deployments use their model provider's own web capability). Then the same three authorization gates as web search apply, reported in-band as HTTP 200 with ok:false and an error.code (capability_disabled, capability_rate_limited, capability_invalid_input for a bad or blocked url, capability_not_found / capability_upstream_error for an upstream HTTP status)."
+        "description": "Fetch one absolute http(s) URL and return its readable text (HTML is reduced to the main article; JSON, plain text, and source are returned as-is). The bounded first page reports data.total_chars, offset, returned_chars, next_offset, and has_more; data.source_truncated says whether the source document itself exceeded the fetch retention cap, not whether this result is merely one page. SSRF-guarded: private/loopback/link-local targets are refused and every redirect hop is independently re-validated (max 5). Cloud-only: requires a hosted per-user runtime token carrying the `web` scope — long-term api-key auth is refused with 403 (self-hosted deployments use their model provider's own web capability). Then the same three authorization gates as web search apply, reported in-band as HTTP 200 with ok:false and an error.code (capability_disabled, capability_rate_limited, capability_invalid_input for a bad or blocked url, capability_not_found / capability_upstream_error for an upstream HTTP status)."
       }
     },
     "/v1/agent/web/search": {
@@ -1699,6 +1699,74 @@
         },
         "x-feedling-contract-level": "compatibility",
         "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
+      }
+    },
+    "/v1/chat/workspace/body": {
+      "get": {
+        "summary": "Chat Workspace Body",
+        "operationId": "chat_workspace_body_v1_chat_workspace_body_get",
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120,
+              "description": "Original case-preserving .io.html file_name from the Chat row.",
+              "title": "Filename"
+            },
+            "description": "Original case-preserving .io.html file_name from the Chat row."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The current Canvas workspace revision and opaque shared envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasWorkspaceBodyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "filename is not a safe .io.html basename.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No current workspace entry exists for that exact filename.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Read the authenticated user's current IO Canvas workspace envelope by the original .io.html file_name stored on its Chat attachment. The server derives /workspace internally and uses an exact case- and Unicode-normalization-sensitive match; clients must not pass a folded canvas id or construct an internal path. A missing current entry is a normal compatibility 404, after which clients may read the historical Chat message body."
       }
     },
     "/v1/content/export": {
@@ -4222,11 +4290,11 @@
         "operationId": "memory_fetch_v1_memory_fetch_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Selected memory records plus explicit resolution and truncation metadata.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryFetchResponse"
                 }
               }
             }
@@ -4256,7 +4324,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract."
+        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed."
       }
     },
     "/v1/memory/get": {
@@ -4436,7 +4504,7 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Page size; values above 500 are capped.",
+            "description": "Page size; values outside the supported range are rejected.",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -9066,7 +9134,7 @@
           "url": {
             "type": "string",
             "format": "uri",
-            "description": "Absolute http(s) URL. Private, loopback, and link-local targets are refused, and every redirect hop (up to 5) is independently re-validated. HTML is reduced to readable text; non-HTML (JSON, plain text, source) is returned as-is. The response body is size-capped and flags truncation."
+            "description": "Absolute http(s) URL. Private, loopback, and link-local targets are refused, and every redirect hop (up to 5) is independently re-validated. HTML is reduced to readable text; non-HTML (JSON, plain text, source) is returned as-is. The stateless V1 endpoint returns the first bounded page with total/range metadata. Hosted Runtime V2 can continue within the same tool-loop turn using next_offset."
           }
         },
         "example": {
@@ -9075,7 +9143,7 @@
       },
       "WebCapabilityResult": {
         "type": "object",
-        "description": "Uniform capability envelope returned by the V1 web execution endpoints. ALWAYS delivered as HTTP 200 — a transport 200 does NOT mean the call succeeded, so branch on `ok`, never on the HTTP status. When ok is true, `data` holds the tool payload (search: `{query, results[], truncated}`; fetch: `{url, text, truncated}`). When ok is false, `error.code` is a stable slug: capability_disabled (the user's web switch is off — not retryable), capability_rate_limited (per-user budget spent — retryable), capability_invalid_input (missing/sensitive query, or a bad/blocked url), capability_unavailable (operator halt), capability_not_found / capability_upstream_error (upstream fetch status).",
+        "description": "Uniform capability envelope returned by the V1 web execution endpoints. ALWAYS delivered as HTTP 200 — a transport 200 does NOT mean the call succeeded, so branch on `ok`, never on the HTTP status. When ok is true, `data` holds the tool payload (search: `{query, results[], truncated}`; fetch: `{url, total_chars, offset, returned_chars, next_offset, has_more, source_truncated, text}`). When ok is false, `error.code` is a stable slug: capability_disabled (the user's web switch is off — not retryable), capability_rate_limited (per-user budget spent — retryable), capability_invalid_input (missing/sensitive query, or a bad/blocked url), capability_unavailable (operator halt), capability_not_found / capability_upstream_error (upstream fetch status).",
         "required": [
           "ok"
         ],
@@ -9882,6 +9950,30 @@
         },
         "additionalProperties": false
       },
+      "ChatImageInput": {
+        "type": "object",
+        "required": [
+          "image_b64"
+        ],
+        "properties": {
+          "image_b64": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Image data; decoded size must not exceed 2,000,000 bytes."
+          },
+          "image_mime": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              "image/gif"
+            ],
+            "default": "image/jpeg"
+          }
+        },
+        "additionalProperties": false
+      },
       "HostedChatSendRequest": {
         "type": "object",
         "properties": {
@@ -9932,6 +10024,15 @@
               "image/gif"
             ]
           },
+          "images": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 9,
+            "items": {
+              "$ref": "#/components/schemas/ChatImageInput"
+            },
+            "description": "One to nine images. Must not be combined with image_b64/image_base64; one item preserves the legacy single-image storage shape."
+          },
           "file_b64": {
             "type": "string",
             "contentEncoding": "base64",
@@ -9974,6 +10075,11 @@
           {
             "required": [
               "image_base64"
+            ]
+          },
+          {
+            "required": [
+              "images"
             ]
           },
           {
@@ -10505,6 +10611,33 @@
         },
         "additionalProperties": true
       },
+      "CanvasWorkspaceBodyResponse": {
+        "type": "object",
+        "required": [
+          "filename",
+          "revision",
+          "mime_type",
+          "envelope"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "envelope": {
+            "$ref": "#/components/schemas/EncryptedEnvelope"
+          }
+        },
+        "additionalProperties": false
+      },
       "ChatTransportRequest": {
         "type": "object",
         "required": [
@@ -10709,7 +10842,7 @@
               "system"
             ],
             "readOnly": true,
-            "description": "Who the failure belongs to. Server-derived from error_class via the notices catalog — a value sent here is NOT trusted (an unknown class always falls back to system, so our own faults are never blamed on the user). user_provider is actionable by the user (top up / fix key / fix model name); system must never point the user at their own configuration."
+            "description": "Who the failure belongs to. Server-derived from error_class via the notices catalog — a value sent here is NOT trusted (an unknown class always falls back to system, so our own faults are never blamed on the user). user_provider is actionable by the user (top up or renew the provider account / fix key / fix model name); system must never point the user at their own configuration."
           },
           "turn_failure_user_text": {
             "type": "string",
@@ -10831,10 +10964,6 @@
             "type": "string",
             "maxLength": 120
           },
-          "include_sensitive": {
-            "type": "boolean",
-            "default": false
-          },
           "ambient": {
             "type": "boolean",
             "default": false
@@ -10848,8 +10977,7 @@
         "example": {
           "limit": 50,
           "bucket": "Collaboration",
-          "thread": "communication style",
-          "include_sensitive": false
+          "thread": "communication style"
         }
       },
       "MemoryFetchRequest": {
@@ -10886,6 +11014,64 @@
             "mem_def456"
           ]
         }
+      },
+      "MemoryFetchResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "missing_ids",
+          "unavailable_ids",
+          "truncation"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "missing_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "unavailable_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "truncation": {
+            "type": "object",
+            "required": [
+              "truncated",
+              "requested_count",
+              "processed_count",
+              "omitted_count"
+            ],
+            "properties": {
+              "truncated": {
+                "type": "boolean"
+              },
+              "requested_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "processed_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "omitted_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryRecordInput": {
         "type": "object",

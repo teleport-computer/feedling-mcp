@@ -22,6 +22,7 @@ _LOCAL = "http://127.0.0.1:9"   # never actually dialled — httpx.post is patch
 _BLOCKS = [
     {"type": "text", "text": "这个报告哪里有问题"},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    {"type": "image_url", "image_url": {"url": "data:image/webp;base64,BBBB"}},
 ]
 
 
@@ -70,6 +71,7 @@ def test_openai_compatible_wire_carries_the_image_block(monkeypatch):
     sent = captured[0]["messages"][-1]["content"]
     assert isinstance(sent, list), "content was flattened to text — the image was dropped"
     assert sent[1]["image_url"]["url"] == "data:image/png;base64,AAAA"
+    assert sent[2]["image_url"]["url"] == "data:image/webp;base64,BBBB"
 
 
 def test_anthropic_wire_maps_the_image_block(monkeypatch):
@@ -91,8 +93,11 @@ def test_anthropic_wire_maps_the_image_block(monkeypatch):
     assert outcome.final_text == "ok"
     sent = captured[0]["messages"][-1]["content"]
     assert isinstance(sent, list), "content was flattened to text — the image was dropped"
-    img = [p for p in sent if p.get("type") == "image"][0]
-    assert img["source"] == {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+    images = [p for p in sent if p.get("type") == "image"]
+    assert [item["source"] for item in images] == [
+        {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        {"type": "base64", "media_type": "image/webp", "data": "BBBB"},
+    ]
 
 
 def test_caption_only_turn_still_sends_plain_text(monkeypatch):

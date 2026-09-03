@@ -1,41 +1,35 @@
-"""Pure-function memory-readside adapters (no Flask/FastAPI/httpx).
-
-Moved verbatim from enclave_app.py (old L900-1299 range), dropping the
-leading underscore from names that are now this module's public surface,
-and routing cross-module calls through `config.env_flag_enabled` /
-`envelope.decrypt_envelope` / `envelope.DecryptFailure` so tests can
-monkeypatch them.
-
-`select_context_memories_via_readside` still reaches into the root
-`memgarden.scoring.selector` module (not moved as part of this migration).
-"""
+"""Pure-function memory-readside adapters (no Flask/FastAPI/httpx)."""
 
 from __future__ import annotations
 
 import json
 import os
 
-from enclave import config, envelope
-from memory import card_shape  # noqa: E402
-from memgarden.scoring.selector import select_memory_index_items  # noqa: E402
+from enclave import envelope
 
 
-def memory_readside_for_model_api_enabled() -> bool:
-    return config.env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
+MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
+MEMORY_READSIDE_MODEL_API_MIN_LIMIT = 1
 
 
-def memory_readside_model_api_limit(default: int = 50) -> int:
+def memory_readside_model_api_limit() -> int:
     """自动注入的候选池大小。
 
-    2026-08-18：默认值由调用方给。两条 runtime 统一挑法之后，chat 入口传 200
-    （resident 一直在用的值）—— 池子大小是运维旋钮，不该随统一被写死。
+    正整数配置原样传给 backend；backend 的 memory/list 契约负责显式拒绝
+    超出其支持范围的值。这里不能再静默钳位，否则运维旋钮只可下调不可上调。
     """
-    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")
+    raw = str(os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")).strip()
     try:
-        value = int(str(raw).strip()) if str(raw).strip() else int(default)
-    except (TypeError, ValueError):
-        value = int(default)
-    return max(1, min(value, 200))
+        value = int(raw) if raw else MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be an integer"
+        ) from exc
+    if value < MEMORY_READSIDE_MODEL_API_MIN_LIMIT:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be positive"
+        )
+    return value
 
 
 def memory_readside_hard_max() -> int:
@@ -50,137 +44,26 @@ def memory_readside_hard_max() -> int:
 def memory_readside_effective_limit(raw_limit=None) -> int:
     """Mirror backend readside limit semantics inside the enclave.
 
-    FEEDLING_MEMORY_READSIDE_LIMIT controls index/fetch candidate windows:
-    - unset: 50
+    The explicit payload limit controls index/fetch candidate windows:
+    - unset: full window, capped by HARD_MAX (same as the backend)
     - positive integer: that many candidates, capped by HARD_MAX
     - 0: "full window", still capped by FEEDLING_MEMORY_READSIDE_HARD_MAX
 
-    This is separate from MEMORY_READSIDE_MODEL_API_LIMIT, which belongs to the
-    older route-B auto-recall path. Keep both knobs distinct.
+    This is separate from MEMORY_READSIDE_MODEL_API_LIMIT, which controls the
+    automatic chat-recall candidate page. Keep both knobs distinct.
     """
     if raw_limit is None or str(raw_limit).strip() == "":
-        raw_limit = os.environ.get("FEEDLING_MEMORY_READSIDE_LIMIT", "50")
+        raw_limit = "0"
     try:
         requested = int(str(raw_limit).strip())
     except (TypeError, ValueError):
-        requested = 50
+        requested = 0
     if requested < 0:
-        requested = 50
+        requested = 0
     hard_max = memory_readside_hard_max()
     if requested == 0:
         return hard_max
     return max(1, min(requested, hard_max))
-
-
-def context_moment_to_index_item(moment: dict) -> dict:
-    """Convert the existing plaintext context card into a readside index item.
-
-    Route B still decrypts in-enclave, but selection now goes through the same
-    index selector used by readside/MCP. This avoids the backend top-50 prefilter
-    while unifying the matching pipe.
-    """
-
-    linked = memory_readside_text(moment.get("linked_dimension"), 160)
-    # 摘要**只能**来自可公开字段（card_fields 保证 content 不在其列）——
-    # 它会进 selector 的 skipped/selected trace，而 context_trace=1 时整个
-    # trace 会返回客户端。用正文兜底会让被拒掉的卡从 trace 漏出正文。
-    summary = memory_readside_text(card_shape.summary_of(moment), 500)
-    bucket_refs = [item for item in (linked, memory_readside_text(moment.get("type"), 40)) if item]
-    return {
-        "id": memory_readside_text(moment.get("id"), 120),
-        "summary": summary,
-        # 私有搜索语料：只在 enclave 内参与匹配，任何出口都必须剥掉。
-        # 沿用 build_memory_search_item 已有的字段名与既定语义，不新造一套。
-        "_search_content": card_shape.private_text(moment),
-        "bucket_refs": bucket_refs,
-        "status": "active",
-        "salience": "medium",
-        "is_open_thread": False,
-        # 由 moments_to_cards 带上来的真实标记。此前这里硬写 False，
-        # selector 的敏感闸（scoring/selector.py 的 sensitive_not_allowed_for_query）
-        # 因而永不触发 —— 标了敏感的卡在普通闲聊里照样会被选中喂给模型。
-        "is_sensitive": bool(moment.get("is_sensitive")),
-        "score": 0,
-        "occurred_at": memory_readside_text(moment.get("occurred_at"), 80),
-        "created_at": memory_readside_text(moment.get("created_at"), 80),
-    }
-
-
-def select_context_memories_via_readside(
-    moments: list[dict],
-    latest_user_text: str,
-    *,
-    cap: int = 8,
-) -> tuple[list[dict], dict]:
-    """Route B readside pipe: plaintext cards -> safe index -> ids -> cards."""
-
-    if not moments:
-        return [], {
-            "mode": "model_api_readside_v1",
-            "readside_enabled": True,
-            "selected": [],
-            "rejected_sample": [],
-            "index_count": 0,
-        }
-    by_id = {str(moment.get("id") or ""): moment for moment in moments if str(moment.get("id") or "")}
-    index_items = [
-        item for item in (context_moment_to_index_item(moment) for moment in moments)
-        # 只有正文、没有摘要的卡也必须进候选池 —— 此前这里只看 summary，
-        # 于是新一代形状（summary/content）的卡被整批丢弃（2026-08-16 事故根因）。
-        if item.get("id") and (item.get("summary") or item.get("_search_content"))
-    ]
-    selection = select_memory_index_items(
-        latest_user_text,
-        index_items,
-        cap=cap,
-        include_sensitive=False,
-    )
-    selected_ids = [memory_id for memory_id in selection.get("selected_ids", []) if memory_id in by_id]
-    context_memories = [dict(by_id[memory_id]) for memory_id in selected_ids[:cap]]
-    selector_trace = selection.get("trace") if isinstance(selection.get("trace"), dict) else {}
-    selected_trace = selector_trace.get("selected") if isinstance(selector_trace.get("selected"), list) else []
-    skipped = selector_trace.get("skipped_sample") if isinstance(selector_trace.get("skipped_sample"), list) else []
-    trace = {
-        "mode": "model_api_readside_v1",
-        "readside_enabled": True,
-        "index_count": len(index_items),
-        "selected": [
-            {
-                "id": item.get("id", ""),
-                "title": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
-                "type": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
-                "score": float(item.get("score") or 0.0),
-                "confidence": memory_readside_text(item.get("confidence"), 40),
-                "matched_units": list(item.get("matched_units") or [])[:8],
-                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
-                "reason": memory_readside_text(item.get("reason"), 120),
-                "bucket": "readside",
-                "selected": True,
-            }
-            for item in selected_trace[:cap]
-        ],
-        "rejected_sample": [
-            {
-                "id": item.get("id", ""),
-                "title": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
-                "type": memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
-                "score": float(item.get("score") or 0.0),
-                "confidence": memory_readside_text(item.get("confidence"), 40),
-                "matched_units": list(item.get("matched_units") or [])[:8],
-                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
-                "reason": memory_readside_text(item.get("reason"), 120),
-                "bucket": "rejected",
-                "selected": False,
-            }
-            for item in skipped[:8]
-        ],
-        "selector_trace": selector_trace,
-    }
-    for key in ("query_units", "query_strong_phrases", "query_rare_terms", "query_weak_terms"):
-        value = selector_trace.get(key)
-        if isinstance(value, list):
-            trace[key] = value
-    return context_memories, trace
 
 
 def memory_readside_text(value, max_chars: int = 2000) -> str:
@@ -223,15 +106,10 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
             "content": memory_readside_text(inner.get("content"), 5000),
             "bucket": memory_readside_text(inner.get("bucket"), 80) or "未分类",
             "threads": memory_readside_list(inner.get("threads"))[:8],
-            **{
-                key: inner[key]
-                for key in ("is_sensitive", "sensitivity_class", "sensitive_scope",
-                            # 通话溯源:agent 拿到它就能调 voice_transcript_read
-                            # 回看原文。这个 dict 是显式重建的,漏加 = 字段被
-                            # 静默剥掉,写进去也等于没写。
-                            "voice_call_id")
-                if key in inner
-            },
+            # 通话溯源:agent 拿到它就能调 voice_transcript_read
+            # 回看原文。这个 dict 是显式重建的,漏加 = 字段被
+            # 静默剥掉,写进去也等于没写。
+            **({"voice_call_id": inner["voice_call_id"]} if "voice_call_id" in inner else {}),
         }
 
     summary = memory_readside_summary(inner)
@@ -257,9 +135,6 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
         or memory_default_bucket(inner.get("type") or envelope.get("type")),
         "threads": threads[:8],
     }
-    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
-        if key in inner:
-            adapted[key] = inner[key]
     return adapted
 
 
@@ -267,16 +142,12 @@ def memory_readside_status(envelope: dict, inner: dict) -> str:
     return str(envelope.get("status") or inner.get("status") or "active").strip().lower() or "active"
 
 
-def memory_readside_is_sensitive(envelope: dict, inner: dict) -> bool:
+def memory_public_item(item: dict) -> dict:
+    """Return a memory item without retired classification metadata."""
+    clean = dict(item)
     for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
-        value = inner.get(key)
-        if value:
-            return True if key != "is_sensitive" else bool(value)
-    for key in ("is_sensitive", "sensitivity_class"):
-        value = envelope.get(key)
-        if value:
-            return True if key != "is_sensitive" else bool(value)
-    return False
+        clean.pop(key, None)
+    return clean
 
 
 def build_memory_index_item(envelope: dict, inner: dict) -> dict:
@@ -293,7 +164,6 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
         "created_at": memory_readside_text(envelope.get("created_at"), 80),
         "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
-        "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
         "score": float(envelope.get("score") or 0),
     }
 
@@ -327,7 +197,6 @@ def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
         "created_at": memory_readside_text(envelope.get("created_at"), 80),
         "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
-        "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
         # 通话溯源。这个返回体是显式白名单,不加就到不了 agent —— 卡上写了也白写。
         # 只放 fetch 不放 index:index 是选择器用的轻量投影,多一个不参与语义的 id
         # 只是噪音;agent 在 fetch 到全文时看到它就够了。
@@ -425,10 +294,5 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             "her_quote": inner.get("her_quote"),
             "context": inner.get("context"),
             "linked_dimension": inner.get("linked_dimension"),
-            # 敏感标记必须跟着卡走 —— Route B 以前在 context_moment_to_index_item
-            # 里硬写 is_sensitive=False，于是 selector 的「敏感卡不给非敏感提问」
-            # 那道闸永远看不到真实标记，等于空转（2026-08-16 查实）。
-            # 这里用与 index/fetch 同一个判据，避免第三套语义。
-            "is_sensitive": memory_readside_is_sensitive(m, inner),
         })
     return out

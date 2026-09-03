@@ -7,6 +7,7 @@ terminal after the durable access audit records success.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 import json
 import os
@@ -127,6 +128,22 @@ def _production_deps() -> InspectDeps:
     def decrypt(user_id: str, envelope: dict, token: str) -> bytes:
         if str(envelope.get("owner_user_id") or "") != user_id:
             raise TrajectoryInspectError("trajectory_owner_mismatch")
+        if envelope.get("body_ct"):
+            return core_envelope.read_envelope_body(
+                envelope,
+                None,
+                purpose="runtime_v2_trajectory_break_glass",
+                runtime_token=token,
+            )
+        body = envelope.get("body")
+        if isinstance(body, str):
+            prefix = jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX
+            if not body.startswith(prefix):
+                raise ValueError("trajectory_plaintext_encoding_invalid")
+            try:
+                return base64.b64decode(body[len(prefix) :], validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("trajectory_plaintext_encoding_invalid") from exc
         return core_envelope.read_envelope_body(
             envelope,
             None,
@@ -248,13 +265,19 @@ def inspect_trajectory(
                 if event_index != expected_index:
                     raise TrajectoryInspectError("trajectory_event_frontier_gap")
                 try:
-                    decoded = trajectory.decode_payload(
-                        runtime.decrypt(user, dict(row["payload_envelope"]), token)
+                    plaintext = runtime.decrypt(
+                        user,
+                        dict(row["payload_envelope"]),
+                        token,
                     )
                 except TrajectoryInspectError:
                     raise
                 except Exception:
                     raise TrajectoryInspectError("trajectory_decrypt_failed") from None
+                try:
+                    decoded = trajectory.decode_payload(plaintext)
+                except Exception:
+                    raise TrajectoryInspectError("trajectory_decode_failed") from None
                 try:
                     decoded_size = len(
                         json.dumps(

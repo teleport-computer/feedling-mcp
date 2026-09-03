@@ -10,9 +10,11 @@ from types import SimpleNamespace
 import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 from agent_protocol_core import self_thinking
-from chat.reply_language import format_time_anchor, infer_reply_language_policy
+from chat.reply_language import format_time_anchor, infer_reply_language
 from capabilities import tool_schema
-from model_api_runtime.v2 import context, language_follow, worker
+from chat import language_follow
+from core import util as core_util
+from model_api_runtime.v2 import context, worker
 import worldbook_readside_core
 
 
@@ -464,9 +466,22 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
 
 def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
+    """这段文案在 agent-protocol-core 里，**不是 io 的**。
+
+    所以升 memgarden/core 的版本时这条会红 —— 这是设计如此：那个包是团队共享
+    的，发版从它的 main 切，升一次就会带上区间里所有人的改动。红了先看
+    `git -C <memgarden> log --oneline vX..vY` 确认改的是什么，再更新这个哈希。
+    详见 backend/requirements.txt 里 memgarden 那段的说明。
+
+    2026-08-30：0.12.0 → 0.12.8 带进了长度那句的措辞改动
+    （「想多写就多写，一句带过也行，不用凑字数也不用收着。」→「长短都行，
+    一句也可以。」），本意不变、仍然没有字数上限，哈希跟着更新。
+    """
     assert hashlib.sha256(self_thinking.INSTRUCTION.encode()).hexdigest() == (
-        "184b0e8508a7e76b71bfb097933002e17e260a143647cd37f7b9b6ef145c74e9"
+        "dfa9f806b4fdcc189cc63d2fc1810a5326f0a3f5b9042f889e48f499ca9bc2ff"
     )
+    assert " 长短都行，一句也可以。" in self_thinking.INSTRUCTION
+    assert "想多写就多写" not in self_thinking.INSTRUCTION
     assert "240 字" not in self_thinking.INSTRUCTION
     assert "写不完就收住" not in self_thinking.INSTRUCTION
     assert "好例子（用户在说中文，所以整块是中文）" in self_thinking.INSTRUCTION
@@ -476,23 +491,31 @@ def test_finalized_self_thinking_copy_is_exact_and_has_no_old_length_cap():
     )
 
 
-def test_chat_heartbeat_and_screen_watch_use_one_shared_instruction(monkeypatch):
+def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
+    monkeypatch,
+):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     shared = self_thinking.INSTRUCTION
 
     assert context.self_thinking.INSTRUCTION is shared
     assert worker.self_thinking.INSTRUCTION is shared
 
-    prompts = {
-        "chat": context.chat_system_prompt(SimpleNamespace(model="deepseek-chat")),
-        "heartbeat": worker._wake_system_prompt_for_lane(
-            "heartbeat", worker._WAKE_SYSTEM_PROMPT
-        ),
-        "screen_watch": worker._wake_system_prompt_for_lane(
-            "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
-        ),
-    }
-    assert all(prompt.count(shared.strip()) == 1 for prompt in prompts.values())
+    chat_prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
+    heartbeat_prompt = worker._wake_system_prompt_for_lane(
+        "heartbeat", worker._WAKE_SYSTEM_PROMPT
+    )
+    screen_prompt = worker._wake_system_prompt_for_lane(
+        "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
+    )
+
+    assert chat_prompt.count(shared.strip()) == 1
+    for prompt in (heartbeat_prompt, screen_prompt):
+        assert shared.strip() not in prompt
+        assert (
+            "<think>Let me update the name and match a boastful tone</think>"
+            not in prompt
+        )
+        assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in prompt
 
 
 def test_ordered_reply_tail_restores_causal_order_and_hides_later_users():
@@ -806,6 +829,21 @@ def test_t101_platform_chinese_has_no_house_style_punctuation_regressions():
     assert re.search(r"[\u3400-\u9fff],|,[\u3400-\u9fff]", platform_chinese) is None
 
 
+def test_canvas_offer_and_mirror_policy_reach_v2_system_prompt():
+    prompt = context.CHAT_SYSTEM_PROMPT
+
+    assert (
+        "如果对方没有要求制作，而一个小型交互体验可能确实有帮助、但是否合适还不确定，"
+        "先简短提议制作，等对方答复后再做。"
+    ) in prompt
+    assert (
+        "不要仅为了装饰闲聊、情绪支持，或本可直接在对话中回答的问题而制作或提议这种体验；"
+        "对方没有接受的提议不要重复。"
+    ) in prompt
+    assert "把 Canvas 写成一个完整、离线、自包含的 UTF-8 文件" in prompt
+    assert "把它写成一个完整、离线、自包含的 UTF-8 文件" not in prompt
+
+
 def test_runtime_protocol_instructions_are_chinese_but_machine_labels_stay_exact():
     policy = context._RUNTIME_CONTEXT_POLICY
 
@@ -1013,14 +1051,15 @@ def test_needs_compaction_counts_nonblank():
 
 
 def test_text_of_handles_str_list_and_none():
-    assert context.text_of("  hi  ") == "hi"
-    assert context.text_of(None) == ""
-    assert context.text_of([
+    assert core_util.text_of("  hi  ") == "hi"
+    assert core_util.text_of(None) == ""
+    assert core_util.text_of([
         {"type": "text", "text": "look at this"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
-    ]) == "look at this"
+        "  and this  ",
+    ]) == "look at this\nand this"
     # image-only block list has no text
-    assert context.text_of([
+    assert core_util.text_of([
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
     ]) == ""
 
@@ -1123,9 +1162,7 @@ def test_v1_anchor_and_v2_temporal_context_share_local_labels(
     day_period,
 ):
     now_dt = datetime(2026, 8, 12, 13, 45, tzinfo=timezone.utc)
-    policy = infer_reply_language_policy(
-        {},
-        [],
+    policy = infer_reply_language(
         locale=locale,
         archive_language=archive_language,
     )

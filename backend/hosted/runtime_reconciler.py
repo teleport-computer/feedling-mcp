@@ -51,7 +51,10 @@ def _current_actual(user_id: str) -> str | None:
     from core import store as core_store  # noqa: PLC0415
     try:
         mode, state, _gen = config_store.get_hosted_runtime_control_strict(
-            core_store.get_store(user_id))
+            core_store.get_store_shell_only(
+                user_id, reason="runtime control tuple is DB-backed"
+            )
+        )
     except Exception:
         return None
     if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2 and state == "v2":

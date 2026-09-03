@@ -1,6 +1,6 @@
 """Frame storage and shape-aware read plumbing."""
 
-import json
+import base64
 import os
 import time
 import uuid
@@ -10,6 +10,7 @@ import httpx
 import db
 from core import envelope as core_envelope
 from core import store as core_store
+from core import visual as core_visual
 from core.frame_ids import is_supported_frame_id
 from core.reqctx import request
 from core.store import UserStore
@@ -110,15 +111,24 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
 
 
 def _read_plaintext_frame(env: dict) -> dict | None:
-    """Decode a plaintext-binary frame wire body without involving the enclave."""
-    if not isinstance(env, dict) or env.get("body_b64") is None:
+    """Decode a plaintext screen bundle or raw photo without enclave I/O."""
+    if core_envelope.classify_envelope_shape(env) != "plaintext_binary":
         return None
     try:
-        inner = json.loads(core_envelope.read_envelope_body(
-            env, None, purpose="screen_frame_plaintext_read").decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        inner = core_visual.parse_visual_plaintext(
+            core_envelope.read_plaintext_envelope_body(env))
+    except (UnicodeDecodeError, ValueError):
         return None
-    return inner if isinstance(inner, dict) else None
+    image_b64 = inner.get("image")
+    if not isinstance(image_b64, str) or not image_b64:
+        return None
+    try:
+        image_bytes = base64.b64decode(image_b64, validate=True)
+    except Exception:
+        return None
+    if not image_bytes:
+        return None
+    return inner
 
 
 def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[dict]:
@@ -189,6 +199,8 @@ def _decrypt_frame_metadata_for_gate(
         if include_image and inner.get("image"):
             result["image_b64"] = str(inner.get("image") or "")
         return result
+    if core_envelope.classify_envelope_shape(env) != "sealed":
+        return {"frame_id": fid, "error": "frame_plaintext_invalid"}
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return {"frame_id": fid, "error": "enclave_unavailable"}

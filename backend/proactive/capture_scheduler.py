@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 
 import db
 from psycopg.types.json import Jsonb
+from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 
@@ -61,6 +62,18 @@ def turn_backstop() -> int:
 
 def min_interval_sec() -> float:
     return _env_float("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", 600.0, hi=86400.0)
+
+
+def append_refresh_deferred() -> bool:
+    """Whether foreground chat writes defer Capture discovery to the tick.
+
+    ``sync`` is an emergency rollback mode that restores the pre-change
+    request-path refresh behavior without reverting the durable-seq fixes.
+    """
+    mode = os.environ.get(
+        "FEEDLING_CAPTURE_APPEND_REFRESH_MODE", "deferred"
+    )
+    return str(mode or "deferred").strip().lower() != "sync"
 
 
 def migrate_window_sec() -> float:
@@ -142,6 +155,7 @@ def _patch_capture_state(
     now: float | None = None,
     expected_frontier_id: str | None = None,
     source_message_id: str | None = None,
+    require_existing: bool = False,
 ) -> dict[str, Any]:
     """Atomically merge selected fields without clobbering another process.
 
@@ -165,12 +179,12 @@ def _patch_capture_state(
             with conn.cursor() as cur:
                 source_id = str(source_message_id or "")
                 source_valid = True
-                if source_id:
+                if source_id or require_existing:
                     # A chat-derived refresh uses the same shared fence as
                     # ordinary writers. If Clear linearized first, the stale
-                    # in-process store row no longer exists and must not
-                    # recreate capture_state metadata.
+                    # refresh must not recreate capture_state metadata.
                     db._lock_chat_user_fence_on_cursor(cur, store.user_id)
+                if source_id:
                     cur.execute(
                         "SELECT 1 FROM chat_messages WHERE user_id=%s "
                         "AND msg_id=%s AND doc->>'role' IN ('user','openclaw') "
@@ -183,11 +197,12 @@ def _patch_capture_state(
                     )
                     source_valid = cur.fetchone() is not None
                 if source_valid:
-                    cur.execute(
-                        "INSERT INTO user_blobs (user_id,kind,doc) "
-                        "VALUES (%s,%s,%s) ON CONFLICT (user_id,kind) DO NOTHING",
-                        (store.user_id, CAPTURE_STATE_KIND, Jsonb({})),
-                    )
+                    if not require_existing:
+                        cur.execute(
+                            "INSERT INTO user_blobs (user_id,kind,doc) "
+                            "VALUES (%s,%s,%s) ON CONFLICT (user_id,kind) DO NOTHING",
+                            (store.user_id, CAPTURE_STATE_KIND, Jsonb({})),
+                        )
                     sql = (
                         "UPDATE user_blobs SET doc=doc || %s "
                         "WHERE user_id=%s AND kind=%s"
@@ -215,7 +230,7 @@ def _patch_capture_state(
                     )
                     row = cur.fetchone()
                 persisted = _state_doc(row[0] if row is not None else {})
-                if wrote and source_id:
+                if wrote and (source_id or require_existing):
                     # Keep the shared Chat Clear fence until the mirror lands.
                     # Clear's primary delete + mirror delete therefore order
                     # after every successful pre-clear refresh; a delayed
@@ -240,57 +255,43 @@ def _is_live_capture_message(message: Mapping[str, Any] | None) -> bool:
 
 
 def _live_messages_after_capture(store, state: Mapping[str, Any]) -> list[dict[str, Any]]:
-    if bool(state.get("capture_seq_initialized")):
-        # Runtime V2's raw frontier may end on a synthetic/import row whose ID
-        # is intentionally absent from the live-message subset. Seq is the
-        # only safe discovery cursor: an out-of-order later live row can carry
-        # an older timestamp and must still trigger Capture.
-        rows = db.chat_capture_messages_after_seq(
-            store.user_id,
-            max(0, int(_safe_float(state.get("last_captured_until_seq"), 0.0))),
-            # Trigger discovery needs the newest live identity plus a capped
-            # turn-count backstop, not the entire uncaptured transcript. The
-            # worker independently pages exact oldest batches of 60. Keeping
-            # this synchronous append-path read bounded avoids O(backlog) work
-            # on every message (especially after a user opts out).
-            sources=tuple(CAPTURE_LIVE_SOURCES),
-            limit=max(64, min(1000, turn_backstop() * 2)),
+    # Runtime V2's raw frontier may end on a synthetic/import row whose ID is
+    # intentionally absent from the live-message subset. Seq is the only safe
+    # discovery cursor: an out-of-order later live row can carry an older
+    # timestamp and must still trigger Capture. Translate a legacy ID once per
+    # read; if it was pruned, restart safely from zero just like V2 extraction.
+    after_seq = max(
+        0, int(_safe_float(state.get("last_captured_until_seq"), 0.0))
+    )
+    if not bool(state.get("capture_seq_initialized")):
+        after_id = str(state.get("last_captured_until_message_id") or "")
+        translated = (
+            db.chat_seq_for_msg_id(store.user_id, after_id)
+            if after_id
+            else None
         )
-        return [dict(row) for row in rows if _is_live_capture_message(row)]
-    after_id = str(state.get("last_captured_until_message_id") or "")
-    after_ts = _safe_float(state.get("last_captured_until_ts"), 0.0)
-    chat_messages = getattr(store, "chat_messages", None)
-    if not isinstance(chat_messages, list):
-        return []
-    chat_lock = getattr(store, "chat_lock", None)
-    if chat_lock is not None:
-        with chat_lock:
-            live = [dict(msg) for msg in chat_messages if _is_live_capture_message(msg)]
-    else:
-        live = [dict(msg) for msg in chat_messages if _is_live_capture_message(msg)]
-    if not after_id and not after_ts:
-        return live
-    out: list[dict[str, Any]] = []
-    found_after_id = False
-    for msg in live:
-        msg_id = str(msg.get("id") or "")
-        msg_ts = _safe_float(msg.get("ts"), 0.0)
-        if after_id:
-            if found_after_id:
-                out.append(msg)
-            elif msg_id == after_id:
-                found_after_id = True
-            elif after_ts and msg_ts > after_ts:
-                # If the boundary message was pruned, use the timestamp fallback.
-                out.append(msg)
-        elif msg_ts > after_ts:
-            out.append(msg)
-    return out
+        after_seq = max(0, int(translated or 0))
+    rows = db.chat_capture_messages_after_seq(
+        store.user_id,
+        after_seq,
+        # Trigger discovery needs the newest live identity plus a capped
+        # turn-count backstop, not the entire uncaptured transcript. The worker
+        # independently pages exact oldest batches of 60.
+        sources=tuple(CAPTURE_LIVE_SOURCES),
+        limit=max(64, min(1000, turn_backstop() * 2)),
+    )
+    return [dict(row) for row in rows if _is_live_capture_message(row)]
 
 
 def refresh_capture_state_from_chat(store, *, now: float | None = None) -> dict[str, Any]:
-    state = load_capture_state(store)
+    raw_state = db.get_blob(store.user_id, CAPTURE_STATE_KIND)
+    state = _state_doc(raw_state)
     window_messages = _live_messages_after_capture(store, state)
+    # Clear deletes both the transcript and this derived frontier. A delayed
+    # scheduler tick that observes neither must remain a no-op instead of
+    # recreating an empty capture_state row after Clear linearized.
+    if raw_state is None and not window_messages:
+        return state
     patch: dict[str, Any] = {}
     if window_messages:
         last = window_messages[-1]
@@ -312,6 +313,10 @@ def refresh_capture_state_from_chat(store, *, now: float | None = None) -> dict[
         source_message_id=(
             str(window_messages[-1].get("id") or "") if window_messages else None
         ),
+        # An empty refresh may update an existing frontier, but it must never
+        # create one. Clear can delete the row between the read above and this
+        # fenced write.
+        require_existing=not bool(window_messages),
     )
 
 
@@ -413,7 +418,23 @@ def _enqueue_window(
     return {"enqueued": bool(enqueued), "reason": reason, "state": state, "job": job}
 
 
-def record_chat_append(store, message: Mapping[str, Any]) -> dict[str, Any]:
+def record_chat_append(
+    store,
+    message: Mapping[str, Any],
+    *,
+    defer_to_tick: bool = False,
+) -> dict[str, Any]:
+    if defer_to_tick:
+        # Latency-sensitive chat writes are already durable before this hook.
+        # The resident/V2 scheduler tick rebuilds the authoritative frontier
+        # from PostgreSQL, so the request path does not need to repeat those
+        # reads synchronously.
+        return {
+            "enqueued": False,
+            "reason": "deferred_to_tick",
+            "state": {},
+            "job": None,
+        }
     if not _is_live_capture_message(message):
         return {"enqueued": False, "reason": "ignored_message", "state": load_capture_state(store), "job": None}
     now_ts = _safe_float(message.get("ts"), time.time())
@@ -499,11 +520,10 @@ def tick_quiet_capture(
         return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
     if until_id == str(state.get("last_captured_until_message_id") or ""):
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
-    # V2 chat writes only refresh capture state; the runner-owned sweep is the
-    # sole producer. Preserve the turn-count backstop with at most one scheduler
-    # cadence of delay, while resident/import paths keep their immediate legacy
-    # ``record_chat_append`` behavior.
-    if submit is not None and int(state.get("turns_since_capture") or 0) >= turn_backstop():
+    # Foreground chat writes defer capture discovery to this durable sweep.
+    # Preserve the turn-count backstop for both resident and V2 with at most
+    # one scheduler cadence of delay.
+    if int(state.get("turns_since_capture") or 0) >= turn_backstop():
         return _enqueue_window(
             store,
             trigger="turn_backstop",
@@ -669,6 +689,19 @@ def _capture_trace_card_titles(job: Mapping[str, Any]) -> str:
     return " | ".join(str(t) for t in titles if t)[:1000]
 
 
+def _trace_safe_reason(job: Mapping[str, Any]) -> str:
+    """Reason for a trace event, redacted before it leaves the process.
+
+    Both fields are externally supplied free text — ``_job_status_patch`` stores
+    ``payload["reason"][:500]`` and ``payload["noop_reason"][:500]`` straight
+    from the request body — and ``GET /v1/debug/trace`` hands trace details back
+    on the user's own auth. ``debug_trace._safe_detail`` bounds length but does
+    not judge content, so redaction has to happen here, at the writer.
+    """
+    raw = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+    return notices_status_reason.sanitize_status_reason(raw)
+
+
 def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     """migrate 终态只维护失败退避 streak——window 游标由 handler 自己重扫，
     这里不像 capture 那样推进 last_captured_*。"""
@@ -755,7 +788,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         # render it red (see CAPTURE_RETRYABLE_TERMINAL comment in capture_jobs.py:
         # "failed = error; skipped = abnormal terminal — noop is reported as
         # completed, not skipped").
-        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        reason = _trace_safe_reason(job)
         detail = {"status": status_text}
         if reason:
             detail["reason"] = reason[:200]
@@ -771,7 +804,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             detail=detail,
         )
     else:
-        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        reason = _trace_safe_reason(job)
         debug_trace.trace_event(
             store,
             subsystem="memory",

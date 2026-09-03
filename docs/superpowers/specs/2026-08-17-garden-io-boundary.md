@@ -1,4 +1,13 @@
+---
+document_lifecycle: decision
+canonical_owner: docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md
+---
 # Garden / io 边界：什么该进独立库，什么必须留在 io
+
+> **CURRENT-STATE NOTE（2026-08-27）**：本文的文件名和行号是 2026-08-17 的边界整理
+> 快照；“可跨宿主复用的纯判断进入 Garden，网络/数据库/密钥/ownership/effect 留在 IO”
+> 仍是现行决策。内核现由外部 `memgarden` 包持有，当前接线和供应链以 public
+> architecture、requirements lock、CI 与聚焦测试为准。
 
 > 2026-08-17。开源前必须回答的问题。
 > 现在的划分是**提取时顺手划的，不是想清楚划的** —— 本文是把它想清楚。

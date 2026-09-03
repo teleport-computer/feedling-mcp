@@ -24,6 +24,7 @@ from asgi import threadpool
 from asgi.deps import require_auth, require_scope
 from chat import idempotency as chat_idempotency
 from core import envelope as core_envelope
+from core.store_sections import StoreSection
 from core import voice_token
 from hosted import chat_send_core
 from hosted import config_store as hosted_config_store
@@ -591,7 +592,10 @@ async def cancel_voice_call(
                 "replayed": True, "deleted": 0,
                 "retained_covered": 0, "remaining": 0,
             }, 200
-        store = core_store.get_store(user_id)
+        store = core_store.get_store_shell_only(
+            user_id,
+            reason="voice archive/card writes are cold-safe before cleanup refresh",
+        )
         if not transcript_store.exists(user_id, call_id):
             runtime_token = results.mint_enclave_token(user_id)
             turns = voice_cleanup.transcript_turns_from_rows(
@@ -642,7 +646,9 @@ async def cancel_voice_call(
         _db.voice_call_mark_finalized(user_id, call_id)
         handoff = results.delete_call_state(user_id, call_id)
         cleanup = voice_cleanup.delete_call_messages(user_id, call_id)
-        store = core_store.get_store(user_id)
+        store = core_store.get_store(
+            user_id, require={StoreSection.CHAT}
+        )
         # Apply the authoritative delete events; older assistant messages may
         # be discoverable only through reply_to_message_id in durable storage.
         store.ensure_chat_fresh(force=True)
@@ -727,7 +733,9 @@ async def finalize_voice_call(
         lifecycle = _db.voice_call_begin_finalize(user_id, call_id)
         if lifecycle["status"] == "cancelled":
             return {"error": "voice_call_cancelled"}, 409
-        store = core_store.get_store(user_id)
+        store = core_store.get_store(
+            user_id, require={StoreSection.CHAT}
+        )
 
         # Idempotent replay. The judge is the ARCHIVE, not the chat card: the
         # card id reuses the summary era's uuid5 namespace, so a row written by

@@ -156,7 +156,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from perception_kernel import prompts as perception_prompts
+from perceptkit import prompts as perception_prompts
 
 import generated_image
 import provider_client as _provider_client
@@ -188,6 +188,8 @@ from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
 from memgarden.prompts.buckets import normalize_bucket_language
+from memgarden import contracts as mg_contracts
+from memory import garden_component
 from memgarden.text.card_text import (
     count_user_token_residuals,
     is_retryable_parse_error,
@@ -197,12 +199,11 @@ from memory.dream_prompt_v1 import (
     build_dream_retry_prompt,
     parse_dream_consolidations,
 )
-from memgarden.prompts.migrate import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
     garden_language_decision,
     infer_garden_language,
-    infer_reply_language_policy,
+    infer_reply_language,
     reply_language_system_line,
     user_written_text,
 )
@@ -1179,13 +1180,36 @@ def _report_runtime_error(
         return False
 
 
-def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
+def _notify_agent_turn_failure(
+    exc: BaseException,
+    *,
+    foreground: bool,
+    lane: str = "",
+    trace_id: str = "",
+    job_id: str = "",
+) -> None:
     """腿①+②：分类 → 上报设置页/admin；仅前台失败（限流后）才发聊天 system 横幅。
 
     后台车道失败不进聊天流（Seven 2026-07-11）——观测走 _report_runtime_error
     + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
+        # Paired with agent.turn.success at the success-reporting locus below.
+        # Reuse this exact notice: reclassifying a synthetic exception here would
+        # let the time series disagree with last_runtime_error_class again.
+        _emit_debug_trace(
+            "agent",
+            "agent.turn.failure",
+            status="error",
+            trace_id=trace_id,
+            job_id=job_id,
+            detail={
+                "error_class": notice.error_class,
+                "blame": notice.blame,
+                "foreground": bool(foreground),
+                "lane": lane,
+            },
+        )
         _report_runtime_error(
             notice.detail,
             notice.error_class,
@@ -1239,6 +1263,33 @@ def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
     if notice is None:
         return
     _system_notice_last_sent[notice.error_class] = time.monotonic()
+
+
+def _emit_agent_turn_success(
+    *,
+    foreground: bool,
+    lane: str,
+    trace_id: str = "",
+    job_id: str = "",
+) -> None:
+    """Emit one denominator event at a terminal locus paired with failure.
+
+    This is intentionally separate from ``_note_agent_turn_success``: that
+    helper runs for internal model attempts and retries, while failure reporting
+    happens once at the owning chat/job layer. Mixing those units creates a
+    plausible-looking but invalid failure rate.
+
+    Debug trace is config-gated, so readers must report the users represented in
+    each window. They must also cap the window at trace partition retention
+    (currently 30 days by default).
+    """
+    _emit_debug_trace(
+        "agent",
+        "agent.turn.success",
+        trace_id=trace_id,
+        job_id=job_id,
+        detail={"foreground": bool(foreground), "lane": lane},
+    )
 
 
 def _note_agent_turn_success() -> None:
@@ -3183,18 +3234,27 @@ def _decode_image_b64(value: Any) -> bytes | None:
 
 
 def _image_payloads_from_msg(msg: dict) -> list[dict[str, str]]:
-    image_bytes = _decode_image_b64(msg.get("image_b64"))
-    if not image_bytes:
-        return []
-    mime = msg.get("image_mime") or "image/jpeg"
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    return [
-        {
+    raw_items = msg.get("images")
+    if not isinstance(raw_items, list):
+        raw_items = [{
+            "image_b64": msg.get("image_b64"),
+            "image_mime": msg.get("image_mime"),
+        }]
+    payloads: list[dict[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        image_bytes = _decode_image_b64(item.get("image_b64"))
+        if not image_bytes:
+            continue
+        mime = item.get("image_mime") or "image/jpeg"
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        payloads.append({
             "mime_type": str(mime),
             "data": b64,
             "data_url": f"data:{mime};base64,{b64}",
-        }
-    ]
+        })
+    return payloads
 
 
 def _image_file_paths_for_msg(msg: dict) -> list[str]:
@@ -9891,7 +9951,163 @@ _CODEX_MISSING_SESSION_RE = re.compile(
 )
 
 
-def call_agent_cli(
+def _emit_cli_model_call_terminal(
+    context: dict[str, Any],
+    *,
+    trace_id: str,
+    succeeded: bool,
+    failure: BaseException | None = None,
+) -> None:
+    """Emit the CLI model terminal from the call's real return/raise result.
+
+    A zero process exit is transport evidence, not turn-success evidence: pi
+    exits zero for provider/API failures too.  The public ``call_agent_cli``
+    wrapper calls this helper only after the implementation either returned a
+    parsed result (positive success evidence) or raised.  Unknown output shapes
+    therefore fail closed into ``agent.model.call.error`` instead of silently
+    becoming ``done``.
+    """
+    if not context.get("started"):
+        return
+    try:
+        cmd = list(context.get("cmd") or [])
+        result = context.get("result")
+        started_at = context.get("started_at")
+        dur_ms = max(
+            0,
+            int(
+                (time.monotonic() - float(started_at)) * 1000
+                if started_at is not None
+                else 0
+            ),
+        )
+        driver = (
+            "pi" if _is_pi_cmd(cmd)
+            else ("codex" if _is_codex_cmd(cmd) else "claude")
+        )
+        rc = getattr(result, "returncode", None)
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        else:
+            stdout = str(stdout)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        else:
+            stderr = str(stderr)
+
+        metrics: dict[str, Any] = {
+            "driver": driver,
+            "rc": rc,
+            "agent_ms": None,
+            "api_ms": None,
+            "num_turns": None,
+            "steps": None,
+            "input_tokens": None,
+            "output_tokens": None,
+        }
+        if result is not None:
+            try:
+                metrics.update(_cli_turn_metrics(cmd, result, dur_ms))
+            except Exception as exc:  # noqa: BLE001 — trace must stay fail-open
+                log.debug("model terminal metrics parse failed: %s", exc)
+
+        trace_turn = AgentTurn()
+        if succeeded:
+            try:
+                trace_turn = _agent_turn_from_raw(stdout)
+            except Exception as exc:  # noqa: BLE001 — trace must stay fail-open
+                log.debug("thinking trace parse failed: %s", exc)
+            stdout_had_thinking_marker = (
+                '"type":"thinking"' in stdout
+                or '"type": "thinking"' in stdout
+                or "thinking_delta" in stdout
+            )
+            if (
+                metrics["driver"] == "claude"
+                and stdout_had_thinking_marker
+                and not trace_turn.thinking_summary
+            ):
+                log.warning("claude stdout had thinking markers but parser yielded none")
+
+        error_class = ""
+        if not succeeded:
+            if isinstance(failure, subprocess.TimeoutExpired):
+                error_class = "turn_timeout"
+            elif failure is not None:
+                error_class = classify_agent_error(failure).error_class
+            else:
+                error_class = "unknown"
+
+        excerpt = {
+            "reply_head": stdout[:1000],
+            "stderr_head": stderr[:500],
+        }
+        if not succeeded:
+            error_detail = _cli_error_detail(stdout, stderr)
+            if not error_detail and failure is not None:
+                error_detail = str(failure)[:500]
+            excerpt = {"error_detail": error_detail, **excerpt}
+
+        if succeeded:
+            explain = (
+                f"模型返回（{metrics['driver']}，{dur_ms}ms"
+                + (
+                    f"，{metrics['num_turns']} 轮"
+                    if metrics.get("num_turns")
+                    else ""
+                )
+                + "）"
+            )
+        elif isinstance(failure, subprocess.TimeoutExpired):
+            explain = (
+                f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，"
+                "FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步"
+            )
+        elif rc not in (None, 0):
+            explain = f"模型调用失败 rc={rc}"
+        else:
+            explain = f"模型调用未产生可用结果（{metrics['driver']}，rc={rc}）"
+
+        _emit_debug_trace(
+            "agent",
+            "agent.model.call.done" if succeeded else "agent.model.call.error",
+            status="ok" if succeeded else "error",
+            trace_id=trace_id,
+            dur_ms=dur_ms,
+            summary=(
+                f"cli turn succeeded rc={rc} {metrics['driver']}"
+                if succeeded
+                else f"cli turn failed rc={rc} {metrics['driver']}"
+            ),
+            explain=explain,
+            detail={
+                **{
+                    key: metrics.get(key)
+                    for key in (
+                        "driver",
+                        "rc",
+                        "agent_ms",
+                        "api_ms",
+                        "num_turns",
+                        "steps",
+                        "input_tokens",
+                        "output_tokens",
+                    )
+                },
+                "error_class": error_class,
+                "thinking_present": bool(trace_turn.thinking_summary),
+                "thinking_source": trace_turn.thinking_source or "",
+                "thinking_len": len(trace_turn.thinking_summary or ""),
+            },
+            content_excerpt=excerpt,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must never affect a turn
+        log.debug("model terminal trace emission failed: %s", exc)
+
+
+def _call_agent_cli_impl(
     message: str,
     image_paths: list[str] | None = None,
     raw_text: bool = False,
@@ -9903,6 +10119,7 @@ def call_agent_cli(
     outbound_fence: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
     absolute_deadline: float | None = None,
+    _model_call_trace: dict[str, Any] | None = None,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -9951,6 +10168,13 @@ def call_agent_cli(
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
+    if _model_call_trace is not None:
+        _model_call_trace.update({
+            "started": True,
+            "started_at": _turn_t0,
+            "cmd": list(cmd),
+            "result": None,
+        })
     _emit_debug_trace("agent", "agent.model.call.start", trace_id=trace_id,
                       summary="cli turn start",
                       explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
@@ -10101,11 +10325,6 @@ def call_agent_cli(
                 "ts": time.time(),
             })
             _queue_provider_attempt_ledger(timeout_rows)
-        _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
-                          dur_ms=(time.monotonic() - _turn_t0) * 1000,
-                          summary="cli turn timeout",
-                          explain=f"模型调用超时（{AGENT_TURN_TIMEOUT_SEC}s 上限，FEEDLING_AGENT_TURN_TIMEOUT_SEC 可调）— 卡在模型这一步",
-                          detail={"error_class": "turn_timeout"})
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit %ds subprocess cap)",
             "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
@@ -10113,6 +10332,8 @@ def call_agent_cli(
             AGENT_TURN_TIMEOUT_SEC,
         )
         raise
+    if _model_call_trace is not None:
+        _model_call_trace.update({"cmd": list(cmd), "result": result})
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
     for _stream_name in ("stdout", "stderr"):
         _repl = (getattr(result, _stream_name, "") or "").count("\ufffd")
@@ -10124,63 +10345,6 @@ def call_agent_cli(
             )
     _log_cli_turn_timing(cmd, result, _wall_ms)
     _m = _cli_turn_metrics(cmd, result, _wall_ms)
-    _trace_turn = AgentTurn()
-    if result.returncode == 0:
-        try:
-            _trace_turn = _agent_turn_from_raw(result.stdout or "")
-        except Exception as e:  # noqa: BLE001 — observability must never affect a turn
-            log.debug("thinking trace parse failed: %s", e)
-    _stdout_had_thinking_marker = (
-        '"type":"thinking"' in (result.stdout or "")
-        or '"type": "thinking"' in (result.stdout or "")
-        or "thinking_delta" in (result.stdout or "")
-    )
-    if (
-        result.returncode == 0
-        and _m["driver"] == "claude"
-        and _stdout_had_thinking_marker
-        and not _trace_turn.thinking_summary
-    ):
-        log.warning("claude stdout had thinking markers but parser yielded none")
-    _excerpt = {"reply_head": (result.stdout or "")[:1000],
-                "stderr_head": (result.stderr or "")[:500]}
-    if result.returncode != 0:
-        # `reply_head` almost never contains the cause. codex opens every stream
-        # with a `thread.started` plus two harmless notices (deprecated
-        # `[features].collab`, missing model metadata for the `gw-<uid>` alias)
-        # that eat ~500 of the 1000 bytes; the failing `error` event lands past
-        # the cap. Every failure therefore *looks* identical in the trace no
-        # matter what killed it — a `web_search` 400 and an upstream 403 both
-        # truncate to the same two notices, and both have been misdiagnosed as a
-        # "collab crash". `_cli_error_detail` already pulls the last top-level
-        # error event for the RuntimeError below (the notices are nested under
-        # `item.completed` and never match), so surface the same string here.
-        _excerpt = {"error_detail": _cli_error_detail(result.stdout or "", result.stderr or ""),
-                    **_excerpt}
-    _trace_error_class = ""
-    if result.returncode != 0:
-        _trace_failure = RuntimeError(
-            f"cli agent exited {result.returncode}: "
-            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
-        )
-        _trace_error_class = classify_agent_error(_trace_failure).error_class
-    _emit_debug_trace(
-        "agent", "agent.model.call.done" if result.returncode == 0 else "agent.model.call.error",
-        status="ok" if result.returncode == 0 else "error", trace_id=trace_id, dur_ms=_wall_ms,
-        summary=f"cli turn rc={result.returncode} {_m['driver']}",
-        explain=(f"模型返回（{_m['driver']}，{_wall_ms}ms" +
-                 (f"，{_m['num_turns']} 轮" if _m.get('num_turns') else "") + "）"
-                 if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
-        detail={
-            **{k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
-                                  "steps", "input_tokens", "output_tokens")},
-            "error_class": _trace_error_class,
-            "thinking_present": bool(_trace_turn.thinking_summary),
-            "thinking_source": _trace_turn.thinking_source or "",
-            "thinking_len": len(_trace_turn.thinking_summary or ""),
-        },
-        content_excerpt=_excerpt,
-    )
     if ledger_enabled:
         _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
             cmd,
@@ -10293,6 +10457,8 @@ def call_agent_cli(
                 stdout_line=runtime_stream.feed if runtime_stream is not None else None,
                 **run_extra,
             )
+            if _model_call_trace is not None:
+                _model_call_trace.update({"cmd": list(cmd), "result": result})
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
                     cmd,
@@ -10371,6 +10537,8 @@ def call_agent_cli(
                 _run_kwargs,
                 stdout_line=runtime_stream.feed if runtime_stream is not None else None,
             )
+            if _model_call_trace is not None:
+                _model_call_trace.update({"cmd": list(cmd), "result": result})
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
                     cmd,
@@ -10529,6 +10697,59 @@ def call_agent_cli(
             f"cli agent produced no usable output (exit={result.returncode})"
         )
     return text
+
+
+def call_agent_cli(
+    message: str,
+    image_paths: list[str] | None = None,
+    raw_text: bool = False,
+    trace_id: str = "",
+    lane: str = "background",
+    attempt_trigger: str = "first",
+    stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
+    outbound_fence: bool = False,
+    cancellation: _VoiceTurnCancellation | None = None,
+    absolute_deadline: float | None = None,
+) -> Any:
+    """Run one resident CLI turn and trace its parsed outcome fail-closed.
+
+    A normal return from the implementation is the success-positive evidence:
+    every supported driver has already passed its real output parser at that
+    point.  Any exception, including an exit-zero output shape that parsed to no
+    reply, is an error.  This keeps trace classification driver-independent and
+    prevents a new exit-zero driver from silently joining the success bucket.
+    """
+    model_call_trace: dict[str, Any] = {}
+    try:
+        value = _call_agent_cli_impl(
+            message,
+            image_paths=image_paths,
+            raw_text=raw_text,
+            trace_id=trace_id,
+            lane=lane,
+            attempt_trigger=attempt_trigger,
+            stream_update=stream_update,
+            isolated_session=isolated_session,
+            outbound_fence=outbound_fence,
+            cancellation=cancellation,
+            absolute_deadline=absolute_deadline,
+            _model_call_trace=model_call_trace,
+        )
+    except Exception as exc:
+        _emit_cli_model_call_terminal(
+            model_call_trace,
+            trace_id=trace_id,
+            succeeded=False,
+            failure=exc,
+        )
+        raise
+    _emit_cli_model_call_terminal(
+        model_call_trace,
+        trace_id=trace_id,
+        succeeded=True,
+    )
+    return value
 
 
 def _sanitize_reply_text(text: str) -> str:
@@ -10969,13 +11190,33 @@ def _wake_self_thinking_allowed() -> bool:
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
 
-def _wake_think_permission_line() -> str:
+def _foreground_self_thinking_instruction() -> str:
+    """前台强制思考指令；与主动道共享同一开关，只保留强度差异。"""
+    if not _wake_self_thinking_allowed():
+        return ""
+    from agent_protocol_core import self_thinking as _self_thinking_v1
+
+    return _self_thinking_v1.INSTRUCTION.strip()
+
+
+def _wake_think_permission_line(presence: dict | None = None) -> str:
     """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
     if not _wake_self_thinking_allowed():
         return ""
+    policy = _resident_reply_language(presence)
+    if policy.language != "en":
+        return (
+            " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
+            "不会显示成消息。如果选择思考，从第一个字到最后一个字都使用用户所用的"
+            "语言。保持你自己的私下内心独白；不要写成对用户的评估，也不要写成他们"
+            "应该做什么的行动方案。"
+        )
     return (
         " You may open with your usual <think>...</think> block before the JSON; "
-        "it stays private and is never shown as a message."
+        "it stays private and is never shown as a message. Write the whole block "
+        "in the language the user uses, from first word to last. Keep it in your "
+        "own private inner voice; do not turn it into an assessment of the user or "
+        "an action plan for what they should do."
     )
 
 
@@ -14836,7 +15077,7 @@ def _message_for_proactive_job(
         "way. Use the glance below to decide whether to look closer; pull the real tools if something makes you want "
         "to understand the moment better. Then do whatever feels right — including nothing. "
         "Never mention this wake or any system wording to the user.",
-        _reply_protocol_block(),
+        _reply_protocol_block(presence),
         _reply_language_line(presence),
         (
             "wake_metadata:\n"
@@ -14875,34 +15116,32 @@ def _message_for_proactive_job(
     return _with_worldbook("\n\n".join(parts))
 
 
-def _reply_protocol_block() -> str:
+def _reply_protocol_block(presence: dict | None = None) -> str:
     """How the agent responds — stated once (no longer repeated across the wake
     preamble + tool block)."""
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(),
+        "Return JSON {\"messages\":[\"...\"]}." + _wake_think_permission_line(presence),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
 
 
-def _resident_reply_language_policy(presence: dict | None = None):
-    """Resident-side reply-language policy via the shared helper. Resident has no
-    identity-card/memory text in hand (only whoami archive_language + presence
-    locale), so it degrades to the helper's locale → archive_language → default
-    tier — same wording, mirror rule, and time-anchor localization as model_api."""
+def _resident_reply_language(presence: dict | None = None):
+    """Resident-side locale → archive-language → default selection."""
     locale = str((presence or {}).get("locale") or "").strip()
     archive_language = str(_whoami_cache.get("archive_language") or "").strip()
-    return infer_reply_language_policy({}, [], locale=locale, archive_language=archive_language)
+    return infer_reply_language(locale=locale, archive_language=archive_language)
 
 
 def _reply_language_line(presence: dict | None = None) -> str:
-    """The shared zh/en reply-language policy line (a default language + a soft
-    mirror of the user's latest-message language). Wired into both the proactive
-    wakes and the foreground reply so the model stops drifting to Chinese when the
-    user is in an English context."""
-    return reply_language_system_line(_resident_reply_language_policy(presence))
+    """Render the shared reply-language rule in the selected zh/en language.
+
+    Wired into both proactive wakes and foreground replies; the rendered rule
+    tells the model how to choose the language from the latest user message.
+    """
+    return reply_language_system_line(_resident_reply_language(presence))
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -15021,7 +15260,7 @@ def _local_time_anchor(since_sec: float | None = None, presence: dict | None = N
     tzs = _user_timezone()
     is_default = not tzs
     zone = tzs or _DEFAULT_TIMEZONE
-    policy = _resident_reply_language_policy(presence)
+    policy = _resident_reply_language(presence)
     return format_time_anchor(
         datetime.now(_tzmod.utc), zone, policy,
         since_sec=since_sec, timezone_default=is_default,
@@ -15800,27 +16039,54 @@ def _process_capture_jobs(jobs: list) -> float:
             explain="这轮落卡用哪种语言写卡，以及凭什么这么判。桶名本身不落库。",
             detail=_lang,
         )
-        prompt = build_capture_prompt(
-            ai_name=ai_name,
-            user_name=user_name,
-            buckets=buckets_text,
-            threads=threads_text,
-            identity=identity_text,
-            window=window_text,
-            locale=capture_locale,
+        # 落卡走 GardenComponent —— 拼提示词 / 调模型 / 解析 / 过闸 / 重问
+        # 这一串编排在包里，io 只提供模型和观测。
+        #
+        # 换过来之前这里是 io 自己拼的（build_capture_prompt → 调 agent →
+        # parse → 打回重问），那份说明书只存在于这个文件里，Garden 内部
+        # 改个函数名 io 就编译不过。
+        #
+        # ⚠️ 产出必须和原来**逐字节相同** —— 搬的是判断逻辑，一点漂移就是
+        # 用户看得见的记忆变化。tests/test_garden_component_parity.py 逐个
+        # 形状对过：正常 / 吐脏后重问 / 重问后留空 / 重问后仍脏 / 本来就没得记。
+        _bounce_tracker = garden_component.BounceTracker()
+        _garden = garden_component.build_garden(
+            garden_component.CallableModel(
+                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
+            ),
+            on_step=_bounce_tracker,
         )
         try:
-            (cards, err), bounce = _memory_agent_parse_with_bounce(
-                prompt,
-                parse=parse_capture_cards,
-                build_retry_prompt=build_capture_retry_prompt,
+            _captured = _garden.capture(mg_contracts.CaptureRequest(
+                window=window_text,
+                locale=capture_locale,
+                buckets=buckets_text,
+                threads=threads_text,
+                identity=identity_text,
+                ai_name=ai_name,
+                user_name=user_name,
+            ))
+            _emit_agent_turn_success(
+                foreground=False,
                 lane="capture",
+                trace_id=job_id,
                 job_id=job_id,
             )
+            _note_agent_turn_success()
+            cards, err = _captured.cards, _captured.error
+            bounce = _bounce_tracker.bounce(cards=cards, error=err)
+            if bounce:
+                log.warning("capture content gate bounced id=%s outcome=%s", job_id, bounce)
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="capture",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -15835,9 +16101,15 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         reask_count = 1 if bounce else 0
-        reask_trigger = "format" if bounce else ""
+        # 触发原因问组件要,**别写死 "format"** —— 本地语义重问现在也在组件里,
+        # 写死的话一次语义打回会在指标里显示成格式打回,而这两类的处理方式不同。
+        reask_trigger = _bounce_tracker.reask_trigger if bounce else ""
         reask_outcome = (
-            "recovered"
+            # 重问之后仍不合格、被组件丢掉的卡 —— 这是失败,哪怕同一轮里还有
+            # 别的好卡活了下来。只看 bounce 的话它会显示成 recovered。
+            "failed"
+            if _bounce_tracker.dropped_semantic
+            else "recovered"
             if bounce == "bounced_ok"
             else "failed"
             if bounce == "bounced_failed"
@@ -15865,67 +16137,52 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
-        semantic_reasons = _capture_semantic_retry_reasons(cards)
-        if semantic_reasons and reask_count < CAPTURE_AGENT_REASK_BUDGET:
-            reask_count += 1
-            reask_trigger = "semantic"
-            try:
-                retry_text = _capture_agent_reply_text(
-                    call_agent(
-                        build_capture_semantic_retry_prompt(
-                            prompt, semantic_reasons
-                        ),
-                        raw_text=True,
-                    )
-                )
-                _note_agent_turn_success()
-                retried_cards, retry_err = parse_capture_cards(
-                    retry_text, strict=False
-                )
-            except Exception as retry_exc:
-                log.warning(
-                    "capture semantic reask failed id=%s: %s",
-                    job_id,
-                    retry_exc,
-                )
-                retried_cards, retry_err = [], "semantic_reask_failed"
-            if retry_err:
-                reask_outcome = "failed"
-            else:
-                cards = retried_cards
-                reask_outcome = (
-                    "failed"
-                    if _capture_semantic_retry_reasons(cards)
-                    else "recovered"
-                    if cards
-                    else "empty"
-                )
-        elif semantic_reasons:
-            reask_outcome = "failed"
+        # 本地可证的语义重问(「要覆盖旧卡却没给 target_id」)**已经归组件了**,
+        # 这里原来那一整段是同一件事的第二份实现 —— 切到组件之后它就成了死代码,
+        # 引用的 prompt 变量也随提示词构建搬进内核而消失(pyflakes 扫出来的)。
+        # 组件重问后仍不合格的卡会被丢掉,丢了几张看 _bounce_tracker.dropped_semantic。
+        #
+        # 服务端才知道的那一类(target_id 指向别人的卡 / 已删的卡)不在这儿,
+        # 在下面 execute_memory_actions 之后 —— 那个必须留在 io,内核没有库。
         # 残留计数(与 V2 同口径)。**刻意不在这里跑确定性改写** —— 那个改写器
         # 现有的锚点在产品语境下会改坏真内容(见 test_card_user_referent.py)。
         user_token_residual = sum(count_user_token_residuals(c) for c in cards)
         if not cards:
+            # 空的原因分两种,**不能都叫 nothing_worth_keeping**。
+            #
+            # 组件会把「要覆盖旧卡但没说覆盖哪张」的卡丢掉(它必须丢 —— 交出来
+            # 就是一条 target_id 为空的 supersede)。如果整轮只有这种卡,这里
+            # 就是空的 —— 但那是一次**模型失败**,不是「真的没什么值得记」。
+            # 两者在 admin 上长得一模一样,混在一起等于这类失败永远查不出来。
+            # 同一条道理见下面 content_gate 那句注释。
+            _dropped = _bounce_tracker.dropped_semantic
+            _noop_reason = (
+                "supersede_without_target" if _dropped else "nothing_worth_keeping"
+            )
+            _capture_result = {
+                "status": "noop",
+                "reason": _noop_reason,
+                "reask_count": reask_count,
+                "reask_trigger": reask_trigger or None,
+                "reask_outcome": reask_outcome,
+            }
+            if _dropped:
+                _capture_result["skipped"] = {"supersede_without_target": _dropped}
+                _capture_result["skipped_count"] = _dropped
             update_proactive_job_status(
                 job_id,
                 "completed",
-                "nothing_worth_keeping",
+                _noop_reason,
                 extra={
                     # content_gate 记下「这轮空是因为占位符被打回」,否则它和
                     # 「真的没什么值得记」在 admin 上长得一模一样。
                     "content_gate": bounce or None,
                     "user_token_residual": user_token_residual or None,
-                    "capture_result": {
-                        "status": "noop",
-                        "reason": "nothing_worth_keeping",
-                        "reask_count": reask_count,
-                        "reask_trigger": reask_trigger or None,
-                        "reask_outcome": reask_outcome,
-                    },
+                    "capture_result": _capture_result,
                     "capture_window": window,
                     "cards_added": 0,
                     "cards_superseded": 0,
-                    "noop_reason": "nothing_worth_keeping",
+                    "noop_reason": _noop_reason,
                 },
             )
             log.info("capture job completed noop id=%s", job_id)
@@ -15936,7 +16193,12 @@ def _process_capture_jobs(jobs: list) -> float:
                 job=job,
                 messages=messages,
             )
-            rejected_without_target = sum(
+            # 组件已经把「要覆盖但没说覆盖哪张」的卡丢掉了(它必须丢 —— 交出来
+            # 就是一条 target_id 为空的 supersede)，所以这里数 cards 是数不到的。
+            # 加上组件报的丢弃数，admin 上才还能看见 supersede_without_target；
+            # 少了它，这种模型失败会退化成「这轮没什么值得记」，和真的没内容
+            # 长得一模一样。
+            rejected_without_target = _bounce_tracker.dropped_semantic + sum(
                 1
                 for card in cards
                 if str(card.get("action") or "").strip().lower()
@@ -15954,18 +16216,30 @@ def _process_capture_jobs(jobs: list) -> float:
                 reask_count += 1
                 reask_trigger = "semantic"
                 try:
-                    retry_text = _capture_agent_reply_text(
-                        call_agent(
-                            build_capture_semantic_retry_prompt(
-                                prompt, server_semantic_reasons
-                            ),
-                            raw_text=True,
-                        )
+                    # 走组件的 recapture_with_feedback —— **理由由 io 给,
+                    # 提示词怎么措辞、怎么解析仍归内核**。
+                    #
+                    # 这一类只有 io 知道:target_id 指向的卡不属于这个人、
+                    # 或已经不存在。内核没有库,判不了;io 试着落库被自己的
+                    # 所有权闸挡回来,才拿到这个事实。
+                    #
+                    # 不在这儿自己拼提示词:那会变成第二份编排,措辞和解析规则
+                    # 在两边各写一份,然后慢慢漂开(这个文件里刚删掉一段就是
+                    # 这么来的)。
+                    _retried = _garden.recapture_with_feedback(
+                        mg_contracts.CaptureRequest(
+                            window=window_text,
+                            locale=capture_locale,
+                            buckets=buckets_text,
+                            threads=threads_text,
+                            identity=identity_text,
+                            ai_name=ai_name,
+                            user_name=user_name,
+                        ),
+                        server_semantic_reasons,
                     )
                     _note_agent_turn_success()
-                    retried_cards, retry_err = parse_capture_cards(
-                        retry_text, strict=False
-                    )
+                    retried_cards, retry_err = _retried.cards, _retried.error
                 except Exception as retry_exc:
                     log.warning(
                         "capture server-semantic reask failed id=%s: %s",
@@ -16482,10 +16756,22 @@ def _process_dream_jobs(jobs: list) -> float:
                 lane="dream",
                 job_id=job_id,
             )
+            _emit_agent_turn_success(
+                foreground=False,
+                lane="dream",
+                trace_id=job_id,
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="dream",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -16929,12 +17215,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 update_proactive_job_status(
                     job_id, "failed", f"provider_payment_required: {e}"
                 )
-                _notify_agent_turn_failure(e, foreground=False)
+                _notify_agent_turn_failure(
+                    e,
+                    foreground=False,
+                    lane="proactive",
+                    trace_id=job_id,
+                    job_id=job_id,
+                )
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             _note_proactive_failure()
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
-            _notify_agent_turn_failure(e, foreground=False)
+            _notify_agent_turn_failure(
+                e,
+                foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
+            )
             continue
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
@@ -16951,6 +17249,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             _notify_agent_turn_failure(
                 _reply_parse_failure_exc(parse_failure_class),
                 foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
             )
             update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
             continue
@@ -16985,9 +17286,18 @@ def _process_proactive_jobs(jobs: list) -> float:
             _notify_agent_turn_failure(
                 ValueError("agent produced only a degenerate reply fragment; not posting"),
                 foreground=False,
+                lane="proactive",
+                trace_id=job_id,
+                job_id=job_id,
             )
             update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
             continue
+        _emit_agent_turn_success(
+            foreground=False,
+            lane="proactive",
+            trace_id=job_id,
+            job_id=job_id,
+        )
         _note_agent_turn_success()
         # NOTE: the self-wake loop streak is advanced at the schedule point below
         # (only when the agent asks for its OWN next wake), NOT on every idle
@@ -17424,19 +17734,27 @@ def _process_migrate_jobs(jobs: list) -> float:
         hash_by_id = {str(r.get("id")): str(r.get("old_body_hash") or "") for r in batch}
         _identity, ai_name, user_name, _identity_text = _capture_identity_context()
         buckets_text, threads_text = _capture_memory_terms_context()
-        prompt = build_migrate_prompt(
-            ai_name=ai_name,
-            user_name=user_name,
-            old_cards=_migrate_render_old_cards(batch),
-            vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
-            locale=infer_garden_language(
-                _identity,
-                existing_buckets=buckets_text,
-                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+        # 迁移走 GardenComponent —— 拼提示词 / 调模型 / 解析在包里。
+        # 白名单必填是接口保证的：模型可能凭空造 id，那会把不存在的卡
+        # 「升级」成新内容或覆盖别的卡。
+        _migrate_garden = garden_component.build_garden(
+            garden_component.CallableModel(
+                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
             ),
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            _migrated = _migrate_garden.migrate(mg_contracts.MigrateRequest(
+                old_cards=_migrate_render_old_cards(batch),
+                allowed_ids=tuple(sorted(allowed_ids)),
+                vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
+                ai_name=ai_name,
+                user_name=user_name,
+                locale=infer_garden_language(
+                    _identity,
+                    existing_buckets=buckets_text,
+                    archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+                ),
+            ))
         except Exception as e:
             reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
             log.error("migrate agent call failed id=%s: %s", job_id, e)
@@ -17445,8 +17763,8 @@ def _process_migrate_jobs(jobs: list) -> float:
                 extra={"migrate_result": {"status": "failed", "reason": reason}},
             )
             continue
-        upgrades, unmigrated_ids, err = parse_migrated_cards(
-            reply_text, allowed_ids=allowed_ids, signals=IO_LEAK_SIGNALS
+        upgrades, unmigrated_ids, err = (
+            _migrated.upgrades, _migrated.unmigrated_ids, _migrated.error
         )
         if err:
             update_proactive_job_status(
@@ -17592,7 +17910,15 @@ def _quoted_memory_context(msg: dict) -> str:
     decrypted cards under ``quoted_memories``; returns "" when there are none.
     Shared by hosted and VPS resident replies (same consumer)."""
     quoted = msg.get("quoted_memories")
-    if not isinstance(quoted, list) or not quoted:
+    if not isinstance(quoted, list):
+        quoted = []
+    status = msg.get("quoted_memory_status")
+    unavailable = (
+        max(0, int(status.get("unavailable") or 0))
+        if isinstance(status, dict)
+        else 0
+    )
+    if not quoted and unavailable == 0:
         return ""
     lines: list[str] = []
     for card in quoted:
@@ -17606,14 +17932,26 @@ def _quoted_memory_context(msg: dict) -> str:
         mid = str(card.get("id") or "").strip()
         id_tag = f"(id={mid}) " if mid else ""
         lines.append(f"- {id_tag}{prefix}{text}")
-    if not lines:
-        return ""
-    return (
-        "The user is referring to this memory from their Garden:\n"
-        + "\n".join(lines)
-        + "\nIf they ask you to correct or delete it, act on it directly with memory_patch / "
-        "memory_delete using the id shown above."
+    unavailable_note = (
+        "One or more Garden memories the user selected are currently unavailable "
+        "or have been updated. Do not guess their contents; ask the user to "
+        "reselect them if the missing context matters."
+        if unavailable
+        else ""
     )
+    if not lines and not unavailable_note:
+        return ""
+    parts: list[str] = []
+    if lines:
+        parts.append(
+            "The user is referring to this memory from their Garden:\n"
+            + "\n".join(lines)
+            + "\nIf they ask you to correct or delete it, act on it directly with "
+            "memory_patch / memory_delete using the id shown above."
+        )
+    if unavailable_note:
+        parts.append(unavailable_note)
+    return "\n".join(parts)
 
 
 # --- Offline backlog collapse ----------------------------------------------
@@ -18154,20 +18492,28 @@ def _process_messages(messages: list) -> float:
         # without a lookup round-trip. Sits right above the user's message.
         quoted_text = _quoted_memory_context(msg)
         # Diagnostic breadcrumb: localizes where Garden「talk in chat」breaks.
-        #   present>0  → enclave attached quoted_memories (② ok) → should inject
-        #   has_ids but present==0 → ② did not expand id into a card (enclave side)
-        #   neither → the reference never reached this message (① / transport)
+        #   present>0       → enclave attached quoted_memories
+        #   unavailable>0   → exact lookup completed/failed without card text;
+        #                     the generic no-guess marker must still inject
+        #   requested==0    → the reference never reached this message
         _quoted_present = len(msg.get("quoted_memories") or [])
-        _quoted_has_ids = bool(str(msg.get("quoted_memory_ids") or "").strip())
+        _quoted_status = msg.get("quoted_memory_status") or {}
+        _quoted_requested = int(_quoted_status.get("requested") or 0)
+        _quoted_unavailable = int(_quoted_status.get("unavailable") or 0)
         _emit_debug_trace(
             "context", "context.quoted_memory", trace_id=trace_id,
             summary=f"quoted present={_quoted_present} injected={bool(quoted_text)}",
             explain=(
                 "注入了引用记忆" if quoted_text
-                else ("有 quoted_memory_ids 但 enclave 未展开成 quoted_memories"
-                      if _quoted_has_ids else "本轮消息未携带任何引用记忆")
+                else ("有引用记忆但 enclave 未生成安全降级上下文"
+                      if _quoted_requested else "本轮消息未携带任何引用记忆")
             ),
-            detail={"present": _quoted_present, "has_ids": _quoted_has_ids, "injected": bool(quoted_text)},
+            detail={
+                "requested": _quoted_requested,
+                "present": _quoted_present,
+                "unavailable": _quoted_unavailable,
+                "injected": bool(quoted_text),
+            },
         )
         if quoted_text:
             content = f"{quoted_text}\n\n{content}"
@@ -18176,19 +18522,16 @@ def _process_messages(messages: list) -> float:
                 _quoted_present, ts,
             )
 
-        # Self-authored thinking — FOREGROUND-CHAT-only (this dispatch; background
-        # lanes build their prompts elsewhere and are never asked to emit <think>).
+        # Self-authored thinking is mandatory in foreground chat. Proactive wakes
+        # use the same switch but only permit it, preserving the intentional lane
+        # intensity difference.
         # Prepended so the user's current message stays LAST (the "answer only the
         # last message" framing) and the transcript header added below stays
         # topmost. The consumer's existing tagged-thinking extraction peels the
         # <think> block into thinking_summary. Same kill switch as V2.
-        from agent_protocol_core import self_thinking as _self_thinking_v1
-
-        if (
-            _self_thinking_v1.enabled()
-            and _supports_mandatory_self_thinking_v1()
-        ):
-            content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
+        thinking_instruction = _foreground_self_thinking_instruction()
+        if thinking_instruction:
+            content = f"{thinking_instruction}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
@@ -18468,7 +18811,12 @@ def _process_messages(messages: list) -> float:
             else:
                 # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双
                 # 通知是边角，接受）。
-                _notify_agent_turn_failure(e, foreground=True)
+                _notify_agent_turn_failure(
+                    e,
+                    foreground=True,
+                    lane="chat",
+                    trace_id=trace_id,
+                )
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 if outbound_file_turn_active:
                     _finish_outbound_attachment_turn(trace_id)
@@ -18857,7 +19205,12 @@ def _process_messages(messages: list) -> float:
                     replies = [_fallback_reply_for(raw_user_content_for_lang)]
                     pending_failure_notice = stream_cut
                 else:
-                    _notify_agent_turn_failure(stream_cut, foreground=True)
+                    _notify_agent_turn_failure(
+                        stream_cut,
+                        foreground=True,
+                        lane="chat",
+                        trace_id=trace_id,
+                    )
                     log.warning(
                         "degenerate-only turn and fallback disabled by env; "
                         "this user turn will not get a visible reply"
@@ -18949,7 +19302,18 @@ def _process_messages(messages: list) -> float:
             break
 
         if pending_failure_notice is not None and posted_any:
-            _notify_agent_turn_failure(pending_failure_notice, foreground=True)
+            _notify_agent_turn_failure(
+                pending_failure_notice,
+                foreground=True,
+                lane="chat",
+                trace_id=trace_id,
+            )
+        elif pending_failure_notice is None:
+            _emit_agent_turn_success(
+                foreground=True,
+                lane="chat",
+                trace_id=trace_id,
+            )
 
         # The turn is settled (posted, or terminally rejected): absorbed
         # backlog messages are now truly consumed by this carrier.
@@ -20078,9 +20442,9 @@ def _resident_incremental_payload(payload: dict, existing: dict) -> dict:
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
     Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1;B2 起覆盖
-    RESIDENT_IDENTITY_FIELDS 这 14 个字段 == 身份卡全部 13 个 profile 字段 + dimensions,
-    含 user_preferred_name / custom_persona_prompt / language_preference /
-    relationship_anchor / stable_definitions 这 5 个用户层字段,GROUNDED——素材没有明确
+    RESIDENT_IDENTITY_FIELDS 这 13 个字段 == 身份卡全部 12 个 profile 字段 + dimensions,
+    含 user_preferred_name / custom_persona_prompt /
+    relationship_anchor / stable_definitions 这 4 个用户层字段,GROUNDED——素材没有明确
     信号就留空,详见 distill_prompt_v1.RESIDENT_IDENTITY_FIELDS 的说明)、card_policy
     清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
     Returns a plaintext identity payload for identity.replace, or None if no persona content
@@ -20662,6 +21026,44 @@ def run() -> None:
                     poll_messages,
                     last_ts=last_ts,
                 )
+
+            # The agent call below can occupy this single loop for up to the
+            # full turn timeout. Reconcile Capture after the claimed messages
+            # are known but before that blocking call, so a turn-backstop is
+            # never delayed by a long foreground turn. This remains fail-open:
+            # Capture availability must not prevent the user turn from running.
+            if capture_tick_enabled:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(
+                        capture_result.get("reason") or ""
+                    ) not in {
+                        "",
+                        "no_new_messages",
+                        "quiet_not_due",
+                        "already_captured",
+                    }:
+                        log.info(
+                            "pre-turn capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        log.warning("pre-turn capture tick failed: HTTP %d", e.response.status_code)
+                except Exception as e:
+                    log.warning("pre-turn capture tick failed: %s", e)
+                finally:
+                    next_capture_tick_mono = (
+                        time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
+                    )
 
             new_ts = _process_messages(messages)
             if new_ts > last_ts:

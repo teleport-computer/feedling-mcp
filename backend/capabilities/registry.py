@@ -54,7 +54,8 @@ READ_ACTIONS = frozenset(set(CAPABILITIES) - WRITE_ACTIONS)
 
 
 def run_capability(action_type: str, store, *, api_key=None, runtime_token=None,
-                   params=None, trace_context=None) -> CapabilityResult:
+                   params=None, trace_context=None,
+                   web_fetch_session=None) -> CapabilityResult:
     fn = CAPABILITIES.get(action_type)
     if fn is None:
         return err(errors.INVALID, f"unknown capability: {action_type}", retryable=False)
@@ -65,4 +66,6 @@ def run_capability(action_type: str, store, *, api_key=None, runtime_token=None,
     }
     if action_type == "worldbook_match":
         kwargs["trace_context"] = trace_context
+    if action_type == "web_fetch":
+        kwargs["web_fetch_session"] = web_fetch_session
     return fn(store, **kwargs)

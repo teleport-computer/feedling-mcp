@@ -723,7 +723,7 @@ def trace_event(
     content_excerpt: dict[str, Any] | None = None,
     actor: str = "backend",
     status: str = "ok",
-    outcome_class: str = TRACE_OUTCOME_DEFAULT,
+    outcome_class: object = None,
     trace_id: str = "",
     turn_id: str = "",
     job_id: str = "",
@@ -740,16 +740,15 @@ def trace_event(
             return
         now = time.time()
         verbose = os.environ.get("FEEDLING_DEBUG_VERBOSE", "").strip().lower() not in ("0", "false", "off", "no")
-        normalized_outcome = str(outcome_class or TRACE_OUTCOME_DEFAULT)
-        if normalized_outcome not in TRACE_OUTCOME_CLASSES:
-            normalized_outcome = TRACE_OUTCOME_DEFAULT
         event = {
             "ts": now,
             "subsystem": str(subsystem or "")[:40],
             "type": str(type or "")[:80],
             "actor": str(actor or "backend")[:40],
             "status": str(status or "ok")[:20],
-            "outcome_class": normalized_outcome,
+            # Keep the caller input until the strict DB boundary so it can
+            # distinguish missing, invalid, and explicit-default provenance.
+            "outcome_class": outcome_class,
             "summary": str(summary or "")[:300],
             "explain": str(explain or "")[:600],
             "trace_id": str(trace_id or "")[:120],
@@ -809,8 +808,19 @@ def clear_trace(store) -> None:
 
 
 def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
-    """Shallow, size-bounded copy. Detail should already be metadata-only (ids/
-    counts/reasons); this just bounds it so a careless caller can't bloat the buf."""
+    """Shallow, size-bounded copy. Bounds size only — it does not judge content.
+
+    This used to say detail "should already be metadata-only", which read as a
+    guarantee someone upstream had made and was in fact the licence to drift: a
+    caller could assume the check happened here. It cannot happen here. ``detail``
+    is an open keyspace, and a closed error code and an exception message are the
+    same character class, so there is nothing at this layer to decide between
+    them — only the write site knows where a value came from.
+
+    Since ``read_trace`` hands ``detail``/``summary``/``explain`` back to the user
+    and tracing is on by default, that contract is load-bearing:
+    ``tests/test_trace_detail_provenance.py`` is what holds write sites to it.
+    """
     if not isinstance(detail, dict):
         return {}
     out: dict[str, Any] = {}

@@ -41,6 +41,72 @@ import memory_readside_core
 
 
 # --------------------------------------------------------------------------- #
+# readside error contract
+# --------------------------------------------------------------------------- #
+
+# The readside raises RuntimeError/ValueError whose message is sometimes a fixed
+# literal and sometimes carries upstream payload -- notably
+# ``enclave_http_<code>:<resp.text[:180]>``, which echoes the enclave's response
+# body. Membership in these sets, not parsing, decides what a caller may see, so
+# an unrecognised message can only degrade to the generic code, never leak.
+#
+# Converged here at the response boundary rather than at the raise in
+# ``memory_readside_core.post_enclave_readside``, which feeds three lanes. The
+# other two match on the body on purpose -- ``tee_replicator/worker.py`` looks
+# for ``decrypt_failed`` inside it and ``v2/serve_worker.py`` for the
+# ``enclave_http_403:`` prefix -- so redacting at the producer would silently
+# blind them. Their sharing the format is deliberate, not an unfinished cleanup.
+_CLOSED_READSIDE_ERRORS = frozenset({
+    "memory_load_failed",
+    "enclave_unavailable",
+    "api_key_unavailable",
+    "enclave_invalid_readside_response",
+})
+_CLOSED_REQUEST_ERRORS = frozenset({
+    "invalid limit",
+    "ids must be a list of non-empty strings",
+})
+
+
+def _readside_error_body(e: Exception) -> dict:
+    message = str(e)
+    if message in _CLOSED_READSIDE_ERRORS:
+        return {"error": message}
+    return {"error": "readside_unavailable"}
+
+
+def _request_error_body(e: Exception) -> dict:
+    message = str(e)
+    if message in _CLOSED_REQUEST_ERRORS:
+        return {"error": message}
+    return {"error": "request_invalid"}
+
+
+# Triage moves here from the response body, which used to be where an operator
+# could tell "the enclave said 403" from "the enclave said 503". Each entry maps
+# a prefix of the upstream message to a label that is a literal *in this file*:
+# the message decides which label, never what the label contains, so no upstream
+# payload can reach the (tenant-readable) trace. Ordered specific-to-general,
+# first match wins; anything unmatched is "unknown" rather than passed through,
+# so a drift in the upstream vocabulary degrades the signal instead of leaking.
+_UPSTREAM_SIGNALS: tuple[tuple[str, str], ...] = (
+    ("enclave_http_401", "enclave_http_401"),
+    ("enclave_http_403", "enclave_http_403"),
+    ("enclave_http_404", "enclave_http_404"),
+    ("enclave_http_408", "enclave_http_408"),
+    ("enclave_http_429", "enclave_http_429"),
+    ("enclave_http_4", "enclave_http_4xx"),
+    ("enclave_http_5", "enclave_http_5xx"),
+    ("enclave_http_", "enclave_http_other"),
+    ("enclave_error:", "enclave_error"),
+    ("enclave_unavailable", "enclave_unavailable"),
+    ("api_key_unavailable", "api_key_unavailable"),
+    ("enclave_invalid_readside_response", "enclave_invalid_readside_response"),
+    ("memory_load_failed", "memory_load_failed"),
+)
+
+
+# --------------------------------------------------------------------------- #
 # readside term helpers (buckets / threads)
 # --------------------------------------------------------------------------- #
 
@@ -107,21 +173,26 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
             post_enclave=post_enclave,
         )
     except RuntimeError as e:
-        detail = {"counts": {"limit": requested_limit}}
+        # The query is end-to-end private and the upstream exception can echo
+        # it, so neither lane reports exception text: a closed category plus the
+        # exception class, which is a bounded set carrying no message.
+        upstream = "unknown"
+        for _prefix, _label in _UPSTREAM_SIGNALS:
+            if str(e).startswith(_prefix):
+                upstream = _label
+                break
+        detail = {
+            "counts": {"limit": requested_limit},
+            "reason": "readside_unavailable",
+            "error_class": type(e).__name__,
+            "upstream": upstream,
+        }
         if is_search:
-            # The query is end-to-end private. Even the upstream exception can
-            # echo it, so the search event keeps only a stable fingerprint and
-            # a closed failure category.
-            detail.update({
-                "query_fingerprint": query_fingerprint,
-                "reason": "readside_unavailable",
-            })
-        else:
-            detail["reason"] = str(e)[:80]
+            detail["query_fingerprint"] = query_fingerprint
         debug_trace.trace_event(
             store, subsystem="memory", type=event_type, actor="agent",
             status="failed", summary=f"{operation_label} failed", detail=detail)
-        return {"error": str(e)}, 503
+        return _readside_error_body(e), 503
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
@@ -146,20 +217,42 @@ def fetch(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
             post_enclave=post_enclave,
         )
     except RuntimeError as e:
+        upstream = "unknown"
+        for _prefix, _label in _UPSTREAM_SIGNALS:
+            if str(e).startswith(_prefix):
+                upstream = _label
+                break
         debug_trace.trace_event(
             store, subsystem="memory", type="memory.fetch.called", actor="agent",
-            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
-        return {"error": str(e)}, 503
+            status="failed", summary="fetch failed",
+            detail={"reason": "readside_unavailable", "error_class": type(e).__name__,
+                    "upstream": upstream})
+        return _readside_error_body(e), 503
     except ValueError as e:
         debug_trace.trace_event(
             store, subsystem="memory", type="memory.fetch.called", actor="agent",
-            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
-        return {"error": str(e)}, 400
+            status="failed", summary="fetch failed",
+            detail={"reason": "request_invalid", "error_class": type(e).__name__})
+        return _request_error_body(e), 400
     _items = response.get("items") if isinstance(response.get("items"), list) else []
+    _missing = response.get("missing_ids") if isinstance(response.get("missing_ids"), list) else []
+    _unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
+    _truncation = response.get("truncation") if isinstance(response.get("truncation"), dict) else {}
     debug_trace.trace_event(
         store, subsystem="memory", type="memory.fetch.called", actor="agent",
         summary=f"fetched {len(_items)}/{len(ids)} cards",
-        detail={"counts": {"requested": len(ids), "fetched": len(_items)}, "ids": ids[:20]},
+        detail={
+            "counts": {
+                "requested": len(ids),
+                "processed": int(_truncation.get("processed_count") or len(ids)),
+                "fetched": len(_items),
+                "missing": len(_missing),
+                "unavailable": len(_unavailable),
+                "omitted": int(_truncation.get("omitted_count") or 0),
+            },
+            "truncated": bool(_truncation.get("truncated")),
+            "ids": ids[:20],
+        },
     )
     return response, 200
 
@@ -274,6 +367,9 @@ def legacy_batch(store, api_key, runtime_token: str, payload: dict) -> tuple[dic
 
 MEMORY_LIST_DEFAULT_LIMIT = 50
 MEMORY_LIST_MAX_LIMIT = 500
+# Keep v1 intentionally: the token's wire fields are unchanged, cursors are
+# session-only, and strict after-key continuation safely accepts an in-flight
+# pre-fallback token even if its old occurred_at anchor no longer matches.
 _MEMORY_LIST_CURSOR_VERSION = 1
 _MEMORY_LIST_CURSOR_MAX_CHARS = 1024
 
@@ -282,9 +378,42 @@ class _MemoryListCursorInvalid(ValueError):
     pass
 
 
+def _memory_list_time_key(moment: dict) -> tuple[bool, datetime]:
+    """Return the display-order instant shared with the Garden client.
+
+    Imported and older cards can legitimately lack ``occurred_at``.  Their
+    creation time is still meaningful and is what the client historically used
+    for display ordering, so the server must use the same fallback before it
+    constructs a pagination cursor.
+    """
+    occurred_key = memory_timestamps.sort_key(moment.get("occurred_at"))
+    if occurred_key[0]:
+        return occurred_key
+    return memory_timestamps.sort_key(moment.get("created_at"))
+
+
 def _memory_list_key(moment: dict) -> tuple[bool, datetime, str]:
-    has_valid_ts, occurred_at = memory_timestamps.sort_key(moment.get("occurred_at"))
-    return has_valid_ts, occurred_at, str(moment.get("id") or "")
+    has_valid_ts, effective_at = _memory_list_time_key(moment)
+    return has_valid_ts, effective_at, str(moment.get("id") or "")
+
+
+def _memory_list_is_after_cursor(
+    moment: dict, cursor_key: tuple[bool, datetime, str]
+) -> bool:
+    """Whether ``moment`` follows an opaque anchor in the public list order.
+
+    Time is descending while the deterministic ID tie-break is ascending, so a
+    normal tuple comparison would be subtly wrong.  Keeping this comparator
+    explicit also lets a syntactically valid cursor continue when its anchor was
+    deleted, archived, or superseded between pages.
+    """
+    moment_has_ts, moment_at, moment_id = _memory_list_key(moment)
+    cursor_has_ts, cursor_at, cursor_id = cursor_key
+    moment_time = (moment_has_ts, moment_at)
+    cursor_time = (cursor_has_ts, cursor_at)
+    if moment_time != cursor_time:
+        return moment_time < cursor_time
+    return moment_id > cursor_id
 
 
 def _encode_memory_list_cursor(moment: dict) -> str:
@@ -357,7 +486,7 @@ def _sort_memory_list(moments: list[dict]) -> list[dict]:
     by_id = sorted(moments, key=lambda m: str(m.get("id") or ""))
     return sorted(
         by_id,
-        key=lambda m: memory_timestamps.sort_key(m.get("occurred_at")),
+        key=_memory_list_time_key,
         reverse=True,
     )
 
@@ -371,10 +500,10 @@ def list_moments(
     include_archived_raw,
 ) -> tuple[dict, int]:
     try:
-        limit = min(int(limit_raw), MEMORY_LIST_MAX_LIMIT)
+        limit = int(limit_raw)
     except (TypeError, ValueError):
         return {"error": "invalid limit"}, 400
-    if limit < 1:
+    if limit < 1 or limit > MEMORY_LIST_MAX_LIMIT:
         return {"error": "invalid limit"}, 400
     include_archived = str(include_archived_raw or "").lower() in {"1", "true", "yes"}
     moments = memory_service._load_moments(store)
@@ -397,15 +526,11 @@ def list_moments(
             cursor_key = _decode_memory_list_cursor(cursor)
         except _MemoryListCursorInvalid:
             return {"error": "invalid cursor"}, 400
-        try:
-            start = next(
-                index + 1
-                for index, moment in enumerate(moments)
-                if _memory_list_key(moment) == cursor_key
-            )
-        except StopIteration:
-            return {"error": "invalid cursor"}, 400
-        moments = moments[start:]
+        moments = [
+            moment
+            for moment in moments
+            if _memory_list_is_after_cursor(moment, cursor_key)
+        ]
     page = moments[:limit]
     next_cursor = (
         _encode_memory_list_cursor(page[-1])

@@ -11,6 +11,7 @@ re-runnable without a fresh DB.
 """
 
 import base64
+import contextlib
 from datetime import datetime, timedelta
 import os
 import sys
@@ -28,6 +29,7 @@ if not os.environ.get("DATABASE_URL"):
     pytest.skip("DATABASE_URL not set — needs a real Postgres", allow_module_level=True)
 
 import db  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -80,6 +82,103 @@ def test_users_roundtrip_and_archive_language_omitted_when_null():
     assert db.delete_user(uid) is True
     assert db.delete_user(uid) is False
     assert uid not in {u["user_id"] for u in db.load_all_users()}
+
+
+def test_new_user_upsert_seeds_web_enabled_only_on_actual_insert():
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "2026-08-27", "label": "new"}
+
+    assert db.upsert_user(entry, seed_web_settings_on_insert=True) is True
+    assert db.get_blob(uid, "web_settings") == {"version": 1, "enabled": True}
+
+    db.delete_user(uid)
+
+
+def test_plain_upsert_keeps_its_default_non_seeding_contract():
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "2026-08-27", "label": "ordinary"}
+
+    assert db.upsert_user(entry) is None
+    assert db.get_blob(uid, "web_settings") is None
+
+    db.delete_user(uid)
+
+
+def test_seed_retry_keeps_old_no_blob_user_off_and_still_updates_doc():
+    """Both clauses are load-bearing: DO NOTHING must protect the absent blob,
+    but must not replace the historical DO UPDATE for the users document."""
+    uid = _uid()
+    db.insert_user({"user_id": uid, "created_at": "old", "label": "before"})
+
+    edited = {"user_id": uid, "created_at": "new", "label": "after"}
+    assert db.upsert_user(edited, seed_web_settings_on_insert=True) is False
+
+    assert db.get_blob(uid, "web_settings") is None
+    assert core_store.UserStore(uid).load_web_settings() == {
+        "version": 1,
+        "enabled": False,
+    }
+    stored = {row["user_id"]: row for row in db.load_all_users()}[uid]
+    assert stored["label"] == "after"
+    assert stored["created_at"] == "new"
+
+    db.delete_user(uid)
+
+
+def test_recreated_user_does_not_overwrite_a_residual_disabled_blob(monkeypatch):
+    """Protect pre-cascade/residual RDS rows even when the user insert is new."""
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "old", "label": "first account"}
+    disabled = {"version": 1, "enabled": False}
+    state = {"blob": disabled}
+
+    class _Result:
+        def fetchone(self):
+            return (uid,)
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def transaction(self):
+            return self
+
+        def execute(self, sql, params):
+            if "INSERT INTO user_blobs" in sql and "DO UPDATE" in sql:
+                state["blob"] = params[2].obj
+            return _Result()
+
+    class _Pool:
+        def connection(self):
+            return _Connection()
+
+    from tee_shadow import mirror
+
+    monkeypatch.setattr(db, "get_pool", lambda: _Pool())
+    monkeypatch.setattr(mirror, "execute", lambda *_args, **_kwargs: None)
+
+    assert db.upsert_user(entry, seed_web_settings_on_insert=True) is True
+    assert state["blob"] == disabled
+
+
+def test_seed_retry_never_reopens_an_explicitly_disabled_user():
+    uid = _uid()
+    entry = {"user_id": uid, "created_at": "old", "label": "before"}
+    db.insert_user(entry)
+    disabled = {"version": 1, "enabled": False}
+    db.set_blob_strict(uid, "web_settings", disabled)
+
+    entry["label"] = "registered-again"
+    assert db.upsert_user(entry, seed_web_settings_on_insert=True) is False
+    assert db.get_blob(uid, "web_settings") == disabled
+    assert {row["user_id"]: row for row in db.load_all_users()}[uid]["label"] == (
+        "registered-again"
+    )
+
+    db.delete_user(uid)
 
 
 def test_users_full_doc_and_save_all():
@@ -186,6 +285,29 @@ def test_get_blobs_for_users_batches_and_omits_missing_rows():
         (uid_a, "trace"): {"events": [1]},
         (uid_b, "enabled"): {"enabled": True},
     }
+
+
+def test_get_blobs_for_users_can_propagate_a_bounded_read_failure(monkeypatch):
+    connection_kwargs = []
+
+    class BrokenPool:
+        @staticmethod
+        def connection(**kwargs):
+            connection_kwargs.append(kwargs)
+            raise RuntimeError("pool unavailable")
+
+    monkeypatch.setattr(db, "get_pool", lambda: BrokenPool())
+
+    assert db.get_blobs_for_users(["usr_a"], ["trace"]) == {}
+    with pytest.raises(RuntimeError, match="pool unavailable"):
+        db.get_blobs_for_users(
+            ["usr_a"],
+            ["trace"],
+            connection_timeout=0.25,
+            statement_timeout_ms=100,
+            raise_on_error=True,
+        )
+    assert connection_kwargs == [{}, {"timeout": 0.25}]
 
 
 def test_blob_delete_and_list_by_prefix():
@@ -577,6 +699,61 @@ def test_log_append_read_trim_prune():
     assert [r["event"] for r in db.log_read_all(uid, "device_events")] == [8, 9]
 
 
+def test_log_read_since_uses_timestamp_window_before_sequence_limit(monkeypatch):
+    """The database must narrow on the timestamp index before seq ordering.
+
+    ``seq`` remains the client-visible chronology, but filtering it after a
+    backwards seq scan can read an unbounded cold history for a sparse cursor.
+    The SQL sent to PostgreSQL is therefore part of the storage contract here.
+    """
+    executed: list[tuple[str, tuple]] = []
+
+    class _Result:
+        def fetchall(self):
+            return [({"event": "newer"},)]
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params):
+            executed.append((str(sql), params))
+            return _Result()
+
+    class _Pool:
+        def connection(self):
+            return _Connection()
+
+    monkeypatch.setattr(db, "get_pool", lambda: _Pool())
+
+    assert db.log_read("usr_log_window", "device_events", limit=25, since_epoch=100.0) == [
+        {"event": "newer"}
+    ]
+    sql, params = executed.pop()
+    assert "WITH time_window AS MATERIALIZED" in sql
+    assert "ts > %s" in sql
+    assert "ORDER BY seq DESC LIMIT %s" in sql
+    assert params == ("usr_log_window", "device_events", 100.0, 25)
+
+
+def test_log_read_future_cursor_returns_without_opening_a_connection(monkeypatch):
+    """A malformed/future sync cursor must not turn into an RDS scan."""
+    opened: list[bool] = []
+
+    class _Pool:
+        def connection(self):
+            opened.append(True)
+            raise AssertionError("future cursor should not query PostgreSQL")
+
+    monkeypatch.setattr(db, "get_pool", lambda: _Pool())
+
+    assert db.log_read("usr_future_cursor", "device_events", since_epoch=time.time() + 60.0) == []
+    assert opened == []
+
+
 def test_admin_data_track_snapshot_aggregates_app_sessions():
     active_uid = _uid()
     empty_uid = _uid()
@@ -732,6 +909,101 @@ def test_admin_data_track_dau_median_is_robust_to_heavy_users():
     assert day["session_dau"] == 3
     assert day["foreground_sec"] == 330            # mean per user = 110
     assert day["median_user_sec"] == 20.0          # median is not fooled by the heavy user
+
+
+def test_admin_data_track_dau_pushes_proven_limit_bound_without_calendar_drift(
+    monkeypatch,
+):
+    """The costly aggregate is bounded, but sparse-day semantics stay exact.
+
+    The two seeded activity days are more than a year apart. A fixed calendar
+    window would silently lose the older one; the optimized result must instead
+    equal the established unbounded SQL row-for-row.
+    """
+    old_user = _uid()
+    new_user = _uid()
+    for uid in (old_user, new_user):
+        seed_user(uid)
+    old_ts = _epoch("2198-01-01T18:00:00Z")
+    new_ts = _epoch("2199-06-01T18:00:00Z")
+    db.log_append(
+        old_user,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 11}},
+        ts=old_ts,
+    )
+    db.log_append(
+        new_user,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 22}},
+        ts=new_ts,
+    )
+
+    real_pool = db.get_pool()
+    executed: list[tuple[str, object]] = []
+
+    class RecordingConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            executed.append((str(sql), params))
+            if params is None:
+                return self._inner.execute(sql, *args, **kwargs)
+            return self._inner.execute(sql, params, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    @contextlib.contextmanager
+    def recording_connection(*args, **kwargs):
+        with real_pool.connection(*args, **kwargs) as conn:
+            yield RecordingConn(conn)
+
+    class RecordingPool:
+        connection = staticmethod(recording_connection)
+
+    monkeypatch.setattr(db, "get_pool", lambda: RecordingPool())
+    optimized = db.admin_data_track_dau(days=2, tz="Asia/Shanghai")
+
+    with real_pool.connection() as conn:
+        legacy = [
+            db._dau_row(row)
+            for row in db._admin_data_track_dau_rows(
+                conn,
+                since=0.0,
+                scan_since=0.0,
+                boundary_day="",
+                day_limit=2,
+                tz="Asia/Shanghai",
+            )
+        ]
+
+    assert optimized == legacy
+    assert [row["day"] for row in optimized] == ["2199-06-02", "2198-01-02"]
+
+    boundary_calls = [
+        (sql, params) for sql, params in executed if "active_days AS (" in sql
+    ]
+    aggregate_calls = [
+        (sql, params) for sql, params in executed if "WITH active AS" in sql
+    ]
+    assert len(boundary_calls) == 1
+    assert len(aggregate_calls) == 1
+    boundary_sql, boundary_params = boundary_calls[0]
+    assert "WITH RECURSIVE settings AS" in boundary_sql
+    assert boundary_sql.count("ORDER BY c.ts DESC") == 2
+    assert boundary_sql.count("ORDER BY l.ts DESC") == 2
+    assert "c.user_id = u.user_id" in boundary_sql
+    assert "l.user_id = u.user_id" in boundary_sql
+    assert boundary_params == ("Asia/Shanghai", 2, 0.0)
+    aggregate_sql, aggregate_params = aggregate_calls[0]
+    assert aggregate_sql.count("AND c.ts >= %s") == 1
+    assert aggregate_sql.count("AND l.ts >= %s") == 2
+    assert aggregate_sql.count("JOIN user_logs l ON l.user_id = u.user_id") == 2
+    assert "JOIN chat_messages c ON c.user_id = u.user_id" in aggregate_sql
+    assert list(aggregate_params[:3]) == [old_ts - 2 * 3600] * 3
+    assert "AND day >= %s" in aggregate_sql
 
 
 def test_admin_data_track_usage_histogram_boundaries_and_dau_parity():

@@ -369,6 +369,26 @@ def test_chunk_envelope_from_row_reconstructs_worker_decrypt_payload():
 def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     blobs = []
     outputs = []
+    attempts = []
+
+    class Attempt:
+        def __init__(self, _store, _job_id, artifact):
+            self.artifact = artifact
+            self.finished = False
+
+        def __enter__(self):
+            return self
+
+        def finish(self, outcome):
+            assert not self.finished
+            self.finished = True
+            attempts.append((self.artifact, outcome))
+
+        def __exit__(self, *_args):
+            assert self.finished, f"{self.artifact} exited before finish"
+            return False
+
+    monkeypatch.setattr(service.distillation_ledger, "ArtifactAttempt", Attempt)
 
     monkeypatch.setattr(
         service.db,
@@ -437,6 +457,10 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     assert reducer_doc["persona_provided"] is True
     assert "You remember the user's voice." not in reducer_json
     assert any(output["type"] == "apply" for output in outputs)
+    assert [artifact for artifact, _outcome in attempts] == [
+        "memory", "identity", "persona", "voice", "profile",
+    ]
+    assert dict(attempts)["persona"] == "written"
 
 
 def test_apply_reducer_output_can_defer_job_completion(monkeypatch):
@@ -654,18 +678,19 @@ def test_identity_payload_from_output_preserves_valid_user_preferred_name():
 
 
 # ---------------------------------------------------------------------------
-# B2 (reverses I7): the 4 remaining user-layer fields — GROUNDED, so present-
+# B2 (reverses I7): the 3 remaining string/list user-layer groups — GROUNDED, so present-
 # in-material -> kept, absent -> just missing from the payload (never invented,
 # never a crash).
 # ---------------------------------------------------------------------------
 
-def test_identity_payload_from_output_carries_the_4_remaining_user_layer_fields():
+def test_identity_payload_from_output_carries_supported_user_layer_fields_only():
+    retired_field = "language_" + "preference"
     payload = service._identity_payload_from_output({
         "identity": {
             "agent_name": "Mira",
             "dimensions": [],
             "custom_persona_prompt": "永远用简短的第二人称回复我。",
-            "language_preference": "中文",
+            retired_field: "中文",
             "relationship_anchor": "大学室友",
             "stable_definitions": ["老板=我上司", "  ", "deadline 一律北京时间"],
         }
@@ -673,7 +698,7 @@ def test_identity_payload_from_output_carries_the_4_remaining_user_layer_fields(
 
     assert payload is not None
     assert payload["custom_persona_prompt"] == "永远用简短的第二人称回复我。"
-    assert payload["language_preference"] == "中文"
+    assert retired_field not in payload
     assert payload["relationship_anchor"] == "大学室友"
     # blank list entries are dropped, not preserved as empty strings
     assert payload["stable_definitions"] == ["老板=我上司", "deadline 一律北京时间"]
@@ -686,14 +711,12 @@ def test_identity_payload_from_output_caps_long_user_layer_strings():
             "agent_name": "Mira", "dimensions": [],
             "custom_persona_prompt": long_text,
             "relationship_anchor": long_text,
-            "language_preference": long_text,
         }
     })
 
     assert payload is not None
     assert len(payload["custom_persona_prompt"]) == 1200
     assert len(payload["relationship_anchor"]) == 1200
-    assert len(payload["language_preference"]) == 240
 
 
 def test_identity_payload_from_output_material_without_user_layer_signal_omits_them():
@@ -706,7 +729,7 @@ def test_identity_payload_from_output_material_without_user_layer_signal_omits_t
     })
 
     assert payload is not None
-    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+    for key in ("user_preferred_name", "custom_persona_prompt",
                 "relationship_anchor", "stable_definitions"):
         assert key not in payload, key
 
@@ -724,7 +747,8 @@ def test_identity_payload_from_output_sparse_material_with_only_persona_directiv
     assert payload["custom_persona_prompt"] == "永远直接回答,不要绕。"
 
 
-def test_init_identity_threads_the_5_user_layer_fields_on_a_new_card(monkeypatch):
+def test_init_identity_threads_the_4_user_layer_fields_on_a_new_card(monkeypatch):
+    retired_field = "language_" + "preference"
     captured: dict = {}
     monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
 
@@ -751,7 +775,7 @@ def test_init_identity_threads_the_5_user_layer_fields_on_a_new_card(monkeypatch
                 "dimensions": [{"name": "Steady", "value": 84, "description": "Persona says steady."}],
                 "user_preferred_name": "Seven",
                 "custom_persona_prompt": "始终用第二人称、简短直接。",
-                "language_preference": "中文",
+                retired_field: "中文",
                 "relationship_anchor": "大学室友",
                 "stable_definitions": ["老板=我上司"],
             },
@@ -766,7 +790,7 @@ def test_init_identity_threads_the_5_user_layer_fields_on_a_new_card(monkeypatch
     plaintext = captured["plaintext"]
     assert plaintext["user_preferred_name"] == "Seven"
     assert plaintext["custom_persona_prompt"] == "始终用第二人称、简短直接。"
-    assert plaintext["language_preference"] == "中文"
+    assert retired_field not in plaintext
     assert plaintext["relationship_anchor"] == "大学室友"
     assert plaintext["stable_definitions"] == ["老板=我上司"]
 
@@ -801,7 +825,7 @@ def test_init_identity_without_user_layer_fields_leaves_new_card_empty_no_crash(
 
     assert status == "initialized"
     plaintext = captured["plaintext"]
-    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+    for key in ("user_preferred_name", "custom_persona_prompt",
                 "relationship_anchor", "stable_definitions"):
         assert key not in plaintext, key
 

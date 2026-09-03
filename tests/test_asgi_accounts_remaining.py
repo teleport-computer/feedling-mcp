@@ -41,6 +41,7 @@ from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from db import get_pool  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -54,7 +55,8 @@ def clean(tmp_path, monkeypatch):
     registry._users[:] = []
     registry._key_to_user.clear()
     core_store._stores.clear()
-    accounts_recover._recover_challenges.clear()
+    with get_pool().connection() as conn:
+        conn.execute("DELETE FROM account_recover_challenges")
     registry._save_users()
     return tmp_path
 
@@ -253,6 +255,27 @@ def test_claim_token_single_use(user):
 # --------------------------------------------------------------------------- #
 
 
+def test_persist_user_seed_flag_defaults_false_and_is_explicit_when_enabled(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        registry.db,
+        "upsert_user",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(registry, "notify_users_changed", lambda: None)
+    entry = {"user_id": "usr_seed_flag_contract"}
+
+    registry.persist_user(entry)
+    registry.persist_user(entry, seed_web_settings_on_insert=True)
+
+    assert calls == [
+        ((entry,), {}),
+        ((entry,), {"seed_web_settings_on_insert": True}),
+    ]
+
+
 def test_register_is_public_and_creates_account(clean):
     """Register must succeed over ASGI with NO auth (there is no user yet)."""
     status, body = _asgi_post("/v1/users/register",
@@ -260,6 +283,10 @@ def test_register_is_public_and_creates_account(clean):
     assert status == 201
     assert body["user_id"] and body["api_key"]
     assert len(registry._users) == 1
+    assert core_store.get_store(body["user_id"]).load_web_settings() == {
+        "version": 1,
+        "enabled": True,
+    }
 
 
 def test_register_duplicate_pubkey_is_409_no_orphan_parity(clean):

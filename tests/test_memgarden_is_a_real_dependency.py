@@ -26,7 +26,15 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 def test_no_local_copy_of_the_kernel():
     """仓库里不许再有内核的源码副本。"""
-    for stale in ("backend/memgarden", "backend/memory_garden", "backend/agent_protocol_core"):
+    # ⚠️ backend/agent_protocol_core **不在这个名单里**，是刻意的。
+    #
+    # 2026-09-02 起它是 io 自己的模块（思维链的产品实现：人格文案、屏幕监看
+    # 说辞、FEEDLING_ 开关），从 memgarden 仓库搬回来的 —— 那些东西本来就不
+    # 该跟一个公开的记忆库一起发。它不是内核的副本，内核也不再依赖它。
+    #
+    # 这条守卫要防的是另一件事：把**内核**的源码拷回 io，导致 io 优先 import
+    # 本地那份、装进来的包被无声架空。
+    for stale in ("backend/memgarden", "backend/memory_garden"):
         assert not (REPO / stale).exists(), (
             f"{stale} 又出现了 —— io 会优先 import 它，装进来的包被无声架空"
         )
@@ -45,36 +53,57 @@ def test_kernel_is_not_imported_from_backend():
     assert (REPO / "backend") not in where.parents, f"memgarden 来自 backend/：{where}"
 
 
-def test_lock_pins_a_hash_locked_release_asset():
-    """lock 里必须钉一个具体版本的 wheel URL，且带哈希。
+def test_lock_pins_an_exact_hash_locked_version():
+    """lock 里必须钉一个**具体版本**，且带哈希。
 
     ⚠️ **哈希锁住的是字节，不是出处。** 这条测试之前叫 "immutable"，那是过度声称
     （codex code_review 2026-08-23 指出，实测 GitHub Release 的 `immutable` 字段
     确实是 false）。准确的说法是：
 
-        能保证   同一个 URL 被换成不同字节时，构建会失败而不是静默换包
-        不保证   这些字节由公开 tag 的源码构建 —— tag 可移动、asset 可删可重传，
-                 而且 tag 未签名、没有 build attestation
+        能保证   同一个版本被换成不同字节时，构建会失败而不是静默换包
+        不保证   这些字节由公开 tag 的源码构建
 
-    要补上「出处」这一环，得由 tag 绑定的 CI 构建 Release 并生成 artifact
-    attestation，升级依赖时验证 tag commit / digest / provenance 三者。那是独立
-    一批活，见 HANDOFF 里的待拍板项。
+    出处那一环现在由包那边补上了：memgarden 的发布流水线走 PyPI Trusted
+    Publishing（仓库不存 token），每个 wheel 同时挂 GitHub Release 并带
+    build provenance attestation，可以 `gh attestation verify` 验。
 
-    这里守住的是底线：钉分支（@main）会让构建完全不可复现，compose 哈希上链的
-    整条证明链直接失效。
+    ## 0.12.3 起从 Release URL 换成了 PyPI
+
+    之前钉的是 `memgarden @ https://.../releases/download/vX/....whl`，
+    原因只有一个：那时两个包**还没发到 PyPI**。现在发了，就用正常钉法。
+
+    这里守住的是底线：钉分支（@main）或不钉版本，会让构建完全不可复现，
+    compose 哈希上链的整条证明链直接失效。
     """
     lock = (REPO / "backend" / "requirements.lock").read_text(encoding="utf-8")
     lines = lock.splitlines()
-    for pkg in ("memgarden @", "agent-protocol-core @"):
-        idx = next((i for i, l in enumerate(lines) if l.startswith(pkg)), None)
-        assert idx is not None, f"lock 里没有 {pkg}"
-        url = lines[idx]
-        assert "/releases/download/v" in url, f"{pkg} 不是 Release 的固定 wheel：{url}"
-        assert url.endswith(".whl \\") or url.endswith(".whl"), f"{pkg} 不是 wheel：{url}"
-        assert any("--hash=sha256:" in l for l in lines[idx:idx + 3]), f"{pkg} 缺哈希"
+    for pkg in ("memgarden",):
+        idx = next((i for i, l in enumerate(lines) if l.startswith(f"{pkg}==")), None)
+        assert idx is not None, (
+            f"lock 里没有钉死版本的 {pkg}== —— 是不是又钉成 URL 或分支了？"
+        )
+        assert any("--hash=sha256:" in l for l in lines[idx:idx + 4]), f"{pkg} 缺哈希"
 
 
-@pytest.mark.parametrize("mod", ["memgarden", "agent_protocol_core"])
+def test_the_kernel_brings_nothing_else_along():
+    """memgarden 必须是**零依赖**的 —— 装它不该连带装上别的包。
+
+    2026-09-02 之前它依赖同源的 agent-protocol-core，而那个包里装的是 io 自己
+    的思维链实现（人格文案、屏幕监看说辞、FEEDLING_ 开关）。别人
+    `pip install memgarden` 会连带拿到 io 的产品设定，而内核一次都用不到它们。
+    那套已经搬回 backend/agent_protocol_core/。
+
+    这条守的是「别又长回来」：往内核加依赖之前先问一句，接入方装 Garden 时
+    多出来的那个包，他认识吗、用得上吗。
+    """
+    lock = (REPO / "backend" / "requirements.lock").read_text(encoding="utf-8")
+    assert "agent-protocol-core" not in lock, (
+        "agent-protocol-core 又回到锁文件里了 —— 它是 io 的东西，"
+        "不该作为 memgarden 的依赖被装进来"
+    )
+
+
+@pytest.mark.parametrize("mod", ["memgarden"])
 def test_declared_in_requirements_not_just_the_lock(mod):
     """requirements.txt 也要有 —— 只写进 lock 的话，下次 compile 就被抹掉了。"""
     req = (REPO / "backend" / "requirements.txt").read_text(encoding="utf-8")

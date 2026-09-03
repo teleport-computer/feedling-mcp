@@ -511,6 +511,55 @@ def test_invalid_key_exits_on_startup():
     assert exc_info.value.code != 0
 
 
+def test_run_fires_capture_tick_before_a_long_foreground_turn(monkeypatch):
+    order = []
+    message = {"id": "user-before-long-turn", "role": "user", "content": "hi", "ts": 2.0}
+
+    monkeypatch.setattr(crc, "_running", True)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", lambda: True)
+    monkeypatch.setattr(crc, "_warn_if_agent_entry_may_drift", lambda: None)
+    monkeypatch.setattr(crc, "_resident_ipc_listener_enabled", lambda: False)
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(crc, "_apply_infra_health", lambda _status: None)
+    monkeypatch.setattr(crc, "_load_checkpoint", lambda: 1.0)
+    monkeypatch.setattr(crc, "_save_checkpoint", lambda _ts: None)
+    monkeypatch.setattr(crc, "_load_proactive_checkpoint", lambda: 0.0)
+    monkeypatch.setattr(crc, "PROACTIVE_POLL_ENABLED", False)
+    monkeypatch.setattr(crc, "CAPTURE_TICK_ENABLED", True)
+    monkeypatch.setattr(crc, "CAPTURE_TICK_START_DELAY_SEC", 3600)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc, "_process_resident_distill_once", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        crc,
+        "poll_chat",
+        lambda _since: {"timed_out": False, "messages": [message]},
+    )
+    monkeypatch.setattr(crc, "_maybe_apply_user_mcp", lambda: None)
+    monkeypatch.setattr(crc, "_process_vision_probe", lambda _result: None)
+    monkeypatch.setattr(
+        crc,
+        "_filter_messages_to_poll_ids",
+        lambda _history, poll_messages, **_kwargs: poll_messages,
+    )
+    monkeypatch.setattr(
+        crc,
+        "fire_capture_tick",
+        lambda: order.append("capture") or {"enqueued": False, "reason": "quiet_not_due"},
+    )
+
+    def _process(_messages):
+        order.append("process")
+        crc._running = False
+        return 2.0
+
+    monkeypatch.setattr(crc, "_process_messages", _process)
+
+    crc.run()
+
+    assert order == ["capture", "process"]
+
+
 def test_whoami_startup_retries_transient_failure(monkeypatch):
     """Startup whoami should tolerate transient network failures."""
     calls = []
@@ -4634,7 +4683,13 @@ def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
             "content": "This valid item must still count as applied.",
         },
     ]})
-    captured, job = _install_capture_job_harness(monkeypatch, reply)
+    # 先用一次格式打回把共享的重问预算吃掉，这条用例要量的是**部分成功的
+    # 记账**，不是重问行为。预算还在的话，服务端那个 error 会触发一次语义
+    # 重问，重问结果再落一遍库，applied 就变成 2 了。
+    format_bad = json.dumps({"cards": [{
+        "action": "add", "summary": "...", "content": "[thickened summary]",
+    }]})
+    captured, job = _install_capture_job_harness(monkeypatch, [format_bad, reply])
 
     def partial_result(actions):
         captured["actions"].extend(actions)
@@ -4652,14 +4707,6 @@ def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
         }
 
     monkeypatch.setattr(crc, "execute_memory_actions", partial_result)
-    # The server error would normally trigger the one semantic re-ask. Consume
-    # the shared budget as a prior format bounce marker so this test isolates
-    # partial-result accounting rather than retry behavior.
-    monkeypatch.setattr(
-        crc,
-        "_memory_agent_parse_with_bounce",
-        lambda *args, **kwargs: ((json.loads(reply)["cards"], None), "bounced_ok"),
-    )
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
     final = _capture_final_status(captured)
@@ -4756,6 +4803,7 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert [row["type"] for row in captured["traces"]] == [
         "memory.dream.start",
         "memory.dream.model.start",
+        "agent.turn.success",
         "memory.dream.model.done",
         "memory.dream.done",
     ]
@@ -5061,7 +5109,9 @@ def _foreground_reply_harness(monkeypatch, agent_result, *, actions_ok=True):
     )
     monkeypatch.setattr(
         crc, "_notify_agent_turn_failure",
-        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+        lambda exc, *, foreground, **kwargs: captured["failures"].append(
+            (str(exc), foreground, kwargs)
+        ),
     )
     if actions_ok:
         monkeypatch.setattr(
@@ -5151,6 +5201,7 @@ def test_foreground_degenerate_with_fallback_disabled_posts_nothing(monkeypatch)
 
     assert _visible_replies(captured) == []
     assert captured["failures"] and captured["failures"][0][1] is True  # foreground
+    assert captured["failures"][0][2] == {"lane": "chat", "trace_id": "u-nofb"}
     assert result_ts == pytest.approx(5555.0)
 
 
@@ -5373,7 +5424,9 @@ def _degenerate_test_harness(monkeypatch, agent_result):
     monkeypatch.setattr(
         crc,
         "_notify_agent_turn_failure",
-        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+        lambda exc, *, foreground, **kwargs: captured["failures"].append(
+            (str(exc), foreground, kwargs)
+        ),
     )
     monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
     monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
@@ -5400,6 +5453,11 @@ def test_process_proactive_degenerate_only_reply_fails_without_post(monkeypatch)
     failed = [s for s in captured["statuses"] if s[1] == "failed"]
     assert failed and failed[-1][2] == "degenerate_reply_suppressed"
     assert captured["failures"] and captured["failures"][-1][1] is False
+    assert captured["failures"][-1][2] == {
+        "lane": "proactive",
+        "trace_id": "pj_degen_only",
+        "job_id": "pj_degen_only",
+    }
     assert crc._self_wake_streak == 0  # no self-wake scheduled → streak untouched
 
 
@@ -5722,6 +5780,119 @@ def test_capture_empty_window_fails_fast_without_identity_fetch(monkeypatch):
     }
     assert crc._process_capture_jobs([job]) == pytest.approx(321.0)
     assert ("cap_empty_window", "failed", "capture_window_unavailable") in statuses
+
+
+def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatch):
+    """The resident Capture call site must decide from text blocks, not keys.
+
+    落点在**组件的 CaptureRequest.locale** 上，不再是 ``crc.build_capture_prompt``
+    的入参 —— V1 切到 GardenComponent 之后提示词由组件构建，监视那个函数只会
+    永远看到空 dict（测试当时就是这么静默失效的）。判定本身没变，只是观察点
+    要跟着搬。
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    message = {
+        "id": "m-block",
+        "role": "user",
+        "source": "chat",
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }
+    seen = {}
+
+    class _Recorder:
+        """替掉组件：只记下这轮拿到的 locale，不真去问模型。"""
+
+        def capture(self, request):
+            seen["locale"] = request.locale
+            return crc.mg_contracts.CaptureResult(cards=[], mutations=[])
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_capture_window_messages", lambda _job: [message])
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: ({}, "小舟", "小雨", ""),
+    )
+    monkeypatch.setattr(crc, "_capture_window_text", lambda *_a, **_kw: "窗口")
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        crc.garden_component, "build_garden", lambda *_a, **_kw: _Recorder()
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "cap_block_language",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "ts": 322.0,
+    }
+
+    assert crc._process_capture_jobs([job]) == pytest.approx(322.0)
+    assert seen == {"locale": "zh-Hans"}
+
+
+def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch):
+    """The resident Dream call site must make the same language decision."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    history = [{
+        "id": "m-block",
+        "ts": 1.0,
+        "role": "user",
+        "source": "chat",
+        "content": [
+            {"type": "text", "text": "我今天很难过"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+            },
+        ],
+    }]
+    seen = {}
+
+    def _fake_dream_prompt(**kwargs):
+        seen["locale"] = kwargs["locale"]
+        return "prompt"
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_emit_resident_dream_lifecycle", lambda *_a, **_kw: None)
+    monkeypatch.setattr(crc, "_dream_cards_context", lambda: ("cards", {"c1": {}}))
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: ({}, "小舟", "小雨", ""),
+    )
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(
+        crc,
+        "build_dream_prompt",
+        _fake_dream_prompt,
+    )
+    monkeypatch.setattr(
+        crc,
+        "_memory_agent_parse_with_bounce",
+        lambda *_a, **_kw: (([], [], None), ""),
+    )
+    job = {
+        "schema_version": 2,
+        "job_id": "dream_block_language",
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "ts": 323.0,
+    }
+
+    assert crc._process_dream_jobs([job]) == pytest.approx(323.0)
+    assert seen == {"locale": "zh-Hans"}
 
 
 def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
@@ -6294,10 +6465,22 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
         "_proactive_perception_digest",
         lambda: (
             {"place_label": "home", "motion_state": "still", "local_time": "2026-06-26T20:30:00+08:00"},
-            [{"signal": "steps", "field": "step_count", "current": 4200, "baseline_median": 3000, "delta": 1200}],
+            [{
+                "signal": "steps",
+                "field": "step_count",
+                "last_known": 4200,
+                "as_of": "2026-06-25 23:10",
+                "baseline_median": 3000,
+                "delta": 1200,
+            }],
             {
                 "media": {"now": {"artist": "Phoebe Bridgers"}, "novelty": "new_artist"},
-                "health": {"notable": [{"signal": "steps", "field": "step_count", "current": 4200}]},
+                "health": {"notable": [{
+                    "signal": "steps",
+                    "field": "step_count",
+                    "last_known": 4200,
+                    "as_of": "2026-06-25 23:10",
+                }]},
             },
         ),
     )
@@ -6330,6 +6513,8 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
     assert "at most 2-3" in captured["message"]
     assert "perception_change_json" not in captured["message"]
     assert "\"signal\": \"steps\"" in captured["message"]
+    assert "\"last_known\": 4200" in captured["message"]
+    assert "2026-06-25 23:10" in captured["message"]
     assert "native_tool_access" in captured["message"]
     assert "perception" in captured["message"]
     assert "memory-index" in captured["message"]
@@ -6711,7 +6896,11 @@ def test_process_proactive_cards_json_reply_does_not_post_fallback(monkeypatch):
         "call_agent_http",
         lambda message, images=None, raw_text=False: '{"cards": []}',
     )
-    monkeypatch.setattr(crc, "_notify_agent_turn_failure", lambda e, foreground=True: None)
+    monkeypatch.setattr(
+        crc,
+        "_notify_agent_turn_failure",
+        lambda e, foreground=True, **kwargs: None,
+    )
     monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
     monkeypatch.setattr(
@@ -9932,35 +10121,39 @@ def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch)
 def test_reply_language_line_prefers_presence_locale(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     # presence locale (zh) must win over archive_language (en): the shared helper
-    # returns the 简体中文 policy line, confirming locale precedence.
+    # returns the Chinese rendering, confirming locale precedence.
     line = crc._reply_language_line({"locale": "zh-Hans"})
-    assert "简体中文" in line
-    assert "English" not in line
+    assert line.startswith("回复语言规则：\n根据用户最新一条消息判断回复语言。")
+    assert "Reply language rule" not in line
 
 
 def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line(None)
-    assert "Default reply language: English" in line
+    assert line.startswith(
+        "Reply language rule:\nDetermine the reply language from the user's latest message."
+    )
 
 
 def test_reply_language_line_treats_empty_locale_as_missing(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
     line = crc._reply_language_line({"locale": ""})
-    assert "Default reply language: English" in line
+    assert line.startswith(
+        "Reply language rule:\nDetermine the reply language from the user's latest message."
+    )
 
 
 def test_reply_language_line_defaults_to_chinese_with_no_locale_or_archive(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": ""})
     line = crc._reply_language_line(None)
-    assert "中文" in line
+    assert line.startswith("回复语言规则：\n根据用户最新一条消息判断回复语言。")
     assert "Always reply in the user's own language." != line
 
 
 def test_reply_language_line_defaults_to_chinese_when_archive_language_key_missing(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {})
     line = crc._reply_language_line(None)
-    assert "中文" in line
+    assert line.startswith("回复语言规则：\n根据用户最新一条消息判断回复语言。")
 
 
 # ---------------------------------------------------------------------------
@@ -11849,7 +12042,7 @@ def test_foreground_prepend_includes_language_line_and_time(monkeypatch):
     crc._last_interaction_unix = 0.0
     out = crc._prepend_time_anchor_foreground("hello", 1000.0)
     assert "current_time:" in out
-    assert "Reply language policy" in out  # language line now wired into foreground
+    assert "Reply language rule" in out  # language line now wired into foreground
     assert out.rstrip().endswith("hello")
 
 
@@ -12900,26 +13093,142 @@ def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
     """
     from agent_protocol_core import self_thinking as _st
 
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *_a, **_k: True)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda _job: "")
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "zh-Hans"})
+
+    def _foreground_prompt(suffix: str) -> str:
+        crc._seen_ids.clear()
+        crc._seen_ids_order.clear()
+        captured = {}
+
+        def _call_agent(message, **_kwargs):
+            captured["message"] = message
+            return {"messages": ["好"]}
+
+        msg = {
+            "id": f"thinking-switch-{suffix}",
+            "role": "user",
+            "content": "陪我看星星",
+            "ts": 1_800_000_000.0,
+        }
+        with patch.object(crc, "call_agent", side_effect=_call_agent), patch.object(
+            crc, "post_reply", return_value={"id": f"reply-{suffix}"}
+        ):
+            crc._process_messages([msg])
+        return captured["message"]
+
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: True)
+    on_foreground = _foreground_prompt("on")
+    on_proactive = crc._message_for_proactive_job(
+        {"trigger": "heartbeat_broadcast_off"}
+    )
+    on_scheduled = crc._scheduled_wake_message(
+        {"scheduled_note": "喝茶", "timezone": "Asia/Shanghai"}
+    )
+    assert _st.INSTRUCTION.strip() in on_foreground
+    assert "<think>" in on_proactive
+    assert "<think>" in on_scheduled
+    # 主动道只放开可选块，不前置前台的整份强制指令。
+    assert _st.INSTRUCTION.strip() not in on_proactive
+    assert _st.INSTRUCTION.strip() not in on_scheduled
+
+    # 只改共享开关，两条真实构建路径必须一起变化。
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: False)
+    off_foreground = _foreground_prompt("off")
+    off_proactive = crc._message_for_proactive_job(
+        {"trigger": "heartbeat_broadcast_off"}
+    )
+    off_scheduled = crc._scheduled_wake_message({"scheduled_note": "喝茶"})
+    assert _st.INSTRUCTION.strip() not in off_foreground
+    assert "<think>" not in off_proactive
+    assert "<think>" not in off_scheduled
+
+    # 阴性对照:关掉 think 后主动回复协议仍在，证明不是整段模板消失。
+    assert '{"messages":["..."]}' in off_proactive
+
+
+@pytest.mark.parametrize(
+    ("locale", "archive_language", "expects_chinese"),
+    [
+        ("zh-Hans", "en", True),
+        ("en-US", "zh-Hans", False),
+    ],
+)
+def test_wake_thinking_rule_uses_the_reply_language_policy(
+    monkeypatch, locale, archive_language, expects_chinese
+):
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: True)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda _job: "")
+    monkeypatch.setattr(
+        crc, "_whoami_cache", {"archive_language": archive_language}
+    )
+    presence = {"locale": locale}
+    think_rule = crc._wake_think_permission_line(presence)
+    reply_rule = crc._reply_language_line(presence)
+
+    message = crc._message_for_proactive_job(
+        {"trigger": "heartbeat_broadcast_off"},
+        perception_digest=(presence, [], {}),
+    )
+
+    def _contains_chinese(text: str) -> bool:
+        return any("\u3400" <= char <= "\u9fff" for char in text)
+
+    assert "<think>" in think_rule  # 最小存在性守卫；其余断言只钉两条规则的关系。
+    assert think_rule in message
+    assert reply_rule in message
+    assert _contains_chinese(think_rule) is expects_chinese
+    assert _contains_chinese(reply_rule) is expects_chinese
+    if expects_chinese:
+        assert "可以" in think_rule
+        assert "必须" not in think_rule
+    else:
+        normalized = f" {think_rule.lower()} "
+        assert " may " in normalized
+        assert " must " not in normalized
+
+
+@pytest.mark.parametrize(
+    ("archive_language", "expects_chinese"),
+    [("zh-Hans", True), ("en", False)],
+)
+def test_scheduled_wake_thinking_rule_uses_the_reply_language_policy(
+    monkeypatch, archive_language, expects_chinese
+):
+    monkeypatch.setattr(crc, "_wake_self_thinking_allowed", lambda: True)
+    monkeypatch.setattr(
+        crc, "_whoami_cache", {"archive_language": archive_language}
+    )
+    think_rule = crc._wake_think_permission_line()
+    reply_rule = crc._reply_language_line()
+
+    message = crc._scheduled_wake_message(
+        {"scheduled_note": "drink tea", "timezone": "Asia/Shanghai"}
+    )
+
+    def _contains_chinese(text: str) -> bool:
+        return any("\u3400" <= char <= "\u9fff" for char in text)
+
+    assert think_rule in message
+    assert reply_rule in message
+    assert _contains_chinese(think_rule) is expects_chinese
+    assert _contains_chinese(reply_rule) is expects_chinese
+
+
+def test_wake_thinking_switch_uses_same_enablement_and_model_support(monkeypatch):
+    from agent_protocol_core import self_thinking as _st
+
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: True)
-    on_protocol = crc._reply_protocol_block()
-    on_scheduled = crc._scheduled_wake_message({"scheduled_note": "喝茶", "timezone": "Asia/Shanghai"})
-    assert "<think>" in on_protocol
-    assert "<think>" in on_scheduled
+    assert crc._wake_self_thinking_allowed() is True
 
-    # 同一个 kill switch 关掉 → 两个模板都不再提 <think>
     monkeypatch.setattr(_st, "enabled", lambda: False)
-    assert "<think>" not in crc._reply_protocol_block()
-    assert "<think>" not in crc._scheduled_wake_message({"scheduled_note": "喝茶"})
+    assert crc._wake_self_thinking_allowed() is False
 
-    # 模型不支持这套协议时同样不提(与前台同一条判据)
     monkeypatch.setattr(_st, "enabled", lambda: True)
     monkeypatch.setattr(crc, "_supports_mandatory_self_thinking_v1", lambda: False)
-    assert "<think>" not in crc._reply_protocol_block()
-    assert "<think>" not in crc._scheduled_wake_message({"scheduled_note": "喝茶"})
-
-    # 阴性对照:JSON 协议那句本身在四种情形下都还在,证明上面不是整段消失
-    assert '{"messages":["..."]}' in on_protocol
+    assert crc._wake_self_thinking_allowed() is False
 
 
 def test_mcp_wiring_trace_covers_the_proactive_lane(monkeypatch):

@@ -1,29 +1,10 @@
 #!/usr/bin/env python3
 """One-shot Runtime V2 triage for a single user — read-only, no decryption.
 
-Written after the 2026-07-27 incident (usr_7f30…, three days of silent
-failures) where reconstructing the picture took twenty-odd ad-hoc queries.
-Everything here is CONTENT-FREE metadata that any operator can read directly;
-nothing needs the break-glass trajectory decrypt.
-
-Four of the checks exist because they are what actually broke that case, and
-none of them is obvious enough that the next person would think to run it:
-
-  * `[summary]`   how long the summary watermark has been FROZEN. A stalled
-                  frontier precedes the visible job failures and is the
-                  earliest, most direct signal of a compaction deadlock.
-  * `[backlog]`   the shape of the queue head — specifically an R2-offloaded
-                  row (`body_key`, no `body_ct`) whose hydrated body exceeds
-                  the whole batch char budget. Such a row can never be folded
-                  and blocks every message behind it.
-  * `[traj]`      per-event elapsed time and repeated request sizes. Identical
-                  `payload_bytes` across retries proves the same batch is being
-                  re-sent, i.e. a self-locking loop rather than flaky luck.
-  * `[ledger]`    the same user's provider outcomes under V1 and V2 together.
-                  A relay succeeding hundreds of times under one runtime while
-                  failing every time under the other rules out the relay and
-                  points at what we send (usr_90184…: 902 V1 successes, peak
-                  70,926 input tokens, against 14/14 V2 failures).
+The tool reports content-free runtime, job, metrics, summary-frontier,
+trajectory, provider-ledger, and peer metadata.  It keeps operator-visible
+facts separate from causal diagnosis so historical failure shapes do not get
+mistaken for the current runtime contract.
 
 Usage:
     python tools/v2_user_triage.py --env prod --user-id usr_7f30d63fb7edb61b
@@ -34,6 +15,7 @@ import argparse
 import pathlib
 import re
 import sys
+from datetime import datetime
 
 try:
     import psycopg
@@ -43,13 +25,16 @@ except ImportError:  # pragma: no cover - operator convenience
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+PROMPT_COVERAGE_ERROR = "turn_failed:prompt_coverage_incomplete"
+# 超过这个天数没有新 job，就提醒操作者「你可能连错库了」。这三个环境都在
+# 持续被 P0/真实流量写，静置一整天本身就值得看一眼。
+_STALE_DB_DAYS = 1.0
 
-# Mirrors worker._COMPACTION_BATCH_CHARS' default. A row larger than this on
-# its own can never sit inside any batch, whatever the batch size.
-COMPACTION_BATCH_CHARS = 120_000
-# Mirrors worker._TAIL_BUDGET's default: a backlog at or under this fits
-# entirely in the verbatim tail, so there is no gap to close.
-TAIL_BUDGET_MSGS = 20
+
+def _is_prompt_coverage_error(error: str) -> bool:
+    return error == PROMPT_COVERAGE_ERROR or error.startswith(
+        f"{PROMPT_COVERAGE_ERROR}:"
+    )
 
 
 def _dsn(env: str) -> str:
@@ -83,11 +68,67 @@ def _warn(text: str) -> str:
     return f"\033[33m⚠ {text}\033[0m"
 
 
-def section_runtime(conn, uid: str) -> None:
+def db_freshness(conn) -> dict:
+    """这个库最后一次被写是什么时候 —— 用来判「我连对库了吗」。
+
+    2026-08-30 实测:`--env test` 读 .env 的 TEST_DATABASE_URL 指向一个
+    2026-08-18 就停更的旧 RDS(users 75 条、max(agent_jobs.id)=6229)，而
+    test-api.feedling.app 当天实际写入的 job id 是 10141-10199，命中 0。
+    那时的输出是 "user not found in this environment" —— 与「账号被删了」
+    完全同形，且失明方向偏向「证据没了」，最容易让人直接放弃追查。
+    """
+    facts: dict = {}
+    for label, sql in (
+        ("users_total", "SELECT count(*) AS v FROM users"),
+        ("users_newest", "SELECT max(created_at) AS v FROM users"),
+        ("jobs_max_id", "SELECT max(id) AS v FROM agent_jobs"),
+        ("jobs_newest", "SELECT max(created_at) AS v FROM agent_jobs"),
+    ):
+        try:
+            row = _one(conn, sql, ())
+            facts[label] = row["v"] if row else None
+        except Exception as e:  # noqa: BLE001 — 自检坏了也不该挡住正常分诊
+            facts[label] = f"<unavailable: {type(e).__name__}>"
+    return facts
+
+
+def _freshness_line(facts: dict) -> str:
+    return (f"users={facts.get('users_total')} newest_user={facts.get('users_newest')} "
+            f"max(agent_jobs.id)={facts.get('jobs_max_id')} "
+            f"newest_job={facts.get('jobs_newest')}")
+
+
+def section_environment(conn, env: str) -> dict:
+    """先报「我连的是哪个库、它有多新」，再报单个用户的事。"""
+    _head("environment")
+    facts = db_freshness(conn)
+    print(f"  env               {env}")
+    print(f"  db freshness      {_freshness_line(facts)}")
+    newest = facts.get("jobs_newest")
+    if isinstance(newest, datetime):
+        reference = datetime.now(newest.tzinfo) if newest.tzinfo else datetime.now()
+        stale_days = (reference - newest).total_seconds() / 86400.0
+        if stale_days > _STALE_DB_DAYS:
+            print(_warn(
+                f"这个库最后一次写入在 {stale_days:.1f} 天前 —— 很可能不是你要的环境。"
+                f" 先核对 {env.upper()}_DATABASE_URL 指向的实例，"
+                f"再相信下面任何「找不到」的结论。"))
+    return facts
+
+
+def section_runtime(conn, uid: str, freshness: dict | None = None) -> None:
     _head("runtime")
     user = _one(conn, "SELECT created_at FROM users WHERE user_id = %s", (uid,))
     if not user:
-        sys.exit(f"user {uid} not found in this environment")
+        # 「找不到这个用户」和「连错库了」在旧输出里同形。把库的新鲜度贴进
+        # 同一句话，读的人才可能分辨这两件事。
+        sys.exit(
+            f"user {uid} not found in this database.\n"
+            f"  db freshness: {_freshness_line(freshness or {})}\n"
+            "  这句话有两种可能:①这个账号确实不存在/已删 "
+            "②连的不是这个环境实际在写的库。\n"
+            "  在把它当成①之前，先确认上面的 max(agent_jobs.id) "
+            "与你预期的量级一致。")
     print(f"  created           {user['created_at']}")
 
     # V1/V2 is decided by the per-user fence, never by the allowlist: the
@@ -121,12 +162,10 @@ def section_runtime(conn, uid: str) -> None:
 
 
 def section_jobs(conn, uid: str, limit: int) -> tuple[int, int]:
-    """Print job outcomes; return (failed_total, coverage_shaped_failures).
+    """Print job outcomes; return (failed_total, coverage_failures).
 
-    The split matters: a coverage stall and a provider error are both
-    "failed" and look identical in a count, but only one of them says
-    anything about compaction (usr_90184… failed 14/14 with a perfectly
-    healthy frontier).
+    Only the dedicated ``prompt_coverage_incomplete`` code contributes to the
+    second value. Generic responder failures remain visible but unclassified.
     """
     _head("jobs")
     agg = _fetch(
@@ -152,13 +191,16 @@ def section_jobs(conn, uid: str, limit: int) -> tuple[int, int]:
     )
     for row in errs:
         print(f"    {row['n']:>3} × {row['e']}")
-        # Since 2026-07-27 the coverage stall carries the compaction reject
-        # code that caused it; older rows collapse into responder_error.
-        if row["e"].startswith("turn_failed:prompt_coverage_incomplete:"):
-            code = row["e"].split(":", 2)[-1]
-            print("        " + _warn(f"compaction refused: {code}"))
+        # Only the dedicated failure code is evidence of incomplete prompt
+        # coverage.  The generic responder bucket has many unrelated causes.
+        if _is_prompt_coverage_error(row["e"]):
+            detail = row["e"].removeprefix(PROMPT_COVERAGE_ERROR).removeprefix(":")
+            message = "prompt coverage incomplete"
+            if detail:
+                message += f": {detail}"
+            print("        " + _warn(message))
         elif row["e"] == "turn_failed:responder_error":
-            print("        (bucket shared by ~12 TurnError sites — see reject codes above)")
+            print("        (generic responder bucket — not classified as coverage)")
 
     recent = _fetch(
         conn,
@@ -174,14 +216,11 @@ def section_jobs(conn, uid: str, limit: int) -> tuple[int, int]:
             f"{row['created_at']:%m-%d %H:%M:%S}  {row['e']}"
         )
     failed = next((r["n"] for r in agg if r["status"] == "failed"), 0)
-    # Both the current code and everything logged before 2026-07-27, when a
-    # coverage stall was still folded into the shared responder_error bucket.
-    coverage_shaped = sum(
+    coverage_failures = sum(
         r["n"] for r in errs
-        if "prompt_coverage_incomplete" in r["e"]
-        or r["e"] == "turn_failed:responder_error"
+        if _is_prompt_coverage_error(r["e"])
     )
-    return failed, coverage_shaped
+    return failed, coverage_failures
 
 
 def section_metrics(conn, uid: str) -> None:
@@ -215,10 +254,9 @@ def section_summary(
 ) -> tuple[int | None, int]:
     """Print the summary frontier; return (watermark_seq, backlog_count).
 
-    A frozen watermark is only a symptom when the frontier is BEHIND and turns
-    are failing. On its own it means nothing: a healthy user who simply has not
-    spoken since yesterday has an equally motionless watermark, and flagging
-    that trains everyone to ignore the warning that matters.
+    Report stored facts without guessing the live tail budget.  The deployed
+    value is environment-specific, so this offline tool cannot infer that a
+    motionless watermark is wedged from backlog size alone.
     """
     _head("summary")
     row = _one(
@@ -247,30 +285,18 @@ def section_summary(
     )
     backlog = int(counts["backlog"] or 0)
 
-    # Three witnesses, all required. Stalled-and-behind with no failures is a
-    # user who stopped talking; failures with a moving frontier are a problem
-    # somewhere else entirely (see usr_90184…, whose frontier was healthy
-    # while every turn died in the provider).
-    wedged = (
-        stalled > 6 and backlog > TAIL_BUDGET_MSGS and coverage_failures > 0
-    )
-    if wedged:
+    print(f"  since update      {stalled:.1f}h")
+    if coverage_failures:
         print(
-            "  since update      "
-            + _warn(
-                f"frozen {stalled:.1f}h with {backlog} unsummarized and "
-                f"{coverage_failures} coverage-shaped failures — compaction is wedged"
-            )
+            "                    "
+            + _warn(f"{coverage_failures} exact prompt coverage failure(s) "
+                    f"with {backlog} unsummarized messages")
         )
-    else:
-        print(f"  since update      {stalled:.1f}h")
-        if failed_jobs and not coverage_failures:
-            # Worth saying out loud: it rules compaction out and points the
-            # next question at the provider instead.
-            print(
-                f"                    (frontier is healthy; all {failed_jobs} "
-                "failures are non-coverage — look at the provider)"
-            )
+    elif failed_jobs:
+        print(
+            f"                    (all {failed_jobs} failures are non-coverage; "
+            "inspect their exact error codes)"
+        )
     print(f"  messages          {counts['total']} total, {backlog} unsummarized")
 
     segs = _fetch(
@@ -289,41 +315,6 @@ def section_summary(
                 f"({s['source_message_count']} msgs, {s['created_at']:%m-%d %H:%M})"
             )
     return watermark, backlog
-
-
-def section_backlog(conn, uid: str, watermark: int, rows_n: int) -> None:
-    """Shape of the queue head — where an unfoldable row hides."""
-    _head("backlog head")
-    rows = _fetch(
-        conn,
-        "SELECT seq, doc->>'role' AS role, "
-        "  (doc ? 'body_key') AS offloaded, "
-        "  coalesce((doc->>'body_ct_len')::bigint, 0) AS ext_len, "
-        "  length(coalesce(doc->>'body_ct','')) AS ct_len "
-        "FROM chat_messages WHERE user_id = %s AND seq > %s "
-        "ORDER BY seq LIMIT %s",
-        (uid, watermark, rows_n),
-    )
-    if not rows:
-        print("  (no unsummarized messages)")
-        return
-    blocked = False
-    for r in rows:
-        size = int(r["ext_len"] or 0) if r["offloaded"] else int(r["ct_len"] or 0)
-        tag = " R2-offloaded" if r["offloaded"] else ""
-        note = ""
-        # This is the wall: `_bounded_compaction_prefix` refuses to skip an
-        # oversized head row (skipping would make seq coverage dishonest), so
-        # it raises before any provider call and no batch size can help.
-        if size > COMPACTION_BATCH_CHARS:
-            note = "  " + _warn(f"exceeds batch char budget ({COMPACTION_BATCH_CHARS})")
-            blocked = True
-        print(f"  {r['seq']:<10} {r['role'] or '?':<10} {size:>9,}B{tag}{note}")
-    if blocked:
-        print(
-            "  → this row can never be folded; before 2026-07-27 it stalled the "
-            "frontier permanently, now it should be quarantined and skipped"
-        )
 
 
 def section_trajectory(conn, uid: str) -> None:
@@ -363,14 +354,10 @@ def section_trajectory(conn, uid: str) -> None:
         )
         if e["event_kind"] == "provider_request":
             req_sizes.append(int(e["payload_bytes"] or 0))
-    # Identical request sizes across retries mean the SAME batch was re-sent:
-    # the failure is deterministic and self-locking, not a flaky provider.
     if len(req_sizes) > 1 and len(set(req_sizes)) == 1:
         print(
-            "  " + _warn(
-                f"all {len(req_sizes)} provider_request payloads are identical "
-                f"({req_sizes[0]}B) — the same batch is being re-sent every retry"
-            )
+            f"  all {len(req_sizes)} provider_request events have the same recorded "
+            f"size ({req_sizes[0]}B); size alone does not establish identical requests"
         )
 
 
@@ -447,7 +434,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env", required=True, choices=("test", "pre", "prod"))
     parser.add_argument("--user-id", required=True)
     parser.add_argument("--jobs", type=int, default=8, help="recent jobs to list")
-    parser.add_argument("--backlog", type=int, default=8, help="backlog head rows")
     args = parser.parse_args(argv)
 
     if not re.fullmatch(r"usr_[0-9a-f]{4,32}", args.user_id):
@@ -455,17 +441,16 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\033[1mRuntime V2 triage — {args.user_id} @ {args.env}\033[0m")
     with psycopg.connect(_dsn(args.env), connect_timeout=15) as conn:
-        section_runtime(conn, args.user_id)
+        freshness = section_environment(conn, args.env)
+        section_runtime(conn, args.user_id, freshness)
         failed_jobs, coverage_failures = section_jobs(
             conn, args.user_id, args.jobs
         )
         section_metrics(conn, args.user_id)
-        watermark, backlog = section_summary(
+        section_summary(
             conn, args.user_id, failed_jobs=failed_jobs,
             coverage_failures=coverage_failures,
         )
-        if watermark is not None and backlog:
-            section_backlog(conn, args.user_id, watermark, args.backlog)
         section_trajectory(conn, args.user_id)
         section_provider_ledger(conn, args.user_id)
         section_peers(conn, args.user_id)
