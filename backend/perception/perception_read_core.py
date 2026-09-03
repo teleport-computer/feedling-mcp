@@ -7,19 +7,20 @@ responses. No ``flask.request`` here — every function takes the already-resolv
 store, the already-parsed params (and, for ``/report``, the caller's api key) as
 explicit arguments, and delegates to ``perception.service`` (the business logic).
 
-E2E boundary (unchanged): perception signals/photos are v1 E2E envelopes. The
-server NEVER decrypts them in this process EXCEPT via the enclave.
+Content boundary: perception signals/photos use the v1 envelope container.
+Sealed rows are decrypted only by the enclave; plaintext rows are decoded
+locally after the account-level plaintext write gate has accepted them.
 
   - ``report`` writes encrypted perception. On the ingress-v2 path it may call the
     ENCLAVE to decrypt sensitive signal envelopes inside the trusted boundary —
     exactly as Flask did — forwarding the caller's ``api_key`` verbatim to
     ``service.ingest_snapshot_v2`` (which owns the enclave decrypt call). No
     plaintext is produced here; decryption happens inside the enclave.
-  - ``photo_evaluate`` stores the encrypted image envelope (ciphertext) as-is; it
-    performs NO decryption and makes NO enclave call.
+  - ``photo_evaluate`` stores the submitted sealed or plaintext-binary image
+    envelope as-is; it performs NO decryption and makes NO enclave call.
   - ``photo_content`` returns JSON metadata + a ``decrypt_path`` pointer to the
-    enclave's frame-decrypt endpoint; it performs NO decryption and makes NO
-    enclave call. Pixels are decrypted later, by the enclave, on that path.
+    shape-aware frame endpoint; it performs NO content read itself. That endpoint
+    decrypts sealed rows in the enclave and decodes plaintext-binary rows locally.
 
 Every function returns ``(body, status)`` — a JSON-able dict and an HTTP status —
 so the two adapters render identical ``jsonify`` / ``JSONResponse`` bodies. The
@@ -103,9 +104,9 @@ def snapshot(store) -> tuple[dict, int]:
 
 
 def photo_evaluate(store, payload: dict) -> tuple[dict, int]:
-    """Single-step photo ingest: metadata + (if usable) the encrypted image.
+    """Single-step photo ingest: metadata + a sealed or plaintext-binary image.
 
-    Stores ciphertext only; no decryption / no enclave call here.
+    Stores the validated envelope shape without reading pixels or calling enclave.
     """
     p = payload or {}
     content_envelope = p.get("content_envelope")
