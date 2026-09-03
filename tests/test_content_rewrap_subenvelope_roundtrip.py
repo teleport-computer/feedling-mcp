@@ -59,7 +59,7 @@ def crypto(tmp_path, monkeypatch):
     )
 
     # The enclave decrypts for real, with its real private key.
-    def real_decrypt(env, key, purpose):
+    def real_decrypt(env, key, purpose, caller_user_id):
         return enclave_envelope.decrypt_envelope(env, env["owner_user_id"], enclave_sk)
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", real_decrypt)

@@ -102,7 +102,7 @@ def test_zero_roster_runtime_token_covers_image_key_and_provider_call(
             },
         )
 
-    def _decrypt(envelope, api_key, *, purpose, runtime_token=""):
+    def _decrypt(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         seen["key_decrypts"] += 1
         assert envelope["body_ct"] == "provider-key-ct"
         assert api_key is None

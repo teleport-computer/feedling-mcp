@@ -512,7 +512,7 @@ def test_memory_add_always_creates_duplicate_without_decrypting_existing_cards(m
 
     decrypt_calls = []
 
-    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+    def fail_if_decrypted(_user_id, moment, _api_key, runtime_token=""):
         decrypt_calls.append((moment["id"], runtime_token))
         raise AssertionError("memory.add must not decrypt existing cards")
 
@@ -556,7 +556,7 @@ def test_memory_add_prebuilt_envelope_does_not_decrypt_for_duplicate_scan(monkey
     saved = _install_memory_action_fakes(monkeypatch, moments)
     decrypt_calls = []
 
-    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+    def fail_if_decrypted(_user_id, moment, _api_key, runtime_token=""):
         decrypt_calls.append((moment["id"], runtime_token))
         raise AssertionError("prebuilt memory.add must not decrypt for duplicate scan")
 
@@ -712,7 +712,7 @@ def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypa
     saved = _install_memory_action_fakes(monkeypatch, moments)
     decrypt_tokens = []
 
-    def fake_plain(moment, _api_key, runtime_token=""):
+    def fake_plain(_user_id, moment, _api_key, runtime_token=""):
         decrypt_tokens.append(runtime_token)
         return json.loads(moment["body_ct"]), ""
 

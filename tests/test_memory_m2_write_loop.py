@@ -118,7 +118,7 @@ def test_memory_supersede_soft_retires_old_card_and_new_card_is_recallable(monke
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
-        lambda moment, _api_key, runtime_token="": (_inner(moment), ""),
+        lambda _user_id, moment, _api_key, runtime_token="": (_inner(moment), ""),
     )
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [
@@ -263,7 +263,7 @@ def test_memory_supersede_aborts_if_any_target_changes_before_locked_commit(monk
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
-        lambda moment, _api_key, runtime_token="": (_inner(moment), ""),
+        lambda _user_id, moment, _api_key, runtime_token="": (_inner(moment), ""),
     )
     loads = {"count": 0}
 
@@ -447,7 +447,7 @@ def test_memory_content_patch_supersedes_old_card_with_v1_shape(monkeypatch):
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
-        lambda _moment, _api_key, runtime_token="": (_inner(existing), ""),
+        lambda _user_id, _moment, _api_key, runtime_token="": (_inner(existing), ""),
     )
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [
