@@ -80,6 +80,24 @@ PHASE2_VERBS = ("send", "wait-for-wake")
 
 _LAST_TOOL_OUTPUT = None
 
+# Only direct literal rejection codes from the resident's stage_file/stage_image
+# handlers are safe to copy into observability.  Those handlers also return
+# ``str(exc)`` for validation and filesystem errors; those values can contain a
+# user path or file name and must stay out of traces.
+_SAFE_ATTACHMENT_REJECTION_CODES = frozenset({
+    "request_id_required",
+    "path_required",
+    "no_active_chat_turn",
+    "path_outside_allowed_file_roots",
+    "wrong_file_suffix",
+    "file_source_must_be_utf8",
+    "chat_turn_finished",
+    "too_many_staged_files",
+    "path_outside_outbound_dir",
+    "too_many_staged_images",
+    "too_many_staged_attachments",
+})
+
 _MEMORY_BUCKET_CATEGORY = {
     "工作": "work", "work": "work",
     "目标与成长": "growth", "goals & growth": "growth",
@@ -288,6 +306,16 @@ def _redacted_tool_args(args):
     return out
 
 
+def _attachment_trace_error_code(tool, output):
+    """Return a content-free reason for failed attachment staging."""
+    if tool not in {"send-file", "send-image"}:
+        return None
+    error = output.get("error") if isinstance(output, dict) else None
+    if isinstance(error, str) and error in _SAFE_ATTACHMENT_REJECTION_CODES:
+        return error
+    return "unclassified"
+
+
 def _emit_tool_trace(args, exit_code, dur_ms):
     """Best-effort per-tool trace. Never let observability affect tool output."""
     try:
@@ -305,6 +333,10 @@ def _emit_tool_trace(args, exit_code, dur_ms):
             "result_status": result_status,
             "dur_ms": rounded_ms,
         }
+        if result_status == "err":
+            error_code = _attachment_trace_error_code(tool, _LAST_TOOL_OUTPUT)
+            if error_code is not None:
+                detail["error_code"] = error_code
         _http_json(
             "POST",
             f"{api_url.rstrip('/')}/v1/debug/trace/event",
