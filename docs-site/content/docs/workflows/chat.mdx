@@ -121,7 +121,7 @@ does not add a second UTC clock representation.
 
 ### 1. Send the turn
 
-At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
+At least one of `message`, `image_b64`, `images`, or `file_b64` is required. `message` is
 limited to 12,000 characters. `context_refs` accepts at most eight references;
 currently memory references are the useful public form.
 
@@ -162,6 +162,13 @@ For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
   "context_refs": []
 }
 ```
+
+To send multiple images, use `images` with one to nine `{image_b64,
+image_mime}` objects. Do not combine `images` with the legacy `image_b64` or
+`image_base64` fields. An empty list returns `image_list_empty`; mixing the two
+forms returns `image_payload_conflict`; more than nine returns
+`image_count_exceeds_limit` with `max_images: 9`. A one-item `images` request is
+stored through the same legacy single-image path.
 
 ### Image model selection
 

@@ -1541,14 +1541,12 @@ def photo_evaluate(user_id: str, metadata: dict,
                    content_envelope: dict | None = None,
                    exif_gps: dict | None = None,
                    meta_envelope: dict | None = None) -> tuple[dict, int]:
-    """Single-step photo ingest: evaluate metadata AND (if usable) store the
-    encrypted image in one call.
+    """Single-step photo ingest: evaluate metadata and store the image envelope.
 
-    V2 does not hard-block sensitive scene hints. The ciphertext goes into the
-    screen-frame envelope channel (reuses the enclave's existing frame-decrypt
-    path); the backend never sees plaintext. frame_id == photo_id ==
-    content_envelope.id. Optional meta_envelope is stored encrypted and returned
-    only on the single-photo content read path.
+    V2 does not hard-block sensitive scene hints. Sealed and plaintext-binary
+    bodies share the screen-frame channel and its shape-aware read path.
+    frame_id == photo_id == content_envelope.id. Optional meta_envelope is stored
+    and returned only on the single-photo content read path.
     """
     now = _now()
     metadata = metadata or {}
@@ -1564,7 +1562,7 @@ def photo_evaluate(user_id: str, metadata: dict,
     if not content_envelope:
         return {"error": "content_envelope_required"}, 400
 
-    # Store ciphertext in the frame channel + metadata as a confirmed item.
+    # Store the visual envelope in the frame channel + metadata as a confirmed item.
     stored = store.put_photo_envelope(user_id, photo_id, now, content_envelope)
     if stored is False:
         # Do not confirm metadata without durable pixels. iOS keeps its cursor
@@ -1649,9 +1647,9 @@ def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
 
 def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
     """Permission + status gate for one confirmed photo. Returns metadata and the
-    frame_id; the caller decrypts pixels via the enclave's existing
-    /v1/screen/frames/<frame_id>/decrypt path. The backend never holds plaintext
-    pixels — only the enclave decrypts."""
+    frame_id; the caller reads pixels through the shape-aware
+    /v1/screen/frames/<frame_id>/decrypt path. Sealed bodies are decrypted by the
+    enclave; plaintext-binary bodies are validated and decoded locally."""
     now = _now()
     doc = store.item_get(user_id, "photo", photo_id, now=now)
     if not doc or doc.get("status") != "confirmed":

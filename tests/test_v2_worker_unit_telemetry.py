@@ -23,6 +23,26 @@ from provider_types import ToolCall, ToolExchange, ToolResult  # noqa: E402
 import provider_attempt_ledger  # noqa: E402
 
 
+def test_protocol_owned_reply_failures_use_reply_parse_failed():
+    """Only these two explicitly named worker families move into this class."""
+    assert worker._DEGENERATE_REPLY_ERROR_CLASS == "reply_parse_failed"
+    assert worker._PROTOCOL_FRAGMENT_ERROR_CLASS == "reply_parse_failed"
+
+
+def test_reply_parse_failed_copy_matches_seven_c_version_exactly():
+    assert notices_catalog.user_text_for(
+        "reply_parse_failed",
+        language="zh-CN",
+    ) == "系统处理回复时出了问题，我们会尽快排查。请再发一次。"
+    assert notices_catalog.user_text_for(
+        "reply_parse_failed",
+        language="en-US",
+    ) == (
+        "Something went wrong while we processed the reply. "
+        "We're looking into it — please send it again."
+    )
+
+
 def test_thinking_extra_preserves_plaintext_body():
     extra = worker._thinking_extra({
         "envelope": {
@@ -250,7 +270,7 @@ def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
             "lane": "chat",
             "error_class": "ProviderError",
             "status_code": 422,
-            "fallback_reason": "tool_schema_rejected",
+            "fallback_reason": "provider_tool_history_rejected",
             "provider_error_class": "provider_config",
             "dur_ms": 321.5,
         },
@@ -264,12 +284,16 @@ def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
     assert captured["provider"] == "openrouter"
     assert captured["model"] == "relay-model"
     assert captured["status_code"] == 422
-    assert captured["fallback_reason"] == "tool_schema_rejected"
+    assert captured["fallback_reason"] == "provider_tool_history_rejected"
     assert captured["provider_error_class"] == "provider_config"
     assert captured["dur_ms"] == 321.5
     assert (
         provider_attempt_ledger.VALID_FALLBACK_REASONS
         == tool_loop._PROVIDER_ATTEMPT_FALLBACK_REASONS
+    )
+    assert (
+        "provider_tool_history_rejected"
+        in provider_attempt_ledger.VALID_FALLBACK_REASONS
     )
 
 
@@ -1096,6 +1120,9 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
         tool_loop._PROVIDER_TERMINAL_TEXT_ROUND_REASONS
     )
     assert "tool_schema_rejected" in (
+        tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+    )
+    assert "provider_tool_history_rejected" in (
         tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
     )
     captured = []

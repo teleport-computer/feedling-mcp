@@ -41,6 +41,10 @@ canonical_owner: self
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |
 | `invalid_image` | 400 | — | 图片校验失败 | ✅ |
+| `invalid_images` | 400 | — | `images` 不是数组 | |
+| `image_payload_conflict` | 400 | — | 单图字段与 `images` 同时出现 | ✅ |
+| `image_list_empty` | 400 | — | `images` 是空数组 | ✅ |
+| `image_count_exceeds_limit` | 400 | — | `images` 超过 9 项；响应带 `max_images: 9` | ✅ |
 | `unsupported_file_type` | 400 | — | 聊天文件上传：文件类型不支持（heic/.doc/.xls/二进制）；detail 说明类型，hint 建议格式 | ✅ |
 | `invalid_file` | 400 | — | 聊天文件上传：file_b64 缺失/空/非法 base64 | ✅ |
 
@@ -347,6 +351,13 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 |---|---|---|---|---|
 | `device_already_enrolled` | 409 | — | 同一设备已在中继注册过（enroll 幂等冲突） | |
 
+## 屏幕与照片读取
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `frame_plaintext_invalid` | 502 | system | 已存明文视觉正文既不是 JSON 屏幕帧，也不是支持的原始图片格式；不得回退 enclave | |
+| `frame_plaintext_caption_unsupported` | — | system | `screen.read` 的 VLM caption 暂不处理明文视觉帧；不得把明文帧转发给 enclave | |
+
 ---
 
 ## 已知问题（登记备查，非本次任务修复范围）
@@ -362,9 +373,9 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
   memory_core.py×2、actions.py×1）。
 - `worldbook/worldbook_core.py::_request_envelope` / `_validate_envelope`
   同样是自由文本消息，未收敛。
-- `screen/screen_read_core.py`（`/v1/screen/*` 的实际 HTTP 路由层）全部错误
-  也是自由文本（`"not found"` / `"bad filename"` 等），未收敛，故本表未列出
-  对应 slug 行。
+- `screen/screen_read_core.py`（`/v1/screen/*` 的实际 HTTP 路由层）除
+  `frame_plaintext_invalid` 外仍有自由文本错误（`"not found"` / `"bad filename"`
+  等），未收敛，故本表未逐项列出。
 
 ---
 
@@ -415,6 +426,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 |---|---|---|---|---|
 | `model_mismatch` | — | system | error | chat：Runtime V1 Claude Code 的结构化回执显示实际模型与用户配置不同；终止本轮并清理错误模型会话，避免静默降级污染后续对话 |
 | `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
+| `provider_tool_history_rejected` | — | user_provider | error | chat：中转通道拒绝原生工具结果历史；Runtime V2 立即终止本轮而不移除工具重试，并引导用户换模型或稍后重试 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |

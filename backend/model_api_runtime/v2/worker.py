@@ -1326,12 +1326,13 @@ _DEGENERATE_REPLY_FALLBACK_EN = (
     ).strip()
     or DEFAULT_FAILURE_FALLBACK_EN
 )
-_DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
+_DEGENERATE_REPLY_ERROR_CLASS = "reply_parse_failed"
 # A torn/leaked protocol-JSON fragment (stream-cut relay split the envelope
-# across reasoning/content). Same blame as a degenerate reply — the relay, not
-# us — but a distinct failure reason keeps flaky-relay users visible in the
-# job_failed_reasons aggregation instead of hiding behind a plain sleep.
-_PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
+# across reasoning/content). It joins the closed reply-parse family while its
+# distinct failure reason stays visible in job_failed_reasons. The neutral
+# notice deliberately does not promise whether the model, relay, or our parser
+# caused the malformed shape.
+_PROTOCOL_FRAGMENT_ERROR_CLASS = "reply_parse_failed"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
 _LOCAL_TOOL_CALL_TAIL_EVIDENCE = "tool_call_tail"
 _TOOL_CALL_TAIL_RE = re.compile(
@@ -13303,6 +13304,33 @@ def _inject_tail_images(
     so a later turn never re-sends old pixels or repeats a paid observer call.
     """
     active_ids = set(active_image_ids or ())
+
+    def image_items(payload: dict | None) -> list[dict]:
+        if not isinstance(payload, dict):
+            return []
+        items = payload.get("images")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        return [payload] if payload.get("image_b64") else []
+
+    def native_blocks(payload: dict | None, caption: str) -> list[dict] | None:
+        items = image_items(payload)
+        if not items:
+            return None
+        blocks: list[dict] = []
+        if caption and caption != "[image]":
+            blocks.append({"type": "text", "text": caption})
+        for item in items:
+            b64 = str(item.get("image_b64") or "")
+            if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
+                return None
+            mime = str(item.get("image_mime") or "image/jpeg")
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        return blocks
+
     targets = [r for r in tail if r.get("has_image") and r.get("id")]
     if not targets:
         return tail
@@ -13472,9 +13500,7 @@ def _inject_tail_images(
             except Exception as exc:  # noqa: BLE001 — preserve dedicated identity
                 raise_dedicated("vision fallback image read failed")
             if any(
-                not str(
-                    (fallback_fetched.get(message_id) or {}).get("image_b64") or ""
-                )
+                not image_items(fallback_fetched.get(message_id))
                 for message_id in selected_ids
             ):
                 raise_dedicated("vision fallback image payload missing")
@@ -13529,42 +13555,26 @@ def _inject_tail_images(
                 out.append({**row, "content": content})
                 continue
             got = fallback_fetched.get(message_id)
-            b64 = str((got or {}).get("image_b64") or "")
-            if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
+            caption = core_util.text_of(row.get("content"))
+            blocks = native_blocks(got, caption)
+            if blocks is None:
                 raise DedicatedVisionUnavailable(
                     "vision fallback image payload invalid"
                 )
-            mime = str((got or {}).get("image_mime") or "image/jpeg")
-            blocks: list[dict] = []
-            caption = core_util.text_of(row.get("content"))
-            if caption and caption != "[image]":
-                blocks.append({"type": "text", "text": caption})
-            blocks.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            })
             out.append({**row, "content": blocks})
             continue
 
         got = fetched.get(message_id) if row.get("has_image") else None
-        b64 = str((got or {}).get("image_b64") or "")
-        if not b64 or len(b64) > _IMAGE_MAX_B64_CHARS:
-            if got and b64:
+        caption = core_util.text_of(row.get("content"))
+        blocks = native_blocks(got, caption)
+        if blocks is None:
+            if got:
                 log.warning(
-                    "[v2.worker] image too large, sending text only (msg=%s, %d chars)",
+                    "[v2.worker] image payload invalid, sending text only (msg=%s)",
                     row.get("id"),
-                    len(b64),
                 )
             out.append(row)
             continue
-        mime = str(got.get("image_mime") or "image/jpeg")
-        blocks: list[dict] = []
-        caption = core_util.text_of(row.get("content"))
-        if caption and caption != "[image]":
-            blocks.append({"type": "text", "text": caption})
-        blocks.append(
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-        )
         out.append({**row, "content": blocks})
     return out
 

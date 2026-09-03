@@ -14,6 +14,7 @@ from __future__ import annotations
 import time
 
 from core import envelope as core_envelope
+from core import chat_images
 from core import wake_bus as core_wake_bus
 
 import db
@@ -69,9 +70,18 @@ def model_api_chat_send_core(
     client_msg_id, client_msg_id_err = chat_idempotency.parse_client_msg_id(payload)
     if client_msg_id_err is not None:
         return client_msg_id_err
+    parsed_images, images_err = hosted_turn._model_api_images_payload(payload)
+    if images_err:
+        return images_err, 400
     image_bytes, image_mime, image_err = hosted_turn._model_api_image_payload(payload)
     if image_err:
         return {"error": "invalid_image", "detail": image_err}, 400
+    image_items: list[tuple[bytes, str]] = []
+    if parsed_images is not None:
+        image_items = parsed_images
+        image_bytes, image_mime = parsed_images[0]
+    elif image_bytes is not None:
+        image_items = [(image_bytes, image_mime)]
     has_image = image_bytes is not None
     file_parse, file_err = hosted_turn._model_api_file_payload(payload)
     if file_err:
@@ -81,6 +91,7 @@ def model_api_chat_send_core(
     if file_parse is not None and file_parse["kind"] == "image":
         image_bytes = file_parse["bytes"]
         image_mime = file_parse["mime"]
+        image_items = [(image_bytes, image_mime)]
         has_image = True
         file_parse = None
     has_file = file_parse is not None
@@ -162,6 +173,7 @@ def model_api_chat_send_core(
                 has_image=has_image,
                 image_bytes=image_bytes,
                 image_mime=image_mime,
+                image_items=image_items,
                 has_file=has_file,
                 file_parse=file_parse,
                 context_refs=context_refs,
@@ -265,7 +277,13 @@ def model_api_chat_send_core(
 
     config = hosted_config_store._load_model_api_config(store)
 
-    if has_image:
+    if len(image_items) >= 2:
+        image_items = [
+            (body, "image/jpeg" if mime.lower() == "image/jpg" else mime.lower())
+            for body, mime in image_items
+        ]
+        user_plaintext = chat_images.encode_image_bundle(image_items)
+    elif has_image:
         user_plaintext = image_bytes
     elif has_file:
         user_plaintext = file_parse["bytes"]
@@ -297,6 +315,13 @@ def model_api_chat_send_core(
         extra["client_msg_id"] = client_msg_id
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if len(image_items) >= 2:
+        extra.update({
+            "image_bundle_version": chat_images.CHAT_IMAGE_BUNDLE_VERSION,
+            "image_count": len(image_items),
+            "image_mimes": [mime for _body, mime in image_items],
+            "image_byte_count": sum(len(body) for body, _mime in image_items),
+        })
     if has_image and vision_route_id:
         extra["vision_route_id"] = vision_route_id
     if has_image and message:
@@ -415,6 +440,7 @@ def _send_resident(
     has_image: bool,
     image_bytes,
     image_mime,
+    image_items,
     has_file: bool,
     file_parse,
     context_refs,
@@ -492,7 +518,13 @@ def _send_resident(
             ):
                 main_vision_binding = candidate
 
-    if has_image:
+    if len(image_items) >= 2:
+        image_items = [
+            (body, "image/jpeg" if mime.lower() == "image/jpg" else mime.lower())
+            for body, mime in image_items
+        ]
+        user_plaintext = chat_images.encode_image_bundle(image_items)
+    elif has_image:
         user_plaintext = image_bytes
     elif has_file:
         user_plaintext = file_parse["bytes"]
@@ -533,6 +565,13 @@ def _send_resident(
     extra: dict = _voice_metadata(voice_context)
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if len(image_items) >= 2:
+        extra.update({
+            "image_bundle_version": chat_images.CHAT_IMAGE_BUNDLE_VERSION,
+            "image_count": len(image_items),
+            "image_mimes": [mime for _body, mime in image_items],
+            "image_byte_count": sum(len(body) for body, _mime in image_items),
+        })
     if has_image and vision_route_id:
         extra["vision_route_id"] = vision_route_id
     if has_image and main_vision_binding is not None:

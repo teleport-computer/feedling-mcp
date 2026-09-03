@@ -1022,6 +1022,7 @@ def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
         [{"role": "user", "content": [
             {"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcd"}},
+            {"type": "image_url", "image_url": {"url": "data:image/webp;base64,efgh"}},
         ]}],
     )
 
@@ -1031,6 +1032,10 @@ def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
     assert content[1] == {
         "type": "image",
         "source": {"type": "base64", "media_type": "image/png", "data": "abcd"},
+    }
+    assert content[2] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/webp", "data": "efgh"},
     }
 
 
@@ -1075,6 +1080,7 @@ def test_gemini_chat_completion_maps_image_parts(monkeypatch):
         [{"role": "user", "content": [
             {"type": "text", "text": "look"},
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abcd"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,efgh"}},
         ]}],
     )
 
@@ -1084,6 +1090,7 @@ def test_gemini_chat_completion_maps_image_parts(monkeypatch):
         "parts": [
             {"text": "look"},
             {"inline_data": {"mime_type": "image/jpeg", "data": "abcd"}},
+            {"inline_data": {"mime_type": "image/png", "data": "efgh"}},
         ],
     }]
 

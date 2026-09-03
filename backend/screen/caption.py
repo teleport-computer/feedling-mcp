@@ -1,10 +1,8 @@
-"""Backend side of the screen.read tool.
+"""Backend side of the screen.read caption tool.
 
-The backend never holds plaintext pixels: it calls the enclave's
-/v1/screen/frames/<id>/caption route, which decrypts in-enclave and returns
-only caption TEXT. We cache that text per frame_id so a re-read (or a second
-agent in the same turn) never re-bills the VLM. recent_frames() lists frame
-metadata + any already-cached caption and never triggers the model.
+Encrypted frames are captioned in the enclave. Plaintext frames never cross
+that boundary and currently return an explicit unsupported error. Captions
+are cached per frame_id so repeated reads do not re-bill the VLM.
 """
 from __future__ import annotations
 
@@ -13,8 +11,10 @@ import os
 import httpx
 
 import db
+from core import envelope as core_envelope
 from core.reqctx import request
 from perception import store as perception_store
+from screen import frames as screen_frames
 
 _CACHE_KIND = "screen_caption"
 _CAPTION_TIMEOUT = 50.0
@@ -42,10 +42,6 @@ def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None)
 def _enclave_get(url: str, headers=None, params=None):
     with httpx.Client(timeout=_CAPTION_TIMEOUT, verify=False) as client:
         return client.get(url, headers=headers or {}, params=params or {})
-
-
-def _frame_exists(user_id: str, frame_id: str) -> bool:
-    return db.frame_get(user_id, frame_id) is not None
 
 
 def _cached_caption(user_id: str, frame_id: str) -> str | None:
@@ -81,8 +77,17 @@ def caption_frame(user_id: str, api_key: str, frame_id: str | None,
     fid = str(frame_id or "").strip() or (_latest_frame_id(user_id) or "")
     if not fid:
         return {"error": "no_recent_frame"}
-    if not _frame_exists(user_id, fid):
+    frame = db.frame_get(user_id, fid)
+    if frame is None:
         return {"frame_id": fid, "error": "no_recent_frame"}
+
+    shape = core_envelope.classify_envelope_shape(frame)
+    if shape == "plaintext_binary":
+        if screen_frames._read_plaintext_frame(frame) is not None:
+            return {"frame_id": fid, "error": "frame_plaintext_caption_unsupported"}
+        return {"frame_id": fid, "error": "frame_plaintext_invalid"}
+    if shape != "sealed":
+        return {"frame_id": fid, "error": "frame_plaintext_invalid"}
 
     # full mode is intentionally NOT cached: it returns richer output (ocr_text,
     # decrypt_status, etc.) that the caption-only cache key can't represent, so

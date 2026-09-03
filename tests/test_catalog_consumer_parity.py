@@ -14,6 +14,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # tools/chat_resident_consumer.py 在 import 时需要一批环境变量默认值（照抄
 # tests/test_consumer_error_classify.py 的既有写法，保持两处环境一致）。
 _ENV_DEFAULTS = {
@@ -41,6 +43,22 @@ from notices import core  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
+
+
+_PROVIDER_TOOL_HISTORY_REJECTION_DETAILS = (
+    "provider_http_400: The GenerateContentRequest proto is invalid:\n"
+    "  * contents[2].parts[0].function_response.name: "
+    "[REQUIRED_FIELD_MISSING]",
+    "provider_http_400: Function call is missing a thought_signature in "
+    "functionCall parts. This is required for tools to work correctly, and "
+    "missing thought_signature may lead to degraded model performance. "
+    "Additional data, function call `default_api:memory_write` , position 2. "
+    "Please refer to https://***.dev/***/***/*** for more details.",
+    "provider_http_400: Provider API error: Provider API error: Please ensure "
+    "that function call turn comes immediately after a user turn or after a "
+    "function response turn. (request id: "
+    "20260903134117388340505BvsDKsJo)",
+)
 
 
 def test_catalog_covers_all_consumer_error_classes():
@@ -211,6 +229,30 @@ def test_timeout_notice_classes_have_non_retry_loop_text():
     assert catalog.user_text_for("provider_timeout") == (
         "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。"
     )
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_provider_tool_history_rejection_has_exact_actionable_notice(detail):
+    expected_code = "provider_tool_history_rejected"
+    expected_zh = (
+        "模型似乎调用工具出错了，这个通道暂时无法使用工具，换个模型或稍后重试。"
+    )
+    expected_en = (
+        "The model seems to have hit an error calling tools, so tools are "
+        "temporarily unavailable on this channel. Switch models or try again "
+        "later."
+    )
+
+    assert catalog.classify_upstream(detail) == expected_code
+    assert catalog.classify_upstream(detail) != "provider_incompatible"
+    assert (
+        crc.classify_agent_error(RuntimeError(detail)).error_class
+        == expected_code
+    )
+    assert catalog.user_text_for(expected_code, language="zh-Hans") == expected_zh
+    assert catalog.user_text_for(expected_code, language="en-US") == expected_en
+    assert catalog.blame_for(expected_code) == "user_provider"
+    assert f"turn_failed:{expected_code}" in worker.PUBLIC_FAILURE_CODES
 
 
 def test_classify_upstream_mirrors_consumer_on_samples():

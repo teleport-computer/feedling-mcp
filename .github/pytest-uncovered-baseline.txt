@@ -44,7 +44,6 @@ tests/test_bootstrap_status_verify_ping.py
 tests/test_branch_flow_guard.py
 tests/test_bucket_lang_normalize.py
 tests/test_bucket_language_normalize.py
-tests/test_capabilities_chat.py
 tests/test_capabilities_registry.py
 tests/test_capabilities_types.py
 tests/test_capability_html_extract.py
@@ -229,7 +228,6 @@ tests/test_v2_kill_switch_web.py
 tests/test_v2_live_genesis_workers.py
 tests/test_v2_local_sandbox.py
 tests/test_v2_manual_wake_bridge.py
-tests/test_v2_multimodal_e2e.py
 tests/test_v2_no_cursor_ts.py
 tests/test_v2_no_dispatch_tiering.py
 tests/test_v2_optional_anchor.py
@@ -251,7 +249,6 @@ tests/test_v2_seq_cursor_migration.py
 tests/test_v2_serve_worker_consent.py
 tests/test_v2_serve_worker_extraction.py
 tests/test_v2_serve_worker_genesis.py
-tests/test_v2_serve_worker_images.py
 tests/test_v2_sink_retryable.py
 tests/test_v2_status_poll.py
 tests/test_v2_status_stream.py
@@ -267,7 +264,6 @@ tests/test_v2_wake_success.py
 tests/test_v2_web_gate.py
 tests/test_v2_worker_files.py
 tests/test_v2_worker_heartbeat.py
-tests/test_v2_worker_images.py
 tests/test_v2_workspace_db.py
 tests/test_v2_workspace_parallel_sink.py
 tests/test_v2_workspace_unit.py

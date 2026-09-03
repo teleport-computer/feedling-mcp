@@ -82,6 +82,23 @@ def _make_image_msg(
     return message
 
 
+def test_multi_image_payloads_preserve_order_and_mime():
+    msg = {
+        "id": "multi",
+        "images": [
+            {"image_b64": base64.b64encode(_JPEG_MAGIC).decode(),
+             "image_mime": "image/jpeg"},
+            {"image_b64": base64.b64encode(_PNG_MAGIC).decode(),
+             "image_mime": "image/png"},
+        ],
+    }
+    payloads = crc._image_payloads_from_msg(msg)
+    assert [item["mime_type"] for item in payloads] == ["image/jpeg", "image/png"]
+    assert [base64.b64decode(item["data"]) for item in payloads] == [
+        _JPEG_MAGIC, _PNG_MAGIC
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Test 1: payload decode from image_b64
 # ---------------------------------------------------------------------------

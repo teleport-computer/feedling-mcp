@@ -77,6 +77,7 @@ from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
 from core import runtime_token
 from core import store as core_store
+from core import chat_images
 from core.store_sections import StoreSection
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
@@ -2083,7 +2084,9 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
         except Exception as e:  # noqa: BLE001
             log.warning("[v2.serve_worker] image read failed msg=%s: %s", mid, e)
             continue
-        if data.get("image_b64"):
+        if isinstance(data.get("images"), list) and data["images"]:
+            out[str(mid)] = {"images": list(data["images"])}
+        elif data.get("image_b64"):
             out[str(mid)] = {
                 "image_mime": data.get("image_mime") or "image/jpeg",
                 "image_b64": data["image_b64"],
@@ -2377,8 +2380,10 @@ def _read_vision_observations_with_deadline(
         message_id = item["message_id"]
         route_id = item["route_id"]
         image = images.get(message_id) or {}
-        image_b64 = str(image.get("image_b64") or "")
-        if not image_b64:
+        image_items = image.get("images")
+        if not isinstance(image_items, list):
+            image_items = [image] if image.get("image_b64") else []
+        if not image_items:
             raise RuntimeError("vision_image_payload_missing")
 
         config = configs.get(route_id)
@@ -2391,7 +2396,6 @@ def _read_vision_observations_with_deadline(
             )
             configs[route_id] = config
 
-        mime = str(image.get("image_mime") or "image/jpeg")
         provider = str(config.provider or "")[:80]
         model = str(config.model or "")[:96]
         started_at = time.monotonic()
@@ -2420,12 +2424,20 @@ def _read_vision_observations_with_deadline(
             detail={"provider": provider, "model": model},
         )
         try:
-            observation = vision_observer.observe_image(
-                config,
-                image_mime=mime,
-                image_b64=image_b64,
-                absolute_deadline=absolute_deadline,
-            )
+            observations: list[str] = []
+            for image_item in image_items:
+                image_b64 = str((image_item or {}).get("image_b64") or "")
+                if not image_b64:
+                    raise RuntimeError("vision_image_payload_missing")
+                observations.append(vision_observer.observe_image(
+                    config,
+                    image_mime=str(
+                        (image_item or {}).get("image_mime") or "image/jpeg"
+                    ),
+                    image_b64=image_b64,
+                    absolute_deadline=absolute_deadline,
+                ))
+            observation = chat_images.combine_numbered_observations(observations)
         except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
             # can carry it to the terminal activity/fallback projection.

@@ -1118,6 +1118,9 @@ class UserStore:
                 "quoted_memory_ids",
                 "image_mime",
                 "image_byte_count",
+                "image_bundle_version",
+                "image_count",
+                "image_mimes",
                 # Hosted V1 follow-main capability-learning fence. The terminal
                 # reply transaction consumes both fields only for the stable
                 # vision_model_required class; they never alter image routing.
@@ -1201,9 +1204,13 @@ class UserStore:
                 elif key in {
                     "file_byte_count",
                     "image_byte_count",
+                    "image_bundle_version",
+                    "image_count",
                     "reply_part_count",
                 } and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "image_mimes" and isinstance(value, list):
+                    msg[key] = [str(item) for item in value]
                 elif key == "reply_part_index" and isinstance(value, int) and value >= 0:
                     msg[key] = value
                 elif (
@@ -1347,6 +1354,9 @@ class UserStore:
                 "quoted_memory_ids",
                 "image_mime",
                 "image_byte_count",
+                "image_bundle_version",
+                "image_count",
+                "image_mimes",
                 # Dedicated visual route proven at image-send time. Runtime V2
                 # resolves this exact caller-owned route so a concurrent Settings
                 # change cannot reroute pixels or expose them to the main model.
@@ -1429,9 +1439,13 @@ class UserStore:
                 elif key in {
                     "file_byte_count",
                     "image_byte_count",
+                    "image_bundle_version",
+                    "image_count",
                     "reply_part_count",
                 } and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "image_mimes" and isinstance(value, list):
+                    msg[key] = [str(item) for item in value]
                 elif key == "reply_part_index" and isinstance(value, int) and value >= 0:
                     msg[key] = value
                 elif (

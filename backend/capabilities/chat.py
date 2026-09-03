@@ -1,12 +1,14 @@
 """Chat-image capability — enclave-only single-message body read."""
 from __future__ import annotations
 
+import base64
 import os
 from urllib.parse import quote
 
 import httpx
 
 import db
+from core import chat_images
 from core import envelope as core_envelope
 from screen import screen_read_core   # reuse enclave_forward_headers
 from capabilities import errors
@@ -31,12 +33,21 @@ def image_read(store, *, api_key=None, runtime_token=None, params=None) -> Capab
         if isinstance(row, dict) and core_envelope.classify_envelope_shape(
                 row) == "plaintext_binary":
             try:
-                core_envelope.read_plaintext_envelope_body(
+                plaintext = core_envelope.read_plaintext_envelope_body(
                     row, owner_user_id=user_id)
             except ValueError:
                 return err(errors.NOT_FOUND, f"message {message_id} not found", retryable=False)
             if str(row.get("content_type") or "") != "image":
                 return err(errors.NOT_FOUND, "message has no image", retryable=False)
+            if row.get("image_bundle_version"):
+                images = [
+                    {
+                        "image_mime": mime,
+                        "image_b64": base64.b64encode(body).decode("ascii"),
+                    }
+                    for body, mime in chat_images.decode_image_bundle(plaintext)
+                ]
+                return ok(data={"message_id": str(message_id), "images": images})
             return ok(data={
                 "message_id": str(message_id),
                 "image_mime": row.get("image_mime", "image/jpeg"),
@@ -67,6 +78,9 @@ def image_read(store, *, api_key=None, runtime_token=None, params=None) -> Capab
     msg = body.get("message") if isinstance(body, dict) else None
     if not msg:
         return err(errors.NOT_FOUND, f"message {message_id} not found", retryable=False)
+    images = msg.get("images")
+    if isinstance(images, list) and images:
+        return ok(data={"message_id": str(message_id), "images": images})
     image_b64 = msg.get("image_b64")
     if not image_b64:
         return err(errors.NOT_FOUND, "message has no image", retryable=False)

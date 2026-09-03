@@ -1185,7 +1185,7 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(
         else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
     )
     assert bubbles[0]["body_ct"] == expected
-    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_error_class"] == "reply_parse_failed"
     assert bubbles[0]["thinking_body_ct"] == "（思考没写完）"
     assert _job_status_row(job_id)[0] == "completed"
 
@@ -1278,10 +1278,12 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
-    assert persisted_extra["turn_failure_error_class"] == "upstream_unavailable"
-    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
-    assert bubbles[0]["turn_failure_blame"] == "provider_transient"
-    assert "模型服务暂时不可用" in bubbles[0]["turn_failure_user_text"]
+    assert persisted_extra["turn_failure_error_class"] == "reply_parse_failed"
+    assert bubbles[0]["turn_failure_error_class"] == "reply_parse_failed"
+    assert bubbles[0]["turn_failure_blame"] == "system"
+    assert bubbles[0]["turn_failure_user_text"] == (
+        "系统处理回复时出了问题，我们会尽快排查。请再发一次。"
+    )
     assert _job_status_row(job_id)[0] == "completed"
 
 
@@ -1405,7 +1407,7 @@ def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(
     )
     assert bubbles[0]["body_ct"] == expected
     assert _TORN_TAIL not in bubbles[0]["body_ct"]
-    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_error_class"] == "reply_parse_failed"
     # Reasoning head must not ride along as a thinking bubble.
     assert not bubbles[0].get("thinking_body_ct")
 

@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest  # noqa: E402
 
-from enclave import readside, visual  # noqa: E402
+from core import visual  # noqa: E402
+from enclave import readside  # noqa: E402
 
 
 def test_raw_image_mime_signatures():
@@ -35,6 +36,11 @@ def test_parse_visual_plaintext_raw_photo_fallback():
 def test_parse_visual_plaintext_garbage_fails_closed():
     with pytest.raises(Exception):
         visual.parse_visual_plaintext(b"\x00\x01 garbage not json not image")
+
+
+def test_parse_visual_plaintext_unrelated_json_object_fails_closed():
+    with pytest.raises(ValueError, match="visual plaintext schema"):
+        visual.parse_visual_plaintext(b'{"foo":"bar"}')
 
 
 def test_readside_effective_limit(monkeypatch):
