@@ -203,7 +203,6 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 > 只出失败横幅（老版按未知 slug 兜底即可）。
 
 计划新增（Phase C 同批；老版按未知 slug 兜底即可）：
-- `provider_tool_history_rejected`（user_provider）——中转通道拒绝原生工具结果历史；本轮不会移除工具后重试
 - `provider_incompatible`（user_provider）——上游不兼容请求格式（如部分中转/xAI 拒收工具 schema）
 - `context_overflow`（user_provider）——上下文超限，指引清理会话/换模型
 - `content_filtered`（provider_transient）——上游安全过滤拒答，换个说法重试
