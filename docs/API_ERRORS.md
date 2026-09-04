@@ -7,7 +7,7 @@ canonical_owner: self
 > `{"error": "<slug>"}` 的 slug 是稳定 API 面：一经写入本表即冻结，废弃走
 > 「新增新 slug、旧 slug 保留」。新增错误返回必须先登记到本表（CONTRIBUTING
 > 有此纪律）。iOS 本地化表以本表为输入；「需本地化」为空的 slug 走通用文案。
-> 对外渲染规则见 docs/FRONTEND_ERROR_CONTRACT.md。
+> 对外渲染规则见 `docs-site/content/docs/errors.mdx`(公开文档,current)。
 >
 > **盘点方法**：`grep -rhoE '"error":\s*"[a-z_0-9]+"' backend/ --include="*.py"`
 > （不要求 `{` 开头，覆盖多行 dict 字面量）+ 单独查 `_bad(`/`json_error(`/
@@ -19,8 +19,8 @@ canonical_owner: self
 > 字段、`admin/data_track.py` 的 trace 反射字段）。状态码从直接返回处/调用处读；
 > 多处不一致的用 `xxx/yyy` 列出全部。blame 只标能明确判定的（基础设施/我方
 > bug → `system`；用户自己的 provider 配置/额度问题 → `user_provider`；纯参数
-> 校验错误不判 blame，留 `—`）。「需本地化」按
-> `docs/FRONTEND_ERROR_CONTRACT.md` §三目录勾选，未在该目录里的留空（多数是
+> 校验错误不判 blame，留 `—`）。「需本地化」由**本表自身**拥有:凡在本表登记
+> 且面向用户的 slug 即勾选,未勾选的留空（多数是
 > 校验类错误，走 `invalid_payload`/`detail` 通用兜底文案，不需要逐条本地化）。
 > `enclave/*` 是独立的 backend↔enclave 内网面，iOS 从不直连，见文末单独一节。
 
@@ -406,7 +406,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 > `error_class` 字段的取值由 `backend/notices/error_contract.py` 的
 > `ErrorSpec` 注册表唯一拥有；`backend/notices/catalog.py` 的 `_CATALOG`
 > 是派生兼容视图。它只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
-> `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二分类；`severity`
+> `blame` 语义见 `docs-site/content/docs/errors.mdx`(公开文档,current)；`severity`
 > 取值 `error`/`warning`，决定通知中心 UI 展示优先级（`warning` 语气弱化，
 > 不打扰用户）。「状态码」列在本节恒为 `—`（notice 不走 HTTP 状态码，此列
 > 仅为复用上面表格的行格式/守卫测试）。

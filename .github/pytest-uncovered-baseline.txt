@@ -81,7 +81,6 @@ tests/test_diagnostics_routes.py
 tests/test_dream_card_render_bucket.py
 tests/test_dream_status.py
 tests/test_e2b_template_contract.py
-tests/test_e2e_deep_claude.py
 tests/test_error_slug_convergence.py
 tests/test_exception_handlers.py
 tests/test_expected_consumer_commit.py
