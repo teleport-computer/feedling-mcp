@@ -6,11 +6,19 @@
 ⚠️ 保留一处易丢的语义：``naming_rule`` 用的是**未 sanitize** 的原始 ``user_name``，
 而模板里的 ``user_name`` 用的是 sanitize 后的值。两者不同源，照搬原实现。
 """
+from dataclasses import replace
+
 from identity.user_naming import _naming_rule, sanitize_user_name  # noqa: F401
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 from memgarden.prompts.capture import *  # noqa: F401,F403
 from memgarden.prompts import capture as _kernel
+from memgarden.policies import CONVERSATION_CAPTURE
+
+
+# 提示词继续要求「少而厚」；硬上限只防失控批次，不再把模型判断截在 2 张。
+# 从钉版 policy replace，确保 rubric 与其余行为逐字段保持原样。
+IO_CONVERSATION_CAPTURE_POLICY = replace(CONVERSATION_CAPTURE, max_cards=50)
 
 
 def build_capture_prompt(
@@ -61,4 +69,5 @@ _kernel_parse_capture_cards = _kernel.parse_capture_cards
 def parse_capture_cards(*args, **kwargs):
     """内核 parser + io 的识别器。调用方不需要、也不应该自己传 signals。"""
     kwargs.setdefault("signals", IO_LEAK_SIGNALS)
+    kwargs.setdefault("policy", IO_CONVERSATION_CAPTURE_POLICY)
     return _kernel_parse_capture_cards(*args, **kwargs)
