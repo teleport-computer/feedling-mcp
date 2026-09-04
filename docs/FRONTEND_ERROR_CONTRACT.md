@@ -1,3 +1,15 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/API_ERRORS.md
+historical_reason: superseded
+superseded_by: docs/API_ERRORS.md
+---
+
+> **本文档已被取代,仅作历史记录。** 现行权威:错误 slug 与文案契约见
+> [`docs/API_ERRORS.md`](API_ERRORS.md);对外公开的行为契约见 `docs-site/content/docs/`。
+> 本文是 2026-07-07 的 v1.1 设计稿,其中的「计划新增」清单与当时的字段形状**未随实现更新**,
+> 引用前请以上述现行权威为准。
+
 # 前端错误契约（后端 ↔ iOS）
 
 状态：v1.1 设计稿，2026-07-07。

@@ -500,6 +500,19 @@ jobs:
             tests/test_e2e_deep_probes.py \
             -v
 
+      # 与上一步同源:同样是确定性离线单测(只 import tools/e2e 的探针模块做纯函数断言,
+      # 不连库、不连网、不起 consumer)。此前它躺在 pytest-uncovered-baseline.txt 里,
+      # CI 一次都没跑过 —— 15 条断言写了等于没写。接线时三件必须同批:
+      # 加本步骤 + 删 baseline 那一行 + 递减 MAX_EXEMPTED,
+      # 只删 baseline 会让覆盖闸报 "now covered" 硬失败。
+      - name: E2E deep-probe claude-lane unit tests (deterministic, no live environment)
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m pytest \
+            tests/test_e2e_deep_claude.py \
+            -v
+
       # PerceptKit（感知内核的外部包）在 io 侧的接线。三个文件要真库：
       # 它们不走 conftest 的 DATABASE_URL，而是自己按 PERCEPTKIT_TEST_PG 连，
       # 因为验的就是真事务边界、并发下只有一个胜者、崩溃恢复 ——
