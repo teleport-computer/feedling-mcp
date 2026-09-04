@@ -41,6 +41,42 @@ _RESIDENT_AGENT_CLI_AUTH_FAILURES = (
     "agent exited: Not logged in · Please run /login",
 )
 
+_RESIDENT_LOCALIZATION_CASES = (
+    (
+        "resident_consumer_stale",
+        "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。",
+        "Your VPS resident consumer may be out of date, or it is not picking "
+        "up tasks properly. Please update it and restart.",
+        116,
+        "ac8ed38dce0480c19fd7e8fc02e7980777d188327d45eb5aa1a69c8d3ead2a01",
+    ),
+    (
+        "resident_decrypt_source_unavailable",
+        "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。",
+        "The decryption source on your VPS resident is unavailable, so "
+        "encrypted messages cannot be answered for now.",
+        108,
+        "e4da5940813becd4d113a0bab1f2272639d0182b2bd70546002de4b25b89ddae",
+    ),
+    (
+        "resident_decrypt_health_unreported",
+        "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。",
+        "Your VPS resident has not reported a verifiable decryption health "
+        "status. This usually means the consumer is out of date. Please update "
+        "it and restart.",
+        151,
+        "34c109beabb508e011b075bcb162f07c5f637f3718e99b32c1bd2fa0715644f7",
+    ),
+    (
+        "resident_never_claimed",
+        "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。",
+        "Your VPS resident consumer has not picked up onboarding or memory "
+        "distillation tasks for a long time. Please update it and restart.",
+        131,
+        "ef856ba6a5747ddd824d4512f87dc445616bdb0aca5a65edde5131ea0effd034",
+    ),
+)
+
 
 def test_resident_agent_cli_logged_out_copy_is_exact_and_bilingual():
     spec = error_contract.require_spec("resident_agent_cli_logged_out")
@@ -90,6 +126,28 @@ def test_resident_agent_cli_matcher_does_not_steal_provider_auth(detail):
         resident.classify_agent_error(RuntimeError(detail)).error_class
         == "auth_invalid"
     )
+
+
+@pytest.mark.parametrize(
+    ("code", "zh", "en", "en_length", "en_sha256"),
+    _RESIDENT_LOCALIZATION_CASES,
+)
+def test_resident_localization_preserves_zh_and_supplies_exact_en(
+    code, zh, en, en_length, en_sha256
+):
+    spec = error_contract.require_spec(code)
+
+    assert spec.text("en") == en
+    assert spec.text("en") != zh
+    assert len(spec.text("en")) == en_length
+    assert spec.text("en").isascii()
+    assert hashlib.sha256(spec.text("en").encode()).hexdigest() == en_sha256
+    assert spec.text("zh") == zh
+    assert spec.text("") == zh
+
+    if code == "resident_decrypt_health_unreported":
+        assert spec.text("zh")[31] == "\u002c"
+        assert spec.text("zh")[49] == "\u002c"
 
 
 def test_auth_headers_prefers_api_key(monkeypatch):

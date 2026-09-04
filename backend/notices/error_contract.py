@@ -189,10 +189,52 @@ def _resident_specs() -> tuple[ErrorSpec, ...]:
                 r"be refreshed|not logged in\s*·\s*please run /login"
             ),
         ),
-        _spec("resident_consumer_stale", "resident", "resident", "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
-        _spec("resident_decrypt_source_unavailable", "resident", "resident", "user_environment", "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。"),
-        _spec("resident_decrypt_health_unreported", "resident", "resident", "user_environment", "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。"),
-        _spec("resident_never_claimed", "resident", "resident", "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
+        _spec(
+            "resident_consumer_stale",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。",
+            en=(
+                "Your VPS resident consumer may be out of date, or it is not "
+                "picking up tasks properly. Please update it and restart."
+            ),
+        ),
+        _spec(
+            "resident_decrypt_source_unavailable",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。",
+            en=(
+                "The decryption source on your VPS resident is unavailable, so "
+                "encrypted messages cannot be answered for now."
+            ),
+        ),
+        _spec(
+            "resident_decrypt_health_unreported",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。",
+            en=(
+                "Your VPS resident has not reported a verifiable decryption "
+                "health status. This usually means the consumer is out of date. "
+                "Please update it and restart."
+            ),
+        ),
+        _spec(
+            "resident_never_claimed",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。",
+            en=(
+                "Your VPS resident consumer has not picked up onboarding or "
+                "memory distillation tasks for a long time. Please update it "
+                "and restart."
+            ),
+        ),
     )
 
 
