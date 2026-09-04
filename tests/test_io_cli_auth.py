@@ -3,13 +3,15 @@
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
 
 import io_cli  # noqa: E402
 
@@ -26,6 +28,93 @@ for key, value in {
     os.environ.setdefault(key, value)
 
 import chat_resident_consumer as resident  # noqa: E402
+
+
+def _foreground_context_limit_from_fresh_import(configured: str | None) -> int:
+    env = os.environ.copy()
+    if configured is None:
+        env.pop("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", None)
+    else:
+        env["FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT"] = configured
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(
+            None,
+            [str(ROOT / "tools"), str(ROOT / "backend"), env.get("PYTHONPATH")],
+        )
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import chat_resident_consumer as resident; "
+            "print(resident.FOREGROUND_CHAT_CONTEXT_LIMIT)",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(result.stdout.strip().splitlines()[-1])
+
+
+def test_foreground_chat_context_limit_defaults_to_50_messages():
+    assert _foreground_context_limit_from_fresh_import(None) == 50
+
+
+def test_foreground_chat_context_limit_honors_environment_override():
+    assert _foreground_context_limit_from_fresh_import("12") == 12
+
+
+@pytest.mark.parametrize(
+    ("requested_limit", "expected_count", "expected_fetch_limit", "first_message"),
+    [
+        (60, 50, 54, "message-10"),
+        (0, 1, 20, "message-59"),
+    ],
+)
+def test_foreground_chat_context_limit_clamps_both_bounds(
+    monkeypatch,
+    requested_limit,
+    expected_count,
+    expected_fetch_limit,
+    first_message,
+):
+    history = [
+        {"role": "user", "content": f"message-{index}", "ts": index + 1}
+        for index in range(60)
+    ]
+    fetch_limits = []
+
+    def _fake_history(*, since, limit, include_image_body):
+        assert since == 0
+        assert include_image_body is False
+        fetch_limits.append(limit)
+        return history
+
+    monkeypatch.setattr(resident, "get_decrypted_history", _fake_history)
+    monkeypatch.setattr(
+        resident,
+        "_clean_messages_for_proactive_context",
+        lambda messages: messages,
+    )
+    monkeypatch.setattr(
+        resident,
+        "_chat_context_line",
+        lambda message, **_kwargs: message["content"],
+    )
+
+    context = resident._recent_chat_context_for_foreground(
+        before_ts=0,
+        limit=requested_limit,
+    )
+
+    assert fetch_limits == [expected_fetch_limit]
+    assert context.splitlines() == [
+        f"message-{index}"
+        for index in range(60 - expected_count, 60)
+    ]
+    assert context.splitlines()[0] == first_message
 
 
 _RESIDENT_AGENT_CLI_LOGGED_OUT_ZH = (

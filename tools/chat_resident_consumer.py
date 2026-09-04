@@ -594,10 +594,8 @@ _RESIDENT_VISION_PRIMARY_BUDGET_SEC = (
 FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT", "auto"
 ).strip().lower()
-# Eight meaningful rows bridge a cold/rebuilt runtime without replaying a large
-# archive. Canonical history stays in the Enclave, and voice archives remain
-# available through voice-transcript-* tools.
-FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "8"))
+# Counts messages, not turns: 25 turns = the hard cap of 50; this transcript has no character cap, so raising the limit proportionally enlarges each bridge prompt; canonical history remains in the Enclave and voice archives remain available via voice-transcript-* tools.
+FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "50"))
 FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
     # 反开机仪式护栏:注入路径下每轮都是新模型会话,自带"唤醒仪式"的 persona
