@@ -1110,6 +1110,59 @@ def test_user_detail_daily_usage_json_page_and_events_limit(client):
     assert (first_day + timedelta(days=1)).isoformat() in body
 
 
+def test_caption_envelope_failure_tracking_event_is_visible_in_user_detail(client):
+    user_id, _ = _register(client)
+    turn_id = "turn-caption-failed"
+    job_id = "481"
+    event = {
+        "event_id": f"caption-envelope-failed:{turn_id}",
+        "type": "caption_envelope_failed",
+        "created_at": "2030-06-02T12:00:00Z",
+        "source": "backend",
+        "route": "/v1/model_api/chat/send",
+        "payload": {
+            "turn_id": turn_id,
+            "job_id": job_id,
+            "attachment_kind": "image",
+            "outcome_class": "operational_failure",
+            "error_code": "enclave_info_unavailable",
+            "caption_persisted": False,
+        },
+    }
+    assert db.log_append(
+        user_id,
+        "tracking_events",
+        event,
+        ts=_epoch(event["created_at"]),
+        item_key=event["event_id"],
+    )
+
+    res = client.get(
+        f"/v1/admin/data-track/users/{user_id}?events_limit=50",
+        headers=_admin_headers(),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    visible = next(
+        item for item in res.get_json()["user"]["tracking"]["latest"]
+        if item.get("type") == "caption_envelope_failed"
+    )
+    assert visible["event_id"] == event["event_id"]
+    assert visible["source"] == "backend"
+    assert visible["route"] == "/v1/model_api/chat/send"
+    assert visible["payload"] == event["payload"]
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}?events_limit=50",
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    page_html = page.get_data(as_text=True)
+    assert "caption_envelope_failed" in page_html
+    assert turn_id in page_html
+    assert job_id in page_html
+
+
 def test_t478_user_detail_never_materializes_store_caches(client, monkeypatch):
     user_id, _ = _register(client)
     snapshot_calls = []

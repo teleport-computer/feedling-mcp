@@ -104,6 +104,20 @@ def _fake_envelope_builder():
     return _build
 
 
+def _caption_failure_envelope_builder(error: str = "enclave_info_unavailable"):
+    """Build the image envelope, then fail only the separate caption envelope."""
+    build = _fake_envelope_builder()
+    calls = {"count": 0}
+
+    def _build(store, plaintext: bytes, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            return None, error
+        return build(store, plaintext, **kwargs)
+
+    return _build
+
+
 def _chat_envelope(user_id: str, msg_id: str) -> dict:
     return {
         "v": 1,
@@ -116,6 +130,16 @@ def _chat_envelope(user_id: str, msg_id: str) -> dict:
         "owner_user_id": user_id,
         "enclave_pk_fpr": "test",
     }
+
+
+def test_caption_failure_code_never_exposes_unstructured_error_detail():
+    assert (
+        chat_send_core._caption_failure_code(
+            "envelope_build_failed:ValueError:private detail"
+        )
+        == "envelope_build_failed"
+    )
+    assert chat_send_core._caption_failure_code("private detail") == "unknown"
 
 
 def _setup_openrouter(client, api_key: str, monkeypatch) -> None:
@@ -758,6 +782,162 @@ def test_send_image_with_caption_persists_caption_envelope(client, monkeypatch):
     assert row.get("image_mime") == "image/png", (
         f"image_mime 应为 image/png，实际 {row.get('image_mime')!r}"
     )
+
+
+def test_caption_envelope_failure_emits_correlated_trace_and_user_log(
+    client, monkeypatch, capsys,
+):
+    user_id, api_key = _register(client)
+    traces: list[dict] = []
+
+    monkeypatch.setattr(
+        chat_send_core.debug_trace,
+        "trace_event",
+        lambda _store, **event: traces.append(event),
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _caption_failure_envelope_builder(),
+    )
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={
+            "message": "caption that must not disappear silently",
+            "image_b64": _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10),
+            "image_mime": "image/png",
+        },
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 202, res.get_data(as_text=True)
+    turn_id = res.get_json()["user_message"]["id"]
+    failure_traces = [
+        item for item in traces
+        if item.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_EVENT
+    ]
+    failure_logs = [
+        item for item in db.log_read(user_id, "tracking_events", limit=50)
+        if item.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_LOG_TYPE
+    ]
+    assert len(failure_traces) == 1
+    assert len(failure_logs) == 1
+    event = failure_traces[0]
+    tracking = failure_logs[0]
+    jobs = jobs_store.recent_jobs_for_user(user_id, within_hours=1, limit=20)["jobs"]
+    job_id = str(next(item for item in jobs if item["lane"] == "chat")["job_id"])
+
+    assert event["type"] == "chat.caption_envelope_failed"
+    assert event["status"] == "error"
+    assert event["outcome_class"] == "operational_failure"
+    assert event["turn_id"] == event["trace_id"] == turn_id
+    assert event["job_id"] == job_id
+    assert event["detail"] == {
+        "attachment_kind": "image",
+        "error_code": "enclave_info_unavailable",
+        "caption_persisted": False,
+    }
+    assert tracking["payload"] == {
+        "turn_id": turn_id,
+        "job_id": job_id,
+        "attachment_kind": "image",
+        "outcome_class": "operational_failure",
+        "error_code": "enclave_info_unavailable",
+        "caption_persisted": False,
+    }
+    assert tracking["type"] == "caption_envelope_failed"
+    stderr = capsys.readouterr().err
+    assert f"turn_id={turn_id}" in stderr
+    assert f"job_id={job_id}" in stderr
+    assert "signal_failures=none" in stderr
+
+
+def test_caption_envelope_success_emits_no_failure_signals(
+    client, monkeypatch, capsys,
+):
+    user_id, api_key = _register(client)
+    traces: list[dict] = []
+
+    monkeypatch.setattr(
+        chat_send_core.debug_trace,
+        "trace_event",
+        lambda _store, **event: traces.append(event),
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_envelope_builder(),
+    )
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={
+            "message": "caption preserved",
+            "image_b64": _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10),
+            "image_mime": "image/png",
+        },
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 202, res.get_data(as_text=True)
+    assert not any(
+        item.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_EVENT
+        for item in traces
+    )
+    assert not any(
+        item.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_LOG_TYPE
+        for item in db.log_read(user_id, "tracking_events", limit=50)
+    )
+    assert "caption_envelope_failed" not in capsys.readouterr().err
+
+
+def test_caption_signal_write_failures_keep_job_correlated_stderr(
+    client, monkeypatch, capsys,
+):
+    user_id, api_key = _register(client)
+
+    def _fail_caption_trace(_store, **event):
+        if event.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_EVENT:
+            raise RuntimeError("forced trace failure")
+
+    monkeypatch.setattr(
+        chat_send_core.debug_trace,
+        "trace_event",
+        _fail_caption_trace,
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _caption_failure_envelope_builder(),
+    )
+    monkeypatch.setattr(chat_send_core.db, "log_append", lambda *_a, **_kw: False)
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={
+            "message": "caption with broken diagnostics",
+            "image_b64": _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10),
+            "image_mime": "image/png",
+        },
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 202, res.get_data(as_text=True)
+    turn_id = res.get_json()["user_message"]["id"]
+    jobs = jobs_store.recent_jobs_for_user(user_id, within_hours=1, limit=20)["jobs"]
+    job_id = str(next(item for item in jobs if item["lane"] == "chat")["job_id"])
+    stderr = capsys.readouterr().err
+    assert "caption_envelope_failed" in stderr
+    assert f"turn_id={turn_id}" in stderr
+    assert f"job_id={job_id}" in stderr
+    assert "signal_failures=trace_events,user_logs" in stderr
 
 
 def test_send_unsupported_provider_returns_409(client, monkeypatch):
