@@ -2235,10 +2235,13 @@ def _build_data_track_user_detail(user_entry: dict) -> dict:
     })
 
     # These detail helpers only need ``user_id`` and perform their own direct,
-    # bounded reads. Constructing a fresh shell is deliberate:
-    # get_store_shell_only still delegates to get_store and therefore loads all
-    # caches in legacy mode.
-    store = core_store.UserStore(user_id)
+    # bounded reads. The reviewed shell-only factory preserves process-local
+    # identity/locks without hydrating Store sections, including in legacy mode.
+    store = core_store.get_store_shell_only(
+        user_id,
+        reason="admin detail helpers use direct bounded DB reads",
+        bypass_legacy_hydration=True,
+    )
     genesis = _genesis_stats(store, include_jobs=True)
     row["genesis"] = genesis
     row["last_activity_at"] = core_util._epoch_to_iso(_latest_epoch(
