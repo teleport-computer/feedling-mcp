@@ -1097,6 +1097,23 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
     },
+    "ChatImageInput": {
+        "type": "object",
+        "required": ["image_b64"],
+        "properties": {
+            "image_b64": {
+                "type": "string",
+                "contentEncoding": "base64",
+                "description": "Image data; decoded size must not exceed 2,000,000 bytes.",
+            },
+            "image_mime": {
+                "type": "string",
+                "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"],
+                "default": "image/jpeg",
+            },
+        },
+        "additionalProperties": False,
+    },
     "HostedChatSendRequest": {
         "type": "object",
         "properties": {
@@ -1116,6 +1133,13 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "image_b64": {"type": "string", "contentEncoding": "base64", "description": "Image data; decoded size must not exceed 2,000,000 bytes."},
             "image_base64": {"type": "string", "contentEncoding": "base64", "deprecated": True},
             "image_mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]},
+            "images": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 9,
+                "items": {"$ref": "#/components/schemas/ChatImageInput"},
+                "description": "One to nine images. Must not be combined with image_b64/image_base64; one item preserves the legacy single-image storage shape.",
+            },
             "file_b64": {"type": "string", "contentEncoding": "base64", "description": "File data; decoded size must not exceed 26,214,400 bytes."},
             "file_name": {"type": "string", "maxLength": 120},
             "file_display_title": {"type": "string", "minLength": 1, "maxLength": 120},
@@ -1127,6 +1151,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             {"required": ["content"]},
             {"required": ["image_b64"]},
             {"required": ["image_base64"]},
+            {"required": ["images"]},
             {"required": ["file_b64"]},
         ],
         "additionalProperties": True,

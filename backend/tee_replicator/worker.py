@@ -319,7 +319,12 @@ def _make_decrypt(user_id: str) -> Callable[[dict, str], bytes]:
         # 形状路由：明文行直读、不白跑一趟 enclave。cutover 后 TEE 主库里
         # 密文/明文行的共存形态仍由 Task 2.4 定，这里只是不再假设行一定是信封。
         return core_envelope.read_envelope_body(
-            envelope, None, purpose=purpose, runtime_token=token)
+            envelope,
+            None,
+            purpose=purpose,
+            caller_user_id=str(user_id),
+            runtime_token=token,
+        )
 
     return decrypt
 

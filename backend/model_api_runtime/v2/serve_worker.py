@@ -77,6 +77,7 @@ from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
 from core import runtime_token
 from core import store as core_store
+from core import chat_images
 from core.store_sections import StoreSection
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
@@ -181,6 +182,7 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
                 envelope,
                 None,
                 purpose="genesis_persona",
+                caller_user_id=user_id,
                 runtime_token=str(runtime_token or ""),
             )
         return raw.decode("utf-8")
@@ -509,7 +511,7 @@ def _caption_envelope(m: dict) -> dict | None:
     }
 
 
-def _caption_text(m, *, mid, token, fallback: str) -> str:
+def _caption_text(m, *, mid, token, caller_user_id: str, fallback: str) -> str:
     """附件行（image / file）的可见文本：随附件发的那句话。
 
     选中行在进入这里之前已由 tail/compaction window 做了有界筛选。因此每个
@@ -523,7 +525,11 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
         return fallback
     caption = (
         core_envelope.read_envelope_body(
-            cap_env, None, purpose="v2_caption_read", runtime_token=token
+            cap_env,
+            None,
+            purpose="v2_caption_read",
+            caller_user_id=caller_user_id,
+            runtime_token=token,
         )
         .decode("utf-8")
         .strip()
@@ -531,9 +537,15 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
     return caption or fallback
 
 
-def _image_row(m, *, mid, ts, role, token) -> dict:
+def _image_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
-    text = _caption_text(m, mid=mid, token=token, fallback=_IMAGE_MARKER)
+    text = _caption_text(
+        m,
+        mid=mid,
+        token=token,
+        caller_user_id=caller_user_id,
+        fallback=_IMAGE_MARKER,
+    )
     row = {
         "id": mid,
         "ts": ts,
@@ -547,7 +559,7 @@ def _image_row(m, *, mid, ts, role, token) -> dict:
     return row
 
 
-def _file_row(m, *, mid, ts, role, token) -> dict:
+def _file_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     """文件行 -> **纯文本** tail 行。**绝不解密 body_ct。**
 
     文件消息的明文是**原始文件字节**（`chat_send_core`: `user_plaintext = file_parse["bytes"]`，
@@ -568,6 +580,7 @@ def _file_row(m, *, mid, ts, role, token) -> dict:
         m,
         mid=mid,
         token=token,
+        caller_user_id=caller_user_id,
         fallback=f"[file: {name}]",
     )
     display_title = str(m.get("file_display_title") or "").strip()
@@ -826,7 +839,7 @@ def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
     )
 
 
-def _resolve_provider(user_id: str):
+def _resolve_provider(user_id: str, *, trace_job_id: str = ""):
     """单次解密该用户 provider key（enclave-bound，BYOK-only）。返回 (ProviderConfig|None, meta)。
 
     ``hosted_config_store._load_runtime_provider_config`` reads only this user's
@@ -845,7 +858,10 @@ def _resolve_provider(user_id: str):
         return None, {"error": "runtime_token_mint_failed", "detail": str(e)[:160]}
     # api_key=None: Runtime V2 turns never hold the user's long-term
     # Feedling API key — only the runtime token authenticates to the enclave.
-    with core_enclave.coalesced_success_trace("model_api_provider_key"):
+    trace_scope_kwargs = {"job_id": trace_job_id} if trace_job_id else {}
+    with core_enclave.coalesced_success_trace(
+        "model_api_provider_key", **trace_scope_kwargs
+    ):
         runtime = hosted_config_store._load_runtime_provider_config(
             store, None, runtime_token=token
         )
@@ -888,6 +904,10 @@ def _resolve_provider(user_id: str):
         capture_attempt_trace=True,
         hosted_route_updated_at=exact_version,
     ), {}
+
+
+def _resolve_provider_for_job(user_id: str, job_id: str):
+    return _resolve_provider(user_id, trace_job_id=str(job_id or ""))
 
 
 def _decrypt_chat_rows(
@@ -949,6 +969,7 @@ def _decrypt_chat_rows_inner(
                 ts=ts,
                 role=role,
                 token=token,
+                caller_user_id=user_id,
             )
         elif m.get("content_type") == "file":
             item = _file_row(
@@ -957,6 +978,7 @@ def _decrypt_chat_rows_inner(
                 ts=ts,
                 role=role,
                 token=token,
+                caller_user_id=user_id,
             )
         else:
             # Chat rows are mixed-shape during the encryption-optional rollout:
@@ -989,7 +1011,11 @@ def _decrypt_chat_rows_inner(
                 }
             else:
                 plaintext = core_envelope.read_envelope_body(
-                    m, None, purpose="v2_chat_read", runtime_token=token
+                    m,
+                    None,
+                    purpose="v2_chat_read",
+                    caller_user_id=user_id,
+                    runtime_token=token,
                 ).decode("utf-8")
                 if not plaintext.strip():
                     if not preserve_unreadable:
@@ -1568,6 +1594,7 @@ def _summary_metadata_frontier(state: dict) -> list:
 def _decrypt_summary_text(
     envelope: dict,
     *,
+    caller_user_id: str,
     runtime_token: str,
     purpose: str,
 ) -> str:
@@ -1583,6 +1610,7 @@ def _decrypt_summary_text(
             envelope,
             None,
             purpose=purpose,
+            caller_user_id=caller_user_id,
             runtime_token=runtime_token,
         )
     except RuntimeError as exc:
@@ -1623,6 +1651,7 @@ def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
             )
         plaintext = _decrypt_summary_text(
             env,
+            caller_user_id=user_id,
             purpose="v2_summary_segment_read",
             runtime_token=token,
         )
@@ -1721,6 +1750,7 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     with core_enclave.coalesced_success_trace("v2_summary_read"):
         plaintext = _decrypt_summary_text(
             env,
+            caller_user_id=user_id,
             purpose="v2_summary_read",
             runtime_token=token,
         )
@@ -1754,6 +1784,7 @@ def _select_agent_profile_for_turn(
             envelope,
             None,
             purpose=f"v2_profile_{field}_read",
+            caller_user_id=user_id,
             runtime_token=token,
         )
 
@@ -2083,7 +2114,9 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
         except Exception as e:  # noqa: BLE001
             log.warning("[v2.serve_worker] image read failed msg=%s: %s", mid, e)
             continue
-        if data.get("image_b64"):
+        if isinstance(data.get("images"), list) and data["images"]:
+            out[str(mid)] = {"images": list(data["images"])}
+        elif data.get("image_b64"):
             out[str(mid)] = {
                 "image_mime": data.get("image_mime") or "image/jpeg",
                 "image_b64": data["image_b64"],
@@ -2377,8 +2410,10 @@ def _read_vision_observations_with_deadline(
         message_id = item["message_id"]
         route_id = item["route_id"]
         image = images.get(message_id) or {}
-        image_b64 = str(image.get("image_b64") or "")
-        if not image_b64:
+        image_items = image.get("images")
+        if not isinstance(image_items, list):
+            image_items = [image] if image.get("image_b64") else []
+        if not image_items:
             raise RuntimeError("vision_image_payload_missing")
 
         config = configs.get(route_id)
@@ -2391,7 +2426,6 @@ def _read_vision_observations_with_deadline(
             )
             configs[route_id] = config
 
-        mime = str(image.get("image_mime") or "image/jpeg")
         provider = str(config.provider or "")[:80]
         model = str(config.model or "")[:96]
         started_at = time.monotonic()
@@ -2420,12 +2454,20 @@ def _read_vision_observations_with_deadline(
             detail={"provider": provider, "model": model},
         )
         try:
-            observation = vision_observer.observe_image(
-                config,
-                image_mime=mime,
-                image_b64=image_b64,
-                absolute_deadline=absolute_deadline,
-            )
+            observations: list[str] = []
+            for image_item in image_items:
+                image_b64 = str((image_item or {}).get("image_b64") or "")
+                if not image_b64:
+                    raise RuntimeError("vision_image_payload_missing")
+                observations.append(vision_observer.observe_image(
+                    config,
+                    image_mime=str(
+                        (image_item or {}).get("image_mime") or "image/jpeg"
+                    ),
+                    image_b64=image_b64,
+                    absolute_deadline=absolute_deadline,
+                ))
+            observation = chat_images.combine_numbered_observations(observations)
         except vision_observer.VisionObserverError as failure:
             # Fixed route metadata, never inferred from model prose. The worker
             # can carry it to the terminal activity/fallback projection.
@@ -2679,6 +2721,7 @@ async def _generate_image_for_chat(
                 core_envelope.decrypt_provider_key_envelope,
                 envelope,
                 api_key,
+                caller_user_id=user_id,
                 runtime_token=runtime_token,
             )
             config = provider_client.ProviderConfig(
@@ -3321,7 +3364,7 @@ def _latest_frame_meta(user_id: str) -> tuple[str, float]:
     `meta[-1]`。frame_id 从 `filename`（"<frame_id>.env.json"）派生，退回 `id`——与
     `screen/caption.py:_frame_id_from_entry` 同一套推导，但**内联复制**以免让本模块耦合
     进 screen 包的私有函数（且 screen/* 在本任务里是只读的）。无帧时返回 ("", 0.0)。"""
-    meta = db.frame_list_meta(user_id)
+    meta = db.frame_list_meta(user_id, source="screen")
     if not meta:
         return "", 0.0
     entry = meta[-1]
@@ -4430,6 +4473,7 @@ def _decrypt_tool_effect_payload(
             envelope,
             None,
             purpose="v2_effect_apply",
+            caller_user_id=user_id,
             runtime_token=runtime_token,
         )
         decoded = json.loads(plaintext.decode("utf-8"))
@@ -4767,6 +4811,7 @@ def _open_trajectory_payload(
         envelope,
         None,
         purpose="runtime_v2_trajectory_review",
+        caller_user_id=str(user_id),
         runtime_token=str(runtime_token),
     )
 
@@ -4933,7 +4978,9 @@ def _mcp_catalog_fingerprint_if_new(store) -> str:
     return fingerprint
 
 
-async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
+async def _load_mcp_turn_observed(
+    store, *, lane: str = "chat", job_id: str = "", **kwargs
+):
     """`mcp_tools.load_turn_mcp` + 把本轮工具面写进 admin 可见的 debug trace。
 
     为什么包在装配层而不是 loader 里:loader 在 `hosted`,worker 是依赖洁净的
@@ -5005,6 +5052,7 @@ async def _load_mcp_turn_observed(store, *, lane: str = "chat", **kwargs):
                 ),
                 detail={"driver": "v2", "lane": str(lane or "chat"),
                         **summary, **catalog_detail},
+                **({"job_id": str(job_id)} if failed and job_id else {}),
             )
             # 指纹只在 trace **确实发出去之后**才记。写在前面的话,某轮加载失败
             # 或 trace 写失败就会把这个指纹永久吃掉,后面恢复了也不再记明细
@@ -5144,6 +5192,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
             is True
         ),
         resolve_provider=_resolve_provider,
+        resolve_provider_for_job=_resolve_provider_for_job,
         mint_enclave_token=_mint_runtime_token,
         read_tail=_read_tail,
         read_tail_after_seq=_read_tail_after_seq,
@@ -5184,6 +5233,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         dream_enabled=_dream_enabled_for_user,
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=_load_mcp_turn_observed,
+        load_mcp_turn_for_job=_load_mcp_turn_observed,
         load_workspace_prompt=_load_workspace_prompt,
         load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,

@@ -16,7 +16,9 @@ def test_shared_screen_grounding_uses_latest_frame_clock(monkeypatch):
     monkeypatch.setattr(
         screen_read_core.db,
         "frame_list_meta",
-        lambda user_id: [{"id": "f1", "ts": 910.0}] if user_id == "u1" else [],
+        lambda user_id, *, source: (
+            [{"id": "f1", "ts": 910.0}] if user_id == "u1" else []
+        ),
     )
 
     assert screen_read_core.screen_share_grounding("u1") == {
@@ -32,7 +34,7 @@ def test_shared_screen_grounding_rejects_stale_or_future_frames(monkeypatch):
         monkeypatch.setattr(
             screen_read_core.db,
             "frame_list_meta",
-            lambda _user_id, ts=frame_ts: [{"id": "f1", "ts": ts}],
+            lambda _user_id, *, source, ts=frame_ts: [{"id": "f1", "ts": ts}],
         )
         assert screen_read_core.screen_share_grounding("u1") == {}
 
@@ -44,7 +46,7 @@ def test_shared_screen_grounding_reports_fresh_broadcast_without_recent_frames(
     monkeypatch.setattr(
         screen_read_core.db,
         "frame_list_meta",
-        lambda _user_id: [{"id": "f1", "ts": 699.0}],
+        lambda _user_id, *, source: [{"id": "f1", "ts": 699.0}],
     )
     monkeypatch.setattr(
         screen_read_core.db,
@@ -71,7 +73,7 @@ def test_shared_screen_grounding_reports_just_ended_share(monkeypatch):
     monkeypatch.setattr(
         screen_read_core.db,
         "frame_list_meta",
-        lambda _user_id: [{"id": "f1", "ts": 950.0}],
+        lambda _user_id, *, source: [{"id": "f1", "ts": 950.0}],
     )
     monkeypatch.setattr(
         screen_read_core.db,
@@ -103,7 +105,7 @@ def test_shared_screen_grounding_ignores_old_or_inactive_broadcast(monkeypatch):
     monkeypatch.setattr(
         screen_read_core.db,
         "frame_list_meta",
-        lambda _user_id: [{"id": "f1", "ts": 600.0}],
+        lambda _user_id, *, source: [{"id": "f1", "ts": 600.0}],
     )
     reports = (
         {
@@ -174,7 +176,10 @@ def test_list_frames_exposes_shared_grounding_contract(monkeypatch):
     store = types.SimpleNamespace(
         user_id="u1",
         frames_lock=threading.RLock(),
-        frames_meta=[{"id": "f1", "filename": "f1.jpg", "ts": 699.0}],
+        frames_meta=[
+            {"id": "f1", "filename": "f1.jpg", "ts": 699.0},
+            {"id": "photo1", "filename": "photo1.jpg", "ts": 999.0},
+        ],
     )
     stalled = {
         "active": False,
@@ -191,14 +196,45 @@ def test_list_frames_exposes_shared_grounding_contract(monkeypatch):
 
     monkeypatch.setattr(screen_read_core, "screen_share_grounding", fake_grounding)
     monkeypatch.setattr(
+        screen_read_core.db,
+        "frame_list_meta",
+        lambda _user_id, *, source, unavailable_raises: [
+            {"id": "f1", "ts": 699.0}
+        ],
+    )
+    monkeypatch.setattr(
         screen_read_core.frames, "_frame_url", lambda _store, filename: f"/{filename}"
     )
 
     result = screen_read_core.list_frames(store, 20)
 
     assert result.status == 200
+    assert result.json_body["total"] == 1
+    assert [row["id"] for row in result.json_body["frames"]] == ["f1"]
     assert result.json_body["screen_share"] == stalled
     assert seen == {"user_id": "u1", "latest_frame_ts": 699.0}
+
+
+def test_list_frames_reports_store_unavailable_instead_of_normal_zero(
+    monkeypatch,
+):
+    store = types.SimpleNamespace(
+        user_id="u_db_unavailable",
+        frames_lock=threading.RLock(),
+        frames_meta=[{"id": "f1", "filename": "f1.jpg", "ts": 699.0}],
+    )
+
+    class BrokenPool:
+        def connection(self):
+            raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(screen_read_core.db, "get_pool", lambda: BrokenPool())
+
+    result = screen_read_core.list_frames(store, 20)
+
+    assert result.status == 503
+    assert result.json_body == {"error": "frame_store_unavailable"}
+    assert result.json_body != {"frames": [], "total": 0, "screen_share": {}}
 
 
 def test_recent_wraps_json_body(monkeypatch):

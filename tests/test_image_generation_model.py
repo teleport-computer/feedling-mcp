@@ -221,8 +221,21 @@ def test_resident_generate_uses_only_the_pinned_image_route(monkeypatch):
         lambda _uid: _route(),
     )
 
-    def fake_decrypt(envelope, caller_key, *, purpose, runtime_token=""):
-        decrypted.append((envelope, caller_key, purpose, runtime_token))
+    def fake_decrypt(
+        envelope,
+        caller_key,
+        *,
+        purpose,
+        caller_user_id,
+        runtime_token="",
+    ):
+        decrypted.append((
+            envelope,
+            caller_key,
+            purpose,
+            caller_user_id,
+            runtime_token,
+        ))
         return b"provider-key"
 
     monkeypatch.setattr(
@@ -288,6 +301,7 @@ def test_resident_generate_uses_only_the_pinned_image_route(monkeypatch):
             _route()["api_key_envelope"],
             "caller-key",
             "model_api_provider_key",
+            "image-user",
             "runtime-token",
         )
     ]

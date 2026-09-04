@@ -1471,6 +1471,7 @@ def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
         "envelope": {"body_ct": "ciphertext"},
         "api_key": "api-key",
         "kwargs": {
+            "caller_user_id": "usr_genesis",
             "purpose": "genesis_checkpoint",
             "runtime_token": "runtime-token",
         },

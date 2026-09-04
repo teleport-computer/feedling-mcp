@@ -45,12 +45,19 @@ PROVIDER_USAGE_TOOL = "provider_usage"
 MEMORY_ORGANIZE_TOOL = "memory_organize"
 MCP_TOOL_SEARCH_TOOL = "mcp_tool_search"
 
+IDENTITY_DIMENSIONS_EMPTY_OFFER_COPY = (
+    "When the persona has no dimensions yet, you may offer once, when it fits "
+    "the conversation, to set up a starting set. Their agreement is the "
+    "explicit request this tool requires — record it in 'reason'. Do not call "
+    "this tool before they agree."
+)
+
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"})
 
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
-_TRUE_BOOL = {"type": "boolean", "enum": [True], "default": True}
+_BOOL_DEFAULT_TRUE = {"type": "boolean", "default": True}
 _NO_ARGS: dict = {"type": "object", "properties": {}}
 
 _IDENTITY_DIMENSION = {
@@ -332,7 +339,10 @@ PARAMS: dict[str, dict] = {
     # params.get("include_image") (bool).
     "photo_read": {
         "type": "object",
-        "properties": {"photo_id": _STR, "include_image": _TRUE_BOOL},
+        "properties": {
+            "photo_id": _STR,
+            "include_image": _BOOL_DEFAULT_TRUE,
+        },
         "required": ["photo_id"],
     },
 
@@ -537,7 +547,8 @@ DESCRIPTIONS: dict[str, str] = {
         "and optional 'description' content. Renaming edits 'name'; an empty list deletes "
         f"all dimensions; at most {card_policy.MAX_DIMENSIONS} are allowed. A non-empty "
         "'reason' describing the explicit user request is required for the encrypted audit. "
-        "For a small conversational score adjustment, keep using identity_nudge."
+        "For a small conversational score adjustment, keep using identity_nudge. "
+        + IDENTITY_DIMENSIONS_EMPTY_OFFER_COPY
     ),
     "memory_index": ("Use only when the current request actually depends on remembered "
                      "information; ordinary conversation and model/runtime identity "
@@ -931,6 +942,12 @@ def validate_tool_args(name: str, args, *, live_model_call: bool = False) -> str
     error = _validate_value(args, schema, path="args")
     if error:
         return error
+    if name == "photo_read" and args.get("include_image") is False:
+        # Gemini's function-declaration enum only accepts strings, so the
+        # provider-facing schema cannot express a true-only boolean without
+        # making an OpenAI-compatible Gemini route reject the whole catalog.
+        # Keep the execution contract authoritative at the local argument gate.
+        return "args.include_image has unsupported value"
     if name == "identity_patch":
         # Run the SAME merge the capability runs, so a call that validates here can't
         # quietly lose a field later. Import direction is safe: registry already pulls

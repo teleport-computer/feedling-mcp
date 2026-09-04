@@ -72,7 +72,8 @@ def test_frames_rebuild_keeps_recovered_index_when_cache_write_fails(store, monk
     recovered = [{"id": "frame-recovered", "ts": 1.0}]
     monkeypatch.setattr(core_store.db, "get_blob", lambda *_args: None)
     monkeypatch.setattr(
-        core_store.db, "frame_list_meta", lambda *_args: list(recovered))
+        core_store.db, "frame_list_meta",
+        lambda *_args, **_kwargs: list(recovered))
     monkeypatch.setattr(
         core_store.db, "set_blob_best_effort", lambda *_args, **_kwargs: False)
 

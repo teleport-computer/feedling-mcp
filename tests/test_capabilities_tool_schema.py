@@ -1,3 +1,4 @@
+import hashlib
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -125,7 +126,7 @@ def test_screen_read_description_defaults_live_shares_to_pixels():
     assert "Start without include_image" not in description
 
 
-def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
+def test_photo_read_defaults_to_pixels_and_execution_rejects_metadata_only_flag():
     spec = next(
         item for item in tool_schema.build_tool_specs()
         if item.name == "photo_read"
@@ -133,7 +134,7 @@ def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
     include_image = spec.parameters["properties"]["include_image"]
 
     assert include_image["default"] is True
-    assert include_image["enum"] == [True]
+    assert "enum" not in include_image
     assert "Pixels are included by default" in spec.description
     assert tool_schema.validate_tool_args(
         "photo_read", {"photo_id": "p1"}
@@ -141,6 +142,32 @@ def test_photo_read_defaults_to_pixels_and_rejects_metadata_only_flag():
     assert "unsupported value" in tool_schema.validate_tool_args(
         "photo_read", {"photo_id": "p1", "include_image": False}
     )
+
+
+def test_all_builtin_tool_schema_enums_contain_only_strings():
+    invalid = []
+
+    def inspect_schema(tool_name, node, path):
+        if isinstance(node, list):
+            for index, child in enumerate(node):
+                inspect_schema(tool_name, child, f"{path}[{index}]")
+            return
+        if not isinstance(node, dict):
+            return
+        if isinstance(node.get("enum"), list):
+            invalid.extend(
+                f"{tool_name}:{path}.enum[{index}]={value!r}"
+                for index, value in enumerate(node["enum"])
+                if not isinstance(value, str)
+            )
+        for key, child in node.items():
+            if key != "enum":
+                inspect_schema(tool_name, child, f"{path}.{key}")
+
+    for spec in tool_schema.build_tool_specs():
+        inspect_schema(spec.name, spec.parameters, "parameters")
+
+    assert invalid == []
 
 
 def test_task_tool_is_read_only_and_requires_a_nonempty_prompt():
@@ -424,6 +451,28 @@ def test_identity_dimensions_set_schema_uses_card_policy_contract():
     assert tool_schema.validate_tool_args(
         "identity_dimensions_set", {"dimensions": [], "reason": "   "}
     ) == "identity_dimensions_set requires a non-empty reason"
+
+
+def test_identity_dimensions_set_description_preserves_approved_offer_copy():
+    approved = (
+        "When the persona has no dimensions yet, you may offer once, when it fits "
+        "the conversation, to set up a starting set. Their agreement is the "
+        "explicit request this tool requires — record it in 'reason'. Do not call "
+        "this tool before they agree."
+    )
+    description = tool_schema.DESCRIPTIONS["identity_dimensions_set"]
+
+    assert tool_schema.IDENTITY_DIMENSIONS_EMPTY_OFFER_COPY == approved
+    assert len(approved) == 241
+    assert hashlib.sha256(approved.encode()).hexdigest() == (
+        "1d880cca5ac252b0a1743ec9b8b543dda0f53a1526dcba9d94404a55729849dc"
+    )
+    assert ord(approved[176]) == 0x2014
+    assert approved[191] == approved[198] == "'"
+    assert not set(approved) & {"‘", "’", "“", "”"}
+    assert description.endswith(approved)
+    assert "Use only for an explicit user-requested rewrite." in description
+    assert "and do not raise it again if they decline." not in description
 
 
 def test_identity_dimensions_set_schema_rejects_shared_policy_failures():

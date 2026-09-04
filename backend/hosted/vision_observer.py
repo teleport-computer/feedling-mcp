@@ -9,6 +9,7 @@ import db
 import debug_trace
 import provider_client
 from capabilities import registry as cap_registry
+from core import chat_images
 from core import envelope as core_envelope
 from notices import error_contract, rejection_stats
 from hosted import visual_transport
@@ -149,6 +150,7 @@ def load_provider_config(
     provider_key = core_envelope.decrypt_provider_key_envelope(
         envelope,
         api_key,
+        caller_user_id=str(user_id),
         **decrypt_kwargs,
     ).decode("utf-8")
     return provider_client.ProviderConfig(
@@ -267,8 +269,10 @@ def observe_pinned_message(
             "detail": code[:160],
         }, 502
     image = image_result.data or {}
-    image_b64 = str(image.get("image_b64") or "")
-    if not image_b64:
+    image_items = image.get("images")
+    if not isinstance(image_items, list):
+        image_items = [image] if image.get("image_b64") else []
+    if not image_items:
         debug_trace.trace_event(
             store,
             subsystem="vision",
@@ -312,11 +316,15 @@ def observe_pinned_message(
             },
         )
         provider_called = True
-        observation = observe_image(
-            config,
-            image_mime=str(image.get("image_mime") or "image/jpeg"),
-            image_b64=image_b64,
-        )
+        observations = [
+            observe_image(
+                config,
+                image_mime=str(item.get("image_mime") or "image/jpeg"),
+                image_b64=str(item.get("image_b64") or ""),
+            )
+            for item in image_items
+        ]
+        observation = chat_images.combine_numbered_observations(observations)
     except Exception as exc:  # noqa: BLE001 - stable public failure surface
         failure = classify_vision_error(exc)
         debug_trace.trace_event(

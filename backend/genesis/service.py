@@ -652,7 +652,11 @@ def load_genesis_staged_payload(
         raise RuntimeError("staged_import_payload_missing")
     try:
         raw = core_envelope.read_envelope_body(
-            envelope, api_key, purpose="genesis_staged_payload")
+            envelope,
+            api_key,
+            purpose="genesis_staged_payload",
+            caller_user_id=str(store.user_id),
+        )
     except ValueError as exc:
         raise RuntimeError(f"staged_import_envelope_invalid:{exc}") from exc
     if _sha256_hex(raw) != str(blob.get("sha256") or ""):
@@ -767,6 +771,7 @@ def load_genesis_checkpoint(
             envelope,
             api_key,
             purpose="genesis_checkpoint",
+            caller_user_id=str(store.user_id),
             runtime_token=runtime_token,
         )
     except ValueError as exc:

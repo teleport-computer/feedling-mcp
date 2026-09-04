@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import pathlib
 import sys
@@ -16,7 +17,7 @@ from capabilities import registry as cap_registry  # noqa: E402
 from capabilities import web as cap_web  # noqa: E402
 from capabilities.types import ok  # noqa: E402
 import provider_client  # noqa: E402
-from provider_types import ToolCall  # noqa: E402
+from provider_types import ToolCall, ToolExchange  # noqa: E402
 
 
 def _call(call_id: str, prompt: str, **extra) -> ToolCall:
@@ -43,6 +44,7 @@ def test_task_batch_runs_in_parallel_and_preserves_provider_order() -> None:
         subagents.run_task_batch(
             [_call("first", "one"), _call("second", "two")],
             run_child=child,
+            propagated_exception_types=(),
             max_parallel_tasks=2,
         )
     )
@@ -71,6 +73,7 @@ def test_task_batch_isolates_failure_and_deadline() -> None:
                 _call("timed-out", "slow"),
             ],
             run_child=child,
+            propagated_exception_types=(),
             child_deadline_sec=0.01,
         )
     )
@@ -83,6 +86,30 @@ def test_task_batch_isolates_failure_and_deadline() -> None:
         "error": "subagent_deadline_exceeded",
     }
     assert "private" not in str(bodies)
+
+
+def test_task_batch_propagates_configured_fatal_exception() -> None:
+    class FatalChildSignal(RuntimeError):
+        pass
+
+    async def child(_task):
+        raise FatalChildSignal("stop parent")
+
+    with pytest.raises(FatalChildSignal, match="stop parent"):
+        asyncio.run(
+            subagents.run_task_batch(
+                [_call("fatal", "stop")],
+                run_child=child,
+                propagated_exception_types=(FatalChildSignal,),
+            )
+        )
+
+
+def test_task_batch_requires_an_explicit_control_flow_policy() -> None:
+    parameter = inspect.signature(subagents.run_task_batch).parameters[
+        "propagated_exception_types"
+    ]
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_shared_budget_reserves_concurrent_calls_and_refunds_reported_usage() -> None:
@@ -130,6 +157,7 @@ def test_task_result_is_bounded_valid_json() -> None:
         subagents.run_task_batch(
             [_call("one", "inspect")],
             run_child=child,
+            propagated_exception_types=(),
             child_result_char_cap=256,
         )
     )
@@ -154,7 +182,13 @@ def test_task_batch_rejects_invalid_task_contract(call) -> None:
         return subagents.ChildTaskResult(summary="unexpected")
 
     with pytest.raises(subagents.SubagentBatchError):
-        asyncio.run(subagents.run_task_batch([call], run_child=child))
+        asyncio.run(
+            subagents.run_task_batch(
+                [call],
+                run_child=child,
+                propagated_exception_types=(),
+            )
+        )
 
 
 def test_task_batch_rejects_oversized_batch_before_execution() -> None:
@@ -170,6 +204,7 @@ def test_task_batch_rejects_oversized_batch_before_execution() -> None:
             subagents.run_task_batch(
                 [_call("one", "a"), _call("two", "b")],
                 run_child=child,
+                propagated_exception_types=(),
                 max_tasks_per_round=1,
             )
         )
@@ -313,6 +348,104 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         "tool_call_result",
     ]
     assert all(event[2]["call_id"] == "child-read" for event in child_tool_events)
+
+
+def test_worker_child_read_failure_reaches_child_model_and_continues(
+    monkeypatch,
+) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+    provider_messages = []
+
+    async def fake_provider(_config, messages, *, tools=None, **kwargs):
+        provider_messages.append(list(messages))
+        if len(provider_messages) == 1:
+            return {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "child-read",
+                        "name": "workspace_read",
+                        "args": {"path": "/artifacts/report.txt"},
+                    }
+                ],
+                "usage": {},
+            }
+        return {
+            "reply": "I continued without the unavailable artifact.",
+            "tool_calls": [],
+            "usage": {},
+        }
+
+    async def failed_dispatch(*_args, **_kwargs):
+        raise worker.RecoverablePlatformReadError("private read failure")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker.v2_executor, "dispatch_tool_calls", failed_dispatch)
+    dispatcher = worker._make_task_batch_dispatcher(
+        disabled_web_tool_names=frozenset(),
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+
+    (result,) = asyncio.run(dispatcher([_call("parent", "Inspect the artifact.")]))
+
+    assert json.loads(result.content)["summary"] == (
+        "I continued without the unavailable artifact."
+    )
+    exchange = next(
+        item for item in provider_messages[1] if isinstance(item, ToolExchange)
+    )
+    assert exchange.results[0].content == worker._PLATFORM_READ_FAILED
+    assert "private read failure" not in exchange.results[0].content
+
+
+def test_worker_child_lost_lease_still_reaches_parent(monkeypatch) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+
+    async def fake_provider(_config, _messages, *, tools=None, **kwargs):
+        return {
+            "reply": "",
+            "tool_calls": [
+                {
+                    "id": "child-read",
+                    "name": "workspace_read",
+                    "args": {"path": "/artifacts/report.txt"},
+                }
+            ],
+            "usage": {},
+        }
+
+    async def lost_lease(*_args, **_kwargs):
+        raise worker.LostJobLease("lease lost in child")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker.v2_executor, "dispatch_tool_calls", lost_lease)
+    dispatcher = worker._make_task_batch_dispatcher(
+        disabled_web_tool_names=frozenset(),
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=(),
+        add_usage=lambda _usage: None,
+    )
+
+    with pytest.raises(worker.LostJobLease, match="lease lost in child"):
+        asyncio.run(dispatcher([_call("parent", "Inspect the artifact.")]))
 
 
 def test_worker_subagent_budget_is_shared_across_parent_task_batches(

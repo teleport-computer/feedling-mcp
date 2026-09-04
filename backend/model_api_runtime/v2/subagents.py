@@ -204,13 +204,16 @@ async def run_task_batch(
     max_parallel_tasks: int = DEFAULT_MAX_PARALLEL_TASKS,
     child_deadline_sec: float = DEFAULT_CHILD_DEADLINE_SEC,
     child_result_char_cap: int = DEFAULT_CHILD_RESULT_CHAR_CAP,
+    propagated_exception_types: tuple[type[BaseException], ...],
 ) -> list[ToolResult]:
     """Run independent child tasks concurrently and preserve provider order.
 
     The parent supplies ``run_child`` and is therefore responsible for the
     child's restricted tool catalog, isolated transcript/workspace overlay,
-    provider-call/token budget, and explicit merge. Exceptions and timeouts are
-    converted to stable tool results so one failed child never cancels siblings.
+    provider-call/token budget, and explicit merge. Ordinary exceptions and
+    timeouts are converted to stable tool results so one failed child never
+    cancels siblings. The injected ``propagated_exception_types`` preserve
+    parent-owned lease/cancellation signals without importing the worker here.
     """
     max_tasks = _positive_int(max_tasks_per_round, name="max_tasks_per_round")
     parallelism = _positive_int(max_parallel_tasks, name="max_parallel_tasks")
@@ -231,6 +234,8 @@ async def run_task_batch(
             if not isinstance(result, ChildTaskResult):
                 raise TypeError("child returned an invalid result")
             content = _bounded_json(result, char_cap=result_cap)
+        except propagated_exception_types:
+            raise
         except asyncio.TimeoutError:
             content = json.dumps(
                 {"status": "error", "error": "subagent_deadline_exceeded"},
@@ -248,4 +253,14 @@ async def run_task_batch(
             )
         return ToolResult(call_id=task.call_id, content=content)
 
-    return list(await asyncio.gather(*(_one(task) for task in tasks)))
+    child_futures = [asyncio.create_task(_one(task)) for task in tasks]
+    try:
+        return list(await asyncio.gather(*child_futures))
+    except propagated_exception_types:
+        # A parent-owned control signal invalidates the whole batch. Do not let
+        # read-only siblings keep consuming provider/enclave work after lease
+        # ownership or cancellation has changed.
+        for child_future in child_futures:
+            child_future.cancel()
+        await asyncio.gather(*child_futures, return_exceptions=True)
+        raise

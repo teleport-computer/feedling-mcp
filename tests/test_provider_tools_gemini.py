@@ -412,8 +412,8 @@ def test_encode_tools_gemini_builtin_schema_bytes_match_golden():
     )
     assert _rejected_schema_keywords(web_fetch_schema) == set()
     assert web_fetch_schema["properties"]["offset"] == {"type": "integer"}
-    # The only built-in schema whose old adapter behavior was more than
-    # additionalProperties stripping: its boolean enum must remain removed.
+    # photo_read's source schema no longer carries the Gemini-invalid boolean
+    # enum. Its already-sanitized native Gemini wire must remain byte-stable.
     assert schema_digests["photo_read"] == expected["schema_sha256"]["photo_read"]
     wire_bytes = _canonical_json_bytes(wire)
     assert len(wire_bytes) == expected["wire_bytes"]

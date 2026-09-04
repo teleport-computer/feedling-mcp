@@ -48,6 +48,7 @@ def _seed(uid):
 def _stub_reencrypt(envelope, key_version):
     """Deterministic stand-in for the enclave storage endpoint: 'decrypt' by
     prefixing, then report checksums of that plaintext (computed enclave-side)."""
+    assert "source" not in envelope
     pt = b"PT:" + envelope["body_ct"].encode()
     sealed = base64.b64encode(b"SEALED:" + pt).decode()
     return {"body_ct_storage": sealed, "key_version": key_version,
@@ -144,7 +145,8 @@ def test_r2_backed_row_replicated(backend_env, r2):
     assert sha == hashlib.sha256(pt).hexdigest()
     assert size == len(pt)
     # meta carries semantic fields, never the body ciphertext or wrap keys
-    assert meta["source"] == "screen" and meta["owner_user_id"] == uid
+    assert meta["owner_user_id"] == uid
+    assert "source" not in meta
     for banned in ("body_ct", "K_enclave", "K_user", "nonce", "v"):
         assert banned not in meta
     # the storage ciphertext went to the frames-tee/ prefix, not a TEE column
@@ -177,11 +179,17 @@ def test_plaintext_all_target_stores_decrypted_frame_inline(
     _reset_cursor()
     uid = f"usr_{uuid.uuid4().hex[:8]}"
     _seed(uid)
-    _insert_inline(uid, "ab" * 8, 10.0, "AAA")
+    _insert_r2(uid, "ab" * 8, 10.0, "AAA", r2)
+    seen_envelopes = []
+
+    def decrypt_without_storage_metadata(envelope, purpose=None):
+        seen_envelopes.append(envelope)
+        return b"decrypted-frame-bytes"
+
     monkeypatch.setattr(
         worker,
         "_make_decrypt",
-        lambda _uid: lambda _envelope, purpose=None: b"decrypted-frame-bytes",
+        lambda _uid: decrypt_without_storage_metadata,
     )
     worker._decrypt_cache.clear()
 
@@ -193,7 +201,7 @@ def test_plaintext_all_target_stores_decrypted_frame_inline(
 
     assert report["copied"] == 1
     row = _tee(
-        "SELECT body_plaintext, body_storage_key, body_sha256, body_size_bytes "
+        "SELECT body_plaintext, body_storage_key, body_sha256, body_size_bytes, meta "
         "FROM frames WHERE user_id=%s AND frame_id=%s",
         (uid, "ab" * 8),
     )[0]
@@ -201,6 +209,8 @@ def test_plaintext_all_target_stores_decrypted_frame_inline(
     assert row[1] is None
     assert row[2] == hashlib.sha256(b"decrypted-frame-bytes").hexdigest()
     assert row[3] == len(b"decrypted-frame-bytes")
+    assert seen_envelopes and "source" not in seen_envelopes[0]
+    assert "source" not in row[4]
     assert r2.tee_puts == []
 
 

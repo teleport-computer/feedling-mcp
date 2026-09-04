@@ -103,6 +103,20 @@ def test_registry_views_are_derived_from_error_specs():
     )
 
 
+def test_hosted_request_validation_codes_do_not_enter_resident_classifier():
+    request_codes = {
+        spec.code
+        for spec in error_contract.public_specs()
+        if spec.family == "request"
+    }
+    assert request_codes == {
+        "image_count_exceeds_limit",
+        "image_list_empty",
+        "image_payload_conflict",
+    }
+    assert request_codes.isdisjoint(resident.CONSUMER_ERROR_CLASSES)
+
+
 def test_dynamic_unknown_maps_to_registered_fallback_and_content_free_report():
     reports = []
     spec = error_contract.resolve_untrusted(

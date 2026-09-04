@@ -49,6 +49,12 @@ def _now() -> float:
 
 _FUTURE_TS_TOLERANCE_SEC = 60.0  # allow minor client clock skew
 PERCEPTION_INGRESS_RUNTIME_V2_FLAG = "perception_ingress_runtime_v2_enabled"
+PERCEPTION_DECRYPT_FAILURE_CLASSES = core_enclave.DECRYPT_FAILURE_CLASSES | frozenset({
+    "invalid_envelope",
+    "decrypt_skipped",
+    "payload_decode_error",
+    "plaintext_envelope_error",
+})
 
 
 def _coerce_ts(client_ts) -> float:
@@ -140,25 +146,52 @@ def _decrypt_signal_payload_v2(
     key: str,
     envelope: Mapping[str, Any],
     *,
+    caller_user_id: str,
     api_key: str | None = None,
     decrypt_envelope: Callable[..., bytes | str | Mapping[str, Any] | list[Any]] | None = None,
-) -> tuple[Any | None, str]:
+) -> tuple[Any | None, str, str, str]:
     if not isinstance(envelope, Mapping):
-        return None, "invalid_envelope"
+        return None, "invalid_envelope", "invalid_envelope", ""
     if (not envelope.get("body") and not envelope.get("body_b64")
             and not api_key and decrypt_envelope is None):
-        return None, "decrypt_skipped"
+        return None, "decrypt_skipped", "decrypt_skipped", ""
     try:
         # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
         # _decrypt_envelope_via_enclave 逐字一致，注入方（测试/上层）不受影响。
-        decrypt = decrypt_envelope or core_envelope.read_envelope_body
-        raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
-        return _decode_decrypted_payload_v2(raw), ""
+        if decrypt_envelope is None:
+            raw = core_envelope.read_envelope_body(
+                dict(envelope),
+                api_key,
+                purpose=f"perception:{key}",
+                caller_user_id=caller_user_id,
+            )
+        else:
+            raw = decrypt_envelope(dict(envelope), api_key, purpose=f"perception:{key}")
+        return _decode_decrypted_payload_v2(raw), "", "", ""
     except Exception as e:
-        return None, f"decrypt_failed:{type(e).__name__}"
+        if isinstance(e, json.JSONDecodeError):
+            failure_class, detail = "payload_decode_error", "invalid_json"
+        elif isinstance(e, ValueError):
+            local_detail = str(e) if str(e) in {
+                "envelope_body_b64_invalid",
+                "envelope_owner_mismatch",
+                "envelope_shape_unrecognized",
+                "plaintext_envelope_required",
+            } else "value_error"
+            failure_class, detail = "plaintext_envelope_error", local_detail
+        else:
+            failure_class, detail = core_enclave.decrypt_failure_metadata(e)
+        return None, f"decrypt_failed:{type(e).__name__}", failure_class, detail
 
 
-def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -> None:
+def _record_decrypt_failure_v2(
+    user_id: str,
+    key: str,
+    reason: str,
+    failure_class: str,
+    detail: str,
+    ts: float,
+) -> None:
     """Make a failed sensitive-signal decrypt visible.
 
     The ingest still answers "accepted" (the report contract is "we took your
@@ -175,6 +208,11 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
     silently disable burst/cluster dedup — precisely when the fleet is already
     unhealthy.
     """
+    stable_failure_class = (
+        failure_class
+        if failure_class in PERCEPTION_DECRYPT_FAILURE_CLASSES
+        else "unexpected_decrypt_error"
+    )
     log.warning("perception v2 decrypt failed for %s key=%s: %s", user_id, key, reason)
     try:
         store.append_decrypt_failure(user_id, {
@@ -182,6 +220,8 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
             "type": "decrypt_failed",
             "key": key,
             "reason": reason,
+            "failure_class": stable_failure_class,
+            "detail": str(detail or "")[:64],
             "ts": ts,
         }, ts)
     except Exception as e:  # observability must never break ingest
@@ -415,9 +455,10 @@ def _ingest_snapshot_v2_inner(
                     results[key] = str(shape_error.get("error") or "invalid_envelope")
                     continue
                 results[key] = "accepted"
-                plaintext, err = _decrypt_signal_payload_v2(
+                plaintext, err, failure_class, failure_detail = _decrypt_signal_payload_v2(
                     key,
                     envelope,
+                    caller_user_id=user_id,
                     api_key=api_key,
                     decrypt_envelope=decrypt_envelope,
                 )
@@ -445,7 +486,14 @@ def _ingest_snapshot_v2_inner(
                     if key in _PERCEPTKIT_DECRYPTED_ENTRIES:
                         shadow_decrypted.append((key, values))
                 else:
-                    _record_decrypt_failure_v2(user_id, key, err, now)
+                    _record_decrypt_failure_v2(
+                        user_id,
+                        key,
+                        err,
+                        failure_class,
+                        failure_detail,
+                        now,
+                    )
                     _record_unavailable_observation_v2(user_id, key, now)
             else:
                 storage_items.append(item)
@@ -1541,14 +1589,12 @@ def photo_evaluate(user_id: str, metadata: dict,
                    content_envelope: dict | None = None,
                    exif_gps: dict | None = None,
                    meta_envelope: dict | None = None) -> tuple[dict, int]:
-    """Single-step photo ingest: evaluate metadata AND (if usable) store the
-    encrypted image in one call.
+    """Single-step photo ingest: evaluate metadata and store the image envelope.
 
-    V2 does not hard-block sensitive scene hints. The ciphertext goes into the
-    screen-frame envelope channel (reuses the enclave's existing frame-decrypt
-    path); the backend never sees plaintext. frame_id == photo_id ==
-    content_envelope.id. Optional meta_envelope is stored encrypted and returned
-    only on the single-photo content read path.
+    V2 does not hard-block sensitive scene hints. Sealed and plaintext-binary
+    bodies share the screen-frame channel and its shape-aware read path.
+    frame_id == photo_id == content_envelope.id. Optional meta_envelope is stored
+    and returned only on the single-photo content read path.
     """
     now = _now()
     metadata = metadata or {}
@@ -1564,7 +1610,7 @@ def photo_evaluate(user_id: str, metadata: dict,
     if not content_envelope:
         return {"error": "content_envelope_required"}, 400
 
-    # Store ciphertext in the frame channel + metadata as a confirmed item.
+    # Store the visual envelope in the frame channel + metadata as a confirmed item.
     stored = store.put_photo_envelope(user_id, photo_id, now, content_envelope)
     if stored is False:
         # Do not confirm metadata without durable pixels. iOS keeps its cursor
@@ -1649,9 +1695,9 @@ def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
 
 def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
     """Permission + status gate for one confirmed photo. Returns metadata and the
-    frame_id; the caller decrypts pixels via the enclave's existing
-    /v1/screen/frames/<frame_id>/decrypt path. The backend never holds plaintext
-    pixels — only the enclave decrypts."""
+    frame_id; the caller reads pixels through the shape-aware
+    /v1/screen/frames/<frame_id>/decrypt path. Sealed bodies are decrypted by the
+    enclave; plaintext-binary bodies are validated and decoded locally."""
     now = _now()
     doc = store.item_get(user_id, "photo", photo_id, now=now)
     if not doc or doc.get("status") != "confirmed":

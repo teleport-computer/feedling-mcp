@@ -569,6 +569,7 @@ def _run_route_vision_test_or_error(
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
+            caller_user_id=str(store.user_id),
             **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as exc:
@@ -950,6 +951,7 @@ def _test_route_image_generation_or_error(
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
+            caller_user_id=str(store.user_id),
         ).decode("utf-8")
     except Exception:
         return {"error": "model_api_key_decrypt_failed"}, 400
@@ -1028,7 +1030,9 @@ def _resolve_provider_key(store, raw_key: str, existing: dict | None,
         return None, {"error": "api_key required"}, 400
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
-            existing_envelope, caller_api_key,
+            existing_envelope,
+            caller_api_key,
+            caller_user_id=str(store.user_id),
         ).decode("utf-8")
     except Exception as e:
         return None, {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
@@ -1845,7 +1849,10 @@ def _test_active_route(
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
-            envelope, api_key).decode("utf-8")
+            envelope,
+            api_key,
+            caller_user_id=str(store.user_id),
+        ).decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     try:
@@ -2185,7 +2192,10 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
-            envelope, caller_api_key).decode("utf-8")
+            envelope,
+            caller_api_key,
+            caller_user_id=str(store.user_id),
+        ).decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     context_window_tokens, frontier_error = _resolve_route_context_window(
@@ -2422,7 +2432,10 @@ def model_api_models(store, payload: dict, *, caller_api_key: str | None) -> tup
             return {"error": "model_api_key_envelope_missing"}, 404
         try:
             provider_key = core_envelope.decrypt_provider_key_envelope(
-                envelope, caller_api_key).decode("utf-8")
+                envelope,
+                caller_api_key,
+                caller_user_id=str(store.user_id),
+            ).decode("utf-8")
         except Exception as e:
             return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     else:

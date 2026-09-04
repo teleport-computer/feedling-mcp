@@ -325,11 +325,7 @@ def test_records_when_flag_on_no_env_needed(monkeypatch):
 def test_outcome_class_defaults_validates_and_round_trips(monkeypatch):
     store = _Store("usr_trace_outcome")
     _reset(monkeypatch, store)
-    explicit = next(
-        item
-        for item in debug_trace.TRACE_OUTCOME_CLASSES
-        if item != debug_trace.TRACE_OUTCOME_DEFAULT
-    )
+    explicit = "operational_failure"
     debug_trace.trace_event(
         store, subsystem="route", type="explicit", outcome_class=explicit
     )
@@ -348,17 +344,15 @@ def test_outcome_class_defaults_validates_and_round_trips(monkeypatch):
     assert events["explicit"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "explicit"
-    assert events["invalid"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events["invalid"]["outcome_class"] == "unspecified"
     assert events["invalid"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "normalized_invalid"
-    assert events["missing"]["outcome_class"] == debug_trace.TRACE_OUTCOME_DEFAULT
+    assert events["missing"]["outcome_class"] == "unspecified"
     assert events["missing"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "missing"
-    assert events["explicit-default"]["outcome_class"] == (
-        debug_trace.TRACE_OUTCOME_DEFAULT
-    )
+    assert events["explicit-default"]["outcome_class"] == "unspecified"
     assert events["explicit-default"]["detail"][
         db.TRACE_OUTCOME_PROVENANCE_FIELD
     ] == "explicit"
@@ -540,6 +534,7 @@ def test_tee_replicate_success_does_not_write_enclave_trace(monkeypatch):
         {"owner_user_id": "usr_replicate", "body_ct": "ciphertext"},
         "api-key",
         purpose="tee_replicate:chat:msg_1",
+        caller_user_id="usr_replicate",
     )
 
     assert plaintext == b"plaintext"
@@ -562,6 +557,7 @@ def test_tee_replicate_failure_keeps_enclave_error_trace(monkeypatch, outcome, e
             {"owner_user_id": "usr_replicate", "body_ct": "ciphertext"},
             "api-key",
             purpose="tee_replicate:memory",
+            caller_user_id="usr_replicate",
         )
 
     assert [event["type"] for event in events] == [expected_type]
@@ -578,11 +574,81 @@ def test_normal_decrypt_keeps_enclave_start_and_done_traces(monkeypatch):
         {"owner_user_id": "usr_chat", "body_ct": "ciphertext"},
         "api-key",
         purpose="chat:history",
+        caller_user_id="usr_chat",
     )
 
     assert plaintext == b"plaintext"
     assert [event["type"] for event in events] == ["enclave.call.start", "enclave.call.done"]
     assert all(event["detail"]["purpose"] == "chat:history" for event in events)
+
+
+def test_enclave_trace_uses_authenticated_caller_not_envelope_owner(monkeypatch):
+    traced = []
+    looked_up = []
+    response = _FakeEnclaveResponse(
+        status_code=403,
+        text='{"error":"decrypt_failed: owner mismatch: forged"}',
+    )
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave.test")
+    monkeypatch.setattr(core_enclave, "_client", lambda: type(
+        "_Client", (), {"post": lambda *_args, **_kwargs: response}
+    )())
+    monkeypatch.setattr(
+        core_enclave,
+        "_trace_store_from_user_id",
+        lambda user_id: (
+            looked_up.append(user_id)
+            or type("_TraceStore", (), {"user_id": user_id})()
+        ),
+    )
+    monkeypatch.setattr(
+        core_enclave.debug_trace,
+        "trace_event",
+        lambda store, **event: traced.append((store.user_id, event)),
+    )
+
+    with pytest.raises(RuntimeError, match="enclave_http_403"):
+        core_enclave._decrypt_envelope_via_enclave(
+            {"owner_user_id": "usr_forged", "body_ct": "ciphertext"},
+            "api-key",
+            purpose="perception:location_signal",
+            caller_user_id="usr_authenticated",
+        )
+
+    assert looked_up == ["usr_authenticated"]
+    assert {owner for owner, _event in traced} == {"usr_authenticated"}
+
+
+def test_enclave_trace_never_looks_up_nonexistent_forged_owner(monkeypatch):
+    looked_up = []
+    response = _FakeEnclaveResponse(
+        status_code=403,
+        text='{"error":"decrypt_failed: box_seal tag invalid: "}',
+    )
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave.test")
+    monkeypatch.setattr(core_enclave, "_client", lambda: type(
+        "_Client", (), {"post": lambda *_args, **_kwargs: response}
+    )())
+    monkeypatch.setattr(
+        core_enclave,
+        "_trace_store_from_user_id",
+        lambda user_id: (
+            looked_up.append(user_id)
+            or type("_TraceStore", (), {"user_id": user_id})()
+        ),
+    )
+    monkeypatch.setattr(core_enclave.debug_trace, "trace_event", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="enclave_http_403"):
+        core_enclave._decrypt_envelope_via_enclave(
+            {"owner_user_id": "usr_nonexistent_forged", "body_ct": "ciphertext"},
+            "api-key",
+            purpose="perception:location_signal",
+            caller_user_id="usr_authenticated",
+        )
+
+    assert looked_up == ["usr_authenticated"]
+    assert "usr_nonexistent_forged" not in looked_up
 
 
 def test_flush_pending_waits_for_worker_in_flight_batch(monkeypatch):

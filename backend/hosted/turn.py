@@ -107,7 +107,11 @@ def _model_api_recent_recap_chat(store: UserStore, api_key: str | None, limit: i
             continue
         try:
             raw = core_envelope.read_envelope_body(
-                row, api_key, purpose="model_api_recap_history")
+                row,
+                api_key,
+                purpose="model_api_recap_history",
+                caller_user_id=str(store.user_id),
+            )
             item = dict(row)
             item["content"] = raw.decode("utf-8")
             raw_messages.append(item)
@@ -139,7 +143,8 @@ def _model_api_plain_memory_cards(store: UserStore, api_key: str | None) -> list
     for moment in memory_service._active_memory_moments(memory_service._load_moments(store)):
         if not isinstance(moment, dict):
             continue
-        inner, _ = memory_actions_mod._memory_plain_from_envelope(moment, api_key)
+        inner, _ = memory_actions_mod._memory_plain_from_envelope(
+            str(store.user_id), moment, api_key)
         if inner is None:
             continue
         card = {
@@ -199,7 +204,8 @@ def _model_api_memory_quality_scan(
     for moment in moments[:max(1, max_cards)]:
         if not isinstance(moment, dict):
             continue
-        inner, err = memory_actions_mod._memory_plain_from_envelope(moment, api_key)
+        inner, err = memory_actions_mod._memory_plain_from_envelope(
+            str(store.user_id), moment, api_key)
         if inner is None:
             decrypt_errors += 1
             continue
@@ -632,3 +638,58 @@ def _model_api_image_payload(payload: dict) -> tuple[bytes | None, str, str | No
     if len(image_bytes) > MODEL_API_MAX_IMAGE_BYTES:
         return None, "", f"image too large; max {MODEL_API_MAX_IMAGE_BYTES} bytes after downscale"
     return image_bytes, mime, None
+
+
+def _model_api_images_payload(
+    payload: dict,
+) -> tuple[list[tuple[bytes, str]] | None, dict | None]:
+    """Parse the new multi-image field while preserving the legacy parser.
+
+    ``None`` means the field was absent.  Exactly one item is returned to the
+    caller and then deliberately routed through the old single-image storage
+    path; only 2..9 items enter the bundle path.
+    """
+    from core.chat_images import MAX_CHAT_IMAGES_PER_MESSAGE
+
+    if "images" not in payload:
+        return None, None
+    if "image_b64" in payload or "image_base64" in payload:
+        return None, {"error": "image_payload_conflict"}
+    raw_images = payload.get("images")
+    if not isinstance(raw_images, list):
+        return None, {
+            "error": "invalid_images",
+            "detail": "images must be an array",
+        }
+    if not raw_images:
+        return None, {"error": "image_list_empty"}
+    if len(raw_images) > MAX_CHAT_IMAGES_PER_MESSAGE:
+        return None, {
+            "error": "image_count_exceeds_limit",
+            "max_images": MAX_CHAT_IMAGES_PER_MESSAGE,
+        }
+    parsed: list[tuple[bytes, str]] = []
+    for index, item in enumerate(raw_images):
+        if not isinstance(item, dict):
+            return None, {
+                "error": "invalid_image",
+                "image_index": index,
+                "detail": "each images item must be an object",
+            }
+        image_bytes, image_mime, image_err = _model_api_image_payload(item)
+        if image_err or image_bytes is None:
+            return None, {
+                "error": "invalid_image",
+                "image_index": index,
+                "detail": image_err or "image_b64 is required",
+            }
+        if image_mime.lower() not in {
+            "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"
+        }:
+            return None, {
+                "error": "invalid_image",
+                "image_index": index,
+                "detail": "image_mime must be image/jpeg, image/png, image/webp, or image/gif",
+            }
+        parsed.append((image_bytes, image_mime))
+    return parsed, None

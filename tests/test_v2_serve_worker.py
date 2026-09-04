@@ -658,6 +658,7 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert callable(deps.read_messages)
     assert callable(deps.read_messages_after_seq)
     assert callable(deps.resolve_provider)
+    assert callable(deps.resolve_provider_for_job)
     assert not hasattr(deps, "is_official")
     assert not hasattr(deps, "record_turn_metric")
     assert callable(deps.mint_enclave_token)
@@ -667,6 +668,7 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
     assert callable(deps.read_summary_with_seq)
     assert callable(deps.has_genuine_user_history)
     assert callable(deps.emit_debug_trace)
+    assert callable(deps.load_mcp_turn_for_job)
     monkeypatch.setattr(
         serve_worker.db,
         "chat_latest_genuine_user_ts",
@@ -679,6 +681,23 @@ def test_build_production_deps_returns_turndeps(monkeypatch):
         lambda _user_id: 123.0,
     )
     assert deps.has_genuine_user_history("u-has-history") is True
+
+
+def test_provider_job_resolver_binds_enclave_failures_to_the_job(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker,
+        "_resolve_provider",
+        lambda user_id, *, trace_job_id="": calls.append(
+            (user_id, trace_job_id)
+        ) or (None, {"error": "model_api_key_decrypt_failed"}),
+    )
+
+    assert serve_worker._resolve_provider_for_job("usr_provider", "job-42") == (
+        None,
+        {"error": "model_api_key_decrypt_failed"},
+    )
+    assert calls == [("usr_provider", "job-42")]
 
 
 def test_v2_debug_trace_user_seam_resolves_store_and_preserves_duration(monkeypatch):
@@ -915,7 +934,7 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     monkeypatch.setattr(
         serve_worker.mcp_tools,
         "_decrypt",
-        lambda envelope, _api_key, _runtime_token: {
+        lambda envelope, _api_key, _runtime_token, _caller_user_id: {
             "url": ("https://up.example.com/mcp" if envelope["id"] == "up"
                     else "http://127.0.0.1/private-mcp"),
             "headers": {"Authorization": "Bearer must-not-leak"},
@@ -961,13 +980,14 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     )
 
     turn = asyncio.run(serve_worker._load_mcp_turn_observed(
-        store, api_key="k", runtime_token="rt"))
+        store, api_key="k", runtime_token="rt", job_id="job-mcp-failure"))
 
     assert [spec.name for spec in turn.tool_specs] == ["mcp__up__search"]
     assert len(traces) == 1
     trace = traces[0]
     assert trace["type"] == "mcp.surface.resolved"
     assert trace["status"] == "error"
+    assert trace["job_id"] == "job-mcp-failure"
     assert trace["detail"]["expected"] == 2
     assert trace["detail"]["resolved"] == 1
     assert trace["detail"]["skipped"] == [
@@ -1737,7 +1757,7 @@ def test_on_v2_job_notify_is_a_noop_without_context():
 # but doesn't slice at last-assistant and doesn't skip non-user rows).
 # ------------------------------------------------------------------
 
-def _fake_decrypt(envelope, key, *, purpose, runtime_token=""):
+def _fake_decrypt(envelope, key, *, purpose, caller_user_id, runtime_token=""):
     return f"plain-{envelope['id']}".encode()
 
 
@@ -1824,7 +1844,7 @@ def test_read_summary_decrypts_present_row(monkeypatch):
                      "watermark_seq": 19, "version": 3})
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": b"- prior chat")
+        lambda envelope, key, *, purpose, caller_user_id, runtime_token="": b"- prior chat")
 
     assert serve_worker._read_summary_with_seq("u_summary_test") == (
         "- prior chat", 7.0, 3, 19,
@@ -1924,7 +1944,7 @@ def test_read_summary_nonzero_watermark_with_empty_plaintext_fails_closed(monkey
     )
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": b" \n\t",
+        lambda envelope, key, *, purpose, caller_user_id, runtime_token="": b" \n\t",
     )
 
     with pytest.raises(v2_summary_frontier.SummaryFrontierIntegrityError):
@@ -1945,6 +1965,7 @@ def test_canonical_summary_decrypt_rejection_is_integrity_failure(monkeypatch):
     ) as caught:
         serve_worker._decrypt_summary_text(
             {"body_ct": "broken"},
+            caller_user_id="u_summary_test",
             runtime_token="rt",
             purpose="v2_summary_read",
         )
@@ -1961,6 +1982,7 @@ def test_canonical_summary_transient_enclave_failure_remains_retryable(monkeypat
     with pytest.raises(RuntimeError, match="^enclave_http_503") as caught:
         serve_worker._decrypt_summary_text(
             {"body_ct": "valid"},
+            caller_user_id="u_summary_test",
             runtime_token="rt",
             purpose="v2_summary_read",
         )

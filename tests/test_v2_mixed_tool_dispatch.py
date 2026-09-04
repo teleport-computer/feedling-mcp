@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from provider_types import ToolCall, ToolResult, ToolSpec
+from provider_types import ToolCall, ToolExchange, ToolResult, ToolSpec
 from capabilities import result_budget as cap_result_budget
 from model_api_runtime.v2 import worker
 
@@ -153,7 +153,7 @@ def test_partial_parallel_results_and_sibling_error_are_observable():
         async def _platform_dispatch(call):
             if call.id == "bad":
                 await good_recorded.wait()
-                raise RuntimeError("read failed")
+                raise worker.RecoverablePlatformReadError("read failed")
             return ToolResult(call_id=call.id, content="evidence")
 
         async def _tool_event(call, event_kind, payload):
@@ -161,24 +161,307 @@ def test_partial_parallel_results_and_sibling_error_are_observable():
             if call.id == "good" and event_kind == "tool_call_result":
                 good_recorded.set()
 
-        with pytest.raises(RuntimeError, match="read failed"):
-            await worker._dispatch_mixed_tool_calls(
-                [_call("good", "memory_index"), _call("bad", "memory_search")],
-                mcp_turn=_DispatchingMcpTurn([], None),
-                mutating_mcp_names=frozenset(),
-                dispatch_platform_one=_platform_dispatch,
-                before_mcp_mutation=lambda: None,
-                read_parallelism=2,
-                mcp_timeout_sec=1,
-                on_tool_event=_tool_event,
-            )
+        results = await worker._dispatch_mixed_tool_calls(
+            [_call("good", "memory_index"), _call("bad", "memory_search")],
+            mcp_turn=_DispatchingMcpTurn([], None),
+            mutating_mcp_names=frozenset(),
+            dispatch_platform_one=_platform_dispatch,
+            before_mcp_mutation=lambda: None,
+            read_parallelism=2,
+            mcp_timeout_sec=1,
+            on_tool_event=_tool_event,
+        )
 
+        assert [result.content for result in results] == [
+            "evidence",
+            worker._PLATFORM_READ_FAILED,
+        ]
         assert ("good", "tool_call_result") in [
             (call_id, kind) for call_id, kind, _payload in events
         ]
         assert ("bad", "tool_call_error") in [
             (call_id, kind) for call_id, kind, _payload in events
         ]
+
+    asyncio.run(_scenario())
+
+
+def test_platform_read_failure_reaches_model_and_turn_continues(monkeypatch):
+    """The real tool loop must carry the failed observation into its next round."""
+
+    class _Provider:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                return {
+                    "reply": "",
+                    "tool_calls": [
+                        {
+                            "id": "read-1",
+                            "name": "memory_search",
+                            "args": {"query": "what do you remember?"},
+                        }
+                    ],
+                    "usage": {},
+                }
+            return {
+                "reply": "I can still answer with the information available.",
+                "tool_calls": [],
+                "usage": {},
+            }
+
+    provider = _Provider()
+    monkeypatch.setattr(worker.provider_client, "chat_completion_async", provider)
+    transcript_snapshots = []
+    replies = []
+    failure_counts = {}
+
+    def _build_messages(transcript):
+        transcript_snapshots.append(list(transcript))
+        return [{"role": "user", "content": "help"}, *transcript]
+
+    async def _dispatch(tool_calls):
+        async def _failed_read(_call):
+            raise worker.RecoverablePlatformReadError(
+                "private operational detail"
+            )
+
+        return await worker._dispatch_mixed_tool_calls(
+            tool_calls,
+            mcp_turn=_DispatchingMcpTurn([], None),
+            mutating_mcp_names=frozenset(),
+            dispatch_platform_one=_failed_read,
+            before_mcp_mutation=lambda: None,
+            read_parallelism=1,
+            mcp_timeout_sec=1,
+            recoverable_platform_read_failures=failure_counts,
+        )
+
+    async def _on_reply(text, *, final, reasoning=""):
+        replies.append((text, final))
+
+    async def _fold():
+        return []
+
+    outcome = asyncio.run(
+        worker.v2_tool_loop.run_tool_loop(
+            provider_config=worker.provider_client.ProviderConfig(
+                provider="anthropic",
+                model="claude-sonnet-4-test",
+                api_key="test-key",
+            ),
+            build_messages=_build_messages,
+            dispatch_tools=_dispatch,
+            on_reply=_on_reply,
+            fold_new_messages=_fold,
+            add_usage=lambda _usage: None,
+            max_calls=2,
+        )
+    )
+
+    assert outcome.final_text == "I can still answer with the information available."
+    assert replies == [(outcome.final_text, True)]
+    assert len(provider.calls) == 2
+    exchange = transcript_snapshots[1][-1]
+    assert isinstance(exchange, ToolExchange)
+    assert exchange.results == (
+        ToolResult(call_id="read-1", content=worker._PLATFORM_READ_FAILED),
+    )
+    assert "private operational detail" not in exchange.results[0].content
+
+
+def test_platform_read_failure_cap_is_shared_across_provider_rounds():
+    async def _scenario():
+        failure_counts = {}
+
+        async def _failed_read(_call):
+            raise worker.RecoverablePlatformReadError("still down")
+
+        async def _attempt(call_id):
+            return await worker._dispatch_mixed_tool_calls(
+                [_call(call_id, "memory_search")],
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_failed_read,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=1,
+                mcp_timeout_sec=1,
+                recoverable_platform_read_failures=failure_counts,
+            )
+
+        assert (await _attempt("first"))[0].content == worker._PLATFORM_READ_FAILED
+        assert (await _attempt("second"))[0].content == worker._PLATFORM_READ_FAILED
+        with pytest.raises(RuntimeError, match="still down"):
+            await _attempt("third")
+        assert failure_counts == {"memory_search": 3}
+
+    asyncio.run(_scenario())
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    [worker.LostJobLease, worker.RuntimeModeChanged, worker.CaptureHalted],
+)
+def test_platform_read_control_flow_exceptions_still_raise(exception_type):
+    async def _scenario():
+        async def _control(_call):
+            raise exception_type("control flow")
+
+        with pytest.raises(exception_type, match="control flow"):
+            await worker._dispatch_mixed_tool_calls(
+                [_call("read", "memory_search")],
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_control,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=1,
+                mcp_timeout_sec=1,
+            )
+
+    asyncio.run(_scenario())
+
+
+def test_unknown_recoverable_error_subclass_fails_closed():
+    class FutureControlSignal(worker.RecoverablePlatformReadError):
+        pass
+
+    with pytest.raises(FutureControlSignal, match="future signal"):
+        worker._recover_platform_read_failure(
+            _call("read", "memory_search"),
+            FutureControlSignal("future signal"),
+            {},
+        )
+
+
+def test_bare_runtime_error_fails_closed():
+    with pytest.raises(RuntimeError, match="invariant broken"):
+        worker._recover_platform_read_failure(
+            _call("read", "memory_search"),
+            RuntimeError("invariant broken"),
+            {},
+        )
+
+
+def test_effect_delivery_uncertain_error_fails_closed():
+    with pytest.raises(
+        worker.db.EffectDeliveryUncertainError,
+        match="unresolved sink claim",
+    ):
+        worker._recover_platform_read_failure(
+            _call("read", "memory_search"),
+            worker.db.EffectDeliveryUncertainError("unresolved sink claim"),
+            {},
+        )
+
+
+def test_platform_mutation_failure_remains_terminal():
+    async def _scenario():
+        async def _failed_mutation(_call):
+            raise RuntimeError("outcome unknown")
+
+        with pytest.raises(RuntimeError, match="outcome unknown"):
+            await worker._dispatch_mixed_tool_calls(
+                [_call("write", "identity_nudge")],
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=_failed_mutation,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=1,
+                mcp_timeout_sec=1,
+                recoverable_platform_read_failures={},
+            )
+
+    asyncio.run(_scenario())
+
+
+def test_discarded_platform_mutation_is_a_bounded_model_visible_failure():
+    failures = {}
+    call = _call("write", "identity_nudge")
+
+    first = worker._recover_discarded_platform_mutation(
+        call,
+        {"status": "discarded", "last_error": "private sink detail"},
+        failures,
+    )
+    second = worker._recover_discarded_platform_mutation(
+        call,
+        {"status": "discarded"},
+        failures,
+    )
+
+    assert first == ToolResult(
+        call_id="write", content=worker._PLATFORM_READ_FAILED
+    )
+    assert second.content == worker._PLATFORM_READ_FAILED
+    assert "private sink detail" not in first.content
+    with pytest.raises(RuntimeError, match="discarded"):
+        worker._recover_discarded_platform_mutation(
+            call,
+            {"status": "discarded"},
+            failures,
+        )
+    assert failures == {"identity_nudge": 3}
+
+
+@pytest.mark.parametrize(
+    "disposition, expected_status",
+    [
+        pytest.param(None, "missing", id="missing-row"),
+        pytest.param(
+            {
+                "status": "pending",
+                "last_error": "dispatch_failed:EffectTerminalError",
+            },
+            "pending",
+            id="pending-even-with-terminal-error-text",
+        ),
+        pytest.param(
+            {"status": "reconciliation_required"},
+            "reconciliation_required",
+            id="reconciliation-required",
+        ),
+        pytest.param(
+            {"status": "delivery_uncertain"},
+            "delivery_uncertain",
+            id="delivery-uncertain",
+        ),
+        pytest.param(
+            {"status": "future_status"},
+            "future_status",
+            id="unknown-future-status",
+        ),
+    ],
+)
+def test_non_discarded_platform_mutation_dispositions_fail_closed(
+    disposition, expected_status,
+):
+    with pytest.raises(RuntimeError, match=expected_status):
+        worker._recover_discarded_platform_mutation(
+            _call("write", "identity_nudge"),
+            disposition,
+            {},
+        )
+
+
+def test_subagent_lost_lease_is_not_converted_to_a_task_error():
+    async def _scenario():
+        async def _lost_lease(_calls):
+            raise worker.LostJobLease("lease lost in task")
+
+        with pytest.raises(worker.LostJobLease, match="lease lost in task"):
+            await worker._dispatch_mixed_tool_calls(
+                [ToolCall("task", "task", {"prompt": "inspect"})],
+                mcp_turn=_DispatchingMcpTurn([], None),
+                mutating_mcp_names=frozenset(),
+                dispatch_platform_one=lambda _call: None,
+                dispatch_task_batch=_lost_lease,
+                before_mcp_mutation=lambda: None,
+                read_parallelism=1,
+                mcp_timeout_sec=1,
+            )
 
     asyncio.run(_scenario())
 

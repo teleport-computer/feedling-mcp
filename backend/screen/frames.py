@@ -1,6 +1,6 @@
 """Frame storage and shape-aware read plumbing."""
 
-import json
+import base64
 import os
 import time
 import uuid
@@ -10,6 +10,7 @@ import httpx
 import db
 from core import envelope as core_envelope
 from core import store as core_store
+from core import visual as core_visual
 from core.frame_ids import is_supported_frame_id
 from core.reqctx import request
 from core.store import UserStore
@@ -79,7 +80,9 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     """
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
-    if db.frame_upsert(store.user_id, item_id, ts, env) is False:
+    if db.frame_upsert(
+        store.user_id, item_id, ts, env, source="screen"
+    ) is False:
         return
 
     encrypted = bool(env.get("body_ct"))
@@ -97,11 +100,30 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
         "owner_user_id": env.get("owner_user_id"),
     }
 
+    # Existing frames_meta blobs may contain photo ids from the pre-source
+    # rebuild path. Only DB rows explicitly attributed to screen are eligible
+    # for retention counting/deletion; legacy-unattributed rows fail safe and
+    # remain untouched.
+    confirmed_screen_ids = {
+        str(row.get("id") or "")
+        for row in db.frame_list_meta(store.user_id, source="screen")
+    }
+
     with store.frames_lock:
         store.frames_meta.append(meta)
-        if len(store.frames_meta) > core_store.MAX_FRAMES:
-            removed = store.frames_meta.pop(0)
-            db.frame_delete(store.user_id, removed.get("id") or removed["filename"].split(".")[0])
+        confirmed = [
+            row for row in store.frames_meta
+            if _frame_id_from_meta(row) in confirmed_screen_ids
+        ]
+        overflow = confirmed[:-core_store.MAX_FRAMES]
+        if overflow:
+            removed_ids = {_frame_id_from_meta(row) for row in overflow}
+            store.frames_meta[:] = [
+                row for row in store.frames_meta
+                if _frame_id_from_meta(row) not in removed_ids
+            ]
+            for frame_id in removed_ids:
+                db.frame_delete(store.user_id, frame_id)
         store._persist_frames_meta()  # also broadcasts the "frames" wake cross-worker
 
     body_field = "body_ct" if encrypted else "body_b64"
@@ -109,16 +131,32 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     print(f"[ingest:{store.user_id}] saved frame id={item_id} shape={body_field} body_len={body_len}")
 
 
+def _frame_id_from_meta(meta: dict) -> str:
+    frame_id = str(meta.get("id") or "")
+    if frame_id:
+        return frame_id
+    return str(meta.get("filename") or "").split(".")[0]
+
+
 def _read_plaintext_frame(env: dict) -> dict | None:
-    """Decode a plaintext-binary frame wire body without involving the enclave."""
-    if not isinstance(env, dict) or env.get("body_b64") is None:
+    """Decode a plaintext screen bundle or raw photo without enclave I/O."""
+    if core_envelope.classify_envelope_shape(env) != "plaintext_binary":
         return None
     try:
-        inner = json.loads(core_envelope.read_envelope_body(
-            env, None, purpose="screen_frame_plaintext_read").decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        inner = core_visual.parse_visual_plaintext(
+            core_envelope.read_plaintext_envelope_body(env))
+    except (UnicodeDecodeError, ValueError):
         return None
-    return inner if isinstance(inner, dict) else None
+    image_b64 = inner.get("image")
+    if not isinstance(image_b64, str) or not image_b64:
+        return None
+    try:
+        image_bytes = base64.b64decode(image_b64, validate=True)
+    except Exception:
+        return None
+    if not image_bytes:
+        return None
+    return inner
 
 
 def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[dict]:
@@ -189,6 +227,8 @@ def _decrypt_frame_metadata_for_gate(
         if include_image and inner.get("image"):
             result["image_b64"] = str(inner.get("image") or "")
         return result
+    if core_envelope.classify_envelope_shape(env) != "sealed":
+        return {"frame_id": fid, "error": "frame_plaintext_invalid"}
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return {"frame_id": fid, "error": "enclave_unavailable"}

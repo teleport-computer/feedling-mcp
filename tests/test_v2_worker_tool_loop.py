@@ -1185,7 +1185,7 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(
         else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
     )
     assert bubbles[0]["body_ct"] == expected
-    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_error_class"] == "reply_parse_failed"
     assert bubbles[0]["thinking_body_ct"] == "（思考没写完）"
     assert _job_status_row(job_id)[0] == "completed"
 
@@ -1278,10 +1278,12 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
-    assert persisted_extra["turn_failure_error_class"] == "upstream_unavailable"
-    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
-    assert bubbles[0]["turn_failure_blame"] == "provider_transient"
-    assert "模型服务暂时不可用" in bubbles[0]["turn_failure_user_text"]
+    assert persisted_extra["turn_failure_error_class"] == "reply_parse_failed"
+    assert bubbles[0]["turn_failure_error_class"] == "reply_parse_failed"
+    assert bubbles[0]["turn_failure_blame"] == "system"
+    assert bubbles[0]["turn_failure_user_text"] == (
+        "系统处理回复时出了问题，我们会尽快排查。请再发一次。"
+    )
     assert _job_status_row(job_id)[0] == "completed"
 
 
@@ -1405,7 +1407,7 @@ def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(
     )
     assert bubbles[0]["body_ct"] == expected
     assert _TORN_TAIL not in bubbles[0]["body_ct"]
-    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_error_class"] == "reply_parse_failed"
     # Reasoning head must not ride along as a thinking bubble.
     assert not bubbles[0].get("thinking_body_ct")
 
@@ -2610,6 +2612,92 @@ def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
     assert captured["results"][1].content.startswith("error: unparseable args")
 
 
+def test_chat_discarded_identity_write_reaches_model_and_turn_continues(
+    monkeypatch,
+):
+    """The production chat dispatcher trusts the exact durable row status.
+
+    This uses a real encrypted tool-effect enqueue and real disposition read.
+    Only the sink boundary is scripted to make that exact identity row
+    terminal-discarded; the following provider round and final reply prove the
+    write failure is an observation rather than a terminal turn exception.
+    """
+    uid = "u_toolloop_discarded_identity_write"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-discarded-identity")
+    _patch_real_write(monkeypatch)
+    _patch_tool_effect_encryption(monkeypatch)
+    calls = _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc(
+                    "identity-write",
+                    "identity_nudge",
+                    dimension="warmth",
+                    delta=1,
+                )
+            ),
+            _text_round("Here is the answer."),
+            _text_round("Here is the answer."),
+        ],
+    )
+
+    def apply_with_discarded_identity(user_id: str):
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_effect_outbox SET status='discarded', "
+                "last_error='dispatch_failed:EffectTerminalError' "
+                "WHERE user_id=%s AND effect_type='identity_encrypted_v1' "
+                "AND status IN ('pending','pending_fenced_v1')",
+                (user_id,),
+            )
+        return _apply_effects(user_id)
+
+    deps = _deps(
+        messages=[
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+        ]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
+    deps.apply_pending_effects = apply_with_discarded_identity
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 3
+    assert _tool_result_contents(calls[1]) == {worker._PLATFORM_READ_FAILED}
+    assert _tool_result_contents(calls[2]) == {worker._PLATFORM_READ_FAILED}
+    assert "EffectTerminalError" not in str(calls[1]["messages"])
+    with db.get_pool().connection() as conn:
+        identity_row = conn.execute(
+            "SELECT status,last_error FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type='identity_encrypted_v1'",
+            (uid,),
+        ).fetchone()
+    assert identity_row == (
+        "discarded",
+        "dispatch_failed:EffectTerminalError",
+    )
+    assert _bubbles(uid)[0]["body_ct"] == "Here is the answer."
+
+
 def test_chat_photo_read_observation_reaches_next_model_round_without_base64(
     monkeypatch,
 ):
@@ -2792,6 +2880,93 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert "trusted skill" in str(system["content"])
     second_offered = {spec.name for spec in calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+@pytest.mark.parametrize(
+    "dimensions,identity_nudge_offered",
+    [
+        ([], False),
+        ([{"name": "warmth", "value": 70}], True),
+    ],
+    ids=("empty", "nonempty"),
+)
+def test_chat_identity_nudge_surface_requires_an_existing_dimension(
+    monkeypatch,
+    dimensions,
+    identity_nudge_offered,
+):
+    uid = f"u_toolloop_identity_nudge_{'on' if dimensions else 'off'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-identity-nudge-surface")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("done")])
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+    ])
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": dimensions,
+        }),
+        "trusted_system_blocks": (),
+    }
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in calls[0]["tools"]}
+    assert ("identity_nudge" in offered) is identity_nudge_offered
+
+
+def test_child_surface_already_withholds_identity_nudge_as_a_write():
+    assert "identity_nudge" not in worker._SUBAGENT_ALLOWED_TOOLS
+    assert "identity_nudge" in worker._SUBAGENT_DISABLED_TOOLS
+
+
+@pytest.mark.parametrize(
+    "identity_block,disabled",
+    [
+        ("# Persona\nvoice fallback", True),
+        (worker.context.IDENTITY_CARD_HEADER, True),
+        (
+            worker.context.IDENTITY_CARD_HEADER + '\ndimensions: {"warmth":70}',
+            True,
+        ),
+        (
+            worker.context.IDENTITY_CARD_HEADER + "\ndimensions: [not-json",
+            True,
+        ),
+        (worker.context.IDENTITY_CARD_HEADER + "\ndimensions: []", True),
+        (
+            worker.context.IDENTITY_CARD_HEADER
+            + '\ndimensions: [{"name":"warmth","value":70}]',
+            False,
+        ),
+    ],
+    ids=(
+        "persona-fallback",
+        "dimensions-missing",
+        "dimensions-not-list",
+        "dimensions-malformed-json",
+        "dimensions-empty",
+        "dimensions-nonempty",
+    ),
+)
+def test_identity_nudge_gate_fails_closed_except_for_nonempty_dimensions(
+    identity_block,
+    disabled,
+):
+    disabled_tools = worker._identity_nudge_disabled_tools(identity_block)
+
+    assert ("identity_nudge" in disabled_tools) is disabled
 
 
 def test_chat_workspace_prompt_failure_is_visible_before_provider(

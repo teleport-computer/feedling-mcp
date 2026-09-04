@@ -121,7 +121,7 @@ does not add a second UTC clock representation.
 
 ### 1. Send the turn
 
-At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
+At least one of `message`, `image_b64`, `images`, or `file_b64` is required. `message` is
 limited to 12,000 characters. `context_refs` accepts at most eight references;
 currently memory references are the useful public form.
 
@@ -163,6 +163,13 @@ For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
 }
 ```
 
+To send multiple images, use `images` with one to nine `{image_b64,
+image_mime}` objects. Do not combine `images` with the legacy `image_b64` or
+`image_base64` fields. An empty list returns `image_list_empty`; mixing the two
+forms returns `image_payload_conflict`; more than nine returns
+`image_count_exceeds_limit` with `max_images: 9`. A one-item `images` request is
+stored through the same legacy single-image path.
+
 ### Image model selection
 
 On Hosted Runtime V1 or V2, and on a VPS with the current IO resident, an
@@ -203,8 +210,11 @@ model cannot accept images.
 
 When a dedicated route is configured, IO records that exact route before the
 image turn is stored. Runtime V2 or the official resident then sends pixels only
-to that route, asks for a neutral visual observation, marks the result as
-untrusted data, and passes only that text to the main agent. The narrow recovery
+to that route, asks for a neutral visual observation, and passes only that text
+to the main agent. Runtime V2 presents it as labelled text (`Image 1:`,
+`Image 2:`, …) followed by the message the user sent with the images, marked as
+the user's own words; the official resident continues to mark the observation as
+untrusted data. The narrow recovery
 path above receives no additional time budget: the dedicated observation and
 every main-model recovery attempt share one monotonic absolute deadline. If a
 batch contains both successful observations and eligible failures, successful
