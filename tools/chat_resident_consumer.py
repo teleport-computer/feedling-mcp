@@ -179,6 +179,7 @@ from notices import rejection_stats as _rejection_stats
 import worldbook_match as _worldbook_match
 
 from memory.capture_prompt_v1 import (
+    IO_CONVERSATION_CAPTURE_POLICY,
     build_capture_prompt,
     build_capture_retry_prompt,
     build_capture_semantic_retry_prompt,
@@ -15810,6 +15811,51 @@ def _capture_agent_reply_text(result: Any) -> str:
     return str(result or "")
 
 
+def _capture_reply_shape(reply_text: str) -> dict[str, Any]:
+    """Return content-free structure signals for a failed capture reply."""
+    text = str(reply_text or "")
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        head = "```"
+    elif stripped[:1] in {"{", "["}:
+        head = stripped[0]
+    else:
+        head = "other" if stripped else "empty"
+    tail = stripped[-1:] if stripped else ""
+    tail_char = tail if tail in {"{", "}", "[", "]", "`"} else (
+        "other" if tail else "empty"
+    )
+
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in {"}", "]"} and stack and stack[-1] == char:
+            stack.pop()
+
+    return {
+        "reply_len": len(text),
+        "reply_head": head,
+        "reply_tail_char": tail_char,
+        "reply_has_fence": "```" in text,
+        "reply_looks_truncated": bool(stack or in_string),
+    }
+
+
 def _memory_agent_parse_with_bounce(
     prompt: str,
     *,
@@ -16110,10 +16156,15 @@ def _process_capture_jobs(jobs: list) -> float:
         # 用户看得见的记忆变化。tests/test_garden_component_parity.py 逐个
         # 形状对过：正常 / 吐脏后重问 / 重问后留空 / 重问后仍脏 / 本来就没得记。
         _bounce_tracker = garden_component.BounceTracker()
+        _capture_raw_replies: list[str] = []
+
+        def _capture_model_call(prompt: str) -> str:
+            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            _capture_raw_replies.append(reply_text)
+            return reply_text
+
         _garden = garden_component.build_garden(
-            garden_component.CallableModel(
-                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
-            ),
+            garden_component.CallableModel(_capture_model_call),
             on_step=_bounce_tracker,
         )
         try:
@@ -16125,6 +16176,7 @@ def _process_capture_jobs(jobs: list) -> float:
                 identity=identity_text,
                 ai_name=ai_name,
                 user_name=user_name,
+                policy=IO_CONVERSATION_CAPTURE_POLICY,
             ))
             _emit_agent_turn_success(
                 foreground=False,
@@ -16189,6 +16241,11 @@ def _process_capture_jobs(jobs: list) -> float:
                         "reask_count": reask_count,
                         "reask_trigger": reask_trigger or None,
                         "reask_outcome": reask_outcome,
+                        **_capture_reply_shape(
+                            _capture_raw_replies[-1]
+                            if _capture_raw_replies
+                            else ""
+                        ),
                     },
                     "capture_window": window,
                     "cards_added": 0,
@@ -16217,7 +16274,11 @@ def _process_capture_jobs(jobs: list) -> float:
             # 同一条道理见下面 content_gate 那句注释。
             _dropped = _bounce_tracker.dropped_semantic
             _noop_reason = (
-                "supersede_without_target" if _dropped else "nothing_worth_keeping"
+                "empty_after_reask"
+                if reask_count > 0 and reask_outcome == "empty"
+                else "supersede_without_target"
+                if _dropped
+                else "nothing_worth_keeping"
             )
             _capture_result = {
                 "status": "noop",
@@ -16295,6 +16356,7 @@ def _process_capture_jobs(jobs: list) -> float:
                             identity=identity_text,
                             ai_name=ai_name,
                             user_name=user_name,
+                            policy=IO_CONVERSATION_CAPTURE_POLICY,
                         ),
                         server_semantic_reasons,
                     )

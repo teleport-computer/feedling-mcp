@@ -4736,6 +4736,99 @@ def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch
     assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 0
     assert extra["noop_reason"] == "nothing_worth_keeping"
+    assert extra["capture_result"]["reason"] == "nothing_worth_keeping"
+    assert extra["capture_result"]["reask_count"] == 0
+    assert extra["capture_result"]["reask_outcome"] == "not_needed"
+
+
+def test_capture_format_reask_then_empty_has_distinct_noop_reason(monkeypatch):
+    format_bad = json.dumps({"cards": [{
+        "action": "add",
+        "summary": "...",
+        "content": "[thickened summary]",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [format_bad, '{"cards":[]}']
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"] == []
+    final = _capture_final_status(captured)
+    assert final[:3] == ("cap_dispatch", "completed", "empty_after_reask")
+    extra = final[3]["extra"]
+    assert extra["noop_reason"] == "empty_after_reask"
+    assert extra["capture_result"]["reason"] == "empty_after_reask"
+    assert extra["capture_result"]["reask_count"] == 1
+    assert extra["capture_result"]["reask_trigger"] == "format"
+    assert extra["capture_result"]["reask_outcome"] == "empty"
+
+
+@pytest.mark.parametrize(
+    ("reply", "sentinel", "head", "tail", "has_fence", "truncated"),
+    [
+        (
+            '```json\n{"cards": invalid}\n``` PRIVATE_FENCE_SENTINEL',
+            "PRIVATE_FENCE_SENTINEL",
+            "```",
+            "other",
+            True,
+            False,
+        ),
+        (
+            '{"cards": invalid} PRIVATE_PROSE_SENTINEL',
+            "PRIVATE_PROSE_SENTINEL",
+            "{",
+            "other",
+            False,
+            False,
+        ),
+        (
+            '{"cards":[{"action":"add","content":"PRIVATE_TRUNCATED_SENTINEL',
+            "PRIVATE_TRUNCATED_SENTINEL",
+            "{",
+            "other",
+            False,
+            True,
+        ),
+    ],
+)
+def test_capture_parse_failure_persists_only_content_free_reply_shape(
+    monkeypatch, reply, sentinel, head, tail, has_fence, truncated
+):
+    # Retryable shapes need a second scripted failure; the truncated shape only
+    # consumes the first value, so the same script works for every case.
+    captured, job = _install_capture_job_harness(monkeypatch, [reply, reply])
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    final = _capture_final_status(captured)
+    assert final[1] == "failed"
+    result = final[3]["extra"]["capture_result"]
+    assert result["reply_len"] == len(reply)
+    assert result["reply_head"] == head
+    assert result["reply_tail_char"] == tail
+    assert result["reply_has_fence"] is has_fence
+    assert result["reply_looks_truncated"] is truncated
+    assert sentinel not in repr(result)
+
+
+def test_capture_job_accepts_eight_cards_through_real_component(monkeypatch):
+    reply = json.dumps({
+        "cards": [
+            {
+                "action": "add",
+                "summary": f"Memory {index}",
+                "content": f"Durable memory content number {index}.",
+            }
+            for index in range(8)
+        ]
+    })
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    final = _capture_final_status(captured)
+    assert final[1] == "completed"
+    assert len(captured["actions"]) == 8
+    assert final[3]["extra"]["cards_added"] == 8
 
 
 def test_capture_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
