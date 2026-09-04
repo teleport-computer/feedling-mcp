@@ -2408,17 +2408,22 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
     )
 
 
+def _get_or_create_store(user_id: str) -> UserStore:
+    with _stores_lock:
+        store = _stores.get(user_id)
+        if store is None:
+            store = UserStore(user_id)
+            _stores[user_id] = store
+    return store
+
+
 def get_store(
     user_id: str,
     *,
     require: Iterable[StoreSection] = (),
 ) -> UserStore:
     now = time.monotonic()
-    with _stores_lock:
-        store = _stores.get(user_id)
-        if store is None:
-            store = UserStore(user_id)
-            _stores[user_id] = store
+    store = _get_or_create_store(user_id)
     expired = store.mark_expired_sections_stale(now)
     mode = store_load_mode()
     if mode is StoreLoadMode.LEGACY:
@@ -2436,10 +2441,22 @@ def get_store(
     return store
 
 
-def get_store_shell_only(user_id: str, *, reason: str) -> UserStore:
-    """Return an unloaded store shell with a mandatory review reason."""
+def get_store_shell_only(
+    user_id: str,
+    *,
+    reason: str,
+    bypass_legacy_hydration: bool = False,
+) -> UserStore:
+    """Return a reviewed store shell reference with a mandatory reason.
+
+    Existing callers retain legacy compatibility hydration. A caller that has
+    proved every operation is backed by direct bounded reads may explicitly
+    bypass that hydration without changing the other reviewed call sites.
+    """
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("shell-only store reason required")
+    if bypass_legacy_hydration:
+        return _get_or_create_store(user_id)
     return get_store(user_id)
 
 

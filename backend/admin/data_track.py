@@ -1541,7 +1541,12 @@ def _effective_responder(
     }
 
 
-def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
+def _build_data_track_user_fast(
+    user_entry: dict,
+    snap: dict,
+    *,
+    include_validation_steps: bool = False,
+) -> dict:
     snap = dict(snap)
     snap.setdefault(
         "snapshot_read_status",
@@ -1622,7 +1627,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
             "steps_done": steps_done,
             "steps_total": steps_total,
             "next_action": validation.get("next_action", ""),
-            "steps": [],
+            "steps": steps if include_validation_steps else [],
             "stuck_for_sec": stuck_for_sec,
             "consumer_poll_status": validation.get(
                 "consumer_poll_status", "not_applicable"
@@ -2143,7 +2148,215 @@ def _v2_profile_detail(user_id: str) -> dict:
     }
 
 
+def _build_data_track_user_detail(user_entry: dict) -> dict:
+    """Build one detail row without materializing the user's Store caches.
+
+    Production intentionally runs the Store in legacy compatibility mode, where
+    even a three-section ``get_store`` request loads every section.  A heavy
+    user's chat cache can contain megabytes of encrypted envelopes, while this
+    page only renders aggregate counts and timestamps.  Keep the detail path on
+    SQL aggregates and explicitly bounded event reads instead.
+    """
+    user_id = str(user_entry.get("user_id") or "")
+    detail_snapshot = db.admin_data_track_snapshot(
+        [user_id],
+        include_worldbook=True,
+        narrow_app_usage_to_user_stream=True,
+        statement_timeout_ms=db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS,
+    ).get(user_id, {})
+    detail_snapshot_status = dict(
+        detail_snapshot.get("snapshot_read_status") or {
+            "level": "unavailable",
+            "message": "取数状态缺失",
+        }
+    )
+    detail_snapshot["snapshot_read_status"] = detail_snapshot_status
+    row = _build_data_track_user_fast(
+        user_entry,
+        detail_snapshot,
+        include_validation_steps=True,
+    )
+    row["snapshot_read_status"] = detail_snapshot_status
+
+    events_limit = _data_track_query_int(
+        "events_limit",
+        default=50,
+        minimum=1,
+        maximum=500,
+    )
+    tracking_events = db.log_read(
+        user_id,
+        "tracking_events",
+        limit=events_limit,
+    )
+    tracking_events.sort(
+        key=lambda event: core_util._to_epoch(
+            event.get("ts") or event.get("created_at")
+        ),
+        reverse=True,
+    )
+    row["tracking"]["events_limit"] = events_limit
+    row["tracking"]["latest"] = [
+        {
+            "event_id": event.get("event_id", ""),
+            "type": event.get("type", ""),
+            "created_at": event.get("created_at", ""),
+            "source": event.get("source", ""),
+            "route": event.get("route", ""),
+            "app_version": event.get("app_version", ""),
+            "build": event.get("build", ""),
+            "payload": event.get("payload", {}),
+        }
+        for event in tracking_events
+    ]
+
+    bootstrap_events = db.log_read(user_id, "bootstrap_events", limit=50)
+    row["bootstrap_events"]["latest"] = [
+        {
+            "event_type": event.get("event_type", ""),
+            "success": bool(event.get("success")),
+            "timestamp": event.get("timestamp", ""),
+            "has_error": bool(
+                str(event.get("error_message") or "").strip()
+            ),
+        }
+        for event in bootstrap_events
+    ]
+
+    worldbook = dict(detail_snapshot.get("worldbook") or {})
+    row["worldbook"] = {
+        "entries": int(worldbook.get("entries") or 0),
+        "last_updated_at": str(worldbook.get("last_updated_at") or ""),
+        "note": "条目数与最后更新时间;id 与正文不出(id 是用户自定名 = 内容)",
+    }
+    tokens = db.get_blob(user_id, "tokens")
+    row["push"] = _push_stats_from_user_entry({
+        "tokens": tokens if isinstance(tokens, list) else [],
+    })
+
+    # These detail helpers only need ``user_id`` and perform their own direct,
+    # bounded reads. The reviewed shell-only factory preserves process-local
+    # identity/locks without hydrating Store sections, including in legacy mode.
+    store = core_store.get_store_shell_only(
+        user_id,
+        reason="admin detail helpers use direct bounded DB reads",
+        bypass_legacy_hydration=True,
+    )
+    genesis = _genesis_stats(store, include_jobs=True)
+    row["genesis"] = genesis
+    row["last_activity_at"] = core_util._epoch_to_iso(_latest_epoch(
+        row.get("last_activity_at"),
+        genesis.get("updated_at"),
+        genesis.get("completed_at"),
+    ))
+
+    daily_days = _data_track_query_int(
+        "days",
+        default=14,
+        minimum=1,
+        maximum=90,
+    )
+    try:
+        row["daily_usage"] = db.admin_data_track_user_daily_usage(
+            user_id=user_id,
+            days=daily_days,
+            tz="Asia/Shanghai",
+            statement_timeout_ms=(
+                db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS
+            ),
+        )
+        row["daily_usage_query"] = "ok"
+    except db.AdminDataTrackDailyUsageReadError:
+        row["daily_usage"] = []
+        row["daily_usage_query"] = "failed"
+    row["daily_usage_days"] = daily_days
+    row["runtime"] = _runtime_summary(store)
+    row["model_api_routes"] = _model_api_route_summaries(user_id)
+    row["notice_summaries"] = _notice_summaries(user_id)
+    row["provider_attempt_ledger"] = _provider_attempts_detail(store)
+    row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+    row["v2_recent_jobs"] = _v2_recent_jobs_detail(user_id)
+    row["v2_profile"] = _v2_profile_detail(user_id)
+    row["memory_capture_validation"] = _memory_capture_validation_detail(store)
+    proactive_settings = store.load_proactive_settings()
+    row["v2_wake_activity"] = _v2_wake_activity_detail(user_id)
+    row["v2_wake_schedule"] = _v2_wake_schedule_detail(
+        user_id,
+        proactive_settings,
+    )
+    row["perception_permissions"] = {
+        "permission_states": dict(
+            proactive_settings.get("permission_states") or {}
+        ),
+        "switches": {
+            "ambient_心跳": bool(proactive_settings.get("enabled", True)),
+            "dnd_勿扰": bool(proactive_settings.get("dnd", False)),
+            "scheduled_定时": bool(proactive_settings.get("scheduled", True)),
+            "dream_做梦": bool(proactive_settings.get("dream_enabled", True)),
+            "capture_记忆整理": bool(
+                proactive_settings.get("capture_enabled", True)
+            ),
+            "screen_watch_屏幕观察": bool(
+                proactive_settings.get("screen_watch_enabled", True)
+            ),
+            "photo_wake_照片唤醒": bool(
+                proactive_settings.get("photo_wake_enabled", True)
+            ),
+            "arrival_wake_到达唤醒": bool(
+                proactive_settings.get("arrival_wake_enabled", True)
+            ),
+            "unlock_wake_解锁唤醒": bool(
+                proactive_settings.get("unlock_wake_enabled", True)
+            ),
+        },
+        "wake_directive_configured": bool(
+            str(proactive_settings.get("wake_directive") or "").strip()
+        ),
+        "wake_interval_sec": int(
+            proactive_settings.get("wake_interval_sec") or 0
+        ),
+        "user_state": proactive_settings.get("user_state"),
+        "ai_state": proactive_settings.get("ai_state"),
+        "broadcast_state": proactive_settings.get("broadcast_state"),
+    }
+    try:
+        from perception import service as _perception_service
+        row["perception_freshness"] = (
+            _perception_service.admin_perception_freshness(user_id)
+        )
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        row["perception_freshness"] = {
+            "error": f"{type(e).__name__}:{str(e)[:120]}"
+        }
+
+    detail_blobs = detail_snapshot.get("blobs") or {}
+    identity = (
+        detail_blobs.get("identity")
+        if isinstance(detail_blobs.get("identity"), dict)
+        else None
+    )
+    row["identity"] = {
+        "written": identity is not None,
+        "updated_at": (identity or {}).get("updated_at", ""),
+        "relationship_started_at": (
+            identity or {}
+        ).get("relationship_started_at", ""),
+        "relationship_anchor_source": (
+            identity or {}
+        ).get("relationship_anchor_source", ""),
+        "has_relationship_anchor_evidence": bool(
+            str(
+                (identity or {}).get("relationship_anchor_evidence") or ""
+            ).strip()
+        ),
+    }
+    return row
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
+    if include_detail:
+        return _build_data_track_user_detail(user_entry)
+
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(
         user_id,
@@ -2246,109 +2459,6 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "history_import": history_import,
         "genesis": genesis,
     }
-    if include_detail:
-        daily_days = _data_track_query_int(
-            "days",
-            default=14,
-            minimum=1,
-            maximum=90,
-        )
-        detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
-        detail_snapshot_status = dict(
-            detail_snapshot.get("snapshot_read_status") or {
-                "level": "unavailable",
-                "message": "取数状态缺失",
-            }
-        )
-        detail_snapshot["snapshot_read_status"] = detail_snapshot_status
-        row["snapshot_read_status"] = detail_snapshot_status
-        row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
-        row["screen_frames"] = _data_track_screen_frames_from_snapshot(
-            detail_snapshot
-        )
-        # Same key the list rows carry (_build_data_track_user_fast), so a
-        # client reading one shape can read the other.
-        row["user_mcp"] = _data_track_user_mcp_from_snapshot(detail_snapshot)
-        detail_blobs = detail_snapshot.get("blobs") or {}
-        row["responder"] = _effective_responder(
-            route=route,
-            consumer_state=(
-                detail_blobs.get("consumer_state")
-                if isinstance(detail_blobs.get("consumer_state"), dict)
-                else None
-            ),
-            runtime=detail_snapshot.get("responder_runtime"),
-            snapshot_read_status=detail_snapshot_status,
-        )
-        try:
-            row["daily_usage"] = db.admin_data_track_user_daily_usage(
-                user_id=user_id,
-                days=daily_days,
-                tz="Asia/Shanghai",
-            )
-            row["daily_usage_query"] = "ok"
-        except db.AdminDataTrackDailyUsageReadError:
-            row["daily_usage"] = []
-            row["daily_usage_query"] = "failed"
-        row["daily_usage_days"] = daily_days
-        row["runtime"] = _runtime_summary(store)
-        row["model_api_routes"] = _model_api_route_summaries(user_id)
-        row["notice_summaries"] = _notice_summaries(user_id)
-        row["provider_attempt_ledger"] = _provider_attempts_detail(store)
-        row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
-        row["v2_recent_jobs"] = _v2_recent_jobs_detail(user_id)
-        row["v2_profile"] = _v2_profile_detail(user_id)
-        row["memory_capture_validation"] = _memory_capture_validation_detail(store)
-        _ps = store.load_proactive_settings()
-        # 主动侧的 V2 真相:上面的 `proactive` 块是 V1 口径,对 V2 用户结构性显示 0
-        # (唤醒 job 在 agent_jobs、回复行 source 恒为 model_api)。这两个块补上
-        # 「真跑了多少」与「现在为什么不到期」——2026-08-10 少了它们,我拿 V1 口径
-        # 的 0 差点判成「心跳十天没跑」。
-        row["v2_wake_activity"] = _v2_wake_activity_detail(user_id)
-        row["v2_wake_schedule"] = _v2_wake_schedule_detail(user_id, _ps)
-        row["perception_permissions"] = {
-            # what the device reports it granted (free-form; keys are app-defined,
-            # e.g. photos / screen / location / health / motion / calendar / audio)
-            "permission_states": dict(_ps.get("permission_states") or {}),
-            # per-user autonomy switches (all default on)
-            "switches": {
-                "ambient_心跳": bool(_ps.get("enabled", True)),
-                "dnd_勿扰": bool(_ps.get("dnd", False)),
-                "scheduled_定时": bool(_ps.get("scheduled", True)),
-                "dream_做梦": bool(_ps.get("dream_enabled", True)),
-                "capture_记忆整理": bool(_ps.get("capture_enabled", True)),
-                "screen_watch_屏幕观察": bool(_ps.get("screen_watch_enabled", True)),
-                "photo_wake_照片唤醒": bool(_ps.get("photo_wake_enabled", True)),
-                "arrival_wake_到达唤醒": bool(_ps.get("arrival_wake_enabled", True)),
-                "unlock_wake_解锁唤醒": bool(_ps.get("unlock_wake_enabled", True)),
-            },
-            # User-authored natural language is private content. Data-track may
-            # expose whether it is configured, never the directive itself.
-            "wake_directive_configured": bool(str(_ps.get("wake_directive") or "").strip()),
-            "wake_interval_sec": int(_ps.get("wake_interval_sec") or 0),
-            "user_state": _ps.get("user_state"),
-            "ai_state": _ps.get("ai_state"),
-            "broadcast_state": _ps.get("broadcast_state"),
-        }
-        # Per-field last-report freshness (timestamps only, no values) so support
-        # can tell "device stopped feeding X" from a backend read gap — the two
-        # blind spots that cost us in usr_7f30 / usr_5d3d triage.
-        try:
-            from perception import service as _perception_service
-            row["perception_freshness"] = _perception_service.admin_perception_freshness(
-                str(user_entry.get("user_id") or "")
-            )
-        except Exception as e:  # noqa: BLE001 — observability must never 500 the page
-            row["perception_freshness"] = {"error": f"{type(e).__name__}:{str(e)[:120]}"}
-        row["identity"] = {
-            "written": identity is not None,
-            "updated_at": identity_updated_at,
-            "relationship_started_at": (identity or {}).get("relationship_started_at", ""),
-            "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", ""),
-            "has_relationship_anchor_evidence": bool(
-                str((identity or {}).get("relationship_anchor_evidence") or "").strip()
-            ),
-        }
     return row
 
 

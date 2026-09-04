@@ -681,6 +681,7 @@ def test_background_lane_coverage_uses_weakest_observed_and_current_route():
 def test_data_track_admin_connection_sets_session_timeout_and_resets(
         monkeypatch):
     executed = []
+    leases = []
 
     class FakeConnection:
         def execute(self, sql):
@@ -698,17 +699,31 @@ def test_data_track_admin_connection_sets_session_timeout_and_resets(
 
     class FakePool:
         def connection(self, *, timeout):
-            assert timeout == 5
+            leases.append(timeout)
             return FakeLease()
 
     monkeypatch.setattr(db, "get_pool", lambda: FakePool())
     with pytest.raises(RuntimeError, match="probe"):
         with db._admin_data_track_connection():
             raise RuntimeError("probe")
+    with pytest.raises(RuntimeError, match="detail probe"):
+        with db._admin_data_track_connection(
+            timeout_ms=db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS,
+        ):
+            raise RuntimeError("detail probe")
 
     assert executed == [
-        "SET statement_timeout = '5000ms'",
+        f"SET statement_timeout = '{db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'",
         "RESET statement_timeout",
+        (
+            "SET statement_timeout = "
+            f"'{db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS}ms'"
+        ),
+        "RESET statement_timeout",
+    ]
+    assert leases == [
+        db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000,
+        db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS / 1000,
     ]
 
 
@@ -727,7 +742,7 @@ def test_t428_dau_and_daily_usage_use_bounded_admin_connection(monkeypatch):
             return EmptyResult()
 
     @contextlib.contextmanager
-    def bounded_connection():
+    def bounded_connection(**_kwargs):
         calls.append("bounded")
         yield FakeConnection()
 
@@ -742,6 +757,61 @@ def test_t428_dau_and_daily_usage_use_bounded_admin_connection(monkeypatch):
         user_id="usr_t428", days=1
     ) == []
     assert calls == ["bounded", "bounded"]
+
+
+def test_t478_user_usage_queries_narrow_stream_before_json_filter(monkeypatch):
+    """Keep the detail queries on the existing per-user stream index.
+
+    Filtering ``app_session_end`` first selects the fleet-wide partial index;
+    for a heavy user that read tens of thousands of other users' rows.  The
+    materialized CTE is the deliberate optimization boundary.
+    """
+    executed = []
+
+    class EmptyResult:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def execute(self, sql, *_args, **_kwargs):
+            executed.append(str(sql))
+            return EmptyResult()
+
+    @contextlib.contextmanager
+    def bounded_connection(**_kwargs):
+        yield FakeConnection()
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", bounded_connection)
+
+    db.admin_data_track_snapshot(["usr_a", "usr_b"])
+    fleet_usage_query = next(
+        " ".join(sql.split())
+        for sql in executed
+        if "app_session_end" in sql and "foreground_sec" in sql
+    )
+    assert "user_tracking AS MATERIALIZED" not in fleet_usage_query
+    assert "FROM user_logs" in fleet_usage_query
+
+    executed.clear()
+    db.admin_data_track_snapshot(
+        ["usr_t478"],
+        narrow_app_usage_to_user_stream=True,
+    )
+    db.admin_data_track_user_daily_usage(user_id="usr_t478", days=14)
+
+    usage_queries = [
+        " ".join(sql.split())
+        for sql in executed
+        if "app_session_end" in sql and "foreground_sec" in sql
+    ]
+    assert len(usage_queries) == 2
+    for sql in usage_queries:
+        assert "user_tracking AS MATERIALIZED" in sql
+        assert "stream = 'tracking_events'" in sql
+        assert "FROM user_tracking" in sql
 
 
 def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
@@ -1040,6 +1110,43 @@ def test_user_detail_daily_usage_json_page_and_events_limit(client):
     assert (first_day + timedelta(days=1)).isoformat() in body
 
 
+def test_t478_user_detail_never_materializes_store_caches(client, monkeypatch):
+    user_id, _ = _register(client)
+    snapshot_calls = []
+    real_snapshot = db.admin_data_track_snapshot
+
+    def forbidden_store_load(*_args, **_kwargs):
+        raise AssertionError("detail page materialized a legacy Store cache")
+
+    def observed_snapshot(user_ids, **kwargs):
+        snapshot_calls.append(kwargs)
+        return real_snapshot(user_ids, **kwargs)
+
+    monkeypatch.setattr(core_store, "get_store", forbidden_store_load)
+    monkeypatch.setattr(
+        db,
+        "chat_load_hot_snapshot_strict",
+        forbidden_store_load,
+    )
+    monkeypatch.setattr(db, "admin_data_track_snapshot", observed_snapshot)
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}",
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    row = response.get_json()["user"]
+    assert row["user_id"] == user_id
+    assert row["snapshot_read_status"]["level"] == "ok"
+    assert row["onboarding"]["steps"]
+    assert snapshot_calls == [{
+        "include_worldbook": True,
+        "narrow_app_usage_to_user_stream": True,
+        "statement_timeout_ms": db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS,
+    }]
+
+
 def test_t428_daily_usage_query_failure_is_distinct_from_true_zero(
     client, monkeypatch
 ):
@@ -1048,17 +1155,23 @@ def test_t428_daily_usage_query_failure_is_distinct_from_true_zero(
     state = {"failed": False}
 
     @contextlib.contextmanager
-    def broken_connection():
+    def broken_connection(**_kwargs):
         raise RuntimeError("injected daily usage query failure")
         yield  # pragma: no cover - makes this a contextmanager generator
 
-    def daily_usage(*, user_id, days, tz):
+    def daily_usage(*, user_id, days, tz, statement_timeout_ms):
+        assert statement_timeout_ms == db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS
         if state["failed"]:
             with monkeypatch.context() as failure_patch:
                 failure_patch.setattr(
                     db, "_admin_data_track_connection", broken_connection
                 )
-                return real_daily_usage(user_id=user_id, days=days, tz=tz)
+                return real_daily_usage(
+                    user_id=user_id,
+                    days=days,
+                    tz=tz,
+                    statement_timeout_ms=statement_timeout_ms,
+                )
         return [{
             "day": "2030-01-01",
             "foreground_sec": 0,
