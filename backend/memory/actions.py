@@ -231,12 +231,22 @@ def _memory_inheritable_inner_fields(inner: dict | None) -> dict:
     return fields
 
 
-def _memory_plain_from_envelope(moment: dict, api_key: str | None, runtime_token: str = "") -> tuple[dict | None, str]:
+def _memory_plain_from_envelope(
+    user_id: str,
+    moment: dict,
+    api_key: str | None,
+    runtime_token: str = "",
+) -> tuple[dict | None, str]:
     if moment.get("visibility") == "local_only":
         return None, "memory_local_only_agent_cannot_read"
     try:
         raw = core_envelope.read_envelope_body(
-            moment, api_key, purpose="memory_action", runtime_token=runtime_token)
+            moment,
+            api_key,
+            purpose="memory_action",
+            caller_user_id=str(user_id),
+            runtime_token=runtime_token,
+        )
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):
             return None, "memory_plaintext_not_object"
@@ -865,7 +875,7 @@ def _memory_supersede_action(
         return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
 
     old_inner, old_inner_err = _memory_plain_from_envelope(
-        old_cards[0], api_key, runtime_token=runtime_token)
+        store.user_id, old_cards[0], api_key, runtime_token=runtime_token)
     if old_inner is None:
         return {
             "status": "error",

@@ -12,6 +12,36 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Chat now distinguishes relay tool-history failures from tool-schema
+  incompatibility.** When a relay rejects the native tool-result transcript,
+  Runtime V2 stops after that provider call instead of dropping tools and
+  making a second request that is expected to fail identically. The resulting
+  `provider_tool_history_rejected` notice tells users that tools are temporarily
+  unavailable on the channel and recommends switching models or trying again
+  later.
+
+- **The text you send with an image is now followed again when a dedicated
+  vision model is configured.** Runtime V2 previously handed the main model the
+  observation wrapped in untrusted-data framing with your message beside it,
+  which led models to treat your own words as an instruction injected from the
+  picture and decline to act on them. The observation now reaches the main model
+  as labelled text (`Image 1:`, `Image 2:`, …) followed by your message under an
+  explicit attribution. Images you did not send — `photo_read` and `screen_read`
+  tool results, which may show text written by someone else — keep the untrusted
+  framing, as does the official resident consumer.
+
+- **Hosted Chat now accepts up to nine images in one user turn.** Use the new
+  `images` array for multi-image messages; the existing `image_b64` and
+  `image_mime` single-image fields remain compatible. Empty arrays, mixed old
+  and new image forms, and batches over nine are rejected explicitly instead
+  of being truncated.
+
+- **Plaintext perception photos can now be read through the same authorized
+  photo workflow as encrypted photos.** The frame reader recognizes raw JPEG,
+  PNG, WebP, HEIC, and AVIF plaintext bodies in addition to JSON screen-frame
+  bundles. Plaintext visual bodies never fall through to enclave decryption;
+  malformed stored plaintext now returns `frame_plaintext_invalid`.
+
 - **Canvas viewers can now fetch the current workspace revision instead of
   remaining pinned to the attachment published in an older Chat message.**
   `GET /v1/chat/workspace/body` accepts the original `.io.html` `file_name`,

@@ -251,7 +251,7 @@ def test_patch_read_only_approvals_without_resending_secrets(
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, *, purpose, runtime_token="": bytes.fromhex(
+        lambda envelope, key, *, purpose, caller_user_id, runtime_token="": bytes.fromhex(
             envelope["body_ct"]
         ),
     )
@@ -332,7 +332,7 @@ def test_test_endpoint_decrypts_and_probes(client, monkeypatch):
 
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, *, purpose, runtime_token="": json.dumps(
+        lambda env, key, *, purpose, caller_user_id, runtime_token="": json.dumps(
             {"url": "https://mcp.example.com/mcp", "headers": {}}).encode())
     monkeypatch.setattr(
         mcp_probe, "probe",
@@ -363,7 +363,7 @@ def test_test_endpoint_probe_error_returns_400(client, monkeypatch):
 
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, *, purpose, runtime_token="": json.dumps(
+        lambda env, key, *, purpose, caller_user_id, runtime_token="": json.dumps(
             {"url": "https://mcp.example.com/mcp", "headers": {}}).encode())
 
     def _raise(url, headers, *, ca_pem=None, transport=None, transport_hint=""):

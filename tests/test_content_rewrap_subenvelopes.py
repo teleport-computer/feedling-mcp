@@ -103,7 +103,7 @@ def _with_thinking(msg: dict, *, thinking_id: str | None = "think1", shared: boo
     return msg
 
 
-def _fake_decrypt(envelope, key, purpose):
+def _fake_decrypt(envelope, key, purpose, caller_user_id):
     return f"plaintext:{envelope.get('id')}:{envelope.get('body_ct')}".encode()
 
 
@@ -206,7 +206,7 @@ def test_rewrap_falls_back_to_record_id_when_thinking_id_absent(client, monkeypa
     assert msg["thinking_id"] == "chatX"
 
 
-def _decrypt_ok_main_fail_thinking(envelope, key, purpose):
+def _decrypt_ok_main_fail_thinking(envelope, key, purpose, caller_user_id):
     if "thinking" in purpose:
         raise RuntimeError("enclave_http_502")
     return f"plaintext:{envelope.get('id')}".encode()

@@ -114,6 +114,9 @@ def _spec(
 
 def _chat_specs() -> tuple[ErrorSpec, ...]:
     return (
+        _spec("image_payload_conflict", "chat", "request", "user_environment", "一次只能使用单图字段或多图字段，请勿同时发送。", en="Send either the single-image fields or images, not both."),
+        _spec("image_list_empty", "chat", "request", "user_environment", "图片列表不能为空。", en="The images list must not be empty."),
+        _spec("image_count_exceeds_limit", "chat", "request", "user_environment", "一次最多发送 9 张图片。", en="You can send at most 9 images in one message."),
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
         _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
         _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
@@ -121,6 +124,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", en="The model name is unavailable. Check the model name in Settings.", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
         _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", en="The Agent launch command is invalid because it is missing the {message} placeholder. Fix AGENT_CLI_CMD.", matcher=r"missing the \{message\} placeholder"),
         _spec("vision_model_required", "vision", "vision_model", "user_provider", "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型", en="Your current model can't process images, so it didn't receive this picture. Switch models, or add a dedicated vision model in Settings.", matcher=r"unknown variant `image_url`, expected `text`|no endpoints found that support image input"),
+        _spec("provider_tool_history_rejected", "chat", "provider", "user_provider", "模型似乎调用工具出错了，这个通道暂时无法使用工具，换个模型或稍后重试。", en="The model seems to have hit an error calling tools, so tools are temporarily unavailable on this channel. Switch models or try again later.", matcher=r"function_response\.name:\s*\[required_field_missing\]|function call is missing a thought_signature in functioncall parts|please ensure that function call turn comes immediately after a user turn or after a function response turn"),
         _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", en="The current model does not support a capability used by this request. Choose another model or adjust it in Settings.", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
         _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", en="This conversation is too long for the model's context window. Shorten it and try again.", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
         _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=r"content_filter|content policy|safety|blocked by"),
@@ -132,7 +136,17 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
         _spec("file_delivery_incomplete", "chat", "delivery", "system", "文件内容已经保存，但附件发送没有完成。请稍后再试。", en="The file was saved, but its attachment was not delivered. Please try again later.", matcher=r"\bfile_delivery_incomplete\b"),
         _spec("canvas_file_delivery_incomplete", "chat", "delivery", "system", "画布内容已经保存，但卡片更新没有完成。请稍后再试。", en="The Canvas content was saved, but its card update did not finish. Please try again later.", matcher=r"\bcanvas_file_delivery_incomplete\b"),
-        _spec("reply_parse_failed", "chat", "provider", "system", "系统处理回复时出了问题，我们会尽快排查。"),
+        _spec(
+            "reply_parse_failed",
+            "chat",
+            "provider",
+            "system",
+            "系统处理回复时出了问题，我们会尽快排查。请再发一次。",
+            en=(
+                "Something went wrong while we processed the reply. "
+                "We're looking into it — please send it again."
+            ),
+        ),
         _spec("unknown", "chat", "provider", "system", "连接模型服务时出了问题。"),
         _spec(UNREGISTERED_ERROR_CLASS, "chat", "contract", "system", "系统返回了未注册的错误分类，我们已记录并会尽快排查。", en="The runtime returned an unregistered error classification. We recorded it for investigation."),
     )
@@ -160,10 +174,67 @@ def _workflow_specs() -> tuple[ErrorSpec, ...]:
 
 def _resident_specs() -> tuple[ErrorSpec, ...]:
     return (
-        _spec("resident_consumer_stale", "resident", "resident", "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
-        _spec("resident_decrypt_source_unavailable", "resident", "resident", "user_environment", "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。"),
-        _spec("resident_decrypt_health_unreported", "resident", "resident", "user_environment", "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。"),
-        _spec("resident_never_claimed", "resident", "resident", "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
+        _spec(
+            "resident_agent_cli_logged_out",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS 上的 AI 助手登录已失效，请到 VPS 上重新登录后再试。",
+            en=(
+                "Your AI assistant on the VPS is no longer signed in. Please "
+                "sign in again on the VPS and try once more."
+            ),
+            matcher=(
+                r"failed to authenticate:\s*oauth session expired and could not "
+                r"be refreshed|not logged in\s*·\s*please run /login"
+            ),
+        ),
+        _spec(
+            "resident_consumer_stale",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。",
+            en=(
+                "Your VPS resident consumer may be out of date, or it is not "
+                "picking up tasks properly. Please update it and restart."
+            ),
+        ),
+        _spec(
+            "resident_decrypt_source_unavailable",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。",
+            en=(
+                "The decryption source on your VPS resident is unavailable, so "
+                "encrypted messages cannot be answered for now."
+            ),
+        ),
+        _spec(
+            "resident_decrypt_health_unreported",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。",
+            en=(
+                "Your VPS resident has not reported a verifiable decryption "
+                "health status. This usually means the consumer is out of date. "
+                "Please update it and restart."
+            ),
+        ),
+        _spec(
+            "resident_never_claimed",
+            "resident",
+            "resident",
+            "user_environment",
+            "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。",
+            en=(
+                "Your VPS resident consumer has not picked up onboarding or "
+                "memory distillation tasks for a long time. Please update it "
+                "and restart."
+            ),
+        ),
     )
 
 
@@ -306,7 +377,15 @@ def consumer_specs() -> tuple[ErrorSpec, ...]:
     return tuple(
         spec
         for spec in public_specs()
-        if spec.domain in {"chat", "platform", "vision", "image_generation"}
+        # Every matcher is a possible classify_agent_error result, including
+        # resident-domain CLI failures, so it belongs in the derived allowlist.
+        if (
+            spec.matcher_pattern
+            or spec.domain in {"chat", "platform", "vision", "image_generation"}
+        )
+        # Request validation failures are returned directly by the hosted API;
+        # they never enter the resident's agent-error classifier.
+        and spec.family != "request"
         and spec.code != "image_generation_internal_error"
     )
 

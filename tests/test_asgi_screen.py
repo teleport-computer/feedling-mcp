@@ -42,7 +42,9 @@ from core import config as core_config  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import runtime_token as rt_mod  # noqa: E402
 from core import store as core_store  # noqa: E402
+from capabilities import photo as cap_photo  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
+from perception import service as perception_service  # noqa: E402
 from screen import frames as screen_frames  # noqa: E402
 from screen import routes_asgi as screen_asgi  # noqa: E402
 from screen import screen_read_core  # noqa: E402
@@ -393,6 +395,163 @@ def test_plaintext_frame_ingest_and_reads_bypass_enclave(env, monkeypatch):
     assert decrypted.json_body["ocr_text"] == "hello"
     assert decrypted.json_body["image_b64"] == inner["image"]
     assert image.status == 200 and image.raw_body == b"jpeg-bytes"
+
+
+def test_plaintext_raw_photo_reads_bypass_enclave(env, monkeypatch):
+    uid, _api_key = _register()
+    fid = uuid.uuid4().hex
+    raw_jpeg = b"\xff\xd8\xff\xe0raw-photo-bytes\xff\xd9"
+    wire = {
+        "v": 1,
+        "id": fid,
+        "body_b64": base64.b64encode(raw_jpeg).decode(),
+        "body_size_bytes": len(raw_jpeg),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda user_id: "off")
+    store = core_store.get_store(uid)
+    screen_frames._save_frame(store, {"type": "frame", "ts": 123.0, "envelope": wire})
+
+    decrypted = screen_read_core.frame_decrypt(
+        store, fid, include_image="true", api_key=None, runtime_token=None)
+    image = screen_read_core.frame_image(
+        store, fid, range_header=None, api_key=None, runtime_token=None)
+
+    assert decrypted.status == 200
+    assert decrypted.json_body["decrypt_status"] == "plaintext"
+    assert decrypted.json_body["image_b64"] == base64.b64encode(raw_jpeg).decode()
+    assert decrypted.json_body["image_mime"] == "image/jpeg"
+    assert image.status == 200
+    assert image.raw_body == raw_jpeg
+    assert image.media_type == "image/jpeg"
+
+
+def test_plaintext_photo_lifecycle_reaches_capability_without_enclave(env, monkeypatch):
+    uid, _api_key = _register()
+    fid = uuid.uuid4().hex
+    raw_jpeg = b"\xff\xd8\xff\xe0photo-capability-regression\xff\xd9"
+    wire = {
+        "v": 1,
+        "id": fid,
+        "body_b64": base64.b64encode(raw_jpeg).decode(),
+        "body_size_bytes": len(raw_jpeg),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda user_id: "off")
+    monkeypatch.setattr(
+        screen_read_core.httpx,
+        "Client",
+        lambda *args, **kwargs: pytest.fail("plaintext photo must not call enclave"),
+    )
+
+    ingested, status = perception_service.photo_evaluate(
+        uid, {"scene_hint": "document"}, wire
+    )
+    result = cap_photo.read(
+        core_store.get_store(uid),
+        params={"photo_id": ingested["photo_id"], "include_image": True},
+    )
+
+    assert status == 200
+    assert result.ok is True
+    assert result.data["frame_id"] == fid
+    assert result.data["has_image"] is True
+    assert result.data["image_media_type"] == "image/jpeg"
+    assert base64.b64decode(result.data["image_b64"]) == raw_jpeg
+
+
+def test_malformed_plaintext_visual_never_falls_through_to_enclave(env, monkeypatch):
+    uid, _api_key = _register()
+    fid = uuid.uuid4().hex
+    malformed = b"not-json-or-a-recognized-image"
+    wire = {
+        "v": 1,
+        "id": fid,
+        "body_b64": base64.b64encode(malformed).decode(),
+        "body_size_bytes": len(malformed),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda user_id: "off")
+    store = core_store.get_store(uid)
+    screen_frames._save_frame(store, {"type": "frame", "ts": 123.0, "envelope": wire})
+
+    decrypted = screen_read_core.frame_decrypt(
+        store, fid, include_image="true", api_key=None, runtime_token=None)
+    image = screen_read_core.frame_image(
+        store, fid, range_header=None, api_key=None, runtime_token=None)
+
+    assert decrypted.status == 502
+    assert decrypted.json_body == {"error": "frame_plaintext_invalid"}
+    assert image.status == 502
+    assert image.json_body == {"error": "frame_plaintext_invalid"}
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        {"app": "Safari"},
+        {"image": "not-valid-base64", "app": "Safari"},
+        {"image": "", "app": "Safari"},
+    ],
+)
+def test_malformed_plaintext_screen_json_is_rejected(env, monkeypatch, inner):
+    uid, _api_key = _register()
+    fid = uuid.uuid4().hex
+    raw = json.dumps(inner).encode()
+    wire = {
+        "v": 1,
+        "id": fid,
+        "body_b64": base64.b64encode(raw).decode(),
+        "body_size_bytes": len(raw),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda user_id: "off")
+    monkeypatch.setattr(
+        screen_read_core.httpx,
+        "Client",
+        lambda *args, **kwargs: pytest.fail("malformed plaintext must not call enclave"),
+    )
+    store = core_store.get_store(uid)
+    screen_frames._save_frame(store, {"type": "frame", "ts": 123.0, "envelope": wire})
+
+    decrypted = screen_read_core.frame_decrypt(
+        store, fid, include_image="true", api_key=None, runtime_token=None
+    )
+    image = screen_read_core.frame_image(
+        store, fid, range_header=None, api_key=None, runtime_token=None
+    )
+
+    assert decrypted.status == 502
+    assert decrypted.json_body == {"error": "frame_plaintext_invalid"}
+    assert image.status == 502
+    assert image.json_body == {"error": "frame_plaintext_invalid"}
+
+
+def test_mixed_frame_envelope_is_not_locally_decoded_as_plaintext(monkeypatch):
+    mixed = {
+        "v": 1,
+        "id": uuid.uuid4().hex,
+        "body_ct": "sealed-ciphertext",
+        "nonce": "nonce",
+        "K_user": "wrapped-user-key",
+        "K_enclave": "wrapped-enclave-key",
+        "body_b64": base64.b64encode(b"{\"image\":\"stale\"}").decode(),
+        "visibility": "shared",
+        "owner_user_id": "usr_test",
+    }
+    monkeypatch.setattr(
+        core_envelope.enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *args, **kwargs: pytest.fail(
+            "plaintext helper must classify before reading mixed envelopes"
+        ),
+    )
+
+    assert screen_frames._read_plaintext_frame(mixed) is None
 
 
 def test_encrypted_account_rejects_plaintext_frame_ingest(env, monkeypatch):

@@ -5,6 +5,7 @@ Regression tests for tools/chat_resident_consumer.py
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
+import ast
 import base64
 import json
 import os
@@ -6687,6 +6688,91 @@ def test_local_time_anchor_localizes_with_whoami_timezone(monkeypatch):
     line = crc._local_time_anchor()
     assert line.startswith("current_time:")
     assert "Asia/Shanghai" in line
+
+
+def test_prompt_history_times_match_current_anchor_timezone(monkeypatch):
+    """Every model-facing Resident transcript uses the anchor's local zone.
+
+    Each assertion names one prompt site, so reverting any one of them to the
+    UTC persistence formatter makes this test fail independently.
+    """
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    ts = 1_700_000_000.0
+    expected = "2023-11-15T06:13:20+08:00 Asia/Shanghai"
+
+    anchor = crc._local_time_anchor()
+    foreground_and_proactive = crc._chat_context_line(
+        {"role": "user", "content": "早上好", "ts": ts}, now=ts + 10, stale=False
+    )
+    assert "Asia/Shanghai" in anchor
+    assert expected in foreground_and_proactive
+
+    monkeypatch.setattr(
+        crc, "_capture_voice_transcript_text", lambda _call_id: "- 小雨: 电话全文"
+    )
+    capture = crc._capture_window_text(
+        [
+            {"role": "user", "content": "普通消息", "ts": ts},
+            {
+                "role": "openclaw",
+                "source": crc.VOICE_TRANSCRIPT_SOURCE,
+                "voice_call_id": "call-local-time",
+                "content": "通话预览",
+                "ts": ts,
+            },
+        ],
+        user_label="小雨",
+        agent_label="小舟",
+    )
+    assert capture.count(expected) == 2
+
+    monkeypatch.setattr(
+        crc,
+        "get_decrypted_history",
+        lambda **_kwargs: [{"role": "user", "content": "梦境消息", "ts": ts}],
+    )
+    dream, _written = crc._dream_recent_conversations_context(
+        user_label="小雨", agent_label="小舟"
+    )
+    assert expected in dream
+
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "")
+    monkeypatch.setattr(crc, "_DEFAULT_TIMEZONE", "America/New_York")
+    fallback_anchor = crc._local_time_anchor()
+    fallback_history = crc._chat_context_line(
+        {"role": "user", "content": "fallback", "ts": ts}, now=ts + 10, stale=False
+    )
+    assert "America/New_York" in fallback_anchor
+    assert "2023-11-14T17:13:20-05:00 America/New_York" in fallback_history
+
+
+def test_prompt_message_time_rejects_malformed_zone_without_failing(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "../malformed-zone")
+    assert crc._format_prompt_message_time(1_700_000_000.0) == (
+        "2023-11-14T22:13:20+00:00 UTC"
+    )
+
+
+def test_memory_occurred_at_sites_remain_utc_z():
+    """Prompt localization must never change persisted memory timestamps."""
+    assert crc._format_message_time(1_700_000_000.0) == "2023-11-14T22:13:20Z"
+
+    source = Path(crc.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    utc_calls_by_function: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        utc_calls_by_function[node.name] = sum(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_format_message_time"
+            for call in ast.walk(node)
+        )
+
+    assert utc_calls_by_function["_capture_occurred_at"] == 1
+    assert utc_calls_by_function["_process_dream_jobs"] == 1
+    assert utc_calls_by_function["_process_migrate_jobs"] == 1
 
 
 def test_user_timezone_empty_when_whoami_has_none(monkeypatch):

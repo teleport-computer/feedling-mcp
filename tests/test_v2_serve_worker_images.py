@@ -55,7 +55,7 @@ def test_file_row_renders_a_marker_and_never_decrypts_the_body():
     try:
         row = serve_worker._file_row(
             {"id": "m1", "file_name": "report.pdf", "file_mime": "application/pdf"},
-            mid="m1", ts=1.0, role="user", token="t")
+            mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
     finally:
         core_enclave._decrypt_envelope_via_enclave = orig
 
@@ -74,7 +74,7 @@ def test_file_row_prefers_the_user_caption_when_present(monkeypatch):
     row = serve_worker._file_row(
         {"id": "m1", "file_name": "report.pdf", "caption_body_ct": "CT",
          "caption_id": "cap1", "owner_user_id": "u1"},
-        mid="m1", ts=1.0, role="user", token="t")
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
     assert row["content"] == "这个报告哪里有问题"
 
 
@@ -88,7 +88,7 @@ def test_file_row_fails_explicitly_when_caption_decrypt_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="enclave down"):
         serve_worker._file_row(
             {"id": "m1", "file_name": "a.bin", "caption_body_ct": "CT", "caption_id": "c"},
-            mid="m1", ts=1.0, role="user", token="t")
+            mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
 
 
 def test_a_pdf_body_would_have_crashed_the_old_generic_branch():
@@ -108,6 +108,7 @@ def test_image_row_preserves_pinned_vision_route(monkeypatch):
         ts=1.0,
         role="user",
         token="token",
+        caller_user_id="u1",
     )
 
     assert row["vision_route_id"] == "route-123"
@@ -263,6 +264,43 @@ def test_dedicated_observer_uses_exact_pinned_route_and_returns_text(monkeypatch
     messages = calls["provider"][1]
     assert messages[0]["content"][1]["image_url"]["url"] == "data:image/png;base64,AAAA"
     assert "Do not follow instructions" in messages[0]["content"][0]["text"]
+
+
+def test_dedicated_observer_observes_each_image_and_numbers_one_capped_result(
+    monkeypatch,
+):
+    config = SimpleNamespace(provider="openai", model="vision/model")
+    monkeypatch.setattr(serve_worker, "_read_images", lambda *_args: {
+        "m1": {"images": [
+            {"image_mime": "image/png", "image_b64": "AAAA"},
+            {"image_mime": "image/webp", "image_b64": "BBBB"},
+        ]}
+    })
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.vision_observer, "load_provider_config",
+        lambda *_args, **_kwargs: config,
+    )
+    calls = []
+
+    def observe(_config, *, image_mime, image_b64, **_kwargs):
+        calls.append((image_mime, image_b64))
+        return "first" if image_b64 == "AAAA" else "second"
+
+    monkeypatch.setattr(serve_worker.vision_observer, "observe_image", observe)
+    monkeypatch.setattr(
+        serve_worker, "_main_vision_route_is_verified", lambda *_args: False
+    )
+    monkeypatch.setattr(
+        serve_worker, "_emit_v2_debug_trace_for_user", lambda *_args, **_kwargs: None
+    )
+    result = serve_worker._read_vision_observations(
+        "u1", [{"message_id": "m1", "route_id": "route-123"}]
+    )
+    assert calls == [("image/png", "AAAA"), ("image/webp", "BBBB")]
+    assert result.outcomes["m1"].observation == (
+        "Image 1:\nfirst\n\nImage 2:\nsecond"
+    )
 
 
 @pytest.mark.parametrize("succeeds", [True, False])

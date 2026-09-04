@@ -891,7 +891,7 @@ def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypa
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-existing",
+        lambda envelope, key, purpose, caller_user_id: b"sk-existing",
     )
     update = client.post(
         "/v1/model_api/setup",
@@ -938,7 +938,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):
@@ -1083,7 +1083,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):
@@ -1145,7 +1145,7 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
     setup = client.post(
         "/v1/model_api/setup",
@@ -1186,7 +1186,7 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):
@@ -2088,7 +2088,7 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):

@@ -295,6 +295,8 @@ if not _provisioned:
         # and compare pure BoxSeal helpers with current backend/enclave codecs.
         "test_v1_envelope_roundtrip_tool.py",
         "test_frame_envelope_roundtrip_tool.py",
+        # Frame source boundary inventory is a pure AST scan: no DB or network.
+        "test_frame_source_contract.py",
         # Fully monkeypatched consumer prompt-gate unit — no DB, no network.
         "test_user_mcp_wait_hint.py",
         "test_bucket_lang_normalize.py",

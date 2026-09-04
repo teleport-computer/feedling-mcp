@@ -133,6 +133,7 @@ def _production_deps() -> InspectDeps:
                 envelope,
                 None,
                 purpose="runtime_v2_trajectory_break_glass",
+                caller_user_id=user_id,
                 runtime_token=token,
             )
         body = envelope.get("body")
@@ -148,6 +149,7 @@ def _production_deps() -> InspectDeps:
             envelope,
             None,
             purpose="runtime_v2_trajectory_break_glass",
+            caller_user_id=user_id,
             runtime_token=token,
         )
 

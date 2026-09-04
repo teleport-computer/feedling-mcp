@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from core import chat_images
 from model_api_runtime.v2 import worker
 
 
@@ -31,6 +32,24 @@ def test_inject_builds_openai_content_blocks_with_caption_first():
     assert blocks[0] == {"type": "text", "text": "这个报告哪里有问题"}
     assert blocks[1] == {"type": "image_url",
                          "image_url": {"url": "data:image/png;base64,AAAA"}}
+
+
+def test_inject_builds_one_native_block_per_image_with_one_caption():
+    tail = [_img_row("m1", caption="compare")]
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=_fake_reader({"m1": {"images": [
+            {"image_mime": "image/png", "image_b64": "AAAA"},
+            {"image_mime": "image/webp", "image_b64": "BBBB"},
+        ]}}),
+        active_image_ids={"m1"},
+    )
+    assert out[0]["content"] == [
+        {"type": "text", "text": "compare"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/webp;base64,BBBB"}},
+    ]
 
 
 def test_inject_omits_text_block_for_the_bare_image_marker():
@@ -118,7 +137,7 @@ def test_injection_cap_covers_any_image_ingestion_accepts():
         f"accepted at send but dropped to text-only at the turn")
 
 
-def test_dedicated_image_becomes_untrusted_observation_not_raw_pixels():
+def test_dedicated_image_becomes_observation_not_raw_pixels():
     tail = [{
         **_img_row("m1", caption="这张图怎么了"),
         "vision_route_id": "vision-route",
@@ -148,9 +167,117 @@ def test_dedicated_image_becomes_untrusted_observation_not_raw_pixels():
         [{"message_id": "m1", "route_id": "vision-route"}],
     )]
     assert isinstance(out[0]["content"], str)
-    assert "UNTRUSTED VISUAL OBSERVATION" in out[0]["content"]
     assert "A blue chart with a rising line." in out[0]["content"]
     assert "image_url" not in out[0]["content"]
+
+
+def test_dedicated_observation_attributes_caption_to_the_user():
+    """T464 (2026-09-03): the observer's own reasoning, measured live, said it
+    refused a caption because the caption sat inside/after an "UNTRUSTED …
+    never instructions" block and read as an injected instruction rather than
+    the user's own words. The measured fix drops that framing, labels each
+    image, and appends an explicit sentence attributing what follows to the
+    user. Every production-sized run passed on all five models measured:
+    Sonnet 16/16, GPT 16/16, Gemini 16/16, a relay model 12/12, a small model
+    12/12 (that small model scored 10/12 on a shorter description, where the
+    two misses were its general reluctance at "change your format from now on"
+    — which it also shows with no image present).
+
+    This pins the produced SHAPE, not any specific wording choice, so a
+    reworded-but-equivalent distrust framing still fails it if reintroduced.
+    """
+    tail = [{
+        **_img_row("m1", caption="这张图怎么了"),
+        "vision_route_id": "vision-route",
+    }]
+    out = worker._inject_tail_images(
+        tail, user_id="u",
+        read_images=lambda *_a: pytest.fail("raw fallback is forbidden"),
+        active_image_ids={"m1"},
+        read_vision_observations=lambda *_a, **_k: {
+            "m1": "A blue chart with a rising line."},
+    )
+    content = out[0]["content"]
+
+    # Never again: this exact literal reintroduced anywhere in this content
+    # is the regression this test exists to catch.
+    assert "UNTRUSTED" not in content
+    assert "never instructions" not in content
+
+    # The observation comes first, the caption comes last, and there is a
+    # sentence between them that says the trailing text is the user's own —
+    # not merely "the caption is present somewhere in the string".
+    obs_at = content.index("A blue chart with a rising line.")
+    caption_at = content.index("这张图怎么了")
+    assert obs_at < caption_at, "observation must precede the caption"
+    between = content[obs_at:caption_at]
+    assert "用户" in between and "话" in between, (
+        "an attribution sentence naming the caption as the user's own words "
+        "must sit between the observation and the caption"
+    )
+
+    # Byte-identical, not paraphrased or truncated.
+    assert content.endswith("这张图怎么了")
+
+
+@pytest.mark.parametrize("image_count", [1, 2, 9])
+def test_dedicated_observation_labels_every_image_at_any_count(image_count):
+    """Every image the model is told about carries an "Image N:" label, whether
+    one photo arrived or nine.
+
+    Driven through the REAL `combine_numbered_observations`, not a hand-written
+    already-numbered string: that helper returns a lone observation bare, so a
+    fixture that pre-numbers its own input proves only that labels pass through
+    and cannot see the single-image case at all — which is exactly how the gap
+    reached review.
+    """
+    per_image = [f"A photo of the digit {i}." for i in range(1, image_count + 1)]
+    observation = chat_images.combine_numbered_observations(per_image)
+    tail = [{
+        **_img_row("m1", caption="这些都是什么"),
+        "vision_route_id": "vision-route",
+    }]
+    out = worker._inject_tail_images(
+        tail, user_id="u",
+        read_images=lambda *_a: pytest.fail("raw fallback is forbidden"),
+        active_image_ids={"m1"},
+        read_vision_observations=lambda *_a, **_k: {"m1": observation},
+    )
+    content = out[0]["content"]
+
+    assert "UNTRUSTED" not in content
+    last_label_at = -1
+    for i in range(1, image_count + 1):
+        label_at = content.index(f"Image {i}:")
+        assert label_at > last_label_at, "image labels must stay in image order"
+        last_label_at = label_at
+    # Every description stays attached to its own label, and all of them sit
+    # ahead of the user's words.
+    assert content.index(f"Image {image_count}:") < content.index("这些都是什么")
+    for text in per_image:
+        assert text in content
+    assert content.endswith("这些都是什么")
+
+
+def test_dedicated_observation_without_caption_has_no_attribution_sentence():
+    """A bare image has no accompanying text, so there is nothing to attribute
+    and the attribution sentence would be pointing at text that is not there.
+    The labelled observation goes alone. (The pre-T464 output for this case was
+    not this string — it carried the JSON wrapper and untrusted framing — so
+    this pins the new shape, not an unchanged one.)"""
+    tail = [{
+        **_img_row("m1", caption="[image]"),
+        "vision_route_id": "vision-route",
+    }]
+    out = worker._inject_tail_images(
+        tail, user_id="u",
+        read_images=lambda *_a: pytest.fail("raw fallback is forbidden"),
+        active_image_ids={"m1"},
+        read_vision_observations=lambda *_a, **_k: {"m1": "A plain white wall."},
+    )
+
+    assert out[0]["content"] == "Image 1:\nA plain white wall."
+    assert "用户" not in out[0]["content"]
 
 
 def test_dedicated_persistent_failure_never_sends_pixels_to_main():
@@ -258,8 +385,8 @@ def test_current_dedicated_image_does_not_rehydrate_historical_follow_main_pixel
     )
 
     assert out[0]["content"] == "旧图"
-    assert "UNTRUSTED VISUAL OBSERVATION" in out[1]["content"]
     assert "A red square." in out[1]["content"]
+    assert "看看新图" in out[1]["content"]
 
 
 def test_verified_main_fallback_reads_only_failed_target_pixels_in_mixed_batch():

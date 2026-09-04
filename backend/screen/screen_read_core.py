@@ -37,6 +37,7 @@ import httpx
 
 import db
 from core import enclave as core_enclave
+from core import envelope as core_envelope
 from screen import frames
 from screen import summary as summary_mod
 from semantic_analysis import analyze as _semantic_analysis
@@ -133,7 +134,7 @@ def screen_share_grounding(
     """
     if latest_frame_ts is None:
         try:
-            meta = db.frame_list_meta(user_id)
+            meta = db.frame_list_meta(user_id, source="screen")
         except Exception:
             return {}
         if not meta:
@@ -268,10 +269,26 @@ def sources_data(store) -> ScreenResult:
 
 def list_frames(store, limit_raw) -> ScreenResult:
     limit = min(int(limit_raw if limit_raw is not None else 20), 100)
+    try:
+        confirmed_screen_ids = {
+            str(row.get("id") or "")
+            for row in db.frame_list_meta(
+                store.user_id, source="screen", unavailable_raises=True
+            )
+        }
+    except db.FrameReadUnavailable:
+        return ScreenResult(
+            503, json_body={"error": "frame_store_unavailable"}
+        )
     with store.frames_lock:
-        recent = [f.copy() for f in reversed(store.frames_meta)][:limit]
-        latest_ts = store.frames_meta[-1].get("ts") if store.frames_meta else None
-        total = len(store.frames_meta)
+        screen_meta = [
+            f for f in store.frames_meta
+            if str(f.get("id") or f.get("filename") or "").split(".")[0]
+            in confirmed_screen_ids
+        ]
+        recent = [f.copy() for f in reversed(screen_meta)][:limit]
+        latest_ts = screen_meta[-1].get("ts") if screen_meta else None
+        total = len(screen_meta)
     for f in recent:
         f["url"] = frames._frame_url(store, f["filename"])
     share_state = (
@@ -330,17 +347,16 @@ def frame_envelope(store, frame_id: str) -> ScreenResult:
 
 
 # --------------------------------------------------------------------------- #
-# Enclave decrypt proxies (decryption happens INSIDE the enclave, not here)
+# Shape-aware visual reads (sealed decrypts happen inside the enclave)
 # --------------------------------------------------------------------------- #
 
 def frame_decrypt(
     store, frame_id: str, *, include_image: str, api_key: str | None, runtime_token: str | None
 ) -> ScreenResult:
-    """Proxy to the enclave's decrypt endpoint so API-only clients get plaintext.
+    """Read a frame through its authoritative stored shape.
 
-    The enclave owns decryption. This process only forwards the caller's
-    credential + the ``include_image`` flag and relays the enclave's response
-    bytes/status/content-type. No plaintext is produced here.
+    Plaintext-binary rows are decoded locally. Sealed rows forward the caller's
+    credential and ``include_image`` flag to the enclave and relay its response.
     """
     try:
         env = db.frame_get(store.user_id, frame_id, unavailable_raises=True)
@@ -366,6 +382,8 @@ def frame_decrypt(
             result["image_b64"] = None
             result["image_bytes_omitted"] = True
         return ScreenResult(200, json_body=result)
+    if core_envelope.classify_envelope_shape(env) != "sealed":
+        return ScreenResult(502, json_body={"error": "frame_plaintext_invalid"})
 
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
@@ -421,10 +439,10 @@ def frame_decrypt(
 def frame_image(
     store, frame_id: str, *, range_header: str | None, api_key: str | None, runtime_token: str | None
 ) -> ScreenResult:
-    """Proxy to the enclave's raw-JPEG endpoint, passing Range through.
+    """Read image bytes locally for plaintext or proxy sealed rows to enclave.
 
-    Returns the enclave's Content-Type image/jpeg with Accept-Ranges: bytes (and
-    Content-Range on 206). The enclave owns decryption; this only relays bytes.
+    Sealed rows preserve Range and response headers from the enclave. Plaintext
+    rows decode only recognized visual payloads and never fall through to it.
     """
     try:
         env = db.frame_get(store.user_id, frame_id, unavailable_raises=True)
@@ -441,6 +459,8 @@ def frame_image(
         return ScreenResult(200, raw_body=image,
                             media_type=str(inner.get("image_mime") or "image/jpeg"),
                             headers={"Accept-Ranges": "bytes", "Content-Length": str(len(image))})
+    if core_envelope.classify_envelope_shape(env) != "sealed":
+        return ScreenResult(502, json_body={"error": "frame_plaintext_invalid"})
 
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:

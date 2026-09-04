@@ -1007,7 +1007,7 @@ def test_legacy_batch_parity(user, monkeypatch):
     monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [dict(legacy)])
     monkeypatch.setattr(
         memory_actions_mod, "_memory_plain_from_envelope",
-        lambda moment, key, runtime_token="": ({"title": "t", "description": "d"}, ""),
+        lambda _user_id, moment, key, runtime_token="": ({"title": "t", "description": "d"}, ""),
     )
     body = {"batch_size": 8}
     f, a = _both("POST", "/v1/memory/legacy_batch", api_key=api_key, json_body=body)

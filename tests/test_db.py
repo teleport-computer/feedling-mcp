@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
@@ -30,6 +31,9 @@ if not os.environ.get("DATABASE_URL"):
 
 import db  # noqa: E402
 from core import store as core_store  # noqa: E402
+from perception import store as perception_store  # noqa: E402
+from screen import frames as screen_frames  # noqa: E402
+from screen import screen_read_core  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -667,16 +671,202 @@ def test_frame_upsert_get_exists_prune():
     uid = _uid()
     seed_user(uid)
     for i in range(5):
-        db.frame_upsert(uid, f"f{i}", float(i), {"id": f"f{i}", "body_ct": f"big{i}"})
+        db.frame_upsert(
+            uid, f"f{i}", float(i),
+            {"id": f"f{i}", "body_ct": f"big{i}"},
+            source="screen",
+        )
     assert db.frame_exists(uid, "f3") is True
     assert db.frame_exists(uid, "nope") is False
     assert db.frame_get(uid, "f2")["body_ct"] == "big2"
     evicted = db.frame_prune_to(uid, 2)  # keep newest 2 by ts (f3, f4)
     assert set(evicted) == {"f0", "f1", "f2"}
-    remaining = {m["id"] for m in db.frame_list_meta(uid)}
+    remaining = {m["id"] for m in db.frame_list_meta(uid, source="screen")}
     assert remaining == {"f3", "f4"}
     db.frame_delete(uid, "f3")
     assert db.frame_exists(uid, "f3") is False
+
+
+def test_frame_sources_are_written_and_screen_grounding_filters_photos(
+    monkeypatch,
+):
+    uid = _uid()
+    seed_user(uid)
+    now = 1_000.0
+    photo_env = {"id": "photo-new", "v": 1, "body_ct": "photo-body"}
+    screen_env = {"id": "screen-new", "v": 1, "body_ct": "screen-body"}
+
+    assert perception_store.put_photo_envelope(
+        uid, "photo-new", now - 30, photo_env
+    ) is True
+    monkeypatch.setattr(screen_frames.time, "time", lambda: now - 20)
+    store = core_store.UserStore(uid)
+
+    monkeypatch.setattr(screen_read_core.time, "time", lambda: now)
+    # A fresh photo alone must not imply an active screen share.
+    assert screen_read_core.screen_share_grounding(uid) == {}
+
+    screen_frames._save_frame_envelope(
+        store, {"ts": now - 20}, screen_env
+    )
+    assert screen_read_core.screen_share_grounding(uid) == {
+        "active": True,
+        "latest_frame_age_sec": 20,
+    }
+
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT frame_id, env_meta->>'source' FROM frame_envelopes "
+            "WHERE user_id = %s ORDER BY frame_id",
+            (uid,),
+        ).fetchall()
+    assert rows == [("photo-new", "photo"), ("screen-new", "screen")]
+
+
+def test_frame_list_source_is_required_and_legacy_rows_fail_closed():
+    uid = _uid()
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes "
+            "(user_id, frame_id, ts, doc, env_meta, body_key) "
+            "VALUES (%s, %s, %s, %s, NULL, NULL)",
+            (uid, "legacy-frame", 1.0, Jsonb({"id": "legacy-frame", "v": 1})),
+        )
+
+    assert db.FRAME_SOURCE_LEGACY_UNATTRIBUTED == "legacy_unattributed"
+    assert db.frame_list_meta(uid, source="screen") == []
+    assert db.frame_list_meta(uid, source="photo") == []
+    with pytest.raises(TypeError):
+        db.frame_list_meta(uid)
+    with pytest.raises(ValueError, match="source must be one of"):
+        db.frame_list_meta(uid, source=db.FRAME_SOURCE_LEGACY_UNATTRIBUTED)
+    with pytest.raises(TypeError):
+        db.frame_upsert(uid, "missing-source", 2.0, {"id": "missing-source"})
+    with pytest.raises(ValueError, match="source must be one of"):
+        db.frame_upsert(
+            uid, "wrong-source", 2.0, {"id": "wrong-source"},
+            source="camera",
+        )
+    assert db.frame_exists(uid, "wrong-source") is False
+
+
+def test_frames_meta_rebuild_only_indexes_and_prunes_screen_rows():
+    uid = _uid()
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO frame_envelopes "
+                "(user_id, frame_id, ts, doc, env_meta, body_key) "
+                "VALUES (%s, %s, %s, %s, %s, NULL)",
+                [
+                    (
+                        uid,
+                        f"photo-{i:03d}",
+                        float(i),
+                        Jsonb({"id": f"photo-{i:03d}", "v": 1}),
+                        Jsonb({
+                            "id": f"photo-{i:03d}", "v": 1,
+                            "source": "photo",
+                        }),
+                    )
+                    for i in range(250)
+                ]
+                + [
+                    (
+                        uid,
+                        f"screen-{i:03d}",
+                        float(250 + i),
+                        Jsonb({"id": f"screen-{i:03d}", "v": 1}),
+                        Jsonb({
+                            "id": f"screen-{i:03d}", "v": 1,
+                            "source": "screen",
+                        }),
+                    )
+                    for i in range(50)
+                ],
+            )
+
+    photos_before = {
+        row["id"] for row in db.frame_list_meta(uid, source="photo")
+    }
+    store = core_store.UserStore(uid)
+    store._load_frames_meta()
+
+    assert len(store.frames_meta) == 50
+    assert {row["id"] for row in store.frames_meta} == {
+        f"screen-{i:03d}" for i in range(50)
+    }
+    assert {
+        row["id"] for row in db.frame_list_meta(uid, source="photo")
+    } == photos_before
+
+
+def test_screen_ingest_retention_never_deletes_polluted_photo_or_legacy_rows():
+    uid = _uid()
+    seed_user(uid)
+    assert perception_store.put_photo_envelope(
+        uid, "polluted-photo", 1.0,
+        {"id": "polluted-photo", "v": 1, "body_ct": "photo"},
+    ) is True
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes "
+            "(user_id, frame_id, ts, doc, env_meta, body_key) "
+            "VALUES (%s, %s, %s, %s, NULL, NULL)",
+            (uid, "polluted-legacy", 2.0, Jsonb({"id": "polluted-legacy"})),
+        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO frame_envelopes "
+                "(user_id, frame_id, ts, doc, env_meta, body_key) "
+                "VALUES (%s, %s, %s, %s, %s, NULL)",
+                [
+                    (
+                        uid,
+                        f"retained-screen-{i:03d}",
+                        float(10 + i),
+                        Jsonb({"id": f"retained-screen-{i:03d}", "v": 1}),
+                        Jsonb({
+                            "id": f"retained-screen-{i:03d}", "v": 1,
+                            "source": "screen",
+                        }),
+                    )
+                    for i in range(core_store.MAX_FRAMES)
+                ],
+            )
+
+    store = core_store.UserStore(uid)
+    store.frames_meta = [
+        {"id": "polluted-photo", "filename": "polluted-photo.env.json", "ts": 1.0},
+        {"id": "polluted-legacy", "filename": "polluted-legacy.env.json", "ts": 2.0},
+    ] + [
+        {
+            "id": f"retained-screen-{i:03d}",
+            "filename": f"retained-screen-{i:03d}.env.json",
+            "ts": float(10 + i),
+        }
+        for i in range(core_store.MAX_FRAMES)
+    ]
+
+    screen_frames._save_frame_envelope(
+        store,
+        {"ts": 1_000.0},
+        {"id": "new-screen", "v": 1, "body_ct": "screen"},
+    )
+
+    assert db.frame_exists(uid, "polluted-photo") is True
+    assert db.frame_exists(uid, "polluted-legacy") is True
+    assert db.frame_exists(uid, "retained-screen-000") is False
+    screen_ids = {
+        row["id"] for row in db.frame_list_meta(uid, source="screen")
+    }
+    assert len(screen_ids) == core_store.MAX_FRAMES
+    assert "new-screen" in screen_ids
+    assert {"polluted-photo", "polluted-legacy"} <= {
+        row["id"] for row in store.frames_meta
+    }
 
 
 def test_log_append_read_trim_prune():
@@ -1446,13 +1636,15 @@ def test_delete_user_data_wipes_everything():
     db.set_blob(uid, "identity", {"a": 1})
     db.chat_append(uid, "c1", 1.0, {"id": "c1"}, max_messages=0)
     db.memory_upsert(uid, "m1", "2026-01-01", {"id": "m1"})
-    db.frame_upsert(uid, "f1", 1.0, {"id": "f1", "body_ct": "x"})
+    db.frame_upsert(
+        uid, "f1", 1.0, {"id": "f1", "body_ct": "x"}, source="screen"
+    )
     db.log_append(uid, "gate_decisions", {"x": 1}, ts=1.0)
     db.delete_user_data(uid)
     assert db.get_blob(uid, "identity") is None
     assert db.chat_load(uid) == []
     assert db.memory_load(uid) == []
-    assert db.frame_list_meta(uid) == []
+    assert db.frame_list_meta(uid, source="screen") == []
     assert db.log_read_all(uid, "gate_decisions") == []
 
 
@@ -1477,5 +1669,5 @@ def test_envelope_fields_stored_byte_for_byte():
         assert got[k] == env[k], f"field {k} drifted in storage"
 
     # frame envelope path too
-    db.frame_upsert(uid, "abc123", 1.0, env)
+    db.frame_upsert(uid, "abc123", 1.0, env, source="screen")
     assert db.frame_get(uid, "abc123") == env

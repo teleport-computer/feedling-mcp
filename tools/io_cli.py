@@ -80,6 +80,24 @@ PHASE2_VERBS = ("send", "wait-for-wake")
 
 _LAST_TOOL_OUTPUT = None
 
+# Only direct literal rejection codes from the resident's stage_file/stage_image
+# handlers are safe to copy into observability.  Those handlers also return
+# ``str(exc)`` for validation and filesystem errors; those values can contain a
+# user path or file name and must stay out of traces.
+_SAFE_ATTACHMENT_REJECTION_CODES = frozenset({
+    "request_id_required",
+    "path_required",
+    "no_active_chat_turn",
+    "path_outside_allowed_file_roots",
+    "wrong_file_suffix",
+    "file_source_must_be_utf8",
+    "chat_turn_finished",
+    "too_many_staged_files",
+    "path_outside_outbound_dir",
+    "too_many_staged_images",
+    "too_many_staged_attachments",
+})
+
 _MEMORY_BUCKET_CATEGORY = {
     "工作": "work", "work": "work",
     "目标与成长": "growth", "goals & growth": "growth",
@@ -164,6 +182,27 @@ def _materialize_decrypted_image(prefix, body):
     out.pop("image_b64", None)
     out["image_file"] = path
     out["image_hint"] = "Use the Read tool on image_file to view the pixels."
+    return out
+
+
+def _materialize_decrypted_image_bundle(prefix, body):
+    """Save every image in a decrypted chat bundle, or return None."""
+    if not isinstance(body, dict) or not isinstance(body.get("images"), list):
+        return None
+    images = body["images"]
+    if not images:
+        return None
+    materialized = []
+    for index, item in enumerate(images, start=1):
+        if not isinstance(item, dict):
+            return None
+        saved = _materialize_decrypted_image(f"{prefix}_{index}", item)
+        if not isinstance(saved, dict) or not saved.get("image_file"):
+            return None
+        materialized.append(saved)
+    out = dict(body)
+    out["images"] = materialized
+    out["image_count"] = len(materialized)
     return out
 
 
@@ -267,6 +306,16 @@ def _redacted_tool_args(args):
     return out
 
 
+def _attachment_trace_error_code(tool, output):
+    """Return a content-free reason for failed attachment staging."""
+    if tool not in {"send-file", "send-image"}:
+        return None
+    error = output.get("error") if isinstance(output, dict) else None
+    if isinstance(error, str) and error in _SAFE_ATTACHMENT_REJECTION_CODES:
+        return error
+    return "unclassified"
+
+
 def _emit_tool_trace(args, exit_code, dur_ms):
     """Best-effort per-tool trace. Never let observability affect tool output."""
     try:
@@ -284,6 +333,10 @@ def _emit_tool_trace(args, exit_code, dur_ms):
             "result_status": result_status,
             "dur_ms": rounded_ms,
         }
+        if result_status == "err":
+            error_code = _attachment_trace_error_code(tool, _LAST_TOOL_OUTPUT)
+            if error_code is not None:
+                detail["error_code"] = error_code
         _http_json(
             "POST",
             f"{api_url.rstrip('/')}/v1/debug/trace/event",
@@ -845,7 +898,7 @@ def cmd_photo_read(args):
 
 
 def cmd_chat_image(args):
-    """Pull ONE past chat message's decrypted image by id, saved as a Read-able file.
+    """Pull one past chat message's decrypted image(s) as Read-able files.
 
     Chat-history images are NOT reachable via ``photo-read`` (that command hits the
     perception photo library, not the chat feed). The recent-chat transcript that
@@ -878,6 +931,23 @@ def cmd_chat_image(args):
             "message_id": mid,
             "error": "message not found in recent history",
             "hint": f"only the {args.limit} most recent messages are searched; raise --limit if the image is older",
+        }, 1)
+    if isinstance(msg.get("images"), list):
+        out = _materialize_decrypted_image_bundle(f"chat_{mid}", msg)
+        if out is None:
+            _emit({
+                "ok": False,
+                "message_id": mid,
+                "error_code": "chat_image_bundle_unavailable",
+                "error": "chat image bundle is unavailable",
+            }, 1)
+        _emit({"ok": True, "message_id": mid, **out})
+    if msg.get("image_bundle_version") is not None:
+        _emit({
+            "ok": False,
+            "message_id": mid,
+            "error_code": "chat_image_bundle_unavailable",
+            "error": "chat image bundle is unavailable",
         }, 1)
     if not msg.get("image_b64"):
         _emit({

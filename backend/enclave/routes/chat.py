@@ -22,6 +22,7 @@ from memgarden.scoring.relevance import (
     select_context_memories_with_trace,
 )
 from memory import card_shape
+from core import chat_images
 from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
@@ -129,8 +130,16 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["body_omitted_reason"] = reason
             if ctype == "image":
                 entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
-                entry["image_omitted"] = True
-                entry["image_mime"] = m.get("image_mime") or "image/jpeg"
+                if m.get("image_bundle_version"):
+                    mimes = m.get("image_mimes") or []
+                    entry["images"] = [
+                        {"image_omitted": True, "image_mime": str(mime)}
+                        for mime in mimes
+                    ]
+                    entry["image_count"] = len(entry["images"])
+                else:
+                    entry["image_omitted"] = True
+                    entry["image_mime"] = m.get("image_mime") or "image/jpeg"
                 if m.get("vision_route_id"):
                     entry["vision_route_id"] = str(m["vision_route_id"])
             elif ctype == "file":
@@ -177,8 +186,19 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 # image), decrypt it and fill content so the agent sees the
                 # user's actual question rather than an empty string.
                 entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
-                entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
-                entry["image_mime"] = m.get("image_mime") or "image/jpeg"
+                if m.get("image_bundle_version"):
+                    unpacked = chat_images.decode_image_bundle(plaintext)
+                    entry["images"] = [
+                        {
+                            "image_b64": base64.b64encode(body).decode("ascii"),
+                            "image_mime": mime,
+                        }
+                        for body, mime in unpacked
+                    ]
+                    entry["image_count"] = len(entry["images"])
+                else:
+                    entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
+                    entry["image_mime"] = m.get("image_mime") or "image/jpeg"
                 if m.get("vision_route_id"):
                     entry["vision_route_id"] = str(m["vision_route_id"])
             elif ctype == "file":

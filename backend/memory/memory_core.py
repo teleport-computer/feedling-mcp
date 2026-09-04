@@ -350,7 +350,12 @@ def legacy_batch(store, api_key, runtime_token: str, payload: dict) -> tuple[dic
     for m in moments:
         if not isinstance(m, dict) or m.get("visibility") == "local_only":
             continue
-        inner, _err = memory_actions_mod._memory_plain_from_envelope(m, api_key, runtime_token=runtime_token)
+        inner, _err = memory_actions_mod._memory_plain_from_envelope(
+            str(store.user_id),
+            m,
+            api_key,
+            runtime_token=runtime_token,
+        )
         if isinstance(inner, dict):
             decrypted.append((m, inner))
     # A11: drop cards that hit the per-card attempt cap so they're never re-selected

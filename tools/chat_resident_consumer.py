@@ -113,6 +113,7 @@ Optional:
 """
 
 import base64
+import binascii
 from collections import OrderedDict, namedtuple
 from dataclasses import dataclass, field
 import hashlib
@@ -167,6 +168,7 @@ from chat import file_display
 # Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
 # sys.path via the insert above, so it imports as a top-level `core.*` name.
 from agent_protocol_core import protocol_leak as _protocol_leak
+from core import chat_images as _chat_images
 from core import envelope as _core_envelope
 from core import tool_markup_leak as _tool_markup_leak
 from identity import card_view as _identity_card_view
@@ -3109,9 +3111,7 @@ def _fetch_plaintext_or_mixed_history(
             out.append({**row, "content": str(row.get("body") or "")})
             continue
         if shape == "plaintext_binary":
-            ctype = str(row.get("content_type") or "")
-            key = "file_b64" if ctype == "file" else "image_b64"
-            out.append({**row, key: str(row.get("body_b64") or "")})
+            out.append(_hydrate_plaintext_binary_body(row))
             continue
         if row.get("body_omitted") and row.get("body_size_bytes") is not None:
             message_id = str(row.get("id") or row.get("message_id") or "")
@@ -3128,10 +3128,8 @@ def _fetch_plaintext_or_mixed_history(
                 full = None
             if isinstance(full, dict):
                 merged = {**row, **full}
-                ctype = str(merged.get("content_type") or "")
                 if merged.get("body_b64") is not None:
-                    merged["file_b64" if ctype == "file" else "image_b64"] = str(
-                        merged.get("body_b64") or "")
+                    merged = _hydrate_plaintext_binary_body(merged)
                 elif isinstance(merged.get("body"), str):
                     merged["content"] = merged["body"]
                 out.append(merged)
@@ -3140,12 +3138,48 @@ def _fetch_plaintext_or_mixed_history(
     return True, _filter_since(out, since)
 
 
+def _hydrate_plaintext_binary_body(row: dict) -> dict:
+    """Expose one plaintext binary body in the consumer's decoded row shape."""
+    ctype = str(row.get("content_type") or "")
+    body_b64 = str(row.get("body_b64") or "")
+    if ctype == "file":
+        return {**row, "file_b64": body_b64}
+    if row.get("image_bundle_version") is None:
+        return {**row, "image_b64": body_b64}
+    try:
+        bundle = base64.b64decode(body_b64, validate=True)
+        unpacked = _chat_images.decode_image_bundle(bundle)
+    except (binascii.Error, ValueError) as exc:
+        log.warning(
+            "invalid plaintext image bundle [id=%s]: %s",
+            row.get("id") or row.get("message_id") or "",
+            type(exc).__name__,
+        )
+        return {
+            **row,
+            "images": [],
+            "image_bundle_error": "invalid_image_bundle",
+            "body_unavailable": True,
+        }
+    return {
+        **row,
+        "images": [
+            {
+                "image_b64": base64.b64encode(body).decode("ascii"),
+                "image_mime": mime,
+            }
+            for body, mime in unpacked
+        ],
+        "image_count": len(unpacked),
+    }
+
+
 def _fetch_message_body_from_enclave(message_id: str) -> dict | None:
     """Decrypt ONE message body via the enclave. Returns None on any failure.
 
-    Bounded by construction: a response carries at most one image (the ingest cap
-    is 2MB), so no accumulation of unanswered photos can ever make this request
-    too big to complete.
+    Bounded by construction: a response carries one stored message body. An image
+    message may expand to the bundle's bounded image list, but no accumulation of
+    unanswered image turns can make this per-message request grow without bound.
     """
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         return None
@@ -3205,6 +3239,8 @@ def _hydrate_omitted_bodies(messages: list[dict]) -> list[dict]:
             out.append({**m, "body_unavailable": True})
             continue
         merged = {**m, **full}
+        if merged.get("body_b64") is not None:
+            merged = _hydrate_plaintext_binary_body(merged)
         for k in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
             merged.pop(k, None)
         out.append(merged)
@@ -3234,18 +3270,27 @@ def _decode_image_b64(value: Any) -> bytes | None:
 
 
 def _image_payloads_from_msg(msg: dict) -> list[dict[str, str]]:
-    image_bytes = _decode_image_b64(msg.get("image_b64"))
-    if not image_bytes:
-        return []
-    mime = msg.get("image_mime") or "image/jpeg"
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    return [
-        {
+    raw_items = msg.get("images")
+    if not isinstance(raw_items, list):
+        raw_items = [{
+            "image_b64": msg.get("image_b64"),
+            "image_mime": msg.get("image_mime"),
+        }]
+    payloads: list[dict[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        image_bytes = _decode_image_b64(item.get("image_b64"))
+        if not image_bytes:
+            continue
+        mime = item.get("image_mime") or "image/jpeg"
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        payloads.append({
             "mime_type": str(mime),
             "data": b64,
             "data_url": f"data:{mime};base64,{b64}",
-        }
-    ]
+        })
+    return payloads
 
 
 def _image_file_paths_for_msg(msg: dict) -> list[str]:
@@ -14377,13 +14422,37 @@ def _format_message_time(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _format_prompt_message_time(ts: float) -> str:
+    """Render chat timestamps in the same labelled local zone as the prompt's
+    current-time anchor.
+
+    This is deliberately separate from ``_format_message_time``: that helper
+    is also the UTC ``occurred_at`` writer for persisted memory-card data.
+    """
+    if ts <= 0:
+        return "unknown time"
+    from datetime import datetime, timezone as _tzmod
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    zone_name = _user_timezone() or _DEFAULT_TIMEZONE
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        # Invalid cached keys must not make prompt rendering fail. Keep the
+        # fallback label honest by changing both the zone and its displayed name.
+        zone_name = "UTC"
+        zone = ZoneInfo("UTC")
+    local = datetime.fromtimestamp(ts, _tzmod.utc).astimezone(zone)
+    return f"{local.isoformat(timespec='seconds')} {zone_name}"
+
+
 def _chat_context_line(msg: dict, *, now: float, stale: bool) -> str:
     ts = _message_ts_for_context(msg)
     age = now - ts if ts > 0 else None
     flags = ["stale"] if stale else ["fresh"]
     text = _message_text_for_context(msg)
     return (
-        f"- [{_format_message_time(ts)}, {_format_age(age)}, {', '.join(flags)}] "
+        f"- [{_format_prompt_message_time(ts)}, {_format_age(age)}, {', '.join(flags)}] "
         f"{_message_role_for_context(msg)}: {text}"
     )
 
@@ -15702,10 +15771,10 @@ def _capture_window_text(messages: list[dict], *, user_label: str = "TA", agent_
                 turn_count=msg.get("voice_turn_count"),
                 user_name=user_label, ai_name=agent_label,
             )
-            lines.append(f"- [{_format_message_time(ts)}] {header}\n{body}")
+            lines.append(f"- [{_format_prompt_message_time(ts)}] {header}\n{body}")
             continue
         lines.append(
-            f"- [{_format_message_time(ts)}] "
+            f"- [{_format_prompt_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )
@@ -16508,7 +16577,7 @@ def _dream_recent_conversations_context(
     for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
         ts = _message_ts_for_context(msg)
         lines.append(
-            f"- [{_format_message_time(ts)}] "
+            f"- [{_format_prompt_message_time(ts)}] "
             f"{_capture_message_role(msg, user_label=user_label, agent_label=agent_label)}: "
             f"{msg.get('_capture_text') or _capture_message_text(msg)}"
         )

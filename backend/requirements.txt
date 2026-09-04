@@ -115,8 +115,9 @@ Pillow>=11,<13
 # 什么」切的。所以把这里从 X 升到 Y，io 拿到的是 X..Y 区间里**所有人**的改动，
 # 不只是你要的那一个。
 #
-# 而且 `agent-protocol-core` 和 `memgarden` 在**同一个仓库**里（`self_thinking`
-# 在前者）。io 两个都装，所以只碰了 core 的改动也会跟着进来。
+# （2026-09-04 起 `agent-protocol-core` 已经搬进 backend/agent_protocol_core/，
+# 不再是外部依赖 —— 上面这条「只碰了 core 也会跟着进来」不再适用。
+# 但「升版本会带进别人合进 memgarden main 的改动」这条依然成立。）
 #
 # 升之前先看一眼区间：
 #
@@ -126,7 +127,7 @@ Pillow>=11,<13
 # self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
-memgarden==0.13.1
+memgarden==0.16.0
 
 # 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +

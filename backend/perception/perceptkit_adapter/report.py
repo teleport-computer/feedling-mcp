@@ -144,7 +144,9 @@ def _coverage(conn: Any, subject_id: str | None) -> dict[str, Any]:
 
     from . import compare
 
-    sql = "SELECT signal, COUNT(*) FROM perceptkit_current"
+    sql = ("SELECT signal, COUNT(*), "
+           "COUNT(*) FILTER (WHERE availability = 'observed') "
+           "FROM perceptkit_current")
     params: list[Any] = []
     if subject_id:
         sql += " WHERE subject_id = %s"
@@ -152,10 +154,31 @@ def _coverage(conn: Any, subject_id: str | None) -> dict[str, Any]:
     sql += " GROUP BY 1 ORDER BY 2 DESC"
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        seen = {row[0]: int(row[1]) for row in cur.fetchall()}
+        rows = cur.fetchall()
+    seen = {r[0]: int(r[1]) for r in rows}
+    observed = {r[0]: int(r[2]) for r in rows}
     declared = compare.coverage(MINIMAL_SIGNALS)
     return {
         "signals_seen": seen,
+        # manifest 里声明了、但一行都没有的信号。
+        "signals_never_seen": sorted(set(MINIMAL_SIGNALS) - set(seen)),
+        # 🔴 **有行、但从来没有一条 observed 的信号。** 这一格才是要紧的那个。
+        #
+        # 2026-09-02 踩的：外部审查说「iOS adapter 只覆盖部分信号」，我数代码
+        # 得出「全覆盖」并据此顶了回去。实际上 health_sleep 的每一条**真数据**
+        # 都被拒（iOS 送四个每日分钟总数，manifest 要「一条观测 = 一个睡眠
+        # 阶段」，stage 必填 → 整条拒收），而「权限关闭」「这轮没读到」那两种
+        # 没有 value、不过字段校验，**照常落一行**。
+        #
+        # 于是 health_sleep 出现在 signals_seen 里，看上去接通了 ——
+        # 先加的 signals_never_seen 那一格也抓不到它。三层都不报错：
+        # 拒收不进任何计数、摄入照样返回成功、快照那侧静默回退到老路。
+        #
+        # 「只有缺席、从没有过在场」和「这个信号根本没接」外观一样，
+        # 和「我们把它的真数据全拒了」外观也一样 —— 所以必须单独数出来。
+        "signals_never_observed": sorted(
+            sig for sig, n in seen.items() if n and not observed.get(sig)
+        ),
         "signals_compared": declared["signals_compared"],
         "fields_compared": declared["fields_compared"],
         # 干净的差异报告只有配上这个才有意义。

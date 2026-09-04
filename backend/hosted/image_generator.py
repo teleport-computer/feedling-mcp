@@ -188,6 +188,7 @@ def generate_with_pinned_route(
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
+            caller_user_id=str(store.user_id),
             runtime_token=caller_runtime_token,
         ).decode("utf-8")
     except (RuntimeError, ValueError) as exc:

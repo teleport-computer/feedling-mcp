@@ -90,7 +90,7 @@ def test_an_empty_batch_writes_nothing(recorded):
 
 def test_a_failure_inside_the_batch_is_still_traced_individually(recorded):
     """批次里第 30 行挂了,那一条必须单独可见。"""
-    with enclave.coalesced_success_trace("v2_chat_read"):
+    with enclave.coalesced_success_trace("v2_chat_read", job_id="job-decrypt"):
         for _ in range(29):
             _ok()
         enclave._trace_enclave(
@@ -104,6 +104,7 @@ def test_a_failure_inside_the_batch_is_still_traced_individually(recorded):
     assert "enclave.call.error" in types, "批次内的失败被折叠掉了 —— 这正是要查的东西"
     errors = [e for e in recorded if e["type"] == "enclave.call.error"]
     assert errors[0]["detail"]["status_code"] == 401, "失败的细节丢了"
+    assert errors[0]["job_id"] == "job-decrypt"
 
 
 def test_a_timeout_inside_the_batch_survives(recorded):
