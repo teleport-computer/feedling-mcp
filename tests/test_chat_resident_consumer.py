@@ -11076,6 +11076,112 @@ def test_foreground_injection_bridges_pi_across_rotation(monkeypatch, tmp_path):
     assert crc._foreground_history_injection_enabled() is True
 
 
+def test_turn_limit_rotation_and_bridge_emit_correlated_traces(
+    monkeypatch, tmp_path
+):
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_trace", max_turns=40)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(
+        crc,
+        "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: [
+            {
+                "role": "user",
+                "source": "chat",
+                "content": "earlier one",
+                "ts": 1.0,
+            },
+            {
+                "role": "agent",
+                "source": "chat",
+                "content": "earlier two",
+                "ts": 2.0,
+            },
+        ],
+    )
+    traces = []
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, event_type, **kwargs: traces.append(
+            (subsystem, event_type, kwargs)
+        ),
+    )
+
+    crc._save_agent_session_id("sess_full")
+    crc._mark_agent_session_bridged("sess_full")
+    for _ in range(40):
+        crc._record_agent_session_turn(
+            "sess_full", sent_bytes=1, received_bytes=1
+        )
+
+    out = crc._foreground_agent_message(
+        "current", current_ts=9.0, trace_id="msg_rotation"
+    )
+
+    assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
+    assert [event_type for _, event_type, _ in traces] == [
+        "agent.session.rotated",
+        "agent.session.bridge_injected",
+    ]
+    rotation = traces[0][2]
+    bridge = traces[1][2]
+    assert rotation["status"] == bridge["status"] == "ok"
+    assert rotation["trace_id"] == bridge["trace_id"] == "msg_rotation"
+    assert rotation["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "chat",
+        "user_id": "usr_pi_trace",
+        "session_ordinal": 40,
+        "trigger_reason": "turn_limit",
+    }
+    transcript = out.split(
+        f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n", 1
+    )[1].split("\n---\n", 1)[0]
+    assert bridge["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "chat",
+        "user_id": "usr_pi_trace",
+        "session_ordinal": 1,
+        "trigger_reason": "turn_limit",
+        "injected_count": 2,
+        "total_chars": len(transcript),
+    }
+    assert "outcome_class" not in rotation
+    assert "outcome_class" not in bridge
+    assert "outcome_class" not in rotation["detail"]
+    assert "outcome_class" not in bridge["detail"]
+
+
+def test_below_turn_limit_emits_neither_rotation_nor_bridge_trace(
+    monkeypatch, tmp_path
+):
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_trace_mirror", max_turns=40)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    traces = []
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, event_type, **kwargs: traces.append(event_type),
+    )
+
+    crc._save_agent_session_id("sess_warm")
+    crc._mark_agent_session_bridged("sess_warm")
+    for _ in range(39):
+        crc._record_agent_session_turn(
+            "sess_warm", sent_bytes=1, received_bytes=1
+        )
+
+    out = crc._foreground_agent_message(
+        "current", current_ts=9.0, trace_id="msg_no_rotation"
+    )
+
+    assert out == "current"
+    assert traces == []
+
+
 def test_foreground_injection_off_mode_disables_even_unbridged_pi(monkeypatch, tmp_path):
     # The explicit off switch outranks the bridge.
     _bridge_session_env(monkeypatch, tmp_path, "usr_pi_off")

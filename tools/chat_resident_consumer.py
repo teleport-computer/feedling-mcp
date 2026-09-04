@@ -7771,19 +7771,24 @@ def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
 
 
 def _agent_session_meta_exceeds_bounds(meta: dict[str, Any]) -> bool:
+    return bool(_agent_session_rotation_trigger(meta))
+
+
+def _agent_session_rotation_trigger(meta: dict[str, Any]) -> str:
+    """Classify the first configured bound that rotates this session."""
     if not str(meta.get("session_id") or "").strip():
-        return False
+        return ""
     if AGENT_SESSION_MAX_TURNS > 0 and int(meta.get("turns") or 0) >= AGENT_SESSION_MAX_TURNS:
-        return True
+        return "turn_limit"
     if AGENT_SESSION_MAX_BYTES > 0 and int(meta.get("bytes") or 0) >= AGENT_SESSION_MAX_BYTES:
-        return True
+        return "byte_limit"
     if (
         AGENT_SESSION_MAX_INPUT_TOKENS > 0
         and int(meta.get("peak_input_tokens") or 0)
         >= AGENT_SESSION_MAX_INPUT_TOKENS
     ):
-        return True
-    return False
+        return "input_token_limit"
+    return ""
 
 
 def _agent_session_meta_cwd_changed(meta: dict[str, Any]) -> bool:
@@ -7843,7 +7848,33 @@ def _clear_agent_session_id(reason: str = "") -> None:
         log.warning("rotating resident agent session for user=%s reason=%s", user_id, reason)
 
 
-def _load_agent_session_meta(*, check_bounds: bool = True) -> dict[str, Any]:
+def _emit_agent_session_rotation_trace(
+    meta: dict[str, Any], *, trigger_reason: str, trace_id: str, lane: str
+) -> None:
+    _emit_debug_trace(
+        "agent",
+        "agent.session.rotated",
+        status="ok",
+        trace_id=trace_id,
+        summary="resident agent session rotated",
+        explain="V1 resident 会话到达轮换条件，下一次调用将建立新会话。",
+        detail={
+            "runtime": "resident_v1",
+            "user_id": _agent_session_user_id(),
+            "session_ordinal": int(meta.get("turns") or 0),
+            "trigger_reason": trigger_reason,
+            **({"lane": lane} if lane else {}),
+        },
+    )
+
+
+def _load_agent_session_meta(
+    *,
+    check_bounds: bool = True,
+    trace_id: str = "",
+    lane: str = "",
+    rotation_out: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     user_id = _agent_session_user_id()
     cached_meta = _agent_session_meta_cache.get(user_id)
     if isinstance(cached_meta, dict):
@@ -7859,21 +7890,37 @@ def _load_agent_session_meta(*, check_bounds: bool = True) -> dict[str, Any]:
             except Exception:
                 meta = _empty_agent_session_meta()
 
-    if check_bounds and _agent_session_meta_exceeds_bounds(meta):
+    bound_trigger = _agent_session_rotation_trigger(meta) if check_bounds else ""
+    if bound_trigger:
         reason = (
             f"turns={meta.get('turns')} bytes={meta.get('bytes')} "
             f"peak_input_tokens={meta.get('peak_input_tokens')}"
+        )
+        if rotation_out is not None:
+            rotation_out["trigger_reason"] = bound_trigger
+        _emit_agent_session_rotation_trace(
+            meta, trigger_reason=bound_trigger, trace_id=trace_id, lane=lane
         )
         _clear_agent_session_id(reason)
         return _empty_agent_session_meta()
 
     if check_bounds and _agent_session_meta_cwd_changed(meta):
+        if rotation_out is not None:
+            rotation_out["trigger_reason"] = "cli_cwd_changed"
+        _emit_agent_session_rotation_trace(
+            meta, trigger_reason="cli_cwd_changed", trace_id=trace_id, lane=lane
+        )
         _clear_agent_session_id(
             f"cli cwd changed {meta.get('cli_cwd')!r} -> {_agent_cli_cwd()!r}"
         )
         return _empty_agent_session_meta()
 
     if check_bounds and _agent_session_meta_entry_changed(meta):
+        if rotation_out is not None:
+            rotation_out["trigger_reason"] = "model_entry_changed"
+        _emit_agent_session_rotation_trace(
+            meta, trigger_reason="model_entry_changed", trace_id=trace_id, lane=lane
+        )
         _clear_agent_session_id("configured model entry changed")
         return _empty_agent_session_meta()
 
@@ -7979,14 +8026,23 @@ def _mark_agent_session_bridged(sid: str) -> None:
         log.warning("failed to persist agent session bridge flag: %s", e)
 
 
-def _agent_session_is_bridged() -> bool:
+def _agent_session_is_bridged(
+    *,
+    trace_id: str = "",
+    lane: str = "",
+    rotation_out: dict[str, Any] | None = None,
+) -> bool:
     """Whether the CURRENT pi session already carries a foreground transcript.
 
     check_bounds defaults to True on purpose: a session that is over its turn/byte
     bound gets cleared right here, so the flag reads False and the next foreground
     turn re-bridges. Reading with check_bounds=False would let a stale True survive
     the rotation — exactly the drop-out this whole change exists to fix."""
-    return bool(_load_agent_session_meta().get("bridged"))
+    return bool(
+        _load_agent_session_meta(
+            trace_id=trace_id, lane=lane, rotation_out=rotation_out
+        ).get("bridged")
+    )
 
 
 def _extract_session_id(raw: str) -> str:
@@ -8888,7 +8944,12 @@ def _cli_cmd_tokens() -> list[str]:
         return AGENT_CLI_CMD.split()
 
 
-def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
+def _foreground_history_injection_enabled(
+    cmd: list[str] | None = None,
+    *,
+    trace_id: str = "",
+    rotation_out: dict[str, Any] | None = None,
+) -> bool:
     """Whether foreground turns get a resident-injected recent-chat transcript.
 
     Gated so we don't double up context for agents that already carry it:
@@ -8919,7 +8980,9 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     if _is_codex_cmd(cmd):
         if not _codex_resume_available_for_cmd(cmd):
             return True
-        return not _agent_session_is_bridged()
+        return not _agent_session_is_bridged(
+            trace_id=trace_id, lane="chat", rotation_out=rotation_out
+        )
     if _is_claude_code_cmd(cmd):
         if _has_cli_resume(cmd) or _has_claude_session_id(cmd):
             return False
@@ -8932,7 +8995,9 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
         # session id too, but never inject). So bridge once per session: the first
         # foreground turn in an unbridged session carries the transcript; the rest ride
         # pi's native --session-id.
-        return not _agent_session_is_bridged()
+        return not _agent_session_is_bridged(
+            trace_id=trace_id, lane="chat", rotation_out=rotation_out
+        )
     return False
 
 
@@ -11724,6 +11789,9 @@ def _discard_io_cli_catalog_pending_injection() -> None:
     _io_cli_catalog_pending_session_id = None
 
 
+_last_foreground_chat_context_metrics = {"injected_count": 0, "total_chars": 0}
+
+
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
     """Short plaintext transcript of recent chat turns STRICTLY older than the
     current turn, for injecting cross-turn continuity into foreground messages.
@@ -11731,6 +11799,11 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
     Uses the same decrypt sources as normal chat processing. Returns "" when no
     decrypt source is configured/reachable or there is no prior turn — the caller
     then sends the bare message (graceful degradation, never raises)."""
+    global _last_foreground_chat_context_metrics
+    _last_foreground_chat_context_metrics = {
+        "injected_count": 0,
+        "total_chars": 0,
+    }
     limit = max(1, min(limit if limit is not None else FOREGROUND_CHAT_CONTEXT_LIMIT, 50))
     fetch_limit = max(limit + 4, 20)
     try:
@@ -11754,19 +11827,55 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
     if not selected:
         return ""
     now = time.time()
-    return "\n".join(_chat_context_line(m, now=now, stale=False) for m in selected)
+    transcript = "\n".join(
+        _chat_context_line(m, now=now, stale=False) for m in selected
+    )
+    _last_foreground_chat_context_metrics = {
+        "injected_count": len(selected),
+        "total_chars": len(transcript),
+    }
+    return transcript
 
 
-def _foreground_agent_message(content: str, *, current_ts: float) -> str:
+def _foreground_agent_message(
+    content: str, *, current_ts: float, trace_id: str = ""
+) -> str:
     """Prepend a recent-chat transcript to a foreground turn when the active
     driver has no reliable session of its own (codex / hosted claude). Returns
     ``content`` unchanged when injection is disabled or no prior context is
     available."""
-    if not _foreground_history_injection_enabled():
+    global _last_foreground_chat_context_metrics
+    rotation: dict[str, Any] = {}
+    if not _foreground_history_injection_enabled(
+        trace_id=trace_id, rotation_out=rotation
+    ):
         return content
+    _last_foreground_chat_context_metrics = {
+        "injected_count": 0,
+        "total_chars": 0,
+    }
     transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
     if not transcript:
         return content
+    session_meta = _load_agent_session_meta(check_bounds=False)
+    _emit_debug_trace(
+        "agent",
+        "agent.session.bridge_injected",
+        status="ok",
+        trace_id=trace_id,
+        summary="recent chat bridged into resident session",
+        explain="V1 resident 新会话的前台首轮注入了最近聊天记录。",
+        detail={
+            "runtime": "resident_v1",
+            "lane": "chat",
+            "user_id": _agent_session_user_id(),
+            "session_ordinal": int(session_meta.get("turns") or 0) + 1,
+            "trigger_reason": rotation.get(
+                "trigger_reason", "unbridged_session"
+            ),
+            **dict(_last_foreground_chat_context_metrics),
+        },
+    )
     # A double-text can arrive before the previous model turn finishes. By the
     # time this turn runs, the injected transcript may therefore end with that
     # older, actionable user request while its later reply is excluded by the
@@ -18680,7 +18789,9 @@ def _process_messages(messages: list) -> float:
         # there is no prior turn. Done once here so every dispatch branch below
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
-        content = _foreground_agent_message(content, current_ts=ts)
+        content = _foreground_agent_message(
+            content, current_ts=ts, trace_id=trace_id
+        )
         session_bound_content = content
 
         # This flag selects the resident V1 chat profile; it does not transfer
@@ -18863,7 +18974,9 @@ def _process_messages(messages: list) -> float:
                         content = _prepend_io_cli_capability_catalog(
                             session_independent_content
                         )
-                        content = _foreground_agent_message(content, current_ts=ts)
+                        content = _foreground_agent_message(
+                            content, current_ts=ts, trace_id=trace_id
+                        )
                         content += suffix
                         agent_result = _dispatch_foreground_agent(content)
         except VoiceTurnSuperseded:
