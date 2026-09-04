@@ -115,6 +115,7 @@ Optional:
 import base64
 import binascii
 from collections import OrderedDict, namedtuple
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
 import io
@@ -11790,6 +11791,9 @@ def _discard_io_cli_catalog_pending_injection() -> None:
 
 
 _last_foreground_chat_context_metrics = {"injected_count": 0, "total_chars": 0}
+_foreground_agent_trace_id: ContextVar[str] = ContextVar(
+    "foreground_agent_trace_id", default=""
+)
 
 
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
@@ -11845,6 +11849,7 @@ def _foreground_agent_message(
     ``content`` unchanged when injection is disabled or no prior context is
     available."""
     global _last_foreground_chat_context_metrics
+    trace_id = trace_id or _foreground_agent_trace_id.get()
     rotation: dict[str, Any] = {}
     if not _foreground_history_injection_enabled(
         trace_id=trace_id, rotation_out=rotation
@@ -11891,6 +11896,17 @@ def _foreground_agent_message(
         f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n---\n"
         f"{current_turn_header}\n{content}"
     )
+
+
+def _foreground_agent_message_for_trace(
+    content: str, *, current_ts: float, trace_id: str
+) -> str:
+    """Scope trace correlation without changing the legacy helper call shape."""
+    token = _foreground_agent_trace_id.set(trace_id)
+    try:
+        return _foreground_agent_message(content, current_ts=current_ts)
+    finally:
+        _foreground_agent_trace_id.reset(token)
 
 
 def _message_has_injected_history(message: str) -> bool:
@@ -18789,7 +18805,7 @@ def _process_messages(messages: list) -> float:
         # there is no prior turn. Done once here so every dispatch branch below
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
-        content = _foreground_agent_message(
+        content = _foreground_agent_message_for_trace(
             content, current_ts=ts, trace_id=trace_id
         )
         session_bound_content = content
@@ -18974,7 +18990,7 @@ def _process_messages(messages: list) -> float:
                         content = _prepend_io_cli_capability_catalog(
                             session_independent_content
                         )
-                        content = _foreground_agent_message(
+                        content = _foreground_agent_message_for_trace(
                             content, current_ts=ts, trace_id=trace_id
                         )
                         content += suffix

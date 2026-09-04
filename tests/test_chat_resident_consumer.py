@@ -11116,7 +11116,7 @@ def test_turn_limit_rotation_and_bridge_emit_correlated_traces(
             "sess_full", sent_bytes=1, received_bytes=1
         )
 
-    out = crc._foreground_agent_message(
+    out = crc._foreground_agent_message_for_trace(
         "current", current_ts=9.0, trace_id="msg_rotation"
     )
 
@@ -11174,12 +11174,40 @@ def test_below_turn_limit_emits_neither_rotation_nor_bridge_trace(
             "sess_warm", sent_bytes=1, received_bytes=1
         )
 
-    out = crc._foreground_agent_message(
+    out = crc._foreground_agent_message_for_trace(
         "current", current_ts=9.0, trace_id="msg_no_rotation"
     )
 
     assert out == "current"
     assert traces == []
+
+
+def test_foreground_trace_scope_preserves_legacy_message_call_shape(monkeypatch):
+    seen = {}
+
+    def legacy_foreground_message(content, *, current_ts):
+        seen.update(
+            content=content,
+            current_ts=current_ts,
+            trace_id=crc._foreground_agent_trace_id.get(),
+        )
+        return "wrapped"
+
+    monkeypatch.setattr(
+        crc, "_foreground_agent_message", legacy_foreground_message
+    )
+
+    out = crc._foreground_agent_message_for_trace(
+        "current", current_ts=9.0, trace_id="msg_legacy_shape"
+    )
+
+    assert out == "wrapped"
+    assert seen == {
+        "content": "current",
+        "current_ts": 9.0,
+        "trace_id": "msg_legacy_shape",
+    }
+    assert crc._foreground_agent_trace_id.get() == ""
 
 
 def test_foreground_injection_off_mode_disables_even_unbridged_pi(monkeypatch, tmp_path):
