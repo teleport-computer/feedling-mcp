@@ -16,13 +16,13 @@ BACKEND_ROOT = REPO_ROOT / "backend"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(BACKEND_ROOT))
 
-from tools.store_shell_only_inventory import (  # noqa: E402
-    derive_shell_only_sites,
+from tools.store_per_load_mode_inventory import (  # noqa: E402
+    derive_reviewed_sites,
     render_inventory,
 )
 
 
-SHELL_ONLY_SNAPSHOT = REPO_ROOT / "tests/fixtures/store_shell_only_sites.json"
+PER_LOAD_MODE_SNAPSHOT = REPO_ROOT / "tests/fixtures/store_per_load_mode_sites.json"
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class CallSite:
     review_reason: str = ""
 
 
-# Shell-only store calls carry their non-empty review reason at the call site.
+# Reviewed store calls carry their non-empty review reason at the call site.
 # The scanner below derives the complete inventory directly from production AST.
 
 
@@ -108,7 +108,7 @@ def test_no_direct_user_store_construction():
     assert _find_calls("UserStore", exclude={"backend/core/store.py"}) == []
 
 
-def test_get_store_sites_are_explicit_or_reviewed_shell_only():
+def test_get_store_sites_are_explicit_or_reviewed():
     implicit = {
         (site.path, site.lineno)
         for site in _find_calls("get_store")
@@ -116,20 +116,20 @@ def test_get_store_sites_are_explicit_or_reviewed_shell_only():
     }
     assert implicit == set(), (
         "replace each implicit get_store call with a real section requirement "
-        "or get_store_shell_only(..., reason=...)"
+        "or get_store_per_load_mode(..., reason=...)"
     )
-    shell_only = _find_calls("get_store_shell_only", exclude={"backend/core/store.py"})
-    assert shell_only, "shell-only scanner must find production declarations"
+    per_load_mode = _find_calls("get_store_per_load_mode", exclude={"backend/core/store.py"})
+    assert per_load_mode, "reviewed scanner must find production declarations"
     assert {
         "backend/accounts/accounts_core.py",
         "backend/model_api_runtime/v2/serve_worker.py",
         "backend/voice/routes_asgi.py",
-    } <= {site.path for site in shell_only}
-    assert all(site.review_reason for site in shell_only)
+    } <= {site.path for site in per_load_mode}
+    assert all(site.review_reason for site in per_load_mode)
 
 
-def test_shell_only_inventory_matches_reviewed_snapshot():
-    expected = SHELL_ONLY_SNAPSHOT.read_text()
+def test_reviewed_inventory_matches_snapshot():
+    expected = PER_LOAD_MODE_SNAPSHOT.read_text()
     actual = render_inventory(REPO_ROOT)
     diff = "".join(
         difflib.unified_diff(
@@ -141,14 +141,14 @@ def test_shell_only_inventory_matches_reviewed_snapshot():
     )
 
     assert actual == expected, (
-        "shell-only Store call inventory changed; review the semantic diff, then "
-        "run `python tools/store_shell_only_inventory.py --write` to accept it:\n"
+        "reviewed Store call inventory changed; review the semantic diff, then "
+        "run `python tools/store_per_load_mode_inventory.py --write` to accept it:\n"
         f"{diff}"
     )
 
 
-def test_shell_only_snapshot_matches_independent_scanner():
-    snapshot = json.loads(SHELL_ONLY_SNAPSHOT.read_text())
+def test_reviewed_snapshot_matches_independent_scanner():
+    snapshot = json.loads(PER_LOAD_MODE_SNAPSHOT.read_text())
     snapshot_counts = Counter(
         {
             (entry["path"], entry["reason"]): entry["count"]
@@ -158,51 +158,51 @@ def test_shell_only_snapshot_matches_independent_scanner():
     independently_scanned = Counter(
         (site.path, site.review_reason)
         for site in _find_calls(
-            "get_store_shell_only", exclude={"backend/core/store.py"}
+            "get_store_per_load_mode", exclude={"backend/core/store.py"}
         )
     )
 
     assert snapshot_counts == independently_scanned
 
 
-def test_shell_only_inventory_identity_ignores_file_local_refactors(tmp_path):
+def test_reviewed_inventory_identity_ignores_file_local_refactors(tmp_path):
     backend = tmp_path / "backend"
     backend.mkdir()
     source = backend / "worker.py"
     source.write_text(
         "def run(user_id):\n"
-        "    return get_store_shell_only(user_id, reason='direct DB helper')\n"
+        "    return get_store_per_load_mode(user_id, reason='direct DB helper')\n"
     )
-    baseline = derive_shell_only_sites(tmp_path)
+    baseline = derive_reviewed_sites(tmp_path)
 
     source.write_text(
         "# unrelated heading\n"
         "# another unrelated line\n"
         "def renamed_run(user_id):\n"
-        "    return get_store_shell_only(\n"
+        "    return get_store_per_load_mode(\n"
         "        user_id, reason='direct DB helper'\n"
         "    )\n"
     )
 
-    assert derive_shell_only_sites(tmp_path) == baseline
+    assert derive_reviewed_sites(tmp_path) == baseline
 
 
-def test_shell_only_inventory_identity_detects_a_new_site(tmp_path):
+def test_reviewed_inventory_identity_detects_a_new_site(tmp_path):
     backend = tmp_path / "backend"
     backend.mkdir()
     source = backend / "worker.py"
     source.write_text(
         "def first(user_id):\n"
-        "    return get_store_shell_only(user_id, reason='first helper')\n"
+        "    return get_store_per_load_mode(user_id, reason='first helper')\n"
     )
-    baseline = derive_shell_only_sites(tmp_path)
+    baseline = derive_reviewed_sites(tmp_path)
 
     source.write_text(
         source.read_text()
         + "\ndef second(user_id):\n"
-        + "    return get_store_shell_only(user_id, reason='first helper')\n"
+        + "    return get_store_per_load_mode(user_id, reason='first helper')\n"
     )
-    updated = derive_shell_only_sites(tmp_path)
+    updated = derive_reviewed_sites(tmp_path)
 
     assert len(updated) == len(baseline) == 1
     assert baseline[0].count == 1
@@ -216,16 +216,16 @@ def test_empty_require_does_not_leave_the_implicit_audit_surface():
         assert not _has_effective_require(call), expression
 
 
-def test_shell_only_store_requires_a_nonempty_review_reason():
+def test_reviewed_store_requires_a_nonempty_review_reason():
     from core import store as core_store
 
     for reason in ("", "   ", None):
         try:
-            core_store.get_store_shell_only("audit-user", reason=reason)
+            core_store.get_store_per_load_mode("audit-user", reason=reason)
         except ValueError as exc:
             assert str(exc) == "shell-only store reason required"
         else:
-            raise AssertionError(f"accepted empty shell-only reason: {reason!r}")
+            raise AssertionError(f"accepted empty reviewed reason: {reason!r}")
 
 
 def test_no_production_legacy_compatibility_calls():
@@ -261,13 +261,13 @@ def _forbid_chat_snapshot(monkeypatch):
         core_store.db,
         "chat_load_hot_snapshot_strict",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("shell-only path loaded Chat hot snapshot")
+            AssertionError("reviewed path loaded Chat hot snapshot")
         ),
     )
     return core_store
 
 
-def test_auth_resolution_is_shell_only(monkeypatch):
+def test_auth_resolution_loads_no_sections(monkeypatch):
     core_store = _forbid_chat_snapshot(monkeypatch)
     from accounts import auth_core
 
@@ -281,7 +281,7 @@ def test_auth_resolution_is_shell_only(monkeypatch):
     assert result.store.loaded_sections() == frozenset()
 
 
-def test_admin_and_reconciler_runtime_control_are_shell_only(monkeypatch):
+def test_admin_and_reconciler_runtime_control_load_no_sections(monkeypatch):
     _forbid_chat_snapshot(monkeypatch)
     from admin import admin_core
     from hosted import config_store, runtime_reconciler
@@ -307,7 +307,7 @@ def test_admin_and_reconciler_runtime_control_are_shell_only(monkeypatch):
     assert runtime_reconciler._current_actual("u-reconcile") == "resident"
 
 
-def test_perception_settings_and_activation_are_shell_only(monkeypatch):
+def test_perception_settings_and_activation_load_no_sections(monkeypatch):
     core_store = _forbid_chat_snapshot(monkeypatch)
     from perception import service as perception_service
 
@@ -328,7 +328,7 @@ def test_perception_settings_and_activation_are_shell_only(monkeypatch):
     assert perception_service._proactive_activation_ready("u-perception") is True
 
 
-def test_profile_sealing_and_debug_trace_are_shell_only(monkeypatch):
+def test_profile_sealing_and_debug_trace_load_no_sections(monkeypatch):
     _forbid_chat_snapshot(monkeypatch)
     from model_api_runtime.v2 import profile_store, serve_worker
 
@@ -372,7 +372,7 @@ def test_v2_bounded_tail_does_not_load_chat_snapshot(monkeypatch):
     ]
 
 
-def test_genesis_early_failure_is_shell_only(monkeypatch):
+def test_genesis_early_failure_loads_no_sections(monkeypatch):
     _forbid_chat_snapshot(monkeypatch)
     from genesis import worker
 

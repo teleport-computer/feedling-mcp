@@ -1117,7 +1117,7 @@ def _web_visible_for_user(user_id: str) -> bool:
 
         return bool(
             web_settings_core.get_settings(
-                core_store.get_store_shell_only(
+                core_store.get_store_per_load_mode(
                     user_id, reason="web settings are direct blob reads"
                 )
             ).get("effective")

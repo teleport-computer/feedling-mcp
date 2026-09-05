@@ -223,7 +223,7 @@ def access_link_token_claim(payload: dict):
                             return {"error": err}, 400
 
                 if make_active:
-                    store = core_store.get_store_shell_only(
+                    store = core_store.get_store_per_load_mode(
                         user_id,
                         reason="access-mode mutation uses DB-backed control state",
                     )
@@ -264,7 +264,7 @@ def access_link_token_claim(payload: dict):
         "access_mode": mode,
         "route": mode,
         "active_route": onboarding._load_onboarding_route(
-            core_store.get_store_shell_only(
+            core_store.get_store_per_load_mode(
                 user_id, reason="onboarding route is a direct blob read"
             )
         ),

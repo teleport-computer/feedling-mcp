@@ -2441,17 +2441,34 @@ def get_store(
     return store
 
 
-def get_store_shell_only(
+def get_store_per_load_mode(
     user_id: str,
     *,
     reason: str,
     bypass_legacy_hydration: bool = False,
 ) -> UserStore:
-    """Return a reviewed store shell reference with a mandatory reason.
+    """Return a store for a reviewed call site; hydration follows the load mode.
 
-    Existing callers retain legacy compatibility hydration. A caller that has
-    proved every operation is backed by direct bounded reads may explicitly
-    bypass that hydration without changing the other reviewed call sites.
+    The former name claimed the caller got an unloaded shell. That is not what
+    this returns, which is why it was renamed:
+
+    * default (``bypass_legacy_hydration=False``) delegates to :func:`get_store`.
+      Under ``StoreLoadMode.LEGACY`` that call tries to ``ensure_sections`` for
+      **every** section; under ``SELECTIVE``/``LAZY`` it is called with no
+      ``require``, so *this call* triggers no new loading.
+    * ``bypass_legacy_hydration=True`` goes straight to the process-local store
+      registry and triggers no loading in **any** mode. It is for a caller that
+      has proved every operation it performs is backed by a direct bounded read;
+      it changes only that call site and leaves the other reviewed sites alone.
+
+    ⚠️ Neither path promises anything about the *returned object's* state: both
+    may hand back a **cached** instance that some earlier caller already loaded
+    sections into. "Triggers no loading here" is the guarantee; "is unhydrated"
+    is not.
+
+    ``reason`` is mandatory and recorded in the reviewed-call-site inventory
+    (``tests/fixtures/store_per_load_mode_sites.json``), so adding a call site is
+    a visible diff rather than a silent one.
     """
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("shell-only store reason required")

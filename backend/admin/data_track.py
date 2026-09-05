@@ -2235,9 +2235,9 @@ def _build_data_track_user_detail(user_entry: dict) -> dict:
     })
 
     # These detail helpers only need ``user_id`` and perform their own direct,
-    # bounded reads. The reviewed shell-only factory preserves process-local
+    # bounded reads. The bypass path preserves process-local
     # identity/locks without hydrating Store sections, including in legacy mode.
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id,
         reason="admin detail helpers use direct bounded DB reads",
         bypass_legacy_hydration=True,
