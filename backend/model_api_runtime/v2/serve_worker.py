@@ -849,7 +849,7 @@ def _resolve_provider(user_id: str, *, trace_job_id: str = ""):
     ``(None, {"error": ...})`` tuple; this function forwards that shape as-is so
     ``worker._run_turn`` can mark the job failed without a placeholder reply.
     """
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="provider configuration is a direct blob read"
     )
     try:
@@ -1450,7 +1450,7 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
 
     by_id: dict[str, dict] = {}
     try:
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="memory quoted-card reads are DB/readside backed"
         )
         token = _mint_runtime_token(user_id)
@@ -1813,7 +1813,7 @@ def _append_summary_segment(
     previous_watermark_seq: int,
 ) -> bool:
     """Seal one leaf and atomically append it with the summary head CAS."""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="summary envelope construction needs identity only"
     )
     env, err = core_envelope._build_shared_envelope_for_store(
@@ -1874,7 +1874,7 @@ def _append_summary_checkpoint(
     legacy_opaque_through_seq: int = 0,
 ) -> bool:
     """Seal one derived parent; all encrypted children remain immutable."""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="checkpoint envelope construction needs identity only"
     )
     env, err = core_envelope._build_shared_envelope_for_store(
@@ -1918,7 +1918,7 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
     layer — reuses gate._build_proactive_v2_wake_decision so activation gate /
     broadcast suppression / all landmines hold with zero drift). No enqueue here;
     the scheduler decides what to do with should_wake."""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="wake gate state uses direct DB/blob helpers"
     )
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(store):
@@ -1950,7 +1950,7 @@ def _fire_scheduled_for_user(user_id: str) -> int:
     镜像 `proactive_core.scheduled_fire` 的 settings/service 构造，只换 owner_id 与
     submit_wake 的落点。"""
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(
-        core_store.get_store_shell_only(
+        core_store.get_store_per_load_mode(
             user_id, reason="scheduled wake control is DB-backed"
         )
     ):
@@ -2096,7 +2096,7 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     单条失败只跳过那一条，绝不抛——调用方 `worker._inject_tail_images` 会把缺失的图片
     行原样留成文本。
     """
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="image capability reads exact DB rows"
     )
     token = _mint_runtime_token(user_id)
@@ -2202,7 +2202,7 @@ def _read_screen_frame_cached(user_id: str, frame_id: str) -> tuple[dict | None,
 
     value: dict | None = None
     try:
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="screen decrypt reads an exact frame row"
         )
         value = _decode_screen_frame_result(
@@ -2537,7 +2537,7 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     stable ``sandbox_unavailable`` result; there is no fallback to the old
     in-process PDF/DOCX/XLSX parser.
     """
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="file capability reads exact DB/object rows"
     )
     token = _mint_runtime_token(user_id)
@@ -2748,7 +2748,7 @@ async def _generate_image_for_chat(
         "provider": str(getattr(config, "provider", "") or ""),
         "model": str(getattr(config, "model", "") or ""),
     }
-    _image_store = core_store.get_store_shell_only(
+    _image_store = core_store.get_store_per_load_mode(
         user_id, reason="image generation output is a cold-safe write"
     )
     _emit_v2_debug_trace(
@@ -2938,7 +2938,7 @@ def _read_profile_cards(
     adds no second per-card cap on top of that source contract.
     """
 
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="profile memory reads use DB/readside helpers"
     )
     token = _mint_runtime_token(user_id)
@@ -3036,7 +3036,7 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
 
     identity 与记忆一样按行形状读取：密文经 enclave，明文 body 本地读取。
     agent_name/user_preferred_name 同步作为抽取 prompt 的说话人标签。"""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="turn memory reads use DB/readside helpers"
     )
     try:
@@ -3201,7 +3201,7 @@ def _apply_memory_actions(
       `turn_failed:runtimeerror`——即使真正想做的写已经提交（实测：显式 id 删除，
       卡确实删了、turn 却失败）。丢弃+记日志：用户照常拿到回复，被拒的 action 在
       runner 日志里可见（body 打进 warning，供事后定位）。"""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="memory actions use durable helpers"
     )
     batches: list[dict] = []
@@ -3266,7 +3266,7 @@ def _build_memory_envelope(
     extraction._to_actions 在 build_envelope 抛出时会把整批 to_actions 一并冒出去，交给
     worker._run_extraction 的 try/except mark_failed —— 这正是我们要的：宁可整批失败重来，
     也不要把半张卡/无信封的卡塞进 memory.actions。"""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="memory envelope construction needs identity only"
     )
     payload = json.dumps(inner, ensure_ascii=False).encode("utf-8")
@@ -3283,7 +3283,7 @@ def _tick_capture_for_user(user_id: str) -> int:
     agent_jobs 的 submitter —— gate 的五道早退（capture_disabled/no_new_messages/
     already_captured/quiet_not_due/min_interval）原样复用，零漂移（spec §3.1）。enqueue 了
     返回 1，否则 0。"""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="capture scheduler state is DB/blob backed"
     )
 
@@ -3316,7 +3316,7 @@ def _tick_dream_for_user(user_id: str) -> int:
     的 submitter —— gate 的全部早退（dream_disabled/no_memory_cards/dream_already_pending/
     night_not_due/failure_backoff/already_dreamed/min_interval/not_enough_new_cards）原样复用，
     零漂移。enqueue 了返回 1，否则 0。"""
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="dream scheduler state is DB/blob backed"
     )
 
@@ -3414,7 +3414,7 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
 
     enqueue 了返回 1，否则 0。"""
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(
-        core_store.get_store_shell_only(
+        core_store.get_store_per_load_mode(
             user_id, reason="screen-watch runtime fence is DB-backed"
         )
     ):
@@ -3679,7 +3679,7 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     extra_kwargs = {"extra": extra} if extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="reply effect is a cold-safe committed write"
         )
         v2_worker._write_encrypted_reply_effect(
@@ -3695,7 +3695,7 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     if not db.effect_sink_claim(eid):
         return  # replay after a crash between sink-write and status=applied -> no-op
     try:
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="legacy reply effect is a cold-safe committed write"
         )
         row = v2_worker._write_encrypted_reply(
@@ -3721,7 +3721,7 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     """
     message_payloads = _reply_payload_sequence(payload)
     reply_parent_id = _reply_parent_message_id(payload)
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="transactional reply uses cold-safe post-commit reconciliation"
     )
     records = []
@@ -4008,7 +4008,7 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
         ):
             # Deterministic bad row — never guess it into identity_patch.
             raise db.EffectTerminalError("identity_operation_invalid")
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="identity capability uses durable helpers"
         )
         params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
@@ -4105,7 +4105,7 @@ def _sink_schedule(user_id: str, payload: dict) -> object:
                     )
                     db.effect_sink_complete(eid)
                     return
-            store = core_store.get_store_shell_only(
+            store = core_store.get_store_per_load_mode(
                 user_id, reason="schedule capability uses durable helpers"
             )
             params = {
@@ -4161,7 +4161,7 @@ def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
         op = str(payload.get("op") or "")
         if op not in {"workspace_write", "workspace_delete"}:
             raise db.EffectTerminalError("workspace_operation_invalid")
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="workspace capability uses exact DB rows"
         )
         params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
@@ -4245,7 +4245,7 @@ def _apply_workspace_batch_operation(
         return {"effect_id": child_effect_id, "status": "applied"}
     try:
         op = str(operation["op"])
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="workspace batch capability uses exact DB rows"
         )
         params = {
@@ -4766,7 +4766,7 @@ def _seal_trajectory_payload(
     therefore stores those bytes as explicitly prefixed base64 text; encrypted
     accounts retain the existing shared envelope unchanged.
     """
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         str(user_id), reason="trajectory envelope construction needs identity only"
     )
     if core_envelope.resolve_content_encryption(store.user_id) == "off":
@@ -4818,7 +4818,7 @@ def _open_trajectory_payload(
 
 def _read_capture_state(user_id: str) -> dict:
     return capture_scheduler.load_capture_state_strict(
-        core_store.get_store_shell_only(
+        core_store.get_store_per_load_mode(
             user_id, reason="capture state is a direct blob read"
         )
     )
@@ -4862,7 +4862,7 @@ def _record_extraction_status(
     detail: dict,
 ) -> None:
     if lane == "dream":
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="dream status uses direct DB/blob helpers"
         )
         snapshot = dream_scheduler._dream_snapshot(store)
@@ -4894,7 +4894,7 @@ def _record_extraction_status(
         return
     window = detail.get("window") if isinstance(detail, dict) else {}
     capture_scheduler.record_v2_capture_status(
-        core_store.get_store_shell_only(
+        core_store.get_store_per_load_mode(
             user_id, reason="capture status uses direct DB/blob helpers"
         ),
         status=status,
@@ -5109,7 +5109,7 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
 def _emit_v2_debug_trace_for_user(user_id: str, event_type: str, **kwargs) -> None:
     """Assembly seam for the dependency-clean V2 worker."""
     _emit_v2_debug_trace(
-        core_store.get_store_shell_only(
+        core_store.get_store_per_load_mode(
             user_id, reason="debug trace is a durable log write"
         ),
         event_type,
@@ -5173,7 +5173,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         ordered_chat_replies=True,
         runtime_mode_enabled=lambda user_id: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
-                core_store.get_store_shell_only(
+                core_store.get_store_per_load_mode(
                     user_id, reason="runtime mode dependency is DB-backed"
                 )
             )
@@ -5184,7 +5184,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         # ``is True``, never bool(...): strict booleans all the way down, so a
         # corrupt setting cannot read as web access switched ON.
         web_tools_enabled=lambda user_id: (
-            core_store.get_store_shell_only(
+            core_store.get_store_per_load_mode(
                 user_id, reason="web-tools setting is a direct blob read"
             )
             .load_web_settings()
@@ -5266,7 +5266,7 @@ def _build_scheduler_deps():
         ),
         runtime_mode_enabled=lambda uid: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
-                core_store.get_store_shell_only(
+                core_store.get_store_per_load_mode(
                     uid, reason="scheduler runtime mode is DB-backed"
                 )
             )

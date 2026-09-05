@@ -9123,7 +9123,7 @@ async def _run_wake(
     )
     provider_reply_signal = _ProviderReplySignal()
     try:
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="wake lane reads bounded DB inputs and durable cursors"
         )
         seq_native = deps.read_messages_after_seq is not None
@@ -14106,7 +14106,7 @@ async def process_job(
             )
             tm.flush(failed=True, status=f"unhandled_lane:{lane}")
             return "failed"
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="chat lane reads bounded DB inputs and durable cursors"
         )
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)

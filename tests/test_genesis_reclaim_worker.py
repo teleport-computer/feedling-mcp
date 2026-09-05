@@ -24,7 +24,7 @@ def test_reclaim_syncs_state_per_action(monkeypatch):
     monkeypatch.setattr(gworker.db, "genesis_reclaim_orphaned_processing_jobs", _fake_reclaim)
     monkeypatch.setattr(
         gworker,
-        "get_store_shell_only",
+        "get_store_per_load_mode",
         lambda _user_id, **_kwargs: object(),
     )
     monkeypatch.setattr(gworker, "_trace_genesis", lambda *a, **k: None)

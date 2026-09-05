@@ -175,7 +175,7 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
     from core import store as _wire_core_store
 
     _diagnostics_core.emit_trace_event_payload(
-        _wire_core_store.get_store_shell_only(
+        _wire_core_store.get_store_per_load_mode(
             user_id, reason="debug trace is a durable log write"
         ),
         {

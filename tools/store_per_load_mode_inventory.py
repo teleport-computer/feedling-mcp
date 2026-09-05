@@ -1,4 +1,4 @@
-"""Derive the reviewed production ``get_store_shell_only`` call inventory.
+"""Derive the reviewed production ``get_store_per_load_mode`` call inventory.
 
 The checked-in snapshot is a multiset keyed by path and review reason.  It is
 intentionally independent of source coordinates and function names: formatting,
@@ -19,11 +19,11 @@ from typing import Sequence
 
 SCHEMA_VERSION = 1
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SNAPSHOT = Path("tests/fixtures/store_shell_only_sites.json")
+DEFAULT_SNAPSHOT = Path("tests/fixtures/store_per_load_mode_sites.json")
 
 
 @dataclass(frozen=True, order=True)
-class ShellOnlyInventoryEntry:
+class ReviewedInventoryEntry:
     path: str
     reason: str
     count: int
@@ -48,19 +48,19 @@ def _review_reason(call: ast.Call) -> str:
     return ""
 
 
-class _ShellOnlyVisitor(ast.NodeVisitor):
+class _ReviewedVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.reasons: list[str] = []
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        if _call_name(node) == "get_store_shell_only":
+        if _call_name(node) == "get_store_per_load_mode":
             self.reasons.append(_review_reason(node))
         self.generic_visit(node)
 
 
-def derive_shell_only_sites(
+def derive_reviewed_sites(
     repo_root: Path,
-) -> tuple[ShellOnlyInventoryEntry, ...]:
+) -> tuple[ReviewedInventoryEntry, ...]:
     backend_root = repo_root / "backend"
     counts: Counter[tuple[str, str]] = Counter()
     for file_path in sorted(backend_root.rglob("*.py")):
@@ -68,11 +68,11 @@ def derive_shell_only_sites(
         if relative == "backend/core/store.py":
             continue
         tree = ast.parse(file_path.read_text(), filename=relative)
-        visitor = _ShellOnlyVisitor()
+        visitor = _ReviewedVisitor()
         visitor.visit(tree)
         counts.update((relative, reason) for reason in visitor.reasons)
     return tuple(
-        ShellOnlyInventoryEntry(path=path, reason=reason, count=count)
+        ReviewedInventoryEntry(path=path, reason=reason, count=count)
         for (path, reason), count in sorted(counts.items())
     )
 
@@ -80,7 +80,7 @@ def derive_shell_only_sites(
 def inventory_document(repo_root: Path) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "sites": [asdict(site) for site in derive_shell_only_sites(repo_root)],
+        "sites": [asdict(site) for site in derive_reviewed_sites(repo_root)],
     }
 
 

@@ -111,7 +111,7 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | `tools/repository_inventory.py`（1） | Repository cleanup | generated helper | retain | E34 |
 | `tools/seed_copytext.py`（1） | Product copy operations | active diagnostic | retain | E35 |
 | `tools/seed_legacy_memory.py`（1） | Memory compatibility | test support | retain | E36 |
-| `tools/store_shell_only_inventory.py`（1） | Store-load contract | generated helper | retain | E37 |
+| `tools/store_per_load_mode_inventory.py`（1） | Store-load contract | generated helper | retain | E37 |
 | `tools/strict_yaml.py`（1） | Deployment configuration validation | test support | retain | E41 |
 | `tools/user_mcp_ca_fetch.py`<br>`tools/user_mcp_materialize.py`（2） | Resident user-MCP runtime | production companion | **retain-protected** | E38 |
 | `tools/v2_user_triage.py`（1） | Runtime V2 operations | active diagnostic | retain | E39 |
