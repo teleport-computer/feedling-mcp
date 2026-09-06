@@ -24,7 +24,13 @@ def roundtrip(old_signal: str, old_doc: dict) -> dict:
     """老文档 → kit → 老文档。两个方向用的是同一张映射表。"""
     produced = dict(backfill.convert(old_signal, old_doc))
     kit_signal = backfill._key_map()[old_signal]
-    main = produced[kit_signal]
+    # 0.4.0 拆分之后一条老记录散在好几个 kit 信号里，往返要**全部合回来**
+    # 才是完整的一份 —— 只取主信号的话，被拆走的指标（体脂、血压）
+    # 会在往返里静默丢失，而这条测试本来就是为了抓这种丢失。
+    from perception.perceptkit_adapter.ios_report import SPLIT_OFF
+    main = dict(produced.get(kit_signal) or {})
+    for target in sorted({t for t, _f in SPLIT_OFF.get(old_signal, {}).values()}):
+        main.update(produced.get(target) or {})
     if old_signal == "health_sleep":
         return history._sleep_back(main)
     if old_signal == "health_vitals":

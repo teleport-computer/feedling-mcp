@@ -663,40 +663,59 @@ class PostgresStorage:
         ]
 
     def delete_source_items(self, *, subject_id, source, collection_kind,
-                            source_item_ids) -> int:
-        """Deletions the source explicitly reported -- not inferred ones.
+                            deleted_items) -> int:
+        """Deletions the source stated outright, scoped to exactly one item.
 
-        Separate from ``apply_source_snapshot`` on purpose:
-
-            snapshot    "inside coverage, not mentioned this round" -- inferred,
-                        so only a full sync may do it, and only in its window
-            this one    "the source says this one is gone" -- a fact, so an
-                        incremental sync must do it too
-
-        Without it an incremental sync has only bad options: delete nothing
-        (an event the user removed on their phone stays in the agent's view
-        forever, and keeps showing up under "what's coming up"), or treat a
-        partial list as a full one, which is worse and irreversible.
+        The scope is all five parts: subject + source + account + collection +
+        item id. Dropping any one of them hits a namesake sibling -- two
+        accounts under one source routinely reuse an event id, and they are
+        different events. Every one of those is irreversible, and what the
+        user sees is "my calendar lost something".
         """
-        ids = [str(i) for i in (source_item_ids or ()) if str(i).strip()]
-        if not ids:
+        if not deleted_items:
             return 0
         if collection_kind == "calendar":
-            table, id_col = "perceptkit_calendar_mirror", "source_event_id"
-        elif collection_kind == "reminders":
-            table, id_col = "perceptkit_reminder_mirror", "source_reminder_id"
+            table, coll, item = ("perceptkit_calendar_mirror",
+                                 "source_calendar_id", "source_event_id")
         else:
-            return 0
+            table, coll, item = ("perceptkit_reminder_mirror",
+                                 "source_list_id", "source_reminder_id")
+        total = 0
         with self.conn.cursor() as cur:
-            cur.execute(
-                # `source` is part of the delete scope. Without it an `ios`
-                # deletion hits a row in another source system that happens
-                # to share the id.
-                f"DELETE FROM {table} WHERE subject_id = %s AND source = %s "
-                f"AND {id_col} = ANY(%s)",
-                (subject_id, source, ids),
-            )
-            return cur.rowcount
+            for d in deleted_items:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE subject_id=%s AND source=%s "
+                    f"AND source_account_id=%s AND {coll}=%s AND {item}=%s",
+                    (subject_id, source, d.source_account_id,
+                     d.source_collection_id, d.source_item_id),
+                )
+                total += cur.rowcount
+        return total
+
+    def record_retraction(self, retraction) -> bool:
+        rows = self._q(
+            """
+            INSERT INTO perceptkit_retraction
+              (subject_id, signal, source, source_event_id, observed_at)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (subject_id, signal, source, source_event_id)
+            DO NOTHING
+            RETURNING 1
+            """,
+            (retraction.subject_id, retraction.signal, retraction.source,
+             retraction.source_event_id, retraction.observed_at),
+        )
+        return bool(rows)
+
+    def list_retractions(self, *, subject_id, signal, source_event_ids=None):
+        from perceptkit.contracts.retraction import Retraction
+        sql = ("SELECT subject_id, signal, source_event_id, source, observed_at "
+               "FROM perceptkit_retraction WHERE subject_id=%s AND signal=%s")
+        params: list[Any] = [subject_id, signal]
+        if source_event_ids is not None:
+            sql += " AND source_event_id = ANY(%s)"
+            params.append(list(source_event_ids))
+        return [Retraction(*r) for r in self._q(sql, params)]
 
     def apply_source_snapshot(self, *, subject_id, source, collection_kind,
                               sync_id, coverage_start, coverage_end,

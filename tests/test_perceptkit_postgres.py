@@ -31,6 +31,7 @@ from perceptkit.contracts.records import (  # noqa: E402
 )
 from perceptkit.contracts.receipt import WakeReceipt  # noqa: E402
 
+from perceptkit.processing.source_sync import DeletedItem  # noqa: E402
 from perception.perceptkit_adapter import schema  # noqa: E402
 from perception.perceptkit_adapter.storage import PostgresStorage  # noqa: E402
 
@@ -458,9 +459,32 @@ def test_an_explicit_tombstone_deletes_only_that_source(clean):
     ])
     n = s.delete_source_items(subject_id="u1", source="ios",
                               collection_kind="calendar",
-                              source_item_ids=["同一个 id"])
+                              deleted_items=[
+                                  DeletedItem("ios-acct", "c1", "同一个 id")])
     left = {e.source for e in s.list_calendar_events(subject_id="u1", limit=50)}
     assert n == 1 and left == {"google"}, f"删越界了，剩下 {left}"
+
+
+def test_a_tombstone_stays_inside_its_own_account_and_calendar(clean):
+    """范围是五段。真实存储要自己写 SQL，**少一个 AND 就是删过头**，
+    而这在内存实现上很容易"看起来对" —— 只放一条数据是发现不了的。
+    """
+    s = store()
+    s.upsert_calendar_events(subject_id="u1", events=[
+        CalendarEventMirror(
+            subject_id="u1", source="ios", source_account_id=acct,
+            source_calendar_id=cal, source_event_id="撞 id",
+            event_fields={"title": f"{acct}/{cal}", "start_at": T0},
+            last_seen_sync_id="a")
+        for acct, cal in (("工作", "日历1"), ("工作", "日历2"), ("私人", "日历1"))
+    ])
+    n = s.delete_source_items(
+        subject_id="u1", source="ios", collection_kind="calendar",
+        deleted_items=[DeletedItem("工作", "日历1", "撞 id")])
+    left = {(e.source_account_id, e.source_calendar_id)
+            for e in s.list_calendar_events(subject_id="u1", limit=50)}
+    assert n == 1, f"该删 1 条，删了 {n} 条"
+    assert left == {("工作", "日历2"), ("私人", "日历1")}, f"剩下 {left}"
 
 
 def test_a_tombstone_for_an_unknown_id_deletes_nothing(clean):
@@ -468,7 +492,7 @@ def test_a_tombstone_for_an_unknown_id_deletes_nothing(clean):
     s.upsert_calendar_events(subject_id="u1", events=[_cal("ios", "i1", sync="a")])
     assert s.delete_source_items(subject_id="u1", source="ios",
                                  collection_kind="calendar",
-                                 source_item_ids=["从来没有过的 id"]) == 0
+                                 deleted_items=[DeletedItem("ios-acct", "c1", "从来没有过的 id")]) == 0
     assert len(s.list_calendar_events(subject_id="u1", limit=50)) == 1
 
 
@@ -482,7 +506,7 @@ def test_a_tombstone_stays_inside_one_subject(clean):
             event_fields={"start_at": T0})])
     s.delete_source_items(subject_id="u1", source="ios",
                           collection_kind="calendar",
-                          source_item_ids=["同一个 id"])
+                          deleted_items=[DeletedItem("ios-acct", "c1", "同一个 id")])
     assert len(s.list_calendar_events(subject_id="u2", limit=10)) == 1
 
 

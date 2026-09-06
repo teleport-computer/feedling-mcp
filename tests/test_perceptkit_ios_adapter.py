@@ -110,18 +110,25 @@ def test_body_fat_is_converted_not_just_renamed():
     只改名的话存进去是 18.4 —— manifest 声明的是 0~1 的比率，
     区间检查会拒掉它，然后体脂就**再也没有到过**，一声不吭。
     """
-    v = value("health_body", json.dumps({"body_fat_pct": 18.4, "weight_kg": 68.2}),
-              "health_body")
+    obs = envelope("health_body", json.dumps({"body_fat_pct": 18.4,
+                                              "weight_kg": 68.2}))
+    v = obs["health_body_fat"]["value"]
     assert v["body_fat_ratio"] == pytest.approx(0.184)
     assert "body_fat_pct" not in v
+    # 体重留在主信号，体脂已经搬走 —— 不许两边各存一份。
+    assert obs["health_weight"]["value"] == {"weight_kg": 68.2}
 
 
 def test_blood_pressure_reaches_the_kit():
-    v = value("health_metabolic",
-              json.dumps({"blood_pressure_systolic": 118,
-                          "blood_pressure_diastolic": 76}), "health_metabolic")
+    obs = envelope("health_metabolic",
+                   json.dumps({"blood_pressure_systolic": 118,
+                               "blood_pressure_diastolic": 76}))
+    # 收缩压和舒张压是**一次**测量的两半（HKCorrelation），
+    # 必须落进同一条观测；拆成两条的话「118/76」就没法再拼回来。
+    v = obs["health_blood_pressure"]["value"]
     assert v["blood_pressure_systolic_mmhg"] == 118
     assert v["blood_pressure_diastolic_mmhg"] == 76
+    assert "health_glucose" not in obs
 
 
 def test_workout_duration_reaches_the_kit():
@@ -149,7 +156,7 @@ def test_step_count_becomes_its_own_signal():
                    json.dumps({"resting_heart_rate": 58, "step_count": 4211}))
     assert obs["steps"]["value"] == {"step_count": 4211}
     # 不能两边都存：同一个数字被两套聚合规则各写一遍。
-    assert "step_count" not in obs["health_vitals"]["value"]
+    assert "step_count" not in obs["health_resting_hr"]["value"]
 
 
 def test_no_steps_observation_when_the_device_did_not_report_any():
@@ -159,3 +166,15 @@ def test_no_steps_observation_when_the_device_did_not_report_any():
     """
     obs = envelope("health_vitals", json.dumps({"resting_heart_rate": 58}))
     assert "steps" not in obs
+
+
+def test_a_report_that_only_carries_split_off_fields_makes_no_main_observation():
+    """只测了步数的那趟上报，不该顺带宣称「量了静息心率、结果是空」。
+
+    0.4.0 把体征拆开之后，主信号的字段有可能**一个都不剩**。照旧发一条
+    `observed` 空 value 的观测，下游会当成一次真实测量：当前值被一条没有
+    数值的记录顶掉、日聚合多算一次，而且不报错。
+    """
+    obs = envelope("health_vitals", json.dumps({"step_count": 4211}))
+    assert "health_resting_hr" not in obs
+    assert obs["steps"]["value"] == {"step_count": 4211}   # 拆出来的照发
