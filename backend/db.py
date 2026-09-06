@@ -12059,6 +12059,47 @@ def chat_get_many_strict(user_id: str, message_ids: list[str]) -> list[dict]:
     return [_chat_project_row(row) for row in rows]
 
 
+def chat_latest_agent_file_metadata_by_name(
+    user_id: str,
+    file_names: list[str],
+) -> dict[str, dict]:
+    """Return the newest agent-authored file-card metadata for each name.
+
+    Canvas workspace rows are durable independently of their original Chat
+    attachment, so missing names are expected and simply do not appear in the
+    result. Only plaintext card metadata is projected; message bodies and
+    envelopes never leave this query.
+    """
+    names = list(
+        dict.fromkeys(
+            str(file_name) for file_name in file_names if str(file_name)
+        )
+    )[:500]
+    if not names:
+        return {}
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (doc->>'file_name') "
+            "doc->>'file_name',msg_id,"
+            "NULLIF(doc->>'file_display_title',''),"
+            "NULLIF(doc->>'file_display_subtitle','') "
+            "FROM chat_messages WHERE user_id=%s "
+            "AND doc->>'role' IN ('agent','openclaw') "
+            "AND doc->>'content_type'='file' "
+            "AND doc->>'file_name'=ANY(%s) "
+            "ORDER BY doc->>'file_name',seq DESC",
+            (user_id, names),
+        ).fetchall()
+    return {
+        str(file_name): {
+            "message_id": str(message_id),
+            "display_title": display_title,
+            "display_subtitle": display_subtitle,
+        }
+        for file_name, message_id, display_title, display_subtitle in rows
+    }
+
+
 def chat_verify_reply_strict(
     user_id: str,
     ping_id: str,

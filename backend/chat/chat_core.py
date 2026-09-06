@@ -675,6 +675,35 @@ def workspace_canvas_body(store: UserStore, filename: str) -> tuple[dict, int]:
     }, 200
 
 
+def _canvas_index_timestamp(value) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def canvas_index(store: UserStore) -> tuple[dict, int]:
+    """Return metadata for the caller's current IO Canvas workspace entries."""
+    rows = v2_jobs_store.list_canvas_workspace_entries(store.user_id, limit=500)
+    prefix = "/workspace/"
+    filenames = [str(row["path"])[len(prefix):] for row in rows]
+    message_metadata = db.chat_latest_agent_file_metadata_by_name(
+        store.user_id,
+        filenames,
+    )
+    canvases = []
+    for row, filename in zip(rows, filenames):
+        message = message_metadata.get(filename, {})
+        canvases.append({
+            "filename": filename,
+            "revision": int(row["revision"]),
+            "mime_type": str(row["mime_type"]),
+            "created_at": _canvas_index_timestamp(row["created_at"]),
+            "updated_at": _canvas_index_timestamp(row["updated_at"]),
+            "message_id": message.get("message_id"),
+            "display_title": message.get("display_title"),
+            "display_subtitle": message.get("display_subtitle"),
+        })
+    return {"canvases": canvases}, 200
+
+
 # --------------------------------------------------------------------------- #
 # POST /v1/chat/message  (user sends a v1 ciphertext envelope)
 # --------------------------------------------------------------------------- #

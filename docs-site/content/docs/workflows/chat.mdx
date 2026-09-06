@@ -17,6 +17,18 @@ the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
 
 An IO Canvas card may outlive the Chat attachment that first published it.
+Authenticated clients should build the Canvas library from
+`GET /v1/chat/canvases`, which reads the caller's current workspace index
+directly instead of walking Chat history. The response contains at most 500
+metadata-only entries ordered by `updated_at` descending. Each entry includes
+the original case-preserving `filename`, workspace revision, MIME type, and
+creation/update timestamps. The `.io.html` suffix match is case-insensitive,
+while the returned filename preserves its original case. When a matching agent-authored file card still
+exists in Chat, the newest row contributes `message_id`, `display_title`, and
+`display_subtitle`; those three fields are `null` when the workspace entry
+predates or outlives its Chat card. Canvas bodies and envelopes are never part
+of this listing response.
+
 Authenticated clients can read the current Canvas source with
 `GET /v1/chat/workspace/body?filename=<original-file_name>`. The endpoint accepts
 only the original `.io.html` basename from the Chat row, derives the private

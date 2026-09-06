@@ -214,8 +214,9 @@ def test_public_operation_and_parameter_inventory(
     # validators; only the two config mutations carry request bodies.
     # The authenticated resident generation exchange adds one prompt-bearing
     # operation.
-    # GET /v1/chat/workspace/body adds one bodyless Canvas live-read operation.
-    assert len(operations) == 177
+    # GET /v1/chat/workspace/body and GET /v1/chat/canvases add two bodyless
+    # Canvas read operations.
+    assert len(operations) == 178
     assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
@@ -420,6 +421,34 @@ def test_chat_memory_and_perception_contracts_are_concrete(
     assert canvas_response["properties"]["envelope"] == {
         "$ref": "#/components/schemas/EncryptedEnvelope"
     }
+
+    canvas_index_operation = operations[("get", "/v1/chat/canvases")]
+    assert _parameters(canvas_index_operation, "query") == {}
+    assert canvas_index_operation["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"] == {"$ref": "#/components/schemas/CanvasIndexResponse"}
+    canvas_index = schemas["CanvasIndexResponse"]
+    assert canvas_index["properties"]["canvases"]["maxItems"] == 500
+    assert canvas_index["properties"]["canvases"]["items"] == {
+        "$ref": "#/components/schemas/CanvasIndexEntry"
+    }
+    canvas_entry = schemas["CanvasIndexEntry"]
+    assert set(canvas_entry["required"]) == {
+        "filename",
+        "revision",
+        "mime_type",
+        "created_at",
+        "updated_at",
+        "message_id",
+        "display_title",
+        "display_subtitle",
+    }
+    message_id_types = {
+        item["type"]
+        for item in canvas_entry["properties"]["message_id"]["anyOf"]
+    }
+    assert message_id_types == {"string", "null"}
+    assert "envelope" not in canvas_entry["properties"]
 
     memory_query = _parameters(
         operations[("get", "/v1/memory/list")], "query"

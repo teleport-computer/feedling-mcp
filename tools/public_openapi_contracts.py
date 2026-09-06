@@ -1421,6 +1421,58 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
     },
+    "CanvasIndexEntry": {
+        "type": "object",
+        "required": [
+            "filename",
+            "revision",
+            "mime_type",
+            "created_at",
+            "updated_at",
+            "message_id",
+            "display_title",
+            "display_subtitle",
+        ],
+        "properties": {
+            "filename": {"type": "string", "minLength": 1, "maxLength": 120},
+            "revision": {"type": "integer", "minimum": 1},
+            "mime_type": {"type": "string"},
+            "created_at": {"type": "string", "format": "date-time"},
+            "updated_at": {"type": "string", "format": "date-time"},
+            "message_id": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 160},
+                    {"type": "null"},
+                ],
+                "description": "Newest matching agent-authored Chat file row, or null when the Canvas has no published attachment row.",
+            },
+            "display_title": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 120},
+                    {"type": "null"},
+                ],
+            },
+            "display_subtitle": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 160},
+                    {"type": "null"},
+                ],
+            },
+        },
+        "additionalProperties": False,
+    },
+    "CanvasIndexResponse": {
+        "type": "object",
+        "required": ["canvases"],
+        "properties": {
+            "canvases": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {"$ref": "#/components/schemas/CanvasIndexEntry"},
+            },
+        },
+        "additionalProperties": False,
+    },
     "ChatTransportRequest": {
         "type": "object",
         "required": ["envelope"],
@@ -2545,6 +2597,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
+    ("get", "/v1/chat/canvases"): (
+        "List up to 500 current IO Canvas workspace entries for the authenticated "
+        "user, ordered by most recent workspace update. This metadata-only index "
+        "matches the .io.html suffix case-insensitively while preserving filename "
+        "case, and "
+        "never returns Canvas bodies or envelopes. message_id and display metadata "
+        "come from the newest matching agent-authored Chat file row and are null "
+        "when no such row exists."
+    ),
     ("get", "/v1/chat/workspace/body"): (
         "Read the authenticated user's current IO Canvas workspace envelope by "
         "the original .io.html file_name stored on its Chat attachment. The "
@@ -2673,6 +2734,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/chat/canvases"): {
+        "200": {
+            "description": "The caller's current Canvas workspace metadata, newest first.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/CanvasIndexResponse"}
+                }
+            },
+        },
+    },
     ("get", "/v1/chat/workspace/body"): {
         "200": {
             "description": "The current Canvas workspace revision and opaque shared envelope.",
