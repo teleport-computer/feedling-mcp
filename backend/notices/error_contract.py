@@ -8,6 +8,7 @@ consumer can distinguish a complete empty value from an unavailable source.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
@@ -118,27 +119,131 @@ def _spec(
 # auth_invalid 会让用户照着文案反复重存 key —— 2026-09-06 线上就这么发生过一整晚
 # （T497：用户的 key 自 7-14 起没变过，测试也通过，失败却是间歇的）。
 #
-# 判据必须对**整条 candidate 一次性**成立，不能写成“某个 403 后面若干字符内有
-# api_error”。逐个出现位置去判会被三种形状绕开（都实测过）：
+# raw JSON 判据必须对**整条 candidate 一次性**成立，不能写成“某个 403 后面若干
+# 字符内有 api_error”。逐个出现位置去判会被三种形状绕开（都实测过）：
 #   ① 只要 type=api_error 就放行 → "Account suspended by provider" 这类真账号问题
 #      被误判成暂时不可用；所以必须连那条**精确的通用 message** 一起要求。
 #   ② 体里再出现一次 403（如 "code":"403"）→ 后一个 occurrence 绕过负向断言。
 #   ③ 状态码写在体后面（"…; status 403"）→ 只向后看的断言直接失效。
 #   ④ 那句话**裸着出现在外层日志里**（而 body 的 message 是别的）→ 若只匹配裸短语
 #      同样会放行；所以它必须钉在 JSON 的 `message` 字段上，不是文本里任意一处。
-# 因此三项条件写成三个独立的先行断言并锚在 \A：**顺序可交换、重复不影响**。
-_GENERIC_UPSTREAM_403_MESSAGE = (
-    r"\"message\"\s*:\s*\"Request failed\. Please try again later\.\""
+# 因此 raw-JSON 三项条件写成三个独立的先行断言并锚在 \A：**顺序可交换、重复
+# 不影响**。另有一个不可合并的 production-detail adapter：provider_client 历史上
+# 先把 JSON 抽成 message，再生成 ``provider_http_403: <message>``。那条输入已经
+# 永久丢了 type，必须用状态前缀 + 精确 message 识别；新的结构化异常则走下方
+# ``provider_response_is_auth_failure(status, raw_body)``，不再主动丢 body。
+GENERIC_UPSTREAM_403_MESSAGE_TEXT = "Request failed. Please try again later."
+_GENERIC_UPSTREAM_403_MESSAGE_VALUE = re.escape(
+    GENERIC_UPSTREAM_403_MESSAGE_TEXT
 )
-_GENERIC_UPSTREAM_403_SHAPE = (
+_GENERIC_UPSTREAM_403_MESSAGE = (
+    r"\"message\"\s*:\s*\"" + _GENERIC_UPSTREAM_403_MESSAGE_VALUE + r"\""
+)
+_GENERIC_UPSTREAM_403_JSON_SHAPE = (
     r"(?=[\s\S]*\b403\b)"
     r"(?=[\s\S]*" + _GENERIC_UPSTREAM_403_MESSAGE + r")"
     r"(?=[\s\S]*\"type\"\s*:\s*\"api_error\")"
+)
+# provider_client._raise_for_provider_status does not expose that JSON to its
+# consumers: it first extracts the message and formats the production exception
+# as ``provider_http_403: <message>``.  Keep that real shape separate from the
+# raw-JSON/log adapter so an unrelated outer log phrase cannot satisfy it.
+_GENERIC_UPSTREAM_403_DETAIL_SHAPE = (
+    r"(?=[\s\S]*\bprovider_http_403\s*:\s*"
+    + _GENERIC_UPSTREAM_403_MESSAGE_VALUE
+    + r"(?:\s|$))"
+)
+_GENERIC_UPSTREAM_403_SHAPE = (
+    r"(?:" + _GENERIC_UPSTREAM_403_JSON_SHAPE
+    + r"|" + _GENERIC_UPSTREAM_403_DETAIL_SHAPE + r")"
 )
 # upstream_unavailable 用的正向式；auth_invalid 的裸 403 分支用它的否定式。
 # 二者共用 _SHAPE，不会各改各的；裸 403 只在整条 candidate **不是**该形状时才算鉴权。
 _GENERIC_UPSTREAM_403 = r"\A" + _GENERIC_UPSTREAM_403_SHAPE
 _AUTH_403 = r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE + r")[\s\S]*?\b403\b"
+_AUTH_PROVIDER_HTTP_403 = (
+    r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE
+    + r")[\s\S]*?\bprovider_http_403\b"
+)
+
+_EXPLICIT_PROVIDER_AUTH = re.compile(
+    r"invalid ?(?:x-)?api.?key|unauthorized|authentication",
+    re.IGNORECASE,
+)
+
+
+def _contains_generic_upstream_403_object(value: object) -> bool:
+    if isinstance(value, dict):
+        message = value.get("message")
+        error_type = value.get("type")
+        if (
+            isinstance(message, str)
+            and message.strip().casefold()
+            == GENERIC_UPSTREAM_403_MESSAGE_TEXT.casefold()
+            and isinstance(error_type, str)
+            and error_type.strip().casefold() == "api_error"
+        ):
+            return True
+        return any(
+            _contains_generic_upstream_403_object(item)
+            for item in value.values()
+            if isinstance(item, (dict, list))
+        )
+    if isinstance(value, list):
+        return any(_contains_generic_upstream_403_object(item) for item in value)
+    return False
+
+
+def _is_generic_upstream_403_body(raw_body: object) -> bool:
+    """Recognize the observed relay shell without normalizing the input first."""
+    candidate = str(raw_body or "").strip()
+    if not candidate:
+        return False
+    # Persisted/detail-only adapters have already lost the JSON envelope.  The
+    # exact message is still sufficient there; structured provider exceptions
+    # supply the raw body and take the object branch below.
+    if candidate.casefold() == GENERIC_UPSTREAM_403_MESSAGE_TEXT.casefold():
+        return True
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError):
+        parsed = None
+    if _contains_generic_upstream_403_object(parsed):
+        return True
+    # Resident CLI errors can wrap the untouched provider body in an outer text
+    # line.  Require both JSON field shapes; the phrase appearing elsewhere in
+    # a log is not enough.
+    return bool(
+        re.search(_GENERIC_UPSTREAM_403_MESSAGE, candidate, re.IGNORECASE)
+        and re.search(
+            r'"type"\s*:\s*"api_error"', candidate, re.IGNORECASE
+        )
+    )
+
+
+def provider_response_is_auth_failure(status_code: object, raw_body: object) -> bool:
+    """Classify only the 401/403 authentication boundary shared by all lanes.
+
+    Callers must pass the original body/text, not a lower-cased derivative.
+    Matching is deliberately case-insensitive because relay capitalization is
+    not stable; retaining the original input is a provenance contract, not a
+    case-sensitivity requirement.  Missing or unrecognised 403 evidence keeps
+    the historical fail-closed authentication classification.
+    """
+    if isinstance(status_code, bool):
+        return False
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if status == 401:
+        return True
+    if status != 403:
+        return False
+    candidate = str(raw_body or "")
+    if _EXPLICIT_PROVIDER_AUTH.search(candidate):
+        return True
+    return not _is_generic_upstream_403_body(candidate)
 
 
 def _chat_specs() -> tuple[ErrorSpec, ...]:
@@ -149,7 +254,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
         _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
         _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
-        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|" + _AUTH_403 + r"|provider_http_40[13]"),
+        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|" + _AUTH_403 + r"|" + _AUTH_PROVIDER_HTTP_403 + r"|provider_http_401"),
         _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", en="The model name is unavailable. Check the model name in Settings.", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
         _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", en="The Agent launch command is invalid because it is missing the {message} placeholder. Fix AGENT_CLI_CMD.", matcher=r"missing the \{message\} placeholder"),
         _spec("vision_model_required", "vision", "vision_model", "user_provider", "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型", en="Your current model can't process images, so it didn't receive this picture. Switch models, or add a dedicated vision model in Settings.", matcher=r"unknown variant `image_url`, expected `text`|no endpoints found that support image input"),

@@ -53,10 +53,12 @@ change must not be interpreted as an API guarantee.
   key was invalid or expired and directed them to re-save a key that was never
   the problem. That exact shape — the `403`, the generic `message` field, and
   `"type":"api_error"`, in any order — now uses the existing
-  `upstream_unavailable` handling instead. A `403` that does carry
-  authentication semantics, such as an invalid or unauthorized key or
-  `provider_http_403`, still classifies as `auth_invalid`, and `401` is
-  unchanged.
+  `upstream_unavailable` handling instead. The same distinction now applies to
+  image-generation and vision provider checks, which reuse their existing
+  unavailable guidance instead of adding new copy. A `403` that does carry
+  authentication semantics, such as an invalid or unauthorized key, still
+  uses the lane's authentication error; a different `provider_http_403` body
+  remains fail-closed as authentication-related, and `401` is unchanged.
 
 - **Chat now distinguishes relay tool-history failures from tool-schema
   incompatibility.** When a relay rejects the native tool-result transcript,

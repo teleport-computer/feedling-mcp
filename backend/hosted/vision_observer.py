@@ -98,7 +98,15 @@ def classify_vision_error(exc: BaseException) -> VisionObserverError:
     ):
         code = "vision_model_empty_response"
     elif status_code in {401, 403}:
-        code = "vision_model_auth_invalid"
+        code = (
+            "vision_model_auth_invalid"
+            if error_contract.provider_response_is_auth_failure(
+                status_code,
+                getattr(exc, "raw_response_body", "")
+                or getattr(exc, "response_detail", ""),
+            )
+            else "vision_model_unavailable"
+        )
     elif status_code == 402:
         code = "vision_model_quota_insufficient"
     elif status_code == 404:

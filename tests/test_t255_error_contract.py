@@ -487,6 +487,14 @@ _T497_GENERIC_403_SPACED = (
     '403 {"message" : "Request failed. Please try again later." , '
     '"type" : "api_error"}'
 )
+# This is the string that provider_client._raise_for_provider_status actually
+# exposes to every ProviderError consumer: _response_error_detail has already
+# reduced the JSON body to its message before __str__ is observed.  T497 only
+# exercised the raw-JSON/log shape above, so its green test could not catch the
+# production misclassification.
+_T504_PRODUCTION_GENERIC_403 = (
+    "provider_http_403: Request failed. Please try again later."
+)
 
 
 @pytest.mark.parametrize(
@@ -550,9 +558,16 @@ def test_t497_positive_and_negative_forms_share_one_shape():
     shape = error_contract._GENERIC_UPSTREAM_403_SHAPE
     assert error_contract._GENERIC_UPSTREAM_403 == r"\A" + shape
     assert error_contract._AUTH_403 == r"\A(?!" + shape + r")[\s\S]*?\b403\b"
+    assert error_contract._AUTH_PROVIDER_HTTP_403 == (
+        r"\A(?!" + shape + r")[\s\S]*?\bprovider_http_403\b"
+    )
     assert error_contract._GENERIC_UPSTREAM_403_MESSAGE in shape
     specs = {spec.code: spec for spec in error_contract.all_specs()}
     assert error_contract._AUTH_403 in specs["auth_invalid"].matcher_pattern
+    assert (
+        error_contract._AUTH_PROVIDER_HTTP_403
+        in specs["auth_invalid"].matcher_pattern
+    )
     assert (
         error_contract._GENERIC_UPSTREAM_403
         in specs["upstream_unavailable"].matcher_pattern
@@ -567,3 +582,56 @@ def test_t497_neighbouring_classes_are_untouched():
         ("cli agent exited 1: unexpected status 403: 额度不足", "quota_insufficient"),
     ):
         assert error_contract.classify_text(text).code == expected, text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        (_T504_PRODUCTION_GENERIC_403, "upstream_unavailable"),
+        ("provider_http_403: Unauthorized: invalid API key", "auth_invalid"),
+        ("provider_http_401: Request failed. Please try again later.", "auth_invalid"),
+    ),
+    ids=("generic-403", "auth-403", "generic-message-401"),
+)
+def test_t504_production_provider_error_shape_preserves_auth_boundary(text, expected):
+    spec = error_contract.classify_text(text)
+    assert spec is not None
+    assert spec.code == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "raw_body", "expected"),
+    (
+        (
+            403,
+            '{"message":"Request failed. Please try again later.",'
+            '"type":"api_error"}',
+            False,
+        ),
+        (
+            403,
+            '{"message":"request failed. please try again later.",'
+            '"type":"API_ERROR"}',
+            False,
+        ),
+        (
+            403,
+            '{"message":"Unauthorized: invalid API key",'
+            '"type":"api_error"}',
+            True,
+        ),
+        (
+            401,
+            '{"message":"Request failed. Please try again later.",'
+            '"type":"api_error"}',
+            True,
+        ),
+    ),
+    ids=("generic-403", "case-variant-403", "auth-403", "generic-message-401"),
+)
+def test_t504_shared_provider_auth_boundary_uses_original_body(
+    status, raw_body, expected
+):
+    assert error_contract.provider_response_is_auth_failure(
+        status, raw_body
+    ) is expected

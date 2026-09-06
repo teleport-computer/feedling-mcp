@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+_MAX_RAW_PROVIDER_ERROR_BODY_CHARS = 64 * 1024
+
+
 class ProviderError(Exception):
     def __init__(
         self,
@@ -42,6 +45,7 @@ class ProviderError(Exception):
         *,
         status_code: int | None = None,
         response_detail: str = "",
+        raw_response_body: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -49,6 +53,14 @@ class ProviderError(Exception):
         # bounded fragment may enter an operator-only sink; tenant-visible
         # response/trace surfaces must not serialize this attribute.
         self.response_detail = str(response_detail or "")[:240]
+        # Classification-only carrier for callers that must distinguish a real
+        # credential rejection from a relay's generic 403 shell.  The body is
+        # already resident in httpx.Response; retaining a bounded prefix on the
+        # short-lived exception avoids an unbounded second copy.  It must never
+        # enter str/repr, traces, ledgers, notices, stderr, or durable storage.
+        self.raw_response_body = str(raw_response_body or "")[
+            :_MAX_RAW_PROVIDER_ERROR_BODY_CHARS
+        ]
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -57,8 +69,9 @@ class ProviderError(Exception):
 # blast radius is small. Why it exists: cheap relay providers fail transiently
 # (timeout / 429 / 5xx / empty reply) across the dozens of serial LLM calls a
 # genesis import makes, and today one blip kills the whole job. Retry the
-# transient ones; NEVER retry user-config ones (402 out-of-credits / 401·403 bad
-# key / 4xx config) — those need the user to fix their provider, not us to hammer it.
+# transient ones; NEVER retry user-config/access ones (402 out-of-credits / 401
+# bad key / 403 access or credential rejection / other 4xx config). The finer
+# user-facing classifier separately recognizes the relay's generic 403 shell.
 _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
@@ -113,8 +126,8 @@ def classify_provider_error(exc: BaseException) -> str:
     """Classify an LLM-call failure for retry decisions.
 
     - "transient"       → retry (network/timeout, 429, 5xx, empty / no-usable / bad-json reply)
-    - "provider_config" → DON'T retry; user must fix key / credits / config
-                          (402 out of credits, 401·403 bad key, other 4xx config)
+    - "provider_config" → DON'T retry; key / credits / access / other 4xx config
+                          (the user-facing layer distinguishes generic relay 403)
     - "unknown"         → treat as transient but capped (better a few retries than
                           silently giving up on an unrecognised blip)
     """
@@ -631,12 +644,14 @@ def _response_error_detail(resp: httpx.Response) -> str:
 def _raise_for_provider_status(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
+    raw_response_body = resp.text
     detail = _response_error_detail(resp)
     suffix = f": {detail}" if detail else ""
     raise ProviderError(
         f"provider_http_{resp.status_code}{suffix}",
         status_code=resp.status_code,
         response_detail=detail,
+        raw_response_body=raw_response_body,
     )
 
 
@@ -4771,6 +4786,10 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
                            timeout=timeout) as resp:
             status = resp.status_code
             if status >= 400:
+                # Catalog classification intentionally uses status only: 401 is
+                # key rejection, while 403 is the existing access_denied class.
+                # It is not a chat/vision/image sink and therefore does not
+                # retain raw_response_body on this streaming GET exception.
                 raise ProviderError(f"provider_http_{status}", status_code=status)
             for chunk in resp.iter_bytes():
                 if time.monotonic() >= deadline:
