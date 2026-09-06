@@ -348,6 +348,9 @@ if not _provisioned:
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",
         "test_provider_health_unit.py",
+        # T504 provider-403 boundary: pure classifiers and monkeypatched sinks;
+        # no database or network access.
+        "test_t504_provider_403_sinks.py",
         "test_provider_usage.py",
         "test_history_import_identity.py",
         "test_model_api_file_payload.py",

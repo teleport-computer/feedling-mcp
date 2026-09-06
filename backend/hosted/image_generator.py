@@ -14,6 +14,7 @@ import generated_image
 import provider_client
 from core import enclave as core_enclave
 from core import envelope as core_envelope
+from notices import error_contract
 from provider_types import ProviderResponse
 
 
@@ -178,7 +179,8 @@ def classify_image_generation_error(
 
     The generic provider classifier intentionally folds every non-retryable
     4xx into ``provider_config``. Image-generation setup needs the original
-    status to tell a bad credential, exhausted account, missing endpoint/model,
+    status plus the original 403 body to tell a bad credential, the relay's
+    generic unavailable shell, an exhausted account, a missing endpoint/model,
     and an incompatible image wire apart.
     """
     raw = str(exc).strip().lower()
@@ -195,7 +197,13 @@ def classify_image_generation_error(
 
     status_code = _safe_status_code(getattr(exc, "status_code", None))
     if status_code in {401, 403}:
-        return "image_generation_auth_invalid"
+        if error_contract.provider_response_is_auth_failure(
+            status_code,
+            getattr(exc, "raw_response_body", "")
+            or getattr(exc, "response_detail", ""),
+        ):
+            return "image_generation_auth_invalid"
+        return "image_generation_unavailable"
     if status_code == 402:
         return "image_generation_quota_insufficient"
     if status_code == 404:

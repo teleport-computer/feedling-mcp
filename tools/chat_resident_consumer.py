@@ -6661,6 +6661,12 @@ def _provider_request_id_from_text(value: str) -> str:
 
 
 def _provider_attempt_error_class(text: str, *, returncode: int = 0) -> str:
+    """Classify provider-attempt telemetry while preserving the original text.
+
+    ``lowered`` serves ordinary substring rules only.  The shared 401/403
+    boundary must receive ``text`` byte-for-byte so future body-shape rules do
+    not silently inherit a lossy normalization.
+    """
     lowered = (text or "").lower()
     if _PI_STREAM_CUT_RE.search(text or ""):
         return "stream_cut"
@@ -6670,7 +6676,15 @@ def _provider_attempt_error_class(text: str, *, returncode: int = 0) -> str:
         return "rate_limit"
     if "insufficient_quota" in lowered or "credit balance" in lowered:
         return "quota"
-    if "401" in lowered or "403" in lowered or "invalid key" in lowered:
+    auth_status = re.search(r"(?<!\d)(401|403)(?!\d)", text or "")
+    if auth_status is not None:
+        status = int(auth_status.group(1))
+        return (
+            "provider_auth"
+            if _error_contract.provider_response_is_auth_failure(status, text or "")
+            else "provider_error"
+        )
+    if "invalid key" in lowered:
         return "provider_auth"
     if "connection" in lowered or "network" in lowered or "dns" in lowered:
         return "network"

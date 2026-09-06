@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -179,6 +180,28 @@ def test_provider_http_error_keeps_bounded_internal_response_detail(status_code)
     assert str(caught.value) == (
         f"provider_http_{status_code}: {upstream_detail[:240]}"
     )
+
+
+def test_provider_http_error_keeps_bounded_raw_body_out_of_str_and_repr():
+    sentinel = "PRIVATE_PROVIDER_BODY_MUST_NOT_ESCAPE"
+    raw_body = json.dumps({
+        "error": {
+            "message": "Request failed. Please try again later.",
+            "type": "api_error",
+            "debug": sentinel,
+        },
+        "padding": "x" * (pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS + 100),
+    })
+
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(httpx.Response(403, text=raw_body))
+
+    exc = caught.value
+    assert exc.raw_response_body == raw_body[: pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS]
+    assert len(exc.raw_response_body) == pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS
+    assert sentinel in exc.raw_response_body
+    assert sentinel not in str(exc)
+    assert sentinel not in repr(exc)
 
 
 def _fake_client(monkeypatch, response_body: dict) -> list[dict]:

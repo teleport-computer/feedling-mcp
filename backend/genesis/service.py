@@ -32,6 +32,7 @@ from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from notices import catalog
 from notices import core as notices
+from notices import error_contract
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 GENESIS_STATE_BLOB = "genesis_state"
@@ -267,9 +268,12 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         (is_empty() true, no exception), the loop returns quietly and the
         caller proceeds with an empty result. all_fact_maps_failed is the
         real, reachable "nothing usable came back" failure signal.
-      - `provider_http_401` / `_403` (provider_client._raise_for_provider_status)
-        -> bad_api_key; `_402` / `_429` -> provider_quota (402 = out of
-        credits, folded into the quota bucket per its user-facing meaning).
+      - `provider_http_401` and credential-bearing `_403`
+        (provider_client._raise_for_provider_status) -> bad_api_key; the known
+        generic relay 403 shell -> internal (the only existing retry-later copy
+        that does not invent a key/quota/model diagnosis); `_402` / `_429` ->
+        provider_quota (402 = out of credits, folded into the quota bucket per
+        its user-facing meaning).
       - httpx timeout / "TimeoutException" in the wrapped message (worker
         call sites wrap as f"...:{type(e).__name__}") -> provider_timeout.
       - `genesis_stale_timeout:...` / `resident_stale_timeout:...` /
@@ -293,7 +297,16 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
         if status_code in _BAD_API_KEY_STATUS:
-            return "bad_api_key"
+            raw_body = (
+                getattr(exc, "raw_response_body", "")
+                or getattr(exc, "response_detail", "")
+                or str(exc or "")
+            )
+            if error_contract.provider_response_is_auth_failure(
+                status_code, raw_body
+            ):
+                return "bad_api_key"
+            return "internal"
         if status_code in _PROVIDER_QUOTA_STATUS:
             return "provider_quota"
     if exc is not None and isinstance(exc, httpx.TimeoutException):
@@ -313,7 +326,10 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     if status_match:
         code = int(status_match.group(1))
         if code in _BAD_API_KEY_STATUS:
-            return "bad_api_key"
+            detail = text[status_match.end() :].lstrip(" :")
+            if error_contract.provider_response_is_auth_failure(code, detail):
+                return "bad_api_key"
+            return "internal"
         if code in _PROVIDER_QUOTA_STATUS:
             return "provider_quota"
 
