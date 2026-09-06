@@ -4947,7 +4947,24 @@ _PROTOCOL_DEBRIS_KEY_RE = re.compile(
 _PROTOCOL_DEBRIS_TYPED_RE = re.compile(
     r'"type"\s*:\s*"(?:identity|memory|proactive)\.\w+"'
 )
-_UNCLOSED_THINKING_RE = re.compile(r'<\s*(?:think|thinking|reasoning|thought)\s*>', re.I)
+def _unclosed_thinking_re() -> "re.Pattern[str]":
+    """开标签词表来自共享内核，含可选 XML 命名空间前缀。
+
+    原先这里自己写死一份字面量、且要求协议词紧跟 ``<`` —— 于是带命名空间前缀的
+    开标签（2026-09-06 线上泄漏那一种）在这道「截断到未闭合思考」的守卫上零命中，
+    整段推理照旧被往下扫。由构造共享，前缀规则不会只在某一处漂掉。
+    """
+    global _UNCLOSED_THINKING_RE_CACHE
+    if _UNCLOSED_THINKING_RE_CACHE is None:
+        from agent_protocol_core import self_thinking as _st_tags
+
+        _UNCLOSED_THINKING_RE_CACHE = re.compile(
+            rf"<\s*{_st_tags.tag_name_pattern()}\s*>", re.I
+        )
+    return _UNCLOSED_THINKING_RE_CACHE
+
+
+_UNCLOSED_THINKING_RE_CACHE: "re.Pattern[str] | None" = None
 _SCAN_ATTEMPT_BUDGET = 64
 
 
@@ -5027,7 +5044,7 @@ def _truncate_at_unclosed_thinking(text: str) -> str:
     """After closed <think>…</think> pairs are removed, an unclosed opening tag
     means everything from it on is reasoning — never a command. Cut it so its
     contents can't be scanned or executed."""
-    m = _UNCLOSED_THINKING_RE.search(text)
+    m = _unclosed_thinking_re().search(text)
     return text[: m.start()] if m else text
 
 
@@ -5815,16 +5832,26 @@ def _pi_message_text(message: Any) -> str:
     return "\n\n".join(texts)
 
 
+# 尚未闭合的标签头：`<`、`</`、`<ns:`、`<ns:thi`、`<thi` 都算；`<3`、`<=` 不算。
+_INCOMPLETE_TAG_HEAD_RE = re.compile(r"^</?(?:[^\W\d_][\w.-]*:)?(?:[^\W\d_][\w.-]*)?$")
+
+
 def _visible_stream_text(text: str) -> str:
     """Project cumulative model text to speech-safe visible text."""
     raw = str(text or "")
     head = raw.lstrip()
-    lowered = re.sub(r"\s+", "", head[:24].lower())
-    thinking_openers = ("<think>", "<thinking>", "<reasoning>", "<thought>")
-    if lowered.startswith("<") and any(
-        opener.startswith(lowered) for opener in thinking_openers
-    ):
-        return ""
+    from agent_protocol_core import self_thinking as _st_tags
+
+    if head.startswith("<"):
+        # 流式快照不可撤回：一旦把 `<n` / `<ns` 发出去，后面再干净的正文也接不回
+        # 单调前缀。所以一个**还没闭合**的开头标签名（含可选命名空间段）一律先
+        # 攒着不发；`<3` 这种不是标签名起始的从来不攒（codex2 review 2026-09-06）。
+        # 闭合之后不在这里短路：交给下面的 _split_tagged_thinking —— 本协议的
+        # 块被剥掉、未闭合的开标签失败关闭为空、`<div>` 之类原样可见。
+        if head.find(">") < 0 and _INCOMPLETE_TAG_HEAD_RE.match(
+            re.sub(r"\s+", "", head[:24].lower())
+        ):
+            return ""
     if head.startswith(("{", "[", "```json", "```JSON")):
         return ""
     visible, _thinking = _split_tagged_thinking(raw)
