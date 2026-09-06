@@ -11636,6 +11636,30 @@ def list_workspace_entries(
             return [dict(row) for row in cur.fetchall()]
 
 
+def list_canvas_workspace_entries(
+    user_id: str,
+    *,
+    limit: int = 500,
+) -> list[dict]:
+    """List one user's published IO Canvas workspace metadata, newest first.
+
+    This is a metadata-only read: ``content_envelope`` is deliberately absent
+    so a library/index request cannot expose or download Canvas source bodies.
+    """
+    maximum = max(1, min(int(limit), 500))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT path,revision,mime_type,created_at,updated_at "
+                "FROM v2_workspace_entries "
+                "WHERE user_id=%s AND kind='workspace' "
+                "AND lower(path) LIKE '/workspace/%%.io.html' "
+                "ORDER BY updated_at DESC, path ASC LIMIT %s",
+                (user_id, maximum),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
 def put_workspace_entry_cas(
     user_id: str,
     path: str,

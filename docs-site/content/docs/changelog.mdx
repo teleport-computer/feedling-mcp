@@ -18,6 +18,14 @@ change must not be interpreted as an API guarantee.
   public error codes instead of collapsing into one model-incompatible result.
   Chinese and English guidance now tells users which setting to correct.
 
+- **Canvas libraries can now load directly from the current workspace index.**
+  `GET /v1/chat/canvases` returns up to 500 metadata-only IO Canvas entries for
+  the authenticated user, newest workspace update first. It includes the
+  newest matching Chat card identifier and display labels when available, but
+  never returns Canvas bodies or envelopes; a Canvas without a matching Chat
+  row remains visible with nullable card metadata. Suffix matching is
+  case-insensitive and the original filename case is preserved.
+
 - **`POST /v1/chat/verify_loop` accepts `only_if_unverified`.** When the JSON
   literal `true` is sent and the server already holds a sticky live-loop
   verification for the user, the endpoint inserts no hidden ping, takes no

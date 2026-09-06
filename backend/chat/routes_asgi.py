@@ -138,13 +138,11 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
 
 
 # --------------------------------------------------------------------------- #
-# Remaining chat routes (append migration): message / response / history /
-# clear / message-body / verify_loop. Each delegates to the framework-neutral
-# ``chat.chat_core`` off the event loop via ``run_db`` (plan §5.2) so the
-# envelope validation, append/claim, wakes (notify_chat_waiters / wake_bus) and
-# debug_trace events are byte-identical to Flask. All use ``require_auth`` (the
-# ASGI equivalent of ``auth.require_user()``) — none of these six carry a scope,
-# matching the Flask surface. E2E: envelopes are opaque, never decrypted here.
+# Remaining chat routes: message / response / history / clear / message-body /
+# workspace and Canvas reads / turn activity / verify_loop. Each delegates to a
+# framework-neutral core off the event loop via ``run_db`` (plan §5.2). All use
+# ``require_auth`` (the ASGI equivalent of ``auth.require_user()``) without a
+# separate scope. E2E: envelopes are opaque, never decrypted here.
 # --------------------------------------------------------------------------- #
 
 
@@ -275,6 +273,12 @@ async def chat_workspace_body(
         auth.store,
         filename,
     )
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/chat/canvases")
+async def chat_canvases(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(chat_core.canvas_index, auth.store)
     return JSONResponse(body, status_code=status)
 
 
