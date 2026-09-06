@@ -823,7 +823,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (76 files)
+      - name: Run CI security tier 3 (77 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -904,6 +904,7 @@ jobs:
             tests/test_worldbook_routes.py \
             tests/test_worldbook_store.py \
             tests/test_worldbook_trace.py \
+            tests/test_verify_loop_only_if_unverified.py \
             -v
 
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
