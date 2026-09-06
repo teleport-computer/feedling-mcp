@@ -381,6 +381,60 @@ def observe_location(user_id: str, values: Mapping[str, Any], *,
     return _guarded("location", build, user_id)
 
 
+#: Which source system these mirrors come from. iOS/EventKit is the only one
+#: wired; the constant exists so the value is stated once instead of spelled
+#: out at each construction site -- it is part of the row identity, and two
+#: sites drifting apart would split one source into two.
+_MIRROR_SOURCE = "ios"
+
+
+def _sync_mirror(user_id: str, collection_kind: str, items, received):
+    """Write a mirror batch through the kit's own orchestration.
+
+    Not ``upsert_*`` directly. The kit's entry is what stamps the batch's
+    source and sync id onto every row, applies deletions only where a full
+    snapshot has standing to, and moves the sync state -- all in one
+    transaction. Calling the storage primitive skips every one of those, and
+    each of them fails silently:
+
+        no source stamped   the rows land under whatever the caller happened
+                            to set, and the next full sync for that source
+                            deletes them
+        no sync id stamped  a full round's snapshot step deletes the rows it
+                            just wrote
+        no sync state       "the calendar is stale" can never be answered, so
+                            a sync that has been failing for days still reads
+                            as current
+
+    Snapshots are declared ``incremental``: iOS sends what it sees now, and it
+    does not tell us the window it covers. Without a coverage range a "full"
+    sync has no bounded set to delete inside -- and an unbounded one deletes
+    everything the batch did not mention, which is how a user loses a year of
+    calendar. Deletions here wait for the producer to report them explicitly.
+    """
+    import db
+    from perceptkit.contracts.context import IngestContext
+    from perceptkit.processing.source_sync import (
+        INCREMENTAL, SyncBatch, sync_source_mirror,
+    )
+
+    from .storage import PostgresStorage
+    batch = SyncBatch(
+        source=_MIRROR_SOURCE, collection_kind=collection_kind,
+        sync_id=f"{collection_kind}-{received.isoformat()}",
+        snapshot_kind=INCREMENTAL, items=items,
+        attempted_at=received, completed_at=received,
+    )
+    with db.get_pool().connection() as conn:
+        conn.autocommit = True
+        out = sync_source_mirror(PostgresStorage(conn), batch,
+                                 context=IngestContext(user_id, received))
+    return {"ran": True, "producer": f"ios_{collection_kind}_mirror",
+            "report_id": batch.sync_id, "observations": len(items),
+            "applied": out.upserted, "rejected": 0, "duplicates": 0,
+            "events": 0, "warnings": [], "rejections": [], "verdicts": {}}
+
+
 def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Calendar and reminders take the source-mirror path, not the signal path.
 
@@ -395,15 +449,11 @@ def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not rows:
             return None
         received = datetime.now(timezone.utc)
-        events = [CalendarEventMirror(subject_id=user_id, updated_at=received,
-                                      **row) for row in rows]
-        import db
-        from .storage import PostgresStorage
-        with db.get_pool().connection() as conn:
-            conn.autocommit = True
-            PostgresStorage(conn).upsert_calendar_events(
-                subject_id=user_id, events=events)
-        return {"ran": True, "producer": "ios_calendar_mirror",
+        events = [CalendarEventMirror(subject_id=user_id, source=_MIRROR_SOURCE,
+                                      updated_at=received, **row)
+                  for row in rows]
+        return _sync_mirror(user_id, "calendar", events, received) or {
+                "ran": True, "producer": "ios_calendar_mirror",
                 "report_id": "-", "observations": len(rows), "applied": len(rows),
                 "rejected": 0, "duplicates": 0, "events": 0,
                 "warnings": [], "rejections": [], "verdicts": {}}
@@ -419,14 +469,11 @@ def mirror_reminders(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]
         if not rows:
             return None
         received = datetime.now(timezone.utc)
-        items = [ReminderItemMirror(subject_id=user_id, updated_at=received,
-                                    **row) for row in rows]
-        import db
-        from .storage import PostgresStorage
-        with db.get_pool().connection() as conn:
-            conn.autocommit = True
-            PostgresStorage(conn).upsert_reminders(subject_id=user_id, items=items)
-        return {"ran": True, "producer": "ios_reminder_mirror",
+        items = [ReminderItemMirror(subject_id=user_id, source=_MIRROR_SOURCE,
+                                    updated_at=received, **row)
+                 for row in rows]
+        return _sync_mirror(user_id, "reminders", items, received) or {
+                "ran": True, "producer": "ios_reminder_mirror",
                 "report_id": "-", "observations": len(rows), "applied": len(rows),
                 "rejected": 0, "duplicates": 0, "events": 0,
                 "warnings": [], "rejections": [], "verdicts": {}}

@@ -311,6 +311,35 @@ def test_a_receipt_written_twice_does_not_double_advance(clean):
     assert rows[0][0] == 1
 
 
+def test_purge_subject_removes_wake_receipt_before_its_outbox_owner(clean):
+    s = store()
+    event_id = "purge-with-receipt"
+    s.enqueue_event(outbox(event_id))
+    claimed = s.claim_pending_event(worker_id="w1", now=T0, lease_seconds=60)
+    assert claimed is not None
+    assert s.record_wake_receipt(
+        receipt=WakeReceipt(
+            event_id=event_id,
+            attempt_id="purge-attempt",
+            status="accepted",
+            received_at=T0 + timedelta(seconds=5),
+        ),
+        next_state="delivered",
+        claim_token=claimed.claim_token,
+    ) is True
+    assert s._q(
+        "SELECT count(*) FROM perceptkit_wake_receipt WHERE event_id=%s",
+        (event_id,),
+    ) == [(1,)]
+
+    s.purge_subject(subject_id="u1")
+
+    assert s._q(
+        "SELECT count(*) FROM perceptkit_wake_receipt WHERE event_id=%s",
+        (event_id,),
+    ) == [(0,)]
+
+
 # ---------------------------------------------------------------------------
 # 整套 conformance，跑在真 adapter 上
 # ---------------------------------------------------------------------------
@@ -348,17 +377,17 @@ def test_the_real_adapter_passes_the_whole_conformance_suite(clean):
 def _mirror_fixtures(s, T):
     s.upsert_calendar_events(subject_id="u", events=[
         CalendarEventMirror(
-            subject_id="u", source_account_id="a", source_calendar_id="c",
+            subject_id="u", source="ios", source_account_id="a", source_calendar_id="c",
             source_event_id="good",
             event_fields={"title": "站会", "start_at": T.isoformat()}),
         # 时间字段里是垃圾 —— 直接 ::timestamptz 会让**整条查询**抛异常。
         CalendarEventMirror(
-            subject_id="u", source_account_id="a", source_calendar_id="c",
+            subject_id="u", source="ios", source_account_id="a", source_calendar_id="c",
             source_event_id="garbage",
             event_fields={"title": "坏数据", "start_at": "不是时间"}),
         # 压根没有时间 —— 按纪律必须保留，不能被窗口藏起来。
         CalendarEventMirror(
-            subject_id="u", source_account_id="a", source_calendar_id="c",
+            subject_id="u", source="ios", source_account_id="a", source_calendar_id="c",
             source_event_id="notime", event_fields={"title": "没写时间"}),
     ])
 
@@ -388,13 +417,13 @@ def test_a_reminder_without_is_completed_counts_as_open(clean):
     """缺字段不等于已完成。SQL 里少个 COALESCE，这条提醒就整条消失。"""
     s = store()
     s.upsert_reminders(subject_id="u", items=[
-        ReminderItemMirror(subject_id="u", source_account_id="a",
+        ReminderItemMirror(subject_id="u", source="ios", source_account_id="a",
                            source_list_id="l", source_reminder_id="done",
                            reminder_fields={"title": "完成的", "is_completed": True}),
-        ReminderItemMirror(subject_id="u", source_account_id="a",
+        ReminderItemMirror(subject_id="u", source="ios", source_account_id="a",
                            source_list_id="l", source_reminder_id="open",
                            reminder_fields={"title": "没完成", "is_completed": False}),
-        ReminderItemMirror(subject_id="u", source_account_id="a",
+        ReminderItemMirror(subject_id="u", source="ios", source_account_id="a",
                            source_list_id="l", source_reminder_id="unset",
                            reminder_fields={"title": "没这个字段"}),
     ])
@@ -403,3 +432,142 @@ def test_a_reminder_without_is_completed_counts_as_open(clean):
     assert {r.source_reminder_id for r in s.list_reminders(
         subject_id="u", include_completed=True, limit=50)} == {
             "open", "unset", "done"}
+
+
+# ---------------------------------------------------------------------------
+# 来源隔离 —— 审查者在 kit 上复现的那个场景，这里用真 Postgres 再跑一遍
+#
+# 内存实现验不出这一条会不会真的落到 SQL 的 WHERE 里。而它的失败长这样：
+# 用户发现自己另一个日历账户的日程凭空消失了，不可逆，且没有任何地方报错。
+# ---------------------------------------------------------------------------
+
+def _cal(source: str, eid: str, *, sync: str, at=None):
+    return CalendarEventMirror(
+        subject_id="u1", source=source, source_account_id=f"{source}-acct",
+        source_calendar_id="c1", source_event_id=eid,
+        event_fields={"title": f"{source}/{eid}", "start_at": at or T0},
+        last_seen_sync_id=sync,
+    )
+
+
+def test_a_full_sync_for_one_source_does_not_delete_another_source(clean):
+    s = store()
+    s.upsert_calendar_events(subject_id="u1", events=[
+        _cal("google", "g1", sync="google-round-1"),
+        _cal("ios", "i1", sync="ios-round-0"),
+    ])
+    # ios 的一轮全量：范围盖住两条，但只有 ios 那条属于它。
+    n = s.apply_source_snapshot(
+        subject_id="u1", source="ios", collection_kind="calendar",
+        sync_id="ios-round-1", coverage_start=T0 - timedelta(days=1),
+        coverage_end=T0 + timedelta(days=1), snapshot_kind="full")
+    left = {(e.source, e.source_event_id)
+            for e in s.list_calendar_events(subject_id="u1", limit=50)}
+    assert ("google", "g1") in left, "ios 的全量同步删掉了 Google 的日程"
+    assert ("ios", "i1") not in left and n == 1
+
+
+def test_two_sources_sharing_an_event_id_do_not_overwrite_each_other(clean):
+    s = store()
+    s.upsert_calendar_events(subject_id="u1", events=[
+        _cal("ios", "同一个 id", sync="a"),
+        _cal("google", "同一个 id", sync="a"),
+    ])
+    titles = {e.event_fields["title"]
+              for e in s.list_calendar_events(subject_id="u1", limit=50)}
+    assert titles == {"ios/同一个 id", "google/同一个 id"}, titles
+
+
+def test_an_explicit_tombstone_deletes_only_that_source(clean):
+    """增量同步执行来源明确的删除；它不能越界到另一个来源。"""
+    s = store()
+    s.upsert_calendar_events(subject_id="u1", events=[
+        _cal("ios", "同一个 id", sync="a"),
+        _cal("google", "同一个 id", sync="a"),
+    ])
+    n = s.delete_source_items(subject_id="u1", source="ios",
+                              collection_kind="calendar",
+                              source_item_ids=["同一个 id"])
+    left = {e.source for e in s.list_calendar_events(subject_id="u1", limit=50)}
+    assert n == 1 and left == {"google"}, f"删越界了，剩下 {left}"
+
+
+def test_a_tombstone_for_an_unknown_id_deletes_nothing(clean):
+    s = store()
+    s.upsert_calendar_events(subject_id="u1", events=[_cal("ios", "i1", sync="a")])
+    assert s.delete_source_items(subject_id="u1", source="ios",
+                                 collection_kind="calendar",
+                                 source_item_ids=["从来没有过的 id"]) == 0
+    assert len(s.list_calendar_events(subject_id="u1", limit=50)) == 1
+
+
+def test_a_tombstone_stays_inside_one_subject(clean):
+    """跨用户的一条 DELETE 少写一个 WHERE 就会删掉别人的数据。"""
+    s = store()
+    for who in ("u1", "u2"):
+        s.upsert_calendar_events(subject_id=who, events=[CalendarEventMirror(
+            subject_id=who, source="ios", source_account_id="a",
+            source_calendar_id="c", source_event_id="同一个 id",
+            event_fields={"start_at": T0})])
+    s.delete_source_items(subject_id="u1", source="ios",
+                          collection_kind="calendar",
+                          source_item_ids=["同一个 id"])
+    assert len(s.list_calendar_events(subject_id="u2", limit=10)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 同步状态的往返
+#
+# 这一类 bug 在这个适配器上出现过两次，都是同一个形状：**写的时候用了记录上
+# 不存在的字段名，而没有任何调用方，所以一直没暴露**。
+#   · 提醒镜像读 source_created_at —— CalendarEventMirror 有、ReminderItemMirror 没有
+#   · 同步状态读 last_sync_id —— 记录上叫 sync_cursor
+# 两次都是"整条路从来没通过，而测试全绿"。往返测试是唯一能拦住它的东西。
+# ---------------------------------------------------------------------------
+
+def test_sync_state_round_trips_every_field(clean):
+    from perceptkit.contracts.records import SourceSyncState
+    s = store()
+    want = SourceSyncState(
+        subject_id="u1", source="ios", collection_kind="calendar",
+        sync_cursor="page-7", coverage_start=T0 - timedelta(days=1),
+        coverage_end=T0 + timedelta(days=1), snapshot_kind="full",
+        last_attempted_at=T0, last_successful_sync_at=T0,
+        last_error_code=None,
+    )
+    s.put_sync_state(want)
+    got = s.get_sync_state(subject_id="u1", source="ios",
+                           collection_kind="calendar")
+    assert got == want, f"往返之后变了：{got}"
+
+
+def test_a_failed_sync_is_distinguishable_from_one_that_never_ran(clean):
+    """没有 last_error_code / last_attempted_at 这两列的话，
+    「日历同步挂了三天」这个问题根本答不出来 —— 失败和从没跑过长得一样。"""
+    from perceptkit.contracts.records import SourceSyncState
+    s = store()
+    s.put_sync_state(SourceSyncState(
+        subject_id="u1", source="ios", collection_kind="calendar",
+        sync_cursor="page-7", last_attempted_at=T0 + timedelta(days=3),
+        last_successful_sync_at=T0, last_error_code="auth_revoked",
+    ))
+    got = s.get_sync_state(subject_id="u1", source="ios",
+                           collection_kind="calendar")
+    assert got.last_error_code == "auth_revoked"
+    assert got.last_attempted_at > got.last_successful_sync_at
+    assert got.sync_cursor == "page-7", "失败不该动游标"
+
+
+def test_sync_state_is_scoped_by_source_and_collection(clean):
+    from perceptkit.contracts.records import SourceSyncState
+    s = store()
+    for src in ("ios", "google"):
+        for kind in ("calendar", "reminders"):
+            s.put_sync_state(SourceSyncState(
+                subject_id="u1", source=src, collection_kind=kind,
+                sync_cursor=f"{src}-{kind}"))
+    for src in ("ios", "google"):
+        for kind in ("calendar", "reminders"):
+            got = s.get_sync_state(subject_id="u1", source=src,
+                                   collection_kind=kind)
+            assert got.sync_cursor == f"{src}-{kind}"

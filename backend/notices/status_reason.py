@@ -74,6 +74,7 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "dream_no_cards_available",
     "dream_nothing_to_consolidate",
     "empty_agent_reply",
+    "empty_after_reask",
     "introduction_identity_action_failed",
     "legacy_batch_unavailable",
     "memory_identity_action_failed",

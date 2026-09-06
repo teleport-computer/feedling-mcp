@@ -148,4 +148,10 @@ memgarden==0.16.0
 #
 # ⚠️ 0.2.5 那条照片计数的修复会**改变已有数字的含义**：历史上被写成 1 的日子
 # 修不回来（明细只留 7 天，更早的连重算的原料都没有），从上线那天起才对。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.7/perceptkit-0.2.7-py3-none-any.whl
+#
+# 0.2.7 → 0.3.0（2026-09-03，外部审查第二轮）。**带破坏性变更**：
+# CalendarEventMirror / ReminderItemMirror 新增必填 source，且它进了唯一身份。
+# 配套迁移是 0107（RDS）/ 0041（tee）—— 少了它，一次 source="ios" 的全量
+# 同步会把概念上属于别的来源的日程一起删掉，不可逆。装着 0.2.7 跑本分支
+# 会在 import 时就炸（缺 StoragePort.delete_source_items）。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.3.0/perceptkit-0.3.0-py3-none-any.whl

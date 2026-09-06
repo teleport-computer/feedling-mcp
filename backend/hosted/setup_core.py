@@ -941,11 +941,37 @@ def _test_route_image_generation_or_error(
     route: dict,
     caller_api_key: str | None,
 ):
+    attempt_id = image_generator.new_attempt_id()
+    started = time.monotonic()
+    provider = str(route.get("provider") or "")
+    model = str(route.get("model") or "")
+
+    def observe(
+        outcome: str,
+        *,
+        error_category: str = "",
+        provider_called: bool = False,
+        status_code: object = None,
+    ) -> None:
+        image_generator.observe_attempt(
+            store,
+            attempt_id=attempt_id,
+            operation="setup_test",
+            provider=provider,
+            model=model,
+            outcome=outcome,
+            error_category=error_category,
+            provider_called=provider_called,
+            status_code=status_code,
+            dur_ms=(time.monotonic() - started) * 1000.0,
+        )
+
     envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         credential = db.model_api_credential_get(store.user_id, route["credential_id"])
         envelope = (credential or {}).get("api_key_envelope")
     if not isinstance(envelope, dict):
+        observe("failed", error_category="model_api_key_envelope_missing")
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
@@ -954,11 +980,12 @@ def _test_route_image_generation_or_error(
             caller_user_id=str(store.user_id),
         ).decode("utf-8")
     except Exception:
+        observe("failed", error_category="model_api_key_decrypt_failed")
         return {"error": "model_api_key_decrypt_failed"}, 400
 
     config = provider_client.ProviderConfig(
-        str(route.get("provider") or ""),
-        str(route.get("model") or ""),
+        provider,
+        model,
         provider_key,
         str(route.get("base_url") or ""),
         context_window_tokens=route.get("context_window_tokens"),
@@ -967,6 +994,15 @@ def _test_route_image_generation_or_error(
 
     def provider_failure(exc: BaseException):
         code = _image_generation_error_code(exc, dedicated=True)
+        provider_called = image_generator.provider_called_for_error(exc)
+        observe(
+            "failed",
+            error_category=code,
+            provider_called=provider_called,
+            status_code=(
+                getattr(exc, "status_code", None) if provider_called else None
+            ),
+        )
         status = (
             "unsupported"
             if code == "image_generation_model_incompatible"
@@ -989,7 +1025,15 @@ def _test_route_image_generation_or_error(
     except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
         return provider_failure(exc)
 
-    images = image_generator.normalize_provider_media(result)
+    try:
+        images = image_generator.normalize_provider_media(result)
+    except Exception:
+        observe(
+            "failed",
+            error_category="image_generation_processing_failed",
+            provider_called=True,
+        )
+        raise
     if not images:
         return provider_failure(
             provider_client.ProviderError("image_generation_invalid_output")
@@ -1000,7 +1044,13 @@ def _test_route_image_generation_or_error(
         str(route["id"]),
         status="ok",
     ):
+        observe(
+            "failed",
+            error_category="model_api_route_write_failed",
+            provider_called=True,
+        )
         return {"error": "model_api_route_write_failed"}, 500
+    observe("ok", provider_called=True)
     return None
 
 

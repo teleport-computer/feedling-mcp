@@ -876,7 +876,7 @@ def store_evict(user_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="runtime mode control is DB-backed"
     )
     if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
@@ -898,7 +898,7 @@ def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
 
 
 def get_runtime_mode(user_id: str) -> tuple[dict, int]:
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="runtime mode control is DB-backed"
     )
     try:
@@ -936,7 +936,7 @@ def get_runtime_allowlist() -> dict:
     for row in rows:
         try:
             mode, state, gen = cs.get_hosted_runtime_control_strict(
-                core_store.get_store_shell_only(
+                core_store.get_store_per_load_mode(
                     row["user_id"],
                     reason="runtime allowlist reconciliation is DB-backed",
                 )

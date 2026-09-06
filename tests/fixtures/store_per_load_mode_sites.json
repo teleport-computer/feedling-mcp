@@ -28,6 +28,11 @@
     },
     {
       "count": 1,
+      "path": "backend/admin/data_track.py",
+      "reason": "admin detail helpers use direct bounded DB reads"
+    },
+    {
+      "count": 1,
       "path": "backend/agent_runtime/spawners.py",
       "reason": "web settings are direct blob reads"
     },

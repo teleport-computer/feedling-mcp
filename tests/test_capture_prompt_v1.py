@@ -3,6 +3,7 @@
 Pure-function coverage of capture_prompt_v1: prompt rendering and the agent
 reply parser (parse_capture_cards). DB-free so it runs anywhere.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -19,6 +20,19 @@ from memgarden.text.card_text import extract_json_block  # noqa: E402
 from agent_protocol_core import self_thinking  # noqa: E402
 
 _FENCE = "`" * 3
+
+
+def _capture_cards_json(count: int) -> str:
+    return json.dumps({
+        "cards": [
+            {
+                "action": "add",
+                "summary": f"Memory {index}",
+                "content": f"Durable memory content number {index}.",
+            }
+            for index in range(count)
+        ]
+    })
 
 
 def test_prompt_renders_with_context_and_escaped_json():
@@ -137,6 +151,16 @@ def test_parse_normal_card():
 def test_parse_empty_is_clean():
     cards, err = parse_capture_cards('{"cards": []}')
     assert cards == [] and err is None
+
+
+def test_io_capture_policy_accepts_eight_cards_but_rejects_fifty_one():
+    cards, err = parse_capture_cards(_capture_cards_json(8))
+    assert err is None
+    assert len(cards) == 8
+
+    cards, err = parse_capture_cards(_capture_cards_json(51))
+    assert cards == []
+    assert err == "too_many_cards:51>50"
 
 
 def test_parse_drops_noop():

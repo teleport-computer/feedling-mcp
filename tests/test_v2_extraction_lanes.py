@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import threading
 from pathlib import Path
@@ -151,6 +152,54 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     assert budget == extraction.max_output_tokens_for_lane(lane)
     assert "截断" in retry_prompt
     assert retry_prompt != "P"
+
+
+def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):
+    uid = "u_x_capture_policy"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    reply = json.dumps({
+        "cards": [
+            {
+                "action": "add",
+                "summary": f"Memory {index}",
+                "content": f"Durable memory content number {index}.",
+            }
+            for index in range(8)
+        ]
+    })
+    seen = {}
+
+    async def _fake_extract(**kwargs):
+        direct_cards, direct_err = kwargs["parse"](reply)
+        retry_cards, retry_err = kwargs["parse_retry"].parse(reply)
+        session = kwargs["session"]
+        assert session.next_prompt()
+        session.feed(reply)
+        outcome = session.result()
+        seen.update(
+            direct=(len(direct_cards), direct_err),
+            retry=(len(retry_cards), retry_err),
+            session=(len(outcome.cards), outcome.error),
+        )
+        return outcome.cards, outcome.error
+
+    monkeypatch.setattr(extraction, "extract", _fake_extract)
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert seen == {
+        "direct": (8, None),
+        "retry": (8, None),
+        "session": (8, None),
+    }
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])

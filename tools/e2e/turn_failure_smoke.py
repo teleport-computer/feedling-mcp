@@ -27,6 +27,7 @@ import time
 import uuid
 
 from .client import E2EClient
+from .config import load_keys
 
 FAKE_KEY = "sk-e2e-turn-failure-" + uuid.uuid4().hex   # 必然 401，不烧额度
 POLL_TIMEOUT = 180.0
@@ -51,14 +52,12 @@ def run() -> int:
         # 进入 main_loop 阶段：/v1/chat/response 的引导门对 model_api 账号放行的
         # 前提正是 stage==main_loop（backend/bootstrap/gates.py:151）。用假 key
         # setup 会 400，账号停在 needs_* 阶段，写回复就被 409 拦下。
-        import os
-        real_key = ""
-        for line in open(os.path.expanduser("~/Projects/io/.env.local"), encoding="utf-8"):
-            if line.startswith("OPEN_ROUTER_KEY="):
-                real_key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+        # key 统一从池子读(~/.feedling-e2e-keys.env)。原先这里手写解析
+        # ~/Projects/io/.env.local —— 那是仓库搬家前的路径,搬到 ~/workspace/io
+        # 之后它永远打不开,探针在读 key 这一步就死,而失败长得像"环境问题"。
+        real_key = load_keys().get("E2E_KEY_OPENROUTER", "")
         if not real_key:
-            _fail("io/.env.local 里没找到 OPEN_ROUTER_KEY，无法完成 setup")
+            _fail("~/.feedling-e2e-keys.env 里没找到 E2E_KEY_OPENROUTER，无法完成 setup")
         r = c.post("/v1/model_api/setup", json={
             "provider": "openrouter",
             "model": "openai/gpt-4o-mini",

@@ -4388,7 +4388,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             )
         )
     )
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="terminal reply is a cold-safe committed write"
     )
     envelope, error = core_envelope._build_shared_envelope_for_store(
