@@ -80,6 +80,90 @@ def _isolate_image_observation_sinks(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("status_code", "dedicated_expected", "follow_main_expected"),
+    (
+        (
+            400,
+            "image_generation_model_incompatible",
+            "image_generation_model_required",
+        ),
+        (401, "image_generation_auth_invalid", "image_generation_auth_invalid"),
+        (
+            402,
+            "image_generation_quota_insufficient",
+            "image_generation_quota_insufficient",
+        ),
+        (403, "image_generation_auth_invalid", "image_generation_auth_invalid"),
+        (
+            404,
+            "image_generation_model_not_found",
+            "image_generation_model_not_found",
+        ),
+        (
+            415,
+            "image_generation_model_incompatible",
+            "image_generation_model_required",
+        ),
+        (
+            422,
+            "image_generation_model_incompatible",
+            "image_generation_model_required",
+        ),
+    ),
+)
+def test_image_generation_classifier_preserves_status_specific_codes(
+    status_code, dedicated_expected, follow_main_expected,
+):
+    exc = image_generator.provider_client.ProviderError(
+        "opaque provider failure",
+        status_code=status_code,
+    )
+
+    # This generic class is deliberately identical for all seven inputs. The
+    # image classifier must therefore read the status itself, not the broad
+    # provider_config bucket that caused T494.
+    assert image_generator.provider_client.classify_provider_error(exc) == (
+        "provider_config"
+    )
+    assert image_generator._classify_error(exc) == dedicated_expected
+    assert setup_core._image_generation_error_code(
+        exc,
+        dedicated=True,
+    ) == dedicated_expected
+    assert setup_core._image_generation_error_code(
+        exc,
+        dedicated=False,
+    ) == follow_main_expected
+
+
+@pytest.mark.parametrize("status_code", (408, 429, 500))
+def test_image_generation_classifier_keeps_existing_transient_fallback(
+    status_code,
+):
+    exc = image_generator.provider_client.ProviderError(
+        "opaque provider failure",
+        status_code=status_code,
+    )
+
+    assert image_generator._classify_error(exc) == "image_generation_failed"
+    assert setup_core._image_generation_error_code(
+        exc, dedicated=True
+    ) == "image_generation_test_failed"
+
+
+def test_image_generation_classifier_keeps_statusless_provider_config_behavior():
+    exc = RuntimeError("opaque configuration failure")
+    exc.feedling_error_class = "provider_config"
+
+    assert image_generator._classify_error(
+        exc
+    ) == "image_generation_model_incompatible"
+    assert setup_core._image_generation_error_code(
+        exc, dedicated=False
+    ) == "image_generation_model_required"
+
+
 def test_config_payload_follows_main_without_replacing_chat_model(monkeypatch):
     active = _route(
         id="route-main",
@@ -744,11 +828,6 @@ def test_route_probe_failure_is_observable_without_provider_error_text(
         setup_core.provider_client,
         "generate_image_async",
         failed,
-    )
-    monkeypatch.setattr(
-        setup_core,
-        "_image_generation_error_code",
-        lambda _exc, *, dedicated: "image_generation_auth_invalid",
     )
     monkeypatch.setattr(
         setup_core.db,

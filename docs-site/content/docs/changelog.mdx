@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Image-generation setup errors now preserve actionable provider causes.**
+  HTTP 401/403 credential rejection, 402 quota exhaustion, 404 missing model or
+  endpoint, and 400/415/422 incompatibility now return their existing distinct
+  public error codes instead of collapsing into one model-incompatible result.
+  Chinese and English guidance now tells users which setting to correct.
+
 - **Chat now distinguishes relay tool-history failures from tool-schema
   incompatibility.** When a relay rejects the native tool-result transcript,
   Runtime V2 stops after that provider call instead of dropping tools and
