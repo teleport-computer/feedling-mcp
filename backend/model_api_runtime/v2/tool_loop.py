@@ -2765,6 +2765,13 @@ async def run_tool_loop(
                 and isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
                 and attempts < max_calls
+                # A regular wake gets one useful schema recovery: its broad
+                # first-round catalog may collapse to the minimal
+                # reply/stay_silent choice. Once that forced choice is already
+                # on the wire there is no smaller valid wake surface to try.
+                # Retrying would send the identical rejected request until the
+                # whole turn budget is exhausted (15 calls in production).
+                and not wake_choice_required
                 and _is_probably_tool_schema_rejection(exc)
             )
             if (

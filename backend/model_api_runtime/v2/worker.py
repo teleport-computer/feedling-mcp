@@ -1844,6 +1844,15 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         # persisted status/error surface.
         candidate = str(exc.code or "")
         kind = candidate if candidate in _FRONTIER_FAILURE_KINDS else "error"
+    elif (
+        isinstance(exc, provider_client.ProviderError)
+        and exc.status_code in {400, 422}
+    ):
+        # Match the user/provider-facing classifier below. These statuses are
+        # incompatible request/config signals, not opaque runtime failures;
+        # preserving the closed catalog code lets a failed background wake be
+        # diagnosed from agent_jobs.last_error without exposing provider text.
+        kind = "provider_incompatible"
     else:
         candidate = type(exc).__name__.lower()
         kind = candidate if candidate in _GENERIC_FAILURE_KINDS else "error"
