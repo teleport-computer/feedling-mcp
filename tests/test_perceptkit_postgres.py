@@ -312,6 +312,35 @@ def test_a_receipt_written_twice_does_not_double_advance(clean):
     assert rows[0][0] == 1
 
 
+def test_purge_subject_removes_wake_receipt_before_its_outbox_owner(clean):
+    s = store()
+    event_id = "purge-with-receipt"
+    s.enqueue_event(outbox(event_id))
+    claimed = s.claim_pending_event(worker_id="w1", now=T0, lease_seconds=60)
+    assert claimed is not None
+    assert s.record_wake_receipt(
+        receipt=WakeReceipt(
+            event_id=event_id,
+            attempt_id="purge-attempt",
+            status="accepted",
+            received_at=T0 + timedelta(seconds=5),
+        ),
+        next_state="delivered",
+        claim_token=claimed.claim_token,
+    ) is True
+    assert s._q(
+        "SELECT count(*) FROM perceptkit_wake_receipt WHERE event_id=%s",
+        (event_id,),
+    ) == [(1,)]
+
+    s.purge_subject(subject_id="u1")
+
+    assert s._q(
+        "SELECT count(*) FROM perceptkit_wake_receipt WHERE event_id=%s",
+        (event_id,),
+    ) == [(0,)]
+
+
 # ---------------------------------------------------------------------------
 # 整套 conformance，跑在真 adapter 上
 # ---------------------------------------------------------------------------

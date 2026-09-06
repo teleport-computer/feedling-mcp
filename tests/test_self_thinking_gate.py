@@ -223,3 +223,61 @@ def test_history_row_scrub_removes_leaked_think():
     assert out[2]["content"] == "好的，没问题"
     # user 行不碰 —— 用户自己打的字里出现标签是他的自由，不是我们的协议。
     assert out[1]["content"] == rows[1]["content"]
+
+
+# 命名空间前缀。第二个是 2026-09-06 线上截图里真实出现的那一个，
+# 拼接书写：以字面量形式经过某些工具链时会被改写掉。
+# 第四个是 2026-09-06 线上原文逐字节的前缀：数学斜体字母（U+1D44E…），不是 ASCII。
+_NS_PREFIXES = ("", "ns:", "a" "ntml:", "\U0001D44E\U0001D45B\U0001D461\U0001D45A\U0001D459:")
+
+
+def test_namespace_prefixed_tags_are_recognized_like_tool_markup():
+    """图4（prod 2026-09-06 用户报障截图）：闭标签带 XML 命名空间前缀。
+
+    旧实现要求协议词紧跟在 ``</`` 之后，于是 ``</<ns>:thinking>`` 在 ``_RESIDUE``
+    上零命中 —— 走 fast-path 直接 ABSENT，整段心里话连同标签逐字节进了用户气泡。
+
+    兄弟守卫 ``backend/core/tool_markup_leak.py`` 处理的是**同一个驱动的同一套
+    内部 XML 方言**（``<invoke>`` / ``<parameter>``），它早就显式接受一个可选命名
+    空间前缀、并且只按 local name 配对（见其 docstring）。本闸 2026-08-08 新建时
+    没采纳同一条规则，于是同一族标记里「工具那一半」认得、「思考那一半」不认得。
+
+    词表与前缀集都从常量派生：新增一个协议词而漏掉前缀形态，这条会红。
+    """
+    assert st._TAG_WORDS, "protocol tag vocabulary must not be empty"
+    assert any(p for p in _NS_PREFIXES), "prefix matrix must exercise a real prefix"
+    for word in st._TAG_WORDS:
+        for prefix in _NS_PREFIXES:
+            tag = prefix + word
+            lone = f"这句是心里话</{tag}>这句是要说的话"
+            status, thinking, reply = st.strip_all_thinking(lone)
+            assert status == st.COMPLETE, (tag, status)
+            assert reply == "这句是要说的话", (tag, reply)
+            assert "这句是心里话" in thinking
+
+            paired = f"<{tag}>这句是心里话</{tag}>这句是要说的话"
+            status, thinking, reply = st.strip_all_thinking(paired)
+            assert status == st.COMPLETE, (tag, status)
+            assert reply == "这句是要说的话", (tag, reply)
+
+
+def test_namespace_prefixed_open_without_close_fails_closed():
+    """前缀形态的截断开标签也必须失败关闭，而不是原样放行。"""
+    for prefix in _NS_PREFIXES:
+        raw = f"<{prefix}thinking>她在提醒我修思考链 我没办法从技术层面修这个"
+        status, thinking, reply = st.strip_all_thinking(raw)
+        assert status == st.FAILED, (prefix, status)
+        assert reply == "" and thinking == ""
+
+
+def test_prefix_support_does_not_widen_to_glued_names():
+    """前缀必须是**带冒号的**命名空间段，不能顺手把别人的标签也吞了。"""
+    for raw in (
+        "<mythinking>这是别人的标签</mythinking>",
+        "<thought-process>hi</thought-process>",
+        "<ns:answer>hi</ns:answer>",
+        "chain of thought 是什么意思呀",
+    ):
+        status, _thinking, reply = st.strip_all_thinking(raw)
+        assert status == st.ABSENT, (raw, status)
+        assert reply == raw

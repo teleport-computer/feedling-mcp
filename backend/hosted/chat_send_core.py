@@ -11,6 +11,7 @@ monkeypatch those module attributes keep working unchanged.
 
 from __future__ import annotations
 
+import sys
 import time
 
 from core import envelope as core_envelope
@@ -30,6 +31,124 @@ from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
 from proactive import capture_scheduler
+
+
+_CAPTION_ENVELOPE_FAILURE_EVENT = "chat.caption_envelope_failed"
+_CAPTION_ENVELOPE_FAILURE_LOG_TYPE = "caption_envelope_failed"
+_CAPTION_ENVELOPE_FAILURE_CODES = frozenset({
+    "plaintext_body_not_utf8",
+    "user_content_public_key_missing",
+    "user_content_public_key_invalid_base64",
+    "user_content_public_key_invalid_length",
+    "enclave_info_unavailable",
+    "enclave_content_public_key_invalid_hex",
+    "enclave_content_public_key_invalid_length",
+    "envelope_build_failed",
+})
+
+
+def _caption_failure_code(error: object) -> str:
+    """Keep only the stable, content-free prefix of an envelope error."""
+    code = str(error or "").strip().partition(":")[0]
+    return code if code in _CAPTION_ENVELOPE_FAILURE_CODES else "unknown"
+
+
+def _current_v2_chat_job_id(user_id: str) -> str:
+    """Resolve the single-flight chat job that accepted the new turn."""
+    try:
+        rows = jobs_store.recent_jobs_for_user(
+            user_id,
+            within_hours=1,
+            limit=20,
+        ).get("jobs") or []
+    except Exception:  # noqa: BLE001 - failure telemetry must stay fail-open
+        return ""
+    active = {"pending", "claimed", "running"}
+    chat_rows = [row for row in rows if str(row.get("lane") or "") == "chat"]
+    selected = next(
+        (row for row in chat_rows if str(row.get("status") or "") in active),
+        chat_rows[0] if chat_rows else None,
+    )
+    return str((selected or {}).get("job_id") or "")
+
+
+def _emit_caption_envelope_failure(
+    store,
+    *,
+    turn_id: str,
+    job_id: str,
+    error: object,
+) -> None:
+    """Expose a dropped image caption without blocking the image send.
+
+    The trace and user-log writes are independent best-effort signals. Stderr
+    is unconditional so a failure in both signal paths cannot make the turn
+    indistinguishable from a caption that was preserved.
+    """
+    error_code = _caption_failure_code(error)
+    signal_failures: list[str] = []
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="route",
+            type=_CAPTION_ENVELOPE_FAILURE_EVENT,
+            actor="host_agent_runtime",
+            status="error",
+            outcome_class="operational_failure",
+            summary="image caption envelope construction failed",
+            explain=(
+                "The image was accepted fail-open, but its accompanying caption "
+                "was not persisted."
+            ),
+            trace_id=turn_id,
+            turn_id=turn_id,
+            job_id=job_id,
+            detail={
+                "attachment_kind": "image",
+                "error_code": error_code,
+                "caption_persisted": False,
+            },
+        )
+    except Exception:  # noqa: BLE001 - stderr below is the independent fallback
+        signal_failures.append("trace_events")
+
+    now = time.time()
+    tracking_event = {
+        "event_id": f"caption-envelope-failed:{turn_id}",
+        "type": _CAPTION_ENVELOPE_FAILURE_LOG_TYPE,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "source": "backend",
+        "route": "/v1/model_api/chat/send",
+        "payload": {
+            "turn_id": turn_id,
+            "job_id": job_id,
+            "attachment_kind": "image",
+            "outcome_class": "operational_failure",
+            "error_code": error_code,
+            "caption_persisted": False,
+        },
+    }
+    try:
+        stored = db.log_append(
+            store.user_id,
+            "tracking_events",
+            tracking_event,
+            ts=now,
+            item_key=tracking_event["event_id"],
+        )
+    except Exception:  # noqa: BLE001 - stderr below is the independent fallback
+        stored = False
+    if not stored:
+        signal_failures.append("user_logs")
+
+    print(
+        f"[model_api:{store.user_id}] caption_envelope_failed "
+        f"turn_id={turn_id or '-'} job_id={job_id or '-'} "
+        f"error_code={error_code} "
+        f"signal_failures={','.join(signal_failures) or 'none'}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _voice_metadata(voice_context: dict | None) -> dict[str, str]:
@@ -324,6 +443,7 @@ def model_api_chat_send_core(
         })
     if has_image and vision_route_id:
         extra["vision_route_id"] = vision_route_id
+    caption_failure = ""
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(
@@ -332,7 +452,7 @@ def model_api_chat_send_core(
         if caption_env:
             extra.update(chat_service._chat_caption_extra_from_envelope(caption_env))
         else:
-            print(f"[model_api:{store.user_id}] caption_envelope_failed detail={caption_err}")
+            caption_failure = caption_err
     if has_file:
         extra["file_name"] = file_parse["name"]
         extra["file_mime"] = file_parse["mime"]
@@ -405,6 +525,13 @@ def model_api_chat_send_core(
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。
     _turn_id = str(user_row.get("id") or "") if isinstance(user_row, dict) else ""
+    if inserted and caption_failure:
+        _emit_caption_envelope_failure(
+            store,
+            turn_id=_turn_id,
+            job_id=_current_v2_chat_job_id(store.user_id),
+            error=caption_failure,
+        )
     if inserted:
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",
@@ -581,6 +708,7 @@ def _send_resident(
         extra["vision_main_route_updated_at"] = str(
             main_vision_binding.get("updated_at_token") or ""
         )
+    caption_failure = ""
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(
@@ -589,7 +717,7 @@ def _send_resident(
         if caption_env:
             extra.update(chat_service._chat_caption_extra_from_envelope(caption_env))
         else:
-            print(f"[model_api:{store.user_id}] caption_envelope_failed detail={caption_err}")
+            caption_failure = caption_err
     if has_file:
         extra["file_name"] = file_parse["name"]
         extra["file_mime"] = file_parse["mime"]
@@ -644,6 +772,13 @@ def _send_resident(
         store.notify_chat_waiters()
 
     _turn_id = str(user_row.get("id") or "") if isinstance(user_row, dict) else ""
+    if inserted and caption_failure:
+        _emit_caption_envelope_failure(
+            store,
+            turn_id=_turn_id,
+            job_id="",
+            error=caption_failure,
+        )
     if inserted:
         debug_trace.trace_event(
             store, subsystem="route", type="route.decided", actor="host_agent_runtime",

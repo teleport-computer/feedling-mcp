@@ -4736,6 +4736,99 @@ def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch
     assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 0
     assert extra["noop_reason"] == "nothing_worth_keeping"
+    assert extra["capture_result"]["reason"] == "nothing_worth_keeping"
+    assert extra["capture_result"]["reask_count"] == 0
+    assert extra["capture_result"]["reask_outcome"] == "not_needed"
+
+
+def test_capture_format_reask_then_empty_has_distinct_noop_reason(monkeypatch):
+    format_bad = json.dumps({"cards": [{
+        "action": "add",
+        "summary": "...",
+        "content": "[thickened summary]",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [format_bad, '{"cards":[]}']
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"] == []
+    final = _capture_final_status(captured)
+    assert final[:3] == ("cap_dispatch", "completed", "empty_after_reask")
+    extra = final[3]["extra"]
+    assert extra["noop_reason"] == "empty_after_reask"
+    assert extra["capture_result"]["reason"] == "empty_after_reask"
+    assert extra["capture_result"]["reask_count"] == 1
+    assert extra["capture_result"]["reask_trigger"] == "format"
+    assert extra["capture_result"]["reask_outcome"] == "empty"
+
+
+@pytest.mark.parametrize(
+    ("reply", "sentinel", "head", "tail", "has_fence", "truncated"),
+    [
+        (
+            '```json\n{"cards": invalid}\n``` PRIVATE_FENCE_SENTINEL',
+            "PRIVATE_FENCE_SENTINEL",
+            "```",
+            "other",
+            True,
+            False,
+        ),
+        (
+            '{"cards": invalid} PRIVATE_PROSE_SENTINEL',
+            "PRIVATE_PROSE_SENTINEL",
+            "{",
+            "other",
+            False,
+            False,
+        ),
+        (
+            '{"cards":[{"action":"add","content":"PRIVATE_TRUNCATED_SENTINEL',
+            "PRIVATE_TRUNCATED_SENTINEL",
+            "{",
+            "other",
+            False,
+            True,
+        ),
+    ],
+)
+def test_capture_parse_failure_persists_only_content_free_reply_shape(
+    monkeypatch, reply, sentinel, head, tail, has_fence, truncated
+):
+    # Retryable shapes need a second scripted failure; the truncated shape only
+    # consumes the first value, so the same script works for every case.
+    captured, job = _install_capture_job_harness(monkeypatch, [reply, reply])
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    final = _capture_final_status(captured)
+    assert final[1] == "failed"
+    result = final[3]["extra"]["capture_result"]
+    assert result["reply_len"] == len(reply)
+    assert result["reply_head"] == head
+    assert result["reply_tail_char"] == tail
+    assert result["reply_has_fence"] is has_fence
+    assert result["reply_looks_truncated"] is truncated
+    assert sentinel not in repr(result)
+
+
+def test_capture_job_accepts_eight_cards_through_real_component(monkeypatch):
+    reply = json.dumps({
+        "cards": [
+            {
+                "action": "add",
+                "summary": f"Memory {index}",
+                "content": f"Durable memory content number {index}.",
+            }
+            for index in range(8)
+        ]
+    })
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    final = _capture_final_status(captured)
+    assert final[1] == "completed"
+    assert len(captured["actions"]) == 8
+    assert final[3]["extra"]["cards_added"] == 8
 
 
 def test_capture_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
@@ -10983,6 +11076,140 @@ def test_foreground_injection_bridges_pi_across_rotation(monkeypatch, tmp_path):
     assert crc._foreground_history_injection_enabled() is True
 
 
+def test_turn_limit_rotation_and_bridge_emit_correlated_traces(
+    monkeypatch, tmp_path
+):
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_trace", max_turns=40)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(
+        crc,
+        "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: [
+            {
+                "role": "user",
+                "source": "chat",
+                "content": "earlier one",
+                "ts": 1.0,
+            },
+            {
+                "role": "agent",
+                "source": "chat",
+                "content": "earlier two",
+                "ts": 2.0,
+            },
+        ],
+    )
+    traces = []
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, event_type, **kwargs: traces.append(
+            (subsystem, event_type, kwargs)
+        ),
+    )
+
+    crc._save_agent_session_id("sess_full")
+    crc._mark_agent_session_bridged("sess_full")
+    for _ in range(40):
+        crc._record_agent_session_turn(
+            "sess_full", sent_bytes=1, received_bytes=1
+        )
+
+    out = crc._foreground_agent_message_for_trace(
+        "current", current_ts=9.0, trace_id="msg_rotation"
+    )
+
+    assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
+    assert [event_type for _, event_type, _ in traces] == [
+        "agent.session.rotated",
+        "agent.session.bridge_injected",
+    ]
+    rotation = traces[0][2]
+    bridge = traces[1][2]
+    assert rotation["status"] == bridge["status"] == "ok"
+    assert rotation["trace_id"] == bridge["trace_id"] == "msg_rotation"
+    assert rotation["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "chat",
+        "user_id": "usr_pi_trace",
+        "session_ordinal": 40,
+        "trigger_reason": "turn_limit",
+    }
+    transcript = out.split(
+        f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n", 1
+    )[1].split("\n---\n", 1)[0]
+    assert bridge["detail"] == {
+        "runtime": "resident_v1",
+        "lane": "chat",
+        "user_id": "usr_pi_trace",
+        "session_ordinal": 1,
+        "trigger_reason": "turn_limit",
+        "injected_count": 2,
+        "total_chars": len(transcript),
+    }
+    assert "outcome_class" not in rotation
+    assert "outcome_class" not in bridge
+    assert "outcome_class" not in rotation["detail"]
+    assert "outcome_class" not in bridge["detail"]
+
+
+def test_below_turn_limit_emits_neither_rotation_nor_bridge_trace(
+    monkeypatch, tmp_path
+):
+    _bridge_session_env(monkeypatch, tmp_path, "usr_pi_trace_mirror", max_turns=40)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    traces = []
+    monkeypatch.setattr(
+        crc,
+        "_emit_debug_trace",
+        lambda subsystem, event_type, **kwargs: traces.append(event_type),
+    )
+
+    crc._save_agent_session_id("sess_warm")
+    crc._mark_agent_session_bridged("sess_warm")
+    for _ in range(39):
+        crc._record_agent_session_turn(
+            "sess_warm", sent_bytes=1, received_bytes=1
+        )
+
+    out = crc._foreground_agent_message_for_trace(
+        "current", current_ts=9.0, trace_id="msg_no_rotation"
+    )
+
+    assert out == "current"
+    assert traces == []
+
+
+def test_foreground_trace_scope_preserves_legacy_message_call_shape(monkeypatch):
+    seen = {}
+
+    def legacy_foreground_message(content, *, current_ts):
+        seen.update(
+            content=content,
+            current_ts=current_ts,
+            trace_id=crc._foreground_agent_trace_id.get(),
+        )
+        return "wrapped"
+
+    monkeypatch.setattr(
+        crc, "_foreground_agent_message", legacy_foreground_message
+    )
+
+    out = crc._foreground_agent_message_for_trace(
+        "current", current_ts=9.0, trace_id="msg_legacy_shape"
+    )
+
+    assert out == "wrapped"
+    assert seen == {
+        "content": "current",
+        "current_ts": 9.0,
+        "trace_id": "msg_legacy_shape",
+    }
+    assert crc._foreground_agent_trace_id.get() == ""
+
+
 def test_foreground_injection_off_mode_disables_even_unbridged_pi(monkeypatch, tmp_path):
     # The explicit off switch outranks the bridge.
     _bridge_session_env(monkeypatch, tmp_path, "usr_pi_off")
@@ -13639,3 +13866,86 @@ def test_introduction_think_only_is_not_reported_as_delivered(monkeypatch):
     assert terminal[1] != "thinking_only_silence", (
         f"首次介绍的 think-only 轮被当成了合法沉默:{terminal}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T489 (2026-09-06): think-family tags with an XML namespace prefix.
+# 前缀集与共享内核的守卫相同；最后一个是线上截图里真实出现的那个，拼接书写。
+# ---------------------------------------------------------------------------
+# 第四个是 2026-09-06 线上原文逐字节的前缀：数学斜体字母（U+1D44E…），不是 ASCII。
+_NS_PREFIXES = ("", "ns:", "a" "ntml:", "\U0001D44E\U0001D45B\U0001D461\U0001D45A\U0001D459:")
+
+
+def test_prefixed_unclosed_thinking_is_truncated_and_stays_off_the_stream():
+    """V1 自己编译的两处正则必须和共享内核一样认命名空间前缀。"""
+    from agent_protocol_core import self_thinking as st
+
+    assert st._TAG_WORDS
+    for prefix in _NS_PREFIXES:
+        for word in st._TAG_WORDS:
+            cut = crc._truncate_at_unclosed_thinking(f"正文前 <{prefix}{word}>心里话继续")
+            assert "心里话" not in cut and "<" not in cut and cut.startswith("正文前"), (prefix, word, cut)
+            assert crc._visible_stream_text(f"<{prefix}{word}>心里话") == ""
+    assert crc._visible_stream_text("<div>hi</div>") == "<div>hi</div>"
+    assert crc._truncate_at_unclosed_thinking("正文 <div>hi") == "正文 <div>hi"
+
+
+def test_stream_buffers_incomplete_leading_tag_head_until_it_resolves():
+    """流式快照不可撤回：`<n` / `<ns` / `<ns:t` 这种还没闭合的标签头一律先攒着。
+
+    codex2 review 2026-09-06：只归一化已到达的前缀不够——冒号之前的那几个字节
+    早就作为可见文本发出去了，后面再干净的正文也接不回单调前缀。
+    """
+    for head in ("<", "</", "<n", "<ns", "<ns:", "<ns:t", "<thi", "<div"):
+        assert crc._visible_stream_text(head) == "", head
+    # 闭合之后：本协议的块被剥、未知标签原样可见、非标签起始从不攒。
+    assert crc._visible_stream_text("<div>hi") == "<div>hi"
+    assert crc._visible_stream_text("<3 你") == "<3 你"
+    assert crc._visible_stream_text("<= 5") == "<= 5"
+    for prefix in _NS_PREFIXES:
+        assert crc._visible_stream_text(f"<{prefix}think>心里话</{prefix}think>正文") == "正文", prefix
+
+
+def _feed_prefixed_thinking_pieces(feed_cumulative, feed_delta, prefix):
+    """前缀逐码点喂：命名空间段还没到冒号那几个字节就是泄漏点，必须一个一个过。"""
+    pieces = ["<", *list(prefix), "thinking>secret", f"</{prefix}thinking>", "正文"]
+    acc = ""
+    for piece in pieces:
+        acc += piece
+        if feed_cumulative is not None:
+            feed_cumulative(acc)
+        if feed_delta is not None:
+            feed_delta(piece)
+
+
+# 只取真的带命名空间的前缀；第二个是线上逐字节的 Unicode 前缀（codex2 review：
+# 只喂 ASCII `ns:` 时，把 _INCOMPLETE_TAG_HEAD_RE 退回 ASCII 类没有任何守卫会红）。
+_STREAM_PREFIXES = tuple(p for p in _NS_PREFIXES if p)
+
+
+def test_pi_observer_never_publishes_a_partial_prefixed_tag_head():
+    assert _STREAM_PREFIXES
+    for prefix in _STREAM_PREFIXES:
+        published = []
+        observer = crc._PiStreamObserver(lambda seg, text, final: published.append((seg, text, final)))
+        observer.feed(json.dumps({"type": "message_start", "message": {"role": "assistant"}}))
+        _feed_prefixed_thinking_pieces(
+            lambda acc: observer.feed(json.dumps({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": acc}]}})),
+            None,
+            prefix,
+        )
+        assert published == [(0, "正文", False)], (prefix, published)
+
+
+def test_claude_observer_never_publishes_a_partial_prefixed_tag_head():
+    assert _STREAM_PREFIXES
+    for prefix in _STREAM_PREFIXES:
+        published = []
+        observer = crc._ClaudeStreamObserver(lambda seg, text, final: published.append((seg, text, final)))
+        observer.feed(json.dumps({"type": "stream_event", "event": {"type": "message_start"}}))
+        _feed_prefixed_thinking_pieces(
+            None,
+            lambda piece: observer.feed(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": piece}}})),
+            prefix,
+        )
+        assert published == [(0, "正文", False)], (prefix, published)

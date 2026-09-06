@@ -1454,6 +1454,7 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
 
 
 _ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
+_ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS = 60000
 
 
 class AdminDataTrackDauReadError(RuntimeError):
@@ -1465,16 +1466,21 @@ class AdminDataTrackDailyUsageReadError(RuntimeError):
 
 
 @contextmanager
-def _admin_data_track_connection():
+def _admin_data_track_connection(*, timeout_ms: int | None = None):
     """Lease one bounded admin connection without poisoning the shared pool."""
+    effective_timeout_ms = int(
+        _ADMIN_DATA_TRACK_READ_TIMEOUT_MS
+        if timeout_ms is None
+        else timeout_ms
+    )
     with get_pool().connection(
-        timeout=_ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+        timeout=effective_timeout_ms / 1000
     ) as conn:
         # Pool connections are autocommit, so SET LOCAL/set_config(..., true)
         # would expire at the end of that one statement. Use a session setting
         # for this lease and always reset it before returning the connection.
         conn.execute(
-            f"SET statement_timeout = '{_ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'"
+            f"SET statement_timeout = '{effective_timeout_ms}ms'"
         )
         try:
             yield conn
@@ -1701,6 +1707,9 @@ def admin_data_track_snapshot(
     include_memory_breakdowns: bool = True,
     include_screen_frames: bool = True,
     include_paged_log_streams: bool = True,
+    include_worldbook: bool = False,
+    narrow_app_usage_to_user_stream: bool = False,
+    statement_timeout_ms: int | None = None,
 ) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
@@ -1708,6 +1717,11 @@ def admin_data_track_snapshot(
     full encrypted chat envelopes or memory bodies into Python just to count
     them. The returned shape is consumed by the data-track surface in
     admin/data_track.py (routes wired in admin/routes_asgi.py).
+
+    ``narrow_app_usage_to_user_stream`` is for one-user detail reads. It makes
+    PostgreSQL use the existing ``(user_id, stream, seq)`` index before testing
+    the JSON event type. Fleet snapshots leave it off so their partial
+    app-session index remains available.
     """
     ids = [str(uid) for uid in user_ids if uid]
     if not ids:
@@ -1727,7 +1741,9 @@ def admin_data_track_snapshot(
         for uid in ids
     }
     try:
-        with _admin_data_track_connection() as conn:
+        with _admin_data_track_connection(
+            timeout_ms=statement_timeout_ms,
+        ) as conn:
             _chat_rollup_into(conn, ids, out, ensure)
 
             if include_screen_frames:
@@ -1783,6 +1799,22 @@ def admin_data_track_snapshot(
             if include_memory_breakdowns:
                 _memory_breakdowns_into(conn, ids, out, ensure)
 
+            if include_worldbook:
+                rows = conn.execute(
+                    """
+                    SELECT user_id, COUNT(*)::int, MAX(updated_at)
+                    FROM world_book_entries
+                    WHERE user_id = ANY(%s)
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, entries, last_updated_at in rows:
+                    ensure(out, uid)["worldbook"] = {
+                        "entries": int(entries or 0),
+                        "last_updated_at": str(last_updated_at or ""),
+                    }
+
             rows = conn.execute(
                 """
                 SELECT user_id, stream, COUNT(*)::int, MAX(ts)
@@ -1811,26 +1843,47 @@ def admin_data_track_snapshot(
             if include_paged_log_streams:
                 _paged_log_streams_into(conn, ids, out, ensure)
 
-            rows = conn.execute(
+            if narrow_app_usage_to_user_stream:
+                app_usage_sql = """
+                    WITH user_tracking AS MATERIALIZED (
+                        SELECT user_id, ts, doc
+                        FROM user_logs
+                        WHERE user_id = ANY(%s)
+                          AND stream = 'tracking_events'
+                    )
+                    SELECT user_id,
+                           COALESCE(SUM(
+                             CASE
+                               WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                               THEN (doc->'payload'->>'duration_sec')::bigint
+                               ELSE 0
+                             END
+                           ), 0)::bigint AS foreground_sec,
+                           COUNT(*)::int AS sessions,
+                           MAX(ts) AS last_at
+                    FROM user_tracking
+                    WHERE doc->>'type' = 'app_session_end'
+                    GROUP BY user_id
                 """
-                SELECT user_id,
-                       COALESCE(SUM(
-                         CASE
-                           WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                           THEN (doc->'payload'->>'duration_sec')::bigint
-                           ELSE 0
-                         END
-                       ), 0)::bigint AS foreground_sec,
-                       COUNT(*)::int AS sessions,
-                       MAX(ts) AS last_at
-                FROM user_logs
-                WHERE user_id = ANY(%s)
-                  AND stream = 'tracking_events'
-                  AND doc->>'type' = 'app_session_end'
-                GROUP BY user_id
-                """,
-                (ids,),
-            ).fetchall()
+            else:
+                app_usage_sql = """
+                    SELECT user_id,
+                           COALESCE(SUM(
+                             CASE
+                               WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                               THEN (doc->'payload'->>'duration_sec')::bigint
+                               ELSE 0
+                             END
+                           ), 0)::bigint AS foreground_sec,
+                           COUNT(*)::int AS sessions,
+                           MAX(ts) AS last_at
+                    FROM user_logs
+                    WHERE user_id = ANY(%s)
+                      AND stream = 'tracking_events'
+                      AND doc->>'type' = 'app_session_end'
+                    GROUP BY user_id
+                """
+            rows = conn.execute(app_usage_sql, (ids,)).fetchall()
             for uid, foreground_sec, sessions, last_at in rows:
                 ensure(out, uid)["app_usage"] = {
                     "foreground_sec": int(foreground_sec or 0),
@@ -2859,6 +2912,7 @@ def admin_data_track_user_daily_usage(
     user_id: str,
     days: int = 14,
     tz: str = "Asia/Shanghai",
+    statement_timeout_ms: int | None = None,
 ) -> list[dict]:
     """Return one user's app usage for the latest ``days`` local dates.
 
@@ -2873,7 +2927,9 @@ def admin_data_track_user_daily_usage(
         day_limit = 14
 
     try:
-        with _admin_data_track_connection() as conn:
+        with _admin_data_track_connection(
+            timeout_ms=statement_timeout_ms,
+        ) as conn:
             rows = conn.execute(
                 """
                 WITH local_clock AS (
@@ -2898,6 +2954,12 @@ def admin_data_track_user_daily_usage(
                     )::date AS day
                     FROM bounds b
                 ),
+                user_tracking AS MATERIALIZED (
+                    SELECT ts, doc
+                    FROM user_logs
+                    WHERE user_id = %s
+                      AND stream = 'tracking_events'
+                ),
                 usage AS (
                     SELECT
                         timezone(%s, to_timestamp(l.ts))::date AS day,
@@ -2916,11 +2978,9 @@ def admin_data_track_user_daily_usage(
                               ELSE 0
                             END
                         ), 0)::bigint AS max_session_sec
-                    FROM user_logs l
+                    FROM user_tracking l
                     CROSS JOIN bounds b
-                    WHERE l.user_id = %s
-                      AND l.stream = 'tracking_events'
-                      AND l.doc->>'type' = 'app_session_end'
+                    WHERE l.doc->>'type' = 'app_session_end'
                       AND l.ts IS NOT NULL
                       AND l.ts >= b.start_epoch
                       AND l.ts < b.end_epoch
@@ -2935,7 +2995,7 @@ def admin_data_track_user_daily_usage(
                 LEFT JOIN usage u USING (day)
                 ORDER BY c.day
                 """,
-                (tz, day_limit, tz, tz, day_limit, tz, str(user_id or "")),
+                (tz, day_limit, tz, tz, day_limit, str(user_id or ""), tz),
             ).fetchall()
         return [
             {
@@ -18561,8 +18621,14 @@ def delete_user_data(user_id: str) -> None:
         "model_api_credentials",
     )
     try:
+        from perception.perceptkit_adapter.storage import PostgresStorage
+
         with get_pool().connection() as conn:
             with conn.transaction():
+                # PerceptKit tables intentionally have no users FK. Keep their
+                # subject-scoped purge in this same belt transaction so both
+                # user and admin reset entrypoints cover them atomically.
+                PostgresStorage(conn).purge_subject(subject_id=user_id)
                 for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
                 # lane_daily_rollup is deliberately NOT in the delete list:

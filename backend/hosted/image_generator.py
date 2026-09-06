@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import base64
 import logging
+import sys
+import time
+import uuid
 
 import db
+import debug_trace
 import generated_image
 import provider_client
 from core import enclave as core_enclave
@@ -25,6 +29,143 @@ _EXPECTED_KEY_DECRYPT_RUNTIME_ERRORS = frozenset({
     "enclave_invalid_decrypt_response",
 })
 log = logging.getLogger(__name__)
+
+_ATTEMPT_EVENT_TYPE = "image_generation.attempt.finished"
+_ATTEMPT_STREAM = "image_generation_attempts"
+_ATTEMPT_ERROR_CATEGORIES = frozenset({
+    "image_generation_auth_invalid",
+    "image_generation_failed",
+    "image_generation_key_decrypt_failed",
+    "image_generation_model_incompatible",
+    "image_generation_model_not_found",
+    "image_generation_model_not_ready",
+    "image_generation_model_required",
+    "image_generation_processing_failed",
+    "image_generation_quota_insufficient",
+    "image_generation_rate_limited",
+    "image_generation_test_failed",
+    "image_generation_unavailable",
+    "model_api_key_decrypt_failed",
+    "model_api_key_envelope_missing",
+    "model_api_route_write_failed",
+})
+
+
+def new_attempt_id() -> str:
+    return f"image_generation:{uuid.uuid4().hex}"
+
+
+def _safe_error_category(value: object) -> str:
+    category = str(value or "").strip()
+    if not category:
+        return ""
+    if category in _ATTEMPT_ERROR_CATEGORIES:
+        return category
+    return "image_generation_unknown_failure"
+
+
+def provider_called_for_error(exc: BaseException) -> bool:
+    """Distinguish the sole local capability rejection from upstream calls."""
+    return str(exc).strip().lower() != "image_generation_model_unsupported"
+
+
+def _safe_status_code(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        status = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def observe_attempt(
+    store,
+    *,
+    attempt_id: str,
+    operation: str,
+    provider: str,
+    model: str,
+    outcome: str,
+    provider_called: bool,
+    error_category: str = "",
+    status_code: object = None,
+    dur_ms: float | None = None,
+) -> None:
+    """Persist content-free image-generation outcome metadata, fail-open.
+
+    ``error_category`` is closed here even though callers already pass only
+    local error codes. Provider exception text, prompts, credentials, response
+    bodies, and generated media must never enter either sink.
+    """
+    safe_outcome = "ok" if outcome == "ok" else "failed"
+    safe_error = _safe_error_category(error_category)
+    safe_operation = str(operation or "unknown")[:48]
+    safe_provider = str(provider or "")[:80]
+    safe_model = str(model or "")[:160]
+    safe_attempt_id = str(attempt_id or "")[:120]
+    duration = max(0.0, float(dur_ms or 0.0))
+    payload = {
+        "attempt_id": safe_attempt_id,
+        "operation": safe_operation,
+        "provider": safe_provider,
+        "model": safe_model,
+        "outcome": safe_outcome,
+        "error_category": safe_error,
+        "provider_called": bool(provider_called),
+        "status_code": _safe_status_code(status_code),
+        "dur_ms": round(duration, 1),
+    }
+    signal_failures: list[str] = []
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="image_generation",
+            type=_ATTEMPT_EVENT_TYPE,
+            actor="backend",
+            status="ok" if safe_outcome == "ok" else "error",
+            outcome_class=(
+                None if safe_outcome == "ok" else "operational_failure"
+            ),
+            summary=f"image generation {safe_outcome}",
+            trace_id=safe_attempt_id,
+            detail=dict(payload),
+            dur_ms=duration,
+        )
+    except Exception:  # noqa: BLE001 - user-log/stderr remain independent
+        signal_failures.append("trace_events")
+
+    now = time.time()
+    record = {
+        "source": "backend",
+        **payload,
+        "ts": now,
+    }
+    try:
+        stored = db.log_append(
+            store.user_id,
+            _ATTEMPT_STREAM,
+            record,
+            ts=now,
+            item_key=safe_attempt_id,
+        )
+    except Exception:  # noqa: BLE001 - stderr remains the independent fallback
+        stored = False
+    if not stored:
+        signal_failures.append("user_logs")
+
+    if safe_outcome != "ok" or signal_failures:
+        print(
+            f"[image-generation:{store.user_id}] attempt_finished "
+            f"attempt_id={safe_attempt_id or '-'} operation={safe_operation} "
+            f"provider={safe_provider or '-'} model={safe_model or '-'} "
+            f"outcome={safe_outcome} error_category={safe_error or '-'} "
+            f"provider_called={str(bool(provider_called)).lower()} "
+            f"status_code={payload['status_code'] or '-'} "
+            f"signal_failures={','.join(signal_failures) or 'none'}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _classify_error(exc: BaseException) -> str:
@@ -170,8 +311,32 @@ def generate_with_pinned_route(
     provider = str(route.get("provider") or "")
     model = str(route.get("model") or "")
     route_id = str(route.get("id") or "")
+    attempt_id = new_attempt_id()
+    started = time.monotonic()
+
+    def observe(
+        outcome: str,
+        *,
+        error_category: str = "",
+        provider_called: bool = False,
+        status_code: object = None,
+    ) -> None:
+        observe_attempt(
+            store,
+            attempt_id=attempt_id,
+            operation="runtime_generate",
+            provider=provider,
+            model=model,
+            outcome=outcome,
+            error_category=error_category,
+            provider_called=provider_called,
+            status_code=status_code,
+            dur_ms=(time.monotonic() - started) * 1000.0,
+        )
+
     if str(route.get("image_generation_test_status") or "") != "ok":
         code = "image_generation_model_not_ready"
+        observe("failed", error_category=code)
         return {
             "error": code,
             "error_class": code,
@@ -182,6 +347,7 @@ def generate_with_pinned_route(
     envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         code = "image_generation_model_not_ready"
+        observe("failed", error_category=code)
         return {"error": code, "error_class": code}, _status_for_error(code)
 
     try:
@@ -194,13 +360,24 @@ def generate_with_pinned_route(
     except (RuntimeError, ValueError) as exc:
         code = _key_decrypt_failure_code(exc)
         if not code:
+            observe(
+                "failed",
+                error_category="image_generation_processing_failed",
+            )
             raise
+        observe("failed", error_category=code)
         return {
             "error": code,
             "error_class": code,
             "provider": provider[:80],
             "model": model[:96],
         }, _status_for_error(code)
+    except Exception:
+        observe(
+            "failed",
+            error_category="image_generation_processing_failed",
+        )
+        raise
     config = provider_client.ProviderConfig(
         provider,
         model,
@@ -212,6 +389,15 @@ def generate_with_pinned_route(
     try:
         result = provider_client.generate_image(config, prompt)
     except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
+        provider_called = provider_called_for_error(exc)
+        observe(
+            "failed",
+            error_category=_classify_error(exc),
+            provider_called=provider_called,
+            status_code=(
+                getattr(exc, "status_code", None) if provider_called else None
+            ),
+        )
         return _provider_failure_response(
             store,
             route_id=route_id,
@@ -220,8 +406,21 @@ def generate_with_pinned_route(
             exc=exc,
         )
 
-    images = normalize_provider_media(result)
+    try:
+        images = normalize_provider_media(result)
+    except Exception:
+        observe(
+            "failed",
+            error_category="image_generation_processing_failed",
+            provider_called=True,
+        )
+        raise
     if not images:
+        observe(
+            "failed",
+            error_category="image_generation_model_incompatible",
+            provider_called=True,
+        )
         return _provider_failure_response(
             store,
             route_id=route_id,
@@ -236,6 +435,7 @@ def generate_with_pinned_route(
             route_id,
             status="ok",
         )
+    observe("ok", provider_called=True)
     return {
         "images": images,
         "provider": provider[:80],

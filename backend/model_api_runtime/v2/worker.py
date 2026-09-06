@@ -141,6 +141,7 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
 from memory.capture_prompt_v1 import (
+    IO_CONVERSATION_CAPTURE_POLICY,
     build_capture_prompt,
     build_capture_retry_prompt,
     build_capture_semantic_retry_prompt,
@@ -1843,6 +1844,15 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         # persisted status/error surface.
         candidate = str(exc.code or "")
         kind = candidate if candidate in _FRONTIER_FAILURE_KINDS else "error"
+    elif (
+        isinstance(exc, provider_client.ProviderError)
+        and exc.status_code in {400, 422}
+    ):
+        # Match the user/provider-facing classifier below. These statuses are
+        # incompatible request/config signals, not opaque runtime failures;
+        # preserving the closed catalog code lets a failed background wake be
+        # diagnosed from agent_jobs.last_error without exposing provider text.
+        kind = "provider_incompatible"
     else:
         candidate = type(exc).__name__.lower()
         kind = candidate if candidate in _GENERIC_FAILURE_KINDS else "error"
@@ -9122,7 +9132,7 @@ async def _run_wake(
     )
     provider_reply_signal = _ProviderReplySignal()
     try:
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="wake lane reads bounded DB inputs and durable cursors"
         )
         seq_native = deps.read_messages_after_seq is not None
@@ -12490,7 +12500,9 @@ async def _run_extraction(
             _sole_call_id = ""
             if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
                 _sole_call_id = next(iter(voice_transcripts))
-            parse = parse_capture_cards
+            parse = lambda reply: parse_capture_cards(
+                reply, policy=IO_CONVERSATION_CAPTURE_POLICY
+            )
 
             def to_actions(*args, _call_id=_sole_call_id, **kwargs):
                 return v2_extraction.cards_to_actions(
@@ -12501,7 +12513,11 @@ async def _run_extraction(
             parse_retry = v2_extraction.ParseRetry(
                 should_retry=is_retryable_parse_error,
                 build_prompt=build_capture_retry_prompt,
-                parse=lambda reply: parse_capture_cards(reply, strict=False),
+                parse=lambda reply: parse_capture_cards(
+                    reply,
+                    strict=False,
+                    policy=IO_CONVERSATION_CAPTURE_POLICY,
+                ),
                 semantic_reasons=capture_semantic_retry_reasons,
                 build_semantic_prompt=build_capture_semantic_retry_prompt,
                 build_truncation_prompt=build_truncation_retry_prompt,
@@ -12680,6 +12696,7 @@ async def _run_extraction(
                     identity=str(ctx.get("identity") or ""),
                     ai_name=ctx.get("ai_name", ""),
                     user_name=ctx.get("user_name", ""),
+                    policy=IO_CONVERSATION_CAPTURE_POLICY,
                 ))
                 prompt = build_capture_prompt(
                     ai_name=ctx.get("ai_name", ""),
@@ -14098,7 +14115,7 @@ async def process_job(
             )
             tm.flush(failed=True, status=f"unhandled_lane:{lane}")
             return "failed"
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id, reason="chat lane reads bounded DB inputs and durable cursors"
         )
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)

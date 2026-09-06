@@ -50,6 +50,9 @@ router = APIRouter()
 
 DEBUG_TRACE_REQUEST_TIMEOUT_SEC = 3.0
 DATA_TRACK_REQUEST_TIMEOUT_SEC = db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC = (
+    db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS / 1000
+)
 
 _ADMIN_SESSION_COOKIE = "admin_session"
 _ADMIN_SESSION_MAX_AGE = 7 * 24 * 60 * 60
@@ -59,12 +62,16 @@ class DataTrackQueryTimeout(RuntimeError):
     """A bounded data-track DB read exceeded its HTTP or PostgreSQL budget."""
 
 
-async def _run_data_track_db(fn, *args):
+async def _run_data_track_db(fn, *args, timeout_seconds: float | None = None):
     try:
         return await threadpool.run_db_bounded(
             fn,
             *args,
-            timeout_seconds=DATA_TRACK_REQUEST_TIMEOUT_SEC,
+            timeout_seconds=(
+                DATA_TRACK_REQUEST_TIMEOUT_SEC
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
         )
     except (TimeoutError, QueryCanceled) as exc:
         raise DataTrackQueryTimeout from exc
@@ -383,7 +390,10 @@ async def route_fence_audit(request: Request):
 async def data_track_user(user_id: str, request: Request):
     _require_admin(request)
     body, status = await _run_data_track_db(
-        admin_core.user_payload, request.url.query, user_id
+        admin_core.user_payload,
+        request.url.query,
+        user_id,
+        timeout_seconds=DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC,
     )
     return JSONResponse(body, status_code=status)
 
@@ -462,7 +472,10 @@ async def data_track_user_lookup(request: Request):
 async def data_track_user_page(user_id: str, request: Request):
     _require_admin(request)
     kind, body, status = await _run_data_track_db(
-        admin_core.user_page, request.url.query, user_id
+        admin_core.user_page,
+        request.url.query,
+        user_id,
+        timeout_seconds=DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC,
     )
     if kind == "text":
         return PlainTextResponse(body, status_code=status)

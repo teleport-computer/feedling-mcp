@@ -93,7 +93,7 @@ def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
         user_store = user_or_store
         if isinstance(user_or_store, str):
             from core import store as core_store  # lazy
-            user_store = core_store.get_store_shell_only(
+            user_store = core_store.get_store_per_load_mode(
                 user_or_store, reason="perception runtime fence is DB-backed"
             )
 
@@ -839,7 +839,7 @@ def _app_proactive_settings(user_id: str) -> dict:
     user_state). Lazy import like _fire_wake; failures mean "no block" so a
     broken app layer can't silently kill perception observability."""
     from core import store as core_store  # lazy; assembly loads core first
-    return core_store.get_store_shell_only(
+    return core_store.get_store_per_load_mode(
         user_id, reason="proactive settings are a direct blob read"
     ).load_proactive_settings()
 
@@ -909,7 +909,7 @@ def _settings_v2_for_user(user_id: str):
 
 def _proactive_activation_ready(user_id: str) -> bool:
     from core import store as core_store  # lazy
-    return core_store.get_store_shell_only(
+    return core_store.get_store_per_load_mode(
         user_id, reason="activation readiness uses direct DB/blob helpers"
     ).proactive_activation_ready()
 
@@ -1075,7 +1075,7 @@ def _fire_wake_event_v2(event) -> None:
         from hosted import config_store as hosted_config_store  # lazy
         from model_api_runtime.v2 import jobs_store  # lazy
         from proactive import service as proactive_service  # lazy
-        s = core_store.get_store_shell_only(
+        s = core_store.get_store_per_load_mode(
             event.user_id, reason="V2 perception enqueue uses durable helpers"
         )
         if not event.manual and not s.proactive_activation_ready():
@@ -1237,7 +1237,7 @@ def _fire_wake(
         from core import store as core_store  # lazy
         from core import util as core_util  # lazy
         from proactive import service as proactive_service  # lazy
-        s = core_store.get_store_shell_only(
+        s = core_store.get_store_per_load_mode(
             user_id, reason="legacy perception enqueue is a cold-safe write"
         )
         if not s.proactive_activation_ready():

@@ -260,6 +260,9 @@ def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
     assert admin_asgi.DATA_TRACK_REQUEST_TIMEOUT_SEC == (
         db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
     )
+    assert admin_asgi.DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC == (
+        db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS / 1000
+    )
     for handler in handlers:
         tree = ast.parse(textwrap.dedent(inspect.getsource(handler)))
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
@@ -279,6 +282,22 @@ def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
         ]
         assert len(bounded_calls) == 1, handler.__name__
         assert raw_calls == [], handler.__name__
+        timeout_keywords = [
+            keyword
+            for keyword in bounded_calls[0].keywords
+            if keyword.arg == "timeout_seconds"
+        ]
+        if handler in {
+            admin_asgi.data_track_user,
+            admin_asgi.data_track_user_page,
+        }:
+            assert len(timeout_keywords) == 1, handler.__name__
+            assert isinstance(timeout_keywords[0].value, ast.Name)
+            assert timeout_keywords[0].value.id == (
+                "DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC"
+            )
+        else:
+            assert timeout_keywords == [], handler.__name__
 
 
 def test_t428_data_track_deadline_returns_503_without_waiting_for_db(
