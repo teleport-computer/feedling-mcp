@@ -102,12 +102,17 @@ THINKING_FAILED_MARKER = "（思考没写完）"
 
 _TAG_WORDS = ("thinking", "reasoning", "thought", "think")  # longest-first
 _TAG_ALT = "|".join(_TAG_WORDS)
+# 可选的 XML 命名空间前缀。起始字符必须放宽到 **Unicode 字母**：2026-09-06 线上
+# （usr_1baf…，pi + mimo-v2.5）真实写出的是 `</𝑎𝑛𝑡𝑚𝑙:thinking>` —— 前缀全是
+# 数学斜体字母（U+1D44E…，category Ll），ASCII `[A-Za-z]` 一个都对不上。
+# 一天 16 条泄漏全是这个形状。
+_NAME_START = r"(?:[^\W\d_][\w.-]*:)?"
 # Invisible leading chars (BOM, zero-width) that must not hide a truncated opener.
 _INVISIBLE = "﻿​‌‍⁠⁦⁧⁨⁩"
 _BIDI_CONTROLS = frozenset("‪‫‬‭‮⁦⁧⁨⁩‎‏")
 # Any of our protocol tags (open or close) — used only to detect nesting INSIDE a
 # resolved thinking block, never to scrub the reply.
-_ANY_TAG = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})\b", re.IGNORECASE)
+_ANY_TAG = re.compile(rf"<\s*/?\s*{_NAME_START}(?:{_TAG_ALT})\b", re.IGNORECASE)
 
 _ENV_FLAG = "FEEDLING_V2_SELF_THINKING"
 
@@ -281,14 +286,14 @@ _NAME_END = r"(?![\w:.-])"
 # 一整对同名标签。开闭必须同名（`(?P=tag)`），否则 <think>…</reasoning> 这种
 # 错配会被当成一块合法协议剥掉。
 _PAIRED_BLOCK = re.compile(
-    rf"<\s*(?P<tag>{_TAG_ALT}){_NAME_END}\s*>(?P<body>.*?)<\s*/\s*(?P=tag){_NAME_END}\s*>",
+    rf"<\s*{_NAME_START}(?P<tag>{_TAG_ALT}){_NAME_END}\s*>(?P<body>.*?)<\s*/\s*{_NAME_START}(?P=tag){_NAME_END}\s*>",
     re.IGNORECASE | re.DOTALL,
 )
 # 剥完之后判定「还有没有残留」。任何开或闭标签都算。
-_RESIDUE = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT}){_NAME_END}", re.IGNORECASE)
+_RESIDUE = re.compile(rf"<\s*/?\s*{_NAME_START}(?:{_TAG_ALT}){_NAME_END}", re.IGNORECASE)
 # 孤立闭标签：按本协议思考永远写在最前面，所以一个配不上对的 </think> 说明它
 # 前面的全是思考（开标签在上游某处被吃掉了）。
-_LONE_CLOSE = re.compile(rf"<\s*/\s*(?:{_TAG_ALT}){_NAME_END}\s*>", re.IGNORECASE)
+_LONE_CLOSE = re.compile(rf"<\s*/\s*{_NAME_START}(?:{_TAG_ALT}){_NAME_END}\s*>", re.IGNORECASE)
 
 
 def gate_enabled() -> bool:
@@ -302,7 +307,22 @@ def gate_enabled() -> bool:
 # 只删标签壳、保留文字。给「历史入口」的 FAILED 兜底用：那种行结构已经乱到
 # 分不清哪段是思考，但它的文字本来就已经发到用户眼前过了，删掉整行会平白打断
 # 对话连贯性。入口真正要断的是「模型看到可抄的格式」，删掉标签壳就够了。
-_TAG_MARKER = re.compile(rf"<\s*/?\s*(?:{_TAG_ALT})(?![\w:.-])\s*>", re.IGNORECASE)
+_TAG_MARKER = re.compile(rf"<\s*/?\s*{_NAME_START}(?:{_TAG_ALT})(?![\w:.-])\s*>", re.IGNORECASE)
+
+
+def tag_name_pattern() -> str:
+    """协议标签名的单一来源：一个可选的 XML 命名空间前缀 + 协议词。
+
+    给 V1 consumer 那几处自己编译的正则用。它们原先各写一份字面量词表、且都
+    要求协议词紧跟在 ``<``/``</`` 之后 —— 2026-09-06 线上泄漏就是从这个缺口出去的。
+    由构造共享，「前缀规则在某一处漂掉」在结构上不可能发生。
+    """
+    return rf"{_NAME_START}(?:{_TAG_ALT})"
+
+
+def strip_namespace_prefix(tag_text: str) -> str:
+    """把 ``<ns:th`` 这种**尚未写完**的标签头去掉命名空间段，便于前缀比对。"""
+    return re.sub(r"^<\s*/?\s*[^\W\d_][\w.-]*:", "<", str(tag_text or ""))
 
 
 def strip_tag_markers(text: str) -> str:

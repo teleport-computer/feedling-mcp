@@ -13866,3 +13866,86 @@ def test_introduction_think_only_is_not_reported_as_delivered(monkeypatch):
     assert terminal[1] != "thinking_only_silence", (
         f"首次介绍的 think-only 轮被当成了合法沉默:{terminal}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T489 (2026-09-06): think-family tags with an XML namespace prefix.
+# 前缀集与共享内核的守卫相同；最后一个是线上截图里真实出现的那个，拼接书写。
+# ---------------------------------------------------------------------------
+# 第四个是 2026-09-06 线上原文逐字节的前缀：数学斜体字母（U+1D44E…），不是 ASCII。
+_NS_PREFIXES = ("", "ns:", "a" "ntml:", "\U0001D44E\U0001D45B\U0001D461\U0001D45A\U0001D459:")
+
+
+def test_prefixed_unclosed_thinking_is_truncated_and_stays_off_the_stream():
+    """V1 自己编译的两处正则必须和共享内核一样认命名空间前缀。"""
+    from agent_protocol_core import self_thinking as st
+
+    assert st._TAG_WORDS
+    for prefix in _NS_PREFIXES:
+        for word in st._TAG_WORDS:
+            cut = crc._truncate_at_unclosed_thinking(f"正文前 <{prefix}{word}>心里话继续")
+            assert "心里话" not in cut and "<" not in cut and cut.startswith("正文前"), (prefix, word, cut)
+            assert crc._visible_stream_text(f"<{prefix}{word}>心里话") == ""
+    assert crc._visible_stream_text("<div>hi</div>") == "<div>hi</div>"
+    assert crc._truncate_at_unclosed_thinking("正文 <div>hi") == "正文 <div>hi"
+
+
+def test_stream_buffers_incomplete_leading_tag_head_until_it_resolves():
+    """流式快照不可撤回：`<n` / `<ns` / `<ns:t` 这种还没闭合的标签头一律先攒着。
+
+    codex2 review 2026-09-06：只归一化已到达的前缀不够——冒号之前的那几个字节
+    早就作为可见文本发出去了，后面再干净的正文也接不回单调前缀。
+    """
+    for head in ("<", "</", "<n", "<ns", "<ns:", "<ns:t", "<thi", "<div"):
+        assert crc._visible_stream_text(head) == "", head
+    # 闭合之后：本协议的块被剥、未知标签原样可见、非标签起始从不攒。
+    assert crc._visible_stream_text("<div>hi") == "<div>hi"
+    assert crc._visible_stream_text("<3 你") == "<3 你"
+    assert crc._visible_stream_text("<= 5") == "<= 5"
+    for prefix in _NS_PREFIXES:
+        assert crc._visible_stream_text(f"<{prefix}think>心里话</{prefix}think>正文") == "正文", prefix
+
+
+def _feed_prefixed_thinking_pieces(feed_cumulative, feed_delta, prefix):
+    """前缀逐码点喂：命名空间段还没到冒号那几个字节就是泄漏点，必须一个一个过。"""
+    pieces = ["<", *list(prefix), "thinking>secret", f"</{prefix}thinking>", "正文"]
+    acc = ""
+    for piece in pieces:
+        acc += piece
+        if feed_cumulative is not None:
+            feed_cumulative(acc)
+        if feed_delta is not None:
+            feed_delta(piece)
+
+
+# 只取真的带命名空间的前缀；第二个是线上逐字节的 Unicode 前缀（codex2 review：
+# 只喂 ASCII `ns:` 时，把 _INCOMPLETE_TAG_HEAD_RE 退回 ASCII 类没有任何守卫会红）。
+_STREAM_PREFIXES = tuple(p for p in _NS_PREFIXES if p)
+
+
+def test_pi_observer_never_publishes_a_partial_prefixed_tag_head():
+    assert _STREAM_PREFIXES
+    for prefix in _STREAM_PREFIXES:
+        published = []
+        observer = crc._PiStreamObserver(lambda seg, text, final: published.append((seg, text, final)))
+        observer.feed(json.dumps({"type": "message_start", "message": {"role": "assistant"}}))
+        _feed_prefixed_thinking_pieces(
+            lambda acc: observer.feed(json.dumps({"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": acc}]}})),
+            None,
+            prefix,
+        )
+        assert published == [(0, "正文", False)], (prefix, published)
+
+
+def test_claude_observer_never_publishes_a_partial_prefixed_tag_head():
+    assert _STREAM_PREFIXES
+    for prefix in _STREAM_PREFIXES:
+        published = []
+        observer = crc._ClaudeStreamObserver(lambda seg, text, final: published.append((seg, text, final)))
+        observer.feed(json.dumps({"type": "stream_event", "event": {"type": "message_start"}}))
+        _feed_prefixed_thinking_pieces(
+            None,
+            lambda piece: observer.feed(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": piece}}})),
+            prefix,
+        )
+        assert published == [(0, "正文", False)], (prefix, published)
