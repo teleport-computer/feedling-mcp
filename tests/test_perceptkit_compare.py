@@ -322,10 +322,12 @@ def test_the_unit_bridge_is_declared_per_pair_not_guessed():
     """体脂两边差 100 倍。换算写死在 UNIT_BRIDGE 里，
     所以「适配层换算对了」和「适配层忘了换算」不会都读成一致。"""
     live = {"body_fat_pct": cell(18.4)}
-    kit = {"health_body": [projection("health_body", {"body_fat_ratio": 0.184})]}
-    v = verdicts(compare.compare(live, kit, signals=["health_body"]))
-    assert v[("health_body", "body_fat_ratio")] == "agree"
+    kit = {"health_body_fat": [projection("health_body_fat",
+                                          {"body_fat_ratio": 0.184})]}
+    v = verdicts(compare.compare(live, kit, signals=["health_body_fat"]))
+    assert v[("health_body_fat", "body_fat_ratio")] == "agree"
 
-    kit = {"health_body": [projection("health_body", {"body_fat_ratio": 18.4})]}
-    v = verdicts(compare.compare(live, kit, signals=["health_body"]))
-    assert v[("health_body", "body_fat_ratio")] == "differ"
+    kit = {"health_body_fat": [projection("health_body_fat",
+                                          {"body_fat_ratio": 18.4})]}
+    v = verdicts(compare.compare(live, kit, signals=["health_body_fat"]))
+    assert v[("health_body_fat", "body_fat_ratio")] == "differ"

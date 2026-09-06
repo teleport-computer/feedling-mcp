@@ -19,7 +19,7 @@ TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
-EXPECTED_TEE_HEAD = "0041_perceptkit_mirror_source"
+EXPECTED_TEE_HEAD = "0043_divergence_skew"
 
 # The two inventory files that name the shared test CVMs.  Every job that
 # reaches one of those machines has to learn its target from here.
@@ -506,6 +506,14 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     assert runtime_head == EXPECTED_TEE_HEAD
     assert (
         script.get_revision(EXPECTED_TEE_HEAD).down_revision
+        == "0042_perceptkit_retraction"
+    )
+    assert (
+        script.get_revision("0042_perceptkit_retraction").down_revision
+        == "0041_perceptkit_mirror_source"
+    )
+    assert (
+        script.get_revision("0041_perceptkit_mirror_source").down_revision
         == "0040_perceptkit_objects"
     )
     assert (

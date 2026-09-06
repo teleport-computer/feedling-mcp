@@ -152,10 +152,15 @@ def daily_rollups(user_id: str, old_signal: str, days: int) -> list[dict] | None
         return None
     from .backfill import _FIELD_RENAMES, _FIELD_SCALES, _SPLITS
 
+    from .ios_report import SPLIT_OFF
+    # 一条老信号的历史现在散在好几个 kit 信号里（0.4.0 的拆分），
+    # 要全读回来才能拼回老路那一份形状 —— 少读一个，那个指标的趋势
+    # 就静默变成空的，而调用方看到的是"这项没有历史"。
     wanted = [kit_signal]
     split = _SPLITS.get(old_signal)
     if split:
         wanted.append(split[0])
+    wanted += sorted({t for t, _f in SPLIT_OFF.get(old_signal, {}).values()})
 
     import db
     limit = max(1, min(int(days), 400)) * len(wanted)
@@ -177,8 +182,15 @@ def daily_rollups(user_id: str, old_signal: str, days: int) -> list[dict] | None
         #   `'2026-08-31'` 一边给 `date(2026, 8, 31)`，比较、当字典键、
         #   序列化全会静默走岔。
         docs = by_date[day]
-        main = docs.get(kit_signal)
-        if main is None:
+        # 主信号那份可能整天都没有（比如那天只测了体脂没称体重）——
+        # 但拆出去的兄弟信号有。以前 `main is None: continue` 会把
+        # 那一天整个丢掉。合并之后只要有任何一个信号有数据就算这天有。
+        main = dict(docs.get(kit_signal) or {})
+        for extra_signal in wanted[1:]:
+            extra = docs.get(extra_signal)
+            if isinstance(extra, dict):
+                main.update(extra)
+        if not main:
             continue
         if old_signal == "health_sleep":
             translated = _sleep_back(main)

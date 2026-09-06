@@ -42,12 +42,19 @@ KEY_TO_SIGNAL: dict[str, str] = {
     "audio_route": "audio_route",
     "weather": "weather",
     "playback": "music_playback",
-    "health_vitals": "health_vitals",
+    # 🔴 左边是 **iOS 送来的 key**，右边是 manifest 的信号名。左边不能动 ——
+    # 那是设备上的契约，改它等于让所有已安装的 app 送来的东西认不出来。
+    #
+    # perceptkit 0.4.0 把三个多指标信号拆成了十二个，所以 iOS 的一个快照
+    # 现在要变成好几条观测：主信号在这里认领，其余走 SPLIT_OFF。
+    # 为什么拆见 kit 那边 —— 一句话是：逐条样本一次只带一个指标，
+    # 挤在一个信号里会把兄弟字段从当前值里静默抹掉。
+    "health_vitals": "health_resting_hr",
     "health_sleep": "health_sleep",
     "health_workout": "health_workout",
     "health_activity": "health_activity",
-    "health_body": "health_body",
-    "health_metabolic": "health_metabolic",
+    "health_body": "health_weight",
+    "health_metabolic": "health_glucose",
     "health_cycle": "health_cycle",
     "health_mood": "health_mood",
 }
@@ -83,9 +90,9 @@ FIELD_ALIASES: dict[str, dict[str, str]] = {
     # data: iOS was sending each of these and the manifest was dropping it as
     # undeclared, so blood pressure, body fat and workout duration reached the
     # live path and never reached the kit at all.
-    "health_body": {"body_fat_pct": "body_fat_ratio"},
-    "health_metabolic": {"blood_pressure_systolic": "blood_pressure_systolic_mmhg",
-                         "blood_pressure_diastolic": "blood_pressure_diastolic_mmhg"},
+    "health_weight": {"body_fat_pct": "body_fat_ratio"},
+    "health_glucose": {"blood_pressure_systolic": "blood_pressure_systolic_mmhg",
+                       "blood_pressure_diastolic": "blood_pressure_diastolic_mmhg"},
     "health_workout": {"duration_min": "duration_minutes"},
     "audio_route": {"device_name": "device_label"},
     "music_playback": {"album_title": "album"},
@@ -101,7 +108,7 @@ FIELD_ALIASES: dict[str, dict[str, str]] = {
 #: 100x difference between them is exactly what a hand-maintained alias table
 #: gets wrong.
 FIELD_TRANSFORMS: dict[str, dict[str, Any]] = {
-    "health_body": {"body_fat_ratio": lambda v: v / 100.0},
+    "health_weight": {"body_fat_ratio": lambda v: v / 100.0},
 }
 
 #: Fields iOS sends that the manifest does not declare. Dropped explicitly
@@ -116,9 +123,12 @@ DROPPED_FIELDS: dict[str, set[str]] = {
     "broadcast": {"state"},
     # Local time is derivable from time_zone_id plus occurred_at.
     "time_context": {"local_time"},
-    # Split off into its own `steps` signal below; leaving it here too would
-    # store the same number twice under two aggregation rules.
-    "health_vitals": {"step_count"},
+    # ⚠️ step_count 曾经列在这里（键 "health_vitals"）。**不要加回来**：
+    # 这张表是按**信号名**查的，而 0.4.0 拆分之后体征的主信号叫
+    # health_resting_hr —— 这一条早就查不到、成了死条目。真正防重复的是
+    # 下面 SPLIT_OFF 的 `moved` 过滤。
+    # 把它按新名字"修好"反而会出事：拆分读的是 _rename 之后的结果，
+    # step_count 在那一步被丢掉的话，`steps` 信号就再也收不到数据。
     # The manifest counts workouts by aggregating the records themselves, so
     # a device-supplied daily count would be a second, disagreeing answer to
     # the same question.
@@ -183,7 +193,33 @@ VALUE_MAPS: dict[str, dict[str, dict[str, str]]] = {
 #: cost one line in the divergence report to notice and would have cost
 #: nothing to keep missing.
 SPLIT_OFF: dict[str, dict[str, tuple[str, str]]] = {
-    "health_vitals": {"step_count": ("steps", "step_count")},
+    "health_vitals": {
+        "step_count": ("steps", "step_count"),
+        # 0.4.0 的拆分。静息心率留在主信号（见 KEY_TO_SIGNAL），
+        # 其余各自成信号。
+        "current_heart_rate": ("health_current_hr", "current_heart_rate"),
+        "hrv_sdnn_ms": ("health_hrv", "hrv_sdnn_ms"),
+        "respiratory_rate": ("health_respiratory", "respiratory_rate"),
+        "oxygen_saturation_pct": ("health_oxygen", "oxygen_saturation_pct"),
+        "vo2_max": ("health_vo2max", "vo2_max"),
+    },
+    # ⚠️ 这里写的是**归一之后**的字段名（manifest 侧），不是 iOS 的原名。
+    # iOS 送 body_fat_pct，别名表把它归一成 body_fat_ratio —— 拆分在归一
+    # 之后做，否则这一条永远匹配不上，体脂静默丢失（写这段时真踩到）。
+    "health_body": {
+        "bmi": ("health_bmi", "bmi"),
+        "body_fat_ratio": ("health_body_fat", "body_fat_ratio"),
+        "height_cm": ("health_height", "height_cm"),
+    },
+    "health_metabolic": {
+        # 收缩压和舒张压一起走 —— 来源侧它们是一次读数，拆成两条就丢了
+        # 「这是同一次量的」。两个字段都指向同一个目标信号，
+        # 下面的拆分循环会把它们合成一条观测。
+        "blood_pressure_systolic_mmhg": ("health_blood_pressure",
+                                         "blood_pressure_systolic_mmhg"),
+        "blood_pressure_diastolic_mmhg": ("health_blood_pressure",
+                                          "blood_pressure_diastolic_mmhg"),
+    },
 }
 
 
@@ -325,6 +361,30 @@ def _rename(signal: str, value: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+#: iOS 送的样本身份字段。**现在 iOS 一个都不送** —— 这条通路是先接上，
+#: 等 anchored query 那批上线就能直接用（后端先兼容、producer 不启用）。
+#:
+#: 没有它，健康信号的身份会退回确定性摘要（subject+source+signal+occurred_at），
+#: 于是"删掉那条体重"在本地没有任何指向，修订也认不出是同一件事。
+_IDENTITY_KEYS = ("source_event_id", "source_revision")
+
+
+def _sample_identity(data: Any) -> dict[str, Any]:
+    """把 iOS 送的样本身份提升成 Observation 的顶层字段。
+
+    留在 value 里没用：normalize 只读顶层的 ``source_event_id``，
+    value 里的会被当成一个未声明字段丢掉 —— 安静地。
+    """
+    if not isinstance(data, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _IDENTITY_KEYS:
+        raw = data.get(key)
+        if raw is not None and str(raw).strip():
+            out[key] = raw
+    return out
+
+
 def report_id_for(payload: Mapping[str, Any]) -> str:
     """Derived from the payload, with no clock and no randomness.
 
@@ -370,31 +430,67 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
         }
         if timezone_id:
             obs["timezone"] = timezone_id
+        obs.update(_sample_identity(data))
+        emit_main = True
         if availability == "observed" and isinstance(data, Mapping):
             value = _rename(signal, data)
             if signal == "music_playback":
                 value.update(_music_fields(data, reason=reason))
+            # 已经拆到别的信号名下的字段，主信号不再带 —— 否则主信号会带着
+            # 一堆不属于它的字段，manifest 校验会把它们当未声明字段丢掉
+            # （安静地），而更糟的是万一某个名字碰巧合法，就成了两条观测
+            # 都声称拥有同一个指标。
+            moved = set(SPLIT_OFF.get(key, {}))
+            value = {k2: v2 for k2, v2 in value.items() if k2 not in moved}
+            if moved and not value:
+                # 这一趟上报里主信号的字段**全部**被拆走了（只测了血压、
+                # 没测血糖）。照旧发一条 `observed` + 空 value，等于替设备
+                # 说了一句「我看了血糖，结果是空」—— 那不是设备说的话。
+                # 下游会把它当成一次真实测量：当前值被一条没有数值的记录
+                # 顶掉，日聚合多一次 count，而错误不会以报错的形式出现。
+                emit_main = False
             obs["value"] = value
-        observations.append(obs)
+        if emit_main:
+            observations.append(obs)
 
         # Fields that belong to a signal of their own. Emitted as separate
         # observations so each gets the aggregation its own signal declares.
-        for src, (target, field) in SPLIT_OFF.get(signal, {}).items():
-            raw = data.get(src) if isinstance(data, Mapping) else None
+        #
+        # Keyed by the **iOS key**, not the mapped signal: one iOS payload now
+        # fans out to several kit signals, so the mapped name is one of the
+        # outputs and cannot also be the lookup.
+        #
+        # Grouped by target before emitting: blood pressure sends systolic and
+        # diastolic to the same signal, and they have to arrive as one
+        # observation. Two observations each carrying half is not "the same
+        # reading twice" -- it is two half readings, and the second overwrites
+        # the first's current value with a record that is missing the other number.
+        # 先过一遍别名/单位换算，再按归一后的名字拆 —— 顺序反了的话，
+        # iOS 原名（body_fat_pct）匹配不上拆分表里的归一名，字段静默丢失。
+        normalized = _rename(signal, data) if isinstance(data, Mapping) else {}
+        grouped: dict[str, dict[str, Any]] = {}
+        for src, (target, field) in SPLIT_OFF.get(key, {}).items():
+            raw = normalized.get(src)
             if raw is None:
                 # Absence stays absence. Emitting `no_data` here would claim
                 # the device reported "no steps" every time a vitals reading
                 # arrives without one, which is a different sentence.
                 continue
+            grouped.setdefault(target, {})[field] = raw
+        for target, value in grouped.items():
             split_obs: dict[str, Any] = {
                 "signal": target,
                 "signal_schema_version": 1,
                 "occurred_at": occurred_at,
                 "availability": "observed",
-                "value": {field: raw},
+                "value": value,
             }
             if timezone_id:
                 split_obs["timezone"] = timezone_id
+            # 拆出来的也要带身份，否则它们退回确定性摘要 ——
+            # 撤回和修订就永远落不到这些信号头上。血压那组两个字段
+            # 共用同一个样本身份（来源侧它们本来就是一次读数）。
+            split_obs.update(_sample_identity(data))
             observations.append(split_obs)
 
     return {

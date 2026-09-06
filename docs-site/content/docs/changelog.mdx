@@ -20,6 +20,21 @@ change must not be interpreted as an API guarantee.
   now sends this flag, so a runtime restart no longer re-probes every resident
   with a real model call on the user's own key. Requests without the flag are
   unchanged.
+
+- **A relay's own `403` refusal is no longer reported as an invalid API key.**
+  When an upstream relay declines a request for its own reasons, it can answer
+  `403` with a generic OpenAI-shaped envelope
+  (`{"message":"Request failed. Please try again later.","type":"api_error"}`)
+  that carries no authentication semantics. Chat previously classified any
+  `403` as `auth_invalid`, so this transient relay condition told users their
+  key was invalid or expired and directed them to re-save a key that was never
+  the problem. That exact shape — the `403`, the generic `message` field, and
+  `"type":"api_error"`, in any order — now uses the existing
+  `upstream_unavailable` handling instead. A `403` that does carry
+  authentication semantics, such as an invalid or unauthorized key or
+  `provider_http_403`, still classifies as `auth_invalid`, and `401` is
+  unchanged.
+
 - **Chat now distinguishes relay tool-history failures from tool-schema
   incompatibility.** When a relay rejects the native tool-result transcript,
   Runtime V2 stops after that provider call instead of dropping tools and

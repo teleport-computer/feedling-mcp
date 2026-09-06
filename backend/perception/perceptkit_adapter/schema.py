@@ -200,6 +200,21 @@ CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
 -- and `last_attempted_at` a failed sync is indistinguishable from one that
 -- never ran, and "the calendar has been failing for three days" cannot be
 -- answered at all.
+-- Facts the source withdrew. Append-only: the observation stays so "why is
+-- there a gap on that day" remains answerable; this table is what keeps the
+-- withdrawn value out of the current projection and the day's aggregate.
+--
+-- `source` is in the key because two sources routinely reuse a
+-- source_event_id, and they are different facts.
+CREATE TABLE IF NOT EXISTS perceptkit_retraction (
+  subject_id      TEXT        NOT NULL,
+  signal          TEXT        NOT NULL,
+  source          TEXT        NOT NULL,
+  source_event_id TEXT        NOT NULL,
+  observed_at     TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (subject_id, signal, source, source_event_id)
+);
+
 CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
   subject_id              TEXT        NOT NULL,
   source                  TEXT        NOT NULL,
@@ -235,6 +250,17 @@ CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
   last_kit       TEXT,
   last_report_id TEXT,
   note           TEXT,
+  -- How far apart the two sides' readings were taken, seconds, for the most
+  -- recent occurrence; and the running max.
+  --
+  -- Without this a `differ` row is unreadable: two paths hold different
+  -- values either because one read the sensor later than the other, or
+  -- because one is wrong -- and the values alone cannot separate those. The
+  -- first is expected on anything that changes by the second; only the
+  -- second is worth acting on. 0.09% of prod comparisons came back `differ`
+  -- with no way to tell which, and that is what blocks retiring the live path.
+  last_skew_sec  DOUBLE PRECISION,
+  max_skew_sec   DOUBLE PRECISION,
   PRIMARY KEY (subject_id, signal, field, verdict)
 );
 """
@@ -247,7 +273,8 @@ TRUNCATE perceptkit_ingest_receipt, perceptkit_observation, perceptkit_current,
          perceptkit_daily_aggregate, perceptkit_dedupe_identity,
          perceptkit_rule_state, perceptkit_event_outbox, perceptkit_wake_receipt,
          perceptkit_calendar_mirror, perceptkit_reminder_mirror,
-         perceptkit_sync_state, perceptkit_shadow_divergence;
+         perceptkit_sync_state, perceptkit_shadow_divergence,
+         perceptkit_retraction;
 """
 
 TABLES = (
@@ -256,6 +283,7 @@ TABLES = (
     "perceptkit_rule_state", "perceptkit_event_outbox", "perceptkit_wake_receipt",
     "perceptkit_calendar_mirror", "perceptkit_reminder_mirror",
     "perceptkit_sync_state", "perceptkit_shadow_divergence",
+    "perceptkit_retraction",
 )
 
 __all__ = ["DDL", "TRUNCATE", "TABLES"]
