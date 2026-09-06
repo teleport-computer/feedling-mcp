@@ -1698,7 +1698,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
+        "description": "Unless the only_if_unverified short-circuit below applies, insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether that exact reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded. Optional request field only_if_unverified: when it is the JSON literal true and the server already holds a sticky live-loop verification for this user, no ping is inserted and no liveness measurement is taken; the response is passing=true, already_verified=true, loop_alive=null, response_time_sec=null and an empty ping_id. Any other value, or an unverified user, runs the ordinary ping. Intended for automated gate-opening callers such as the hosted runner supervisor, so a runtime restart does not re-probe every resident with a real model call."
       }
     },
     "/v1/chat/workspace/body": {

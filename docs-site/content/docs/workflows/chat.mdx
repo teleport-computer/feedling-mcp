@@ -777,12 +777,23 @@ continuous for 30 minutes before it can inject a repair turn; operators can
 change this persistence window with
 `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC`.
 
-`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row.
+`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row
+unless the `only_if_unverified` short-circuit described below applies.
 The resident's hidden ack must post `source: "verify_ping"` and set
 `reply_to_message_id` to that exact ping ID. An unrelated or stale agent reply
 does not satisfy the probe. The verify response distinguishes `loop_alive`
 (the exact ack arrived) from `passing` (the ack arrived and decrypt policy also
 allows verification); only `passing: true` records the sticky live-loop green.
+
+An automated caller whose only purpose is opening that gate can send
+`only_if_unverified: true`. When the server already holds a sticky live-loop
+verification for the user, it inserts no ping, takes no liveness measurement,
+and answers `passing: true, already_verified: true` with `loop_alive: null`,
+`response_time_sec: null`, and an empty `ping_id` — `passing` then reflects the
+persisted gate, not a fresh exact-ack observation. An unverified user, or any
+value other than the JSON literal `true`, runs the ordinary probe.
+The hosted runner supervisor sends this flag so a runtime restart does not
+re-probe every resident with a real model call on the user's own key.
 
 If a self-hosted resident consumer appears stale while it is still polling, the
 server may claimably inject a user-role maintenance message with
