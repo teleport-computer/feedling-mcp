@@ -1650,7 +1650,16 @@ def test_generate_image_openai_mainline_uses_hosted_image_tool(monkeypatch):
     assert result["media"][0]["data_base64"] == "aW1hZ2U="
 
 
-def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("deepseek", "deepseek-v4-flash"),
+        ("gemini", "gemini-2.5-flash"),
+    ),
+)
+def test_generate_image_without_name_marker_fails_before_provider_request(
+    monkeypatch, provider, model,
+):
     import asyncio
 
     class ExplodingAsyncClient:
@@ -1664,10 +1673,120 @@ def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
     with pytest.raises(pc.ProviderError, match="image_generation_model_unsupported"):
         asyncio.run(
             pc.generate_image_async(
-                pc.ProviderConfig("deepseek", "deepseek-v4-flash", "sk-test"),
+                pc.ProviderConfig(provider, model, "sk-test"),
                 "draw a moonlit lake",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("deepseek", "qwen-image-3.0"),
+        ("gemini", "qwen-image-3.0"),
+    ),
+)
+def test_ordinary_chat_keeps_provider_family_image_gate(
+    monkeypatch, provider, model,
+):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError):
+        asyncio.run(
+            pc.chat_completion_async(
+                pc.ProviderConfig(provider, model, "sk-test"),
+                [{"role": "user", "content": "hello"}],
+                allow_image_output=True,
+            )
+        )
+
+    assert len(calls) == 1
+    if provider == "gemini":
+        assert "responseModalities" not in calls[0]["json"]["generationConfig"]
+    else:
+        assert "modalities" not in calls[0]["json"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "url_marker"),
+    (
+        ("deepseek", "qwen-image-3.0", "/chat/completions"),
+        ("gemini", "qwen-image-3.0", ":generateContent"),
+    ),
+)
+def test_named_image_models_reach_http_across_provider_families(
+    monkeypatch, provider, model, url_marker,
+):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(provider, model, "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+    assert len(calls) == 1
+    assert url_marker in calls[0]["url"]
+    if provider == "gemini":
+        assert calls[0]["json"]["generationConfig"]["responseModalities"] == [
+            "TEXT",
+            "IMAGE",
+        ]
+    else:
+        assert calls[0]["json"]["modalities"] == ["text", "image"]
+    assert raised.value.status_code == 401
+
+
+def test_newly_admitted_named_model_still_requires_nonempty_media(monkeypatch):
+    import asyncio
+
+    calls: list[str] = []
+
+    class TextOnlyAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append(url)
+            return FakeResponse(
+                200,
+                {"choices": [{"message": {"content": "I cannot draw that."}}]},
+            )
+
+    monkeypatch.setattr(pc, "_shared_async_client", TextOnlyAsyncClient())
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig("deepseek", "qwen-image-3.0", "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+    assert len(calls) == 1
 
 
 def test_blocking_image_generation_isolates_each_event_loop(monkeypatch):

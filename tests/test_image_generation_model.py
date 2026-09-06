@@ -872,7 +872,7 @@ def test_local_image_capability_rejection_records_provider_not_called(
     monkeypatch, capsys,
 ):
     traces, logs = _capture_attempt_observations(monkeypatch)
-    route = _route(provider="deepseek", model="qwen-image-3.0")
+    route = _route(provider="deepseek", model="deepseek-v4-flash")
     monkeypatch.setattr(
         setup_core.core_enclave,
         "_decrypt_envelope_via_enclave",
@@ -923,6 +923,70 @@ def test_local_image_capability_rejection_records_provider_not_called(
     assert all(record[3]["provider_called"] is False for record in logs)
     assert all(record[3]["status_code"] is None for record in logs)
     assert "provider_called=false" in capsys.readouterr().err
+
+
+def test_new_provider_family_probe_records_http_status(monkeypatch, capsys):
+    calls: list[str] = []
+    traces, logs = _capture_attempt_observations(monkeypatch)
+    route = _route(provider="deepseek", model="qwen-image-3.0")
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+
+    class RejectedAsyncClient:
+        is_closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            self.is_closed = True
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append(url)
+
+            class Response:
+                status_code = 401
+                text = "test rejection"
+
+                @staticmethod
+                def json():
+                    return {"error": {"message": "test rejection"}}
+
+            return Response()
+
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "_build_shared_async_client",
+        lambda **_kwargs: RejectedAsyncClient(),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_image_generation_test",
+        lambda *_args, **_kwargs: True,
+    )
+
+    body, status = setup_core._test_route_image_generation_or_error(
+        _store(),
+        route,
+        "caller-key",
+    )
+
+    assert status == 400
+    assert body == {
+        "error": "image_generation_auth_invalid",
+        "retryable": True,
+    }
+    assert len(calls) == 1
+    assert calls[0].endswith("/chat/completions")
+    assert len(traces) == len(logs) == 1
+    payload = logs[0][3]
+    assert payload["provider_called"] is True
+    assert payload["status_code"] == 401
+    assert payload["error_category"] == "image_generation_auth_invalid"
+    assert "provider_called=true" in capsys.readouterr().err
 
 
 def test_route_probe_observation_sink_failures_keep_content_free_stderr(
