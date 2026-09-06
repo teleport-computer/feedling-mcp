@@ -154,4 +154,21 @@ memgarden==0.16.0
 # 配套迁移是 0107（RDS）/ 0041（tee）—— 少了它，一次 source="ios" 的全量
 # 同步会把概念上属于别的来源的日程一起删掉，不可逆。装着 0.2.7 跑本分支
 # 会在 import 时就炸（缺 StoragePort.delete_source_items）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.3.0/perceptkit-0.3.0-py3-none-any.whl
+#
+# 0.3.0 → 0.4.0（2026-09-06，外部复核第二轮 + 产品拍板的信号拆分）。
+# **带破坏性变更**，而且这一版的 pin 和代码耦合得比前几次都紧：
+#
+#   健康信号拆成单指标  health_body / health_vitals / health_metabolic
+#                       在**存储侧**拆成十二个（23 信号 → 32）。
+#                       ⚠️ **上报契约没拆** —— 客户端仍然按 HealthKit 的授权
+#                       分组一次报一整包，catalog.SIGNALS 和四张声明表
+#                       (history.SHAPE / attribution / trend_models /
+#                       retention) 仍然按上报键建索引。这两套词表混起来
+#                       在 0.4.0 的开发过程中翻过三次车，每次都不报错。
+#   来源撤回            用户在健康 app 里删掉的记录，这边跟着不作数。
+#                       配套迁移 0108（RDS）/ 0042（tee）。
+#
+# 装着 0.3.0 跑本分支会在 import 时就炸（缺 contracts.Retraction、
+# StoragePort.record_retraction / list_retractions、
+# PerceptionKit.apply_retractions）。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.4.0/perceptkit-0.4.0-py3-none-any.whl
