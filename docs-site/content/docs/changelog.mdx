@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Image-generation setup errors now preserve actionable provider causes.**
+  HTTP 401/403 credential rejection, 402 quota exhaustion, 404 missing model or
+  endpoint, and 400/415/422 incompatibility now return their existing distinct
+  public error codes instead of collapsing into one model-incompatible result.
+  Chinese and English guidance now tells users which setting to correct.
+
 - **`POST /v1/chat/verify_loop` accepts `only_if_unverified`.** When the JSON
   literal `true` is sent and the server already holds a sticky live-loop
   verification for the user, the endpoint inserts no hidden ping, takes no

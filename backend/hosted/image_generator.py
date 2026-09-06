@@ -168,23 +168,53 @@ def observe_attempt(
         )
 
 
-def _classify_error(exc: BaseException) -> str:
-    classified = provider_client.classify_provider_error(exc)
+def classify_image_generation_error(
+    exc: BaseException,
+    *,
+    dedicated: bool = True,
+    fallback_code: str = "image_generation_failed",
+) -> str:
+    """Map provider failures to stable image-generation codes.
+
+    The generic provider classifier intentionally folds every non-retryable
+    4xx into ``provider_config``. Image-generation setup needs the original
+    status to tell a bad credential, exhausted account, missing endpoint/model,
+    and an incompatible image wire apart.
+    """
     raw = str(exc).strip().lower()
-    incompatible = classified in {"provider_config", "provider_incompatible"} or raw in {
+    incompatible_code = (
+        "image_generation_model_incompatible"
+        if dedicated
+        else "image_generation_model_required"
+    )
+    if raw in {
         "image_generation_model_unsupported",
         "image_generation_invalid_output",
-    }
-    if incompatible:
-        return "image_generation_model_incompatible"
+    }:
+        return incompatible_code
+
+    status_code = _safe_status_code(getattr(exc, "status_code", None))
+    if status_code in {401, 403}:
+        return "image_generation_auth_invalid"
+    if status_code == 402:
+        return "image_generation_quota_insufficient"
+    if status_code == 404:
+        return "image_generation_model_not_found"
+    if status_code in {400, 415, 422}:
+        return incompatible_code
+    classified = str(
+        getattr(exc, "feedling_error_class", "")
+        or provider_client.classify_provider_error(exc)
+        or ""
+    )
     return {
-        "auth_invalid": "image_generation_auth_invalid",
-        "quota_insufficient": "image_generation_quota_insufficient",
-        "model_not_found": "image_generation_model_not_found",
-        "rate_limited": "image_generation_rate_limited",
-        "upstream_unavailable": "image_generation_unavailable",
-        "turn_timeout": "image_generation_unavailable",
-    }.get(classified, "image_generation_failed")
+        "provider_config": incompatible_code,
+        "provider_incompatible": incompatible_code,
+    }.get(classified, fallback_code)
+
+
+def _classify_error(exc: BaseException) -> str:
+    return classify_image_generation_error(exc)
 
 
 def _status_for_error(error_code: str) -> int:

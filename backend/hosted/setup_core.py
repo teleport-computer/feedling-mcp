@@ -915,25 +915,11 @@ def _image_generation_config_payload(store) -> dict:
 
 
 def _image_generation_error_code(exc: BaseException, *, dedicated: bool) -> str:
-    classified = provider_client.classify_provider_error(exc)
-    raw = str(exc).strip().lower()
-    if classified in {"provider_config", "provider_incompatible"} or raw in {
-        "image_generation_model_unsupported",
-        "image_generation_invalid_output",
-    }:
-        return (
-            "image_generation_model_incompatible"
-            if dedicated
-            else "image_generation_model_required"
-        )
-    return {
-        "auth_invalid": "image_generation_auth_invalid",
-        "quota_insufficient": "image_generation_quota_insufficient",
-        "model_not_found": "image_generation_model_not_found",
-        "rate_limited": "image_generation_rate_limited",
-        "upstream_unavailable": "image_generation_unavailable",
-        "turn_timeout": "image_generation_unavailable",
-    }.get(classified, "image_generation_test_failed")
+    return image_generator.classify_image_generation_error(
+        exc,
+        dedicated=dedicated,
+        fallback_code="image_generation_test_failed",
+    )
 
 
 def _test_route_image_generation_or_error(
