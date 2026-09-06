@@ -218,14 +218,40 @@ def convert(old_signal: str, doc: Mapping[str, Any]) -> list[tuple[str, dict[str
         converted = _rename_fields(doc, _FIELD_RENAMES.get(old_signal, {}),
                                    scale=_FIELD_SCALES.get(old_signal, {}))
     if converted:
-        out.append((kit_signal, converted))
+        # 已经拆到别的信号名下的字段，主信号不再带 —— 否则同一个指标
+        # 会出现在两个信号的历史里，而趋势读的是哪一个取决于谁先被查到。
+        # （adapter 那边踩过同一个坑。）
+        from .ios_report import SPLIT_OFF
+        moved = {f for _t, f in SPLIT_OFF.get(old_signal, {}).values()}
+        kept = {k: v for k, v in converted.items() if k not in moved}
+        if kept:
+            out.append((kit_signal, kept))
     split = _SPLITS.get(old_signal)
     if split is not None:
         extra_signal, extra_fn = split
         extra = extra_fn(doc)
         if extra:
             out.append((extra_signal, extra))
+    # perceptkit 0.4.0 把三个多指标信号拆成了十二个，所以一条老记录现在
+    # 要落到好几个 kit 信号上。复用 adapter 那张拆分表，**不另建一份** ——
+    # 两份会漂，而漂了之后表现是"某个指标的历史静默丢失"。
+    out.extend(_split_by_metric(old_signal, converted or doc))
     return out
+
+
+def _split_by_metric(old_signal: str,
+                     doc: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """按 adapter 的拆分表，把已经归一过的文档分到各自的 kit 信号上。
+
+    ``converted`` 是归一之后的（字段名已经是 manifest 侧的），所以这里
+    直接按目标字段名取 —— 和 adapter 里"先归一再拆"是同一个顺序。
+    """
+    from .ios_report import SPLIT_OFF
+    grouped: dict[str, dict[str, Any]] = {}
+    for _src, (target, field) in SPLIT_OFF.get(old_signal, {}).items():
+        if field in doc:
+            grouped.setdefault(target, {})[field] = doc[field]
+    return sorted(grouped.items())
 
 
 # ---------------------------------------------------------------------------
