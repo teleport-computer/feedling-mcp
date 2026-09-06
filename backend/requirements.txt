@@ -127,7 +127,7 @@ Pillow>=11,<13
 # self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
-memgarden==0.16.0
+memgarden==0.18.0
 
 # 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
