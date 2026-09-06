@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Image-generation setup now verifies image-named models across provider
+  families with a real request.** A model id containing an existing image
+  marker is no longer rejected solely because its provider is outside the
+  former local allowlist or, for Gemini, because the id lacks a `gemini-`
+  prefix. The setup check can therefore incur one provider request; it succeeds
+  only when that request returns non-empty image media. Model ids without an
+  image marker are still rejected locally without contacting the provider.
+  Ordinary Chat requests keep their existing provider-specific modality gate.
+
 - **Image-generation setup errors now preserve actionable provider causes.**
   HTTP 401/403 credential rejection, 402 quota exhaustion, 404 missing model or
   endpoint, and 400/415/422 incompatibility now return their existing distinct
