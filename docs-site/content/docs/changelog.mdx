@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **`POST /v1/chat/verify_loop` accepts `only_if_unverified`.** When the JSON
+  literal `true` is sent and the server already holds a sticky live-loop
+  verification for the user, the endpoint inserts no hidden ping, takes no
+  liveness measurement, and answers `passing: true` with `already_verified:
+  true` (`loop_alive` and `response_time_sec` are `null`). The hosted runner supervisor
+  now sends this flag, so a runtime restart no longer re-probes every resident
+  with a real model call on the user's own key. Requests without the flag are
+  unchanged.
 - **Chat now distinguishes relay tool-history failures from tool-schema
   incompatibility.** When a relay rejects the native tool-result transcript,
   Runtime V2 stops after that provider call instead of dropping tools and

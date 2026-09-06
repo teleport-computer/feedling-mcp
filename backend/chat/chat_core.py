@@ -1491,6 +1491,34 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         # else (dual + resident hosted account): fall through to the synthetic
         # ping protocol below, exactly like an explicitly independent account.
 
+    # Opt-in short-circuit for callers whose only purpose is opening the
+    # bootstrap gate (the runner supervisor's autoverify). The resident probe
+    # below is a REAL model call on the user's own key: on 2026-09-04 and
+    # 2026-09-06 every deploy restarted the runner, its in-memory autoverify
+    # state was lost, and all 226 hosted residents were re-probed within 15
+    # minutes — 140 of them (dormant users with dead keys) failed, burning
+    # their credits and showing up as a failure spike. A user the server
+    # already knows to be verified gains nothing from another ping. Default
+    # False keeps the iOS manual check and the bootstrap skill byte-identical.
+    # Only the JSON literal ``true`` opts in. ``"false"`` / ``1`` / ``"yes"`` are
+    # caller mistakes, and a mistake here means "skip the real probe" — so they
+    # must fall through to the ordinary ping, never into the short-circuit.
+    if payload.get("only_if_unverified") is True and (
+        boot_gates._chat_loop_verified_by_server(store)
+    ):
+        # Not a liveness measurement: no ping, no reply, no timing. loop_alive
+        # and response_time_sec are null so a caller cannot mistake this for a
+        # fresh exact-ack observation; passing reflects the persisted gate.
+        return {
+            "loop_alive": None,
+            "response_time_sec": None,
+            "ping_id": "",
+            "timeout_sec": timeout_sec,
+            "suggestions": [],
+            "passing": True,
+            "already_verified": True,
+        }, 200
+
     # append_chat acquires chat_lock internally — don't hold it here or we'd
     # deadlock on the non-reentrant lock.
     ping_msg = store.append_chat("user", "verify_ping", synthetic_env)
