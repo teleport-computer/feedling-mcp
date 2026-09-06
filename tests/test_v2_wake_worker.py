@@ -3684,6 +3684,98 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     assert schedule["payment_cooldown_until"] is not None
 
 
+def test_forced_wake_choice_schema_rejection_fails_after_one_400(monkeypatch):
+    """A minimal forced choice has no smaller schema fallback to retry.
+
+    Mirrors the observed DeepSeek thinking-mode sequence: the broad wake call
+    succeeds with reasoning-only output stopped at the token limit, then the
+    forced reply/stay_silent request is rejected because that mode does not
+    support required tool choice. The outer tool loop must not spend the rest
+    of its 15-call production budget repeating that identical 400.
+    """
+    uid = "u_wake_forced_choice_schema_rejected"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    config = provider_client.ProviderConfig(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        api_key="synthetic-test-key",
+        base_url="https://api.deepseek.com",
+    )
+    calls = []
+    rejected_calls = []
+
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
+        call = {"tools": tools, **kwargs}
+        calls.append(call)
+        if len(calls) == 1:
+            return {
+                "reply": "",
+                "reasoning": "synthetic reasoning-only output",
+                "tool_calls": [],
+                "stop_reason": "length",
+                "usage": {"prompt_tokens": 30, "completion_tokens": 700},
+            }
+        rejected_calls.append(call)
+        raise provider_client.ProviderError(
+            "Thinking mode does not support this tool_choice",
+            status_code=400,
+        )
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    cooldown_calls = []
+    original_upsert = jobs_store.upsert_wake_schedule
+
+    def _spy_upsert(user_id_, **kwargs):
+        cooldown_calls.append((user_id_, kwargs))
+        return original_upsert(user_id_, **kwargs)
+
+    monkeypatch.setattr(jobs_store, "upsert_wake_schedule", _spy_upsert)
+
+    assert worker._TURN_MAX_LLM_CALLS == 15
+    before = time.time()
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        _wake_deps(tail=[{
+            "id": "m1", "ts": 1.0, "role": "user", "content": "hi",
+        }]),
+        config,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+    after = time.time()
+
+    assert status == "failed"
+    assert len(calls) == 2
+    assert len(rejected_calls) == 1
+    assert "tool_choice" not in calls[0]
+    assert calls[1]["tool_choice"] == "required"
+    assert {spec.name for spec in calls[1]["tools"]} == {
+        "reply",
+        cap_tool_schema.STAY_SILENT_TOOL,
+    }
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:provider_incompatible",
+    )
+    assert len(cooldown_calls) == 1
+    called_uid, cooldown_kwargs = cooldown_calls[0]
+    assert called_uid == uid
+    cooldown_at = cooldown_kwargs["payment_cooldown_until"]
+    assert (
+        before + worker._WAKE_COOLDOWN_SEC - 5
+        <= cooldown_at
+        <= after + worker._WAKE_COOLDOWN_SEC + 5
+    )
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule is not None
+    assert schedule["payment_cooldown_until"] is not None
+
+
 def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
     uid = "u_wake_provider_rollback"
     conftest.seed_user(uid)
