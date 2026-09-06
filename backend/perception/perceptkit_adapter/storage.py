@@ -780,19 +780,22 @@ class PostgresStorage:
         and no record of where it stopped."""
         counts: dict[str, int] = {}
         with self.transaction():
-            for table in _schema.TABLES:
-                if table == "perceptkit_wake_receipt":
-                    continue                    # keyed by event_id; below
-                with self.conn.cursor() as cur:
-                    cur.execute(f"DELETE FROM {table} WHERE subject_id = %s",
-                                (subject_id,))
-                    counts[table] = cur.rowcount
+            # A wake receipt has no subject_id of its own. Resolve ownership
+            # through the outbox while that row still exists; deleting the
+            # outbox first would strand the receipt as an unowned orphan.
             with self.conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM perceptkit_wake_receipt WHERE event_id IN "
                     "(SELECT event_id FROM perceptkit_event_outbox "
                     " WHERE subject_id = %s)", (subject_id,))
                 counts["perceptkit_wake_receipt"] = cur.rowcount
+            for table in _schema.TABLES:
+                if table == "perceptkit_wake_receipt":
+                    continue                    # keyed by event_id; above
+                with self.conn.cursor() as cur:
+                    cur.execute(f"DELETE FROM {table} WHERE subject_id = %s",
+                                (subject_id,))
+                    counts[table] = cur.rowcount
         return counts
 
 

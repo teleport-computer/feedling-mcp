@@ -18621,8 +18621,14 @@ def delete_user_data(user_id: str) -> None:
         "model_api_credentials",
     )
     try:
+        from perception.perceptkit_adapter.storage import PostgresStorage
+
         with get_pool().connection() as conn:
             with conn.transaction():
+                # PerceptKit tables intentionally have no users FK. Keep their
+                # subject-scoped purge in this same belt transaction so both
+                # user and admin reset entrypoints cover them atomically.
+                PostgresStorage(conn).purge_subject(subject_id=user_id)
                 for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
                 # lane_daily_rollup is deliberately NOT in the delete list:
