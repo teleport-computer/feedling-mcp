@@ -540,6 +540,9 @@ _PERCEPTKIT_DECRYPTED_ENTRIES = {
     "location_signal": "observe_location",
     "calendar_next_event": "mirror_calendar",
     "reminders": "mirror_reminders",
+    # 来源撤回：用户在健康 app 里删掉的记录。它**不是**一条观测 ——
+    # 走的是 kit 的撤回通道，不是 ingest。
+    "health_deleted": "apply_deletions",
 }
 
 

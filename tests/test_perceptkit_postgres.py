@@ -934,3 +934,29 @@ def test_a_deletion_never_takes_out_another_sources_same_id(clean):
                                source_event_ids=["same-id"])
     assert [h.source for h in hits] == ["ios"], \
         f"撤回记到了别的来源头上：{[(h.source, h.source_event_id) for h in hits]}"
+
+
+def test_the_deletion_key_is_encrypted_and_routed_but_not_expected_in_every_report():
+    """三张表各管一件事，少登记一张就是一种不同的静默失败。
+
+        加密名单没登记   删除的样本 id 明文上路 —— 被删的是哪条健康记录，
+                        本身就是健康信息
+        路由表没登记     iOS 发了、后端收下、什么都不做（最难查的那种）
+        "完整报告应有"   加进去的话每份正常报告都会被判成缺了一个键
+                        （删除只在真有删除时才发）
+    """
+    from perception.ios_contract_v2 import (
+        ENCRYPTED_SIGNAL_KEYS_V2, EXPECTED_REPORT_KEYS_V2)
+    from perception.service import _PERCEPTKIT_DECRYPTED_ENTRIES
+    assert "health_deleted" in ENCRYPTED_SIGNAL_KEYS_V2
+    assert _PERCEPTKIT_DECRYPTED_ENTRIES.get("health_deleted") == "apply_deletions"
+    assert "health_deleted" not in EXPECTED_REPORT_KEYS_V2
+
+
+def test_every_routed_shadow_entry_actually_exists():
+    """路由表写了个不存在的函数名，表现是"收下了、什么都没发生" ——
+    调用被 _guarded 吞掉，日志里只有一行 warning。影子当年就这么静默停过。"""
+    from perception.perceptkit_adapter import shadow
+    from perception.service import _PERCEPTKIT_DECRYPTED_ENTRIES
+    for key, entry in _PERCEPTKIT_DECRYPTED_ENTRIES.items():
+        assert callable(getattr(shadow, entry, None)), f"{key} -> {entry} 不存在"
