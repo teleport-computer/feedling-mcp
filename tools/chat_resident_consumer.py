@@ -2521,7 +2521,16 @@ def _unmark_seen(keys) -> None:
 # from the big turn functions. ``selected`` = cards the enclave picked this poll
 # (they do NOT reach the prompt until T512 wires injection); ``quoted`` = cards
 # the user explicitly referenced (a separate, already-wired path).
-_RECALL_TURN_STATE: dict[str, Any] = {"selected": None, "candidate_pool": None, "quoted": 0}
+_RECALL_TURN_STATE: dict[str, Any] = {
+    "selected": None, "candidate_pool": None, "quoted": 0,
+    # T512: what was rendered for this turn and what actually reached the driver.
+    "injected": 0, "injected_ids": [], "injected_chars": 0,
+    "rendered_header": "", "rendered_lines": {},
+    "arrived_ids": [], "missing_ids": [], "arrival_channel": "", "driver_request": "",
+}
+AUTO_MEMORY_TURN_PAGE = 4  # enclave selects against this many trailing messages (T512 query widening)
+AUTO_MEMORY_BUDGET_CHARS = 2500  # ≈1-1.5k tokens; whole cards only, never a sliced card
+AUTO_MEMORY_SUMMARY_CHARS = 120
 _RECALL_LEDGER_KEYS = ("index_calls", "search_calls", "empty_searches", "fetch_cards")
 _turn_ledger_path: str | None = None
 
@@ -2530,8 +2539,9 @@ def _emit_injection_trace(log: dict | None) -> None:
     """把 enclave 带回来的**选卡**记录落成一条 debug trace。
 
     ⚠️ 这条 trace 以前叫 ``memory.inject``「注入 N 张」——但 consumer 从来没把这些卡
-    送进 prompt（T510 查实:消费方在 24161351 随死簇删除后无人接回）。事件名和措辞
-    改为「已选、未注入」,detail 显式带 ``injected_to_prompt: 0``,直到 T512 接线。
+    送进 prompt（T510 查实）。它只记录**选卡**;到达 prompt 的证据是 T512 加的
+    ``context.auto_memory.arrived``(在最终 driver payload 上核)和该轮的
+    ``memory.recall.completed``。
     记录本身已经是内容无关的(见 memgarden/observability.py);这里只转发不加工。
     失败一律吞掉:可观测性绝不能拖垮聊天。
     """
@@ -2542,18 +2552,257 @@ def _emit_injection_trace(log: dict | None) -> None:
         selected = counts.get("injected", 0)
         pool = counts.get("candidate_pool", 0)
         mode = log.get("mode", "?")
-        _RECALL_TURN_STATE["selected"] = int(selected or 0)
-        _RECALL_TURN_STATE["candidate_pool"] = int(pool or 0)
         _emit_debug_trace(
             "memory", "memory.select.traced",
             status="ok" if mode != "failed" else "failed",
-            summary=f"已选 {selected} 张（{mode}，候选 {pool}）· 未注入",
-            explain="enclave 每轮自动挑卡的结果。当前这些卡不进 prompt（T512 接线前）；id 与计数落库，卡片正文不落库。",
-            detail={**log, "injected_to_prompt": 0},
+            summary=f"已选 {selected} 张（{mode}，候选 {pool}）",
+            explain="enclave 对这页历史最新一条用户消息挑出的卡。是否进入 prompt 以该轮的 memory.context.applied / memory.recall.completed 为准；id 与计数落库，卡片正文不落库。",
+            detail={**log, "arrival_evidence": "memory.context.applied"},
             dur_ms=log.get("dur_ms"),
         )
     except Exception:  # noqa: BLE001 — 观测失败绝不能影响这一轮对话
         pass
+
+
+_AUTO_MEMORY_BUCKET_LABEL = {
+    "turning": "转折点", "turning_point": "转折点", "recent": "最近记下",
+    "query": "与这句相关", "relevance": "与这句相关", "correction": "纠正",
+}
+
+
+def _stash_auto_memories(cards, trace) -> list[dict] | None:
+    """Join the enclave's picked cards with their selection reasons (T512).
+
+    ``trace`` is the ``context_memory_trace`` dict returned when history is
+    fetched with ``context_trace=1`` (``{"selected": [{id, bucket, reason,
+    matched_phrases, score, …}], …}``); a legacy ``context_memory_log`` carrying
+    ``selection_trace`` is accepted too. Returns ``None`` when the response had
+    no ``context_memories`` (older enclave / failed recall) so the turn reports
+    selected=unknown rather than 0. Card text stays in memory only; traces get
+    ids and counts.
+    """
+    if not isinstance(cards, list):
+        return None
+    reasons: dict[str, dict] = {}
+    if isinstance(trace, dict) and not isinstance(trace.get("selected"), list):
+        trace = trace.get("selection_trace")
+    selected = trace.get("selected") if isinstance(trace, dict) else None
+    for item in selected if isinstance(selected, list) else []:
+        if isinstance(item, dict) and item.get("id"):
+            reasons[str(item["id"])] = item
+    picked: list[dict] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        mid = str(card.get("id") or "").strip()
+        # summary → title → legacy description. NEVER the body: the block is a
+        # pointer to the card, the body is fetched on demand (memory-fetch).
+        text = str(card.get("summary") or card.get("title") or card.get("description") or "").strip()
+        if not mid or not text:
+            continue
+        rel = reasons.get(mid, {})
+        picked.append({
+            "id": mid,
+            "text": text,
+            "bucket": str(rel.get("bucket") or card.get("bucket") or ""),
+            "reason": str(rel.get("reason") or ""),
+            "matched": [str(x) for x in (rel.get("matched_phrases") or [])[:3]],
+            "score": float(rel.get("score") or 0.0),
+        })
+    return picked
+
+
+def _auto_memory_fetch_for_turn(msg: dict) -> dict | None:
+    """Ask the enclave for the picks bound to exactly this user message (T512).
+
+    One small history page ending at this message (``before_seq = seq + 1``,
+    ``limit = AUTO_MEMORY_TURN_PAGE``) so the enclave's selection query is this
+    message (+ the few messages before it — the T512 query widening), never a
+    later message of the same poll and never the future. No ``seq`` (legacy
+    rows), transport failure, page mismatch or ``mode=failed`` ⇒ ``None`` =
+    unknown; an empty pick list on a healthy response ⇒ selected 0.
+    Returns ``{"picks", "selected", "pool"}``.
+    """
+    seq = msg.get("seq") if isinstance(msg, dict) else None
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+        return None
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        return None
+    mid = str(msg.get("id") or msg.get("message_id") or "").strip()
+    if not mid:
+        return None
+    try:
+        resp = _ENCLAVE_CLIENT.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+            params={"before_seq": seq + 1, "limit": AUTO_MEMORY_TURN_PAGE,
+                    "context_trace": "1", "include_image_body": "false"},
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001 — recall is best-effort; unknown, never 0
+        log.debug("per-turn memory selection fetch failed: %s", exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    page = data.get("messages") or data.get("history") or []
+    newest_user = ""
+    page_ids: set = set()
+    for m in page if isinstance(page, list) else []:
+        if not isinstance(m, dict):
+            continue
+        pid = str(m.get("id") or m.get("message_id") or "").strip()
+        if pid:
+            page_ids.add(pid)
+        if str(m.get("role") or "").lower() == "user" and pid:
+            newest_user = pid
+    # The enclave selected against the newest user message of *this* page: the
+    # page must contain this message and it must be that newest user message.
+    if mid not in page_ids or newest_user != mid:
+        return None
+    rec = data.get("context_memory_log") if isinstance(data.get("context_memory_log"), dict) else {}
+    if str(rec.get("mode") or "") == "failed":
+        return None
+    cards = data.get("context_memories")
+    if not isinstance(cards, list):
+        return None
+    picks = _stash_auto_memories(cards, data.get("context_memory_trace") or rec) or []
+    counts = rec.get("counts") if isinstance(rec.get("counts"), dict) else {}
+    pool = counts.get("candidate_pool")
+    # ``selected`` = what the enclave picked; ``picks`` = what is renderable
+    # (a body-only card is selected but never rendered).
+    return {"picks": picks, "selected": len([c for c in cards if isinstance(c, dict)]),
+            "pool": pool if isinstance(pool, int) and not isinstance(pool, bool) else None}
+
+
+def _auto_memory_arrival(payload: str, channel: str, *, driver: str, trace_id: str) -> None:
+    """Prove arrival on the *final* driver payload (stdin / argv / app-server
+    message), after every later prefix was applied. A card counts only when its
+    complete rendered entry line is present (an id alone can be echoed by old
+    history, quoted cards or the user); ``injected_chars`` is the size of what
+    actually arrived. This is「已备好发给驱动」(driver_request=prepared), not
+    network success — read agent.model.call.done/error of the same turn for that."""
+    lines: dict = _RECALL_TURN_STATE.get("rendered_lines") or {}
+    ids = list(_RECALL_TURN_STATE.get("injected_ids") or [])
+    if not ids:
+        return
+    text = payload if isinstance(payload, str) else ""
+    arrived = [mid for mid in ids if lines.get(mid) and lines[mid] in text]
+    missing = [mid for mid in ids if mid not in arrived]
+    header = str(_RECALL_TURN_STATE.get("rendered_header") or "")
+    if arrived:
+        parts = ([header] if header and header in text else []) + [lines[m] for m in arrived]
+        chars = len("\n".join(parts))
+    else:
+        chars = 0  # header alone is render evidence, not an injected card
+    _RECALL_TURN_STATE.update({
+        "injected": len(arrived), "injected_chars": chars, "arrived_ids": arrived,
+        "missing_ids": missing, "arrival_channel": channel, "driver_request": "prepared",
+    })
+    # Same event name/fields as the V2 bridge (memory.context.applied, one per
+    # provider request) so instruments can join across runtimes. Flat detail:
+    # debug_trace._safe_detail str()-truncates list items at 80 chars, so only
+    # short scalars / id lists live here — never nested dicts or card text.
+    _emit_debug_trace(
+        "memory", "memory.context.applied", trace_id=trace_id,
+        status="ok" if not missing else "failed",
+        summary=f"到达 {len(arrived)}/{len(ids)} 张（{driver} · {channel} · 已备好）",
+        explain="在最终发给驱动的 payload 上逐条核对已渲染的完整记忆行（不只核 id）；缺失=块被后续拼接挤掉或未随 payload 发送。到达≠网络成功，成败看同轮 agent.model.call.done/error。",
+        detail={"runtime": "v1", "driver": driver, "channel": channel, "driver_request": "prepared",
+                "round": 1, "rendered": len(ids), "arrived": len(arrived), "ids": arrived,
+                "missing_ids": missing, "chars": chars, "payload_chars": len(text),
+                "profile_used": False, "block_head": header[:60]},
+    )
+
+
+def _auto_memory_block_for(msg: dict, trace_id: str) -> tuple[str, list[str]]:
+    """Fetch + render this message's own picks (never another message's), record
+    the turn state pending arrival, and trace ids/counts only. Used at the chat
+    assembly site; extracted so the per-turn rule is unit-testable."""
+    entry = _auto_memory_fetch_for_turn(msg or {})
+    picked = entry.get("picks") if entry else None
+    quoted_ids = [str(c.get("id") or "") for c in ((msg or {}).get("quoted_memories") or []) if isinstance(c, dict)]
+    auto_text, auto_ids, rendered = _auto_memory_render(picked, quoted_ids)
+    header = rendered.pop("__header__", "") if rendered else ""
+    _RECALL_TURN_STATE.update({
+        "selected": (None if entry is None else entry.get("selected")),
+        "candidate_pool": (entry or {}).get("pool"),
+        # rendered for this turn; ``injected``/``injected_chars`` are settled by
+        # the arrival check on the final driver payload, not here.
+        "injected": 0, "injected_ids": list(auto_ids), "injected_chars": 0,
+        "rendered_header": header, "rendered_lines": rendered,
+        "arrived_ids": [], "missing_ids": [], "arrival_channel": "", "driver_request": "",
+    })
+    _emit_debug_trace(
+        "context", "context.auto_memory", trace_id=trace_id,
+        summary=f"渲染 {len(auto_ids)} 张（该消息已选 {'?' if entry is None else entry.get('selected')}）",
+        explain=(
+            "enclave 对这条消息挑出的记忆卡以摘要+命中原因拼在用户消息之前；正文靠 memory-fetch；到达以 memory.context.applied 为准。"
+            if auto_ids else
+            ("enclave 对这条消息未挑出可注入的卡" if picked is not None else "这条消息的选卡结果未知（无 seq / 拉取失败 / mode=failed / 页不匹配），不注入也不复用旧卡")
+        ),
+        detail={
+            "message_id": str((msg or {}).get("id") or (msg or {}).get("message_id") or "")[:40],
+            "selected": None if entry is None else entry.get("selected"),
+            "renderable": None if picked is None else len(picked),
+            "rendered": len(auto_ids), "rendered_ids": list(auto_ids),
+            "rendered_chars": len(auto_text), "quoted_excluded": len(set(quoted_ids)),
+        },
+    )
+    return auto_text, auto_ids
+
+
+def _auto_memory_reason(card: dict) -> str:
+    label = _AUTO_MEMORY_BUCKET_LABEL.get(card.get("bucket") or "", "")
+    if card.get("matched"):
+        hit = "、".join(f"「{m}」" for m in card["matched"])
+        return f"{label or '与这句相关'}:匹配{hit}"
+    return label or "可能相关"
+
+
+def _auto_memory_context(picked, quoted_ids, *, budget_chars: int = AUTO_MEMORY_BUDGET_CHARS) -> tuple[str, list[str]]:
+    text, ids, _lines = _auto_memory_render(picked, quoted_ids, budget_chars=budget_chars)
+    return text, ids
+
+
+def _auto_memory_render(picked, quoted_ids, *, budget_chars: int = AUTO_MEMORY_BUDGET_CHARS) -> tuple[str, list[str], dict]:
+    """Render the enclave's picks as a「相关记忆」block for this turn (T512).
+
+    summary + one-line hit reason per card, never the full body; highest score
+    first; cards already quoted by the user are skipped; when the budget is
+    exceeded the lowest-scored *whole* cards are dropped — a card is never cut
+    mid-way. Returns (text, injected_ids); ("", []) when nothing is injected.
+    """
+    if not picked:
+        return "", [], {}
+    seen = set(str(x) for x in (quoted_ids or []))
+    header = (
+        "相关记忆(系统按本轮对话自动挑出,不一定都相关;只把这里写着的内容当作依据,"
+        "需要全文或更多细节先用 memory-fetch <id>):"
+    )
+    footer = ""
+    lines: list[str] = []
+    by_id: dict = {}
+    ids: list[str] = []
+    size = len(header) + len(footer)
+    for card in sorted(picked, key=lambda c: -float(c.get("score") or 0.0)):
+        mid = card["id"]
+        if mid in seen:
+            continue
+        summary = " ".join(str(card["text"]).split())
+        if len(summary) > AUTO_MEMORY_SUMMARY_CHARS:
+            summary = summary[:AUTO_MEMORY_SUMMARY_CHARS - 1] + "…"
+        line = f"- (id={mid}) {summary} · {_auto_memory_reason(card)}"
+        if size + len(line) + 1 > budget_chars:
+            continue  # drop this whole card; keep looking for smaller ones
+        lines.append(line)
+        by_id[mid] = line
+        ids.append(mid)
+        seen.add(mid)
+        size += len(line) + 1
+    if not lines:
+        return "", [], {}
+    return header + "\n" + "\n".join(lines), ids, {"__header__": header, **by_id}
 
 
 def _turn_ledger_open(child_env: dict) -> None:
@@ -2672,7 +2921,12 @@ def _recall_lane(lane_raw: str) -> str:
 
 def _recall_turn_reset() -> None:
     _turn_ledger_close()
-    _RECALL_TURN_STATE.update({"selected": None, "candidate_pool": None, "quoted": 0})
+    _RECALL_TURN_STATE.update({
+        "selected": None, "candidate_pool": None, "quoted": 0,
+        "injected": 0, "injected_ids": [], "injected_chars": 0,
+        "rendered_header": "", "rendered_lines": {},
+        "arrived_ids": [], "missing_ids": [], "arrival_channel": "", "driver_request": "",
+    })
 
 
 def _emit_recall_completed(
@@ -2680,8 +2934,8 @@ def _emit_recall_completed(
 ) -> None:
     """Exactly one ``memory.recall.completed`` per CLI turn (T511 contract).
 
-    ``injected`` is what actually reached the message sent to the driver — 0 until
-    T512 wires the enclave picks in. ``quoted`` is the user's explicit reference
+    ``injected`` is what actually reached the message sent to the driver (the
+    「相关记忆」block rendered by ``_auto_memory_context``, T512). ``quoted`` is the user's explicit reference
     path and is reported separately, never folded into ``injected``. ``turn_id``
     is the FEEDLING_TRACE_ID handed to the driver (the same key io_cli stamps on
     its own events); ``job_id`` is null + unknown when the caller has none.
@@ -2695,7 +2949,7 @@ def _emit_recall_completed(
         if not job_id:
             unknown = [*unknown, "job_id"]
         counts = {
-            "injected": 0,
+            "injected": int(_RECALL_TURN_STATE.get("injected") or 0),
             "selected": selected,
             **ledger_counts,
         }
@@ -2723,6 +2977,16 @@ def _emit_recall_completed(
                 "counts": counts,
                 "quoted_memories": int(_RECALL_TURN_STATE.get("quoted") or 0),
                 "candidate_pool": _RECALL_TURN_STATE.get("candidate_pool"),
+                "rendered_ids": list(_RECALL_TURN_STATE.get("injected_ids") or []),
+                "injected_ids": list(_RECALL_TURN_STATE.get("arrived_ids") or []),
+                "missing_ids": list(_RECALL_TURN_STATE.get("missing_ids") or []),
+                "injected_chars": int(_RECALL_TURN_STATE.get("injected_chars") or 0),
+                "arrival_channel": str(_RECALL_TURN_STATE.get("arrival_channel") or ""),
+                "driver_request": str(_RECALL_TURN_STATE.get("driver_request") or ""),
+                # V1 has no V2 profile-summary lane; whether the CLI driver's own
+                # native session memory contributed is not observable here.
+                "v2_profile_lane": False,
+                "native_session_memory": "unknown",
                 "unknown": unknown,
                 "source": "turn_ledger",
             },
@@ -2756,6 +3020,10 @@ def _fetch_from_enclave(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
+    # T512: ask for the per-card selection trace (reasons/bucket/score, no card
+    # bodies) so the injected block can say *why* each card is there. The
+    # released memgarden injection_record carries counts only.
+    params["context_trace"] = "1"
     for attempt in range(ENCLAVE_FETCH_MAX_ATTEMPTS):
         last = attempt == ENCLAVE_FETCH_MAX_ATTEMPTS - 1
         try:
@@ -10745,6 +11013,17 @@ def _call_agent_cli_impl(
         if stream_update is not None and _is_codex_cmd(cmd)
         else None
     )
+    # T512: settle「到达」on what actually leaves for the driver — stdin when set
+    # (pi / claude / codex prompt-on-stdin), the message body for the codex
+    # app-server path, else argv. Every later prefix has been applied by now.
+    _auto_memory_arrival(
+        _run_kwargs["input"] if _run_kwargs.get("input") else (
+            message if app_server_plan is not None else " ".join(str(x) for x in cmd)
+        ),
+        "stdin" if _run_kwargs.get("input") else ("app-server" if app_server_plan is not None else "argv"),
+        driver=("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")),
+        trace_id=trace_id,
+    )
     try:
         if app_server_plan is not None:
             try:
@@ -11802,7 +12081,14 @@ def _memory_read_prompt_block() -> str:
         f"{_IO_CLI_COMMAND} memory-fetch <real_id> [<real_id> ...]` before "
         "answering or creating a file. Never pass placeholder words such as "
         "ids or memory_id. Never claim memories are unavailable based on an "
-        "older turn or before the current turn's memory-index result."
+        "older turn or before the current turn's memory-index result. "
+        "FACT DISCIPLINE: For any specific fact (codes, numbers, dates, places, "
+        "names, where something is kept, what is written on it), state only what "
+        "a memory card, the 相关记忆 block, or a memory-index/memory-fetch result "
+        "actually says. If nothing supports it, run memory-index / memory-fetch "
+        "first; if it is still unsupported, say plainly that you do not have it "
+        "and ask. Never guess a plausible value and never add details (colors, "
+        "scenes, counts, times) the cards do not contain."
     )
 
 
@@ -19171,6 +19457,11 @@ def _process_messages(messages: list) -> float:
                 "attached %d quoted memor(ies) to agent message ts=%.3f",
                 _quoted_present, ts,
             )
+        # T512: the enclave's per-turn picks finally reach the prompt. Above the
+        # user-quoted block (explicit reference sits closest to the message).
+        auto_text, auto_ids = _auto_memory_block_for(msg, trace_id)
+        if auto_text:
+            content = f"{auto_text}\n\n{content}"
 
         # Self-authored thinking is mandatory in foreground chat. Proactive wakes
         # use the same switch but only permit it, preserving the intentional lane

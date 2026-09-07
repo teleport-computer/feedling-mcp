@@ -93,12 +93,34 @@ resident CLI output are unchanged. Index discovery is allowed once per V2
 loop; after a bounded overview, fetch visible IDs or use a more specific search.
 
 Recall diagnostics distinguish card selection from actual prompt injection.
+Each V2 chat/wake turn can read enclave-selected cards from a sequence-bounded
+history window. The selection query includes the last four conversation messages,
+including assistant replies. The runtime adds a non-system “相关记忆” data block
+before conversation replay: card ID, a summary excerpt of at most 120 characters,
+and the selection reason. It never substitutes the card body for a missing summary.
+The block is limited to 2500 characters; overflow drops whole lower-ranked cards.
+Explicitly quoted IDs and verbatim summaries already present in the profile are
+excluded. This is conservative text deduplication, not semantic coverage detection.
+Models must fetch details and must not invent facts absent from their evidence.
+
 `memory.select.traced` does not claim the selected cards reached the model.
 `memory.recall.completed` records per-execution recall counts, with unknown
 values marked explicitly; automatic injection and user-quoted cards are separate.
 V2 events carry turn/job/attempt coordinates so retries and wake work need not
 be mistaken for additional foreground turns. Search diagnostics record a bounded
 sample of returned card IDs and an omitted-ID count, never the query or card text.
+V2 `memory.context.applied` events measure actual provider-request injection IDs
+and characters and whether profile context was included. Separate
+`memory.recall.tool_result` events record final normalized tool-result
+JSON completeness, returned/omitted counts, result characters, and fetch call-ID
+to requested/returned card-ID bindings, joined by turn/job/attempt. The terminal
+`memory.recall.completed` event contains aggregate counts. These are content-free operational fields,
+not proof of semantic relevance or provider-token usage. The full provider-request
+messages remain in the encrypted trajectory under its existing access controls.
+On the pinned memgarden 0.19.0 release, selection still uses its historical buckets;
+the opt-in relevance-gated soft-quota policy is used only when a reviewed, released
+dependency upgrade supplies it. A missing or failed selection remains unknown,
+not a measured empty Garden.
 
 `memory_search` matches a literal, case-insensitive substring of the card text;
 it applies no synonyms, translation, or stemming. An empty result therefore means

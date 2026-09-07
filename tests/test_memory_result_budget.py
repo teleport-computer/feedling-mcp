@@ -174,6 +174,13 @@ def test_actual_provider_receives_intact_index_and_recall_summary(garden, monkey
                                       "search_calls": 1, "empty_searches": 1, "fetch_cards": 1}
     assert summaries[0]["unknown"] == ["selected", "quoted_memories"]
     assert "正文" not in json.dumps(summaries, ensure_ascii=False)
+    measured = {r["call_id"]: r for r in summaries[0]["tool_results"]}
+    assert measured["index"]["json_complete"] is True
+    assert measured["index"]["returned"] == indexed["returned"]
+    assert measured["index"]["omitted"] == indexed["omitted"]
+    assert measured["fetch"]["requested_ids"] == [rows[0]["id"]]
+    assert measured["fetch"]["returned_ids"] == [rows[0]["id"]]
+    assert "again" not in measured  # cached discovery isn't a new dispatch
 
 
 def test_trace_emits_zero_read_turn_and_survives_callback_failure(monkeypatch):
@@ -196,7 +203,7 @@ def test_cancelled_read_emits_unknown_not_false_empty():
     events = []
 
     @memory_recall.traced
-    async def cancelled(*, dispatch_tools):
+    async def cancelled(*, dispatch_tools, on_trajectory_event=None):
         await dispatch_tools([ToolCall("s", "memory_search", {"query": "private"})])
 
     async def dispatch(_calls):
@@ -238,3 +245,167 @@ def test_worker_bridge_emits_stable_coordinates_and_memory_subsystem(monkeypatch
     assert event["detail"]["counts"]["selected"] is None
     assert event["detail"]["attempt"] == 2
     assert "已选?" in event["summary"]
+
+
+def _injection_payload():
+    return {
+        "context_memories": [
+            {"id": "target", "summary": "灯牌编号 NP-4286", "content": "PRIVATE_BODY"},
+            {"id": "quoted", "summary": "已经被引用"},
+            {"id": "profile", "summary": "已有完整摘要"},
+            {"id": "body_only", "content": "PRIVATE_BODY"},
+        ],
+        "context_memory_trace": {"selected": [
+            {"id": "target", "score": 0.9, "bucket": "query", "matched_phrases": ["灯牌"]},
+        ]},
+        "context_memory_log": {"mode": "bucketed:unified"},
+    }
+
+
+@pytest.mark.parametrize("role", ["user", "assistant"])
+def test_turn_memory_block_is_untrusted_summary_only_deduped_and_bounded(role):
+    from model_api_runtime.v2 import memory_context, worker
+    view = {}
+    builder = worker._make_build_messages_fn(
+        system_prompt="SYS", summary="", agent_memory="已有完整摘要",
+        tail=[{"role": "user", "content": "本轮问灯牌", "_quoted_memory_ids": ["quoted"]}],
+        memory_context_payload=_injection_payload(), memory_context_observation=view,
+        application_data_role=role,
+    )
+    messages = builder([])
+    assert view["ids"] == ["target"] and view["selected"] == 4
+    assert messages[1] == {"role": role, "content": view["block"]}
+    assert messages[-1]["content"] == "本轮问灯牌"
+    assert "PRIVATE_BODY" not in view["block"]
+    assert '匹配「灯牌」' in view["block"] and "memory_fetch <id>" in view["block"]
+    assert view["chars"] == len(view["block"]) <= memory_context.MAX_CHARS
+
+
+def test_injection_budget_drops_whole_low_ranked_cards():
+    from model_api_runtime.v2 import memory_context
+    payload = {"context_memories": [
+        {"id": f"m{i:02}", "summary": "x" * 119 + "\x00" * 100} for i in range(40)
+    ], "context_memory_trace": {"selected": [
+        {"id": f"m{i:02}", "score": 40 - i} for i in range(40)
+    ]}, "context_memory_log": {"mode": "default"}}
+    view = memory_context.render(payload)
+    entries = [json.loads(line) for line in view["block"].splitlines()[2:-1]]
+    assert 0 < len(entries) < 40
+    assert len(view["block"]) <= 2500
+    assert [e["id"] for e in entries] == view["ids"] == [f"m{i:02}" for i in range(len(entries))]
+    assert all(len(e["summary"]) <= 120 for e in entries)
+    assert memory_context.render({})["selected"] is None
+    assert memory_context.render({"context_memories": [], "context_memory_log": {"mode": "failed"}})["selected"] is None
+
+
+@pytest.mark.parametrize("drop_at_boundary", [False, True])
+def test_recall_measures_final_provider_request_not_selection(monkeypatch, drop_at_boundary):
+    from model_api_runtime.v2 import worker
+    view, observed, sent, trajectories = {}, [], [], []
+    builder = worker._make_build_messages_fn(
+        system_prompt="SYS", summary="", tail=[{"role": "user", "content": "灯牌编号?"}],
+        memory_context_payload=_injection_payload(), memory_context_observation=view,
+        agent_memory="已有完整摘要",
+    )
+    def build(transcript):
+        messages = builder(transcript)
+        return [m for m in messages if m.get("content") != view["block"]] if drop_at_boundary else messages
+    async def provider(_config, messages, **kwargs):
+        sent.append(messages)
+        return {"reply": "不猜具体值", "tool_calls": [], "usage": {}}
+    async def noop(*args, **kwargs):
+        return []
+    async def trajectory(kind, payload):
+        trajectories.append((kind, payload))
+    async def reply(*args, **kwargs):
+        return None
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=provider_client.ProviderConfig(provider="anthropic", model="claude-sonnet-4-test", api_key="test"),
+        build_messages=build, dispatch_tools=noop, on_reply=reply,
+        fold_new_messages=noop, add_usage=lambda *a, **k: None, max_calls=1,
+        memory_context_observation=view, on_memory_recall_completed=observed.append,
+        on_trajectory_event=trajectory,
+    ))
+    assert len(sent) == 1 and len(observed) == 1
+    expected = [] if drop_at_boundary else ["quoted", "target"]
+    assert observed[0]["injected_ids"] == expected
+    assert observed[0]["counts"]["injected"] == len(expected)
+    assert observed[0]["profile_used"] is True
+    assert observed[0]["injected_chars"] == (0 if drop_at_boundary else len(view["block"]))
+    request = next(p for k, p in trajectories if k == "provider_request")
+    assert request["memory_context"]["injected_ids"] == ([] if drop_at_boundary else view["ids"])
+    assert "NP-4286" not in json.dumps(observed, ensure_ascii=False)
+
+
+def test_enclave_selection_query_is_last_four_conversation_messages():
+    from enclave.routes import chat
+    from memgarden import observability
+    rows = [{"role": "user", "content": "old-secret"},
+            {"role": "user", "content": "露营灯"},
+            {"role": "assistant", "content": "你问的是保修卡吗"},
+            {"role": "user", "content": "对"},
+            {"role": "assistant", "content": "需要编号"},
+            {"role": "tool", "content": "tool-secret"}]
+    _, _, log = chat._build_context_memories([], rows, {
+        "context_mode": "", "want_trace": True, "authorized_user_id": "u", "content_sk": None,
+    })
+    assert log["query_fingerprint"] == observability.query_fingerprint("露营灯\n你问的是保修卡吗\n对\n需要编号")
+    assert "old-secret" not in json.dumps(log) and "tool-secret" not in json.dumps(log)
+
+
+def test_production_selection_reader_is_authenticated_and_frontier_bounded(monkeypatch):
+    from model_api_runtime.v2 import serve_worker
+    captured = {}
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"user_id": "u", **_injection_payload()}
+    class Client:
+        def get(self, url, **kwargs):
+            captured.update(url=url, **kwargs)
+            return Response()
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave.invalid")
+    monkeypatch.setattr(serve_worker.core_enclave, "_client", lambda: Client())
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda uid: "test-token:" + uid)
+    payload = serve_worker._read_context_memories("u", through_seq=47)
+    assert payload == _injection_payload()
+    assert captured["params"] == {"before_seq": 48, "limit": 4, "include_image_body": "0", "context_trace": "1"}
+    assert captured["headers"] == {"X-Feedling-Runtime-Token": "test-token:u"}
+    with pytest.raises(ValueError, match="frontier"):
+        serve_worker._read_context_memories("u", through_seq=0)
+    with pytest.raises(RuntimeError, match="user_mismatch"):
+        serve_worker._read_context_memories("other", through_seq=47)
+
+
+def test_v2_fact_discipline_retains_past_memory_and_forbids_invention():
+    from model_api_runtime.v2 import context
+    assert "不要顺着话头猜一个像样的值" in context.chat_system_prompt(None)
+    assert "没有这些支撑就先去查" in context.CHAT_SYSTEM_PROMPT
+    assert "记忆可能停在过去" in context.AGENT_MEMORY_HEADER
+    assert "先查再答" in context.AGENT_MEMORY_HEADER
+
+
+def test_flat_recall_events_survive_the_real_durable_detail_sanitizer():
+    import debug_trace
+    from model_api_runtime.v2 import worker
+    saved = []
+    def sink(_uid, kind, **kwargs):
+        saved.append((kind, debug_trace._safe_detail(kwargs["detail"])))
+    ids = [f"{i:032x}" for i in range(8)]
+    callback = worker._memory_recall_callback(SimpleNamespace(emit_debug_trace=sink), "u",
+        {"id": 23, "trace_id": "trace23", "attempt_count": 1}, "chat")
+    asyncio.run(callback({"counts": {"injected": 8, "selected": 8},
+        "tool_results": [{"call_id": "fetch23", "tool": "memory_fetch", "returned": 8,
+                          "omitted": 0, "json_complete": True, "result_chars": 1200,
+                          "requested_ids": ids, "returned_ids": ids}],
+        "prompt_observations": [{"round": 1, "injected_ids": ids, "injected_chars": 1000,
+                                 "profile_used": False, "block_header": "# 相关记忆"}],
+        "injected_ids": ids, "injected_chars": 1000, "profile_used": False}))
+    rows = dict(saved)
+    assert rows["memory.recall.tool_result"]["returned_ids"] == ids
+    assert rows["memory.recall.tool_result"]["requested_ids"] == ids
+    assert rows["memory.recall.tool_result"]["call_id"] == "fetch23"
+    assert rows["memory.context.applied"]["injected_ids"] == ids
+    assert rows["memory.recall.completed"]["tool_result_events"] == 1
+    assert rows["memory.recall.completed"]["attempt"] == 1

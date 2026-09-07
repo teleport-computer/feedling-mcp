@@ -474,6 +474,15 @@ lets an authorized administrator compare whether two searches used the same
 trimmed query during the trace-retention window, but it is not ciphertext and
 must not be exposed through a public debug route.
 
+Runtime V2 also requests enclave-selected context using the current turn's
+sequence frontier. Summary-only related-memory blocks stay at application-data
+authority, after the profile/system prefix and before conversation replay; they
+do not add retrieved instructions to the privileged prefix. The existing TDX
+worker assembles this plaintext for the authorized provider, without new storage,
+decryption keys, or a backend plaintext index. Operational recall diagnostics
+contain IDs, counts and lengths measured at the provider-request/tool-result
+boundary; full messages remain in the existing encrypted trajectory.
+
 In managed deployments, each trace event is an append-only row in the selected
 primary PostgreSQL database. The RDS and TEE migration chains carry the same
 table, index, and partition contract, but the service writes only the database
