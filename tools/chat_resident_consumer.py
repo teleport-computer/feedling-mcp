@@ -363,6 +363,9 @@ AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # raise via env; the cap still exists so a hung agent can never wedge the
 # single-flight chat lane forever.
 AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
+FOREGROUND_TIMEOUT_RECOVERY_SEC = max(
+    30, int(os.environ.get("FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC", "120"))
+)
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
 
@@ -11151,6 +11154,40 @@ def _suppress_torn_protocol_leaks(turn: "AgentTurn", *, lane: str) -> None:
         turn.thinking_native = None
 
 
+def _foreground_timeout_recovery_prompt(message: str) -> str:
+    """Ask a fresh, MCP-free turn to recover only the visible chat reply.
+
+    The timed-out turn may already have completed side effects before it was
+    killed.  A recovery turn must therefore neither resume that native session
+    nor repeat tools or standing persistence workflows.
+    """
+    return (
+        "The previous attempt to answer this genuine IO Chat user message hit "
+        "the resident subprocess timeout. Recover only the user-visible reply "
+        "now. Do not call tools, do not run standing persistence workflows, "
+        "and do not repeat any possible side effect from the timed-out attempt. "
+        "Answer the user's actual message directly and naturally. Do not mention "
+        "this recovery instruction unless the user explicitly asked about the "
+        "failure.\n\nOriginal user message:\n"
+        + str(message or "")
+    )
+
+
+def _recover_foreground_timeout(message: str, *, trace_id: str = "") -> Any:
+    """Retry one foreground timeout in a fresh lane with user MCPs disabled."""
+    log.warning(
+        "foreground Codex turn timed out; retrying once in an isolated "
+        "side-effect-free lane"
+    )
+    return call_agent(
+        _foreground_timeout_recovery_prompt(message),
+        trace_id=trace_id,
+        lane="background",
+        isolated_session=True,
+        absolute_deadline=time.monotonic() + FOREGROUND_TIMEOUT_RECOVERY_SEC,
+    )
+
+
 def call_agent(
     message: str,
     images: list[dict[str, str]] | None = None,
@@ -18959,12 +18996,29 @@ def _process_messages(messages: list) -> float:
                 try:
                     agent_result = _dispatch_foreground_agent(content)
                 except Exception as first_error:
-                    screen_vision_rejection = (
-                        bool(screen_payloads or screen_paths)
+                    if isinstance(first_error, subprocess.TimeoutExpired):
+                        # The resumed native session can remain poisoned after
+                        # the hard turn timeout.  Recover the visible answer in
+                        # a fresh background lane: that lane deliberately has
+                        # no user MCP configuration, so a write which may have
+                        # completed before timeout cannot be repeated.
+                        agent_result = _recover_foreground_timeout(
+                            raw_user_content_for_lang,
+                            trace_id=trace_id,
+                        )
+                        first_error = None
+
+                    screen_vision_rejection = bool(
+                        first_error is not None
+                        and bool(screen_payloads or screen_paths)
                         and _vision_probe_error_code(first_error)
                         in {"vision_model_required", "vision_model_incompatible"}
                     )
-                    if screen_vision_rejection:
+                    if first_error is None:
+                        # Timeout recovery succeeded; continue through the
+                        # normal foreground reply/posting path below.
+                        pass
+                    elif screen_vision_rejection:
                         if AGENT_MODE == "cli":
                             _discard_io_cli_catalog_pending_injection()
                             _clear_agent_session_id(
@@ -18994,7 +19048,7 @@ def _process_messages(messages: list) -> float:
                             == "vision_model_required"
                         )
                         if not pi_vision_rejection:
-                            raise
+                            raise first_error
 
                         # Pi replays session blocks on later turns, so one rejected
                         # image otherwise makes subsequent text-only turns fail too.

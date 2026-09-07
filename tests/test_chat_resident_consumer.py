@@ -12527,6 +12527,31 @@ def test_agent_turn_timeout_default_is_300():
     assert crc.AGENT_TURN_TIMEOUT_SEC == 300
 
 
+def test_foreground_timeout_recovery_is_isolated_and_mcp_free(monkeypatch):
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        return {"messages": ["recovered"]}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(crc, "FOREGROUND_TIMEOUT_RECOVERY_SEC", 120)
+
+    result = crc._recover_foreground_timeout("hello", trace_id="trace-1")
+
+    assert result == {"messages": ["recovered"]}
+    prompt, kwargs = calls[0]
+    assert "Original user message:\nhello" in prompt
+    assert "Do not call tools" in prompt
+    assert kwargs == {
+        "trace_id": "trace-1",
+        "lane": "background",
+        "isolated_session": True,
+        "absolute_deadline": 1120.0,
+    }
+
+
 def test_agent_call_failed_reason_keeps_message_and_prefix():
     """Capture/dream/migrate lanes must record the underlying error message, not
     just the exception type — a relay 403 (RuntimeError "pi agent produced no
