@@ -39,6 +39,14 @@ def test_content_is_never_used_as_summary():
     assert card_fields.summary_of(card) == ""
 
 
+def test_turning_role_requires_semantic_field_not_display_title():
+    assert card_fields.roles_of({"title": "转折｜看上去像转折"}) == []
+    assert card_fields.roles_of({"summary": "没有标题的新卡", "roles": ["turning_point"]}) == ["turning_point"]
+    assert card_fields.to_garden_card({"roles": ["turning_point"], "summary": "新卡"})["roles"] == ["turning_point"]
+    assert card_fields.roles_of({"roles": "turning_point"}) == []
+    assert card_fields.roles_of({"source": "user_correction"}) == ["correction"]
+
+
 def test_summary_prefers_the_canonical_field():
     """新一代是主：summary 在，就用 summary。"""
     card = {"summary": "新的摘要", "description": "老的描述", "title": "老的标题"}

@@ -2142,6 +2142,7 @@ class TurnDeps:
     # callbacks above so a positional float/int mix-up cannot silently drop a
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
+    read_context_memories: Callable[..., dict] | None = None
     # Production chat preserves one visible reply per user message. Later sends
     # stay queued behind the current turn instead of being folded into it.
     ordered_chat_replies: bool = False
@@ -3278,6 +3279,23 @@ def _schema_surface_trace_callback(
     return _emit
 
 
+async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem):
+    """Best-effort selection with an explicit unavailable state, never fake 0."""
+    if deps.read_context_memories is None or int(through_seq or 0) < 1:
+        return {}
+    try:
+        async with enclave_sem:
+            payload = await asyncio.to_thread(
+                deps.read_context_memories, user_id, through_seq=int(through_seq)
+            )
+        if not isinstance(payload, dict):
+            raise ValueError("context_memory_response_not_object")
+        return payload
+    except Exception as exc:
+        log.warning("[v2.memory] selection unavailable: %s", type(exc).__name__)
+        return {}
+
+
 def _memory_recall_callback(deps, user_id, job, lane):
     """Attach durable coordinates at the worker/diagnostics assembly boundary."""
     from model_api_runtime.v2 import memory_recall
@@ -3288,13 +3306,32 @@ def _memory_recall_callback(deps, user_id, job, lane):
         trace_id = str(job.get("trace_id") or "")
         job_id = str(job["id"])
         turn_id = trace_id or f"{lane}:{job_id}"
+        coordinates = {"lane": "chat" if lane == "chat" else "wake",
+                       "turn_id": turn_id, "job_id": job_id,
+                       "attempt": int(job.get("attempt_count") or 0)}
+        # _safe_detail keeps one scalar/list level only. A nested per-tool list
+        # would become an 80-character string, silently destroying ID bindings.
+        # Emit each bounded observation as a flat event with the same turn keys.
+        for key, event_type in (("tool_results", "memory.recall.tool_result"),
+                                ("prompt_observations", "memory.context.applied")):
+            for observation in detail.get(key, []):
+                try:
+                    await asyncio.to_thread(
+                        deps.emit_debug_trace, user_id, event_type,
+                        status="ok", trace_id=trace_id, turn_id=turn_id, job_id=job_id,
+                        detail={**observation, **coordinates},
+                    )
+                except Exception as exc:
+                    log.warning("[v2.memory] observation trace failed: %s", type(exc).__name__)
+        terminal_detail = {k: v for k, v in detail.items()
+                           if k not in {"tool_results", "prompt_observations"}}
         await asyncio.to_thread(
             deps.emit_debug_trace, user_id, "memory.recall.completed",
             status="ok", trace_id=trace_id, turn_id=turn_id, job_id=job_id,
             summary=memory_recall.summary(detail["counts"]),
-            detail={**detail, "lane": "chat" if lane == "chat" else "wake",
-                    "turn_id": turn_id, "job_id": job_id,
-                    "attempt": int(job.get("attempt_count") or 0)},
+            detail={**terminal_detail, **coordinates,
+                    "tool_result_events": len(detail.get("tool_results", [])),
+                    "provider_requests": len(detail.get("prompt_observations", []))},
         )
     return emit
 
@@ -6006,6 +6043,8 @@ def _make_build_messages_fn(
     trusted_system_blocks: tuple[str, ...] = (),
     agent_memory: str = "",
     user_profile: str = "",
+    memory_context_payload: dict | None = None,
+    memory_context_observation: dict | None = None,
     worldbook_context: str = "",
     coverage_hole_notice: str = "",
     provider_config: Any = None,
@@ -6086,6 +6125,14 @@ def _make_build_messages_fn(
         worldbook_char_cap: int = context.WORLD_BOOK_CONTEXT_CHAR_CAP,
     ) -> list:
         rendered_tail = _flatten_turns(selected_turns) + required_tail
+        from model_api_runtime.v2 import memory_context
+        memory_view = memory_context.render(
+            memory_context_payload or {},
+            profile=agent_memory + "\n" + user_profile,
+            rows=rendered_tail,
+        )
+        if memory_context_observation is not None:
+            memory_context_observation.update(memory_view)
         return context.build_turn_messages(
             system_prompt=system_prompt,
             summary=summary,
@@ -6097,6 +6144,7 @@ def _make_build_messages_fn(
             trusted_system_blocks=trusted_system_blocks,
             agent_memory=agent_memory,
             user_profile=user_profile,
+            related_memories=memory_view["block"],
             worldbook_context=worldbook_context,
             worldbook_context_char_cap=worldbook_char_cap,
             coverage_hole_notice=coverage_hole_notice,
@@ -11006,6 +11054,11 @@ async def _run_wake(
                     type(exc).__name__.lower(),
                 )
 
+        turn_memory_payload = await _load_turn_memory_context(
+            deps, user_id, wake_snapshot_seq, enclave_sem,
+        )
+        turn_memory_observation: dict = {}
+
         def _wake_builder():
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
@@ -11028,6 +11081,8 @@ async def _run_wake(
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
+                memory_context_payload=turn_memory_payload,
+                memory_context_observation=turn_memory_observation,
                 summary=summary,
                 tail=wake_tail,
                 extra_context=_wake_action_context_str(
@@ -11156,6 +11211,7 @@ async def _run_wake(
         try:
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
+                memory_context_observation=turn_memory_observation,
                 on_memory_recall_completed=_memory_recall_callback(
                     deps, user_id,
                     {"id": job_id, "trace_id": trace_id, "attempt_count": attempt_count}, lane,
@@ -16208,6 +16264,11 @@ async def process_job(
         if ordered_chat_replies:
             turn_trusted_system_blocks += (context.ORDERED_REPLY_TARGET_POLICY,)
 
+        turn_memory_payload = await _load_turn_memory_context(
+            deps, user_id, cursor_seq, enclave_sem,
+        )
+        turn_memory_observation: dict = {}
+
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
                 context.chat_system_prompt(provider_config),
@@ -16215,6 +16276,8 @@ async def process_job(
             )
             return _make_build_messages_fn(
                 system_prompt=chat_system_prompt,
+                memory_context_payload=turn_memory_payload,
+                memory_context_observation=turn_memory_observation,
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
@@ -16344,6 +16407,7 @@ async def process_job(
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
+            memory_context_observation=turn_memory_observation,
             on_memory_recall_completed=_memory_recall_callback(deps, user_id, job, lane),
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),

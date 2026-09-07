@@ -714,11 +714,10 @@ def test_select_trace_says_selected_not_injected(monkeypatch):
     assert not any(c["type"] == "memory.inject" for c in calls)
     ev = calls[0]
     assert ev["subsystem"] == "memory"
-    assert "未注入" in ev["summary"] and "注入 4 张" not in ev["summary"]
-    assert ev["detail"]["injected_to_prompt"] == 0
+    assert "已选 4 张" in ev["summary"] and "注入 4 张" not in ev["summary"]
+    assert ev["detail"]["arrival_evidence"] == "memory.context.applied"
+    assert "injected_to_prompt" not in ev["detail"]
     assert ev["detail"]["counts"] == log["counts"]
-    assert resident._RECALL_TURN_STATE["selected"] == log["counts"]["injected"]
-    assert resident._RECALL_TURN_STATE["candidate_pool"] == log["counts"]["candidate_pool"]
 
 
 def test_recall_completed_reports_ledger_counts_and_resets(monkeypatch, tmp_path):
@@ -756,7 +755,7 @@ def test_recall_completed_reports_ledger_counts_and_resets(monkeypatch, tmp_path
     assert "注入0" in ev["summary"] and "已选5" in ev["summary"] and "?" not in ev["summary"]
     # Turn state and ledger are consumed exactly once.
     assert not os.path.exists(path) and resident._turn_ledger_path is None
-    assert resident._RECALL_TURN_STATE == {"selected": None, "candidate_pool": None, "quoted": 0}
+    assert {k: resident._RECALL_TURN_STATE[k] for k in ("selected", "candidate_pool", "quoted")} == {"selected": None, "candidate_pool": None, "quoted": 0}
 
 
 def test_recall_completed_marks_missing_ledger_as_unknown(monkeypatch):
@@ -851,7 +850,7 @@ def test_terminal_without_started_turn_only_cleans_up(monkeypatch):
     resident._emit_cli_model_call_terminal({"started": False}, trace_id="tr_4", succeeded=True)
     assert calls == []
     assert not os.path.exists(path) and resident._turn_ledger_path is None
-    assert resident._RECALL_TURN_STATE == {"selected": None, "candidate_pool": None, "quoted": 0}
+    assert {k: resident._RECALL_TURN_STATE[k] for k in ("selected", "candidate_pool", "quoted")} == {"selected": None, "candidate_pool": None, "quoted": 0}
 
 
 def test_recall_completed_emits_even_when_terminal_trace_raises(monkeypatch):
@@ -871,3 +870,267 @@ def test_recall_completed_emits_even_when_terminal_trace_raises(monkeypatch):
                                            failure=RuntimeError("driver failed"))
     assert [c["type"] for c in calls] == ["memory.recall.completed"]
     assert not os.path.exists(path) and resident._turn_ledger_path is None
+
+
+# ---------------------------------------------------------------------------
+# T512 — V1 per-turn automatic memory injection (enclave picks → prompt block).
+# ---------------------------------------------------------------------------
+
+
+def _picked(*cards):
+    return [dict(id=c[0], text=c[1], bucket=c[2], reason="", matched=list(c[3]), score=c[4]) for c in cards]
+
+
+def test_stash_auto_memories_is_unknown_without_context_memories():
+    assert resident._stash_auto_memories(None, {"counts": {"injected": 3}}) is None
+    assert resident._stash_auto_memories("nope", None) is None
+    assert resident._stash_auto_memories([], None) == []
+
+
+def test_stash_auto_memories_joins_cards_with_selection_reasons():
+    cards = [{"id": "m1", "summary": "露营灯保修码 NP-4286", "bucket": "生活"},
+             {"id": "m2", "content": "只有正文的卡", "bucket": "b"}, {"id": "m3", "description": "旧形状描述", "content": "正文"},
+             {"id": "", "summary": "no id"}, "junk"]
+    trace = {"selected": [
+        {"id": "m1", "bucket": "query", "reason": "phrase_match", "matched_phrases": ["露营灯", "保修码"], "score": 0.72},
+    ], "rejected_sample": []}
+    picked = resident._stash_auto_memories(cards, trace)
+    # legacy log shape (selection_trace nested) still works
+    assert resident._stash_auto_memories(cards, {"selection_trace": trace})[0]["score"] == 0.72
+    # a card with only a body is NOT rendered (the block never carries bodies);
+    # legacy description still is.
+    assert [c["id"] for c in picked] == ["m1", "m3"]
+    assert picked[0]["bucket"] == "query" and picked[0]["matched"] == ["露营灯", "保修码"] and picked[0]["score"] == 0.72
+    assert picked[1]["text"] == "旧形状描述" and picked[1]["score"] == 0.0
+    assert all("正文" not in c["text"] for c in picked)
+
+
+def test_auto_memory_context_orders_by_score_skips_quoted_and_keeps_ids_only():
+    picked = _picked(("low", "低分卡", "recent", [], 0.1), ("hi", "高分卡 保修码", "query", ["保修码"], 0.9),
+                     ("q", "用户已引用的卡", "query", [], 0.8))
+    text, ids = resident._auto_memory_context(picked, ["q"])
+    assert ids == ["hi", "low"]
+    assert text.startswith("相关记忆(") and "memory-fetch" in text
+    assert text.index("(id=hi)") < text.index("(id=low)")
+    assert "用户已引用的卡" not in text and "(id=q)" not in text
+    assert "匹配「保修码」" in text and "最近记下" in text
+
+
+def test_auto_memory_context_drops_whole_cards_over_budget_never_slices():
+    big = "很长的摘要" * 40  # > AUTO_MEMORY_SUMMARY_CHARS → truncated with an ellipsis
+    picked = _picked(("a", big, "query", [], 0.9), ("b", "短卡二", "recent", [], 0.5), ("c", "短卡三", "recent", [], 0.4))
+    text, ids = resident._auto_memory_context(picked, [], budget_chars=260)
+    # the truncated big card still fits the header+one-line budget; the rest are whole-card drops
+    for mid in ids:
+        assert f"(id={mid})" in text
+    assert all(len(line) <= resident.AUTO_MEMORY_SUMMARY_CHARS + 80 for line in text.splitlines()[1:])
+    assert "…" in text  # truncation happens at the summary, not mid-line
+    assert set(ids) <= {"a", "b", "c"} and ids == sorted(ids, key=lambda m: -{"a": 0.9, "b": 0.5, "c": 0.4}[m])
+    assert len(text) <= 260
+    assert resident._auto_memory_context(picked, [], budget_chars=10) == ("", [])
+    assert resident._auto_memory_context(None, []) == ("", []) and resident._auto_memory_context([], []) == ("", [])
+
+
+def test_recall_completed_reports_real_injection_from_turn_state(monkeypatch):
+    calls = _capture_debug_traces(monkeypatch)
+    resident._turn_ledger_close()
+    resident._RECALL_TURN_STATE.update({"selected": 4, "candidate_pool": 40, "quoted": 0,
+                                        "injected": 2, "injected_ids": ["m1", "m9", "m3"], "injected_chars": 321,
+                                        "arrived_ids": ["m1", "m9"], "missing_ids": ["m3"], "arrival_channel": "stdin", "driver_request": "prepared"})
+    resident._emit_recall_completed(trace_id="tr_6", driver="pi", lane="chat")
+    d = calls[0]["detail"]
+    assert d["counts"]["injected"] == 2 and d["injected_ids"] == ["m1", "m9"] and d["missing_ids"] == ["m3"]
+    assert d["rendered_ids"] == ["m1", "m9", "m3"] and d["injected_chars"] == 321 and d["arrival_channel"] == "stdin"
+    assert d["driver_request"] == "prepared"
+    assert d["v2_profile_lane"] is False and d["native_session_memory"] == "unknown"
+    assert "注入2" in calls[0]["summary"]
+    assert resident._RECALL_TURN_STATE["injected"] == 0 and resident._RECALL_TURN_STATE["injected_ids"] == []
+    assert resident._RECALL_TURN_STATE["arrived_ids"] == [] and resident._RECALL_TURN_STATE["injected_chars"] == 0
+
+
+def test_v1_memory_protocol_has_fact_discipline():
+    block = resident._memory_read_prompt_block()
+    assert "FACT DISCIPLINE" in block
+    assert "Never guess a plausible value" in block
+    assert "相关记忆" in block and "memory-fetch" in block
+    # the pre-existing two-step protocol stays intact
+    assert "memory-index --limit 20" in block and "Never claim memories are unavailable" in block
+
+
+def test_history_fetch_requests_selection_trace_and_stashes_picks(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "messages": [{"id": "u1", "role": "user", "ts": 1.0}, {"id": "a1", "role": "openclaw", "ts": 2.0},
+                             {"id": "u2", "role": "user", "ts": 3.0}],
+                "context_memories": [{"id": "m1", "summary": "露营灯保修码 NP-4286", "bucket": "生活"}],
+                "context_memory_trace": {"selected": [{"id": "m1", "bucket": "query", "reason": "phrase_match",
+                                                        "matched_phrases": ["露营灯"], "score": 0.7}]},
+                "context_memory_log": {"mode": "bucketed:unified", "counts": {"injected": 1, "candidate_pool": 40}},
+            }
+
+    class _Client:
+        def get(self, url, params=None, headers=None):
+            captured["url"] = url
+            captured["params"] = dict(params or {})
+            return _Resp()
+
+    monkeypatch.setattr(resident, "_ENCLAVE_CLIENT", _Client())
+    monkeypatch.setattr(resident, "FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    monkeypatch.setattr(resident, "_emit_debug_trace", lambda *a, **k: None)
+    assert [m["id"] for m in resident._fetch_from_enclave(0.0, 20)] == ["u1", "a1", "u2"]
+    assert captured["url"].endswith("/v1/chat/history")
+    assert captured["params"].get("context_trace") == "1"
+    # the main poll never binds picks to the turn; the per-turn fetch does
+    assert resident._RECALL_TURN_STATE["injected_ids"] == []
+    resident._recall_turn_reset()
+
+
+def _page(*msgs):
+    return [{"id": i, "role": r, "ts": float(n)} for n, (i, r) in enumerate(msgs, 1)]
+
+
+def test_arrival_reports_zero_when_block_was_squeezed_out(monkeypatch):
+    import subprocess as _sp
+    monkeypatch.setattr(resident, "AGENT_CLI_CMD", "pi --mode json")
+    calls = []
+    monkeypatch.setattr(resident, "_emit_debug_trace", lambda subsystem, type, **kw: calls.append({"type": type, **kw}))
+    monkeypatch.setattr(resident, "_prepare_cli_command", lambda msg, **kw: (["pi", "--mode", "json"], None))
+    monkeypatch.setattr(resident.subprocess, "run", lambda *a, **kw: _sp.CompletedProcess(args=[], returncode=0, stdout='{"type":"result","duration_ms":5}', stderr=""))
+    resident._recall_turn_reset()
+    resident._RECALL_TURN_STATE.update({"injected_ids": ["m1"], "rendered_lines": {"m1": "- (id=m1) 露营灯保修码 · 与这句相关"}, "rendered_header": "相关记忆(测试):"})
+    try:
+        resident.call_agent_cli("只有用户的话，块被挤掉了 (id=m1)", trace_id="tr_sq", lane="chat")
+    except Exception:  # noqa: BLE001 — see above
+        pass
+    arrived = [c for c in calls if c["type"] == "memory.context.applied"][0]
+    assert arrived["detail"]["arrived"] == 0 and arrived["detail"]["missing_ids"] == ["m1"] and arrived["detail"]["chars"] == 0
+    done = [c for c in calls if c["type"] == "memory.recall.completed"][0]
+    assert done["detail"]["counts"]["injected"] == 0 and done["detail"]["rendered_ids"] == ["m1"] and done["detail"]["injected_chars"] == 0
+
+
+
+
+class _TurnEnclave:
+    """Fake enclave for the per-turn selection fetch: records params, answers per before_seq."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def get(self, url, params=None, headers=None):
+        self.calls.append(dict(params or {}))
+        body = self.pages.get(int(params["before_seq"]))
+
+        class _R:
+            status_code = 200
+
+            def raise_for_status(self_inner):
+                if body is None:
+                    raise RuntimeError("boom")
+
+            def json(self_inner):
+                return body
+        return _R()
+
+
+def _turn_page(msg_id, seq, cards, mode="bucketed:unified"):
+    return {"messages": [{"id": f"a{seq-1}", "role": "openclaw", "seq": seq - 1}, {"id": msg_id, "role": "user", "seq": seq}],
+            "context_memories": cards,
+            "context_memory_trace": {"selected": [{"id": c["id"], "bucket": "query", "score": 0.9, "matched_phrases": ["x"]} for c in cards]},
+            "context_memory_log": {"mode": mode, "counts": {"injected": len(cards), "candidate_pool": 7}}}
+
+
+def test_per_turn_fetch_binds_each_message_to_its_own_page(monkeypatch):
+    fake = _TurnEnclave({
+        11: _turn_page("u10", 10, [{"id": "m1", "summary": "卡一"}]),
+        13: _turn_page("u12", 12, [{"id": "m2", "summary": "卡二"}]),
+    })
+    monkeypatch.setattr(resident, "_ENCLAVE_CLIENT", fake)
+    monkeypatch.setattr(resident, "FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    calls = _capture_debug_traces(monkeypatch)
+    resident._recall_turn_reset()
+    t1, ids1 = resident._auto_memory_block_for({"id": "u10", "seq": 10}, "tr")
+    assert ids1 == ["m1"] and "卡一" in t1 and resident._RECALL_TURN_STATE["selected"] == 1
+    assert resident._RECALL_TURN_STATE["candidate_pool"] == 7 and resident._RECALL_TURN_STATE["rendered_lines"]["m1"].startswith("- (id=m1)")
+    t2, ids2 = resident._auto_memory_block_for({"id": "u12", "seq": 12}, "tr")
+    assert ids2 == ["m2"] and "卡二" in t2 and "卡一" not in t2
+    # both messages of one poll got their own selection, with the exact page each
+    assert [c["before_seq"] for c in fake.calls] == [11, 13]
+    assert all(c["limit"] == resident.AUTO_MEMORY_TURN_PAGE and c["context_trace"] == "1" and c["include_image_body"] == "false" for c in fake.calls)
+    assert [c["type"] for c in calls].count("context.auto_memory") == 2
+    resident._recall_turn_reset()
+
+
+@pytest.mark.parametrize("msg, page, expect_selected, expect_ids", [
+    ({"id": "u1"}, None, None, []),                                                     # no seq → unknown, no fetch
+    ({"id": "u1", "seq": 0}, None, None, []),                                           # non-positive seq → unknown
+    ({"id": "u1", "seq": True}, None, None, []),                                        # bool is not a seq
+    ({"id": "", "seq": 5}, _turn_page("u1", 5, [{"id": "m1", "summary": "x"}]), None, []),  # missing id → unknown
+    ({"id": "u1", "seq": 5}, {"messages": [], "context_memories": [{"id": "m1", "summary": "x"}], "context_memory_log": {"mode": "ok"}}, None, []),  # empty page → unknown
+    ({"id": "u1", "seq": 5}, {"messages": [{"id": "a4", "role": "openclaw", "seq": 4}], "context_memories": [{"id": "m1", "summary": "x"}], "context_memory_log": {"mode": "ok"}}, None, []),  # no user row → unknown
+    ({"id": "u1", "seq": 5}, _turn_page("u1", 5, [], mode="failed"), None, []),          # failed mode → unknown
+    ({"id": "u1", "seq": 5}, _turn_page("u1", 5, []), 0, []),                            # healthy, nothing picked → 0
+    ({"id": "u1", "seq": 5}, _turn_page("u9", 5, [{"id": "m1", "summary": "x"}]), None, []),  # page ends at another user msg → unknown
+    ({"id": "u1", "seq": 5}, {"messages": [], "context_memory_log": {"mode": "ok"}}, None, []),  # no context_memories field → unknown
+])
+def test_per_turn_fetch_unknown_vs_zero(monkeypatch, msg, page, expect_selected, expect_ids):
+    fake = _TurnEnclave({6: page} if page is not None else {})
+    monkeypatch.setattr(resident, "_ENCLAVE_CLIENT", fake)
+    monkeypatch.setattr(resident, "FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    monkeypatch.setattr(resident, "_emit_debug_trace", lambda *a, **k: None)
+    resident._recall_turn_reset()
+    text, ids = resident._auto_memory_block_for(msg, "tr")
+    assert (text, ids) == ("", expect_ids)
+    assert resident._RECALL_TURN_STATE["selected"] == expect_selected
+    if not isinstance(msg.get("seq"), int) or isinstance(msg.get("seq"), bool) or msg.get("seq", 0) <= 0 or not msg.get("id"):
+        assert fake.calls == []
+    resident._recall_turn_reset()
+
+
+def test_per_turn_fetch_transport_failure_is_unknown_not_zero(monkeypatch):
+    fake = _TurnEnclave({})  # every before_seq → raise
+    monkeypatch.setattr(resident, "_ENCLAVE_CLIENT", fake)
+    monkeypatch.setattr(resident, "FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    monkeypatch.setattr(resident, "_emit_debug_trace", lambda *a, **k: None)
+    resident._recall_turn_reset()
+    assert resident._auto_memory_block_for({"id": "u1", "seq": 3}, "tr") == ("", [])
+    assert resident._RECALL_TURN_STATE["selected"] is None and fake.calls[0]["before_seq"] == 4
+    resident._recall_turn_reset()
+
+
+def test_selected_counts_enclave_picks_but_rendered_skips_body_only_cards(monkeypatch):
+    page = _turn_page("u1", 5, [{"id": "m1", "content": "只有正文"}, {"id": "m2", "summary": "有摘要"}])
+    fake = _TurnEnclave({6: page})
+    monkeypatch.setattr(resident, "_ENCLAVE_CLIENT", fake)
+    monkeypatch.setattr(resident, "FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    calls = _capture_debug_traces(monkeypatch)
+    resident._recall_turn_reset()
+    text, ids = resident._auto_memory_block_for({"id": "u1", "seq": 5}, "tr")
+    assert ids == ["m2"] and "只有正文" not in text
+    assert resident._RECALL_TURN_STATE["selected"] == 2
+    d = calls[-1]["detail"]
+    assert d["selected"] == 2 and d["renderable"] == 1 and d["rendered"] == 1
+    resident._recall_turn_reset()
+
+
+def test_arrival_header_only_is_not_injection(monkeypatch):
+    calls = _capture_debug_traces(monkeypatch)
+    resident._recall_turn_reset()
+    resident._RECALL_TURN_STATE.update({"injected_ids": ["m1"], "rendered_lines": {"m1": "- (id=m1) 卡 · 可能相关"}, "rendered_header": "相关记忆(测试):"})
+    resident._auto_memory_arrival("相关记忆(测试):\n\n用户的话", "stdin", driver="pi", trace_id="tr")
+    d = calls[-1]["detail"]
+    assert d["arrived"] == 0 and d["chars"] == 0 and resident._RECALL_TURN_STATE["injected"] == 0
+    resident._recall_turn_reset()
+    resident._RECALL_TURN_STATE.update({"injected_ids": ["m1"], "rendered_lines": {"m1": "- (id=m1) 卡 · 可能相关"}, "rendered_header": "相关记忆(测试):"})
+    block = "相关记忆(测试):\n- (id=m1) 卡 · 可能相关"
+    resident._auto_memory_arrival(block + "\n\n用户的话", "stdin", driver="pi", trace_id="tr")
+    assert calls[-1]["detail"]["chars"] == len(block) and resident._RECALL_TURN_STATE["injected_chars"] == len(block)
+    resident._recall_turn_reset()

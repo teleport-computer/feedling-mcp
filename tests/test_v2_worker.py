@@ -1925,6 +1925,49 @@ def test_process_job_records_whole_turn_metric_after_successful_respond(monkeypa
     assert row[7] >= 0
 
 
+@pytest.mark.parametrize("selection_fails", [False, True])
+def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, selection_fails):
+    uid = "u_memory_injection_chat"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("memory-chat")
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r-memory"})
+    provider_calls = []
+    async def failing_provider(config, messages, **kwargs):
+        provider_calls.append({"messages": messages})
+        # Exercise the real failure/finally path without needing reply crypto.
+        raise provider_client.ProviderError("fixture authentication failure", status_code=401)
+    monkeypatch.setattr(provider_client, "chat_completion_async", failing_provider)
+    reads, events = [], []
+    def select(user_id, *, through_seq):
+        reads.append((user_id, through_seq))
+        if selection_fails:
+            raise RuntimeError("selection unavailable")
+        return {"context_memories": [{"id": "chat-memory", "summary": "露营灯编号 NP-4286"}],
+                "context_memory_log": {"mode": "default"}}
+    row = {"id": "m-memory", "seq": 1, "ts": 1.0, "role": "user", "content": "灯牌编号?"}
+    deps = worker.TurnDeps(
+        read_messages=lambda _: [row],
+        read_messages_after_seq=lambda _, after_seq: [row] if after_seq < 1 else [],
+        read_context_memories=select,
+        resolve_provider=lambda _: (_BYOK, {}), mint_enclave_token=lambda _: "rt",
+        emit_debug_trace=lambda uid, kind, **kwargs: events.append((kind, kwargs)),
+        apply_pending_effects=_apply_effects,
+    )
+    status = asyncio.run(worker.process_job(job, deps, provider_config=_BYOK,
+                                           api_key=None, runtime_token="rt"))
+    assert status == "failed" and len(provider_calls) == 1
+    assert reads == [(uid, 1)]
+    blocks = [m["content"] for m in provider_calls[0]["messages"]
+              if isinstance(m, dict) and str(m.get("content", "")).startswith("# 相关记忆")]
+    assert len(blocks) == (0 if selection_fails else 1)
+    completed = [e["detail"] for kind, e in events if kind == "memory.recall.completed"]
+    assert len(completed) == 1
+    assert completed[0]["counts"]["injected"] == (0 if selection_fails else 1)
+    assert completed[0]["counts"]["selected"] == (None if selection_fails else 1)
+
+
 def test_process_job_records_failed_whole_turn_metric_on_provider_error(monkeypatch):
     """Inverted from the old per-call semantics: a failed turn (ResponderError)
     now DOES get a whole-turn metric row — spec B5 explicitly covers failed
@@ -1977,13 +2020,18 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    _script_provider(monkeypatch, [
+    provider_calls = _script_provider(monkeypatch, [
         _wake_reply_round(
             "hey, thinking of you", prompt_tokens=17, completion_tokens=4
         )])
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
+    selection_reads = []
+    def read_memories(user_id, *, through_seq):
+        selection_reads.append((user_id, through_seq))
+        return {"context_memories": [{"id": "wake-memory", "summary": "露营灯保修码 NP-4286"}],
+                "context_memory_log": {"mode": "default"}}
 
     deps = worker.TurnDeps(
         read_messages=lambda uid_: [],
@@ -1991,6 +2039,7 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
         mint_enclave_token=lambda uid_: "rt",
         has_genuine_user_history=lambda _uid: True,
         read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        read_context_memories=read_memories,
         read_tail_after_seq=lambda *_a, **_k: [
             {"id": "m1", "seq": 1, "ts": 1.0, "role": "user", "content": "hi"}
         ],
@@ -2001,6 +2050,9 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
+    assert selection_reads == [(uid, 1)]
+    assert any(m.get("role") == "assistant" and "NP-4286" in str(m.get("content"))
+               for m in provider_calls[0]["messages"] if isinstance(m, dict))
     with db.get_pool().connection() as c:
         row = c.execute(
             "SELECT user_id, lane, prompt_tokens, completion_tokens, model_calls, failed, status "

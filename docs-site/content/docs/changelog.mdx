@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now consumes per-turn related-memory summaries.** Enclave selection
+  uses the last four conversation messages. Bounded, non-system memory blocks
+  carry IDs and selection reasons, with full details available through fetch.
+  Recall diagnostics measure actual request inclusion and normalized tool-result
+  completeness, separately from selection. Model guidance requires checking
+  supporting memories before asserting specific remembered facts.
+
 - **Runtime V2 memory results now preserve complete JSON and card content.**
   Compact index/search views use a 6000-character budget; fetched cards share a
   12000-character budget without the former per-string 2000-character cut.

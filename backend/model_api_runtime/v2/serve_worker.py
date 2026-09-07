@@ -1495,6 +1495,7 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
             out.append(row)
             continue
         requested = [i.strip() for i in raw.split(",") if i.strip()][:_QUOTED_MEMORY_MAX]
+        row["_quoted_memory_ids"] = requested
         cards = [by_id[mid] for mid in requested if mid in by_id]
         block = _quoted_memory_block(
             cards,
@@ -4824,6 +4825,28 @@ def _read_capture_state(user_id: str) -> dict:
     )
 
 
+def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
+    """Select on an authenticated, frozen history window inside the enclave.
+
+    Do not read the latest unbounded history: ordered replies must never select
+    using a later queued user message. No decrypted history is persisted here.
+    """
+    if through_seq < 1:
+        raise ValueError("context_memory_frontier_required")
+    payload, error = core_enclave._enclave_get_json_for_gate(
+        "/v1/chat/history", None,
+        params={"before_seq": through_seq + 1, "limit": 4,
+                "include_image_body": "0", "context_trace": "1"},
+        runtime_token=_mint_runtime_token(user_id),
+    )
+    if error or not isinstance(payload, dict):
+        raise RuntimeError("context_memory_read_failed")
+    if payload.get("user_id") != user_id:
+        raise RuntimeError("context_memory_user_mismatch")
+    return {key: payload.get(key) for key in (
+        "context_memories", "context_memory_trace", "context_memory_log")}
+
+
 def _read_worldbook_context(
     user_id: str,
     messages: list[dict],
@@ -5089,7 +5112,7 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
     from diagnostics import diagnostics_core
 
     event = {
-        "subsystem": "memory" if event_type == "memory.recall.completed" else "agent",
+        "subsystem": "memory" if event_type.startswith(("memory.recall.", "memory.context.")) else "agent",
         "type": event_type, "status": status,
         "summary": summary, "explain": explain, "detail": detail,
         "actor": "hosted_v2", "trace_id": str(trace_id or ""),
@@ -5171,6 +5194,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_messages=_read_messages,
         read_messages_since=_read_messages,
         read_messages_after_seq=_read_messages_after_seq,
+        read_context_memories=_read_context_memories,
         ordered_chat_replies=True,
         runtime_mode_enabled=lambda user_id: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(

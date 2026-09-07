@@ -186,7 +186,6 @@ def to_garden_card(raw: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> dict:
 ROLE_TURNING_POINT = "turning_point"
 ROLE_CORRECTION = "correction"
 
-_TURNING_PREFIX = "转折｜"
 _CORRECTION_MARKERS = ("correction", "纠正", "设定更新", "边界更新")
 _CORRECTION_SOURCES = {"model_api_correction", "user_correction", "settings_correction"}
 
@@ -194,21 +193,17 @@ _CORRECTION_SOURCES = {"model_api_correction", "user_correction", "settings_corr
 def roles_of(raw: dict) -> list[str]:
     """io 的卡带哪些角色。
 
-    ⚠️ 现在靠标题前缀 / 来源名判断 —— 这个做法本来就脆弱
-    （codex 2026-08-16 指出：展示文案兼任了协议字段），而且**对新形状的卡完全失效**，
-    因为新卡没有 title。这里是过渡实现：把脆弱的判断收在 io 这一处，
-    内核那边只认干净的 `roles` 字段。
-
-    下一步是让写入端直接产出显式角色，然后这里的前缀分支可以删掉。
+    转折点只认显式 roles，不再从标题前缀猜。没有语义角色的存量卡仍可按
+    最近/相关性召回；这里不回填用户数据。纠正卡保留已有来源兼容规则。
     """
     if not isinstance(raw, dict):
         return []
-    roles: list[str] = []
+    explicit = raw.get("roles")
+    roles = [r for r in (ROLE_TURNING_POINT, ROLE_CORRECTION)
+             if isinstance(explicit, list) and r in explicit]
     title = str(raw.get("title") or "")
-    if title.startswith(_TURNING_PREFIX):
-        roles.append(ROLE_TURNING_POINT)
     source = str(raw.get("source") or "").strip().lower()
-    if source in _CORRECTION_SOURCES or any(m in title.lower() for m in _CORRECTION_MARKERS):
+    if ROLE_CORRECTION not in roles and (source in _CORRECTION_SOURCES or any(m in title.lower() for m in _CORRECTION_MARKERS)):
         roles.append(ROLE_CORRECTION)
     return roles
 

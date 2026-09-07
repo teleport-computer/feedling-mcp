@@ -399,9 +399,11 @@ def test_select_caps_turning_points_at_3():
                 occurred_at=f"2026-{i + 1:02d}-01T00:00:00")
         for i in range(5)
     ]
+    for moment in moments:
+        moment["roles"] = ["turning_point"]
     out = _select_context_memories(moments, "")
     # 2026-08-17 边界整理：内核拿到的是翻译产物，没有 title —— 角色改看 roles。
-    # 「靠标题前缀认转折卡」的识别逻辑已收到宿主侧（card_shape.roles_of）。
+    # T512: explicit roles survive host translation; titles confer no role.
     turning_ids = [m["id"] for m in out if "turning_point" in (m.get("roles") or [])]
     # Top 3 by occurred_at desc should be t4, t3, t2
     assert turning_ids[:3] == ["t4", "t3", "t2"]
@@ -419,9 +421,11 @@ def test_turning_points_compare_instants_and_put_garbage_last():
         _moment(id="date_only", title="转折｜date", occurred_at="2026-08-13"),
     ]
 
+    for moment in moments:
+        moment["roles"] = ["turning_point"]
     out = _select_context_memories(moments, "")
     # 2026-08-17 边界整理：内核拿到的是翻译产物，没有 title —— 角色改看 roles。
-    # 「靠标题前缀认转折卡」的识别逻辑已收到宿主侧（card_shape.roles_of）。
+    # T512: explicit roles survive host translation; titles confer no role.
     turning_ids = [m["id"] for m in out if "turning_point" in (m.get("roles") or [])]
 
     assert turning_ids[:3] == ["newer_z", "older_offset", "date_only"]
@@ -867,6 +871,7 @@ def test_strict_index_sample_excludes_selected_and_lists_rest():
         _index_card("b", "转折｜第一次一起熬夜赶 deadline", "2026-02-01", "moment"),
         _index_card("c", "用户搬到了东京", "2026-03-01", "event"),
     ]
+    moments[1]["roles"] = ["turning_point"]
     # Query shares nothing lexically with any card → strict selects nothing,
     # so all three fall to the index.
     _selected, trace = _select_context_memories_with_trace(
