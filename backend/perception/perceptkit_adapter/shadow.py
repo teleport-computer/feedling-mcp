@@ -388,7 +388,24 @@ def observe_location(user_id: str, values: Mapping[str, Any], *,
 _MIRROR_SOURCE = "ios"
 
 
-def _sync_mirror(user_id: str, collection_kind: str, items, received):
+def _coverage_window(payload: Mapping[str, Any]) -> tuple[Any, Any] | None:
+    """这批镜像覆盖的时间窗，客户端自己声明的。
+
+    没有窗口就不能声明「全量」—— 没有范围的全量，删的是**全部**。
+    """
+    from datetime import datetime
+    start = payload.get("calendar_window_start")
+    end = payload.get("calendar_window_end")
+    if not start or not end:
+        return None
+    try:
+        return datetime.fromisoformat(str(start)), datetime.fromisoformat(str(end))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sync_mirror(user_id: str, collection_kind: str, items, received,
+                 coverage: tuple[Any, Any] | None = None):
     """Write a mirror batch through the kit's own orchestration.
 
     Not ``upsert_*`` directly. The kit's entry is what stamps the batch's
@@ -419,10 +436,18 @@ def _sync_mirror(user_id: str, collection_kind: str, items, received):
     )
 
     from .storage import PostgresStorage
+    # 有覆盖窗口才敢声明全量：**窗口内没出现的条目 = 被删了**，
+    # 这也是「删除范围五段全比」那段代码唯一会被走到的路径。
+    # 没窗口（客户端太老、或者这批被截断了）就退回增量：宁可漏掉删除，
+    # 也不能把没看全的那部分当成"用户删了"—— 那是不可逆的。
+    from perceptkit.processing.source_sync import FULL
+    kind = FULL if coverage else INCREMENTAL
     batch = SyncBatch(
         source=_MIRROR_SOURCE, collection_kind=collection_kind,
         sync_id=f"{collection_kind}-{received.isoformat()}",
-        snapshot_kind=INCREMENTAL, items=items,
+        snapshot_kind=kind, items=items,
+        coverage_start=coverage[0] if coverage else None,
+        coverage_end=coverage[1] if coverage else None,
         attempted_at=received, completed_at=received,
     )
     with db.get_pool().connection() as conn:
@@ -452,7 +477,12 @@ def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         events = [CalendarEventMirror(subject_id=user_id, source=_MIRROR_SOURCE,
                                       updated_at=received, **row)
                   for row in rows]
-        return _sync_mirror(user_id, "calendar", events, received) or {
+        # ⚠️ 被截断（事件数超过客户端上限）时**不能**声明全量：那批不是窗口
+        # 内的全部，被截掉的会被当成"已删除"删掉。截断时 coverage 传 None。
+        coverage = None if payload.get("calendar_events_truncated") else \
+            _coverage_window(payload)
+        return _sync_mirror(user_id, "calendar", events, received,
+                            coverage=coverage) or {
                 "ran": True, "producer": "ios_calendar_mirror",
                 "report_id": "-", "observations": len(rows), "applied": len(rows),
                 "rejected": 0, "duplicates": 0, "events": 0,

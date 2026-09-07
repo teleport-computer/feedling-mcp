@@ -960,3 +960,63 @@ def test_every_routed_shadow_entry_actually_exists():
     from perception.service import _PERCEPTKIT_DECRYPTED_ENTRIES
     for key, entry in _PERCEPTKIT_DECRYPTED_ENTRIES.items():
         assert callable(getattr(shadow, entry, None)), f"{key} -> {entry} 不存在"
+
+
+# ---------------------------------------------------------------------------
+# 日历删除：靠「窗口内的全量」表达，而不是靠客户端追踪删除
+#
+# 在这之前日历镜像永远是 INCREMENTAL —— 也就是说「删除范围五段全比」那段
+# 代码在生产上**一次都没执行过**。用户在日历里删掉一个会，io 这边照旧留着。
+# ---------------------------------------------------------------------------
+
+def _cal_payload(events, *, truncated=False, window=True):
+    out = {"events": events, "calendar_events_truncated": truncated}
+    if window:
+        out["calendar_window_start"] = "2026-08-13T10:00:00+08:00"
+        out["calendar_window_end"] = "2026-09-10T10:00:00+08:00"
+    return out
+
+
+def _event(eid, title="会"):
+    return {"event_id": eid, "calendar_id": "work", "title": title,
+            "start_time": "2026-08-27T10:00:00+08:00",
+            "end_time": "2026-08-27T11:00:00+08:00"}
+
+
+def _mirror(conn, payload):
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import shadow
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        return shadow.mirror_calendar("u1", payload)
+
+
+def _titles(conn):
+    return sorted(e.source_event_id
+                  for e in store(conn).list_calendar_events(subject_id="u1", limit=50))
+
+
+def test_an_event_deleted_upstream_disappears_from_the_mirror(clean):
+    """这是这条链存在的全部理由：用户在日历里删掉一个会，io 跟着删掉。"""
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
+    assert _titles(conn) == ["e1", "e2"]
+    _mirror(conn, _cal_payload([_event("e1")]))          # e2 被删了
+    assert _titles(conn) == ["e1"], "窗口里没出现的事件应该被删掉"
+
+
+def test_a_truncated_batch_never_deletes(clean):
+    """截断意味着这批**不是**窗口内的全部。当成全量的话，被截掉的那些会被
+    当成"用户删了"删掉 —— 不可逆。"""
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
+    _mirror(conn, _cal_payload([_event("e1")], truncated=True))
+    assert _titles(conn) == ["e1", "e2"], "截断的批次不该删任何东西"
+
+
+def test_a_client_that_sends_no_window_never_deletes(clean):
+    """老版本客户端不发窗口。没有范围的"全量"删的是全部 —— 必须退回增量。"""
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
+    _mirror(conn, _cal_payload([_event("e1")], window=False))
+    assert _titles(conn) == ["e1", "e2"]
