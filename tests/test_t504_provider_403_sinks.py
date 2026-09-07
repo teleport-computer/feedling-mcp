@@ -185,9 +185,85 @@ def test_resident_cli_passes_unmodified_text_to_shared_boundary(monkeypatch):
     assert seen == [(403, production_text)]
 
 
-def test_extraction_status_only_contract_is_unchanged_pending_product_ruling():
-    exc = _provider_error(403, GENERIC_BODY)
-    assert extraction._provider_failure_code(exc) == "auth_invalid"
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    (
+        (403, GENERIC_BODY, "upstream_unavailable"),
+        (403, AUTH_BODY, "auth_invalid"),
+        (401, GENERIC_BODY, "auth_invalid"),
+    ),
+    ids=("generic-403", "auth-403", "generic-message-401"),
+)
+def test_extraction_contract_is_reversed_after_product_ruling(
+    status, body, expected
+):
+    # This is the former pending-product-ruling lock.  Seven ruled that this
+    # sink may inspect the provider body, so the generic-403 expectation is now
+    # deliberately reversed while the auth-403 and 401 cells remain unchanged.
+    assert extraction._provider_failure_code(
+        _provider_error(status, body)
+    ) == expected
+
+
+def test_extraction_passes_original_raw_body_to_shared_boundary(monkeypatch):
+    exc = _provider_error(403, GENERIC_CASE_VARIANT_BODY)
+    seen = []
+
+    def classify(status, raw_body):
+        seen.append((status, raw_body))
+        return False
+
+    monkeypatch.setattr(
+        extraction.error_contract,
+        "provider_response_is_auth_failure",
+        classify,
+    )
+
+    assert extraction._provider_failure_code(exc) == "upstream_unavailable"
+    assert seen == [(403, GENERIC_CASE_VARIANT_BODY)]
+
+
+def test_extraction_unknown_or_missing_403_body_remains_fail_closed():
+    for raw_body in ("", '{"error":{"message":"forbidden"}}'):
+        exc = provider_client.ProviderError(
+            "provider_http_403: forbidden",
+            status_code=403,
+            response_detail=GENERIC_MESSAGE,
+            raw_response_body=raw_body,
+        )
+        assert extraction._provider_failure_code(exc) == "auth_invalid"
+
+
+def test_extraction_trace_status_uses_only_exception_raw_body():
+    trace_only_403 = RuntimeError("provider failed")
+    provider_client._attach_provider_attempt_trace(
+        trace_only_403,
+        [{"status": 403, "raw_response_body": GENERIC_BODY}],
+    )
+    # Attempt traces are status evidence, not a provider-response-body carrier.
+    # A fake body there must not defeat the missing-body fail-closed policy.
+    assert extraction._provider_failure_code(trace_only_403) == "auth_invalid"
+
+    trace_only_401 = RuntimeError("provider failed")
+    provider_client._attach_provider_attempt_trace(
+        trace_only_401,
+        [{"status": 401}],
+    )
+    assert extraction._provider_failure_code(trace_only_401) == "auth_invalid"
+
+    raw_on_exception = provider_client.ProviderError(
+        "provider failed",
+        status_code=None,
+        raw_response_body=GENERIC_BODY,
+    )
+    provider_client._attach_provider_attempt_trace(
+        raw_on_exception,
+        [{"status": 403}],
+    )
+    assert (
+        extraction._provider_failure_code(raw_on_exception)
+        == "upstream_unavailable"
+    )
 
 
 def test_shared_boundary_accepts_case_variants_without_pre_lowering():
