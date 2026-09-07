@@ -7,6 +7,7 @@ Run with: pytest tests/test_chat_resident_consumer.py -v
 
 import ast
 import base64
+import collections
 import json
 import os
 import shlex
@@ -1359,7 +1360,532 @@ def test_screen_context_tool_mode_never_prefetches(monkeypatch):
     assert crc._screen_context_for_message("你能看到我的屏幕吗") == ("", [], [])
 
 
-def test_foreground_worldbook_tool_mode_never_prefetches(monkeypatch):
+def _worldbook_mode_from_fresh_import(configured: str | None) -> str:
+    """在**干净子进程**里读默认值。
+
+    不能拿本进程的 crc.FOREGROUND_WORLDBOOK_CONTEXT_MODE 来断言:跑测试的机器/CI
+    只要显式设了这个变量，断言就会静默地测不到默认值（第一版用了 skip，等于在带
+    配置的环境里这条回归根本不存在）。形状照 tests/test_io_cli_auth.py 的
+    `_foreground_context_limit_from_fresh_import`。
+    """
+    env = os.environ.copy()
+    if configured is None:
+        env.pop("FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT", None)
+    else:
+        env["FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT"] = configured
+    root = Path(__file__).resolve().parent.parent
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(root / "tools"), str(root / "backend"), env.get("PYTHONPATH")])
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import chat_resident_consumer as resident; "
+            "print(resident.FOREGROUND_WORLDBOOK_CONTEXT_MODE)",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip().splitlines()[-1]
+
+
+def test_foreground_worldbook_default_is_eager():
+    """默认必须是 eager —— 这条规则的全部价值就在默认值上。
+
+    改成 "tool"（让模型自己去调）在线上被证伪:近 3 天有世界书条目的 47 个用户里
+    只有 9 个拿到过一次带 query 的匹配。默认值一旦被改回去，用户写的设定又会静默
+    地不生效，而且没有任何报错 —— 所以这里钉死它。
+    """
+    assert _worldbook_mode_from_fresh_import(None) == "eager"
+
+
+def test_foreground_worldbook_mode_honors_environment_override():
+    assert _worldbook_mode_from_fresh_import("tool") == "tool"
+
+
+def test_foreground_worldbook_sends_the_recent_window_not_just_this_message(
+    monkeypatch,
+):
+    """扫描深度必须对齐 worldbook_match.WORLD_BOOK_SCAN_MESSAGES。
+
+    只传当前一条等于深度 1，「上一句提了地名、这一句问它」这类跨句触发会全漏。
+    深度从被测模块派生，不写死 5。
+    """
+    import worldbook_match as _wbm
+
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(
+        crc, "_worldbook_signal_window", collections.deque(maxlen=crc.WORLDBOOK_SIGNAL_WINDOW)
+    )
+    crc._remember_worldbook_signal("user", "我们去青岚学院吧")
+    crc._remember_worldbook_signal("assistant", "好啊")
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    crc._worldbook_context_for_foreground("那边现在什么季节")
+
+    sent = post.call_args.kwargs["json"]
+    assert [m["content"] for m in sent["messages"]] == ["我们去青岚学院吧", "好啊"]
+    assert sent["message"] == "那边现在什么季节"
+    # 窗口容量必须跟着匹配器走，不是各写各的；且 = N-1，给本轮那一句留位
+    assert crc.WORLDBOOK_SIGNAL_WINDOW == _wbm.WORLD_BOOK_SCAN_MESSAGES - 1
+    assert crc._worldbook_signal_window.maxlen == _wbm.WORLD_BOOK_SCAN_MESSAGES - 1
+
+
+def test_foreground_worldbook_full_window_sends_exactly_scan_depth(monkeypatch):
+    """满窗时送出 prior=N-1 条,后端再追加当前句,总数恰好 = N。
+
+    第一版 deque maxlen=N,于是满窗实际送 N+1 条:matcher 只取最后 N,trace 的
+    counts.messages 却虚报扫描量(codex 复审实测 prior=5、backend message_count=6)。
+    """
+    import worldbook_match as _wbm
+
+    n = _wbm.WORLD_BOOK_SCAN_MESSAGES
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=crc.WORLDBOOK_SIGNAL_WINDOW))
+    for i in range(n + 3):                       # 故意超量,验证 deque 自己裁
+        crc._remember_worldbook_signal("user" if i % 2 == 0 else "assistant", f"第{i}句")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    crc._worldbook_context_for_foreground("当前句")
+
+    sent = post.call_args.kwargs["json"]
+    assert len(sent["messages"]) == n - 1
+    assert len(sent["messages"]) + 1 == n            # + 当前 `message` = 匹配器深度
+    assert sent["messages"][-1]["content"] == f"第{n + 2}句"   # 留下的是最新的
+
+
+def test_worldbook_signal_window_capacity_handles_scan_depth_of_one(monkeypatch):
+    """N<=1 时容量为 0:deque(maxlen=0) 永远为空,只送当前句,不能负数也不能崩。"""
+    import worldbook_match as _wbm
+
+    monkeypatch.setattr(_wbm, "WORLD_BOOK_SCAN_MESSAGES", 1)
+    cap = max(0, _wbm.WORLD_BOOK_SCAN_MESSAGES - 1)
+    assert cap == 0
+    window = collections.deque(maxlen=cap)
+    window.append({"role": "user", "content": "x"})
+    assert list(window) == []
+
+
+def test_foreground_worldbook_match_seeds_the_window_before_asking(monkeypatch):
+    """光测 seed 函数本身抓不到「调用点被删掉」——那样窗口又退回 session-local。"""
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    seeded: list[float] = []
+    monkeypatch.setattr(
+        crc, "_seed_worldbook_signal_window", lambda before_ts: seeded.append(before_ts)
+    )
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    monkeypatch.setattr(crc._HTTP, "post", MagicMock(return_value=response))
+
+    crc._worldbook_context_for_foreground("那边现在什么季节", before_ts=4600.0)
+
+    assert seeded == [4600.0]
+
+
+def test_worldbook_signal_window_refuses_empty_text(monkeypatch):
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=5))
+    crc._remember_worldbook_signal("user", "   ")
+    crc._remember_worldbook_signal("user", "")
+    assert list(crc._worldbook_signal_window) == []
+
+
+def test_foreground_worldbook_never_matches_on_untrusted_screen_text(monkeypatch):
+    """屏幕文本绝不能参与选世界书条目。
+
+    调用点上方就把屏幕文本拼进了 content；拿那个 content 去匹配，等于让屏幕上的
+    字决定 prompt 里出现什么，绕开「屏幕文本 pull-only」的防注入姿态 —— 与
+    `_worldbook_context_for_wake` 的 docstring 是同一条红线。本测试锁的是:送进
+    匹配器的文本必须是**用户自己那句**，不含屏幕注入。
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(
+        crc,
+        "_worldbook_context_for_foreground",
+        lambda text, **_kwargs: (seen.append(text), "")[1],
+    )
+    monkeypatch.setattr(
+        crc,
+        "_screen_context_for_message",
+        lambda _content: (
+            "UNTRUSTED LIVE SCREEN-SHARE FRAMES\nocr_text: 青岚学院的校规",
+            [],
+            [],
+        ),
+    )
+    msg = _make_msg(role="user", content="今天过得怎么样", ts=3300.0)
+
+    with patch.object(crc, "call_agent", return_value="ok"), patch.object(
+        crc, "post_reply"
+    ):
+        crc._process_messages([msg])
+
+    assert seen == ["今天过得怎么样"]
+    assert not any("ocr_text" in text or "SCREEN-SHARE" in text for text in seen)
+
+
+def test_worldbook_window_is_not_written_until_the_turn_settles(monkeypatch):
+    """回合没落定就写窗口 = 重试后留下幽灵副本。
+
+    transient 写失败会 `_unmark_seen` 把同一条消息放回去重跑。第一版在匹配处就
+    入窗口，于是第二次尝试时窗口里出现两条一模一样的 user 行 —— 既挤掉真实的最近
+    行，又让同一句重复触发（codex 复审实测到这个读数）。
+    """
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=5))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)   # 本测试不测 seed
+    seen_windows: list[list[str]] = []
+
+    def _fake_match(text, **_kwargs):
+        seen_windows.append([m["content"] for m in crc._worldbook_signal_window])
+        return ""
+
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", _fake_match)
+    monkeypatch.setattr(
+        crc, "post_reply", MagicMock(side_effect=RuntimeError("transient write"))
+    )
+    msg = _make_msg(role="user", content="青岚学院在哪", ts=4400.0)
+
+    with patch.object(crc, "call_agent", return_value="在北边"):
+        crc._process_messages([msg])
+        crc._process_messages([msg])          # 重试同一条
+
+    assert len(seen_windows) == 2
+    assert seen_windows[0] == []
+    assert seen_windows[1] == [], f"重试看到了幽灵副本: {seen_windows[1]}"
+
+
+def test_worldbook_window_records_user_then_reply_once_a_turn_settles(monkeypatch):
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=5))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *_a, **_k: "")
+    monkeypatch.setattr(crc, "post_reply", MagicMock(return_value={"ok": True}))
+    msg = _make_msg(role="user", content="青岚学院在哪", ts=4500.0)
+
+    with patch.object(crc, "call_agent", return_value="在北边"):
+        crc._process_messages([msg])
+
+    assert [
+        (m["role"], m["content"]) for m in crc._worldbook_signal_window
+    ] == [("user", "青岚学院在哪"), ("assistant", "在北边")]
+
+
+def test_worldbook_window_seed_backfills_from_durable_history(monkeypatch):
+    """进程重启后不能只剩 session-local 的一两条。
+
+    重启前第 1 句写了关键词、重启后第 2 句才指代它 —— 那正是本单要修的跨句形状，
+    不能用「退化成 1~2 条不影响正确性」含糊过去。
+    """
+    import worldbook_match as _wbm
+
+    monkeypatch.setattr(
+        crc, "_worldbook_signal_window", collections.deque(maxlen=crc.WORLDBOOK_SIGNAL_WINDOW)
+    )
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    history = [
+        _make_msg(role="user", content="我们去青岚学院", ts=100.0),
+        _make_msg(role="openclaw", content="好啊", ts=101.0),
+        _make_msg(role="system", content="上游报错提醒", ts=102.0),
+        _make_msg(role="user", content="带上地图", ts=103.0),
+        _make_msg(role="openclaw", content="收到", ts=104.0),
+        _make_msg(role="user", content="更早之前", ts=1.0),
+        _make_msg(role="user", content="这条比本轮新，不许进", ts=999.0),
+    ]
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)
+
+    contents = [m["content"] for m in crc._worldbook_signal_window]
+    assert "这条比本轮新，不许进" not in contents
+    assert "上游报错提醒" not in contents          # system 通知不是发言过的话
+    # 至多 WINDOW-1 条,给本轮那条留位置
+    assert len(contents) <= _wbm.WORLD_BOOK_SCAN_MESSAGES - 1
+    assert contents[-1] == "收到"
+    assert "我们去青岚学院" in contents
+
+
+def test_worldbook_window_seed_retries_after_transient_none_then_backfills(monkeypatch):
+    """首次 None(无可用源)/异常不能永久记成「已补齐」。
+
+    第一版在读之前就置 seeded=True,又把 None 经 `history or []` 当成功空历史:
+    codex 实测 first=None、second=可用历史时 history_calls=1、seeded=True、window=[]
+    —— 本进程此后永不补齐,重启后跨句匹配仍退回深度 1。
+    """
+    outcomes = iter([None, RuntimeError("decrypt source down"), [
+        _make_msg(role="user", content="我们去青岚学院", ts=100.0),
+        _make_msg(role="openclaw", content="好啊", ts=101.0),
+    ]])
+    calls = {"n": 0}
+
+    def _history(**_kw):
+        calls["n"] += 1
+        item = next(outcomes)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    monkeypatch.setattr(crc, "get_decrypted_history", _history)
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # None → 未补齐
+    assert crc._worldbook_window_seeded is False and list(crc._worldbook_signal_window) == []
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 节流窗口内 → 不打源
+    assert calls["n"] == 1
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 异常 → 仍未补齐
+    assert calls["n"] == 2 and crc._worldbook_window_seeded is False
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 拿到 list → 补齐
+    assert calls["n"] == 3 and crc._worldbook_window_seeded is True
+    assert [m["content"] for m in crc._worldbook_signal_window] == ["我们去青岚学院", "好啊"]
+
+
+def test_worldbook_window_seed_merges_with_live_turns_without_duplicates(monkeypatch):
+    """瞬断期间已落定的回合，恢复补齐时不能再 append 一遍。
+
+    codex r2 实测：first seed=None → 落定 remember(user, assistant) → 61s 后 history 返回
+    同一对 → 窗口 = [用户,回复,用户,回复]，重复且挤掉更早信号。正确语义：durable 快照
+    是更早信号的权威来源；live 里尚未出现在 durable 中的回合保留在其后；同
+    (role, content) 只计一次，且尽可能多地保留真实最近信号。
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    outcomes = iter([None, [
+        _make_msg(role="user", content="更早的用户句", ts=50.0),
+        _make_msg(role="openclaw", content="更早的回复", ts=51.0),
+        _make_msg(role="user", content="上一轮用户", ts=100.0),
+        _make_msg(role="openclaw", content="上一轮回复", ts=101.0),
+    ]])
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: next(outcomes))
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # None → 未补齐
+    crc._remember_worldbook_signal("user", "上一轮用户", ts=100.0)      # 瞬断期间回合落定
+    crc._remember_worldbook_signal("assistant", "上一轮回复", ts=101.0)
+    crc._remember_worldbook_signal("assistant", "只在 live 里的新回复", ts=102.0)  # durable 尚未看到
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 恢复 → 合并
+
+    contents = [m["content"] for m in crc._worldbook_signal_window]
+    assert contents.count("上一轮用户") == 1 and contents.count("上一轮回复") == 1
+    # maxlen=4 下保留尽可能多的最近信号：durable 更早 2 条 + live 3 条 → 留最新 4
+    assert contents == ["更早的回复", "上一轮用户", "上一轮回复", "只在 live 里的新回复"]
+    assert crc._worldbook_window_seeded is True
+
+
+def test_worldbook_window_seed_keeps_legitimate_repeats_from_different_moments(monkeypatch):
+    """同文 ≠ 同事件。
+
+    codex r3 实测：durable=[user:"好"@旧, assistant:"旧回复"]，读侧滞后期间
+    live=[user:"好"@新, assistant:"这是新一轮回复"]；按 (role, content) 去重会把新的那条
+    user:"好" 吞掉。最近 N 条允许内容相同，身份是时间，不是文本。
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    outcomes = iter([None, [
+        _make_msg(role="user", content="好", ts=10.0),
+        _make_msg(role="openclaw", content="旧回复", ts=11.0),
+    ]])
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: next(outcomes))
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # None
+    crc._remember_worldbook_signal("user", "好", ts=100.0)        # 新一轮，同文
+    crc._remember_worldbook_signal("assistant", "这是新一轮回复", ts=101.0)
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)
+
+    assert [(m["role"], m["content"]) for m in crc._worldbook_signal_window] == [
+        ("user", "好"), ("assistant", "旧回复"),
+        ("user", "好"), ("assistant", "这是新一轮回复"),
+    ]
+
+
+def _proactive_job_for_worldbook(ts: float = 123.0) -> dict:
+    # job_id 从 ts 派生：consumer 对已处理 job 有进程内去重，两格若共用同一个 id，
+    # 第二格根本不会发（单跑绿、合跑红的那种漏）。每格传不同 ts。
+    return {
+        "schema_version": 2, "job_id": f"pj_wb_{int(ts)}", "wake_id": "wake_wb",
+        "gate_decision_id": "gd_wb", "source": crc.PROACTIVE_JOB_SOURCE, "ts": ts,
+        "trigger": "screen_tick", "wake_kind": "screen", "user_state": "default",
+        "ai_state": "present", "broadcast_state": "on", "current_app": "Docs",
+        "frame_ids": ["frame_1"],
+    }
+
+
+def _wire_proactive_harness(monkeypatch, *, replies: list[str], post_result):
+    monkeypatch.setattr(crc, "call_agent", lambda *_a, **_k: "\n\n".join(replies))
+    posted: list[str] = []
+
+    def _post(reply, **_kwargs):
+        posted.append(reply)
+        return post_result
+
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda: False)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda job: "")
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids",
+                        lambda frame_ids: ("screen: reading", [{"data": "x"}], ["/tmp/f.jpg"]))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    return posted
+
+
+def test_successful_proactive_reply_enters_worldbook_window_once(monkeypatch):
+    """主动道确认发出的回复 = Feedling 自己的回复，必须进窗口（seed 之后不再拉历史，
+    不记就永远漏）。"""
+    posted = _wire_proactive_harness(
+        monkeypatch, replies=["青岚学院今年的观星祭快到了。"], post_result={"id": "msg_p1"})
+
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=201.0)])
+
+    assert posted == ["青岚学院今年的观星祭快到了。"]
+    assert [(m["role"], m["content"]) for m in crc._worldbook_signal_window] == [
+        ("assistant", "青岚学院今年的观星祭快到了。")
+    ]
+
+
+def test_failed_proactive_post_leaves_no_ghost_in_worldbook_window(monkeypatch):
+    _wire_proactive_harness(
+        monkeypatch, replies=["不该进窗口的段"], post_result={"error": "transient"})
+
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=202.0)])
+
+    assert list(crc._worldbook_signal_window) == []
+
+
+def test_proactive_multi_segment_records_only_successfully_posted_segments(monkeypatch):
+    """多段回复逐条记、只记成功的段。段来自 `_split_agent_turn` 的结构化结果，不是
+    按空行切文本，所以这里直接给一个三段的 AgentTurn。"""
+    results = iter([{"id": "ok1"}, {"error": "transient"}, {"id": "ok3"}])
+    monkeypatch.setattr(crc, "call_agent", lambda *_a, **_k: "raw")
+    monkeypatch.setattr(
+        crc, "_split_agent_turn",
+        lambda *_a, **_k: crc.AgentTurn(messages=["第一段", "第二段", "第三段"]),
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **_k: next(results))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda: False)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda job: "")
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids",
+                        lambda frame_ids: ("screen: reading", [{"data": "x"}], ["/tmp/f.jpg"]))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=203.0)])
+
+    assert [m["content"] for m in crc._worldbook_signal_window] == ["第一段", "第三段"]
+
+
+def test_proactive_reply_then_keywordless_question_reaches_the_matcher(monkeypatch):
+    """主动先说「青岚学院…」，用户随后只问「那里呢？」：foreground 的 payload 必须带上
+    那条主动回复 —— 旧代码（主动道不记窗口）必红。"""
+    _wire_proactive_harness(
+        monkeypatch, replies=["青岚学院今年的观星祭快到了。"], post_result={"id": "msg_p1"})
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=204.0)])
+
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    crc._worldbook_context_for_foreground("那里呢？")
+
+    sent = post.call_args.kwargs["json"]
+    assert sent["message"] == "那里呢？"
+    assert {"role": "assistant", "content": "青岚学院今年的观星祭快到了。"} in sent["messages"]
+
+
+def test_worldbook_signal_payload_never_carries_local_ts(monkeypatch):
+    """ts 是本地身份，不外传：送给 /v1/worldbook/match 的窗口只有 role/content。"""
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    crc._remember_worldbook_signal("user", "x", ts=1.0)
+    assert crc._worldbook_signal_payload() == [{"role": "user", "content": "x"}]
+
+
+def test_foreground_worldbook_context_applied_trace_is_content_free(monkeypatch):
+    """resident V1 **前台**的 worldbook.context.applied：事件闭集、无 content_excerpt、
+    不带条目正文也不带用户原文。live /v1/debug/trace 的投影可能已脱敏，证不了 emitter
+    从未写入正文 —— 只有这格能。现有格只钉了唤醒道。"""
+    block = "<world_book>私密世界设定正文</world_book>"
+    events: list[dict] = []
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *_a, **_k: block)
+    monkeypatch.setattr(crc, "_screen_context_for_message", lambda _c: ("", [], []))
+    monkeypatch.setattr(
+        crc, "_emit_debug_trace",
+        lambda subsystem, event_type, **fields: events.append(
+            {"subsystem": subsystem, "type": event_type, **fields}),
+    )
+    monkeypatch.setattr(crc, "post_reply", MagicMock(return_value={"ok": True}))
+    user_text = "私密的用户提问原文"
+    msg = _make_msg(role="user", content=user_text, ts=4700.0)
+
+    with patch.object(crc, "call_agent", return_value="ok"):
+        crc._process_messages([msg])
+
+    event = next(e for e in events if e["type"] == "worldbook.context.applied")
+    assert set(event) == {"subsystem", "type", "status", "trace_id", "summary", "explain", "detail"}
+    assert "content_excerpt" not in event
+    assert set(event["detail"]) == {"runtime", "lane", "source", "carrier_chars", "truncated"}
+    assert event["detail"]["lane"] == "chat" and event["detail"]["source"] == "eager_context"
+    assert event["detail"]["carrier_chars"] > 0
+    dumped = json.dumps(event, ensure_ascii=False)
+    assert "私密世界设定正文" not in dumped and user_text not in dumped
+
+
+def test_worldbook_window_seed_treats_empty_list_as_done_and_does_not_refetch(monkeypatch):
+    """合法空 list = 账号确实没历史,算补齐,不重复拉。"""
+    calls = {"n": 0}
+
+    def _empty(**_kw):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    monkeypatch.setattr(crc, "get_decrypted_history", _empty)
+
+    crc._seed_worldbook_signal_window(before_ts=10.0)
+    crc._seed_worldbook_signal_window(before_ts=11.0)
+
+    assert calls["n"] == 1
+    assert crc._worldbook_window_seeded is True
+    assert list(crc._worldbook_signal_window) == []
+
+
+def test_foreground_worldbook_tool_mode_is_the_documented_rollback(monkeypatch):
     monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "tool")
     monkeypatch.setattr(
         crc._HTTP,
@@ -1372,7 +1898,7 @@ def test_foreground_worldbook_tool_mode_never_prefetches(monkeypatch):
     assert crc._worldbook_context_for_foreground("今天是什么日子") == ""
 
 
-def test_foreground_worldbook_eager_mode_remains_as_rollback(monkeypatch):
+def test_foreground_worldbook_eager_mode_posts_and_carries_the_trace_id(monkeypatch):
     response = MagicMock(status_code=200)
     response.json.return_value = {
         "block": "<world_book>影月历</world_book>",

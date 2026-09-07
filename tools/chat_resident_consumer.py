@@ -114,6 +114,7 @@ Optional:
 
 import base64
 import binascii
+import collections
 from collections import OrderedDict, namedtuple
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -573,9 +574,31 @@ IMAGE_TEMP_DIR = Path(os.environ.get(
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "tool").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = 90
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
+# 2026-09-07(Seven 拍板 T501):默认从 "tool" 改成 "eager"。
+# 原来的 "tool" 意思是「普通聊天不预取，模型想要自己去调 worldbook-match」。
+# 线上实测这个假设不成立：近 3 天有世界书条目的 47 个用户里，只有 9 个拿到过
+# 一次带 query 的匹配，38 个一次都没有 —— 用户认真写了设定，模型基本不去查。
+# 市面上做世界书的产品（酒馆/NovelAI 一族）没有一家把触发交给模型：都是编排器
+# 每轮拿最近 N 条对话做确定性关键词扫描后直接注入。我们的匹配器本来就是那一套
+# （backend/worldbook_match.py：扫最近 5 条 / alwaysOn / 关键词子串 / 上限+截断），
+# 缺的只是有人喂它。设成 "tool" 可以退回旧行为。
 FOREGROUND_WORLDBOOK_CONTEXT_MODE = os.environ.get(
-    "FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT", "tool"
+    "FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT", "eager"
 ).strip().lower()
+# 世界书匹配信号的进程内滚动缓冲：存**已落定回合**的文本（用户自己发的消息 +
+# 我们自己发出去的回复），每轮随回合提交更新，不再额外解密；进程启动后第一次
+# 前台匹配前由 `_seed_worldbook_signal_window` 从已存储历史补齐一次（那一次会
+# 走解密源）。深度对齐 worldbook_match.WORLD_BOOK_SCAN_MESSAGES：只传当前一条
+# 等于扫描深度 1，「上一句说了地名、这一句问它」这类跨句触发会全部漏掉。
+#
+# 容量 = N-1，**给本轮那一句留位**：后端 match() 会把 `message`（当前句）追加到
+# `messages` 之后再扫最后 N 条。若这里也存 N 条，实际送出 N+1 条——matcher 只取
+# 最后 N，trace 的 counts.messages 却虚报扫描量（codex 复审实测 prior=5、
+# backend message_count=6）。从匹配器派生，不各写一个数。
+WORLDBOOK_SIGNAL_WINDOW = max(0, _worldbook_match.WORLD_BOOK_SCAN_MESSAGES - 1)
+_worldbook_signal_window: "collections.deque[dict[str, str]]" = collections.deque(
+    maxlen=WORLDBOOK_SIGNAL_WINDOW
+)
 SCREEN_VISION_TEST_STATUS = os.environ.get(
     "FEEDLING_AGENT_VISION_TEST_STATUS", "untested"
 ).strip().lower()
@@ -3976,7 +3999,122 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     return "\n".join(context_parts), payloads, paths
 
 
-def _worldbook_context_for_foreground(content: str, *, trace_id: str = "") -> str:
+_worldbook_window_seeded = False
+# 历史源瞬断（异常 / None=无可用源）时**不**标 seeded，下一轮再试；但要节流，
+# 别让一个持续挂掉的解密源在每一轮前台消息上都被打一次。
+_WORLDBOOK_SEED_RETRY_SEC = 60.0
+_worldbook_seed_next_try_at = 0.0
+
+
+def _seed_worldbook_signal_window(before_ts: float) -> None:
+    """进程启动后第一次前台匹配前，用既有历史把窗口补齐。
+
+    没有这一步，窗口就只是 session-local 的：进程重启后「上一句提了地名、这一句
+    指代它」会照样漏匹配 —— 那正是本单要修的跨句形状，不能拿「退化成 1~2 条」
+    含糊过去。走的是与前台续写桥同一套解密源与同一套清洗
+    （`_clean_messages_for_proactive_context` 去掉 system 通知 / 维护行 /
+    verify ping，再去掉语音归档行），并严格只取比本轮更早的行。
+
+    「已补齐」只在拿到**可判定的 list**（含合法空 list：账号确实没历史）后才成立。
+    `get_decrypted_history` 返回 None 表示无可用解密源、异常表示瞬断——这两种都
+    保持未补齐、按 `_WORLDBOOK_SEED_RETRY_SEC` 节流重试；否则一次瞬断会让本进程
+    永远停在深度 1（codex 复审实测：first=None 后 seeded=True、window=[]）。
+
+    补齐取的是**已存储的聊天行**。屏幕文本只拼进发给模型的那份 content，从不
+    落库，因此不会经此进入匹配信号；live 路径的隔离由
+    `test_foreground_worldbook_never_matches_on_untrusted_screen_text` 钉住。
+    """
+    global _worldbook_window_seeded, _worldbook_seed_next_try_at
+    if _worldbook_window_seeded:
+        return
+    want = WORLDBOOK_SIGNAL_WINDOW
+    if not want:
+        _worldbook_window_seeded = True
+        return
+    now = time.monotonic()
+    if now < _worldbook_seed_next_try_at:
+        return
+    try:
+        history = get_decrypted_history(
+            since=0, limit=max(want + 4, 20), include_image_body=False
+        )
+    except Exception as exc:  # noqa: BLE001 — 补齐失败绝不打掉这一轮
+        _worldbook_seed_next_try_at = now + _WORLDBOOK_SEED_RETRY_SEC
+        log.warning("worldbook signal window seed failed (will retry): %s", exc)
+        return
+    if not isinstance(history, list):
+        _worldbook_seed_next_try_at = now + _WORLDBOOK_SEED_RETRY_SEC
+        log.warning("worldbook signal window seed: no decrypt source yet (will retry)")
+        return
+    _worldbook_window_seeded = True
+    rows = [
+        row
+        for row in _clean_messages_for_proactive_context(history)
+        if str(row.get("source") or "") != VOICE_TRANSCRIPT_SOURCE
+    ]
+    if before_ts > 0:
+        rows = [r for r in rows if _message_ts_for_context(r) < before_ts]
+    # 按时间排,不吃调用方的到达顺序:窗口的语义是「最近 N 条」,若顺序反了就会
+    # 把更老的行当成最近的塞进去(单测里故意给了乱序的 history 钉住这一点)。
+    rows.sort(key=_message_ts_for_context)
+    durable: list[dict] = []
+    for row in rows[-want:]:
+        text = str(row.get("_context_text") or "").strip()
+        if not text:
+            continue
+        role = "assistant" if str(row.get("role") or "") != "user" else "user"
+        durable.append({"role": role, "content": text,
+                        "ts": float(_message_ts_for_context(row) or 0.0)})
+    # 与 live 窗口按**时间边界**合并，不按文本判重：
+    #   · 瞬断期间可能已有回合落定进了 live 窗口，恢复后 durable 里会再出现同一批
+    #     事件（codex r2 实测：直接 append 会得到 [用户,回复,用户,回复]）；
+    #   · 但同文 ≠ 同事件（codex r3 实测：旧历史 user:"好" 与新一轮 user:"好" 是两件
+    #     合法的事，按 (role, content) 去重会吞掉新的那条）。
+    # 规则：live 窗口里最早那条信号的 ts 是分界；durable 中 ts >= 分界的行就是 live
+    # 已经持有的那些事件（durable 只是它们的存储副本），丢 durable 的、留 live 的；
+    # ts < 分界的是 live 没有的「更早信号」，排在前面。同一事件只出现一次，
+    # 不同时刻的同文各保留一次。
+    live = list(_worldbook_signal_window)
+    cut = min((float(m.get("ts") or 0.0) for m in live), default=float("inf"))
+    older = [d for d in durable if d["ts"] < cut]
+    _worldbook_signal_window.clear()
+    _worldbook_signal_window.extend(older + live)   # deque 自裁到 maxlen，留最新
+    if durable:
+        log.info("worldbook signal window seeded older=%d live_kept=%d",
+                 len(older), len(live))
+
+
+def _remember_worldbook_signal(role: str, text: str, *, ts: float | None = None) -> None:
+    """Record one trusted turn of text as a future world-book match signal.
+
+    `ts` 是这条信号的事件时刻（用户消息用它的 ts，回复用落定时刻）。它是 seed 合并
+    时的**身份**：同文不等于同事件（用户可以隔一小时再说一次「好」），所以不能拿
+    (role, content) 判重，只能按时间边界判 durable 与 live 的重叠。
+
+    ⛔ 绝不收不可信来源（屏幕文本等）：用它去选世界书条目，等于让屏幕上的字
+    决定 prompt 里出现什么，绕开「屏幕文本 pull-only」的防注入姿态 —— 与
+    `_worldbook_context_for_wake` 的 docstring 是同一条红线。"""
+    body = str(text or "").strip()
+    if not body:
+        return
+    _worldbook_signal_window.append({
+        "role": str(role or "user"), "content": body,
+        "ts": float(ts) if ts is not None else time.time(),
+    })
+
+
+def _worldbook_signal_payload() -> list[dict[str, str]]:
+    """送给 /v1/worldbook/match 的窗口：只带 role/content，ts 是本地身份不外传。"""
+    return [{"role": m["role"], "content": m["content"]} for m in _worldbook_signal_window]
+
+
+def _worldbook_context_for_foreground(
+    content: str, *, trace_id: str = "", before_ts: float = 0.0
+) -> str:
+    """本轮的世界书注入。
+
+    `content` 必须是**用户自己的原始文本**，不能是已经拼进屏幕文本的那个 content
+    （见调用点注释）。窗口里的历史信号同样只来自可信来源。"""
     if FOREGROUND_WORLDBOOK_CONTEXT_MODE not in {
         "1", "true", "on", "auto", "always", "eager",
     }:
@@ -3984,6 +4122,7 @@ def _worldbook_context_for_foreground(content: str, *, trace_id: str = "") -> st
     text = str(content or "").strip()
     if not text:
         return ""
+    _seed_worldbook_signal_window(before_ts)
     try:
         resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/worldbook/match",
@@ -3995,7 +4134,7 @@ def _worldbook_context_for_foreground(content: str, *, trace_id: str = "") -> st
                     else {}
                 ),
             },
-            json={"message": text},
+            json={"messages": _worldbook_signal_payload(), "message": text},
             timeout=20,
         )
         if resp.status_code == 404:
@@ -17912,6 +18051,11 @@ def _process_proactive_jobs(jobs: list) -> float:
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
+                # 主动道**确认发出**的回复也是「Feedling 自己的回复」，按与前台落定处
+                # 同一提交语义记进世界书匹配窗口：逐段、只记成功的段；失败/collision/
+                # suppressed 都到不了这里，不会留幽灵。否则主动先说了「青岚学院…」，
+                # 用户接着只问「那里呢？」时，所谓最近 N 条仍然漏触发（codex r4 指出）。
+                _remember_worldbook_signal("assistant", reply, ts=time.time())
                 if isinstance(result, dict):
                     extra = {
                         "wake_result": "posted",
@@ -18733,6 +18877,12 @@ def _process_messages(messages: list) -> float:
                               "screen_attached": screen_attached,
                               **dict(_last_screen_context_metrics),
                           })
+        # 世界书的匹配信号只能用**用户自己的文本**。下面一行会把屏幕文本拼进
+        # content，而屏幕文本是 pull-only 的不可信输入；拿它去选世界书条目等于
+        # 让屏幕上的字决定 prompt 里出现什么，绕开既有的防注入姿态（与
+        # `_worldbook_context_for_wake` 的 docstring 同一条红线）。所以在拼接
+        # **之前**把原文留下来。
+        worldbook_signal_text = content
         if screen_text:
             content = f"{content}{screen_injection_text}"
             image_payloads.extend(screen_payloads)
@@ -18747,7 +18897,8 @@ def _process_messages(messages: list) -> float:
         # ——enclave 只 cap 单条(20k),多条 alwaysOn 合并后可以远超一轮该占的份额,
         # V2 的 builder 会截断而 resident 直接全塞(codex 复验 2026-08-10 指出)。
         worldbook_text = _worldbook_match.format_context_block(
-            _worldbook_context_for_foreground(content, trace_id=trace_id))
+            _worldbook_context_for_foreground(
+                worldbook_signal_text, trace_id=trace_id, before_ts=ts))
         if worldbook_text:
             _emit_debug_trace(
                 "worldbook",
@@ -19523,6 +19674,7 @@ def _process_messages(messages: list) -> float:
 
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False
+        posted_replies: list[str] = []
         terminal_response_error = False
         for idx, reply in enumerate(replies):
             try:
@@ -19567,6 +19719,7 @@ def _process_messages(messages: list) -> float:
                         continue
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
+                posted_replies.append(reply)
                 log.info("reply sent: %s", reply[:80])
             except Exception as e:
                 log.error("failed to post reply: %s", e)
@@ -19590,6 +19743,15 @@ def _process_messages(messages: list) -> float:
                 ts,
             )
             break
+
+        # 世界书的匹配窗口只在**回合落定后**更新。上面那条重试路径会 _unmark_seen
+        # 把同一条消息放回去重跑；若在匹配处就写窗口，重试会在窗口里留下一个幽灵
+        # 副本——既挤掉真实的最近行，又让同一句重复触发（codex 复审实测:第二次
+        # 尝试时窗口变成两条一模一样的 user 行）。所以窗口的更新点与 checkpoint
+        # 的推进点保持一致。
+        _remember_worldbook_signal("user", worldbook_signal_text, ts=ts)
+        for _posted_reply in posted_replies:
+            _remember_worldbook_signal("assistant", _posted_reply, ts=time.time())
 
         if pending_failure_notice is not None and posted_any:
             _notify_agent_turn_failure(

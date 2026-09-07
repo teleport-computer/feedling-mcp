@@ -498,6 +498,7 @@ jobs:
         run: |
           python -m pytest \
             tests/test_e2e_deep_probes.py \
+            tests/test_worldbook_v1_eager_probe.py \
             -v
 
       # 与上一步同源:同样是确定性离线单测(只 import tools/e2e 的探针模块做纯函数断言,
