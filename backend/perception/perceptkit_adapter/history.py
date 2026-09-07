@@ -131,8 +131,21 @@ def _vitals_back(doc: Mapping[str, Any], steps_doc: Mapping[str, Any] | None
     return out
 
 
+#: 🔴 **同一天同一信号可能有好几行 —— 每个 aggregation_version 一行。**
+#:
+#: 聚合语义变了就会升版本（kit 的 AGGREGATION_VERSION），而新旧两版是
+#: **并排存着**的，旧口径留着供对照和回滚，这是设计如此。不挑版本就会两版
+#: 混读：同一条曲线上半段一个口径、下半段另一个，两边都是合法 JSON，不报错。
+#:
+#: 2026-09-07 睡眠改聚合算法时踩到：v1 的 minutes 恒为空、duration_minutes
+#: 是各阶段的 **max**；v2 才是真正的分桶和求和。混读的话「昨晚睡了多久」
+#: 会在 430 和 250 之间跳。
+#:
+#: 版本一起选出来，**由 Python 挑最高的那一版**（见 daily_rollups）——
+#: 不靠 SQL 的返回顺序。靠顺序的话测试也证不了什么：写一版正确的和一版
+#: 错误的进去，碰巧正确的那版最后返回，测试就绿了。
 _READ = """
-SELECT local_date, signal, typed_aggregate
+SELECT local_date, signal, typed_aggregate, aggregation_version
 FROM perceptkit_daily_aggregate
 WHERE subject_id = %s AND signal = ANY(%s) AND aggregation_kind = 'daily'
 ORDER BY local_date DESC
@@ -172,7 +185,15 @@ def daily_rollups(user_id: str, old_signal: str, days: int) -> list[dict] | None
         return None
 
     by_date: dict[Any, dict[str, Any]] = {}
-    for day, signal, doc in rows:
+    # (日期, 信号) -> 已经采用的那一版。见 _READ 上面那段：同一格可能有
+    # 好几个版本的行，只能留最高的那一版，混读会让同一条曲线两种口径。
+    chosen: dict[tuple[Any, str], int] = {}
+    for day, signal, doc, version in rows:
+        version = int(version or 0)
+        key = (day, signal)
+        if key in chosen and chosen[key] >= version:
+            continue
+        chosen[key] = version
         by_date.setdefault(day, {})[signal] = doc if isinstance(doc, dict) else {}
 
     out: list[dict] = []

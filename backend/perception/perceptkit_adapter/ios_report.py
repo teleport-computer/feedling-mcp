@@ -385,6 +385,103 @@ def _sample_identity(data: Any) -> dict[str, Any]:
     return out
 
 
+#: 睡眠：iOS 送的是**当天各阶段的分钟总数**，manifest 要的是
+#: 「一条观测 = 一个睡眠阶段」（``stage`` 必填）。不摊开的话每一条真实睡眠
+#: 数据都被拒 —— 而且不报错：拒收不进任何计数、摄入照样返回成功、
+#: 快照那侧静默回退到老路，于是 health_sleep 看上去是接通的。
+#:
+#: 摊开**不编造任何东西**：我们只是把「core 250 分钟」这句话按 manifest 的
+#: 形状说一遍，起止时间留空（manifest 里本来就可空）。答不出「你几点入睡」
+#: 是因为 iOS 没告诉我们，不是因为我们丢了。
+#:
+#: 2026-09-07 hx 拍的是「甲+丙」：先服务端摊开止血，iOS 改成按段上报之后
+#: 自然切过去 —— 见下面 `_sleep_observations` 里的直通分支。
+#: 浮点误差容忍：差额小于这个数就不补 unknown 了。
+_SLEEP_REMAINDER_EPS = 0.5
+
+_SLEEP_STAGE_FIELDS = (
+    ("core_minutes", "core"),
+    ("deep_minutes", "deep"),
+    ("rem_minutes", "rem"),
+)
+
+
+def sleep_child_event_id(parent: str, one: Mapping[str, Any]) -> str:
+    """一条睡眠载荷摊成多条观测时，每条子观测的上游身份。
+
+    **为什么必须各有各的身份**：kit 的 fact_key 是
+    `digest(subject, source, signal, source_event_id)` —— **不含维度**。
+    几条子观测共用父 id 就会被当成"同一条事实的几个版本"，
+    只有最后一条留下来，睡眠就只剩一个阶段。
+
+    **格式是契约，不是实现细节**：
+        `<父id>:<阶段>`                    当天总数摊开（一个阶段只出现一次）
+        `<父id>:<阶段>:<起>-<止>`          真实分段（同一觉里可能有多段 core，
+                                          光拼阶段会撞成同一个 id）
+
+    🔴 **给未来接撤回入口的人**：撤回是按 `(source, source_event_id)`
+    **精确匹配**找观测的（见 perceptkit.processing.retract）。上游删的是
+    父 id，而我们存的是子 id —— 所以撤回入口**必须**先把父 id 展开成这里
+    生成的那批子 id，否则"用户在健康 app 里删掉一夜睡眠"会一条都匹配不上，
+    数据纹丝不动。io 目前还没有撤回入口，接的时候从这里开始看。
+    """
+    own = one.get("source_event_id")
+    if own is not None and str(own).strip():
+        return str(own)            # 上游给了分段自己的 id，直接用
+    stage = one.get("stage") or "unknown"
+    start, end = one.get("start_at"), one.get("end_at")
+    if start or end:
+        return f"{parent}:{stage}:{start or ''}-{end or ''}"
+    return f"{parent}:{stage}"
+
+
+def _sleep_observations(data: Any) -> list[dict[str, Any]]:
+    """iOS 的睡眠载荷 → 每个阶段一条观测的 value 列表。
+
+    返回空列表 = 这份载荷里没有可用的睡眠数字，调用方照常走原路。
+    """
+    if not isinstance(data, Mapping):
+        return []
+
+    # ① iOS 已经按段上报（丙 落地之后走这条）。原样直通，一个字段都不改 ——
+    #    真实分段自带起止时间，比我们摊出来的那份准。
+    segments = data.get("stages") or data.get("segments")
+    if isinstance(segments, (list, tuple)) and segments:
+        out = []
+        for seg in segments:
+            if isinstance(seg, Mapping) and seg.get("stage"):
+                out.append({k: v for k, v in seg.items() if v is not None})
+        if out:
+            return out
+
+    # ② 当天总数（今天的 iOS）。摊成每阶段一条。
+    out = []
+    known = 0.0
+    for field, stage in _SLEEP_STAGE_FIELDS:
+        minutes = data.get(field)
+        if isinstance(minutes, (int, float)) and not isinstance(minutes, bool):
+            out.append({"stage": stage, "duration_minutes": minutes})
+            known += float(minutes)
+
+    asleep = data.get("asleep_minutes")
+    if isinstance(asleep, (int, float)) and not isinstance(asleep, bool):
+        # ⚠️ `asleep_minutes` 是**总数**，不是第四个阶段。三个分期都在时
+        # 再发一条 asleep 就等于把同一段睡眠在时间线上记两遍。
+        if not out:
+            # 有些设备只给总睡眠、不给分期。那时 asleep 就是唯一能说的话 ——
+            # 不发它等于这类设备的睡眠一条都进不来。
+            out.append({"stage": "asleep", "duration_minutes": asleep})
+        elif float(asleep) - known > _SLEEP_REMAINDER_EPS:
+            # **部分分期**：比如只有 core 250，而总数是 430。既不能把 asleep
+            # 当第四个阶段发（和 core 重叠），也不能直接丢掉那 180 分钟
+            # （总睡眠会从 430 缩成 250 —— 一个错的数字，不报错）。
+            # 差额记成 `unknown`：manifest 的 stage 枚举里本来就有这一档，
+            # 它诚实地表示"这段睡眠我们知道存在，但不知道属于哪个阶段"。
+            out.append({"stage": "unknown",
+                        "duration_minutes": round(float(asleep) - known, 2)})
+    return out
+
+
 def report_id_for(payload: Mapping[str, Any]) -> str:
     """Derived from the payload, with no clock and no randomness.
 
@@ -431,6 +528,35 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
         if timezone_id:
             obs["timezone"] = timezone_id
         obs.update(_sample_identity(data))
+
+        # 睡眠一条载荷 = 好几条观测（每个阶段一条），和下面的 SPLIT_OFF
+        # 不是一回事：那个是「字段搬去别的信号」，这个是「同一个信号里
+        # 一条记录摊成多条」。所以单独走一段。
+        if signal == "health_sleep" and availability == "observed":
+            stages = _sleep_observations(data)
+            if stages:
+                ident = _sample_identity(data)
+                base_id = ident.get("source_event_id")
+                for one in stages:
+                    stage_obs: dict[str, Any] = {
+                        "signal": signal,
+                        "signal_schema_version": 1,
+                        "occurred_at": occurred_at,
+                        "availability": "observed",
+                        # 段自己的 id 只是用来算身份的，不是 manifest 声明的
+                        # 字段 —— 留在 value 里会被当未声明字段静默丢掉。
+                        "value": {k: v for k, v in one.items()
+                                  if k != "source_event_id"},
+                    }
+                    if timezone_id:
+                        stage_obs["timezone"] = timezone_id
+                    stage_obs.update(ident)
+                    if base_id:
+                        stage_obs["source_event_id"] = sleep_child_event_id(
+                            base_id, one)
+                    observations.append(stage_obs)
+                continue
+
         emit_main = True
         if availability == "observed" and isinstance(data, Mapping):
             value = _rename(signal, data)

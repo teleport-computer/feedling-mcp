@@ -595,3 +595,251 @@ def test_sync_state_is_scoped_by_source_and_collection(clean):
             got = s.get_sync_state(subject_id="u1", source=src,
                                    collection_kind=kind)
             assert got.sync_cursor == f"{src}-{kind}"
+
+
+# ---------------------------------------------------------------------------
+# 睡眠：iOS 的「当天总数」摊成每阶段一条，一路走到真库再读回老路的形状
+#
+# 这是 2026-09-07 hx 拍的「甲」。在此之前 health_sleep 的**每一条真实数据
+# 都被拒**（iOS 送四个当天分钟总数，manifest 要「一条观测 = 一个睡眠阶段」，
+# stage 必填），而三层都不报错：拒收不进任何计数、摄入照样返回成功、
+# 快照那侧静默回退到老路 —— 于是它在「见过的信号」列表里，看上去是通的。
+#
+# 所以这里不验「摊开函数返回了四个 dict」（那只证明我按自己的想法造了数据），
+# 验的是端到端：iOS 载荷 → 信封 → **真 Postgres** → 趋势读回来的文档，
+# 和老路给的逐字段相同。
+# ---------------------------------------------------------------------------
+
+SLEEP_IOS = {"asleep_minutes": 430, "core_minutes": 250,
+             "deep_minutes": 70, "rem_minutes": 110,
+             "source_event_id": "hk-sleep-1"}
+
+
+def _sleep_only(applied):
+    """信封里还有 time_context 那条（时区要跟着走），断言时要滤掉。"""
+    return [o for o in applied if o.stored.signal == "health_sleep"]
+
+
+def _sleep_envelope(payload_data, at="2026-08-27T10:00:00+00:00"):
+    import json as _json
+    from perception.perceptkit_adapter.ios_report import to_envelope
+    return to_envelope({"context_snapshot": [
+        {"key": "time", "data": {"timezone": "UTC", "locale": "zh_CN",
+                                 "local_time": "x"}},
+        {"key": "health_sleep", "data": _json.dumps(payload_data)},
+    ], "client_ts": 1}, occurred_at=at)
+
+
+def test_a_real_sleep_payload_is_no_longer_rejected(clean):
+    """在这条修复之前，applied 是空的、rejected 是整条 —— 而且没有任何报错。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(SLEEP_IOS), context=IngestContext("u1", T0))
+    assert not out.rejected, out.rejected
+    stages = {o.stored.typed_value["stage"] for o in _sleep_only(out.applied)}
+    assert stages == {"core", "deep", "rem"}
+
+
+def test_each_stage_gets_its_own_identity(clean):
+    """四条观测共用一个 source_event_id 会被判成「同身份异内容」冲突，
+    于是只有一条能落地、其余静默丢掉 —— 睡眠就只剩一个阶段。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(SLEEP_IOS), context=IngestContext("u1", T0))
+    ids = sorted(o.stored.source_event_id for o in _sleep_only(out.applied))
+    assert ids == ["hk-sleep-1:core", "hk-sleep-1:deep", "hk-sleep-1:rem"]
+
+
+def test_asleep_total_is_not_emitted_as_a_fourth_overlapping_stage(clean):
+    """`asleep_minutes` 是**总数**，不是第四个阶段。三个分期都在时再发一条
+    asleep，等于把同一段睡眠在时间线上记两遍。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(SLEEP_IOS), context=IngestContext("u1", T0))
+    assert "asleep" not in {o.stored.typed_value["stage"]
+                            for o in _sleep_only(out.applied)}
+
+
+def test_a_device_that_only_reports_total_sleep_still_lands(clean):
+    """有些设备只给总睡眠、不给分期。那时 asleep 就是唯一能说的话 ——
+    不发它等于这类设备的睡眠数据一条都进不来。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope({"asleep_minutes": 430,
+                                      "source_event_id": "hk-sleep-2"}),
+                     context=IngestContext("u1", T0))
+    assert [o.stored.typed_value for o in _sleep_only(out.applied)] == [
+        {"stage": "asleep", "duration_minutes": 430}]
+
+
+def test_ios_reporting_real_segments_passes_straight_through(clean):
+    """iOS 改成按段上报之后（hx 拍的「丙」），真实分段自带起止时间，
+    比我们摊出来的那份准 —— 必须原样直通，不能被摊开逻辑覆盖掉。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    payload = {"source_event_id": "hk-sleep-3", "stages": [
+        {"stage": "core", "duration_minutes": 250,
+         "start_at": "2026-08-26T23:00:00+00:00",
+         "end_at": "2026-08-27T03:10:00+00:00"},
+    ]}
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(payload), context=IngestContext("u1", T0))
+    assert not out.rejected, out.rejected
+    got = _sleep_only(out.applied)[0].stored.typed_value
+    assert got["start_at"] == "2026-08-26T23:00:00+00:00"
+    assert got["end_at"] == "2026-08-27T03:10:00+00:00"
+
+
+def test_the_trend_reads_sleep_back_in_the_old_shape(clean):
+    """真正的验收：趋势工具问「我最近睡得比以前少吗」，读回来的文档必须和
+    老路逐字段相同 —— 包括**算出来的** asleep_minutes（老路的趋势就是读它）。"""
+    from unittest.mock import patch
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    from perception.perceptkit_adapter import history
+    conn = connect()
+    kit = PerceptionKit(storage=store(conn))
+    kit.ingest(_sleep_envelope(SLEEP_IOS), context=IngestContext("u1", T0))
+
+    class _Pool:
+        def connection(self):
+            from contextlib import contextmanager
+            @contextmanager
+            def _c():
+                yield conn
+            return _c()
+
+    with patch("db.get_pool", return_value=_Pool()):
+        rows = history.daily_rollups("u1", "health_sleep", days=30)
+    assert rows, "趋势一天都读不到 —— 摊开之后聚合没折成老路的形状"
+    doc = rows[-1]["doc"]
+    assert doc["core_minutes"] == 250
+    assert doc["deep_minutes"] == 70
+    assert doc["rem_minutes"] == 110
+    # 老路的趋势问的是「睡了多久」，读的就是 asleep_minutes。
+    assert doc["asleep_minutes"] == 430
+
+
+def test_partial_stages_keep_the_missing_time_as_unknown(clean):
+    """只有 core 250、总数 430 时，那 180 分钟不能凭空消失。
+
+    丢掉的话总睡眠从 430 缩成 250 —— 一个错的数字，不报错。
+    补成第四个 asleep 也不行（和 core 在时间线上重叠）。
+    `unknown` 是 manifest 枚举里本来就有的一档，诚实表示
+    「这段睡眠我们知道存在，但不知道属于哪个阶段」。
+    """
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope({"asleep_minutes": 430, "core_minutes": 250,
+                                      "source_event_id": "hk-partial"}),
+                     context=IngestContext("u1", T0))
+    got = {o.stored.typed_value["stage"]: o.stored.typed_value["duration_minutes"]
+           for o in _sleep_only(out.applied)}
+    assert got == {"core": 250, "unknown": 180.0}
+    assert sum(got.values()) == 430
+
+
+def test_two_segments_of_the_same_stage_do_not_collide(clean):
+    """同一觉里可能有好几段 core。身份只拼阶段的话两段撞成同一个 id ——
+    被判成「同一条事实的新版本」，第一段被第二段顶掉，睡眠时长少一截。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    payload = {"source_event_id": "hk-seg", "stages": [
+        {"stage": "core", "duration_minutes": 120,
+         "start_at": "2026-08-26T23:00:00+00:00",
+         "end_at": "2026-08-27T01:00:00+00:00"},
+        {"stage": "core", "duration_minutes": 130,
+         "start_at": "2026-08-27T02:00:00+00:00",
+         "end_at": "2026-08-27T04:10:00+00:00"},
+    ]}
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(payload), context=IngestContext("u1", T0))
+    kept = _sleep_only(out.applied)
+    assert len(kept) == 2, f"两段 core 只留下了 {len(kept)} 段"
+    assert len({o.stored.source_event_id for o in kept}) == 2
+
+
+def test_a_segment_id_from_upstream_wins_over_the_derived_one(clean):
+    """上游给了分段自己的 id 就该用它 —— 那才是撤回时上游会指名的东西。"""
+    from perception.perceptkit_adapter.ios_report import sleep_child_event_id
+    assert sleep_child_event_id("parent", {"stage": "core",
+                                           "source_event_id": "seg-9"}) == "seg-9"
+    assert sleep_child_event_id("parent", {"stage": "core"}) == "parent:core"
+
+
+def test_the_trend_reads_the_newest_aggregation_version_not_a_mix(clean):
+    """两版聚合是**并排存着**的（旧口径留着供对照和回滚）。不筛版本就会
+    混读：同一条曲线上半段一个口径、下半段另一个，两边都是合法 JSON，
+    不报错。"""
+    from unittest.mock import patch
+    from datetime import date
+    from perceptkit.contracts.records import DailyAggregate
+    from perception.perceptkit_adapter import history
+    conn = connect()
+    st = store(conn)
+    for version, total in ((1, 250), (2, 430)):
+        st.put_aggregate(DailyAggregate(
+            subject_id="u1", signal="health_sleep", local_date=date(2026, 8, 27),
+            aggregation_kind="daily", aggregation_version=version,
+            typed_aggregate={"minutes": {"core": 250, "deep": 70, "rem": 110}
+                             if version == 2 else {},
+                             "duration_minutes": {"total": total}},
+            updated_at=T0))
+
+    class _Pool:
+        def connection(self):
+            from contextlib import contextmanager
+            @contextmanager
+            def _c():
+                yield conn
+            return _c()
+
+    with patch("db.get_pool", return_value=_Pool()):
+        rows = history.daily_rollups("u1", "health_sleep", days=30)
+    assert len(rows) == 1, f"同一天返回了 {len(rows)} 行"
+    # v1 的 minutes 是空的 —— 采用 v1 就一个阶段都读不出来。
+    assert rows[0]["doc"].get("core_minutes") == 250, \
+        f"采用的不是最高版本：{rows[0]['doc']}"
+
+
+def test_the_version_choice_does_not_depend_on_row_order():
+    """⚠️ 上面那条其实证不了「挑了最高版本」—— 两版都塞进同一个日期键，
+    后写的那个赢，而谁最后返回取决于 Postgres 的物理顺序。碰巧正确的那版
+    最后返回，测试就绿了（第一版就是这么假绿的，故障注入才抓出来）。
+
+    所以这里直接钉住选择逻辑本身：把**错误的版本放在最后**喂进去。
+    """
+    from datetime import date
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import history
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a): return self
+        def fetchall(self):
+            # 故意让 v2（对的那版）先来、v1（错的）最后来。
+            return [
+                (date(2026, 8, 27), "health_sleep",
+                 {"minutes": {"core": 250}, "duration_minutes": {"total": 430}}, 2),
+                (date(2026, 8, 27), "health_sleep",
+                 {"minutes": {}, "duration_minutes": {"total": 250}}, 1),
+            ]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+
+    class _Pool:
+        def connection(self): return _Conn()
+
+    with patch("db.get_pool", return_value=_Pool()):
+        rows = history.daily_rollups("u1", "health_sleep", days=30)
+    assert rows[0]["doc"].get("core_minutes") == 250, \
+        f"后返回的旧版本把新版本盖掉了：{rows[0]['doc']}"

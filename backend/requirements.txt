@@ -171,4 +171,10 @@ memgarden==0.16.0
 # 装着 0.3.0 跑本分支会在 import 时就炸（缺 contracts.Retraction、
 # StoragePort.record_retraction / list_retractions、
 # PerceptionKit.apply_retractions）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.4.0/perceptkit-0.4.0-py3-none-any.whl
+#
+# 0.4.0 → 0.4.1（2026-09-07）。**带破坏性变更**：`AGGREGATION_VERSION` 1 → 2。
+# 睡眠的聚合语义换了（此前 duration_minutes 取的是各阶段的 max 而不是和，
+# 「昨晚睡了多久」会答 250 而不是 430）。两版聚合是并排存着的，所以读日聚合
+# **必须挑最高版本** —— 配套改动在 perceptkit_adapter/history.py。
+# 装着 0.4.0 跑本分支不会 import 报错，但睡眠会读到空聚合。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.4.1/perceptkit-0.4.1-py3-none-any.whl
