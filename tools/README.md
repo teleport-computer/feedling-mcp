@@ -382,9 +382,13 @@ Cold/rebuilt sessions receive at most eight meaningful recent chat rows by
 default (`FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT=8`). Voice-call archive cards
 are not replayed into that bridge; the model can inspect a relevant call with
 `voice-transcript-list` / `voice-transcript-read`. Foreground World Book matching
-also defaults to `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=tool`, using
-`worldbook-match --query ...` only when the model decides the setting matters.
-Set the World Book mode to `eager` as a rollback.
+defaults to `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=eager`: every foreground turn
+runs the same deterministic keyword scan the proactive lane already used, over a
+recent-turn window (seeded from stored history on the first match after start).
+Only the user's own messages and Feedling's own replies feed that window —
+screen-share text never selects entries. `worldbook-match --query ...` remains
+available for the model to look something up on demand. Set the World Book mode
+to `tool` to restore the old model-invoked-only behaviour.
 
 ##### Hermes example
 

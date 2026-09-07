@@ -12,6 +12,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **World Book entries now reach the model on their own.** Matching used to be
+  left to the model: ordinary chat prefetched nothing, and the model was
+  expected to call `worldbook-match` when it judged the setting mattered. In
+  practice it rarely did — of the users who had entries, most never got a single
+  query-bearing match, so carefully written setting data silently never
+  appeared. Every foreground turn now runs the same deterministic scan the
+  proactive lane already used: the recent window is matched against each entry's
+  keywords, `alwaysOn` entries always apply, and matched entries are injected
+  under the existing World Book header with the existing cap and explicit
+  truncation marker. The `worldbook-match` tool still exists for the model to
+  look something up on demand. Only the user's own message and Feedling's own
+  replies are used as matching signals — screen-share text never selects
+  entries. Self-hosted runtimes can restore the old behaviour with
+  `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=tool`.
+
 - **Image-generation setup now verifies image-named models across provider
   families with a real request.** A model id containing an existing image
   marker is no longer rejected solely because its provider is outside the
