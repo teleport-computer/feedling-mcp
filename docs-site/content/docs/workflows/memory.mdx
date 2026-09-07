@@ -72,14 +72,33 @@ returned by `index` or `fetch`.
 
 Runtime V2's `memory_index` tool accepts `bucket` and `thread` filters in
 addition to `limit`, matching the resident CLI's partitioned browsing path.
-Both `memory_index` and `memory_search` results include `total` (the number of
-available Garden cards before the filter) and `returned` (the number matched by
-that call before the model-result display cap). A truncation marker directs the
-model to browse by bucket or thread while the existing result-size limit stays
-unchanged. Specific questions should use `memory_search` followed by
+The V2-only `memory_index` and `memory_search` views contain compact items
+(`id`, event `date`, `bucket`, and the first sentence of `summary`). `total` is
+the available Garden count before filtering, `matched` is the number returned
+by the underlying read, and `returned` is the number of complete items retained
+for the model. `omitted`, `source_truncated`, and `truncated` distinguish the
+model budget from upstream limits. The 6000-character result budget drops
+whole lower-ranked items, never part of a JSON object. Specific questions should use `memory_search` followed by
 `memory_fetch`; broad reviews should reconcile partition counts against
 `total`, without indiscriminately loading every card. Bulk cleanup requests
 belong to `memory_organize`, not a chat-loop sequence of single-card edits.
+
+V2 `memory_fetch` has a 12000-character result budget and preserves each retained
+card's complete read-side content (up to 5000 characters). Cards that do not fit
+are omitted as whole items and counted explicitly. These memory results reserve
+their full budget in addition to the ordinary tool batch's 8000 characters, so
+mixed batches cannot silently slice their JSON. A turn still limits the number
+of tool calls. The HTTP `/v1/memory/index` and `/v1/memory/fetch` responses and
+resident CLI output are unchanged. Index discovery is allowed once per V2
+loop; after a bounded overview, fetch visible IDs or use a more specific search.
+
+Recall diagnostics distinguish card selection from actual prompt injection.
+`memory.select.traced` does not claim the selected cards reached the model.
+`memory.recall.completed` records per-execution recall counts, with unknown
+values marked explicitly; automatic injection and user-quoted cards are separate.
+V2 events carry turn/job/attempt coordinates so retries and wake work need not
+be mistaken for additional foreground turns. Search diagnostics record a bounded
+sample of returned card IDs and an omitted-ID count, never the query or card text.
 
 `memory_search` matches a literal, case-insensitive substring of the card text;
 it applies no synonyms, translation, or stemming. An empty result therefore means

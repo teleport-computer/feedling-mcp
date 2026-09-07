@@ -24,6 +24,7 @@ from chat import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
+from model_api_runtime.v2 import memory_recall
 import provider_client
 
 
@@ -1019,7 +1020,7 @@ def _normalize_tool_results(
                 "...[memory result truncated; this query returned "
                 f"{returned if isinstance(returned, int) else '?'} of "
                 f"{total if isinstance(total, int) else '?'} total cards. "
-                "Use memory_index with bucket or thread filters to browse partitions.]"
+                "Fetch visible ids or use memory_search with a narrower query.]"
             )
         else:
             markers.append(_RESULT_TRUNCATION_MARKER)
@@ -1187,6 +1188,7 @@ def _with_system_suffix(messages: list, suffix: str) -> list:
     return updated
 
 
+@memory_recall.traced
 async def run_tool_loop(
     *,
     provider_config,

@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 memory results now preserve complete JSON and card content.**
+  Compact index/search views use a 6000-character budget; fetched cards share a
+  12000-character budget without the former per-string 2000-character cut.
+  Overflow drops whole cards with explicit counts, including in mixed tool
+  batches. Public memory HTTP responses and resident CLI output are unchanged.
+  Recall diagnostics separate selection from injection and report unknown
+  counts explicitly instead of presenting missing observations as zero.
+
 - **World Book entries now reach the model on their own.** Matching used to be
   left to the model: ordinary chat prefetched nothing, and the model was
   expected to call `worldbook-match` when it judged the setting mattered. In

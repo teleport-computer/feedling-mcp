@@ -2517,30 +2517,220 @@ def _unmark_seen(keys) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _emit_injection_trace(log: dict | None) -> None:
-    """把 enclave 带回来的注入记录落成一条 debug trace。
+# Per-turn recall bookkeeping (T511). Mutated in place — no ``global`` needed
+# from the big turn functions. ``selected`` = cards the enclave picked this poll
+# (they do NOT reach the prompt until T512 wires injection); ``quoted`` = cards
+# the user explicitly referenced (a separate, already-wired path).
+_RECALL_TURN_STATE: dict[str, Any] = {"selected": None, "candidate_pool": None, "quoted": 0}
+_RECALL_LEDGER_KEYS = ("index_calls", "search_calls", "empty_searches", "fetch_cards")
+_turn_ledger_path: str | None = None
 
-    记录本身已经是内容无关的（见 memgarden/observability.py）；
-    这里只负责转发，不再加工 —— 加工会让「什么算内容」这件事散成两处。
-    失败一律吞掉：可观测性绝不能拖垮聊天。
+
+def _emit_injection_trace(log: dict | None) -> None:
+    """把 enclave 带回来的**选卡**记录落成一条 debug trace。
+
+    ⚠️ 这条 trace 以前叫 ``memory.inject``「注入 N 张」——但 consumer 从来没把这些卡
+    送进 prompt（T510 查实:消费方在 24161351 随死簇删除后无人接回）。事件名和措辞
+    改为「已选、未注入」,detail 显式带 ``injected_to_prompt: 0``,直到 T512 接线。
+    记录本身已经是内容无关的(见 memgarden/observability.py);这里只转发不加工。
+    失败一律吞掉:可观测性绝不能拖垮聊天。
     """
     if not isinstance(log, dict) or not log:
         return
     try:
         counts = log.get("counts") or {}
-        injected = counts.get("injected", 0)
+        selected = counts.get("injected", 0)
         pool = counts.get("candidate_pool", 0)
         mode = log.get("mode", "?")
+        _RECALL_TURN_STATE["selected"] = int(selected or 0)
+        _RECALL_TURN_STATE["candidate_pool"] = int(pool or 0)
         _emit_debug_trace(
-            "memory", "memory.inject",
+            "memory", "memory.select.traced",
             status="ok" if mode != "failed" else "failed",
-            summary=f"注入 {injected} 张（{mode}，候选 {pool}）",
-            explain="每轮自动挑卡的结果。id 与计数落库，卡片正文不落库。",
-            detail=log,
+            summary=f"已选 {selected} 张（{mode}，候选 {pool}）· 未注入",
+            explain="enclave 每轮自动挑卡的结果。当前这些卡不进 prompt（T512 接线前）；id 与计数落库，卡片正文不落库。",
+            detail={**log, "injected_to_prompt": 0},
             dur_ms=log.get("dur_ms"),
         )
     except Exception:  # noqa: BLE001 — 观测失败绝不能影响这一轮对话
         pass
+
+
+def _turn_ledger_open(child_env: dict) -> None:
+    """Create this turn's ledger file and hand its path to the driver via env.
+
+    io_cli appends one content-free line per memory read call (see
+    ``io_cli._append_turn_ledger``); ``_emit_recall_completed`` reads it back.
+    Failure to create the file leaves the env unset → counts report as unknown,
+    never as 0.
+    """
+    global _turn_ledger_path
+    _turn_ledger_close()
+    try:
+        fd, path = tempfile.mkstemp(prefix="feedling-turn-ledger-", suffix=".jsonl")
+        os.close(fd)
+        _turn_ledger_path = path
+        child_env["FEEDLING_TURN_LEDGER"] = path
+    except Exception:  # noqa: BLE001 — bookkeeping must never block a turn
+        _turn_ledger_path = None
+        child_env.pop("FEEDLING_TURN_LEDGER", None)
+
+
+def _turn_ledger_read() -> list[dict] | None:
+    """``None`` = unknown; ``[]`` = ledger present and clean, no memory reads.
+
+    A single unreadable / non-JSON / non-dict line makes the whole ledger
+    unknown: skipping bad lines would turn a broken instrument into「0 次搜索」.
+    Coverage is best-effort — io_cli write failures are silent, so a clean
+    ledger is evidence of *at least* these calls, not a proof of all of them.
+    """
+    path = _turn_ledger_path
+    if not path or not os.path.exists(path):
+        return None
+    rows: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    return None
+                if not isinstance(obj, dict):
+                    return None
+                rows.append(obj)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return rows
+
+
+def _turn_ledger_close() -> None:
+    global _turn_ledger_path
+    path = _turn_ledger_path
+    _turn_ledger_path = None
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _recall_counts_from_ledger(rows: list[dict] | None) -> tuple[dict, list[str]]:
+    """Fold ledger rows into the ``memory.recall.completed`` counts.
+
+    Rules (T511 review): a call is counted when it was dispatched, whatever its
+    outcome; ``empty_searches`` and ``fetch_cards`` only trust rows that
+    succeeded (``ok`` and ``exit == 0``) *and* carry an integer ``items``. A
+    successful row without a valid count makes that derived metric unknown
+    (``None`` + listed in ``unknown``) instead of contributing 0. No ledger at
+    all → every count unknown.
+    """
+    if rows is None:
+        return {k: None for k in _RECALL_LEDGER_KEYS}, list(_RECALL_LEDGER_KEYS)
+    counts: dict[str, int | None] = {k: 0 for k in _RECALL_LEDGER_KEYS}
+    unknown: list[str] = []
+
+    def _mark_unknown(key: str) -> None:
+        counts[key] = None
+        if key not in unknown:
+            unknown.append(key)
+
+    for r in rows:
+        tool = r.get("tool")
+        if tool not in ("memory-index", "memory-fetch"):
+            continue
+        items = r.get("items")
+        valid_items = isinstance(items, int) and not isinstance(items, bool) and items >= 0
+        succeeded = bool(r.get("ok")) and int(r.get("exit") or 0) == 0
+        if tool == "memory-index":
+            if r.get("query"):
+                if counts["search_calls"] is not None:
+                    counts["search_calls"] += 1
+                if succeeded:
+                    if not valid_items:
+                        _mark_unknown("empty_searches")
+                    elif items == 0 and counts["empty_searches"] is not None:
+                        counts["empty_searches"] += 1
+            elif counts["index_calls"] is not None:
+                counts["index_calls"] += 1
+        else:  # memory-fetch
+            if not succeeded:
+                continue
+            if not valid_items:
+                _mark_unknown("fetch_cards")
+            elif counts["fetch_cards"] is not None:
+                counts["fetch_cards"] += items
+    return counts, unknown
+
+
+def _recall_lane(lane_raw: str) -> str:
+    """Contract lane: ``chat`` for a user-facing foreground turn, else ``wake``."""
+    return "chat" if str(lane_raw or "") in ("chat", "foreground") else "wake"
+
+
+def _recall_turn_reset() -> None:
+    _turn_ledger_close()
+    _RECALL_TURN_STATE.update({"selected": None, "candidate_pool": None, "quoted": 0})
+
+
+def _emit_recall_completed(
+    *, trace_id: str, driver: str, lane: str, job_id: str | None = None
+) -> None:
+    """Exactly one ``memory.recall.completed`` per CLI turn (T511 contract).
+
+    ``injected`` is what actually reached the message sent to the driver — 0 until
+    T512 wires the enclave picks in. ``quoted`` is the user's explicit reference
+    path and is reported separately, never folded into ``injected``. ``turn_id``
+    is the FEEDLING_TRACE_ID handed to the driver (the same key io_cli stamps on
+    its own events); ``job_id`` is null + unknown when the caller has none.
+    Always resets the per-turn state, even when the emit itself fails.
+    """
+    try:
+        ledger_counts, unknown = _recall_counts_from_ledger(_turn_ledger_read())
+        selected = _RECALL_TURN_STATE.get("selected")
+        if selected is None:
+            unknown = ["selected", *unknown]
+        if not job_id:
+            unknown = [*unknown, "job_id"]
+        counts = {
+            "injected": 0,
+            "selected": selected,
+            **ledger_counts,
+        }
+
+        def _show(v):
+            return "?" if v is None else str(v)
+
+        _emit_debug_trace(
+            "memory", "memory.recall.completed",
+            trace_id=trace_id,
+            job_id=job_id or "",
+            summary=(
+                f"召回 注入{_show(counts['injected'])} · 已选{_show(selected)} · "
+                f"索引{_show(counts['index_calls'])} · 搜索{_show(counts['search_calls'])}"
+                f"(空{_show(counts['empty_searches'])}) · 取卡{_show(counts['fetch_cards'])}"
+            ),
+            explain="本轮记忆召回汇总：注入=真正进入发给模型的消息的卡数；已选=enclave 挑出但未注入；索引/搜索/取卡=io_cli 本轮调用（来自按轮台账，缺台账或台账损坏记 ?；台账是尽力而为，写失败不可见）。",
+            detail={
+                "runtime": "v1",
+                "driver": driver,
+                "lane": _recall_lane(lane),
+                "lane_raw": str(lane or ""),
+                "turn_id": trace_id or None,
+                "job_id": job_id or None,
+                "counts": counts,
+                "quoted_memories": int(_RECALL_TURN_STATE.get("quoted") or 0),
+                "candidate_pool": _RECALL_TURN_STATE.get("candidate_pool"),
+                "unknown": unknown,
+                "source": "turn_ledger",
+            },
+        )
+    except Exception:  # noqa: BLE001 — 观测失败绝不能影响这一轮对话
+        pass
+    finally:
+        _recall_turn_reset()
 
 
 def _filter_since(msgs: list, since: float) -> list:
@@ -10249,6 +10439,8 @@ def _emit_cli_model_call_terminal(
     becoming ``done``.
     """
     if not context.get("started"):
+        # No turn actually ran: nothing to summarize, but never leak a ledger.
+        _recall_turn_reset()
         return
     try:
         cmd = list(context.get("cmd") or [])
@@ -10386,6 +10578,19 @@ def _emit_cli_model_call_terminal(
         )
     except Exception as exc:  # noqa: BLE001 — observability must never affect a turn
         log.debug("model terminal trace emission failed: %s", exc)
+    finally:
+        # T511: the per-turn recall summary must be emitted (and the ledger
+        # released) even if the terminal trace above raised.
+        _recall_cmd = list(context.get("cmd") or [])
+        _emit_recall_completed(
+            trace_id=trace_id,
+            driver=(
+                "pi" if _is_pi_cmd(_recall_cmd)
+                else ("codex" if _is_codex_cmd(_recall_cmd) else "claude")
+            ) if _recall_cmd else "",
+            lane=str(context.get("lane") or "background"),
+            job_id=str(context.get("job_id") or "") or None,
+        )
 
 
 def _call_agent_cli_impl(
@@ -10480,6 +10685,13 @@ def _call_agent_cli_impl(
     else:
         child_env.pop("FEEDLING_TRACE_ID", None)
         child_env.pop("FEEDLING_DEBUG_TRACE_ID", None)
+    # T511: per-turn ledger so memory.recall.completed can count io_cli memory
+    # reads (subprocesses we otherwise cannot see). Closed at the turn terminal.
+    if _model_call_trace is not None:
+        _turn_ledger_open(child_env)
+        _model_call_trace["lane"] = lane or "background"
+    else:
+        child_env.pop("FEEDLING_TURN_LEDGER", None)
     # pi arg-parses every positional (a message starting with @/-/-- would be eaten
     # as a file ref / flag), so the managed pi template omits {message} and we feed
     # the message via STDIN instead — safe for arbitrary user text. An operator
@@ -18934,6 +19146,7 @@ def _process_messages(messages: list) -> float:
         #                     the generic no-guess marker must still inject
         #   requested==0    → the reference never reached this message
         _quoted_present = len(msg.get("quoted_memories") or [])
+        _RECALL_TURN_STATE["quoted"] = _quoted_present
         _quoted_status = msg.get("quoted_memory_status") or {}
         _quoted_requested = int(_quoted_status.get("requested") or 0)
         _quoted_unavailable = int(_quoted_status.get("unavailable") or 0)

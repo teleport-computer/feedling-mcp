@@ -625,3 +625,249 @@ def test_memory_activity_metadata_custom_bucket_falls_back_to_total():
             ],
         },
     ) == {"memory_count": 11}
+
+
+# ---------------------------------------------------------------------------
+# T511 — V1 recall observability: per-turn ledger + memory.recall.completed.
+# Lives here (not tests/test_chat_resident_consumer.py) because this file is in
+# the CI executed set and already imports both io_cli and the consumer.
+# ---------------------------------------------------------------------------
+
+
+def _ledger_lines(path):
+    with open(path, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def test_turn_ledger_records_only_memory_read_verbs(monkeypatch, tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("FEEDLING_TURN_LEDGER", str(path))
+    monkeypatch.setattr(io_cli, "_LAST_TOOL_OUTPUT", {"ok": True, "items": [1, 2, 3]})
+    io_cli._append_turn_ledger(types.SimpleNamespace(verb="memory-index", query="杯盖"), 0)
+    io_cli._append_turn_ledger(types.SimpleNamespace(verb="memory-index", query=None), 0)
+    io_cli._append_turn_ledger(types.SimpleNamespace(verb="memory-fetch"), 0)
+    io_cli._append_turn_ledger(types.SimpleNamespace(verb="web-search"), 0)
+    rows = _ledger_lines(path)
+    assert [r["tool"] for r in rows] == ["memory-index", "memory-index", "memory-fetch"]
+    assert [r["query"] for r in rows] == [True, False, False]
+    assert all(r["items"] == 3 and r["ok"] is True and r["exit"] == 0 for r in rows)
+    # Content never leaks into the ledger: only tool name and counts.
+    assert not any("杯盖" in line for line in path.read_text(encoding="utf-8").splitlines())
+
+
+def test_turn_ledger_is_silent_without_env_and_never_raises(monkeypatch, tmp_path):
+    monkeypatch.delenv("FEEDLING_TURN_LEDGER", raising=False)
+    monkeypatch.setattr(io_cli, "_LAST_TOOL_OUTPUT", {"ok": True, "items": []})
+    io_cli._append_turn_ledger(types.SimpleNamespace(verb="memory-index", query=None), 0)
+    assert not list(tmp_path.iterdir())
+    # Unwritable path must not break the tool call either.
+    monkeypatch.setenv("FEEDLING_TURN_LEDGER", str(tmp_path / "missing-dir" / "ledger.jsonl"))
+    io_cli._append_turn_ledger(types.SimpleNamespace(verb="memory-fetch"), 0)
+
+
+def test_recall_counts_unknown_without_ledger_is_null_not_zero():
+    counts, unknown = resident._recall_counts_from_ledger(None)
+    assert set(counts) == set(resident._RECALL_LEDGER_KEYS)
+    assert all(v is None for v in counts.values())
+    assert unknown == list(resident._RECALL_LEDGER_KEYS)
+
+
+def test_recall_counts_fold_ledger_rows():
+    ok = {"ok": True, "exit": 0}
+    rows = [
+        {"tool": "memory-index", "query": False, "items": 94, **ok},
+        {"tool": "memory-index", "query": True, "items": 0, **ok},
+        {"tool": "memory-index", "query": True, "items": 2, **ok},
+        {"tool": "memory-fetch", "items": 3, **ok},
+        {"tool": "memory-fetch", "items": 1, **ok},
+        {"tool": "web-search", "items": 5, **ok},
+    ]
+    counts, unknown = resident._recall_counts_from_ledger(rows)
+    assert unknown == []
+    assert counts == {
+        "index_calls": sum(1 for r in rows if r["tool"] == "memory-index" and not r["query"]),
+        "search_calls": sum(1 for r in rows if r["tool"] == "memory-index" and r["query"]),
+        "empty_searches": sum(
+            1 for r in rows
+            if r["tool"] == "memory-index" and r["query"] and r["ok"] and r["items"] == 0
+        ),
+        "fetch_cards": sum(r["items"] for r in rows if r["tool"] == "memory-fetch" and r["ok"]),
+    }
+
+
+def _capture_debug_traces(monkeypatch):
+    calls = []
+
+    def fake_emit(subsystem, type, **kw):
+        calls.append({"subsystem": subsystem, "type": type, **kw})
+
+    monkeypatch.setattr(resident, "_emit_debug_trace", fake_emit)
+    return calls
+
+
+def test_select_trace_says_selected_not_injected(monkeypatch):
+    calls = _capture_debug_traces(monkeypatch)
+    log = {"mode": "bucketed:unified", "counts": {"injected": 4, "candidate_pool": 41}, "dur_ms": 3}
+    resident._emit_injection_trace(log)
+    assert [c["type"] for c in calls] == ["memory.select.traced"]
+    # The old name claimed an injection that never reached the prompt (T510).
+    assert not any(c["type"] == "memory.inject" for c in calls)
+    ev = calls[0]
+    assert ev["subsystem"] == "memory"
+    assert "未注入" in ev["summary"] and "注入 4 张" not in ev["summary"]
+    assert ev["detail"]["injected_to_prompt"] == 0
+    assert ev["detail"]["counts"] == log["counts"]
+    assert resident._RECALL_TURN_STATE["selected"] == log["counts"]["injected"]
+    assert resident._RECALL_TURN_STATE["candidate_pool"] == log["counts"]["candidate_pool"]
+
+
+def test_recall_completed_reports_ledger_counts_and_resets(monkeypatch, tmp_path):
+    calls = _capture_debug_traces(monkeypatch)
+    child_env = {}
+    resident._turn_ledger_open(child_env)
+    path = child_env["FEEDLING_TURN_LEDGER"]
+    assert os.path.exists(path) and resident._turn_ledger_path == path
+    rows = [
+        {"tool": "memory-index", "query": False, "items": 20, "ok": True, "exit": 0},
+        {"tool": "memory-index", "query": True, "items": 0, "ok": True, "exit": 0},
+        {"tool": "memory-fetch", "items": 2, "ok": True, "exit": 0},
+    ]
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(json.dumps(r) for r in rows) + "\n")
+    resident._RECALL_TURN_STATE.update({"selected": 5, "candidate_pool": 41, "quoted": 1})
+
+    resident._emit_recall_completed(trace_id="tr_1", driver="pi", lane="chat")
+
+    assert [c["type"] for c in calls] == ["memory.recall.completed"]
+    ev = calls[0]
+    assert ev["subsystem"] == "memory" and ev["trace_id"] == "tr_1"
+    d = ev["detail"]
+    assert d["runtime"] == "v1" and d["driver"] == "pi" and d["lane"] == "chat"
+    assert d["counts"] == {
+        "injected": 0,
+        "selected": 5,
+        "index_calls": 1,
+        "search_calls": 1,
+        "empty_searches": 1,
+        "fetch_cards": 2,
+    }
+    assert d["quoted_memories"] == 1 and d["unknown"] == ["job_id"] and d["source"] == "turn_ledger"
+    assert d["turn_id"] == "tr_1" and d["job_id"] is None and d["lane_raw"] == "chat"
+    assert "注入0" in ev["summary"] and "已选5" in ev["summary"] and "?" not in ev["summary"]
+    # Turn state and ledger are consumed exactly once.
+    assert not os.path.exists(path) and resident._turn_ledger_path is None
+    assert resident._RECALL_TURN_STATE == {"selected": None, "candidate_pool": None, "quoted": 0}
+
+
+def test_recall_completed_marks_missing_ledger_as_unknown(monkeypatch):
+    calls = _capture_debug_traces(monkeypatch)
+    resident._turn_ledger_close()
+    resident._RECALL_TURN_STATE.update({"selected": None, "candidate_pool": None, "quoted": 0})
+
+    resident._emit_recall_completed(trace_id="tr_2", driver="codex", lane="chat")
+
+    assert [c["type"] for c in calls] == ["memory.recall.completed"]
+    d = calls[0]["detail"]
+    assert d["counts"]["injected"] == 0
+    assert all(d["counts"][k] is None for k in resident._RECALL_LEDGER_KEYS)
+    assert d["counts"]["selected"] is None
+    assert d["unknown"] == ["selected", *resident._RECALL_LEDGER_KEYS, "job_id"]
+    assert "?" in calls[0]["summary"]
+
+
+@pytest.mark.parametrize(
+    "rows, expect_counts, expect_unknown",
+    [
+        # fetch succeeded but reported no integer count → fetch_cards unknown, not 0
+        (
+            [{"tool": "memory-fetch", "ok": True, "exit": 0, "items": None}],
+            {"index_calls": 0, "search_calls": 0, "empty_searches": 0, "fetch_cards": None},
+            ["fetch_cards"],
+        ),
+        # failed search: it is a call, but never an "empty search"
+        (
+            [{"tool": "memory-index", "query": True, "ok": False, "exit": 1, "items": 0}],
+            {"index_calls": 0, "search_calls": 1, "empty_searches": 0, "fetch_cards": 0},
+            [],
+        ),
+        # successful search without a valid count → empty_searches unknown
+        (
+            [{"tool": "memory-index", "query": True, "ok": True, "exit": 0, "items": "3"}],
+            {"index_calls": 0, "search_calls": 1, "empty_searches": None, "fetch_cards": 0},
+            ["empty_searches"],
+        ),
+        # failed fetch contributes nothing and does not poison the count
+        (
+            [
+                {"tool": "memory-fetch", "ok": False, "exit": 1, "items": None},
+                {"tool": "memory-fetch", "ok": True, "exit": 0, "items": 2},
+            ],
+            {"index_calls": 0, "search_calls": 0, "empty_searches": 0, "fetch_cards": 2},
+            [],
+        ),
+    ],
+)
+def test_recall_counts_trust_only_successful_integer_counts(rows, expect_counts, expect_unknown):
+    counts, unknown = resident._recall_counts_from_ledger(rows)
+    assert counts == expect_counts
+    assert unknown == expect_unknown
+
+
+def test_turn_ledger_with_a_bad_line_is_unknown_not_partial(tmp_path, monkeypatch):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(
+        json.dumps({"tool": "memory-index", "query": False, "ok": True, "exit": 0, "items": 3})
+        + "\n{not json\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(resident, "_turn_ledger_path", str(path))
+    assert resident._turn_ledger_read() is None
+    path.write_text("[1, 2]\n", encoding="utf-8")
+    assert resident._turn_ledger_read() is None
+    path.write_bytes(b"\xff\xfe not utf8\n")
+    assert resident._turn_ledger_read() is None
+    path.write_text("", encoding="utf-8")
+    assert resident._turn_ledger_read() == []
+    resident._turn_ledger_path = None
+
+
+def test_recall_completed_maps_lane_and_carries_job_id(monkeypatch):
+    calls = _capture_debug_traces(monkeypatch)
+    resident._turn_ledger_close()
+    resident._emit_recall_completed(trace_id="tr_3", driver="claude", lane="heartbeat", job_id="job_9")
+    d = calls[0]["detail"]
+    assert d["lane"] == "wake" and d["lane_raw"] == "heartbeat"
+    assert d["turn_id"] == "tr_3" and d["job_id"] == "job_9" and calls[0]["job_id"] == "job_9"
+    assert "job_id" not in d["unknown"]
+    assert resident._recall_lane("chat") == "chat" and resident._recall_lane("background") == "wake"
+
+
+def test_terminal_without_started_turn_only_cleans_up(monkeypatch):
+    calls = _capture_debug_traces(monkeypatch)
+    child_env = {}
+    resident._turn_ledger_open(child_env)
+    path = child_env["FEEDLING_TURN_LEDGER"]
+    resident._RECALL_TURN_STATE.update({"selected": 2, "candidate_pool": 9, "quoted": 1})
+    resident._emit_cli_model_call_terminal({"started": False}, trace_id="tr_4", succeeded=True)
+    assert calls == []
+    assert not os.path.exists(path) and resident._turn_ledger_path is None
+    assert resident._RECALL_TURN_STATE == {"selected": None, "candidate_pool": None, "quoted": 0}
+
+
+def test_recall_completed_emits_even_when_terminal_trace_raises(monkeypatch):
+    calls = []
+
+    def flaky_emit(subsystem, type, **kw):
+        if type.startswith("agent.model.call."):
+            raise RuntimeError("boom")
+        calls.append({"subsystem": subsystem, "type": type, **kw})
+
+    monkeypatch.setattr(resident, "_emit_debug_trace", flaky_emit)
+    child_env = {}
+    resident._turn_ledger_open(child_env)
+    path = child_env["FEEDLING_TURN_LEDGER"]
+    context = {"started": True, "started_at": 0.0, "cmd": ["pi"], "result": None, "lane": "chat"}
+    resident._emit_cli_model_call_terminal(context, trace_id="tr_5", succeeded=False,
+                                           failure=RuntimeError("driver failed"))
+    assert [c["type"] for c in calls] == ["memory.recall.completed"]
+    assert not os.path.exists(path) and resident._turn_ledger_path is None

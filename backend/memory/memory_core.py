@@ -197,6 +197,12 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
         detail["query_fingerprint"] = query_fingerprint
+        # debug_trace bounds lists at 20; make that sampling explicit rather
+        # than suggesting that unlogged matches did not exist. Never log text.
+        returned_ids = [item["id"] for item in _items
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        detail["ids"] = returned_ids[:20]
+        detail["ids_omitted"] = max(0, len(returned_ids) - 20)
     debug_trace.trace_event(
         store, subsystem="memory", type=event_type, actor="agent",
         summary=f"{operation_label} returned {len(_items)} items",
