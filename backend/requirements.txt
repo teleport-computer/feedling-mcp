@@ -177,4 +177,11 @@ memgarden==0.19.0
 # 「昨晚睡了多久」会答 250 而不是 430）。两版聚合是并排存着的，所以读日聚合
 # **必须挑最高版本** —— 配套改动在 perceptkit_adapter/history.py。
 # 装着 0.4.0 跑本分支不会 import 报错，但睡眠会读到空聚合。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.4.1/perceptkit-0.4.1-py3-none-any.whl
+#
+# 0.4.1 → 0.5.0（2026-09-07）。**这次 pin 和代码必须一起改**：
+# io 已经在 presence_recovery 里发 `evidence`，而 0.4.1 的 manifest 没有这个
+# 字段 —— 装着 0.4.1 跑本分支不会报错，但那一格会被当未声明字段静默丢掉，
+# 于是下游又只剩"回来了"可说。
+# 同批还有：EventDefinition 动态装配、Workout 三投影（当日求和而不是取 max）、
+# 累计型允许向下修订（counter_epoch_id）。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.5.0/perceptkit-0.5.0-py3-none-any.whl

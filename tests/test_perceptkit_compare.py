@@ -331,3 +331,40 @@ def test_the_unit_bridge_is_declared_per_pair_not_guessed():
                                           {"body_fat_ratio": 18.4})]}
     v = verdicts(compare.compare(live, kit, signals=["health_body_fat"]))
     assert v[("health_body_fat", "body_fat_ratio")] == "differ"
+
+
+# ---------------------------------------------------------------------------
+# 两边各自的取值时刻（外部复核 2026-09-03 §5）
+#
+# prod 上 0.09% 的比对是 `differ`，而「两条路取值时刻不同」和「其中一条算错了」
+# 光看值和次数分不开 —— 分不开就不能下线老路。
+# ---------------------------------------------------------------------------
+
+@needs_pg
+def test_both_sides_own_observed_at_are_recorded_not_just_their_difference(conn):
+    """skew 只答「差多久」，答不了「谁更晚」（它取了绝对值）和「什么时候」。"""
+    d = compare.Divergence("battery", "level_ratio", "differ", 0.30, 0.35,
+                           live_at=1787824800.0, kit_at=1787824812.0)
+    compare.record(conn, "u1", [d], now=T0, report_id="r1")
+    row = compare.summarize(conn, subject_id="u1")[0]
+    assert row["last_skew_sec"] == 12.0
+    assert row["last_live_at"] is not None and row["last_kit_at"] is not None
+    # 谁更晚：kit。这一点光看 skew 是丢的。
+    assert row["last_kit_at"] > row["last_live_at"]
+
+
+@needs_pg
+def test_a_reading_with_no_known_time_stores_null_rather_than_a_made_up_one(conn):
+    """给不出时刻就写 NULL。编一个进去，「时刻不同」这个判据就自己毁了。"""
+    d = compare.Divergence("battery", "level_ratio", "differ", 0.30, 0.35)
+    compare.record(conn, "u1", [d], now=T0, report_id="r1")
+    row = compare.summarize(conn, subject_id="u1")[0]
+    assert row["last_live_at"] is None and row["last_kit_at"] is None
+
+
+def test_app_usage_is_deliberately_still_compared():
+    """外部复核怀疑 app_usage 的比对方法根本不适用（occurrence 流，
+    "当前值"是竞态）。那是个**假设** —— 加了两边 observed_at 之后，
+    数据自己能回答。提前把它标成"形状不同"就是在收证据之前先把证据藏起来。
+    """
+    assert "app_usage" not in compare.SHAPE_DIFFERS

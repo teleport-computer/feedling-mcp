@@ -26,7 +26,7 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0109_divergence_skew"]
+    assert script.get_heads() == ["0110_divergence_observed_at"]
     assert (
         script.get_revision("0109_divergence_skew").down_revision
         == "0108_perceptkit_retraction"
@@ -123,7 +123,7 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0043_divergence_skew"]
+    assert script.get_heads() == ["0044_divergence_observed_at"]
     assert (
         script.get_revision("0043_divergence_skew").down_revision
         == "0042_perceptkit_retraction"

@@ -267,6 +267,14 @@ CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
   -- with no way to tell which, and that is what blocks retiring the live path.
   last_skew_sec  DOUBLE PRECISION,
   max_skew_sec   DOUBLE PRECISION,
+  -- 🔴 两边**各自的**取值时刻，不只是它们的差。
+  --
+  -- 差值回答了「谁读得晚多久」，但丢了两件事：谁更晚（skew 取了绝对值），
+  -- 以及绝对时间（没法和别的东西对时间线）。外部复核要的就是这两格 ——
+  -- 「取值时刻不同」和「其中一条路算错了」，光看值和次数分不开，
+  -- 而分不开就不能下线老路。
+  last_live_at   TIMESTAMPTZ,
+  last_kit_at    TIMESTAMPTZ,
   PRIMARY KEY (subject_id, signal, field, verdict)
 );
 """

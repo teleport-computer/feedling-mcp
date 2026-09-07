@@ -1020,3 +1020,64 @@ def test_a_client_that_sends_no_window_never_deletes(clean):
     _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
     _mirror(conn, _cal_payload([_event("e1")], window=False))
     assert _titles(conn) == ["e1", "e2"]
+
+
+def test_the_real_ios_per_segment_payload_lands_with_its_own_intervals(clean):
+    """iOS 改成逐段上报之后的**真实载荷形状**（字段名按 .convertToSnakeCase
+    之后的样子写），一路走到真库。
+
+    这是「甲+丙」里的丙：真实分段自带起止，比服务端摊出来的那份准 ——
+    摊出来的答不了「你几点入睡」。
+    """
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    payload = {
+        # 老路读的四个当天总数照旧发（新旧后端都不坏）
+        "asleep_minutes": 430, "core_minutes": 250,
+        "deep_minutes": 70, "rem_minutes": 110,
+        "source_event_id": "hk-night-1",
+        "stages": [
+            {"stage": "core", "duration_minutes": 130,
+             "start_at": "2026-08-26T23:10:00+08:00",
+             "end_at": "2026-08-27T01:20:00+08:00",
+             "source_event_id": "seg-a"},
+            {"stage": "deep", "duration_minutes": 70,
+             "start_at": "2026-08-27T01:20:00+08:00",
+             "end_at": "2026-08-27T02:30:00+08:00",
+             "source_event_id": "seg-b"},
+            {"stage": "core", "duration_minutes": 120,
+             "start_at": "2026-08-27T02:30:00+08:00",
+             "end_at": "2026-08-27T04:30:00+08:00",
+             "source_event_id": "seg-c"},
+        ],
+    }
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(payload), context=IngestContext("u1", T0))
+    assert not out.rejected, out.rejected
+    kept = _sleep_only(out.applied)
+    # 两段 core 必须都活着，各带各的起止和身份
+    assert len(kept) == 3, f"三段只留下了 {len(kept)} 段"
+    assert sorted(o.stored.source_event_id for o in kept) == ["seg-a", "seg-b", "seg-c"]
+    core = [o.stored.typed_value for o in kept if o.stored.typed_value["stage"] == "core"]
+    assert len(core) == 2
+    assert all(c.get("start_at") and c.get("end_at") for c in core), \
+        "真实分段必须带着自己的起止 —— 那正是它比总数摊开强的地方"
+    # 段自己的 id 不该留在 value 里（manifest 没声明这个字段）
+    assert all("source_event_id" not in c for c in core)
+
+
+def test_per_segment_wins_over_the_daily_totals_in_the_same_payload(clean):
+    """两者同时存在时走分段。总数是给老路读的，摊开只是分段缺席时的兜底。"""
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    payload = {"asleep_minutes": 430, "core_minutes": 250, "deep_minutes": 70,
+               "rem_minutes": 110, "source_event_id": "hk-night-2",
+               "stages": [{"stage": "core", "duration_minutes": 250,
+                           "start_at": "2026-08-26T23:00:00+08:00",
+                           "end_at": "2026-08-27T03:10:00+08:00",
+                           "source_event_id": "seg-only"}]}
+    kit = PerceptionKit(storage=store())
+    out = kit.ingest(_sleep_envelope(payload), context=IngestContext("u1", T0))
+    kept = _sleep_only(out.applied)
+    assert [o.stored.source_event_id for o in kept] == ["seg-only"], \
+        "有分段时不该再按总数摊出 deep/rem 那两条"
