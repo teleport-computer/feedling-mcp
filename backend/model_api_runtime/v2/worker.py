@@ -561,7 +561,7 @@ cap_result_budget.validate_result_caps(
     tool_names=tuple(
         name
         for name in cap_result_budget.ATOMIC_TOOL_NAMES
-        if name == "web_fetch"
+        if name == "web_fetch" or name in cap_result_budget.MEMORY_TOOL_NAMES
         or (cap_history.enabled() and name in cap_history.HISTORY_TOOL_NAMES)
     ),
 )
@@ -3276,6 +3276,27 @@ def _schema_surface_trace_callback(
             )
 
     return _emit
+
+
+def _memory_recall_callback(deps, user_id, job, lane):
+    """Attach durable coordinates at the worker/diagnostics assembly boundary."""
+    from model_api_runtime.v2 import memory_recall
+
+    async def emit(detail):
+        if deps.emit_debug_trace is None:
+            return
+        trace_id = str(job.get("trace_id") or "")
+        job_id = str(job["id"])
+        turn_id = trace_id or f"{lane}:{job_id}"
+        await asyncio.to_thread(
+            deps.emit_debug_trace, user_id, "memory.recall.completed",
+            status="ok", trace_id=trace_id, turn_id=turn_id, job_id=job_id,
+            summary=memory_recall.summary(detail["counts"]),
+            detail={**detail, "lane": "chat" if lane == "chat" else "wake",
+                    "turn_id": turn_id, "job_id": job_id,
+                    "attempt": int(job.get("attempt_count") or 0)},
+        )
+    return emit
 
 
 def _normalize_provider_trace_lane(lane: object) -> str:
@@ -11135,6 +11156,10 @@ async def _run_wake(
         try:
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
+                on_memory_recall_completed=_memory_recall_callback(
+                    deps, user_id,
+                    {"id": job_id, "trace_id": trace_id, "attempt_count": attempt_count}, lane,
+                ),
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
@@ -16319,6 +16344,7 @@ async def process_job(
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
+            on_memory_recall_completed=_memory_recall_callback(deps, user_id, job, lane),
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
             memory_delete_allowed=True,

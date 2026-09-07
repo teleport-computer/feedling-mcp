@@ -5089,7 +5089,8 @@ def _emit_v2_debug_trace(store, event_type: str, *, status: str,
     from diagnostics import diagnostics_core
 
     event = {
-        "subsystem": "agent", "type": event_type, "status": status,
+        "subsystem": "memory" if event_type == "memory.recall.completed" else "agent",
+        "type": event_type, "status": status,
         "summary": summary, "explain": explain, "detail": detail,
         "actor": "hosted_v2", "trace_id": str(trace_id or ""),
     }

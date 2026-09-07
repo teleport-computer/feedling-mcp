@@ -3284,7 +3284,7 @@ def test_all_tool_results_share_per_call_and_aggregate_prompt_budgets(monkeypatc
     assert all(result.content.endswith("...[truncated]") for result in exchange.results[1:])
 
 
-def test_truncated_memory_index_result_keeps_partition_guidance_and_metadata():
+def test_truncated_memory_index_result_keeps_actionable_guidance_and_metadata():
     original = ToolResult(
         call_id="memory-many",
         content="x" * 5000,
@@ -3303,7 +3303,8 @@ def test_truncated_memory_index_result_keeps_partition_guidance_and_metadata():
 
     assert len(normalized.content) == 500
     assert "returned 50 of 103 total cards" in normalized.content
-    assert "bucket or thread filters" in normalized.content
+    assert "memory_search with a narrower query" in normalized.content
+    assert "Use memory_index" not in normalized.content
     assert normalized.metadata == original.metadata
 
 

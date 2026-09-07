@@ -364,6 +364,40 @@ def _activity_tool_name(args):
     return verb.replace("-", "_")
 
 
+_TURN_LEDGER_TOOLS = ("memory-index", "memory-fetch")
+
+
+def _append_turn_ledger(args, exit_code):
+    """Append one content-free line per memory read call to the per-turn ledger.
+
+    The V1 consumer sets ``FEEDLING_TURN_LEDGER`` on the driver process for one
+    turn and reads the file back at turn end to build ``memory.recall.completed``
+    (T511). io_cli runs as a subprocess the consumer cannot observe, so this file
+    is the only reliable per-turn count of index/search/fetch calls. Only the
+    tool name and counts are written — never card text or ids. No env = not a
+    consumer turn (V2 / ad-hoc): do nothing. Best-effort: bookkeeping must never
+    change tool output or exit code.
+    """
+    try:
+        path = _env("FEEDLING_TURN_LEDGER")
+        verb = str(getattr(args, "verb", "") or "")
+        if not path or verb not in _TURN_LEDGER_TOOLS:
+            return
+        out = _LAST_TOOL_OUTPUT if isinstance(_LAST_TOOL_OUTPUT, dict) else {}
+        items = out.get("items")
+        rec = {
+            "tool": verb,
+            "query": bool(getattr(args, "query", None)) if verb == "memory-index" else False,
+            "exit": int(exit_code or 0),
+            "ok": bool(out.get("ok")) if out else False,
+            "items": len(items) if isinstance(items, list) else None,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a tool call
+        pass
+
+
 def _memory_activity_metadata(tool_name, output):
     if tool_name not in {"memory_index", "memory_search", "memory_fetch"}:
         return {}
@@ -2391,6 +2425,7 @@ def main():
             exit_code=exit_code,
         )
         _emit_tool_trace(args, exit_code, duration_ms)
+        _append_turn_ledger(args, exit_code)
 
 
 if __name__ == "__main__":

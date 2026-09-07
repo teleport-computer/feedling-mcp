@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -694,7 +695,7 @@ def test_chat_tool_callback_persists_only_safe_memory_summary(monkeypatch):
     assert "private" not in repr(captured)
 
 
-def test_executor_keeps_memory_count_before_provider_result_truncation(monkeypatch):
+def test_executor_keeps_memory_count_and_full_atomic_result(monkeypatch):
     monkeypatch.setattr(
         executor.cap_registry,
         "run_capability",
@@ -718,10 +719,12 @@ def test_executor_keeps_memory_count_before_provider_result_truncation(monkeypat
         )
 
     result = asyncio.run(run())[0]
-    assert result.content.endswith("...[truncated]")
+    assert len(json.loads(result.content)["items"]) == 2
     assert result.metadata == {
         "memory_count": 2,
         "memory_categories": [{"key": "family", "count": 2}],
+        "result_budget_kind": "memory_search",
+        "memory_matched": None,
     }
 
 
@@ -754,7 +757,7 @@ def test_executor_projects_perception_empty_metadata_at_trusted_boundary(monkeyp
     assert result.metadata == {"perception_result_kind": "empty"}
 
 
-def test_executor_memory_index_truncation_guides_partition_browsing(monkeypatch):
+def test_executor_rejects_unshrunk_overbudget_atomic_memory_result(monkeypatch):
     monkeypatch.setattr(
         executor.cap_registry,
         "run_capability",
@@ -780,6 +783,6 @@ def test_executor_memory_index_truncation_guides_partition_browsing(monkeypatch)
         )
 
     result = asyncio.run(run())[0]
-    assert "returned 50 of 103 total cards" in result.content
-    assert "bucket or thread filters" in result.content
-    assert len(result.content) == executor._RESULT_CHAR_CAP + len("...[truncated]")
+    # This fake capability violates its structural shrink contract. The
+    # executor must fail closed, not send a sliced JSON object to the model.
+    assert result.content == "error: result_budget_exceeded"
