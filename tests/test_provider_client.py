@@ -390,6 +390,184 @@ def test_deepseek_v4_flash_defaults_to_non_thinking(monkeypatch):
     assert calls[0]["json"]["thinking"] == {"type": "disabled"}
 
 
+@pytest.mark.parametrize(
+    ("configured_model", "wire_model"),
+    [
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek-v4-flash", "deepseek-v4-flash"),
+        ("deepseek-reasoner", "deepseek-v4-flash"),
+    ],
+)
+def test_deepseek_required_tool_choice_disables_thinking_for_that_request(
+    configured_model,
+    wire_model,
+):
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+
+    assert payload["model"] == wire_model
+    assert payload["tool_choice"] == "required"
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        None,
+        "auto",
+        {"type": "function", "function": {"name": "ping"}},
+    ],
+)
+def test_deepseek_non_required_tool_choice_preserves_default_thinking(
+    tool_choice,
+):
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice=tool_choice,
+    )
+
+    assert "thinking" not in payload
+    if tool_choice is None:
+        assert "tool_choice" not in payload
+    else:
+        assert payload["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "expected_thinking"),
+    [
+        ("deepseek-v4-flash", {"type": "disabled"}),
+        ("deepseek-reasoner", {"type": "enabled"}),
+    ],
+)
+def test_deepseek_auto_choice_preserves_explicit_model_thinking_mode(
+    configured_model,
+    expected_thinking,
+):
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="auto",
+    )
+
+    assert payload["tool_choice"] == "auto"
+    assert payload["thinking"] == expected_thinking
+
+
+def test_deepseek_required_choice_without_tools_never_reaches_the_wire():
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "No tools are offered."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=None,
+        tool_choice="required",
+    )
+
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "openai_compatible"])
+def test_non_deepseek_required_tool_choice_never_injects_thinking(provider):
+    payload = pc._build_openai_compat_payload(
+        provider=provider,
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+
+    assert payload["tool_choice"] == "required"
+    assert "thinking" not in payload
+
+
+def test_deepseek_host_does_not_override_openai_compatible_adapter(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(200, {
+                "id": "chatcmpl-relay-test",
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call-ping",
+                            "type": "function",
+                            "function": {"name": "ping", "arguments": "{}"},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            })
+
+    monkeypatch.setattr(pc, "_shared_async_client", FakeAsyncClient())
+
+    asyncio.run(
+        pc.chat_completion_async(
+            pc.ProviderConfig(
+                "openai_compatible",
+                "deepseek-v4-flash-vision-exp",
+                "sk-relay-test",
+                base_url="https://api.deepseek.com",
+            ),
+            [{"role": "user", "content": "Call ping."}],
+            tools=[ToolSpec(
+                "ping", "Ping.", {"type": "object", "properties": {}}
+            )],
+            tool_choice="required",
+        ),
+    )
+
+    assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
+    assert calls[0]["json"]["tool_choice"] == "required"
+    assert "thinking" not in calls[0]["json"]
+
+
 def test_openrouter_legacy_deepseek_model_maps_to_v4_flash(monkeypatch):
     calls = _fake_client(
         monkeypatch,

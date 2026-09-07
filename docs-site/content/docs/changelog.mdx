@@ -21,6 +21,11 @@ change must not be interpreted as an API guarantee.
   image marker are still rejected locally without contacting the provider.
   Ordinary Chat requests keep their existing provider-specific modality gate.
 
+- **DeepSeek proactive wakes can again complete their required final choice.**
+  When a DeepSeek turn must select a tool, the backend disables native thinking
+  for that one request. Other DeepSeek requests keep their configured thinking
+  behavior, and other providers are unchanged.
+
 - **Image-generation setup errors now preserve actionable provider causes.**
   HTTP 401/403 credential rejection, 402 quota exhaustion, 404 missing model or
   endpoint, and 400/415/422 incompatibility now return their existing distinct
