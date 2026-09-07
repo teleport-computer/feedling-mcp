@@ -146,6 +146,33 @@ def test_image_generation_configuration_catalog_is_actionable_and_bilingual():
         ) != catalog.user_text_for(error_class, language="zh-Hans")
 
 
+def test_image_generation_status_specific_copy_matches_approved_contract():
+    expected = {
+        "image_generation_model_incompatible": (
+            "这个模型或接口不支持生图，请换一个模型。",
+            "This model or endpoint can't generate images. Try another model.",
+        ),
+        "image_generation_auth_invalid": (
+            "API Key 被拒绝，请检查 Key 和权限。",
+            "API key rejected. Check the key and its permissions.",
+        ),
+        "image_generation_quota_insufficient": (
+            "额度或余额不足，请充值后重试。",
+            "Insufficient quota or balance. Top up and retry.",
+        ),
+        "image_generation_model_not_found": (
+            "找不到该模型或接口地址，请检查模型名和 Base URL。",
+            "Model or endpoint not found. Check the model name and Base URL.",
+        ),
+    }
+
+    for error_class, (expected_zh, expected_en) in expected.items():
+        assert catalog.user_text_for(
+            error_class, language="zh-Hans"
+        ) == expected_zh
+        assert catalog.user_text_for(error_class, language="en-US") == expected_en
+
+
 def test_every_direct_terminal_chat_notice_is_bilingual():
     direct_notice_classes = set(jobs_store._DIRECT_NOTICE_ERROR_CLASSES)
     direct_notice_classes.update(

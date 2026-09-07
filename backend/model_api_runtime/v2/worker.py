@@ -1999,14 +1999,22 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         # reject suffix is diagnostic, never evidence of a provider/user fault.
         return "unknown"
 
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {401, 403}:
+        return (
+            "auth_invalid"
+            if error_contract.provider_response_is_auth_failure(
+                status_code,
+                getattr(exc, "raw_response_body", "")
+                or getattr(exc, "response_detail", ""),
+            )
+            else "upstream_unavailable"
+        )
     classified = notices_catalog.classify_upstream(str(exc))
     if classified:
         return classified
-    status_code = getattr(exc, "status_code", None)
     if status_code == 402:
         return "quota_insufficient"
-    if status_code in {401, 403}:
-        return "auth_invalid"
     if status_code in {400, 422}:
         return "provider_incompatible"
     if status_code == 408:

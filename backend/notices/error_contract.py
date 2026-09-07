@@ -8,6 +8,7 @@ consumer can distinguish a complete empty value from an unavailable source.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
@@ -112,6 +113,139 @@ def _spec(
     )
 
 
+# 上游“通用 403 体”：中转站/网关因为自己的原因拒绝时回的 OpenAI 风格空壳
+# （403 + {"message":"Request failed. Please try again later.","type":"api_error",…}），
+# 里面没有任何鉴权语义。它与真正的“key 无效”403 在状态码上同形，但把它判成
+# auth_invalid 会让用户照着文案反复重存 key —— 2026-09-06 线上就这么发生过一整晚
+# （T497：用户的 key 自 7-14 起没变过，测试也通过，失败却是间歇的）。
+#
+# raw JSON 判据必须对**整条 candidate 一次性**成立，不能写成“某个 403 后面若干
+# 字符内有 api_error”。逐个出现位置去判会被三种形状绕开（都实测过）：
+#   ① 只要 type=api_error 就放行 → "Account suspended by provider" 这类真账号问题
+#      被误判成暂时不可用；所以必须连那条**精确的通用 message** 一起要求。
+#   ② 体里再出现一次 403（如 "code":"403"）→ 后一个 occurrence 绕过负向断言。
+#   ③ 状态码写在体后面（"…; status 403"）→ 只向后看的断言直接失效。
+#   ④ 那句话**裸着出现在外层日志里**（而 body 的 message 是别的）→ 若只匹配裸短语
+#      同样会放行；所以它必须钉在 JSON 的 `message` 字段上，不是文本里任意一处。
+# 因此 raw-JSON 三项条件写成三个独立的先行断言并锚在 \A：**顺序可交换、重复
+# 不影响**。另有一个不可合并的 production-detail adapter：provider_client 历史上
+# 先把 JSON 抽成 message，再生成 ``provider_http_403: <message>``。那条输入已经
+# 永久丢了 type，必须用状态前缀 + 精确 message 识别；新的结构化异常则走下方
+# ``provider_response_is_auth_failure(status, raw_body)``，不再主动丢 body。
+GENERIC_UPSTREAM_403_MESSAGE_TEXT = "Request failed. Please try again later."
+_GENERIC_UPSTREAM_403_MESSAGE_VALUE = re.escape(
+    GENERIC_UPSTREAM_403_MESSAGE_TEXT
+)
+_GENERIC_UPSTREAM_403_MESSAGE = (
+    r"\"message\"\s*:\s*\"" + _GENERIC_UPSTREAM_403_MESSAGE_VALUE + r"\""
+)
+_GENERIC_UPSTREAM_403_JSON_SHAPE = (
+    r"(?=[\s\S]*\b403\b)"
+    r"(?=[\s\S]*" + _GENERIC_UPSTREAM_403_MESSAGE + r")"
+    r"(?=[\s\S]*\"type\"\s*:\s*\"api_error\")"
+)
+# provider_client._raise_for_provider_status does not expose that JSON to its
+# consumers: it first extracts the message and formats the production exception
+# as ``provider_http_403: <message>``.  Keep that real shape separate from the
+# raw-JSON/log adapter so an unrelated outer log phrase cannot satisfy it.
+_GENERIC_UPSTREAM_403_DETAIL_SHAPE = (
+    r"(?=[\s\S]*\bprovider_http_403\s*:\s*"
+    + _GENERIC_UPSTREAM_403_MESSAGE_VALUE
+    + r"(?:\s|$))"
+)
+_GENERIC_UPSTREAM_403_SHAPE = (
+    r"(?:" + _GENERIC_UPSTREAM_403_JSON_SHAPE
+    + r"|" + _GENERIC_UPSTREAM_403_DETAIL_SHAPE + r")"
+)
+# upstream_unavailable 用的正向式；auth_invalid 的裸 403 分支用它的否定式。
+# 二者共用 _SHAPE，不会各改各的；裸 403 只在整条 candidate **不是**该形状时才算鉴权。
+_GENERIC_UPSTREAM_403 = r"\A" + _GENERIC_UPSTREAM_403_SHAPE
+_AUTH_403 = r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE + r")[\s\S]*?\b403\b"
+_AUTH_PROVIDER_HTTP_403 = (
+    r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE
+    + r")[\s\S]*?\bprovider_http_403\b"
+)
+
+_EXPLICIT_PROVIDER_AUTH = re.compile(
+    r"invalid ?(?:x-)?api.?key|unauthorized|authentication",
+    re.IGNORECASE,
+)
+
+
+def _contains_generic_upstream_403_object(value: object) -> bool:
+    if isinstance(value, dict):
+        message = value.get("message")
+        error_type = value.get("type")
+        if (
+            isinstance(message, str)
+            and message.strip().casefold()
+            == GENERIC_UPSTREAM_403_MESSAGE_TEXT.casefold()
+            and isinstance(error_type, str)
+            and error_type.strip().casefold() == "api_error"
+        ):
+            return True
+        return any(
+            _contains_generic_upstream_403_object(item)
+            for item in value.values()
+            if isinstance(item, (dict, list))
+        )
+    if isinstance(value, list):
+        return any(_contains_generic_upstream_403_object(item) for item in value)
+    return False
+
+
+def _is_generic_upstream_403_body(raw_body: object) -> bool:
+    """Recognize the observed relay shell without normalizing the input first."""
+    candidate = str(raw_body or "").strip()
+    if not candidate:
+        return False
+    # Persisted/detail-only adapters have already lost the JSON envelope.  The
+    # exact message is still sufficient there; structured provider exceptions
+    # supply the raw body and take the object branch below.
+    if candidate.casefold() == GENERIC_UPSTREAM_403_MESSAGE_TEXT.casefold():
+        return True
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError):
+        parsed = None
+    if _contains_generic_upstream_403_object(parsed):
+        return True
+    # Resident CLI errors can wrap the untouched provider body in an outer text
+    # line.  Require both JSON field shapes; the phrase appearing elsewhere in
+    # a log is not enough.
+    return bool(
+        re.search(_GENERIC_UPSTREAM_403_MESSAGE, candidate, re.IGNORECASE)
+        and re.search(
+            r'"type"\s*:\s*"api_error"', candidate, re.IGNORECASE
+        )
+    )
+
+
+def provider_response_is_auth_failure(status_code: object, raw_body: object) -> bool:
+    """Classify only the 401/403 authentication boundary shared by all lanes.
+
+    Callers must pass the original body/text, not a lower-cased derivative.
+    Matching is deliberately case-insensitive because relay capitalization is
+    not stable; retaining the original input is a provenance contract, not a
+    case-sensitivity requirement.  Missing or unrecognised 403 evidence keeps
+    the historical fail-closed authentication classification.
+    """
+    if isinstance(status_code, bool):
+        return False
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if status == 401:
+        return True
+    if status != 403:
+        return False
+    candidate = str(raw_body or "")
+    if _EXPLICIT_PROVIDER_AUTH.search(candidate):
+        return True
+    return not _is_generic_upstream_403_body(candidate)
+
+
 def _chat_specs() -> tuple[ErrorSpec, ...]:
     return (
         _spec("image_payload_conflict", "chat", "request", "user_environment", "一次只能使用单图字段或多图字段，请勿同时发送。", en="Send either the single-image fields or images, not both."),
@@ -120,7 +254,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
         _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
         _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
-        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b40[13]\b|provider_http_40[13]"),
+        _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|" + _AUTH_403 + r"|" + _AUTH_PROVIDER_HTTP_403 + r"|provider_http_401"),
         _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", en="The model name is unavailable. Check the model name in Settings.", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),
         _spec("cli_config_invalid", "chat", "provider", "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。", en="The Agent launch command is invalid because it is missing the {message} placeholder. Fix AGENT_CLI_CMD.", matcher=r"missing the \{message\} placeholder"),
         _spec("vision_model_required", "vision", "vision_model", "user_provider", "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型", en="Your current model can't process images, so it didn't receive this picture. Switch models, or add a dedicated vision model in Settings.", matcher=r"unknown variant `image_url`, expected `text`|no endpoints found that support image input"),
@@ -129,7 +263,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", en="This conversation is too long for the model's context window. Shorten it and try again.", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
         _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=r"content_filter|content policy|safety|blocked by"),
         _spec("rate_limited", "chat", "provider", "provider_transient", "模型服务限流了，稍等几分钟再试。", matcher=r"\b429\b|provider_http_429|too many requests|rate.?limit"),
-        _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason"),
+        _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason|" + _GENERIC_UPSTREAM_403),
         _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。"),
         _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。", en="Your model service did not respond in time. Check the provider's stability before trying again."),
         _spec("provider_output_truncated", "chat", "provider", "provider_transient", "模型在写完文件前达到了输出上限，未发送不完整的文件。可缩小内容后重试，或换用输出上限更高的模型。", en="The model reached its output limit before finishing the file, so the incomplete file was not sent. Try a smaller version or a model with a higher output limit.", matcher=r"\bprovider_output_truncated\b"),
@@ -260,10 +394,10 @@ def _vision_specs() -> tuple[ErrorSpec, ...]:
 def _image_generation_specs() -> tuple[ErrorSpec, ...]:
     rows = (
         ("image_generation_model_required", "user_provider", "当前模型不能生成图片，请到设置里添加生图模型。", "Your current model can't generate images. Add an image generation model in Settings."),
-        ("image_generation_model_incompatible", "user_provider", "当前生图模型无法生成图片，请到设置里更换模型。", "This image generation model can't create images. Choose another model in Settings."),
-        ("image_generation_auth_invalid", "user_provider", "生图模型的 API Key 无效或已过期，请到设置里重新保存。", "The image generation API key is invalid or expired. Save it again in Settings."),
-        ("image_generation_quota_insufficient", "user_provider", "生图模型服务额度不足，充值后再试。", "The image generation service has insufficient quota. Add credit and try again."),
-        ("image_generation_model_not_found", "user_provider", "当前生图模型不可用，请到设置里更换模型。", "The image generation model is unavailable. Choose another model in Settings."),
+        ("image_generation_model_incompatible", "user_provider", "这个模型或接口不支持生图，请换一个模型。", "This model or endpoint can't generate images. Try another model."),
+        ("image_generation_auth_invalid", "user_provider", "API Key 被拒绝，请检查 Key 和权限。", "API key rejected. Check the key and its permissions."),
+        ("image_generation_quota_insufficient", "user_provider", "额度或余额不足，请充值后重试。", "Insufficient quota or balance. Top up and retry."),
+        ("image_generation_model_not_found", "user_provider", "找不到该模型或接口地址，请检查模型名和 Base URL。", "Model or endpoint not found. Check the model name and Base URL."),
         ("image_generation_model_not_ready", "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。", "The image generation model isn't ready. Save it again or choose another model in Settings."),
         ("image_generation_key_decrypt_failed", "user_provider", "生图模型尚未准备好，请到设置里重新保存或更换模型。", "The image generation model isn't ready. Save it again or choose another model in Settings."),
         ("image_generation_rate_limited", "provider_transient", "生图模型请求太多，请稍等几分钟再试。", "The image generation service is rate limited. Try again in a few minutes."),

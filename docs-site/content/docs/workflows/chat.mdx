@@ -17,6 +17,18 @@ the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
 
 An IO Canvas card may outlive the Chat attachment that first published it.
+Authenticated clients should build the Canvas library from
+`GET /v1/chat/canvases`, which reads the caller's current workspace index
+directly instead of walking Chat history. The response contains at most 500
+metadata-only entries ordered by `updated_at` descending. Each entry includes
+the original case-preserving `filename`, workspace revision, MIME type, and
+creation/update timestamps. The `.io.html` suffix match is case-insensitive,
+while the returned filename preserves its original case. When a matching agent-authored file card still
+exists in Chat, the newest row contributes `message_id`, `display_title`, and
+`display_subtitle`; those three fields are `null` when the workspace entry
+predates or outlives its Chat card. Canvas bodies and envelopes are never part
+of this listing response.
+
 Authenticated clients can read the current Canvas source with
 `GET /v1/chat/workspace/body?filename=<original-file_name>`. The endpoint accepts
 only the original `.io.html` basename from the Chat row, derives the private
@@ -777,12 +789,23 @@ continuous for 30 minutes before it can inject a repair turn; operators can
 change this persistence window with
 `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC`.
 
-`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row.
+`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row
+unless the `only_if_unverified` short-circuit described below applies.
 The resident's hidden ack must post `source: "verify_ping"` and set
 `reply_to_message_id` to that exact ping ID. An unrelated or stale agent reply
 does not satisfy the probe. The verify response distinguishes `loop_alive`
 (the exact ack arrived) from `passing` (the ack arrived and decrypt policy also
 allows verification); only `passing: true` records the sticky live-loop green.
+
+An automated caller whose only purpose is opening that gate can send
+`only_if_unverified: true`. When the server already holds a sticky live-loop
+verification for the user, it inserts no ping, takes no liveness measurement,
+and answers `passing: true, already_verified: true` with `loop_alive: null`,
+`response_time_sec: null`, and an empty `ping_id` — `passing` then reflects the
+persisted gate, not a fresh exact-ack observation. An unverified user, or any
+value other than the JSON literal `true`, runs the ordinary probe.
+The hosted runner supervisor sends this flag so a runtime restart does not
+re-probe every resident with a real model call on the user's own key.
 
 If a self-hosted resident consumer appears stale while it is still polling, the
 server may claimably inject a user-role maintenance message with

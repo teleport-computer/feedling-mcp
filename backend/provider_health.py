@@ -11,6 +11,7 @@ from typing import Any
 import db
 from core import util as core_util
 from notices import catalog as notices_catalog
+from notices import error_contract
 
 
 log = logging.getLogger(__name__)
@@ -344,7 +345,18 @@ def record_failure(
 
 
 def error_class_for_exception(exc: BaseException) -> str:
-    """Classify a V2 provider exception with the shared backend catalog."""
+    """Classify a V2 provider exception without discarding raw 403 evidence."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {401, 403}:
+        return (
+            "auth_invalid"
+            if error_contract.provider_response_is_auth_failure(
+                status_code,
+                getattr(exc, "raw_response_body", "")
+                or getattr(exc, "response_detail", ""),
+            )
+            else "upstream_unavailable"
+        )
     return notices_catalog.classify_upstream(str(exc or "")) or "unknown"
 
 

@@ -989,6 +989,39 @@
         "x-feedling-contract-level": "compatibility"
       }
     },
+    "/v1/chat/canvases": {
+      "get": {
+        "summary": "Chat Canvases",
+        "operationId": "chat_canvases_v1_chat_canvases_get",
+        "responses": {
+          "200": {
+            "description": "The caller's current Canvas workspace metadata, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasIndexResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "List up to 500 current IO Canvas workspace entries for the authenticated user, ordered by most recent workspace update. This metadata-only index matches the .io.html suffix case-insensitively while preserving filename case, and never returns Canvas bodies or envelopes. message_id and display metadata come from the newest matching agent-authored Chat file row and are null when no such row exists."
+      }
+    },
     "/v1/chat/history": {
       "get": {
         "summary": "Chat History",
@@ -1698,7 +1731,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
+        "description": "Unless the only_if_unverified short-circuit below applies, insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether that exact reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded. Optional request field only_if_unverified: when it is the JSON literal true and the server already holds a sticky live-loop verification for this user, no ping is inserted and no liveness measurement is taken; the response is passing=true, already_verified=true, loop_alive=null, response_time_sec=null and an empty ping_id. Any other value, or an unverified user, runs the ordinary ping. Intended for automated gate-opening callers such as the hosted runner supervisor, so a runtime restart does not re-probe every resident with a real model call."
       }
     },
     "/v1/chat/workspace/body": {
@@ -10634,6 +10667,95 @@
           },
           "envelope": {
             "$ref": "#/components/schemas/EncryptedEnvelope"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CanvasIndexEntry": {
+        "type": "object",
+        "required": [
+          "filename",
+          "revision",
+          "mime_type",
+          "created_at",
+          "updated_at",
+          "message_id",
+          "display_title",
+          "display_subtitle"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Newest matching agent-authored Chat file row, or null when the Canvas has no published attachment row."
+          },
+          "display_title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "display_subtitle": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CanvasIndexResponse": {
+        "type": "object",
+        "required": [
+          "canvases"
+        ],
+        "properties": {
+          "canvases": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/CanvasIndexEntry"
+            }
           }
         },
         "additionalProperties": false

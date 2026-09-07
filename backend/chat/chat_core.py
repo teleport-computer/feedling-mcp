@@ -675,6 +675,35 @@ def workspace_canvas_body(store: UserStore, filename: str) -> tuple[dict, int]:
     }, 200
 
 
+def _canvas_index_timestamp(value) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def canvas_index(store: UserStore) -> tuple[dict, int]:
+    """Return metadata for the caller's current IO Canvas workspace entries."""
+    rows = v2_jobs_store.list_canvas_workspace_entries(store.user_id, limit=500)
+    prefix = "/workspace/"
+    filenames = [str(row["path"])[len(prefix):] for row in rows]
+    message_metadata = db.chat_latest_agent_file_metadata_by_name(
+        store.user_id,
+        filenames,
+    )
+    canvases = []
+    for row, filename in zip(rows, filenames):
+        message = message_metadata.get(filename, {})
+        canvases.append({
+            "filename": filename,
+            "revision": int(row["revision"]),
+            "mime_type": str(row["mime_type"]),
+            "created_at": _canvas_index_timestamp(row["created_at"]),
+            "updated_at": _canvas_index_timestamp(row["updated_at"]),
+            "message_id": message.get("message_id"),
+            "display_title": message.get("display_title"),
+            "display_subtitle": message.get("display_subtitle"),
+        })
+    return {"canvases": canvases}, 200
+
+
 # --------------------------------------------------------------------------- #
 # POST /v1/chat/message  (user sends a v1 ciphertext envelope)
 # --------------------------------------------------------------------------- #
@@ -1490,6 +1519,34 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
             }, 200
         # else (dual + resident hosted account): fall through to the synthetic
         # ping protocol below, exactly like an explicitly independent account.
+
+    # Opt-in short-circuit for callers whose only purpose is opening the
+    # bootstrap gate (the runner supervisor's autoverify). The resident probe
+    # below is a REAL model call on the user's own key: on 2026-09-04 and
+    # 2026-09-06 every deploy restarted the runner, its in-memory autoverify
+    # state was lost, and all 226 hosted residents were re-probed within 15
+    # minutes — 140 of them (dormant users with dead keys) failed, burning
+    # their credits and showing up as a failure spike. A user the server
+    # already knows to be verified gains nothing from another ping. Default
+    # False keeps the iOS manual check and the bootstrap skill byte-identical.
+    # Only the JSON literal ``true`` opts in. ``"false"`` / ``1`` / ``"yes"`` are
+    # caller mistakes, and a mistake here means "skip the real probe" — so they
+    # must fall through to the ordinary ping, never into the short-circuit.
+    if payload.get("only_if_unverified") is True and (
+        boot_gates._chat_loop_verified_by_server(store)
+    ):
+        # Not a liveness measurement: no ping, no reply, no timing. loop_alive
+        # and response_time_sec are null so a caller cannot mistake this for a
+        # fresh exact-ack observation; passing reflects the persisted gate.
+        return {
+            "loop_alive": None,
+            "response_time_sec": None,
+            "ping_id": "",
+            "timeout_sec": timeout_sec,
+            "suggestions": [],
+            "passing": True,
+            "already_verified": True,
+        }, 200
 
     # append_chat acquires chat_lock internally — don't hold it here or we'd
     # deadlock on the non-reentrant lock.

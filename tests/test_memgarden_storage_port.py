@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from memgarden.storage import (
@@ -32,6 +34,21 @@ from memgarden.storage import (
 # --------------------------------------------------------------------------- #
 # 能力声明必须显式
 # --------------------------------------------------------------------------- #
+
+
+def _with(**overrides) -> Capabilities:
+    """从 ``FULL_CAPABILITIES`` 出发只改指定项。
+
+    手写全部字段的写法有个隐藏代价：memgarden 每加一项能力，这里就要跟着
+    改一次，而红的原因和 io 的行为无关 —— 那种红会被当成噪音，
+    真正该拦的那次也就拦不住了。
+    """
+    return replace(FULL_CAPABILITIES, **overrides)
+
+
+def _without(capability: str) -> Capabilities:
+    """只把某一项关掉，其余全开。"""
+    return _with(**{capability: False})
 
 
 def test_capabilities_have_no_defaults():
@@ -57,31 +74,27 @@ def test_capabilities_are_immutable():
 # --------------------------------------------------------------------------- #
 
 
-def test_critical_capabilities_are_the_two_data_integrity_ones():
-    assert CORRECTNESS_CRITICAL == {"supports_supersede", "supports_atomic_batch"}
+def test_the_data_integrity_capabilities_are_correctness_critical():
+    """这几项缺了就必须拒绝操作，不能降级。
+
+    ⚠️ 断言的是**包含**不是相等：memgarden 后来又加了 hard_delete 和
+    owner_scoping（0.17.0），写死相等会让每次扩充契约都在 io 这边假红一次，
+    而红的原因和 io 的行为毫无关系。
+    """
+    assert {"supports_supersede", "supports_atomic_batch"} <= CORRECTNESS_CRITICAL
 
 
 @pytest.mark.parametrize("capability", sorted(CORRECTNESS_CRITICAL))
 def test_missing_critical_capability_is_not_a_degradation(capability):
     """缺前置条件时**不能**出现在降级列表里 —— 那会读成「降级后继续跑」。"""
-    caps = Capabilities(
-        supports_supersede=capability != "supports_supersede",
-        supports_atomic_batch=capability != "supports_atomic_batch",
-        supports_custom_fields=True,
-        supports_metadata_sort=True,
-    )
+    caps = _without(capability)
     assert plan_degradations(caps) == []
     assert missing_critical(caps) == [capability]
 
 
 @pytest.mark.parametrize("capability", sorted(CORRECTNESS_CRITICAL))
 def test_operation_needing_missing_capability_is_rejected(capability):
-    caps = Capabilities(
-        supports_supersede=capability != "supports_supersede",
-        supports_atomic_batch=capability != "supports_atomic_batch",
-        supports_custom_fields=True,
-        supports_metadata_sort=True,
-    )
+    caps = _without(capability)
     with pytest.raises(UnsupportedOperation) as excinfo:
         ensure_supported(caps, operation="dream.consolidate", requires=capability)
     assert excinfo.value.capability == capability
@@ -104,12 +117,8 @@ def test_unsupported_operation_is_a_runtimeerror():
 
 
 def test_degradable_capabilities_report_fallback_and_cost():
-    caps = Capabilities(
-        supports_supersede=True,
-        supports_atomic_batch=True,
-        supports_custom_fields=False,
-        supports_metadata_sort=False,
-    )
+    caps = _with(supports_supersede=True, supports_atomic_batch=True,
+                supports_custom_fields=False, supports_metadata_sort=False)
     degradations = plan_degradations(caps)
     assert len(degradations) == 2
     for d in degradations:
@@ -119,12 +128,8 @@ def test_degradable_capabilities_report_fallback_and_cost():
 
 
 def test_describe_mentions_both_kinds_separately():
-    caps = Capabilities(
-        supports_supersede=False,
-        supports_atomic_batch=True,
-        supports_custom_fields=False,
-        supports_metadata_sort=True,
-    )
+    caps = _with(supports_supersede=False, supports_atomic_batch=True,
+                supports_custom_fields=False, supports_metadata_sort=True)
     text = describe_capabilities(caps)
     assert "会被拒绝" in text, "前置条件缺失要说清是拒绝，不是降级"
     assert "已降级运行" in text
@@ -147,19 +152,18 @@ def test_user_facing_text_is_empty_when_nothing_is_lost():
 
 
 def test_user_facing_text_covers_every_gap():
-    caps = Capabilities(
-        supports_supersede=False,
-        supports_atomic_batch=False,
-        supports_custom_fields=False,
-        supports_metadata_sort=False,
-    )
+    caps = _with(supports_supersede=False, supports_atomic_batch=False,
+                supports_custom_fields=False, supports_metadata_sort=False)
     lines = describe_for_user(caps)
     assert len(lines) == 4, "每一项缺失都要有一句给用户的说明"
 
 
 def test_user_facing_text_has_no_field_names():
     """接入方看的是「你会失去什么」，不是内部字段名。"""
-    caps = Capabilities(False, False, False, False)
+    # 全部关掉。用字段名逐个关，不写位置参数 —— 位置参数在契约加字段时
+    # 会静默错位（第 5 个字段的值跑到第 4 个上），比报错还危险。
+    caps = replace(FULL_CAPABILITIES,
+                   **{f: False for f in FULL_CAPABILITIES.__dataclass_fields__})
     for line in describe_for_user(caps):
         assert "supports_" not in line, f"话术里漏了字段名: {line}"
         assert line.strip(), "不能有空话术"
@@ -167,12 +171,8 @@ def test_user_facing_text_has_no_field_names():
 
 def test_user_facing_text_says_what_is_lost_not_just_what_is_missing():
     """每句都要落到后果上，否则用户看了也不知道该不该在意。"""
-    caps = Capabilities(
-        supports_supersede=True,
-        supports_atomic_batch=True,
-        supports_custom_fields=True,
-        supports_metadata_sort=False,
-    )
+    caps = _with(supports_supersede=True, supports_atomic_batch=True,
+                supports_custom_fields=True, supports_metadata_sort=False)
     (line,) = describe_for_user(caps)
     assert "变慢" in line, "只说「不支持排序」没用，要说清用户会感觉到什么"
 
