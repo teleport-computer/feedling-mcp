@@ -2874,6 +2874,18 @@ def _build_openai_compat_payload(
         payload["tools"] = _encode_tools_openai_chat(tools)
         if tool_choice is not None:
             payload["tool_choice"] = copy.deepcopy(tool_choice)
+        # DeepSeek supports tools in thinking mode, but its Chat Completions
+        # endpoint rejects the narrower combination of native thinking and the
+        # literal ``required`` tool choice.  Keep thinking for ordinary/auto
+        # rounds and disable it only for the request whose wire contract must
+        # force a tool call.  Key this on the declared provider, never the URL:
+        # an openai_compatible route remains owned by that adapter even when it
+        # happens to point at a DeepSeek host.
+        if (
+            normalize_provider(provider) == "deepseek"
+            and payload.get("tool_choice") == "required"
+        ):
+            payload["thinking"] = {"type": "disabled"}
     if cache_key := _cache_key(prompt_cache_key):
         if provider == "openai":
             payload["prompt_cache_key"] = cache_key

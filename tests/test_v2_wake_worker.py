@@ -3776,6 +3776,96 @@ def test_forced_wake_choice_schema_rejection_fails_after_one_400(monkeypatch):
     assert schedule["payment_cooldown_until"] is not None
 
 
+def test_deepseek_forced_wake_choice_disables_thinking_before_t492_fence(
+    monkeypatch,
+):
+    """The T508 wire fix succeeds before T492's one-400 stop-loss is needed."""
+    uid = "u_wake_deepseek_required_non_thinking"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    config = provider_client.ProviderConfig(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        api_key="synthetic-test-key",
+        base_url="https://api.deepseek.com",
+    )
+    payloads = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+            self.text = json.dumps(body)
+
+        def json(self):
+            return self._body
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, _url, *, headers=None, json=None, timeout=None):
+            payloads.append(json)
+            if len(payloads) == 1:
+                return FakeResponse({
+                    "id": "chatcmpl-reasoning-only",
+                    "choices": [{
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "synthetic reasoning only",
+                        },
+                        "finish_reason": "length",
+                    }],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 700},
+                })
+            return FakeResponse({
+                "id": "chatcmpl-forced-silent",
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "forced-silent-1",
+                            "type": "function",
+                            "function": {
+                                "name": cap_tool_schema.STAY_SILENT_TOOL,
+                                "arguments": '{"reason":"nothing useful to add"}',
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 32, "completion_tokens": 8},
+            })
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_async_client",
+        FakeAsyncClient(),
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        _wake_deps(tail=[{
+            "id": "m1", "ts": 1.0, "role": "user", "content": "hi",
+        }]),
+        config,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    assert len(payloads) == 2
+    assert "tool_choice" not in payloads[0]
+    assert "thinking" not in payloads[0]
+    assert payloads[1]["tool_choice"] == "required"
+    assert payloads[1]["thinking"] == {"type": "disabled"}
+    assert _job_status(job_id) == ("completed", None)
+
+
 def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
     uid = "u_wake_provider_rollback"
     conftest.seed_user(uid)
