@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_current (
   expires_at            TIMESTAMPTZ,
   source_observation_id TEXT,
   source_revision       TEXT,
+  -- 🔴 这条当前值来自**上游的哪条事实**。撤回按 (source, source_event_id)
+  -- 精确匹配找它 —— 少了这两列，撤回记下来了、当前值却一条都重选不了，
+  -- 而且不报错。迁移 0108 给已有库补了这两列；新建的库走的是这份 DDL，
+  -- 两边必须一致。
+  source                TEXT,
+  source_event_id       TEXT,
   version               INT         NOT NULL DEFAULT 0,
   content_digest        TEXT,
   PRIMARY KEY (subject_id, signal, dimension_key)

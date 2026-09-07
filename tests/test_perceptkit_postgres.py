@@ -843,3 +843,94 @@ def test_the_version_choice_does_not_depend_on_row_order():
         rows = history.daily_rollups("u1", "health_sleep", days=30)
     assert rows[0]["doc"].get("core_minutes") == 250, \
         f"后返回的旧版本把新版本盖掉了：{rows[0]['doc']}"
+
+
+# ---------------------------------------------------------------------------
+# 来源撤回入口：用户在健康 app 里删掉一条记录
+# ---------------------------------------------------------------------------
+
+def _pool(conn):
+    from contextlib import contextmanager
+
+    class _Pool:
+        def connection(self):
+            @contextmanager
+            def _c():
+                yield conn
+            return _c()
+    return _Pool()
+
+
+def test_deleting_a_weight_sample_stops_it_from_being_the_current_value(clean):
+    """这是撤回存在的全部理由：用户删掉那条难看的读数，agent 就不该再说它。"""
+    from unittest.mock import patch
+    from datetime import timedelta
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    from perception.perceptkit_adapter import shadow
+    conn = connect()
+    kit = PerceptionKit(storage=store(conn))
+    for oid, kg, at in (("w1", 70.5, T0), ("w2", 69.8, T0 + timedelta(hours=1))):
+        kit.ingest({"schema_version": 1, "report_id": oid, "producer": "ios",
+                    "observations": [{"signal": "health_weight",
+                                      "signal_schema_version": 1,
+                                      "occurred_at": at.isoformat(),
+                                      "availability": "observed",
+                                      "source_event_id": oid,
+                                      "value": {"weight_kg": kg}}]},
+                   context=IngestContext("u1", at))
+    now = kit.get_current(subject_id="u1", signals=["health_weight"],
+                          now=T0 + timedelta(hours=2))["health_weight"]
+    assert now.value["weight_kg"] == 69.8
+
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        out = shadow.apply_deletions("u1", {"deleted": [
+            {"signal": "health_weight", "sample_id": "w2"}]})
+    assert out["ran"] and out["applied"] == 1, out
+
+    after = PerceptionKit(storage=store(conn)).get_current(
+        subject_id="u1", signals=["health_weight"],
+        now=T0 + timedelta(hours=2))["health_weight"]
+    assert after.value["weight_kg"] == 70.5, \
+        f"删掉之后当前值应该重选到上一条，实际是 {after.value}"
+
+
+def test_sleep_is_refused_out_loud_rather_than_silently_doing_nothing(clean):
+    """睡眠走的是重述那条路（一夜由几十条样本聚成一条事实）。
+
+    硬走撤回会一条都匹配不上 —— 而「我发了，什么都没发生」是最难查的失败。
+    所以这里要求它**明确说出来**，不是安静丢掉。
+    """
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import shadow
+    conn = connect()
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        out = shadow.apply_deletions("u1", {"deleted": [
+            {"signal": "health_sleep", "sample_id": "s1"}]})
+    assert out["applied"] == 0
+    assert out["rejected"] == 1
+    assert any("health_sleep" in w for w in out["warnings"]), out["warnings"]
+
+
+def test_a_deletion_never_takes_out_another_sources_same_id(clean):
+    """同一个 id 在两个来源下是两件事。撤回只该命中它指名的那个来源。"""
+    from unittest.mock import patch
+    from perceptkit.kit import PerceptionKit
+    from perceptkit.contracts import IngestContext
+    from perception.perceptkit_adapter import shadow
+    conn = connect()
+    st = store(conn)
+    for src in ("ios", "google"):
+        st.append_observation(obs(oid=f"o-{src}", signal="health_weight", source=src,
+                                  source_event_id="same-id",
+                                  typed_value={"weight_kg": 70.0}))
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        shadow.apply_deletions("u1", {"deleted": [
+            {"signal": "health_weight", "sample_id": "same-id"}]})
+    hits = st.list_retractions(subject_id="u1", signal="health_weight",
+                               source_event_ids=["same-id"])
+    assert [h.source for h in hits] == ["ios"], \
+        f"撤回记到了别的来源头上：{[(h.source, h.source_event_id) for h in hits]}"

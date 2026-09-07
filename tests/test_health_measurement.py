@@ -317,3 +317,83 @@ def test_select_rollup_rows_is_a_no_op_when_nothing_is_measurement_aware():
 def test_select_rollup_rows_tolerates_empty_and_malformed_input():
     assert hm.select_rollup_rows_after_cutover([]) == []
     assert hm.select_rollup_rows_after_cutover(None) == []
+
+
+# ---------------------------------------------------------------------------
+# 线上字段名的契约 —— 对不上会**完全静默**地失效
+#
+# 2026-09-07 抓到：iOS 那边按「概念名」发（weight_sample_id），而这边按
+# 「字段名」找（weight_kg_sample_id），32 个键里 16 个对不上。
+# 后果不是报错，是 has_measurement_time 恒为 False → 退回按到达时刻归日。
+# 一半指标修好了、另一半照旧错，没有任何地方看得出来。
+#
+# 所以把整张表钉死在这里：谁改了组名，这条测试就红，改的人必须同时去改 iOS。
+# ---------------------------------------------------------------------------
+
+#: 组名 -> 客户端必须发的键。**这就是线上契约**，见 docs/NOTES-measured-at-ingest.md。
+_WIRE_KEYS = {
+    "health_body": {
+        "weight_kg": ("weight_kg_measured_at", "weight_kg_sample_id"),
+        "bmi": ("bmi_measured_at", "bmi_sample_id"),
+        "body_fat_pct": ("body_fat_pct_measured_at", "body_fat_pct_sample_id"),
+        "height_cm": ("height_cm_measured_at", "height_cm_sample_id"),
+    },
+    "health_vitals": {
+        "resting_heart_rate": ("resting_heart_rate_measured_at",
+                               "resting_heart_rate_sample_id"),
+        # ⚠️ 步数这一组**声明了但客户端从不填**：它是当天累积量
+        # （HKStatisticsQuery 的和），没有"这一条样本"可指，编一个 id 出来
+        # 就是造上游没有的身份。留着这一组是无害的（拿不到就退回老路），
+        # 但别指望它有数据。见 docs/NOTES-measured-at-ingest.md。
+        "step_count": ("step_count_measured_at", "step_count_sample_id"),
+        "current_heart_rate": ("current_heart_rate_measured_at",
+                               "current_heart_rate_sample_id"),
+        "hrv_sdnn_ms": ("hrv_sdnn_ms_measured_at", "hrv_sdnn_ms_sample_id"),
+        "respiratory_rate": ("respiratory_rate_measured_at",
+                             "respiratory_rate_sample_id"),
+        "oxygen_saturation_pct": ("oxygen_saturation_pct_measured_at",
+                                  "oxygen_saturation_pct_sample_id"),
+        "vo2_max": ("vo2_max_measured_at", "vo2_max_sample_id"),
+    },
+    "health_metabolic": {
+        "blood_glucose_mmol_l": ("blood_glucose_mmol_l_measured_at",
+                                 "blood_glucose_mmol_l_sample_id"),
+        # 收缩压和舒张压共用一组 —— 一次测量的一对值。
+        "blood_pressure": ("blood_pressure_measured_at", "blood_pressure_sample_id"),
+    },
+    "health_sleep": {"sleep": ("sleep_start", "sleep_end", "sleep_sample_id")},
+    "health_workout": {"workout": ("workout_start", "workout_end",
+                                   "workout_sample_id")},
+}
+
+
+def test_the_wire_keys_are_exactly_what_the_groups_derive():
+    """组名换一个字，客户端发的键就对不上了 —— 而且不报错。"""
+    from perception.health_measurement import MEASUREMENT_GROUPS, INTERVAL
+    for signal, groups in MEASUREMENT_GROUPS.items():
+        assert signal in _WIRE_KEYS, f"{signal} 是新加的组，线上契约还没登记"
+        for g in groups:
+            want = _WIRE_KEYS[signal].get(g.name)
+            assert want is not None, f"{signal}.{g.name} 没登记线上键"
+            derived = ((f"{g.name}_start", f"{g.name}_end")
+                       if g.kind == INTERVAL else (f"{g.name}_measured_at",))
+            derived += (f"{g.name}_sample_id",)
+            assert set(derived) == set(want), f"{signal}.{g.name}: {derived} != {want}"
+    extra = set(_WIRE_KEYS) - set(MEASUREMENT_GROUPS)
+    assert not extra, f"契约表里有已经不存在的组：{extra}"
+
+
+def test_a_measurement_time_is_actually_picked_up_under_those_keys():
+    """上面那条只比对了名字。这条真的喂一份载荷进去，确认时间被认出来了 ——
+    不然「名字都对」和「代码真的去读了那个名字」还是两回事。"""
+    from perception import health_measurement as hm
+    metas = hm.extract_group_metadata("health_body", {
+        "weight_kg": 68.2,
+        "weight_kg_measured_at": "2026-08-27T07:30:00+08:00",
+        "weight_kg_sample_id": "hk-w-1",
+    })
+    weight = next(m for m in metas if m.group.name == "weight_kg")
+    assert weight.has_measurement_time, "带了 measured_at 却没被认出来"
+    assert weight.sample_id == "hk-w-1"
+    fallback = "2026-01-01"
+    assert hm.attributed_date(weight, fallback=fallback) == "2026-08-27"

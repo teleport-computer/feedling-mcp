@@ -249,9 +249,13 @@ class PostgresStorage:
     def get_current(self, *, subject_id, signals):
         if not signals:
             return {}
+        # 列名写全，不用 `SELECT *` —— 按位置取值时，加一列就会让后面每一列
+        # 都错位，而错位的结果仍然是合法的 dataclass。
         rows = self._q(
-            "SELECT * FROM perceptkit_current "
-            "WHERE subject_id=%s AND signal = ANY(%s)",
+            "SELECT subject_id, signal, dimension_key, typed_value, availability,"
+            " observed_at, received_at, expires_at, source_observation_id,"
+            " source_revision, source, source_event_id, version, content_digest"
+            " FROM perceptkit_current WHERE subject_id=%s AND signal = ANY(%s)",
             (subject_id, list(signals)),
         )
         out: dict[str, list[CurrentProjection]] = {}
@@ -260,7 +264,8 @@ class PostgresStorage:
                 subject_id=r[0], signal=r[1], dimension_key=r[2], typed_value=r[3],
                 availability=r[4], observed_at=r[5], received_at=r[6],
                 expires_at=r[7], source_observation_id=r[8], source_revision=r[9],
-                version=r[10], content_digest=r[11],
+                source=r[10], source_event_id=r[11],
+                version=r[12], content_digest=r[13],
             ))
         return out
 
@@ -269,16 +274,19 @@ class PostgresStorage:
         p = projection
         cols = (p.subject_id, p.signal, p.dimension_key, _j(p.typed_value),
                 p.availability, p.observed_at, p.received_at, p.expires_at,
-                p.source_observation_id, _rev(p.source_revision), p.version,
-                p.content_digest)
+                p.source_observation_id, _rev(p.source_revision),
+                # 不写这两格，撤回就永远匹配不上这条当前值（见 schema.py）。
+                p.source, p.source_event_id,
+                p.version, p.content_digest)
         if expected_version < 0:
             rows = self._q(
                 """
                 INSERT INTO perceptkit_current
                   (subject_id, signal, dimension_key, typed_value, availability,
                    observed_at, received_at, expires_at, source_observation_id,
-                   source_revision, version, content_digest)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   source_revision, source, source_event_id,
+                   version, content_digest)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (subject_id, signal, dimension_key) DO NOTHING
                 RETURNING 1
                 """, cols)
@@ -292,6 +300,7 @@ class PostgresStorage:
             UPDATE perceptkit_current
                SET typed_value=%s, availability=%s, observed_at=%s, received_at=%s,
                    expires_at=%s, source_observation_id=%s, source_revision=%s,
+                   source=%s, source_event_id=%s,
                    version=%s, content_digest=%s
              WHERE subject_id=%s AND signal=%s AND dimension_key=%s
                AND version=%s
@@ -299,6 +308,7 @@ class PostgresStorage:
             """,
             (_j(p.typed_value), p.availability, p.observed_at, p.received_at,
              p.expires_at, p.source_observation_id, _rev(p.source_revision),
+             p.source, p.source_event_id,
              p.version, p.content_digest,
              p.subject_id, p.signal, p.dimension_key, expected_version),
         )
