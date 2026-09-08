@@ -2927,7 +2927,8 @@ jobs:
     if: |
       github.ref == 'refs/heads/test' &&
       github.event_name == 'push' &&
-      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+      needs.detect-cvm-changes-test.outputs.cvm == 'true' &&
+      !cancelled()
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -2936,6 +2937,55 @@ jobs:
       group: deploy-test-runner-cvm
       cancel-in-progress: false
     steps:
+      # The ordering dependency is intentional: a runner from the new release
+      # can require backend interfaces that the old main CVM does not have. Do
+      # not deploy across a failed main-CVM release. Still start this job so the
+      # blocked runner release is a visible failure instead of an implicit skip.
+      - name: Report runner release blocked by main CVM failure
+        if: ${{ !cancelled() && needs.deploy-test-cvm.result != 'success' }}
+        env:
+          MAIN_DEPLOY_RESULT: ${{ needs.deploy-test-cvm.result }}
+          EXPECTED_RELEASE: ${{ github.sha }}
+          TEST_API_URL: ${{ vars.TEST_MAIN_API_URL || 'https://test-api.feedling.app' }}
+        run: |
+          HEALTH_FILE=$(mktemp)
+          trap 'rm -f "$HEALTH_FILE"' EXIT
+          HTTP_CODE=$(curl --silent --show-error \
+            --connect-timeout 8 --max-time 15 \
+            --output "$HEALTH_FILE" --write-out '%{http_code}' \
+            "$TEST_API_URL/healthz" || true)
+          LIVE_RELEASE=$(python3 - "$HEALTH_FILE" <<'PY'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as stream:
+                  payload = json.load(stream)
+              value = payload.get("release", {}).get("git_commit")
+              print(value if isinstance(value, str) and value else "missing")
+          except Exception as exc:
+              print(f"unreadable:{type(exc).__name__}")
+          PY
+          )
+          if [ "$LIVE_RELEASE" = "$EXPECTED_RELEASE" ]; then
+            RELEASE_RELATION="matches triggering release"
+          else
+            RELEASE_RELATION="does not match triggering release"
+          fi
+          {
+            echo "## Test runner deployment blocked"
+            echo
+            echo "- main deploy result: \`$MAIN_DEPLOY_RESULT\`"
+            echo "- triggering release: \`$EXPECTED_RELEASE\`"
+            echo "- live backend release: \`$LIVE_RELEASE\` ($RELEASE_RELATION)"
+            echo "- live backend health HTTP: \`${HTTP_CODE:-transport-error}\`"
+            echo
+            echo "The runner was not deployed because main/runner ordering is an intentional release-unit boundary."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::deploy-test-cvm concluded $MAIN_DEPLOY_RESULT; runner release $EXPECTED_RELEASE was deliberately not deployed"
+          echo "::error::test backend /healthz returned HTTP ${HTTP_CODE:-transport-error}, release.git_commit=$LIVE_RELEASE ($RELEASE_RELATION)"
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
