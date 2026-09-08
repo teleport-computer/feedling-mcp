@@ -209,7 +209,6 @@ tests/test_v2_claim_roundtrips.py
 tests/test_v2_coalesce.py
 tests/test_v2_cursor.py
 tests/test_v2_dependency_direction.py
-tests/test_v2_downloadable_files.py
 tests/test_v2_e2b_template_extractor.py
 tests/test_v2_effect_enqueue.py
 tests/test_v2_effect_id.py
@@ -220,7 +219,6 @@ tests/test_v2_gc_coverage_gate.py
 tests/test_v2_history_readside.py
 tests/test_v2_history_search_store.py
 tests/test_v2_history_search_unit.py
-tests/test_v2_history_tools.py
 tests/test_v2_image_generation_guidance.py
 tests/test_v2_kill_switch.py
 tests/test_v2_kill_switch_web.py

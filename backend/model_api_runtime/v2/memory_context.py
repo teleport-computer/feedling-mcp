@@ -61,7 +61,7 @@ def render(payload: dict, *, profile: str = "", rows: list[dict] = ()) -> dict:
         reason = reasons.get(mid, {})
         bucket = reason.get("bucket")
         label = {"turning": "转折点", "recent": "最近记下", "query": "与这句相关",
-                 "correction": "纠正"}.get(bucket, "已选记忆（原因未知）")
+                 "correction": "纠正", "fresh_recent": "最近7天新卡（不代表与本题相关）"}.get(bucket, "已选记忆（原因未知）")
         phrases = reason.get("matched_phrases")
         if bucket not in {"turning", "recent"} and isinstance(phrases, list) and phrases:
             label += "：匹配「" + _line(phrases[0])[:40] + "」"

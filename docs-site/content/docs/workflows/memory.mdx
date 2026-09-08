@@ -88,8 +88,8 @@ card's complete read-side content (up to 5000 characters). Cards that do not fit
 are omitted as whole items and counted explicitly. These memory results reserve
 their full budget in addition to the ordinary tool batch's 8000 characters, so
 mixed batches cannot silently slice their JSON. A turn still limits the number
-of tool calls. The HTTP `/v1/memory/index` and `/v1/memory/fetch` responses and
-resident CLI output are unchanged. Index discovery is allowed once per V2
+of tool calls. Existing primary-card fields remain compatible; optional recall
+metadata is described below. Index discovery is allowed once per V2
 loop; after a bounded overview, fetch visible IDs or use a more specific search.
 
 Recall diagnostics distinguish card selection from actual prompt injection.
@@ -102,6 +102,38 @@ The block is limited to 2500 characters; overflow drops whole lower-ranked cards
 Explicitly quoted IDs and verbatim summaries already present in the profile are
 excluded. This is conservative text deduplication, not semantic coverage detection.
 Models must fetch details and must not invent facts absent from their evidence.
+
+V2 also requests a recent-card supplement on each turn. Up to three readable,
+active cards created in the last seven days take priority within the same
+eight-card selection and 2500-character block. This uses creation time, not
+last-fetch/update time, and is bounded by the existing candidate window. Unknown,
+timezone-less or future dates are not treated as recent. The reason label says
+“recent” rather than claiming a query match. This supplements a potentially stale
+profile; it does not regenerate it. Quoted/profile deduplication still applies,
+so three candidates do not imply three actual injections. Older enclave versions
+may ignore the optional `context_recent` request flag.
+
+Cards may carry `retrieval_cues`: up to five short, grounded keywords, aliases,
+answerable questions or known event-time hints, at most 120 characters each.
+The read side includes them in literal search and lightweight index projections;
+V2's index also retains up to three thread pointers for navigation. Cues are
+search hints, not independent factual evidence. The pinned memgarden 0.19.0
+producer does not generate this new field; absent cues remain compatible. New
+Capture/Dream cue generation and five-level importance guidance require a later
+reviewed dependency release. No existing user cards are backfilled by this IO change.
+
+`memory_fetch` preserves requested full cards and adds `related_items`, at most
+six one-hop pointers (`id`, summary excerpt, `source_id`, `relation`, `status`).
+Relations are shared threads or explicit `anchor_memory_ids`/`supersedes` links.
+Only same-user readable candidates are considered; local-only, deleted and
+archived cards are excluded. A superseded card is included only through an
+explicit link and is marked `superseded`, not presented as current. Expansion
+does not recurse or mark neighbors as fetched. `related_status` is `ok` when
+the bounded search is complete, `bounded` when the candidate/result window or
+decryption limits coverage, `unavailable` when relation lookup cannot be measured,
+or `not_needed` when fetched cards have no links. In the V2 tool budget, primary
+bodies take precedence and optional pointers may be omitted (`related_omitted`
+when metadata fits). Missing optional metadata is not proof of no relations.
 
 `memory.select.traced` does not claim the selected cards reached the model.
 `memory.recall.completed` records per-execution recall counts, with unknown
@@ -314,9 +346,13 @@ response's effective `limit` and `truncated` values.
 }
 ```
 
-The body currently accepts a `query` field for compatibility, but it is not used
-to perform semantic or lexical filtering. Do not present `/v1/memory/index` as a
-search endpoint. Select from the returned index in your client or agent.
+The optional `query` field is a **literal, case-insensitive substring filter**
+over each card's summary, content, bucket, source and threads (`bucket` and
+`thread` are exact filters). There is no synonym, stemming or semantic matching:
+an empty result means that exact wording is absent from every card, not that the
+memory is missing — try different wording or browse by `bucket` / `thread`.
+`/v1/memory/index` is a navigation endpoint, not a search engine; final card
+selection still happens in your client or agent from the returned summaries.
 
 ## 3. Fetch selected content
 

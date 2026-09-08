@@ -239,7 +239,7 @@ _CHAT_MEMORY_EVIDENCE_POLICY = (
     "只能说记忆卡、「相关记忆」块或 memory_search/memory_fetch 结果里写着的内容。"
     "没有这些支撑就先去查；查了还没有，就直说不记得、请对方告诉你。"
     "不要顺着话头猜一个像样的值，也不要往记忆里补它没写的细节(颜色、场景、次数、时间)。"
-    "不确定就说不确定。"
+    "不确定就说不确定。也别拿无关偏好或事件冒充这个问题的答案。"
 )
 
 _CHAT_MEMORY_POLICY = _join_policy_blocks(

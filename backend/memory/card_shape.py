@@ -102,6 +102,11 @@ def text_for_match(card: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> str:
         for text in (_clean(card.get(key)) for key in field_map.canonical_match_fields)
         if text
     ]
+    # Optional producer-authored hints are matching data, never card body.
+    hints = card.get("retrieval_cues")
+    canonical_parts.extend(" ".join(c.split())[:120] for c in
+                           (hints[:5] if isinstance(hints, list) else [])
+                           if isinstance(c, str) and c.strip())
 
     if not canonical_parts:
         return legacy_text
@@ -222,6 +227,8 @@ def is_retired(raw: dict) -> bool:
         return True
     return bool(
         raw.get("is_archived") is True
+        or raw.get("archived") is True
+        or str(raw.get("status") or "").lower() in {"archived", "superseded", "deleted"}
         or str(raw.get("archived_at") or "").strip()
         or str(raw.get("archive_reason") or "").strip()
         or str(raw.get("superseded_by") or "").strip()

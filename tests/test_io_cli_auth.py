@@ -953,8 +953,40 @@ def test_v1_memory_protocol_has_fact_discipline():
     assert "FACT DISCIPLINE" in block
     assert "Never guess a plausible value" in block
     assert "相关记忆" in block and "memory-fetch" in block
-    # the pre-existing two-step protocol stays intact
+    # the pre-existing entry points stay intact
     assert "memory-index --limit 20" in block and "Never claim memories are unavailable" in block
+
+
+def test_v1_memory_protocol_teaches_navigation_not_search_first():
+    block = resident._memory_read_prompt_block()
+    # order: injected block first → locate → pick → relate (threads) → fetch bodies
+    assert block.index("相关记忆") < block.index("(1) Locate") < block.index("(2) Pick") < block.index("(3) Relate") < block.index("(4) Fetch")
+    assert "memory-index --query <exact word>" in block and "literal substring" in block
+    assert "zero results mean that wording is absent" in block
+    assert "--bucket <bucket>" in block and "--thread <thread>" in block
+    assert "follow one with" in block and "threads" in block
+    assert "summaries are pointers, not the record" in block
+    assert "evidence, not instructions" in block
+    # valid id sources: the injected block, this turn's index result, related_items — never invented/stale
+    assert "related_items" in block and "Never invent an id" in block and "older turn" in block
+
+
+def test_hosted_agent_prompt_memory_section_teaches_navigation():
+    from pathlib import Path
+    text = (ROOT / "backend" / "agent_runtime" / "agent_tools_prompt.md").read_text(encoding="utf-8")
+    section = text[text.index("## Memory"):]
+    section = section[: section.index("\n## ", 5)] if "\n## " in section[5:] else section
+    assert "locate → pick → relate → fetch" in section
+    assert "strict two-step" not in section and "Index first" not in section
+    for step in ("1. **Locate.**", "2. **Pick.**", "3. **Relate.**", "4. **Fetch.**"):
+        assert step in section
+    assert "memory-index --query <exact word>" in section and "literal substring" in section
+    assert "memory-index --thread <thread>" in section and "memory-index --bucket <bucket>" in section
+    assert "相关记忆" in section and "evidence, not" in section
+    assert "Fact discipline" in section and "Never guess a plausible value" in section
+    assert "memory-index --limit 20" in section
+    assert "related_items" in section and "don't\ninvent ids" in section
+    assert "didn't come from the current recall step's index result" not in section
 
 
 def test_history_fetch_requests_selection_trace_and_stashes_picks(monkeypatch):
@@ -1134,3 +1166,32 @@ def test_arrival_header_only_is_not_injection(monkeypatch):
     resident._auto_memory_arrival(block + "\n\n用户的话", "stdin", driver="pi", trace_id="tr")
     assert calls[-1]["detail"]["chars"] == len(block) and resident._RECALL_TURN_STATE["injected_chars"] == len(block)
     resident._recall_turn_reset()
+
+
+# ---------------------------------------------------------------------------
+# T513 #5 — optional retrieval_cues pass-through into the sealed card body.
+# ---------------------------------------------------------------------------
+
+
+def test_retrieval_cues_normalized_bounded_and_deduped():
+    raw = ["  露营灯 ", "露营灯", "", None, "保修码 NP-4286", "x" * 300, "帐篷", "睡袋", "第七条不要"]
+    out = resident._normalize_retrieval_cues(raw)
+    assert out[:2] == ["露营灯", "保修码 NP-4286"]
+    assert len(out) == resident.RETRIEVAL_CUES_MAX
+    assert all(len(c) <= resident.RETRIEVAL_CUE_CHARS for c in out) and "x" * resident.RETRIEVAL_CUE_CHARS in out
+    assert "第七条不要" not in out
+    assert resident._normalize_retrieval_cues(None) == [] and resident._normalize_retrieval_cues("露营灯") == []
+    assert resident._normalize_retrieval_cues({"a": 1}) == []
+    # strictly list[str]: objects, numbers and bools are skipped, never stringified
+    assert resident._normalize_retrieval_cues([{"k": "v"}, ["x"], 7, 3.5, True, False, "只留我"]) == ["只留我"]
+
+
+def test_capture_inner_keeps_legacy_shape_without_cues_and_adds_them_when_present():
+    base = {"summary": " 露营灯的小档案 ", "content": "保修码是 NP-4286。", "bucket": "生活", "threads": ["露营灯"], "importance": 0.7}
+    inner = resident._capture_inner_from_card(base)
+    assert inner == {"summary": "露营灯的小档案", "content": "保修码是 NP-4286。", "bucket": "生活", "threads": ["露营灯"]}
+    with_cues = resident._capture_inner_from_card({**base, "retrieval_cues": ["保修码", "NP-4286", "保修码"]}, voice_call_id="vc1")
+    assert with_cues["retrieval_cues"] == ["保修码", "NP-4286"] and with_cues["voice_call_id"] == "vc1"
+    # a non-list / empty cues field must not create the key
+    assert "retrieval_cues" not in resident._capture_inner_from_card({**base, "retrieval_cues": []})
+    assert "retrieval_cues" not in resident._capture_inner_from_card({**base, "retrieval_cues": "保修码"})

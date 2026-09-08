@@ -12,6 +12,7 @@ import httpx
 from core import envelope as core_envelope
 from enclave import readside as enclave_readside
 from memory import service as memory_service
+from memory import recall_metadata
 from memgarden import timestamps as memory_timestamps
 
 
@@ -502,6 +503,36 @@ def memory_fetch_core(
     unavailable_ids = [
         memory_id for memory_id in ids if memory_id in unavailable_set
     ]
+    related_items: list[dict] = []
+    related_status = "not_needed"
+    source_items = [items_by_id[mid] for mid in ids if mid in items_by_id]
+    if any(item.get("threads") or item.get("anchor_memory_ids") or item.get("supersedes")
+           for item in source_items):
+        try:
+            # Reuse the authenticated, lifecycle-filtered index projection;
+            # decrypted bodies stay within the existing enclave boundary.
+            linked_ids = {mid for item in source_items for key in ("anchor_memory_ids", "supersedes")
+                          for mid in recall_metadata.links(item.get(key))}
+            neighbors = [m for m in moments if memory_available(
+                m, store.user_id, include_superseded=True)]
+            # Explicit links win seats before thread discovery. A superseded
+            # card is returned only along an explicit link, marked historical.
+            neighbors.sort(key=lambda m: (m.get("id") not in linked_ids, str(m.get("id") or "")))
+            bound = readside_hard_max()
+            neighbor_items = _memory_index_partition(
+                api_key, neighbors[:bound], store.user_id, {"limit": bound},
+                post=post_enclave or post_enclave_readside)
+            related_items = recall_metadata.one_hop(source_items, neighbor_items, cap=7)
+            complete_window = {m.get("id") for m in neighbors[:bound]} <= {i.get("id") for i in neighbor_items}
+            related_status = "bounded" if (len(neighbors) > bound or len(related_items) > 6
+                                             or not complete_window) else "ok"
+            if neighbors and not neighbor_items:
+                related_status = "unavailable"
+            related_items = related_items[:6]
+        except RuntimeError:
+            # Primary fetch remains useful, but missing relation evidence is
+            # explicitly unknown rather than a false claim of no neighbors.
+            related_status = "unavailable"
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
     if referenced_ids:
         now = _now_iso()
@@ -520,6 +551,8 @@ def memory_fetch_core(
                 memory_service._save_moments(store, fresh)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
+        "related_items": related_items,
+        "related_status": related_status,
         "missing_ids": missing_ids,
         "unavailable_ids": unavailable_ids,
         "truncation": {
