@@ -14475,3 +14475,223 @@ def test_claude_observer_never_publishes_a_partial_prefixed_tag_head():
             prefix,
         )
         assert published == [(0, "正文", False)], (prefix, published)
+
+
+# ---------------------------------------------------------------------------
+# T521 (2026-09-08): content-free pi stream shape in the model-call trace.
+# ---------------------------------------------------------------------------
+def _pi_events(*events):
+    return "\n".join(json.dumps(e, ensure_ascii=False) for e in events)
+
+
+def _pi_assistant_end(content, stop_reason=None, usage=None):
+    msg = {"role": "assistant", "content": content, "usage": usage or {"input": 10, "output": 7}}
+    if stop_reason is not None:
+        msg["stopReason"] = stop_reason
+    return {"type": "message_end", "message": msg}
+
+
+_SECRET_TEXT = "秘密正文 usr_do_not_leak_9f2c"
+_SECRET_THOUGHT = "私密推理 do_not_leak_thought_77"
+
+
+def test_pi_stream_shape_text_only_message_end():
+    shape = crc._pi_stream_shape(_pi_events(
+        {"type": "session", "id": "s1"},
+        {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+        _pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"),
+    ))
+    assert shape["assistant_message_ends"] == 1
+    assert shape["blocks"] == {"text": 1, "thinking": 0, "toolCall": 0, "other": 0}
+    assert shape["text_chars_total"] == len(_SECRET_TEXT)
+    assert shape["update_text_seen"] is False
+    assert shape["update_text_chars_max"] == 0
+    assert shape["stop_reasons"] == ["stop"]
+
+
+def test_pi_stream_shape_thinking_only_is_shape_a():
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"),
+    ))
+    assert shape["blocks"]["thinking"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["text_chars_total"] == 0
+    assert shape["stop_reasons"] == ["length"]
+
+
+def test_pi_stream_shape_tool_call_only_is_shape_b():
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "toolCall", "name": "memory_search", "args": {"q": _SECRET_TEXT}}]),
+    ))
+    assert shape["blocks"]["toolCall"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["blocks"]["other"] == 0
+
+
+def test_pi_stream_shape_update_only_text_is_shape_c():
+    """Text seen in cumulative message_update snapshots but absent from the
+    final message_end — the parser-bug candidate."""
+    shape = crc._pi_stream_shape(_pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT[:4]}]}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+        _pi_assistant_end([], stop_reason="stop"),
+    ))
+    assert shape["update_text_seen"] is True
+    assert shape["update_text_chars_max"] == len(_SECRET_TEXT)
+    assert shape["assistant_message_ends"] == 1
+    assert shape["blocks"]["text"] == 0 and shape["text_chars_total"] == 0
+
+
+def test_pi_stream_shape_counts_unknown_blocks_and_keeps_stop_reasons_enumerated():
+    ends = [_pi_assistant_end([{"type": "image", "x": 1}, "junk"], stop_reason=f"r{i}") for i in range(12)]
+    shape = crc._pi_stream_shape(_pi_events(*ends))
+    assert shape["assistant_message_ends"] == 12
+    assert shape["blocks"]["other"] == 24
+    # Twelve distinct unknown reasons collapse to the single enum "other".
+    assert shape["stop_reasons"] == ["other"]
+
+
+def test_pi_stream_shape_stop_reason_is_whitelisted_enum_never_free_text():
+    """codex2 early review: an upstream can put free text into stopReason; the
+    trace must carry an enum, never the text."""
+    sentinel = "leak-" + _SECRET_TEXT
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason=sentinel),
+        _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason="Length"),
+        _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason=""),
+    ))
+    assert shape["stop_reasons"] == ["other", "length"]
+    dumped = json.dumps(shape, ensure_ascii=False)
+    assert sentinel not in dumped and "leak-" not in dumped and _SECRET_TEXT not in dumped
+    assert set(shape["stop_reasons"]) <= (crc._PI_STREAM_STOP_REASONS | {"other"})
+
+
+def test_pi_stream_shape_is_content_free_and_never_raises():
+    raw = _pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}, {"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"),
+    )
+    dumped = json.dumps(crc._pi_stream_shape(raw), ensure_ascii=False)
+    assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
+    assert "do_not_leak" not in dumped
+    empty = crc._pi_stream_shape("")
+    assert empty["parse_failed"] is False and empty["parse_error_count"] == 0
+    garbage = crc._pi_stream_shape("not json at all {{{")
+    assert garbage["parse_failed"] is True and garbage["parse_error_count"] == 1
+
+
+def test_pi_stream_shape_truncated_jsonl_is_flagged_not_all_zero():
+    """codex2 review r1: a session-only stream and a session + truncated
+    assistant message_end must NOT be byte-identical all-zero shapes."""
+    clean = crc._pi_stream_shape(_pi_events({"type": "session", "id": "s1"}))
+    truncated_line = json.dumps(_pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}]))[:-25]
+    truncated = crc._pi_stream_shape(_pi_events({"type": "session", "id": "s1"}) + "\n" + truncated_line)
+    assert clean["parse_failed"] is False and clean["parse_error_count"] == 0
+    assert truncated["parse_failed"] is True and truncated["parse_error_count"] == 1
+    assert clean != truncated
+    assert _SECRET_TEXT not in json.dumps(truncated, ensure_ascii=False)
+
+
+def test_pi_stream_shape_structural_oddity_keeps_partial_counts_but_flags():
+    """codex2 review r1: content=7 used to abort the scan after incrementing
+    ends, returning half data with no flag. Partial observation is allowed
+    only when flagged, and later events must still be counted."""
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "text", "text": "ok"}]),
+        {"type": "message_end", "message": {"role": "assistant", "content": 7}},
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="stop"),
+    ))
+    assert shape["assistant_message_ends"] == 3
+    assert shape["blocks"]["text"] == 1 and shape["blocks"]["thinking"] == 1
+    assert shape["stop_reasons"] == ["stop"]
+    assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
+
+
+def test_pi_stream_shape_whitespace_only_update_is_not_shape_c():
+    """codex2 review r1: _pi_turn_from_stream strips text, so a whitespace-only
+    snapshot is unusable and must not read as 'text seen in updates'."""
+    shape = crc._pi_stream_shape(_pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "  \n\t "}]}},
+        _pi_assistant_end([], stop_reason="stop"),
+    ))
+    assert shape["update_text_seen"] is False
+    assert shape["update_text_chars_max"] == 0
+    assert shape["parse_failed"] is False
+
+
+def test_pi_turn_metrics_carries_stream_shape_into_terminal_detail():
+    raw = _pi_events(_pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"))
+    metrics = crc._pi_turn_metrics(raw)
+    assert metrics["output_tokens"] == 7
+    assert metrics["pi_stream"]["blocks"]["thinking"] == 1
+    assert metrics["pi_stream"]["stop_reasons"] == ["length"]
+    # The terminal trace merges _cli_turn_metrics into detail; the pi branch must
+    # keep carrying the shape so agent.model.call.error can be read off the DB.
+    completed = subprocess.CompletedProcess(args=["pi", "--mode", "json"], returncode=0, stdout=raw, stderr="")
+    detail = crc._cli_turn_metrics(["pi", "--mode", "json"], completed, 123)
+    assert detail["driver"] == "pi"
+    assert detail["pi_stream"]["text_chars_total"] == 0
+
+
+def _terminal_detail(monkeypatch, *, raw, succeeded, cmd=("pi", "--mode", "json")):
+    """Drive the real terminal emitter and capture the detail it hands to
+    _emit_debug_trace — the same dict that lands in trace_events."""
+    captured = []
+
+    def fake_emit(subsystem, type_, **kwargs):
+        captured.append({"subsystem": subsystem, "type": type_, **kwargs})
+
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    monkeypatch.setattr(crc, "_emit_recall_completed", lambda *a, **k: None)
+    monkeypatch.setattr(crc, "_recall_turn_reset", lambda *a, **k: None)
+    context = {
+        "started": True,
+        "cmd": list(cmd),
+        "result": subprocess.CompletedProcess(args=list(cmd), returncode=0, stdout=raw, stderr=""),
+        "started_at": time.monotonic(),
+    }
+    crc._emit_cli_model_call_terminal(
+        context, trace_id="tr_t521", succeeded=succeeded,
+        failure=None if succeeded else RuntimeError(f"{crc.EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply"),
+    )
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_terminal_error_detail_carries_pi_stream_shape(monkeypatch):
+    raw = _pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"),
+    )
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=False)
+    assert event["type"] == "agent.model.call.error"
+    shape = event["detail"]["pi_stream"]
+    assert shape["parse_failed"] is False and shape["parse_error_count"] == 0
+    assert shape["blocks"]["thinking"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["update_text_seen"] is True
+    assert shape["update_text_chars_max"] == len(_SECRET_TEXT)
+    assert shape["stop_reasons"] == ["length"]
+    dumped = json.dumps(event["detail"], ensure_ascii=False)
+    assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
+
+
+def test_terminal_done_detail_carries_pi_stream_shape(monkeypatch):
+    raw = _pi_events(_pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"))
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=True)
+    assert event["type"] == "agent.model.call.done"
+    assert event["detail"]["pi_stream"]["text_chars_total"] == len(_SECRET_TEXT)
+    assert event["detail"]["pi_stream"]["stop_reasons"] == ["stop"]
+
+
+def test_terminal_detail_has_no_pi_stream_for_other_drivers(monkeypatch):
+    event = _terminal_detail(monkeypatch, raw="{}", succeeded=True, cmd=("claude", "-p", "x"))
+    assert event["detail"]["driver"] == "claude"
+    assert "pi_stream" not in event["detail"]
+
+
+def test_terminal_error_detail_flags_truncated_pi_stream(monkeypatch):
+    raw = _pi_events({"type": "session", "id": "s1"}) + "\n" + json.dumps(
+        _pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}])
+    )[:-30]
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=False)
+    shape = event["detail"]["pi_stream"]
+    assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
+    assert _SECRET_TEXT not in json.dumps(event["detail"], ensure_ascii=False)

@@ -7218,7 +7218,113 @@ def _pi_turn_metrics(raw: str) -> dict:
         except (TypeError, ValueError):
             pass
     return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok,
-            "cost_usd": round(cost, 6)}
+            "cost_usd": round(cost, 6), "pi_stream": _pi_stream_shape(raw)}
+
+
+# pi 流形状摘要(T521,2026-09-08 督导准):只记**数字与枚举**,永不记内容。
+# 背景:test 上 pi 驱动 8/31 轮 provider_empty_reply——trace 只有 output_tokens
+# (226~398,模型确实产出了)与 thinking_present=false,而 reply_head 是前 1000 字
+# 的 session 头,原始 stdout 又拿不到(runner CVM 不在本账号,账号已删)。这四种
+# 「有 token 无文本」的形状用现有字段分不开:
+#   (a) 只有 thinking 块  (b) 只有 toolCall 块
+#   (c) 文本只出现在 message_update 增量、最终 message_end 没带
+#   (d) stopReason 非 error 的截断(length 等)
+# 摘要落在 agent.model.call.done/error 的 detail 里,复现一次就能读出是哪种。
+_PI_STREAM_BLOCK_TYPES = ("text", "thinking", "toolCall")
+_PI_STREAM_MAX_STOP_REASONS = 8
+# stopReason 只记白名单枚举:上游/异常路径可能把自由文本塞进这个字段,原样落
+# trace 就不再是 content-free(codex2 早审 2026-09-08)。未知一律记 "other"。
+_PI_STREAM_STOP_REASONS = frozenset({
+    "stop", "end_turn", "length", "max_tokens", "error", "tooluse", "tool_use",
+    "toolcall", "tool_call", "cancelled", "canceled", "aborted", "content_filter",
+})
+
+
+def _pi_stream_shape(raw: str) -> dict:
+    """Content-free shape of a ``pi --mode json`` JSONL stream. Never raises.
+
+    ``parse_error_count`` / ``parse_failed`` are the parse-health half of the
+    shape (codex2 review 2026-09-09): without them a truncated stream and a
+    genuinely empty upstream turn would produce byte-identical all-zero shapes,
+    and a structurally odd message would abort the scan leaving partial counts
+    with no flag. Partial observations are kept but always flagged.
+    """
+    block_counts = {name: 0 for name in _PI_STREAM_BLOCK_TYPES}
+    block_counts["other"] = 0
+    assistant_message_ends = 0
+    text_chars_total = 0
+    update_text_seen = False
+    update_text_chars_max = 0
+    stop_reasons: list[str] = []
+    parse_error_count = 0
+    parse_failed = False
+    try:
+        # Line-level health: pi emits one JSON object per line. A non-empty line
+        # that is not valid JSON is a dropped event (truncation, interleaved
+        # terminal noise) and must be counted, not silently skipped.
+        objects: list[Any] = []
+        for line in str(raw or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                objects.append(json.loads(stripped))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                parse_error_count += 1
+        for obj in objects:
+            try:
+                if not isinstance(obj, dict):
+                    continue
+                kind = str(obj.get("type") or "")
+                msg = obj.get("message")
+                if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+                    continue
+                if kind == "message_update":
+                    # Cumulative snapshot; only the size of USABLE text is
+                    # recorded — the same strip() the reply parser applies, so
+                    # whitespace-only snapshots cannot masquerade as shape (c).
+                    length = len(_pi_message_text(msg).strip())
+                    if length > 0:
+                        update_text_seen = True
+                        update_text_chars_max = max(update_text_chars_max, length)
+                    continue
+                if kind != "message_end":
+                    continue
+                assistant_message_ends += 1
+                # A structurally odd message (content not a list) raises below and
+                # is counted by the per-event except: partial counts kept, flagged.
+                for block in msg.get("content") or []:
+                    if not isinstance(block, dict):
+                        block_counts["other"] += 1
+                        continue
+                    block_type = str(block.get("type") or "")
+                    if block_type in block_counts:
+                        block_counts[block_type] += 1
+                    else:
+                        block_counts["other"] += 1
+                    if block_type == "text" and isinstance(block.get("text"), str):
+                        text_chars_total += len(block["text"].strip())
+                raw_stop = str(msg.get("stopReason") or obj.get("stopReason") or "").strip().lower()
+                if raw_stop:
+                    stop_reason = raw_stop if raw_stop in _PI_STREAM_STOP_REASONS else "other"
+                    if stop_reason not in stop_reasons and len(stop_reasons) < _PI_STREAM_MAX_STOP_REASONS:
+                        stop_reasons.append(stop_reason)
+            except Exception:  # noqa: BLE001 — one bad event must not hide the rest
+                parse_error_count += 1
+    except Exception:  # noqa: BLE001 — telemetry must stay fail-open
+        parse_failed = True
+    if parse_error_count > 0:
+        parse_failed = True
+    return {
+        "assistant_message_ends": assistant_message_ends,
+        "blocks": block_counts,
+        "text_chars_total": text_chars_total,
+        "update_text_seen": update_text_seen,
+        "update_text_chars_max": update_text_chars_max,
+        "stop_reasons": stop_reasons,
+        "parse_error_count": parse_error_count,
+        "parse_failed": parse_failed,
+    }
 
 
 _PROVIDER_ATTEMPT_TRIGGERS = frozenset({"first", "stream_cut_retry", "redelivery"})
@@ -10841,6 +10947,13 @@ def _emit_cli_model_call_terminal(
                 "thinking_present": bool(trace_turn.thinking_summary),
                 "thinking_source": trace_turn.thinking_source or "",
                 "thinking_len": len(trace_turn.thinking_summary or ""),
+                # T521: content-free pi stream shape (numbers/enums only);
+                # absent for other drivers.
+                **(
+                    {"pi_stream": metrics["pi_stream"]}
+                    if isinstance(metrics.get("pi_stream"), dict)
+                    else {}
+                ),
             },
             content_excerpt=excerpt,
         )
