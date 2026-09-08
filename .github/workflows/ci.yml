@@ -2925,10 +2925,10 @@ jobs:
     name: deploy runner CVM (test)
     needs: [deploy-test-cvm, detect-cvm-changes-test]
     if: |
-      !cancelled() &&
       github.ref == 'refs/heads/test' &&
       github.event_name == 'push' &&
-      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+      needs.detect-cvm-changes-test.outputs.cvm == 'true' &&
+      !cancelled()
     runs-on: ubuntu-24.04
     permissions:
       contents: read

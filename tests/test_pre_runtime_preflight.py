@@ -436,6 +436,9 @@ def _condition_requires(condition: str, atom: str) -> bool:
     every assignment of the other atoms instead.
     """
     normalised = " ".join(condition.split())
+    # Keep no-argument status checks such as ``cancelled()`` atomic.  Splitting
+    # their parentheses would compile a boolean placeholder as a function call.
+    normalised = re.sub(r"\b([A-Za-z_][\w.]*)\(\)", r"\1__call", normalised)
     # Protect ``!=`` so the operator split below does not tear it apart.
     sentinel = "\x00NE\x00"
     normalised = normalised.replace("!=", sentinel)
@@ -455,7 +458,7 @@ def _condition_requires(condition: str, atom: str) -> bool:
         elif token in "()":
             expression.append(token)
         else:
-            text = token.replace(sentinel, "!=")
+            text = token.replace(sentinel, "!=").replace("__call", "()")
             expression.append(f" {names.setdefault(text, f'a{len(names)}')} ")
 
     if atom not in names:
@@ -1038,6 +1041,9 @@ def test_every_test_cvm_touching_job_is_locked_to_the_test_branch():
     # is not the same as a dependence on it.
     assert _condition_requires(TEST_REF_ATOM, TEST_REF_ATOM)
     assert _condition_requires(f"{TEST_REF_ATOM} && github.event_name == 'push'", TEST_REF_ATOM)
+    assert _condition_requires(f"!cancelled() && {TEST_REF_ATOM} && github.event_name == 'push'", TEST_REF_ATOM)
+    assert not _condition_requires(f"{TEST_REF_ATOM} || !cancelled()", TEST_REF_ATOM)
+    assert not _condition_requires(f"cancelled() || {TEST_REF_ATOM}", TEST_REF_ATOM)
     assert not _condition_requires(
         f"{TEST_REF_ATOM} || github.event_name == 'workflow_dispatch'", TEST_REF_ATOM
     )
@@ -1225,6 +1231,8 @@ def test_test_release_jobs_only_run_for_pushes_to_test():
             if name in change_detectors
             else f"{push_to_test} && {cvm_changed}"
         )
+        if name == "deploy-test-runner-cvm":
+            expected += " && !cancelled()"
         assert actual == expected, name
 
 
