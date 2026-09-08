@@ -12,6 +12,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory recall adds bounded navigation metadata and recent-card context.**
+  Optional encrypted `retrieval_cues` reach search and lightweight indexes;
+  fetch adds up to six readable one-hop pointers with explicit coverage status.
+  V2 supplements its profile with up to three cards created in the last seven
+  days inside the existing eight-card/2500-character limit. Cue generation needs
+  a later memgarden release; existing cards and the 0.19.0 pin remain compatible.
+
+- **Memory index `query` semantics corrected in docs.** `/v1/memory/index` applies
+  a literal, case-insensitive substring filter (plus exact `bucket` / `thread`
+  filters); it is not semantic search and an empty result means the wording is
+  absent, not the memory. Agent guidance now describes the navigation order
+  locate → pick → relate (follow `threads`) → fetch, and reads the auto-injected
+  related-memory block as evidence before searching.
+
 - **Runtime V2 now consumes per-turn related-memory summaries.** Enclave selection
   uses the last four conversation messages. Bounded, non-system memory blocks
   carry IDs and selection reasons, with full details available through fetch.

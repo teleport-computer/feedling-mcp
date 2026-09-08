@@ -469,6 +469,10 @@ def test_chat_memory_and_perception_contracts_are_concrete(
 
     memory_index_properties = set(schemas["MemoryIndexRequest"]["properties"])
     memory_fetch_properties = set(schemas["MemoryFetchRequest"]["properties"])
+    assert "query" in memory_index_properties
+    response_fields = schemas["MemoryFetchResponse"]["properties"]
+    assert response_fields["related_items"]["maxItems"] == 6
+    assert set(response_fields["related_status"]["enum"]) == {"ok", "bounded", "unavailable", "not_needed"}
     retired_memory_fields = {
         "include_sensitive",
         "user_explicit_selection",

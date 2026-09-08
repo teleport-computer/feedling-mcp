@@ -402,6 +402,14 @@ def _inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # Optional future-package field: keep it inside the encrypted body. Old
+    # parsers omit it; no dependency on an unpublished memgarden API.
+    raw_cues = card.get("retrieval_cues")
+    cues = list(dict.fromkeys(" ".join(c.split())[:120] for c in
+                             (raw_cues if isinstance(raw_cues, list) else [])
+                             if isinstance(c, str) and c.strip()))[:5]
+    if cues:
+        inner["retrieval_cues"] = cues
     # 溯源提示:这张卡来自一个含该通电话的 capture 窗口,agent 可据此调
     # voice_transcript_read 回看原文。只在窗口"恰好含一通电话"时打——多通电话
     # 的窗口无法判断某张卡属于哪一通,给了就是假精度。放在加密正文里(不放

@@ -4836,7 +4836,7 @@ def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
     payload, error = core_enclave._enclave_get_json_for_gate(
         "/v1/chat/history", None,
         params={"before_seq": through_seq + 1, "limit": 4,
-                "include_image_body": "0", "context_trace": "1"},
+                "include_image_body": "0", "context_trace": "1", "context_recent": "1"},
         runtime_token=_mint_runtime_token(user_id),
     )
     if error or not isinstance(payload, dict):

@@ -9,6 +9,7 @@ import json
 import re
 
 from capabilities import result_budget
+from memory import recall_metadata
 
 
 # An ASCII dot is a boundary only before whitespace/end/CJK, and not after
@@ -65,6 +66,10 @@ def index_payload(body: dict, *, tool_name: str) -> dict:
             "date": str(item.get("occurred_at") or item.get("created_at") or "")[:10],
             "bucket": str(item.get("bucket") or ""),
             "summary": " ".join(summary.split()),
+            **({"threads": recall_metadata.links(item.get("threads"))[:3]}
+               if recall_metadata.links(item.get("threads")) else {}),
+            **({"retrieval_cues": recall_metadata.cues(item.get("retrieval_cues"))}
+               if recall_metadata.cues(item.get("retrieval_cues")) else {}),
         })
     return _fit({
         "total": _count(body.get("user_card_count"), len(source)),
@@ -79,10 +84,29 @@ def fetch_payload(body: dict) -> dict:
     # No generic cap_data: that silently clips each body at 2000 chars.
     items = [item for item in source if isinstance(item, dict)]
     truncation = body.get("truncation") or {}
-    return _fit({
+    payload = _fit({
         "matched": len(source),
         "missing_count": len(body.get("missing_ids") or []),
         "unavailable_count": len(body.get("unavailable_ids") or []),
         "source_omitted": _count(truncation.get("omitted_count")),
         "source_truncated": bool(truncation.get("truncated")),
     }, items, "memory_fetch")
+    if "related_items" in body:
+        # Never evict a fetched full card to make room for an optional neighbor.
+        policy = result_budget.for_tool("memory_fetch")
+        cap = policy.result_cap if policy else 2000
+        related = body.get("related_items") or []
+        addition = {"related_items": [], "related_status": body.get("related_status", "unavailable"),
+                    "related_omitted": len(related)}
+        if _size({**payload, **addition}) <= cap:
+            payload.update(addition)
+            returned_ids = {item.get("id") for item in payload["items"]}
+            for neighbor in related:
+                if not isinstance(neighbor, dict) or neighbor.get("source_id") not in returned_ids:
+                    continue
+                candidate = {**payload, "related_items": [*payload["related_items"], neighbor],
+                             "related_omitted": payload["related_omitted"] - 1}
+                if _size(candidate) > cap:
+                    break
+                payload = candidate
+    return payload

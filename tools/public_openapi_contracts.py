@@ -1687,6 +1687,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "MemoryIndexRequest": {
         "type": "object",
         "properties": {
+            "query": {"type": "string", "maxLength": 500, "description": "Case-insensitive literal substring over readable card text and optional retrieval cues; not semantic search."},
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
@@ -1712,6 +1713,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["items", "missing_ids", "unavailable_ids", "truncation"],
         "properties": {
+            "related_status": {"type": "string", "enum": ["ok", "bounded", "unavailable", "not_needed"]},
+            "related_items": {
+                "type": "array", "maxItems": 6,
+                "description": "Same-user readable one-hop pointers only, not full bodies. Superseded cards appear only through explicit anchor/supersedes links and are marked historical.",
+                "items": {"type": "object", "required": ["id", "summary", "source_id", "relation", "status"],
+                          "properties": {"id": {"type": "string"}, "summary": {"type": "string", "maxLength": 120},
+                                         "source_id": {"type": "string"}, "relation": {"type": "string", "enum": ["anchor", "supersedes", "thread"]},
+                                         "status": {"type": "string"}}, "additionalProperties": False},
+            },
             "items": {
                 "type": "array",
                 "items": {"type": "object", "additionalProperties": True},
@@ -2617,12 +2627,14 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ),
     ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
-    ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
+    ("post", "/v1/memory/index"): "Return lightweight memory cards with optional retrieval cues. Query applies a case-insensitive literal substring filter over readable card text and cues, combined with exact bucket/thread filters; empty results do not prove the memory is absent. Full content is available through fetch, not the index.",
     ("post", "/v1/memory/fetch"): (
         "Fetch full records for selected memory IDs in request order. All shared "
         "cards use the same read contract; legacy card-classification metadata is "
         "ignored. Inspect the truncation object instead of assuming every "
-        "requested ID was processed."
+        "requested ID was processed. Optional related_items contains up to six "
+        "readable one-hop id/summary pointers; related_status distinguishes complete, "
+        "bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
     ),
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",

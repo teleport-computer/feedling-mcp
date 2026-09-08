@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 from memgarden import observability as mg_observability
 from memgarden.scoring import relevance as memory_relevance
 from memory import card_shape
+from memory import recall_metadata
 from core import chat_images
 from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
@@ -353,6 +354,20 @@ def _build_context_memories(moments, decrypted, query_args):
         latest_user_text,
     )
     context_memories = _back_to_original(picked)
+    if query_args.get("context_recent"):
+        fresh = recall_metadata.recent_cards(selectable)
+        fresh_ids = {c["id"] for c in fresh}
+        context_memories = fresh + [c for c in context_memories if c.get("id") not in fresh_ids]
+        context_memories = context_memories[:8]
+        selection_trace = dict(selection_trace or {})
+        selected = selection_trace.get("selected") or []
+        # Distinguish recency from relevance; it is not a claim of a query hit.
+        selection_trace["selected"] = [
+            {"id": c["id"], "bucket": "fresh_recent", "score": 2.0,
+             "reason": "created_within_7_days"} for c in fresh
+        ] + [s for s in selected if s.get("id") not in fresh_ids
+             and s.get("id") in {c.get("id") for c in context_memories}]
+        mode += ":recent7d"
     context_memory_trace = selection_trace if want_trace else None
 
     context_memory_log = mg_observability.injection_record(
@@ -447,6 +462,8 @@ async def v1_chat_history(request: Request):
         memory_limit = readside.memory_readside_model_api_limit()
         query_args = {
             "context_mode": context_mode,
+            "context_recent": str(request.query_params.get("context_recent") or "").lower()
+                              in {"1", "true", "yes", "on"},
             "want_trace": want_trace,
             "authorized_user_id": user_id,
             "content_sk": content_sk,

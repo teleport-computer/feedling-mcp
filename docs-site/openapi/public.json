@@ -4357,7 +4357,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed."
+        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed. Optional related_items contains up to six readable one-hop id/summary pointers; related_status distinguishes complete, bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
       }
     },
     "/v1/memory/get": {
@@ -4448,7 +4448,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today."
+        "description": "Return lightweight memory cards with optional retrieval cues. Query applies a case-insensitive literal substring filter over readable card text and cues, combined with exact bucket/thread filters; empty results do not prove the memory is absent. Full content is available through fetch, not the index."
       }
     },
     "/v1/memory/legacy_batch": {
@@ -11073,6 +11073,11 @@
       "MemoryIndexRequest": {
         "type": "object",
         "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Case-insensitive literal substring over readable card text and optional retrieval cues; not semantic search."
+          },
           "limit": {
             "type": "integer",
             "minimum": 0,
@@ -11146,6 +11151,54 @@
           "truncation"
         ],
         "properties": {
+          "related_status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "bounded",
+              "unavailable",
+              "not_needed"
+            ]
+          },
+          "related_items": {
+            "type": "array",
+            "maxItems": 6,
+            "description": "Same-user readable one-hop pointers only, not full bodies. Superseded cards appear only through explicit anchor/supersedes links and are marked historical.",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "summary",
+                "source_id",
+                "relation",
+                "status"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string",
+                  "maxLength": 120
+                },
+                "source_id": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "anchor",
+                    "supersedes",
+                    "thread"
+                  ]
+                },
+                "status": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
           "items": {
             "type": "array",
             "items": {
