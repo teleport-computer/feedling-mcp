@@ -971,6 +971,8 @@ jobs:
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
+            tests/test_v2_downloadable_files.py \
+            tests/test_v2_history_tools.py \
             tests/test_v2_push_endpoint.py \
             tests/test_v2_adaptive_tail.py \
             tests/test_v2_metrics_endpoint.py \

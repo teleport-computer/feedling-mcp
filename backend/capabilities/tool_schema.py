@@ -585,7 +585,7 @@ DESCRIPTIONS: dict[str, str] = {
                       "to paste the content back to you — search again with different "
                       "wording (the user's own words, the other language, a shorter "
                       "distinctive fragment). Case and surrounding whitespace are "
-                      "normalized away. Identical arguments are refused; changing only "
+                      "normalized away. An identical repeat of the same arguments is refused; changing only "
                       "case/whitespace is wasted, but narrowing limit/bucket/thread "
                       "is a legitimate re-search. Use it "
                       "only when the current request actually depends on remembered "
@@ -617,8 +617,8 @@ DESCRIPTIONS: dict[str, str] = {
         "Search the user's raw chat history (original message text from ANY "
         "time period, beyond what is visible in context) by substring query "
         "and/or RFC3339 time range. "
-        # 2026-08-21 Seven 口径:memory_search 是默认路径(约 95% 的「以前的事」
-        # 它就够了),history_search 是**升级路径**,不是平行选项。两者串行,
+        # T513 默认入口扩为 bucket/thread/search 记忆卡导航,但保留 2026-08-21
+        # 的 history_search **升级而非平行**合同。与 memory_search 串行,
         # 不许同批一起调 —— 实测同批双调占了这两道题非命中的 26/40 与 20/40。
         "Memory-card navigation is the normal path for remembered facts; this "
         "tool is the escalation, not a parallel option. Reach for it when the "
