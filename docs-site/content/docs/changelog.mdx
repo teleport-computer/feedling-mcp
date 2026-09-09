@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Rejected agent replies are traced, and attachments degrade instead of looping.**
+  `POST /v1/chat/response` now records a `chat.response.rejected` route trace
+  (status, error code, followup counts; no content) whenever it answers 4xx.
+  The resident consumer keeps the server's reason in its log, resends a reply
+  whose image/file followups were rejected **without** the attachments, and
+  posts a system notice that the picture/file could not be delivered — instead
+  of re-running the whole turn (which regenerated the image and looped).
+
 - **Memory recall adds bounded navigation metadata and recent-card context.**
   Optional encrypted `retrieval_cues` reach search and lightweight indexes;
   fetch adds up to six readable one-hop pointers with explicit coverage status.

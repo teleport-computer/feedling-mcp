@@ -14840,3 +14840,135 @@ def test_stage_file_is_canvas_mirrors_name_or_path_suffix(monkeypatch):
     events.clear()
     crc._handle_stage_file_ipc({"path": "   "})
     assert events[-1][1]["detail"]["is_canvas"] is False
+# ── T528: reply with attachments rejected by the server ────────────────────
+# A hosted user's generated images were staged, sent, and bounced with a bare
+# 400 for two days: the consumer re-raised, released the turn, the model re-ran
+# (generating a fresh image each time), and the user saw "Send Image ok" loops
+# with no picture. Fix = keep the server's reason, resend the words without
+# the attachments, then tell the user the picture did not make it.
+
+class _FakeResponse:
+    def __init__(self, status_code: int, body=None):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no json")
+        return self._body
+
+    def raise_for_status(self):
+        raise AssertionError("raise_for_status must not be reached for a 4xx with a body")
+
+
+def test_post_reply_4xx_keeps_the_servers_reason():
+    with pytest.raises(crc.ChatResponseRejected) as info:
+        crc._handle_post_reply_response(
+            _FakeResponse(400, {"error": "invalid image_followup size", "detail": ["image_byte_count"]})
+        )
+    assert info.value.status_code == 400
+    assert info.value.error == "invalid image_followup size"
+    assert "invalid image_followup size" in str(info.value)
+
+
+def test_post_reply_4xx_without_body_still_names_the_status():
+    with pytest.raises(crc.ChatResponseRejected) as info:
+        crc._handle_post_reply_response(_FakeResponse(422, None))
+    assert info.value.status_code == 422 and info.value.error == ""
+
+
+def test_dropped_attachment_notice_text_follows_the_users_language():
+    assert crc._dropped_attachments_notice_text("画一张", ["image"]) == "这条回复里的图片没能发出来。"
+    assert crc._dropped_attachments_notice_text("画一张", ["image", "file"]) == "这条回复里的图片和文件没能发出来。"
+    assert crc._dropped_attachments_notice_text("draw one", ["file"]) == "The file in this reply could not be delivered."
+    assert crc._dropped_attachments_notice_text("draw one", ["image"]) == "The image in this reply could not be delivered."
+
+
+def _staged_image():
+    return crc.StagedChatImage(source_path="/tmp/x.png", name="x.png", mime_type="image/png", data=b"png")
+
+
+def _arm_staged_image_turn(monkeypatch):
+    monkeypatch.setattr(crc, "_agent_can_stage_outbound_attachments", lambda: True)
+    monkeypatch.setattr(crc, "_required_outbound_file_suffixes", lambda _text: None)
+    monkeypatch.setattr(crc, "_begin_outbound_file_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(crc, "_staged_outbound_file_snapshot", lambda _t: [])
+    monkeypatch.setattr(crc, "_staged_outbound_image_snapshot", lambda _t: [_staged_image()])
+    monkeypatch.setattr(crc, "_finish_outbound_attachment_turn", lambda _t: ([], [_staged_image()]))
+
+
+def test_rejected_image_reply_is_resent_without_the_image_and_the_user_is_told(monkeypatch):
+    _arm_staged_image_turn(monkeypatch)
+    unmarked: list = []
+    monkeypatch.setattr(crc, "_unmark_seen", lambda keys: unmarked.extend(keys))
+    traces: list[tuple] = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: traces.append((a, k)))
+    calls: list[dict] = []
+
+    def _post_reply(text, **kwargs):
+        calls.append({"text": text, **kwargs})
+        if kwargs.get("image_followups"):
+            raise crc.ChatResponseRejected(400, {"error": "invalid image_followup size"})
+        return {"ok": True}
+
+    monkeypatch.setattr(crc, "post_reply", _post_reply)
+    msg = _make_msg(role="user", content="给我画一张海边", ts=5300.0)
+    msg["source"] = "chat"   # staging only arms for chat/model_api turns
+    with patch.object(crc, "call_agent", return_value="画好了,给你"):
+        crc._process_messages([msg])
+
+    # 1st attempt carried the image and was rejected; 2nd is the same words without it.
+    assert calls[0]["image_followups"] and calls[0]["text"] == "画好了,给你"
+    assert "image_followups" not in calls[1] and calls[1]["text"] == "画好了,给你"
+    # The user is told, in their language, AFTER the words landed.
+    notice = calls[2]
+    assert notice["role"] == "system" and notice["notice_kind"] == "upstream_error"
+    assert notice["text"] == "这条回复里的图片没能发出来。"
+    # The turn settled: no release-for-retry (that is what produced the loop).
+    assert unmarked == []
+    # The reason is on the trace, content-free.
+    dropped = [k for a, k in traces if a[1] == "chat.reply.attachments_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["detail"] == {
+        "status_class": "400", "error_class": "image_followup_invalid",
+        "image_followups": 1, "file_followups": 0,
+    }
+    assert dropped[0]["summary"] == "reply attachments dropped: image_followup_invalid"
+
+
+def test_reply_rejection_classifier_is_closed_and_content_free():
+    cases = {
+        "invalid image_followup size": ("image_followup_invalid", "400"),
+        "image_followup_envelope_missing_fields": ("image_followup_invalid", "400"),
+        "shared image_followup requires K_enclave": ("image_followup_invalid", "400"),
+        "invalid file_followup mime": ("file_followup_invalid", "400"),
+        "reply followups are chat-only": ("followups_not_allowed", "400"),
+        "content_pk_fpr_mismatch": ("stale_key", "409"),
+        "something new the server says with user text inside": ("other", "4xx"),
+    }
+    for error, (error_class, status_class) in cases.items():
+        code = 409 if error == "content_pk_fpr_mismatch" else (418 if error_class == "other" else 400)
+        got = crc.classify_reply_rejection(crc.ChatResponseRejected(code, {"error": error}))
+        assert (got.error_class, got.status_class) == (error_class, status_class), error
+        assert got.error_class in crc._REPLY_REJECTION_CLASS_VALUES
+        assert error not in (got.error_class, got.status_class) or error_class != "other"
+
+
+def test_rejected_reply_without_attachments_still_releases_the_turn(monkeypatch):
+    """The degrade path is ONLY for attachments. A bare-text 4xx keeps the old
+    contract (release the turn), so this change cannot swallow other rejections."""
+    unmarked: list = []
+    monkeypatch.setattr(crc, "_unmark_seen", lambda keys: unmarked.extend(keys))
+    calls: list[dict] = []
+
+    def _post_reply(text, **kwargs):
+        calls.append({"text": text, **kwargs})
+        raise crc.ChatResponseRejected(400, {"error": "invalid source"})
+
+    monkeypatch.setattr(crc, "post_reply", _post_reply)
+    msg = _make_msg(role="user", content="你好", ts=5400.0)
+    with patch.object(crc, "call_agent", return_value="你好呀"):
+        crc._process_messages([msg])
+
+    assert len(calls) == 1 and "image_followups" not in calls[0]
+    assert unmarked, "a rejected text reply must still release the turn for retry"
