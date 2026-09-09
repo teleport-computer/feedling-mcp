@@ -94,7 +94,9 @@ def test_index_core_private_query_limit_is_applied_after_enclave_search(monkeypa
     def fake_enclave(api_key, candidates, *, operation, payload=None):
         captured["ids"] = [m["id"] for m in candidates]
         captured["payload"] = dict(payload or {})
-        return {"items": [{"id": "late_private_match", "summary": "private match"}]}
+        return {"user_id": "usr_v1_read", "unavailable_ids": [],
+                "ranking": readside_core.search_contract.VERSION,
+                "items": [{"id": "late_private_match", "summary": "private match"}]}
 
     body = readside_core.memory_index_core(
         store,

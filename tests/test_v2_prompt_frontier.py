@@ -87,7 +87,7 @@ def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_455
+_REAL_TOOL_CATALOG_BYTES = 36_702
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -95,7 +95,7 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
 
     The fixture is derived from the real platform catalog rather than copying a
     toy schema list. ASCII description padding makes the combined canonical
-    payload exactly 35,691 bytes while keeping 69 independently named tools.
+    payload exactly 36,702 bytes while keeping 69 independently named tools.
     The 2026-08-17 increase records the real `stay_silent` wake schema: it adds
     341 bytes by itself and 267 bytes net when replacing one synthetic MCP tool
     in this fixed-count mixed catalog.
@@ -135,6 +135,10 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     real catalog by 215 bytes to 36,211. System-prompt bytes are not catalog bytes.
     T453 adds the approved empty-dimensions setup offer to
     identity_dimensions_set, increasing the real catalog by 244 bytes to 36,455.
+    T524 adds BM25 and rolling-compatibility guidance to memory_search,
+    increasing the real catalog by 247 bytes to 36,702. The previous 12-byte
+    MCP padding is preserved; the old fixture overflow was 235 bytes, not the
+    full description delta. Tool count and parameter schemas are unchanged.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

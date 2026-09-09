@@ -961,8 +961,9 @@ def test_v1_memory_protocol_teaches_navigation_not_search_first():
     block = resident._memory_read_prompt_block()
     # order: injected block first → locate → pick → relate (threads) → fetch bodies
     assert block.index("相关记忆") < block.index("(1) Locate") < block.index("(2) Pick") < block.index("(3) Relate") < block.index("(4) Fetch")
-    assert "memory-index --query <exact word>" in block and "literal substring" in block
-    assert "zero results mean that wording is absent" in block
+    assert "memory-index --query <keywords>" in block and "BM25 token ranking" in block
+    assert "Zero results do not prove the memory is absent" in block
+    assert "ranking=substring-legacy" in block
     assert "--bucket <bucket>" in block and "--thread <thread>" in block
     assert "follow one with" in block and "threads" in block
     assert "summaries are pointers, not the record" in block
@@ -980,7 +981,8 @@ def test_hosted_agent_prompt_memory_section_teaches_navigation():
     assert "strict two-step" not in section and "Index first" not in section
     for step in ("1. **Locate.**", "2. **Pick.**", "3. **Relate.**", "4. **Fetch.**"):
         assert step in section
-    assert "memory-index --query <exact word>" in section and "literal substring" in section
+    assert "memory-index --query <keywords>" in section and "BM25" in section
+    assert "ranking=substring-legacy" in section
     assert "memory-index --thread <thread>" in section and "memory-index --bucket <bucket>" in section
     assert "相关记忆" in section and "evidence, not" in section
     assert "Fact discipline" in section and "Never guess a plausible value" in section

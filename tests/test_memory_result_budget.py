@@ -183,6 +183,13 @@ def garden(monkeypatch):
     } for i in range(94)]
     monkeypatch.setattr(service.db, "memory_load_strict", lambda _user: list(rows))
     monkeypatch.setattr(service.db, "memory_replace_all", lambda _user, updated: None)
+    # Only replace the transport: plaintext-tier queries now use the same real
+    # enclave ranker as sealed rows, instead of being ranked in backend.
+    import memory_readside_core
+    from enclave import memory_search
+    monkeypatch.setattr(memory_readside_core, "post_enclave_readside",
+        lambda api_key, candidates, *, operation, payload, **kw:
+            memory_search.search(candidates, "budget-user", None, payload))
     events = []
     monkeypatch.setattr(memory_core.debug_trace, "trace_event", lambda _store, **event: events.append(event))
     return SimpleNamespace(user_id="budget-user"), rows, events
@@ -241,7 +248,8 @@ def test_94_cards_survive_real_pipeline_with_seven_siblings(garden, name, args):
     assert all(set(item) == {"id", "date", "bucket", "summary", "threads"} for item in payload["items"])
     assert all(item["threads"] == ["生活物品"] for item in payload["items"])
     assert all(item["summary"].endswith("。") and "第二" not in item["summary"] for item in payload["items"])
-    assert [item["id"] for item in payload["items"]] == sorted((row["id"] for row in rows), reverse=True)[:payload["returned"]]
+    assert [item["id"] for item in payload["items"]] == sorted(
+        (row["id"] for row in rows), reverse=name == "memory_index")[:payload["returned"]]
     assert sum(len(item.content) for item in batch) <= 14000
     assert all(len(item.content) >= 1100 for item in batch[1:])
     # The HTTP/core contract is still the full index, including all metadata.
@@ -249,6 +257,8 @@ def test_94_cards_survive_real_pipeline_with_seven_siblings(garden, name, args):
     assert status == 200 and len(http["items"]) == 94
     assert "score" in http["items"][0] and "threads" in http["items"][0]
     if name == "memory_search":
+        assert payload["ranking"] == "bm25-jieba-0.42.1-v1"
+        assert payload["unavailable_count"] == 0
         search_event = next(e for e in events if e["type"] == "memory.search.called")
         assert len(search_event["detail"]["ids"]) == 20
         assert search_event["detail"]["ids_omitted"] == 74
@@ -293,7 +303,7 @@ def test_actual_provider_receives_intact_index_and_recall_summary(garden, monkey
     answers = [
         {"reply": "", "tool_calls": [
             {"id": "index", "name": "memory_index", "args": {}},
-            {"id": "empty", "name": "memory_search", "args": {"query": "不存在的词"}},
+            {"id": "empty", "name": "memory_search", "args": {"query": "ZZ-NOMATCH-735"}},
             {"id": "fetch", "name": "memory_fetch", "args": {"ids": [rows[0]["id"]]}},
         ], "usage": {}},
         {"reply": "", "tool_calls": [{"id": "again", "name": "memory_index", "args": {}}], "usage": {}},
