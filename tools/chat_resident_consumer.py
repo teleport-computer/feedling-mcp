@@ -130,6 +130,7 @@ import shlex
 import shutil
 import signal
 import socket
+import contextvars
 import subprocess
 import sys
 import tempfile
@@ -3853,6 +3854,61 @@ def _vision_observation(
     if not observation:
         raise VisionObserverFailure("vision_model_empty_response")
     return observation
+
+
+_CAPTION_TRACE_BRANCHES = frozenset({
+    "intake", "dedicated_vision", "native_image", "image_placeholder",
+    "agent_carrier", "cli_carrier",
+})
+
+# 当轮图片消息的原始 caption。**只在进程内传递,永不外发**;trace 只发布尔与长度。
+# 用 ContextVar 而不是模块级 dict:模块级 dict 在一轮结束后不会自己消失,
+# 之后任何 verify/后台/重试的 CLI 准备都会顶着上一轮的 caption 打出**幽灵事件**
+# (codex3 r4 用真实 harness 实测到了)。ContextVar + finally 让它的寿命
+# 严格等于那一次 dispatch。
+_CAPTION_HOP_CTX: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
+    "feedling_caption_hop", default=("", ""),
+)
+
+
+def _caption_hop_current() -> tuple[str, str]:
+    try:
+        return _CAPTION_HOP_CTX.get()
+    except Exception:  # noqa: BLE001
+        return ("", "")
+
+
+def _emit_caption_hop(branch: str, *, content_type: str, caption: str,
+                      payload: str, message_id: str = "") -> None:
+    """T534: content-free 观测 —— 「用户随图发的文字,到这一跳还在不在」。
+
+    ⚠️ 判据必须是**原始 caption 在不在载荷里**,不是「载荷非空」:
+    装配后的载荷永远非空(里面有图片观察或占位符),拿它当判据会把
+    「caption 丢了」报成「caption 还在」—— 那正是这条 trace 要证伪的东西。
+    ⛔ caption / observation / 载荷的字面一个字都不进 payload,只发布尔与长度。
+    """
+    try:
+        safe_branch = branch if branch in _CAPTION_TRACE_BRANCHES else "unknown"
+        cap = str(caption or "")
+        body = str(payload or "")
+        cap_stripped = cap.strip()
+        _emit_debug_trace(
+            "chat",
+            "chat.image_caption.hop",
+            summary=f"caption hop {safe_branch}",
+            trace_id=str(message_id or "")[:64],
+            detail={
+                "branch": safe_branch,
+                "content_type": str(content_type or "")[:16],
+                "caption_present": bool(cap_stripped),
+                "caption_len": len(cap),
+                # 决定性的一格:原始 caption 是否**仍在**这一跳的载荷里
+                "caption_in_payload": bool(cap_stripped and cap_stripped in body),
+                "payload_len": len(body),
+            },
+        )
+    except Exception:  # noqa: BLE001 - 观测绝不能影响回合
+        pass
 
 
 def _vision_observation_content(caption: str, observation: str) -> str:
@@ -11132,6 +11188,23 @@ def _call_agent_cli_impl(
     # T512: settle「到达」on what actually leaves for the driver — stdin when set
     # (pi / claude / codex prompt-on-stdin), the message body for the codex
     # app-server path, else argv. Every later prefix has been applied by now.
+    # T534 跳四:**真正离开进程交给驱动的那一份文本**里,原始 caption 是否还在。
+    # 与 T512 的「到达」用同一个表达式 —— 名字与断言必须对得上载体本身,
+    # 早于 _render_cli_template 的 rendered_message 不是载体(codex3 r4)。
+    _caption_hop_cap, _caption_hop_mid = _caption_hop_current()
+    if _caption_hop_cap:
+        _emit_caption_hop(
+            "cli_carrier",
+            content_type="image",
+            caption=_caption_hop_cap,
+            payload=(
+                _run_kwargs["input"] if _run_kwargs.get("input") else (
+                    message if app_server_plan is not None
+                    else " ".join(str(x) for x in cmd)
+                )
+            ),
+            message_id=_caption_hop_mid,
+        )
     _auto_memory_arrival(
         _run_kwargs["input"] if _run_kwargs.get("input") else (
             message if app_server_plan is not None else " ".join(str(x) for x in cmd)
@@ -19430,6 +19503,20 @@ def _process_messages(messages: list) -> float:
             continue
 
         content = str(msg.get("content") or "").strip()
+        if str(msg.get("content_type", "text")) == "image":
+            # T534 跳一:消息刚取到时配文在不在(判「进来就没有」还是「装配时掉的」)
+            _caption_hop_message_id = str(msg.get("id") or msg.get("message_id") or "")
+            _caption_hop_caption = content
+            _emit_caption_hop(
+                "intake",
+                content_type=str(msg.get("content_type", "text")),
+                caption=_caption_hop_caption,
+                payload=content,
+                message_id=_caption_hop_message_id,
+            )
+        else:
+            _caption_hop_message_id = ""
+            _caption_hop_caption = ""
         # I5: snapshot BEFORE any prompt-composition mutation below (screen
         # context / world book / quoted text / time anchor / io_cli capability
         # catalog / transcript header) — those can all carry unrelated
@@ -19549,6 +19636,15 @@ def _process_messages(messages: list) -> float:
             # otherwise the agent gets the attachment but loses the actual prompt.
             if not content and not vision_observer_failed:
                 content = IMAGE_PLACEHOLDER
+            # T534 跳二:装配完成后,原始 caption 是否还在载荷里
+            _emit_caption_hop(
+                "image_placeholder" if content == IMAGE_PLACEHOLDER
+                else ("dedicated_vision" if vision_route_id else "native_image"),
+                content_type=content_type,
+                caption=_caption_hop_caption,
+                payload=content,
+                message_id=_caption_hop_message_id,
+            )
         elif content_type == "file" and msg.get("body_unavailable"):
             # _prepare_file_for_agent decodes a missing file_b64 to b"" and would
             # land a 0-byte document — the agent would then dutifully describe an
@@ -19845,6 +19941,25 @@ def _process_messages(messages: list) -> float:
             return {"absolute_deadline": vision_fallback_deadline}
 
         def _dispatch_foreground_agent(turn_content: str) -> Any:
+            # T534 跳三:交给 agent 的最终装配文本里,原始 caption 是否还在
+            if _caption_hop_caption:
+                _emit_caption_hop(
+                    "agent_carrier",
+                    content_type="image",
+                    caption=_caption_hop_caption,
+                    payload=turn_content,
+                    message_id=_caption_hop_message_id,
+                )
+            # 只在这一次 dispatch 期间可见 —— 成功、异常都在 finally 里还原
+            _caption_hop_token = _CAPTION_HOP_CTX.set(
+                (_caption_hop_caption, _caption_hop_message_id)
+            )
+            try:
+                return _dispatch_foreground_agent_inner(turn_content)
+            finally:
+                _CAPTION_HOP_CTX.reset(_caption_hop_token)
+
+        def _dispatch_foreground_agent_inner(turn_content: str) -> Any:
             _start_voice_cancellation()
             fence_kwargs = {"outbound_fence": True} if screen_pixel_turn else {}
             cancellation_kwargs = (
