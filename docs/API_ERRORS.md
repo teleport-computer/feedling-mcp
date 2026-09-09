@@ -188,6 +188,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | slug | 状态码 | blame | 说明 | 需本地化 |
 |---|---|---|---|---|
 | `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*` 及任何未知消息）；分诊看 `detail.upstream` | |
+| `memory_search_resource_limit` | 413 | system | query 全语料超过 4096 卡、32 MiB 内部 JSON 请求或 16 MiB 可搜索 UTF-8 文本；整次失败，不返回局部排名 | |
 | `memory_load_failed` | 503 | system | `memory/service.py` 载入 moments 失败 | |
 | `enclave_unavailable` | 503 | system | 未配置 `FEEDLING_ENCLAVE_URL` | |
 | `api_key_unavailable` | 503 | system | 既无 api_key 也无 runtime token | |
@@ -392,6 +393,8 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `unauthorized` | 401 | — | whoami 缓存过、key 已被吊销 |
 | `not_ready` | 503 | system | enclave 尚未完成初始化 |
 | `missing_api_key` | 401 | — | envelope 路由鉴权前置检查缺 api_key |
+| `memory_search_protocol_unsupported` | 400 | — | memory/index 请求了未知的搜索协议版本 |
+| `memory_search_resource_limit` | 413 | system | memory/index 请求体或全语料搜索超过固定资源上限 |
 | `cannot_resolve_user_id` | 401 | — | |
 | `screen_caption_unconfigured` | 503 | — | |
 | `backend_error` | 502 | system | `_errors.py::backend_call_or_error` 兜底；实际 body 是 `backend_error: <httpx 异常文本>`（历史写法，非规范 slug+detail 分离） |

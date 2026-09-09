@@ -7,11 +7,12 @@ from __future__ import annotations
 import json
 
 import anyio.to_thread
+import memory_search_contract as search_contract
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from enclave import auth, backend_client, envelope, readside
+from enclave import auth, backend_client, envelope, readside, memory_search
 from enclave.routes._body import read_json_payload
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 
@@ -28,27 +29,35 @@ async def v1_memory_index(request: Request):
     content_sk, err_response = await content_sk_or_503()
     if err_response is not None:
         return err_response
-    payload = await read_json_payload(request)
+    try:
+        payload = await read_json_payload(request, max_bytes=search_contract.MAX_REQUEST_BYTES)
+    except search_contract.SearchLimitExceeded:
+        return JSONResponse({"error": "memory_search_resource_limit"}, status_code=413)
     moments = payload.get("moments")
     if not isinstance(moments, list):
         return JSONResponse({"error": "moments must be a list"}, status_code=400)
     effective_limit = readside.memory_readside_effective_limit(payload.get("limit"))
     query = str(payload.get("query") or "").strip()
 
+    protocol = payload.get("search_protocol")
+    if query and protocol not in (None, search_contract.VERSION):
+        return JSONResponse({"error": "memory_search_protocol_unsupported"}, status_code=400)
+    if query and protocol == search_contract.VERSION:
+        try:
+            result = await anyio.to_thread.run_sync(
+                memory_search.search, moments, user_id or "", content_sk, payload)
+        except search_contract.SearchLimitExceeded:
+            return JSONResponse({"error": "memory_search_resource_limit"}, status_code=413)
+        return JSONResponse(result)
+
     def _work():
-        builder = (
-            readside.build_memory_search_item
-            if query
-            else readside.build_memory_index_item
-        )
-        # Query matching depends on encrypted content.  Decrypt the bounded
-        # candidate window before filtering, then apply the requested result
-        # limit.  Pre-slicing here would make a match after the first N cards
-        # invisible even though the backend sent it to the enclave.
-        decrypt_candidates = moments if query else moments[:effective_limit]
+        # Old backend workers still partition/page queries and restore their
+        # own input order. Preserve substring semantics until they explicitly
+        # request the global-corpus protocol; never claim per-page BM25 is global.
         items, unavailable_ids = readside.decrypt_readside_items(
-            decrypt_candidates, user_id or "", content_sk,
-            item_builder=builder)
+            moments if query else moments[:effective_limit], user_id or "", content_sk,
+            item_builder=(readside.build_memory_search_item if query
+                          else readside.build_memory_index_item))
         items = readside.memory_index_filter_items(items, payload)
         items = [readside.memory_public_item(item) for item in items]
         items = items[:effective_limit]
@@ -61,6 +70,7 @@ async def v1_memory_index(request: Request):
         "user_id": user_id,
         "items": items,
         "unavailable_ids": unavailable_ids,
+        **({"ranking": search_contract.LEGACY} if query else {}),
     })
 
 

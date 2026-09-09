@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory queries rank token matches with BM25.** Nonblank `query` uses pinned
+  jieba 0.42.1 Chinese segmentation and whole case-insensitive ASCII identifiers.
+  The enclave ranks the complete readable corpus across both storage tiers before
+  applying filters and limit; item `score` keeps its old meaning. Query responses
+  add `ranking` and `unavailable_count`; `substring-legacy` explicitly marks a
+  rolling-upgrade fallback, never an auth/timeout fallback. Search resource limits
+  return HTTP 413 `memory_search_resource_limit` rather than partial rankings.
+  All nonblank queries now require the enclave path, including plaintext-tier
+  cards. Blank-query browsing and fetch are unchanged.
+
 - **Rejected agent replies are traced, and attachments degrade instead of looping.**
   `POST /v1/chat/response` now records a `chat.response.rejected` route trace
   (status, error code, followup counts; no content) whenever it answers 4xx.
@@ -40,10 +50,9 @@ change must not be interpreted as an API guarantee.
   days inside the existing eight-card/2500-character limit. Cue generation needs
   a later memgarden release; existing cards and the 0.19.0 pin remain compatible.
 
-- **Memory index `query` semantics corrected in docs.** `/v1/memory/index` applies
-  a literal, case-insensitive substring filter (plus exact `bucket` / `thread`
-  filters); it is not semantic search and an empty result means the wording is
-  absent, not the memory. Agent guidance now describes the navigation order
+- **Memory navigation guidance clarified.** The former literal-substring query
+  contract is superseded by BM25 above (and retained only for rolling compatibility).
+  Empty results do not prove memory absence. Agent guidance describes the navigation order
   locate → pick → relate (follow `threads`) → fetch, and reads the auto-injected
   related-memory block as evidence before searching.
 

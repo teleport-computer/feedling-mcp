@@ -77,7 +77,7 @@ def test_plaintext_memory_index_never_posts_enclave(monkeypatch):
     result = readside_core.memory_index_core(
         store,
         None,
-        {"query": "needle"},
+        {},
         post_enclave=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("plaintext memory must not post to enclave")
         ),
@@ -195,7 +195,8 @@ def test_index_core_ignores_old_recall_window_env_and_returns_full_light_index(m
     def fake_enclave(api_key, candidates, *, operation, payload=None):
         captured["ids"] = [m["id"] for m in candidates]
         captured["payload"] = dict(payload or {})
-        return {"items": [{"id": m["id"], "summary": m["id"]} for m in candidates]}
+        return {"user_id": "usr_core", "unavailable_ids": [],
+                "items": [{"id": m["id"], "summary": m["id"]} for m in candidates]}
 
     monkeypatch.setattr(readside_core, "post_enclave_readside", fake_enclave)
 
@@ -227,7 +228,8 @@ def test_index_core_limit_zero_opens_window_but_keeps_eligibility_and_sort(monke
     def fake_enclave(api_key, candidates, *, operation, payload=None):
         captured["ids"] = [m["id"] for m in candidates]
         captured["payload"] = dict(payload or {})
-        return {"items": [{"id": m["id"], "summary": m["id"]} for m in candidates]}
+        return {"user_id": "usr_core", "unavailable_ids": [],
+                "items": [{"id": m["id"], "summary": m["id"]} for m in candidates]}
 
     monkeypatch.setattr(readside_core, "post_enclave_readside", fake_enclave)
 
@@ -265,8 +267,8 @@ def test_index_core_hard_max_caps_full_open_window(monkeypatch):
     assert body["truncated"] is True
 
 
-def test_index_core_exact_query_pages_past_hard_max(monkeypatch):
-    """HARD_MAX bounds each enclave request, never the searchable corpus."""
+def test_index_core_query_sends_global_corpus_past_hard_max(monkeypatch):
+    """HARD_MAX bounds decrypt chunks/results, never the searchable corpus."""
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", "3")
     store = types.SimpleNamespace(user_id="usr_core")
     moments = [
@@ -281,6 +283,8 @@ def test_index_core_exact_query_pages_past_hard_max(monkeypatch):
         ids = [m["id"] for m in candidates]
         pages.append(ids)
         return {
+            "user_id": "usr_core", "unavailable_ids": [],
+            "ranking": readside_core.search_contract.VERSION,
             "items": ([{"id": "card_6", "summary": "exact late match"}]
                       if "card_6" in ids else [])
         }
@@ -292,10 +296,74 @@ def test_index_core_exact_query_pages_past_hard_max(monkeypatch):
         post_enclave=fake_enclave,
     )
 
-    assert [len(page) for page in pages] == [3, 3, 1]
+    assert [len(page) for page in pages] == [7]
     assert body["items"] == [{"id": "card_6", "summary": "exact late match"}]
     assert body["user_card_count"] == 7
     assert body["truncated"] is False
+
+
+def test_search_mixed_corpus_preserves_enclave_rank_and_strips_private(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_core")
+    plain = _plaintext_moment("plain", "low importance best lexical match")
+    sealed = _moment("sealed", importance=1)
+    sealed["body"] = "must not forward shadow plaintext"
+    rows = [sealed, plain, _moment("local", visibility="local_only"),
+            _moment("foreign", owner="other"), _moment("deleted", status="deleted")]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _: rows)
+    monkeypatch.setattr(readside_core, "_local_memory_items", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("query text must only be built in enclave")))
+
+    def post(api_key, candidates, *, operation, payload):
+        assert [m["id"] for m in candidates] == ["sealed", "plain"]
+        assert "body" not in candidates[0]
+        assert candidates[1]["body"] == plain["body"]
+        assert payload["search_protocol"] == readside_core.search_contract.VERSION
+        return {"user_id": "usr_core", "unavailable_ids": [],
+                "ranking": readside_core.search_contract.VERSION,
+                "items": [{"id": "plain", "score": .01, "_search_content": "private",
+                           "_bm25_score": 99}, {"id": "sealed", "score": .9}]}
+
+    out = readside_core.memory_index_core(store, "key", {"query": "match"}, post_enclave=post)
+    assert out["items"] == [{"id": "plain", "score": .01}, {"id": "sealed", "score": .9}]
+    assert out["ranking"] == readside_core.search_contract.VERSION
+    assert out["unavailable_count"] == 0
+
+
+def test_search_legacy_marker_and_nonprotocol_errors_do_not_fallback(monkeypatch):
+    import pytest
+    store = types.SimpleNamespace(user_id="usr_core")
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments",
+                        lambda _: [_moment("m")])
+    legacy = {"user_id": "usr_core", "items": [{"id": "m"}], "unavailable_ids": []}
+    out = readside_core.memory_index_core(store, "key", {"query": "m"},
+                                         post_enclave=lambda *a, **kw: legacy)
+    assert out["ranking"] == "substring-legacy"
+    for bad in ({"items": []}, {**legacy, "ranking": "future"},
+                {**legacy, "user_id": "other"}):
+        with pytest.raises(RuntimeError, match="enclave_invalid_readside_response"):
+            readside_core.memory_index_core(store, "key", {"query": "m"},
+                                           post_enclave=lambda *a, **kw: bad)
+    for error in ("enclave_http_401:private", "enclave_http_403:private",
+                  "enclave_error:ReadTimeout", "enclave_http_500:private"):
+        calls = []
+        def fail(*a, **kw):
+            calls.append(1)
+            raise RuntimeError(error)
+        with pytest.raises(RuntimeError, match=error):
+            readside_core.memory_index_core(store, "key", {"query": "m"}, post_enclave=fail)
+        assert len(calls) == 1
+
+
+def test_search_resource_limit_rejects_before_post(monkeypatch):
+    import pytest
+    contract = readside_core.search_contract
+    store = types.SimpleNamespace(user_id="usr_core")
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments",
+                        lambda _: [_moment("a"), _moment("b")])
+    monkeypatch.setattr(contract, "MAX_CARDS", 1)
+    with pytest.raises(contract.SearchLimitExceeded):
+        readside_core.memory_index_core(store, "key", {"query": "x"},
+            post_enclave=lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not post")))
 
 
 def test_index_core_negative_env_limit_is_ignored_by_v1_full_index(monkeypatch):
