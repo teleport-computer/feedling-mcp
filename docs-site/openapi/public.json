@@ -4411,11 +4411,11 @@
         "operationId": "memory_index_v1_memory_index_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Lightweight discovery/search result and explicit ranking mode.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryIndexResponse"
                 }
               }
             }
@@ -4425,6 +4425,16 @@
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "memory_search_resource_limit: complete-corpus resource bound exceeded; no partial search result.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4448,7 +4458,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Return lightweight memory cards with optional retrieval cues. Query applies a case-insensitive literal substring filter over readable card text and cues, combined with exact bucket/thread filters; empty results do not prove the memory is absent. Full content is available through fetch, not the index."
+        "description": "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 in the enclave, then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking."
       }
     },
     "/v1/memory/legacy_batch": {
@@ -11076,7 +11086,7 @@
           "query": {
             "type": "string",
             "maxLength": 500,
-            "description": "Case-insensitive literal substring over readable card text and optional retrieval cues; not semantic search."
+            "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."
           },
           "limit": {
             "type": "integer",
@@ -11106,6 +11116,51 @@
           "bucket": "Collaboration",
           "thread": "communication style"
         }
+      },
+      "MemoryIndexResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "limit",
+          "truncated",
+          "user_card_count"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "description": "Lightweight card projections, no full content or BM25 scores. With query: BM25 descending, occurred_at descending, then ID ascending. Existing item score remains importance/recency, not BM25."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."
+          },
+          "user_card_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ranking": {
+            "type": "string",
+            "enum": [
+              "bm25-jieba-0.42.1-v1",
+              "substring-legacy"
+            ],
+            "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."
+          },
+          "unavailable_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryFetchRequest": {
         "type": "object",

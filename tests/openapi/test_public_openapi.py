@@ -129,6 +129,18 @@ def public_schema() -> dict[str, Any]:
     return _build_public_schema(_load_schema())
 
 
+def test_memory_search_bm25_contract_and_explicit_resource_failure(public_schema):
+    schemas = public_schema["components"]["schemas"]
+    query = schemas["MemoryIndexRequest"]["properties"]["query"]
+    assert "BM25" in query["description"] and "jieba 0.42.1" in query["description"]
+    result = schemas["MemoryIndexResponse"]["properties"]
+    assert result["ranking"]["enum"] == ["bm25-jieba-0.42.1-v1", "substring-legacy"]
+    assert "unavailable_count" in result
+    op = public_schema["paths"]["/v1/memory/index"]["post"]
+    assert "413" in op["responses"]
+    assert "memory_search_resource_limit" in op["responses"]["413"]["description"]
+
+
 @pytest.fixture(scope="module")
 def operations(public_schema: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
     return {

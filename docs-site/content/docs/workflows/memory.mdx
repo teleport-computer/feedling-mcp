@@ -120,7 +120,7 @@ may ignore the optional `context_recent` request flag.
 
 Cards may carry `retrieval_cues`: up to five short, grounded keywords, aliases,
 answerable questions or known event-time hints, at most 120 characters each.
-The read side includes them in literal search and lightweight index projections;
+The read side includes them in BM25 search and lightweight index projections;
 V2's index also retains up to three thread pointers for navigation. Cues are
 search hints, not independent factual evidence. The pinned memgarden 0.19.0
 producer does not generate this new field; absent cues remain compatible. New
@@ -168,13 +168,17 @@ the opt-in relevance-gated soft-quota policy is used only when a reviewed, relea
 dependency upgrade supplies it. A missing or failed selection remains unknown,
 not a measured empty Garden.
 
-`memory_search` matches a literal, case-insensitive substring of the card text;
-it applies no synonyms, translation, or stemming. An empty result therefore means
-that exact wording does not appear on any card, not that the memory is missing —
-a card written in one language is not found by searching for the other. The tool
-guidance directs the model to retry with different wording before concluding that
-a memory does not exist; only an identical repeat of the same arguments is
-refused within a turn.
+`memory_search` uses request-local BM25 token ranking over the complete authorized
+readable Garden. Chinese segmentation uses pinned jieba 0.42.1 (precise mode,
+HMM disabled); ASCII words and whole identifiers such as `NP-4286` and `CR2450`
+are case-insensitive tokens, not substring prefixes. Query terms need not be
+adjacent; any matching term can contribute. No synonyms, translation, stemming,
+time interpretation, embedding or model is involved. A nonblank query with no
+searchable tokens returns no matches. Empty results do not prove memory absence;
+try different wording or browse a bucket/thread. Only identical repeated
+arguments are refused within a turn. The V2 compact result preserves `ranking`
+and `unavailable_count`, including the explicit `substring-legacy` mode during
+rolling upgrades.
 
 `GET /v1/dream/status` also returns `capture_cards_added` and
 `capture_completed_at`. The count is a monotonic total of cards actually added
@@ -360,13 +364,32 @@ response's effective `limit` and `truncated` values.
 }
 ```
 
-The optional `query` field is a **literal, case-insensitive substring filter**
-over each card's summary, content, bucket, source and threads (`bucket` and
-`thread` are exact filters). There is no synonym, stemming or semantic matching:
-an empty result means that exact wording is absent from every card, not that the
-memory is missing — try different wording or browse by `bucket` / `thread`.
-`/v1/memory/index` is a navigation endpoint, not a search engine; final card
-selection still happens in your client or agent from the returned summaries.
+A nonblank `query` searches the existing readable summary/content/thread/bucket
+projection plus retrieval cues using **BM25** (`k1=1.2`, `b=0.75`, nonnegative
+IDF). In the enclave, plaintext-tier and sealed cards share one corpus and one
+set of statistics. Exact `bucket` / `thread` filters select from that ranking;
+`limit` is applied only afterwards. Scores tie by `occurred_at` descending, then
+ID ascending. The existing per-item `score` remains importance/recency, **not**
+BM25. Full content, tokens, postings and BM25 scores are not added to the response.
+Final evidence selection still belongs to your client or agent.
+
+Query responses additionally carry `ranking: "bm25-jieba-0.42.1-v1"` and
+`unavailable_count` (candidate cards that could not be read, excluded from
+statistics). A recognized older enclave response instead reports
+`ranking: "substring-legacy"`: this temporary rolling-upgrade mode uses the old
+case-insensitive whole-query substring match and importance order. Authentication
+errors, timeouts, and unknown protocols do not silently fall back. Blank or
+omitted `query` retains the existing index browsing path; fetch is unchanged.
+
+Search is bounded to 4096 candidate cards, 32 MiB of encoded internal JSON request,
+and 16 MiB of searchable UTF-8 projection text. Crossing any bound fails the
+whole search with HTTP 413 `memory_search_resource_limit`; no partial-corpus rank
+or false empty result is returned. Reducing `limit` does not reduce the corpus.
+`FEEDLING_MEMORY_READSIDE_HARD_MAX` bounds result count and enclave decrypt chunks,
+not search corpus size. Within the bounds, a query's `truncated: false` means no
+candidate-window truncation, not that every match was returned or every card
+was decryptable; inspect `limit` and `unavailable_count`. These resource bounds
+are not a deployed latency guarantee.
 
 ## 3. Fetch selected content
 

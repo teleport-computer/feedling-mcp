@@ -1687,7 +1687,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "MemoryIndexRequest": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "maxLength": 500, "description": "Case-insensitive literal substring over readable card text and optional retrieval cues; not semantic search."},
+            "query": {"type": "string", "maxLength": 500, "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."},
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
@@ -1696,6 +1696,22 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
         "example": {"limit": 50, "bucket": "Collaboration", "thread": "communication style"},
+    },
+    "MemoryIndexResponse": {
+        "type": "object",
+        "required": ["items", "limit", "truncated", "user_card_count"],
+        "properties": {
+            "items": {"type": "array", "items": {"type": "object", "additionalProperties": True},
+                      "description": "Lightweight card projections, no full content or BM25 scores. With query: BM25 descending, occurred_at descending, then ID ascending. Existing item score remains importance/recency, not BM25."},
+            "limit": {"type": "integer", "minimum": 1},
+            "truncated": {"type": "boolean", "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."},
+            "user_card_count": {"type": "integer", "minimum": 0},
+            "ranking": {"type": "string", "enum": ["bm25-jieba-0.42.1-v1", "substring-legacy"],
+                        "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."},
+            "unavailable_count": {"type": "integer", "minimum": 0,
+                                  "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."},
+        },
+        "additionalProperties": False,
     },
     "MemoryFetchRequest": {
         "type": "object",
@@ -2627,7 +2643,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ),
     ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
-    ("post", "/v1/memory/index"): "Return lightweight memory cards with optional retrieval cues. Query applies a case-insensitive literal substring filter over readable card text and cues, combined with exact bucket/thread filters; empty results do not prove the memory is absent. Full content is available through fetch, not the index.",
+    ("post", "/v1/memory/index"): "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 in the enclave, then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking.",
     ("post", "/v1/memory/fetch"): (
         "Fetch full records for selected memory IDs in request order. All shared "
         "cards use the same read contract; legacy card-classification metadata is "
@@ -2829,6 +2845,12 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                 }
             },
         },
+    },
+    ("post", "/v1/memory/index"): {
+        "200": {"description": "Lightweight discovery/search result and explicit ranking mode.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MemoryIndexResponse"}}}},
+        "413": {"description": "memory_search_resource_limit: complete-corpus resource bound exceeded; no partial search result.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
     },
     ("post", "/v1/memory/fetch"): {
         "200": {

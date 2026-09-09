@@ -128,6 +128,7 @@ Pillow>=11,<13
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
 memgarden==0.20.0
+jieba==0.42.1  # deterministic Chinese BM25 tokenization; hash in requirements.lock
 
 # 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +

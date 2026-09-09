@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import memory_search_contract as search_contract
 
 from capabilities import result_budget
 from memory import recall_metadata
@@ -75,6 +76,9 @@ def index_payload(body: dict, *, tool_name: str) -> dict:
         "total": _count(body.get("user_card_count"), len(source)),
         "matched": len(source),
         "source_truncated": bool(body.get("truncated")),
+        **({"ranking": body["ranking"],
+            "unavailable_count": _count(body.get("unavailable_count"))}
+           if body.get("ranking") in (search_contract.VERSION, search_contract.LEGACY) else {}),
     }, items, tool_name)
 
 
