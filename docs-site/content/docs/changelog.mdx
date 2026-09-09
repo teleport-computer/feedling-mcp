@@ -21,6 +21,15 @@ change must not be interpreted as an API guarantee.
   checkout refuses to overwrite conflicting untracked or ignored files.
   This does not introduce TCP IPC or full Windows support.
 
+- **Image-model setup no longer rejects valid models by name.** Adding an image
+  model on a relay (`openai_compatible`, which uses `/images/generations`, or
+  `openrouter`, which uses `/images`) now probes that dedicated endpoint
+  regardless of the model id, so a real image model whose name carries none of
+  the known markers (e.g. `nai-diffusion-4-5-full` on a relay serving NovelAI)
+  is tested for real instead of being reported "this model can't generate images"
+  before any request is sent. A model that genuinely cannot generate is still
+  rejected by the endpoint's error or empty result.
+
 - **Memory queries rank token matches with BM25.** Nonblank `query` uses pinned
   jieba 0.42.1 Chinese segmentation and whole case-insensitive ASCII identifiers.
   The enclave ranks the complete readable corpus across both storage tiers before

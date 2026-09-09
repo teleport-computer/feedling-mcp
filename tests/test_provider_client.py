@@ -1919,6 +1919,44 @@ def test_ordinary_chat_keeps_provider_family_image_gate(
         assert "modalities" not in calls[0]["json"]
 
 
+def test_ordinary_chat_on_relay_keeps_unmarked_model_off_the_image_wire(monkeypatch):
+    """T535 opened the dedicated image endpoint for relay PROBES regardless of
+    the model id. This locks the other side: a normal chat turn on the same
+    relay (no probe) with an unmarked model must NOT be diverted onto the image
+    wire — it stays on /chat/completions with no image modalities, so an
+    ordinary chat model is never billed an image request on a hunch."""
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError):
+        asyncio.run(
+            pc.chat_completion_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "some-text-only-model", "sk-relay", _RELAY_BASE
+                ),
+                [{"role": "user", "content": "hello"}],
+                allow_image_output=True,
+                # image_generation_probe defaults to False: this is a live chat
+                # turn, not a setup probe.
+            )
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/chat/completions")
+    assert "/images/generations" not in calls[0]["url"]
+    assert "modalities" not in calls[0]["json"]
+
+
 @pytest.mark.parametrize(
     ("provider", "model", "url_marker"),
     (
@@ -2104,6 +2142,58 @@ def test_relay_image_uses_dedicated_endpoint_first(monkeypatch):
 
     assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
     assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_relay_probe_reaches_dedicated_endpoint_for_unmarked_image_model(monkeypatch):
+    """T535: an explicit setup probe declares "this is my image model", so the
+    dedicated /images/generations endpoint is tried for a relay model whose id
+    carries none of the name markers. ``nai-diffusion-4-5-full`` (NovelAI on a
+    relay) used to be reported "can't generate images" before any request left
+    the box, because the probe silently fell through to the chat wire."""
+    import asyncio
+
+    assert not pc._model_name_has_image_output("nai-diffusion-4-5-full")
+
+    def handler(url, payload):
+        assert url.endswith("/images/generations"), url
+        return FakeResponse(200, {"data": [{"b64_json": _TINY_PNG_B64}]})
+
+    calls = _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "nai-diffusion-4-5-full", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
+    assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_relay_probe_unmarked_model_still_rejected_when_endpoint_denies(monkeypatch):
+    """Opening the wire for unmarked relay models cannot pass a non-image model:
+    a relay that genuinely does not serve images answers the dedicated endpoint
+    with a 4xx that carries no fall-back shape, so the probe still fails."""
+    import asyncio
+
+    def handler(url, payload):
+        return FakeResponse(404, {"error": {"message": "model not found"}})
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "some-text-only-model", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+    assert raised.value.status_code == 404
 
 
 def test_relay_image_falls_back_to_chat_when_dedicated_endpoint_rejects(monkeypatch):
