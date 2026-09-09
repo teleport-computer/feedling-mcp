@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Rejected agent replies are traced, and attachments degrade instead of looping.**
+  `POST /v1/chat/response` now records a `chat.response.rejected` route trace
+  (status, error code, followup counts; no content) whenever it answers 4xx.
+  The resident consumer keeps the server's reason in its log, resends a reply
+  whose image/file followups were rejected **without** the attachments, and
+  posts a system notice that the picture/file could not be delivered — instead
+  of re-running the whole turn (which regenerated the image and looped).
+
 - **Injected memory summaries are never truncated, and a profile-covered card
   keeps its ID.** Summaries up to 300 characters appear whole; a longer one is
   replaced by its ID, reason and a fetch hint instead of a cut-off sentence. A

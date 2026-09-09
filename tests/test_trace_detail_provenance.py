@@ -87,6 +87,10 @@ SANITIZER_RESULT_FIELDS: dict[str, frozenset[str]] = {
     # AgentErrorNotice(error_class=spec.code, blame=spec.blame,
     #                  user_text=spec.text(language), detail=str(exc)[:200])
     "classify_agent_error": frozenset({"error_class", "blame", "user_text"}),
+    # ReplyRejection(error_class=<closed token from _REPLY_REJECTION_CLASSES | "other">,
+    #                status_class=<"400"|"401"|...|"4xx">) — T528: the server's
+    # rejection text stays in the process log; only these two codes reach the trace.
+    "classify_reply_rejection": frozenset({"error_class", "status_class"}),
 }
 
 # Producers that may still carry exception text, each with the reason it is
