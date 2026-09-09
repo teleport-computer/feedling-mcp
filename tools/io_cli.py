@@ -32,6 +32,7 @@ import re
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -1398,14 +1399,15 @@ def _resident_ipc_home():
     /tmp file, not a directory) — this mirrors their exact fingerprint recipe
     (sha1(FEEDLING_API_KEY)[:10]) so io_cli and the consumer, given the same
     env, always agree on the socket path with zero operator configuration,
-    while still keeping co-hosted accounts on the same box from colliding on
-    one socket (the same cross-tenant concern IMAGE_TEMP_DIR's default guards
-    against)."""
+    for a self-hosted account. The fingerprint is a naming convention, not
+    an isolation boundary: hosted/keyless consumers require an explicitly
+    pinned per-user FEEDLING_HOME and OS access controls."""
     raw = _env("FEEDLING_HOME")
     if raw:
         return raw.rstrip("/")
     fp = hashlib.sha1((os.environ.get("FEEDLING_API_KEY") or "").encode()).hexdigest()[:10]
-    return f"/tmp/feedling_home_{fp}"
+    root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    return os.path.join(root, f"feedling_home_{fp}")
 
 
 def _resident_ipc_sock_path():
@@ -1418,6 +1420,8 @@ def _resident_ipc_round_trip(sock_path, line, timeout):
     listening; socket.timeout = consumer alive but slow/stuck; other OSError =
     some other local IPC failure). Never touches the network itself — that
     happens consumer-side."""
+    if not hasattr(socket, "AF_UNIX"):
+        raise NotImplementedError("resident IPC requires socket.AF_UNIX")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
@@ -1441,6 +1445,16 @@ def _resident_ipc_round_trip(sock_path, line, timeout):
             pass
 
 
+def _resident_ipc_unsupported(request_id):
+    return {
+        "ok": False, "error": "ipc_unsupported", "request_id": request_id,
+        "hint": "This Python runtime has no AF_UNIX: identity-redistill, "
+                "send-file and send-image cannot use resident IPC. "
+                "Text replies use the consumer HTTP flow, not this socket. "
+                "No TCP fallback is enabled.",
+    }
+
+
 def _resident_ipc_request(material, *, timeout=30.0):
     """Round-trip one redistill request to the resident consumer's local IPC
     listener. Retries ONCE with the SAME request_id on timeout — the consumer
@@ -1460,6 +1474,8 @@ def _resident_ipc_request(material, *, timeout=30.0):
         """(reply_dict_or_None, should_retry). None body ⇒ caller may retry."""
         try:
             raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except NotImplementedError:
+            return _resident_ipc_unsupported(request_id), False
         except (FileNotFoundError, ConnectionRefusedError):
             return {
                 "ok": False, "error": "consumer_not_running", "request_id": request_id,
@@ -1513,6 +1529,8 @@ def _resident_ipc_call(op, payload, *, timeout=30.0):
     def _attempt():
         try:
             raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except NotImplementedError:
+            return _resident_ipc_unsupported(request_id), False
         except (FileNotFoundError, ConnectionRefusedError):
             return {
                 "ok": False,

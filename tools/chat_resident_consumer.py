@@ -407,15 +407,18 @@ USER_MCP_CASTORE_FILE = os.environ.get(
 # single fingerprinted /tmp FILE, not a directory) — FEEDLING_HOME picks the
 # SAME fingerprint recipe (sha1(FEEDLING_API_KEY)[:10]) so io_cli (a separate
 # process, stdlib-only, cannot import this module) computes the identical
-# default path with zero shared state, while still keeping co-hosted accounts
-# on one box from colliding on a single socket (mirrors the collision hazard
-# _USER_MCP_PATHS_PINNED below documents for a keyless host-all consumer —
-# this lane is VPS/CLI-only and never runs keyless, so no pinning fallback is
-# needed here).
-FEEDLING_HOME = Path(
-    os.environ.get("FEEDLING_HOME")
-    or f"/tmp/feedling_home_{CHECKPOINT_API_KEY_FINGERPRINT}"
-)
+# default path with zero shared state for a self-hosted account. This naming
+# convention is not an isolation boundary: hosted/keyless consumers must have
+# FEEDLING_HOME explicitly pinned per user by their supervisor, with OS access
+# controls. An empty API key cannot provide distinct per-user defaults.
+def _resident_home_default() -> str:
+    # Keep the established POSIX path; Windows uses its native temp root.
+    # Mirrored in io_cli._resident_ipc_home (separate process/distribution).
+    root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    return os.path.join(root, f"feedling_home_{CHECKPOINT_API_KEY_FINGERPRINT}")
+
+
+FEEDLING_HOME = Path(os.environ.get("FEEDLING_HOME") or _resident_home_default())
 RESIDENT_IPC_SOCK = FEEDLING_HOME / "resident_ipc.sock"
 RESIDENT_IPC_STATE_FILE = FEEDLING_HOME / "resident_ipc_state.json"
 OUTBOUND_FILE_DIR = FEEDLING_HOME / "outbound-files"
@@ -1996,10 +1999,13 @@ def _git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
 
 
 def _git_tree_dirty() -> bool:
-    """True if there are uncommitted changes — or if we can't tell (fail safe:
-    an unknown state must not be overwritten)."""
+    """True for tracked edits or an unknown state (fail safe).
+
+    Untracked configuration/state alone must not stall updates. This relies
+    on _git_checkout refusing to overwrite both untracked and ignored files.
+    """
     try:
-        r = _git("status", "--porcelain", timeout=10)
+        r = _git("status", "--porcelain", "--untracked-files=no", timeout=10)
     except Exception:
         return True
     if r.returncode != 0:
@@ -2034,7 +2040,10 @@ def _git_checkout(target: str) -> bool:
     # Detached checkout pins us exactly to the backend's commit (lockstep). A
     # self-hoster who wants to take over manually can `git checkout main`.
     try:
-        r = _git("checkout", "--detach", "--force", target, timeout=60)
+        # Never force: that can delete untracked files/directories in the way.
+        # Git overwrites ignored files by default, so explicitly protect those
+        # too. On collision stderr names the paths; no pip/re-exec follows.
+        r = _git("checkout", "--detach", "--no-overwrite-ignore", target, timeout=60)
     except Exception as e:
         log.error("self-update checkout error: %s", e)
         return False
@@ -2180,7 +2189,10 @@ def _run_self_update(target: str) -> None:
         if dirty:
             log.warning(
                 "self-update %s -> %s available but working tree has uncommitted "
-                "changes; skipping (run `git stash` / commit to allow it)",
+                "changes; skipping. Back up consumer.env, identity.json and local "
+                "state outside the checkout before reviewing git status. Do not "
+                "use git stash -u/-a or git clean to clear this warning; do not "
+                "commit secrets. The operator must decide how to preserve edits.",
                 local,
                 target,
             )
@@ -21488,6 +21500,14 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
     enforce them), and a `/tmp` dir-squat landing between a stale-dir cleanup
     and this mkdir could otherwise let another local user plant a listener
     that intercepts plaintext identity material."""
+    if not hasattr(socket, "AF_UNIX"):
+        log.error(
+            "resident IPC disabled: ipc_unsupported (Python has no AF_UNIX). "
+            "identity-redistill/send-file/send-image are unavailable; "
+            "HTTP polling and text replies do not use this socket. "
+            "No TCP fallback is enabled."
+        )
+        return
     parent = sock_path.parent
     try:
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -21516,8 +21536,9 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
             sock_path.unlink()
     except Exception:
         pass
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv = None
     try:
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(str(sock_path))
         try:
             os.chmod(sock_path, 0o600)  # local-user-only — this carries plaintext material
@@ -21528,7 +21549,8 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
     except Exception as e:
         log.error("redistill IPC: cannot bind %s: %s — listener disabled", sock_path, e)
         try:
-            srv.close()
+            if srv is not None:
+                srv.close()
         except Exception:
             pass
         return
