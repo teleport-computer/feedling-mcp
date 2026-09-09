@@ -205,6 +205,39 @@ def test_chat_response_accepts_matching_fpr(user, monkeypatch):
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
+def test_unlinked_text_reply_accepts_real_envelope_not_raw_content(user, monkeypatch):
+    # Isolate the existing bootstrap prerequisite; auth/envelope/route stay real.
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    uid, api_key = user
+    envelope = build_envelope(
+        plaintext=b"synthetic unsolicited text", owner_user_id=uid,
+        user_pk_bytes=USER_PK, enclave_pk_bytes=None, visibility="local_only",
+    )
+    client = make_client()
+    response = client.post(
+        "/v1/chat/response", headers=_hk(api_key), json={"envelope": envelope},
+    )
+    assert response.status_code == 200, response.get_data(as_text=True)
+    persisted = core_store.get_store(uid).chat_messages
+    assert any(row["id"] == envelope["id"] for row in persisted)
+    assert not next(row for row in persisted if row["id"] == envelope["id"]).get("reply_to_message_id")
+    rejected = client.post(
+        "/v1/chat/response", headers=_hk(api_key), json={"content": "synthetic text"},
+    )
+    assert rejected.status_code == 400
+    assert rejected.get_json()["error"] == "envelope required"
+
+
+def test_public_key_is_not_chat_response_authentication(user, monkeypatch):
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    uid, _api_key = user
+    response = make_client().post(
+        "/v1/chat/response", headers=_hk(_b64(USER_PK)),
+        json={"envelope": _env(uid, "public-key-is-not-auth")},
+    )
+    assert response.status_code == 401
+
+
 # --------------------------------------------------------------------------- #
 # 4. the label survives storage (rewrap's skip logic reads it off the row)
 # --------------------------------------------------------------------------- #

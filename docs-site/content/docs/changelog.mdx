@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident clients report unsupported local IPC explicitly.** Python runtimes
+  without `AF_UNIX` now log a disabled listener and return `ipc_unsupported`
+  for local attachment/redistill commands; normal HTTP text replies are separate.
+  Windows consumer and CLI defaults agree on the native temporary directory.
+  Update warnings now protect local configuration/state instead of suggesting
+  a generic stash. Unrelated untracked files no longer stall self-update;
+  checkout refuses to overwrite conflicting untracked or ignored files.
+  This does not introduce TCP IPC or full Windows support.
+
 - **Memory queries rank token matches with BM25.** Nonblank `query` uses pinned
   jieba 0.42.1 Chinese segmentation and whole case-insensitive ASCII identifiers.
   The enclave ranks the complete readable corpus across both storage tiers before

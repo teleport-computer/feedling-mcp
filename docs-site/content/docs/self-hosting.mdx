@@ -16,6 +16,48 @@ logical component, data-flow, and encryption model used by this guide.
 
 ## Choose the trust model first
 
+### Resident clients on Windows
+
+Local resident IPC depends on the Python runtime exposing `socket.AF_UNIX`.
+When it is absent, the consumer logs `ipc_unsupported` and disables the listener;
+`io_cli` reports a structured error for `identity-redistill`, `send-file`, and
+`send-image`. No TCP listener is substituted. This is explicit degradation,
+not a claim of full Windows support. Normal polling and text replies use HTTP,
+not this socket; `io_cli send` and `wait-for-wake` remain unsupported verbs.
+
+Both processes honor an explicit `FEEDLING_HOME`. Otherwise Windows uses Python's
+native temporary directory plus `feedling_home_<fingerprint>`; POSIX keeps its
+existing `/tmp/feedling_home_<fingerprint>` default. Choose the same private,
+persistent directory for both processes when state must survive temporary-file
+cleanup. The fingerprint is not an authorization boundary; hosted keyless
+consumers still require per-user pinned paths.
+
+The current simple/OpenAI HTTP and CLI agent paths already share
+`FEEDLING_AGENT_TURN_TIMEOUT_SEC` (300 seconds by default, minimum 30), bounded
+by any shorter remaining turn deadline. Older simple-HTTP builds used a fixed
+60 seconds. Check the running consumer commit before changing modes. This
+setting cannot extend an upstream server or proxy timeout and is not a
+recommendation to migrate runtimes.
+
+For direct `POST /v1/chat/response`, authenticate with the account's API key and
+send a valid envelope for that account's encryption tier. A whoami public key
+is an encryption recipient, not an API credential. Plain-text-only chat messages
+(carried inside an envelope) may omit `reply_to_message_id`; file/image
+**followups** require it. Authentication, bootstrap, and envelope validation
+still apply. A 400 response alone does not identify which validation failed.
+
+Unrelated untracked files do not block self-update, but tracked edits still do.
+Checkout refuses to overwrite conflicting untracked or ignored files and logs
+their paths under `self-update checkout failed`; dependency installation and
+restart do not proceed. Older consumers also count untracked files as dirty.
+When an update is blocked, first privately back up
+`consumer.env`, `identity.json`, and local state outside the checkout, then inspect
+`git status`. Do not use `git stash -u`, `git stash -a`, or `git clean` to clear
+the warning, and never commit secrets. Plain `git stash` leaves untracked files
+in place. Agents must not move, stash, or delete operator files without permission.
+
+### Server deployment isolation
+
 The HTTP backend is multi-user and API-key scoped. That is not the same as strong
 tenant isolation for code execution.
 

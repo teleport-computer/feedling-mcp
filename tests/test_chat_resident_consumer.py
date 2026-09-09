@@ -4468,6 +4468,72 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
 
 
+@pytest.mark.parametrize("response_status", [200, 400])
+def test_proactive_http_text_chain_without_af_unix(monkeypatch, response_status):
+    """Real poll/claim -> HTTP agent -> sealing/post_reply -> status, fake wire.
+
+    This is a capability simulation, not a Windows or deployed-provider smoke.
+    A rejected reply must remain failed even though the agent returned text.
+    """
+    monkeypatch.delattr(crc.socket, "AF_UNIX", raising=False)
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "simple")
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://agent.invalid/chat")
+    monkeypatch.setattr(crc, "FEEDLING_API_URL", "https://io.invalid")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: {})
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "synthetic-owner")
+    monkeypatch.setitem(crc._whoami_cache, "user_pk", b"\x11" * 32)
+    monkeypatch.setitem(crc._whoami_cache, "enclave_pk", b"\x22" * 32)
+    monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", "on")
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    job = {
+        "schema_version": 2, "job_id": "synthetic-wake", "ts": 123.0,
+        "source": crc.PROACTIVE_JOB_SOURCE, "trigger": "scheduled_wake",
+        "wake_kind": "ambient", "broadcast_state": "on", "frame_ids": [],
+    }
+    seen = []
+
+    def wire(request):
+        payload = json.loads(request.content) if request.content else {}
+        seen.append((request.method, str(request.url), payload))
+        if request.url.path == "/v1/proactive/jobs/poll":
+            return crc.httpx.Response(200, json={"jobs": [job]})
+        if request.url.path.endswith("/claim"):
+            return crc.httpx.Response(200, json={"claimed": True})
+        if request.url.host == "agent.invalid":
+            return crc.httpx.Response(200, json={"response": "这是一条合成的提醒。"})
+        if request.url.path == "/v1/chat/response":
+            body = {"id": "synthetic-delivered"} if response_status == 200 else {
+                "error": "envelope_missing_fields",
+            }
+            return crc.httpx.Response(response_status, json=body)
+        return crc.httpx.Response(200, json={})  # ancillary reads/status/trace
+
+    with crc.httpx.Client(transport=crc.httpx.MockTransport(wire)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        polled = crc.poll_proactive_jobs(0)
+        assert crc._process_proactive_jobs(polled["jobs"]) == 123.0
+    agent_calls = [row for row in seen if row[1] == "http://agent.invalid/chat"]
+    replies = [row[2] for row in seen if row[1] == "https://io.invalid/v1/chat/response"]
+    statuses = [row[2]["status"] for row in seen if row[1].endswith("/status")]
+    assert len(agent_calls) == 1
+    assert len(replies) == 1
+    assert "reply_to_message_id" not in replies[0]
+    assert replies[0]["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert replies[0]["proactive_job_id"] == job["job_id"]
+    assert replies[0]["envelope"]["body_ct"]
+    assert "body" not in replies[0]["envelope"]
+    assert "realizing" in statuses
+    assert ("posted" in statuses) is (response_status == 200)
+    if response_status == 400:
+        assert "failed" in statuses
+
+
 def _install_capture_job_harness(monkeypatch, agent_reply):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -7662,7 +7728,12 @@ def test_call_agent_http_openai_raw_text_returns_bare_cards_body(monkeypatch):
         ("openai", crc._call_agent_http_openai),
     ],
 )
-def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, call):
+@pytest.mark.parametrize("remaining", [None, 45.0])
+@pytest.mark.parametrize("has_unix", [True, False])
+def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, call, remaining, has_unix):
+    if not has_unix:
+        monkeypatch.delattr(crc.socket, "AF_UNIX", raising=False)
+
     class _Resp:
         headers = {}
 
@@ -7685,9 +7756,11 @@ def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, c
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_agent_session_key", lambda: "")
     monkeypatch.setattr(crc._HTTP, "post", post)
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)
 
-    assert call("make a canvas") == "ok"
-    assert seen["timeout"] == 600
+    deadline = None if remaining is None else 100.0 + remaining
+    assert call("make a canvas", absolute_deadline=deadline) == "ok"
+    assert seen["timeout"] == (600 if remaining is None else remaining)
 
 
 def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_from_text_block():

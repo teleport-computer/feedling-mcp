@@ -26,6 +26,16 @@ canonical_owner: self
 
 ## 通用
 
+### 本地 resident CLI（不是 HTTP API）
+
+`ipc_unsupported` 是 `tools/io_cli.py` 的本地 JSON 错误码：当前 Python
+没有 `socket.AF_UNIX`，无法执行依赖 resident IPC 的重蒸馏和附件暂存。
+结果包含 `ok: false`、`request_id` 和不含输入内容的 `hint`；不自动重试或
+改走 TCP。consumer 同时记录 listener disabled 日志。这不是服务端 HTTP
+状态码，也不意味着 HTTP 文本回复不可用。
+
+### HTTP 通用错误
+
 | slug | 状态码 | blame | 说明 | 需本地化 |
 |---|---|---|---|---|
 | `unauthorized` | 401 | — | 未认证/凭证失效 | ✅ |
