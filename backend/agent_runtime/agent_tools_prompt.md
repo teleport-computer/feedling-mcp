@@ -125,9 +125,12 @@ the request depends on remembered facts and that block does not settle it. For
 purely current-turn questions that don't depend on prior context, answer
 directly — don't query memory for ordinary chit-chat.
 
-1. **Locate.** For a known subject run `memory-index --query <exact word>`.
-   Matching is a literal substring: zero results mean that *wording* is absent,
-   not that the memory is absent — try one other wording before concluding.
+1. **Locate.** For a known subject run `memory-index --query <keywords>`.
+   BM25 ranks token matches across the readable Garden, using jieba for Chinese
+   and case-insensitive whole ASCII words/identifiers (such as NP-4286, CR2450).
+   Terms need not be adjacent; there is no translation or semantic matching.
+   `ranking=substring-legacy` marks rolling-upgrade substring fallback.
+   Zero results do not prove the memory is absent — try other wording before concluding.
    To browse a partition use `memory-index --bucket <bucket>` or
    `memory-index --thread <thread>`. For a broad review start with
    `memory-index --limit 20`.

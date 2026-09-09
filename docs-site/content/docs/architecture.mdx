@@ -465,9 +465,21 @@ encrypted and expires automatically.
 4. A `local_only` body remains client-readable but is unavailable to agent-side
    index and fetch operations.
 
+Nonblank memory queries send the complete eligible corpus (both plaintext-tier
+and sealed rows) to the enclave in one authenticated request. It decrypts in
+bounded chunks, computes request-local jieba/BM25 statistics across all readable
+cards, then filters and selects top-k. No user token index, postings, or decoded
+search-body cache is persisted or exported to the backend. Only the bundled
+jieba dictionary is process-shared and prewarmed at startup. Request, card-count
+and searchable-text limits fail explicitly rather than rank a partial corpus.
+Browse without a query and fetch retain the existing tier partitioning. The
+transport trust boundary and deployment topology do not change; plaintext-tier
+query searches now also require the authenticated enclave path.
+
 The operator-only debug trace distinguishes an executed memory search from an
 index overview. It records the returned-card count, requested limit, and a
-12-hex SHA-256 prefix of the trimmed search query; it never records the query
+12-hex SHA-256 prefix of the trimmed search query, ranking mode and unavailable
+count; it never records the query
 text. Repeated Runtime V2 discovery calls that reuse an earlier result carry a
 separate content-free reuse flag. The fingerprint is operational metadata: it
 lets an authorized administrator compare whether two searches used the same

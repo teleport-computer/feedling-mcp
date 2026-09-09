@@ -11,10 +11,24 @@ from __future__ import annotations
 from starlette.requests import Request
 
 from asgi.http import read_json_silent
+import memory_search_contract as search_contract
 
 
-async def read_json_payload(request: Request) -> dict:
+async def read_json_payload(request: Request, *, max_bytes: int | None = None) -> dict:
     """读请求体为 JSON dict。Content-Type 非 JSON、解析失败、客户端中途断开、
     或结果非 dict → ``{}``。"""
+    if max_bytes is not None:
+        received = 0
+        original = request
+
+        async def bounded_receive():
+            nonlocal received
+            message = await original.receive()
+            received += len(message.get("body", b""))
+            if received > max_bytes:
+                raise search_contract.SearchLimitExceeded()
+            return message
+
+        request = Request(original.scope, receive=bounded_receive)
     payload = await read_json_silent(request)
     return payload if isinstance(payload, dict) else {}
