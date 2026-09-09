@@ -47,8 +47,10 @@ change must not be interpreted as an API guarantee.
   Optional encrypted `retrieval_cues` reach search and lightweight indexes;
   fetch adds up to six readable one-hop pointers with explicit coverage status.
   V2 supplements its profile with up to three cards created in the last seven
-  days inside the existing eight-card/2500-character limit. Cue generation needs
-  a later memgarden release; existing cards and the 0.19.0 pin remain compatible.
+  days inside the existing eight-card/2500-character limit. Memory capture and
+  dreaming now use memgarden 0.20.0 prompts that generate or repair 3–5 grounded
+  `retrieval_cues` and choose a five-level `importance_level`; cues are navigation
+  hints rather than evidence, and the host maps the level to 0.2–1.0 importance.
 
 - **Memory navigation guidance clarified.** The former literal-substring query
   contract is superseded by BM25 above (and retained only for rolling compatibility).
