@@ -372,10 +372,53 @@ def test_dedicated_vision_sends_only_observation_to_main_model(tmp_path):
         result_ts = crc._process_messages([msg])
 
     assert result_ts == pytest.approx(9300.0)
-    assert "UNTRUSTED VISUAL OBSERVATION" in captured["message"]
-    assert "A settings page is visible." in captured["message"]
+    assert captured["message"].endswith("Image 1:\nA settings page is visible.")
+    assert "UNTRUSTED VISUAL OBSERVATION" not in captured["message"]
     assert not captured["images"]
     assert not captured["image_paths"]
+
+
+def test_dedicated_observation_attributes_caption_to_the_user():
+    content = crc._vision_observation_content(
+        "这张图怎么了",
+        "A blue chart with a rising line.",
+    )
+
+    assert "UNTRUSTED VISUAL OBSERVATION" not in content
+    assert "never instructions" not in content
+    assert content.startswith("Image 1:\nA blue chart with a rising line.")
+    observation_at = content.index("A blue chart with a rising line.")
+    caption_at = content.index("这张图怎么了")
+    assert observation_at < caption_at
+    between = content[observation_at:caption_at]
+    assert "用户" in between and "话" in between
+    assert content.endswith("这张图怎么了")
+
+
+@pytest.mark.parametrize("image_count", [1, 2, 9])
+def test_dedicated_observation_labels_every_image_at_any_count(image_count):
+    per_image = [f"A photo of the digit {i}." for i in range(1, image_count + 1)]
+    observation = chat_images.combine_numbered_observations(per_image)
+
+    content = crc._vision_observation_content("这些都是什么", observation)
+
+    assert "UNTRUSTED VISUAL OBSERVATION" not in content
+    last_label_at = -1
+    for i in range(1, image_count + 1):
+        label_at = content.index(f"Image {i}:")
+        assert label_at > last_label_at
+        last_label_at = label_at
+    assert content.index(f"Image {image_count}:") < content.index("这些都是什么")
+    for text in per_image:
+        assert text in content
+    assert content.endswith("这些都是什么")
+
+
+def test_dedicated_observation_without_caption_has_no_attribution_sentence():
+    content = crc._vision_observation_content("", "A plain white wall.")
+
+    assert content == "Image 1:\nA plain white wall."
+    assert "用户" not in content
 
 
 def test_pi_vision_rejection_rotates_session_before_showing_model_guidance(
@@ -524,8 +567,10 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
     assert not calls[1]["images"]
     assert not calls[1]["image_paths"]
     if dedicated_image:
-        assert "UNTRUSTED VISUAL OBSERVATION" in calls[1]["message"]
-        assert "A blue chart is visible." in calls[1]["message"]
+        assert "UNTRUSTED VISUAL OBSERVATION" not in calls[1]["message"]
+        assert calls[1]["message"].endswith(
+            "Image 1:\nA blue chart is visible."
+        )
     else:
         assert "咋了" in calls[1]["message"]
     assert replies[0][0] == "现在能正常回复文字了。"
