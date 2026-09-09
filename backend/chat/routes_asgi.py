@@ -211,6 +211,9 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
         consumer_info=consumer_info,
         allow_verify_reply=allow_verify_reply,
     )
+    if int(status) >= 400:
+        # A rejected reply used to leave no route trace at all (T528).
+        await threadpool.run_db(chat_core.trace_response_rejected, store, payload, body, status)
     return JSONResponse(body, status_code=status)
 
 

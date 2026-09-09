@@ -869,6 +869,42 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
+def trace_response_rejected(store: UserStore, payload: dict, body: dict, status: int) -> None:
+    """The ``chat.response.rejected`` debug-trace event.
+
+    ``write_response`` answers a malformed reply with a 4xx and NO trace, so a
+    resident consumer whose reply (typically one carrying image/file followups)
+    keeps bouncing shows up in the trace as "agent.reply ok, then nothing" —
+    the turn is released, re-run, and the user never learns why (T528: a hosted
+    user's generated images were staged, sent, and rejected with a bare 400
+    for days). Record the rejection reason here, content-free: only the error
+    code string the route returns, the status, and which followup kinds rode
+    along.
+    """
+    reply_to_message_id = _reply_to_message_id(payload)
+    error = str((body or {}).get("error") or "")[:120]
+    image_followups = payload.get("image_followups")
+    file_followups = payload.get("file_followups")
+    debug_trace.trace_event(
+        store,
+        subsystem="route",
+        type="chat.response.rejected",
+        actor="agent",
+        status="error",
+        outcome_class="operational_failure",
+        trace_id=reply_to_message_id,
+        turn_id=reply_to_message_id,
+        summary=f"reply rejected {int(status)} {error}".strip(),
+        detail={
+            "status": int(status),
+            "error": error,
+            "source": str(payload.get("source") or "chat")[:32],
+            "image_followups": len(image_followups) if isinstance(image_followups, list) else 0,
+            "file_followups": len(file_followups) if isinstance(file_followups, list) else 0,
+        },
+    )
+
+
 def gate_response_dict(
     store: UserStore,
     allow_verify_reply: bool,

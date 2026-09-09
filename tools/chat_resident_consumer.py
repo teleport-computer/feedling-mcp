@@ -12332,6 +12332,56 @@ def _image_ready_reply(text: str) -> str:
     return "The image is ready."
 
 
+def _dropped_attachment_kinds(post_kwargs: dict) -> list[str]:
+    """Which followup kinds a rejected reply carried (for logs/notice only)."""
+    kinds: list[str] = []
+    if post_kwargs.get("image_followups"):
+        kinds.append("image")
+    if post_kwargs.get("file_followups"):
+        kinds.append("file")
+    return kinds
+
+
+def _dropped_attachments_notice_text(lang_anchor: Any, kinds: list[str]) -> str:
+    """System notice after a reply had to be resent without its attachments.
+
+    Plain fact, no blame: the words were delivered, the picture/file was not.
+    The server's rejection code stays in the log and trace, not in the bubble.
+    """
+    zh = re.search(r"[一-鿿]", str(lang_anchor or "")) is not None
+    has_image = "image" in kinds
+    has_file = "file" in kinds
+    if zh:
+        if has_image and has_file:
+            return "这条回复里的图片和文件没能发出来。"
+        if has_file:
+            return "这条回复里的文件没能发出来。"
+        return "这条回复里的图片没能发出来。"
+    if has_image and has_file:
+        return "The image and file in this reply could not be delivered."
+    if has_file:
+        return "The file in this reply could not be delivered."
+    return "The image in this reply could not be delivered."
+
+
+def _notify_dropped_attachments(
+    rejected: "ChatResponseRejected", *, lang_anchor: Any,
+) -> None:
+    """Tell the user the attachments were dropped, once the text reply landed.
+
+    Posted AFTER the reply is accepted (same exclusivity as the turn-failure
+    notice): if this attempt lost the claim, the winner's attempt speaks.
+    """
+    kinds = list(getattr(rejected, "dropped_kinds", None) or ["image"])
+    try:
+        post_reply(
+            _dropped_attachments_notice_text(lang_anchor, kinds),
+            role="system", notice_kind="upstream_error", suppress_push=True,
+        )
+    except Exception:
+        log.exception("dropped-attachment notice emit failed (non-fatal)")
+
+
 def _sanitize_outbound_file_reply(
     text: str,
     *,
@@ -15255,11 +15305,76 @@ def _handle_post_reply_response(resp) -> dict:
                     body.get("identity_written"),
                 )
             return body
+    if 400 <= int(resp.status_code) < 500 and int(resp.status_code) != 409:
+        # (409s not handled above keep their existing raise_for_status path:
+        # they are claim/ordering conflicts, not a rejected body.)
+        # Keep the server's reason. ``raise_for_status`` alone yields
+        # "Client error '400 Bad Request'" and drops the body, which is the
+        # only place the rejected validation is named (T528: a reply carrying
+        # generated images bounced for days as a bare 400).
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        raise ChatResponseRejected(int(resp.status_code), body)
     resp.raise_for_status()
     try:
         return resp.json()
     except Exception:
         return {}
+
+
+class ChatResponseRejected(RuntimeError):
+    """``/v1/chat/response`` answered 4xx: the reply as sent will never be
+    accepted, so retrying the same body (or re-running the model to rebuild
+    it) cannot help. Carries the server's error code so the caller can decide
+    what to drop."""
+
+    def __init__(self, status_code: int, body: dict | None):
+        self.status_code = int(status_code)
+        self.body = dict(body) if isinstance(body, dict) else {}
+        self.error = str(self.body.get("error") or "")[:120]
+        detail = self.body.get("detail")
+        detail_text = f" detail={detail!r}"[:160] if detail else ""
+        super().__init__(
+            f"chat_response rejected status={self.status_code} error={self.error or '?'}{detail_text}"
+        )
+
+
+@dataclass(frozen=True)
+class ReplyRejection:
+    """Closed-vocabulary view of a ``ChatResponseRejected`` for traces.
+
+    Trace fields are tenant-readable, so they carry these categories, never the
+    server's text (``tests/test_trace_detail_provenance.py`` holds write sites
+    to that). The raw error string stays in the process log.
+    """
+
+    error_class: str
+    status_class: str
+
+
+_REPLY_REJECTION_CLASSES: tuple[tuple[str, str], ...] = (
+    ("image_followup", "image_followup_invalid"),
+    ("file_followup", "file_followup_invalid"),
+    ("reply followups", "followups_not_allowed"),
+    ("content_pk_fpr_mismatch", "stale_key"),
+)
+_REPLY_REJECTION_CLASS_VALUES = frozenset(
+    {cls for _needle, cls in _REPLY_REJECTION_CLASSES} | {"other"}
+)
+
+
+def classify_reply_rejection(rejected: ChatResponseRejected) -> ReplyRejection:
+    """Map a 4xx from ``/v1/chat/response`` onto closed categories."""
+    error_class = "other"
+    for needle, cls in _REPLY_REJECTION_CLASSES:
+        if needle in rejected.error:
+            error_class = cls
+            break
+    code = rejected.status_code
+    status_class = str(code) if code in (400, 401, 403, 404, 409, 413, 422) else "4xx"
+    return ReplyRejection(error_class=error_class, status_class=status_class)
 
 
 def get_latest_ts() -> float:
@@ -19714,6 +19829,9 @@ def _process_messages(messages: list) -> float:
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
         pending_failure_is_parse_only = False
+        # 带附件的回复被 4xx 拒、已降级为无附件重发时记下原因;回复被接受后再
+        # 发 system 通知(和 pending_failure_notice 一样,通知与回复共享排他性)。
+        dropped_attachments_error: ChatResponseRejected | None = None
 
         def _vision_fallback_deadline_kwargs() -> dict[str, float]:
             if not vision_fallback_selected:
@@ -20376,7 +20494,38 @@ def _process_messages(messages: list) -> float:
                     post_kwargs["file_followups"] = staged_outbound_files
                 if idx == 0 and staged_outbound_images:
                     post_kwargs["image_followups"] = staged_outbound_images
-                result = post_reply(reply, **post_kwargs)
+                try:
+                    result = post_reply(reply, **post_kwargs)
+                except ChatResponseRejected as rejected:
+                    # 带附件的回复被服务端 4xx 拒:同一个 body 再发多少次都不会被
+                    # 收,重跑整轮更不会(模型会再生一张图、再 send、再被拒——
+                    # T528 里一个用户就这样循环了两天,每圈都在真调生图烧额度)。
+                    # 去掉附件把伴侣的话先送到,再用 system 通知告诉用户图/文件
+                    # 没送出去;拒绝原因进日志和 trace,下次不用猜。
+                    if not (post_kwargs.get("image_followups") or post_kwargs.get("file_followups")):
+                        raise
+                    dropped_kinds = _dropped_attachment_kinds(post_kwargs)
+                    log.error(
+                        "reply with %s rejected by server (%s); resending without attachments",
+                        "+".join(dropped_kinds), rejected,
+                    )
+                    rejection = classify_reply_rejection(rejected)
+                    _emit_debug_trace(
+                        "agent", "chat.reply.attachments_dropped", trace_id=trace_id,
+                        status="error",
+                        summary=f"reply attachments dropped: {rejection.error_class}",
+                        detail={
+                            "status_class": rejection.status_class,
+                            "error_class": rejection.error_class,
+                            "image_followups": len(post_kwargs.get("image_followups") or []),
+                            "file_followups": len(post_kwargs.get("file_followups") or []),
+                        },
+                    )
+                    post_kwargs.pop("image_followups", None)
+                    post_kwargs.pop("file_followups", None)
+                    result = post_reply(reply, **post_kwargs)
+                    rejected.dropped_kinds = dropped_kinds
+                    dropped_attachments_error = rejected
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") in {
                         "already_answered",
@@ -20425,6 +20574,11 @@ def _process_messages(messages: list) -> float:
         for _posted_reply in posted_replies:
             _remember_worldbook_signal("assistant", _posted_reply, ts=time.time())
 
+        if dropped_attachments_error is not None and posted_any:
+            _notify_dropped_attachments(
+                dropped_attachments_error,
+                lang_anchor=raw_user_content_for_lang,
+            )
         if pending_failure_notice is not None and posted_any:
             _notify_agent_turn_failure(
                 pending_failure_notice,
