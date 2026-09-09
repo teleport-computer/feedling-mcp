@@ -471,15 +471,44 @@ def _model_has_native_image_output(provider: str, model: str) -> bool:
     return False
 
 
+def _relay_serves_dedicated_image_endpoint(provider: str) -> bool:
+    """Bring-your-own-base_url relays whose image model is reached through a
+    dedicated images endpoint (``openrouter`` → ``/images``; ``openai_compatible``
+    → ``/images/generations``; see ``post_dedicated_image``).
+
+    Canonical ``openai`` is deliberately excluded: its reasoning models
+    generate images through the Responses API's hosted image tool, not a
+    dedicated images endpoint, so it keeps the name-marker gate (gpt-image-* →
+    dedicated; gpt-5.6 → Responses image tool).
+    """
+    return normalize_provider(provider) in {"openrouter", "openai_compatible"}
+
+
 def _image_output_wire_enabled(
     provider: str,
     model: str,
     *,
     image_generation_probe: bool = False,
 ) -> bool:
-    """Choose the marker-only gate only for an explicit image-generation probe."""
+    """Whether to try the provider's dedicated images endpoint for this call.
+
+    An explicit setup probe is the user declaring "this is my image model", so
+    the dedicated endpoint is tried for any relay-style provider regardless of
+    the model id. The name marker used to gate the probe too, but it only knew
+    ``image``/``flux``/``dall-e``/``stable-diffusion``/``seedream`` — so a real
+    image model whose id carries none of them (measured: ``nai-diffusion-4-5-
+    full`` on a relay serving NovelAI) was reported "can't generate images"
+    before any request left the box, because the probe silently fell through to
+    the chat wire and got no media (T535). Trying the dedicated endpoint is a
+    cheap pre-flight: a genuinely non-image model is still rejected by the 4xx
+    it returns (or by producing no media), so opening the wire cannot pass a
+    model that does not actually generate.
+
+    Outside a probe (a live chat turn), the name marker still governs so an
+    ordinary chat model is never diverted onto the image wire on a hunch.
+    """
     if image_generation_probe:
-        return _model_name_has_image_output(model)
+        return _model_name_has_image_output(model) or _relay_serves_dedicated_image_endpoint(provider)
     return _model_has_native_image_output(provider, model)
 
 
@@ -5593,10 +5622,14 @@ async def generate_image_async(
 ) -> dict[str, Any]:
     """Generate one image through a provider-neutral saved route.
 
-    Mainline OpenAI routes use the Responses hosted image tool; dedicated
-    image-named models use their provider wire. Models without an image marker
-    fail locally; marker hits reach the provider and only non-empty media proves
-    that the route supports image generation.
+    Mainline OpenAI routes use the Responses hosted image tool. On a relay
+    (``openai_compatible`` / ``openrouter``) the model id is an explicit image
+    declaration, so the call reaches the provider's dedicated images endpoint
+    regardless of name and is judged by the real response — the endpoint's 4xx
+    or empty media, not a local name guess (T535). On non-relay providers
+    (deepseek / gemini) an image marker in the id still admits the call and a
+    marker-less model fails locally. Either way, only non-empty media proves the
+    route supports image generation.
     """
     provider, model, _ = validate_config(
         config.provider,
@@ -5609,8 +5642,16 @@ async def generate_image_async(
     if len(normalized_prompt) > 16_000:
         raise ProviderError("image prompt too long")
 
-    supported = _model_name_has_image_output(model) or (
-        provider == "openai" and _openai_uses_responses_for_reasoning(model)
+    # A dedicated generate-image call (setup probe or a resident's real
+    # generation) is an explicit image-model declaration, so a relay-style
+    # provider is admitted regardless of the model id (T535). The name marker
+    # still admits image models on non-relay providers (e.g. deepseek /
+    # gemini). A truly non-image model is caught downstream by the endpoint's
+    # 4xx or by producing no media — not by guessing from the name here.
+    supported = (
+        _model_name_has_image_output(model)
+        or _relay_serves_dedicated_image_endpoint(provider)
+        or (provider == "openai" and _openai_uses_responses_for_reasoning(model))
     )
     if not supported:
         exc = ProviderError("image_generation_model_unsupported")
