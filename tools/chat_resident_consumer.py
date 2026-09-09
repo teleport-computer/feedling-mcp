@@ -20697,7 +20697,96 @@ def _outbound_file_mime(name: str) -> str:
     )
 
 
+# T526 (2026-09-09): send-file rejects ~30% of the time for some users
+# (usr_1baf: 20 err / 46 ok in a week) and the rejection reason was returned to
+# io_cli but never persisted — the agent.tool.call error carried no reason, so
+# a blank Canvas ("有过程无内容") could not be attributed. Emit a content-free
+# reason (closed-set enum) whenever staging is rejected. Numbers/enums only:
+# never the path, name, title, or document bytes.
+# Every reject exit of ``_stage_file_ipc_impl`` (+ ``_safe_outbound_file_name``)
+# as a stable, actionable enum. The source-scan guard in the tests fails if the
+# implementation grows an ``"error": "x"`` / ``ValueError("x")`` exit not listed
+# here, so the table cannot silently drift back into ``other``.
+_SEND_FILE_REJECTION_REASONS = frozenset({
+    "request_id_required",
+    "path_required",
+    "no_active_chat_turn",
+    "chat_turn_finished",
+    "too_many_staged_files",
+    "path_outside_allowed_file_roots",
+    "file_name_required",
+    "unsupported_file_suffix",
+    "wrong_file_suffix",
+    "file_source_empty_or_too_large",
+    "canvas_file_too_large",
+    "rendered_file_empty_or_too_large",
+    "file_source_must_be_utf8",
+    "canvas_title_subtitle_required",
+    "canvas_metadata_invalid",
+})
+
+# file_display.metadata_from_payload raises human-worded ValueErrors. Map the
+# EXACT lowered string — NOT substrings: "subtitle" contains "title", so a
+# substring test folds an invalid-subtitle error into the missing-pair reason.
+_SEND_FILE_REJECTION_MESSAGE_MAP = {
+    "canvas delivery requires title and subtitle": "canvas_title_subtitle_required",
+    "file display metadata requires a canvas filename": "canvas_metadata_invalid",
+    "invalid file_display_title": "canvas_metadata_invalid",
+    "invalid file_display_subtitle": "canvas_metadata_invalid",
+}
+
+
+def _classify_send_file_rejection(error: object) -> str:
+    """Map a stage-file failure to a closed-set, content-free reason enum."""
+    code = str(error or "").strip()
+    if code in _SEND_FILE_REJECTION_REASONS:
+        return code
+    mapped = _SEND_FILE_REJECTION_MESSAGE_MAP.get(code.lower())
+    return mapped if mapped is not None else "other"
+
+
+def _stage_file_is_canvas(msg: dict) -> bool:
+    """Decide Canvas-ness through the SAME normalization the impl applies, so a
+    reject is never mis-flagged non-Canvas over surrounding whitespace/control
+    chars. The impl strips ``path``, falls back to the path basename when
+    ``name`` is absent, and canonicalizes via ``_safe_outbound_file_name``;
+    an unresolvable/unsupported name is not a Canvas."""
+    raw_name = str((msg or {}).get("name") or "").strip()
+    if not raw_name:
+        raw_name = Path(str((msg or {}).get("path") or "").strip()).name
+    if not raw_name:
+        return False
+    try:
+        canonical = _safe_outbound_file_name(raw_name)
+    except ValueError:
+        return False
+    return canonical.casefold().endswith(".io.html")
+
+
 def _handle_stage_file_ipc(msg: dict) -> dict:
+    """Validate/render/stage a document; emit a content-free reason on reject."""
+    # Capture the turn this request belongs to BEFORE staging: a concurrent
+    # chat_turn_finished can advance _active_outbound_file_turn_id while the impl
+    # runs, which would otherwise hang this rejection off the wrong (new) turn.
+    with _outbound_file_lock:
+        origin_turn_id = _active_outbound_file_turn_id
+    result = _stage_file_ipc_impl(msg)
+    if isinstance(result, dict) and result.get("ok") is False:
+        _emit_debug_trace(
+            "agent",
+            "resident.send_file.rejected",
+            status="error",
+            summary="io_cli send-file rejected",
+            trace_id=origin_turn_id,
+            detail={
+                "reason": _classify_send_file_rejection(result.get("error")),
+                "is_canvas": _stage_file_is_canvas(msg),
+            },
+        )
+    return result
+
+
+def _stage_file_ipc_impl(msg: dict) -> dict:
     """Validate, render, and stage one model-authored UTF-8 document source."""
     request_id = str(msg.get("request_id") or "").strip()
     raw_path = str(msg.get("path") or "").strip()

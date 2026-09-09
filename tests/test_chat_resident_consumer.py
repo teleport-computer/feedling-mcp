@@ -14695,3 +14695,148 @@ def test_terminal_error_detail_flags_truncated_pi_stream(monkeypatch):
     shape = event["detail"]["pi_stream"]
     assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
     assert _SECRET_TEXT not in json.dumps(event["detail"], ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# T526 (2026-09-09): content-free send-file rejection reason on the trace.
+# usr_1baf saw ~30% send-file failures with no persisted reason, so a blank
+# Canvas ("有过程无内容") could not be attributed.
+# ---------------------------------------------------------------------------
+# Every actionable reject string the staging path can emit, with its enum.
+# codex2 review r1: the closed set previously dropped chat_turn_finished /
+# too_many_staged_files / unsupported_file_suffix into "other", and the
+# invalid-subtitle message misclassified as the missing-pair reason.
+_SEND_FILE_REJECTION_CASES = [
+    ("request_id_required", "request_id_required"),
+    ("path_required", "path_required"),
+    ("no_active_chat_turn", "no_active_chat_turn"),
+    ("chat_turn_finished", "chat_turn_finished"),
+    ("too_many_staged_files", "too_many_staged_files"),
+    ("path_outside_allowed_file_roots", "path_outside_allowed_file_roots"),
+    ("file_name_required", "file_name_required"),
+    ("unsupported_file_suffix", "unsupported_file_suffix"),
+    ("wrong_file_suffix", "wrong_file_suffix"),
+    ("file_source_empty_or_too_large", "file_source_empty_or_too_large"),
+    ("canvas_file_too_large", "canvas_file_too_large"),
+    ("rendered_file_empty_or_too_large", "rendered_file_empty_or_too_large"),
+    ("file_source_must_be_utf8", "file_source_must_be_utf8"),
+    ("Canvas delivery requires title and subtitle", "canvas_title_subtitle_required"),
+    ("file display metadata requires a Canvas filename", "canvas_metadata_invalid"),
+    ("invalid file_display_title", "canvas_metadata_invalid"),
+    # The substring "title" lives inside "subtitle": this must NOT fold into the
+    # missing-pair reason.
+    ("invalid file_display_subtitle", "canvas_metadata_invalid"),
+    ("weird new backend message with secret usr_leak_x", "other"),
+    ("", "other"),
+    (None, "other"),
+]
+
+
+@pytest.mark.parametrize(("error", "expected"), _SEND_FILE_REJECTION_CASES)
+def test_classify_send_file_rejection_is_closed_set(error, expected):
+    got = crc._classify_send_file_rejection(error)
+    assert got == expected
+    assert got in (crc._SEND_FILE_REJECTION_REASONS | {"other"})
+
+
+def test_send_file_rejection_table_covers_every_impl_exit():
+    """Source-scan guard: every literal reject reason in the staging path must
+    classify to a real enum, so the table cannot drift back into 'other'."""
+    import inspect
+    import re
+
+    sources = inspect.getsource(crc._stage_file_ipc_impl) + inspect.getsource(
+        crc._safe_outbound_file_name
+    )
+    literals = set(re.findall(r'"error":\s*"([a-z0-9_]+)"', sources))
+    literals |= set(re.findall(r'ValueError\("([a-z0-9_]+)"\)', sources))
+    assert literals, "guard failed to locate any reject literals"
+    drifted = {code for code in literals if crc._classify_send_file_rejection(code) == "other"}
+    assert not drifted, f"unmapped stage-file reject reasons: {sorted(drifted)}"
+
+
+def test_stage_file_rejection_emits_content_free_reason(monkeypatch):
+    """A rejected send-file must emit exactly one content-free trace whose
+    detail carries the reason enum and the is_canvas flag — no path/name/body."""
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "turn_t526")
+    secret_path = "/tmp/secret_usr_leak/哄猫猫-绝密.io.html"
+    monkeypatch.setattr(
+        crc, "_stage_file_ipc_impl",
+        lambda _msg: {"ok": False, "error": "Canvas delivery requires title and subtitle"},
+    )
+    out = crc._handle_stage_file_ipc({"path": secret_path, "name": "哄猫猫.io.html"})
+    assert out["ok"] is False
+    assert len(events) == 1
+    args, kwargs = events[0]
+    assert args[:2] == ("agent", "resident.send_file.rejected")
+    assert kwargs["status"] == "error"
+    assert kwargs["trace_id"] == "turn_t526"
+    assert kwargs["detail"] == {"reason": "canvas_title_subtitle_required", "is_canvas": True}
+    dumped = json.dumps({"a": [str(x) for x in args], "k": {kk: str(vv) for kk, vv in kwargs.items()}}, ensure_ascii=False)
+    assert "哄猫猫" not in dumped and "secret" not in dumped and "usr_leak" not in dumped
+
+
+def test_stage_file_success_emits_no_rejection_trace(monkeypatch):
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": True, "request_id": "r1"})
+    out = crc._handle_stage_file_ipc({"path": "/x", "name": "a.io.html"})
+    assert out["ok"] is True
+    assert events == []
+
+
+def test_stage_file_non_canvas_rejection_flags_is_canvas_false(monkeypatch):
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "t")
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": False, "error": "wrong_file_suffix"})
+    crc._handle_stage_file_ipc({"path": "/x", "name": "report.pdf"})
+    assert events[0][1]["detail"] == {"reason": "wrong_file_suffix", "is_canvas": False}
+
+
+def test_stage_file_rejection_uses_turn_id_captured_before_impl(monkeypatch):
+    """codex2 review r1: a concurrent chat_turn_finished advances the active
+    turn id while the impl runs; the rejection must hang off the ORIGIN turn,
+    captured before staging, not whatever it became."""
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    crc._active_outbound_file_turn_id = "turn_old"
+
+    def _impl(_msg):
+        crc._active_outbound_file_turn_id = "turn_new"  # turn advanced mid-stage
+        return {"ok": False, "error": "chat_turn_finished"}
+
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", _impl)
+    try:
+        crc._handle_stage_file_ipc({"path": "/x", "name": "a.io.html"})
+    finally:
+        crc._active_outbound_file_turn_id = ""
+    assert events[0][1]["trace_id"] == "turn_old"
+    assert events[0][1]["detail"]["reason"] == "chat_turn_finished"
+
+
+def test_stage_file_is_canvas_mirrors_name_or_path_suffix(monkeypatch):
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "t")
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": False, "error": "file_source_empty_or_too_large"})
+    # name absent — the impl falls back to the path's basename, so telemetry must too.
+    crc._handle_stage_file_ipc({"path": "/tmp/report.io.html"})
+    assert events[-1][1]["detail"]["is_canvas"] is True
+    events.clear()
+    crc._handle_stage_file_ipc({"path": "/tmp/notes.pdf"})
+    assert events[-1][1]["detail"]["is_canvas"] is False
+    # codex2 review r2: the impl strips name/path before deciding; telemetry must
+    # apply the SAME normalization or a whitespaced Canvas reads as non-Canvas.
+    events.clear()
+    crc._handle_stage_file_ipc({"name": " report.io.html ", "path": "/tmp/x"})
+    assert events[-1][1]["detail"]["is_canvas"] is True
+    events.clear()
+    crc._handle_stage_file_ipc({"path": " /tmp/report.io.html "})
+    assert events[-1][1]["detail"]["is_canvas"] is True
+    # An unresolvable/empty name canonicalizes to a non-Canvas, never raises.
+    events.clear()
+    crc._handle_stage_file_ipc({"path": "   "})
+    assert events[-1][1]["detail"]["is_canvas"] is False
