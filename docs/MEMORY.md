@@ -142,14 +142,18 @@ matched_phrases / score）。
 - **V1 resident**（`tools/chat_resident_consumer.py`）：每条用户消息组装前用它自己的
   `seq` 单独请求 `GET /v1/chat/history?before_seq=seq+1&limit=4&context_trace=1`
   （`_auto_memory_fetch_for_turn`），页尾用户消息必须就是本条；把选中卡渲染成
-  「相关记忆」块（`_auto_memory_render`：每张 id + ≤120 字摘要 + 一句命中原因，
+  「相关记忆」块（`_auto_memory_render`：每张 id + 整句摘要 + 一句命中原因；摘要**永不截断**，
+  超过 300 字的只给 id + 命中原因 + 「细节请 memory-fetch」（T529：半句话最诱发补全）；
   按 score 排序，与用户显式引用的卡去重，预算 2500 字，超出按整卡丢弃，**永不放正文**），
   拼在用户消息之前、`quoted_memories` 块之上。无 `seq`、拉取失败、`mode=failed`
   或页不匹配 ⇒ 记 unknown 且不注入，不复用旧卡。
 - **V2**（`backend/model_api_runtime/v2/memory_context.py::render`）：serve-worker 以本轮
   冻结的 seq 边界读同一接口（`serve_worker._read_context_memories`），块以
   application-data 角色放在 profile/system 之后、对话回放之前（不是特权前缀），
-  JSON 条目 id / summary / reason，与 profile 摘要逐字去重，2500 字整条丢。
+  JSON 条目 id / summary / reason；与 profile 摘要逐字去重时**只省摘要、保留 id**
+  （reason=「档案已涵盖，细节可 fetch」，模型仍能取正文）；摘要超过 300 字只给 id + reason；
+  2500 字整条丢。到达判定（`memory_recall.py`）按逐卡渲染行、空白归一、content 为字符串或
+  分片数组均认，不再整块全等（T529，浩轩指出全等在适配器重排后恒报「未到达」）。
 
 **到达证据**（口径：选出 ≠ 注入）：`memory.select.traced` 只记 enclave 选卡；
 `memory.context.applied` 在最终发给驱动 / provider 的 payload 上核对整块是否到达

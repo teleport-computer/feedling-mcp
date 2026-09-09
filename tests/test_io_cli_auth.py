@@ -917,14 +917,14 @@ def test_auto_memory_context_orders_by_score_skips_quoted_and_keeps_ids_only():
 
 
 def test_auto_memory_context_drops_whole_cards_over_budget_never_slices():
-    big = "很长的摘要" * 40  # > AUTO_MEMORY_SUMMARY_CHARS → truncated with an ellipsis
+    big = "很长的摘要" * 80  # > AUTO_MEMORY_SUMMARY_MAX_CHARS → shown as id + note only, never cut
     picked = _picked(("a", big, "query", [], 0.9), ("b", "短卡二", "recent", [], 0.5), ("c", "短卡三", "recent", [], 0.4))
     text, ids = resident._auto_memory_context(picked, [], budget_chars=260)
-    # the truncated big card still fits the header+one-line budget; the rest are whole-card drops
+    # the over-long card keeps its id with a "fetch" note; the rest are whole-card drops
     for mid in ids:
         assert f"(id={mid})" in text
-    assert all(len(line) <= resident.AUTO_MEMORY_SUMMARY_CHARS + 80 for line in text.splitlines()[1:])
-    assert "…" in text  # truncation happens at the summary, not mid-line
+    assert "…" not in text and "很长的摘要很长" not in text
+    assert resident.AUTO_MEMORY_TOO_LONG_NOTE in text
     assert set(ids) <= {"a", "b", "c"} and ids == sorted(ids, key=lambda m: -{"a": 0.9, "b": 0.5, "c": 0.4}[m])
     assert len(text) <= 260
     assert resident._auto_memory_context(picked, [], budget_chars=10) == ("", [])
@@ -1195,3 +1195,13 @@ def test_capture_inner_keeps_legacy_shape_without_cues_and_adds_them_when_presen
     # a non-list / empty cues field must not create the key
     assert "retrieval_cues" not in resident._capture_inner_from_card({**base, "retrieval_cues": []})
     assert "retrieval_cues" not in resident._capture_inner_from_card({**base, "retrieval_cues": "保修码"})
+
+
+def test_auto_memory_context_shows_whole_summaries_up_to_the_limit():
+    """haoxuan (T529): a cut summary ("他一开始想辞职…") reads as a different fact.
+    Up to the limit the summary is shown whole; over it, id + note only."""
+    whole = "他一开始想辞职，后来跟他妈聊完就打消了。" * 8   # 160 chars: was cut at 120 before
+    assert 120 < len(whole) <= resident.AUTO_MEMORY_SUMMARY_MAX_CHARS
+    picked = _picked(("w", whole, "query", [], 0.9))
+    text, ids = resident._auto_memory_context(picked, [])
+    assert ids == ["w"] and whole in text and "…" not in text

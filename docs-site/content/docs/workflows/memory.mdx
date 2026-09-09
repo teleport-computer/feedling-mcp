@@ -96,12 +96,17 @@ Recall diagnostics distinguish card selection from actual prompt injection.
 Each V2 chat/wake turn can read enclave-selected cards from a sequence-bounded
 history window. The selection query includes the last four conversation messages,
 including assistant replies. The runtime adds a non-system “相关记忆” data block
-before conversation replay: card ID, a summary excerpt of at most 120 characters,
-and the selection reason. It never substitutes the card body for a missing summary.
-The block is limited to 2500 characters; overflow drops whole lower-ranked cards.
-Explicitly quoted IDs and verbatim summaries already present in the profile are
-excluded. This is conservative text deduplication, not semantic coverage detection.
-Models must fetch details and must not invent facts absent from their evidence.
+before conversation replay: card ID, the summary, and the selection reason. It
+never substitutes the card body for a missing summary and never truncates a
+summary: summaries up to 300 characters appear whole, and a longer one is
+replaced by its ID and reason plus a fetch hint, because a half sentence is the
+input shape that most invites a model to complete it. The block is limited to
+2500 characters; overflow drops whole lower-ranked cards. Explicitly quoted IDs
+are excluded. A card whose verbatim summary already appears in the profile keeps
+its ID with an empty summary and a “profile already covers this, details can be
+fetched” reason, so the fuller body stays fetchable. This is conservative text
+deduplication, not semantic coverage detection. Models must fetch details and
+must not invent facts absent from their evidence.
 
 V2 also requests a recent-card supplement on each turn. Up to three readable,
 active cards created in the last seven days take priority within the same
@@ -141,8 +146,17 @@ values marked explicitly; automatic injection and user-quoted cards are separate
 V2 events carry turn/job/attempt coordinates so retries and wake work need not
 be mistaken for additional foreground turns. Search diagnostics record a bounded
 sample of returned card IDs and an omitted-ID count, never the query or card text.
-V2 `memory.context.applied` events measure actual provider-request injection IDs
-and characters and whether profile context was included. Separate
+V2 `memory.context.applied` events report which rendered card entries were found
+in the final provider-request messages and whether profile context was included.
+An entry counts as present when it appears verbatim (whitespace-normalized) or as
+an equal JSON object, so an adapter that re-formats, re-flows or splits content
+into parts does not read as a missing injection, while an edited entry does.
+`injected_chars` is the normalized size of the rendered block reduced to the
+entries that were found, including its frame lines — not the character count of
+the provider payload. When a bound stops that check or it fails, the affected
+IDs are reported in `unverified_ids` with `injected_is_lower_bound` set and any
+`arrival_errors` named: unverified is not the same as absent, and only a complete
+check reports `missing_ids`. Separate
 `memory.recall.tool_result` events record final normalized tool-result
 JSON completeness, returned/omitted counts, result characters, and fetch call-ID
 to requested/returned card-ID bindings, joined by turn/job/attempt. The terminal

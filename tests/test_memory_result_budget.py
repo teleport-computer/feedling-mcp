@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,7 +139,9 @@ def test_recent_supplement_is_created_time_bounded_not_updated_time(monkeypatch)
     view = memory_context.render({"context_memories": picked, "context_memory_trace": trace, "context_memory_log": log})
     assert view["ids"] == ["fresh"] and "最近7天新卡" in view["block"]
     assert view["chars"] <= 2500 and "不代表与本题相关" in view["block"]
-    assert memory_context.render({"context_memories": picked}, profile="fresh")["ids"] == []
+    covered = memory_context.render({"context_memories": picked}, profile="fresh")
+    assert covered["ids"] == ["fresh"]   # profile-covered: id kept, summary dropped (T529)
+    assert json.loads(covered["block"].splitlines()[2])["summary"] == ""
 
 
 def test_related_optional_budget_never_evicts_primary(monkeypatch):
@@ -422,7 +425,7 @@ def test_turn_memory_block_is_untrusted_summary_only_deduped_and_bounded(role):
         application_data_role=role,
     )
     messages = builder([])
-    assert view["ids"] == ["target"] and view["selected"] == 4
+    assert view["ids"] == ["target", "profile"] and view["selected"] == 4   # covered card keeps its id (T529)
     assert messages[1] == {"role": role, "content": view["block"]}
     assert messages[-1]["content"] == "本轮问灯牌"
     assert "PRIVATE_BODY" not in view["block"]
@@ -442,7 +445,7 @@ def test_injection_budget_drops_whole_low_ranked_cards():
     assert 0 < len(entries) < 40
     assert len(view["block"]) <= 2500
     assert [e["id"] for e in entries] == view["ids"] == [f"m{i:02}" for i in range(len(entries))]
-    assert all(len(e["summary"]) <= 120 for e in entries)
+    assert all("…" not in e["summary"] and len(e["summary"]) <= memory_context.SUMMARY_MAX_CHARS for e in entries)
     assert memory_context.render({})["selected"] is None
     assert memory_context.render({"context_memories": [], "context_memory_log": {"mode": "failed"}})["selected"] is None
 
@@ -477,7 +480,7 @@ def test_recall_measures_final_provider_request_not_selection(monkeypatch, drop_
         on_trajectory_event=trajectory,
     ))
     assert len(sent) == 1 and len(observed) == 1
-    expected = [] if drop_at_boundary else ["quoted", "target"]
+    expected = [] if drop_at_boundary else ["profile", "quoted", "target"]
     assert observed[0]["injected_ids"] == expected
     assert observed[0]["counts"]["injected"] == len(expected)
     assert observed[0]["profile_used"] is True
@@ -558,3 +561,243 @@ def test_flat_recall_events_survive_the_real_durable_detail_sanitizer():
     assert rows["memory.context.applied"]["injected_ids"] == ids
     assert rows["memory.recall.completed"]["tool_result_events"] == 1
     assert rows["memory.recall.completed"]["attempt"] == 1
+
+
+@pytest.mark.parametrize("shape", ["reflow", "parts", "parts_mid_token", "compact_json",
+                                   "partial", "id_only", "altered_summary", "system_only"])
+def test_recall_arrival_survives_adapter_reflow_and_parts_but_not_missing_lines(monkeypatch, shape):
+    """haoxuan (T529): whole-block equality read 'never arrived' the moment an
+    adapter re-flowed whitespace or split content into parts; arrival is now
+    proven per rendered card line, whitespace-normalized, on string or parts
+    content. A line that is really gone is still reported missing, and an id
+    without its line does not count."""
+    from model_api_runtime.v2 import worker
+    view, observed, sent = {}, [], []
+    builder = worker._make_build_messages_fn(
+        system_prompt="SYS", summary="", tail=[{"role": "user", "content": "灯牌编号?"}],
+        memory_context_payload=_injection_payload(), memory_context_observation=view,
+        agent_memory="已有完整摘要",
+    )
+    def mutate(message):
+        if message.get("content") != view["block"]:
+            return message
+        lines = view["block"].splitlines()
+        if shape == "reflow":
+            return {**message, "content": "  ".join(ln.strip() for ln in lines) + "  "}
+        if shape == "parts":
+            return {**message, "content": [{"type": "text", "text": ln} for ln in lines]}
+        if shape == "parts_mid_token":
+            # an adapter may split anywhere, including inside "NP-4286"
+            whole = view["block"]
+            cut = whole.index("NP-") + 3
+            return {**message, "content": [{"type": "text", "text": whole[:cut]},
+                                           {"type": "text", "text": whole[cut:]}]}
+        if shape == "compact_json":
+            out = []
+            for ln in lines:
+                stripped = ln.strip()
+                if stripped.startswith("{"):
+                    row = json.loads(stripped)
+                    out.append(json.dumps({k: row[k] for k in reversed(list(row))},
+                                          ensure_ascii=False, separators=(",", ":")))
+                else:
+                    out.append(ln)
+            return {**message, "content": "\n".join(out)}
+        if shape == "altered_summary":
+            out = []
+            for ln in lines:
+                stripped = ln.strip()
+                if stripped.startswith("{") and '"id": "target"' in stripped:
+                    row = json.loads(stripped)
+                    row["summary"] = row["summary"].replace("NP-4286", "NP-9999")
+                    out.append(json.dumps(row, ensure_ascii=False))
+                else:
+                    out.append(ln)
+            return {**message, "content": "\n".join(out)}
+        if shape == "system_only":
+            return {**message, "role": "system"}
+        if shape == "partial":
+            keep = [ln for ln in lines if '"id": "target"' not in ln]
+            return {**message, "content": "\n".join(keep)}
+        if shape == "id_only":
+            return {**message, "content": "ids: " + ",".join(view["ids"])}
+        raise AssertionError(shape)
+    def build(transcript):
+        return [mutate(m) for m in builder(transcript)]
+    async def provider(_config, messages, **kwargs):
+        sent.append(messages)
+        return {"reply": "不猜具体值", "tool_calls": [], "usage": {}}
+    async def noop(*args, **kwargs):
+        return []
+    async def reply(*args, **kwargs):
+        return None
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=provider_client.ProviderConfig(provider="anthropic", model="claude-sonnet-4-test", api_key="test"),
+        build_messages=build, dispatch_tools=noop, on_reply=reply,
+        fold_new_messages=noop, add_usage=lambda *a, **k: None, max_calls=1,
+        memory_context_observation=view, on_memory_recall_completed=observed.append,
+    ))
+    assert len(sent) == 1 and len(observed) == 1
+    every = ["profile", "quoted", "target"]
+    expected = {"reflow": every, "parts": every, "parts_mid_token": every,
+                "compact_json": every, "partial": ["profile", "quoted"],
+                "id_only": [], "altered_summary": ["profile", "quoted"],
+                "system_only": []}[shape]
+    assert observed[0]["injected_ids"] == expected
+    assert observed[0]["counts"]["injected"] == len(expected)
+    if shape in {"reflow", "parts", "parts_mid_token", "compact_json"}:
+        assert observed[0]["injected_chars"] == len(view["block"])
+    if shape in {"partial", "altered_summary"}:
+        assert 0 < observed[0]["injected_chars"] < len(view["block"])
+        assert observed[0]["prompt_observations"][0]["missing_ids"] == ["target"]
+        assert observed[0]["injected_is_lower_bound"] is False
+    if shape in {"id_only", "system_only"}:
+        assert observed[0]["injected_chars"] == 0
+    assert "NP-4286" not in json.dumps(observed, ensure_ascii=False)
+
+
+def test_render_never_cuts_a_summary_and_keeps_ids_covered_by_profile():
+    """haoxuan (T529): a cut summary is the shape that invites completion, and
+    dropping a profile-covered card whole hides its id so the body can never be
+    fetched. Over the limit: id + reason only. Covered: id kept, summary empty."""
+    from model_api_runtime.v2 import memory_context
+    long = "他一开始想辞职，后来跟他妈聊完就打消了。" * 20   # > SUMMARY_MAX_CHARS
+    payload = {"context_memories": [
+        {"id": "long", "summary": long},
+        {"id": "mom", "summary": "他妈妈住在杭州", "content": "上个月摔了一跤，他每周末回去看一次"},
+        {"id": "short", "summary": "旅行杯盖维修单号 LK-7319"},
+    ], "context_memory_trace": {"selected": [
+        {"id": "long", "score": 0.9, "bucket": "query", "matched_phrases": ["辞职"]},
+        {"id": "mom", "score": 0.8, "bucket": "query"},
+        {"id": "short", "score": 0.7, "bucket": "recent"},
+    ]}, "context_memory_log": {"mode": "default"}}
+    view = memory_context.render(payload, profile="档案：他妈妈住在杭州，喜欢散步。")
+    entries = {json.loads(line)["id"]: json.loads(line) for line in view["block"].splitlines()[2:-1]}
+    assert view["ids"] == ["long", "mom", "short"]
+    assert entries["long"]["summary"] == "" and "fetch" in entries["long"]["reason"] and "…" not in view["block"]
+    assert "他一开始想辞职" not in view["block"]          # whole or nothing: no half sentence
+    assert entries["mom"]["summary"] == "" and entries["mom"]["reason"] == memory_context.PROFILE_COVERED_REASON
+    assert "上个月摔了一跤" not in view["block"]           # body still never leaks into the block
+    assert entries["short"]["summary"] == "旅行杯盖维修单号 LK-7319"
+
+
+def test_arrival_scan_is_bounded_and_never_aborts_the_turn():
+    """codex (T529 round 3): this accounting runs *before* the provider request,
+    so hostile-looking text must not make it slow or raise. A brace flood used to
+    rescan to the end from every position (quadratic); 1100-level nesting used to
+    raise RecursionError out of json.loads and abort the turn."""
+    from model_api_runtime.v2 import memory_recall
+    entry = {"id": "target", "summary": "灯牌编号 NP-4286", "reason": "与这句相关"}
+    block = "\n".join(["# 相关记忆", "以下是记忆资料", json.dumps(entry, ensure_ascii=False),
+                       "需要细节用 memory_fetch <id>"])
+    started = time.time()
+    assert memory_recall.arrival_ids(block, ["target"], [{"role": "user", "content": "{" * 8000}]) == ([], [], ["target"])
+    assert time.time() - started < 1.0            # was ~2.5s at 8k unmatched braces
+    deep = "{" * 1100 + "}" * 1100                # was RecursionError
+    compact = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    assert memory_recall.arrival_ids(
+        block, ["target"], [{"role": "user", "content": deep + "\n" + compact}]) == (["target"], [], [])
+
+
+def test_arrival_matches_any_equal_object_with_the_same_id():
+    """codex (T529 round 3): a stale copy of the same id earlier in the text must
+    not shadow the correct entry that follows."""
+    from model_api_runtime.v2 import memory_recall
+    entry = {"id": "target", "summary": "灯牌编号 NP-4286", "reason": "与这句相关"}
+    block = "\n".join(["# 相关记忆", "以下是记忆资料", json.dumps(entry, ensure_ascii=False), "尾"])
+    stale = json.dumps({**entry, "summary": "旧的摘要"}, ensure_ascii=False)
+    correct = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    assert memory_recall.arrival_ids(
+        block, ["target"], [{"role": "user", "content": stale + "\n" + correct}]) == (["target"], [], [])
+    assert memory_recall.arrival_ids(
+        block, ["target"], [{"role": "user", "content": stale}]) == ([], ["target"], [])
+
+
+def test_arrival_failure_degrades_the_observation_not_the_turn(monkeypatch):
+    """An accounting bug must show up as arrival_error, never as a failed turn."""
+    from model_api_runtime.v2 import worker
+    view, observed, sent = {}, [], []
+    builder = worker._make_build_messages_fn(
+        system_prompt="SYS", summary="", tail=[{"role": "user", "content": "灯牌编号?"}],
+        memory_context_payload=_injection_payload(), memory_context_observation=view,
+        agent_memory="已有完整摘要",
+    )
+    def boom(*args, **kwargs):
+        raise RecursionError("simulated")
+    monkeypatch.setattr("model_api_runtime.v2.memory_recall.arrival_ids", boom)
+    async def provider(_config, messages, **kwargs):
+        sent.append(messages)
+        return {"reply": "照常回复", "tool_calls": [], "usage": {}}
+    async def noop(*args, **kwargs):
+        return []
+    async def reply(*args, **kwargs):
+        return None
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=provider_client.ProviderConfig(provider="anthropic", model="claude-sonnet-4-test", api_key="test"),
+        build_messages=builder, dispatch_tools=noop, on_reply=reply,
+        fold_new_messages=noop, add_usage=lambda *a, **k: None, max_calls=1,
+        memory_context_observation=view, on_memory_recall_completed=observed.append,
+    ))
+    assert len(sent) == 1 and len(observed) == 1          # the turn still ran
+    obs = observed[0]["prompt_observations"][0]
+    assert obs["arrival_error"] == "RecursionError"
+    assert obs["injected_ids"] == [] and obs["missing_ids"] == []
+    assert obs["unverified_ids"] == view["ids"] and obs["injected_is_lower_bound"] is True
+    assert observed[0]["unverified_ids"] == sorted(view["ids"])
+    assert observed[0]["injected_is_lower_bound"] is True
+    assert observed[0]["arrival_errors"] == ["RecursionError"]
+
+
+def test_arrival_scan_bounds_are_explicit(monkeypatch):
+    """The linear stack scan is what makes a brace flood cheap; these caps are the
+    belt-and-braces on top, so pin them: past a bound an entry is simply not
+    structurally matched (the verbatim path still applies), never an exception."""
+    from model_api_runtime.v2 import memory_recall
+    entry = {"id": "target", "summary": "灯牌编号 NP-4286", "reason": "与这句相关"}
+    block = "\n".join(["# 相关记忆", "以下是记忆资料", json.dumps(entry, ensure_ascii=False), "尾"])
+    compact = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    # Past a bound the answer is "not verified", never "absent" (codex round 5).
+    beyond = {"role": "user", "content": "x" * memory_recall._MAX_JSON_SCAN_CHARS + compact}
+    assert memory_recall.arrival_ids(block, ["target"], [beyond]) == ([], [], ["target"])
+    nested = {"role": "user", "content": "{" * memory_recall._MAX_JSON_DEPTH + compact}
+    assert memory_recall.arrival_ids(block, ["target"], [nested]) == ([], [], ["target"])
+    monkeypatch.setattr(memory_recall, "_MAX_JSON_SPAN_CHARS", 4)
+    assert memory_recall.arrival_ids(block, ["target"], [{"role": "user", "content": compact}]) == ([], [], ["target"])
+
+
+def test_a_quote_in_ordinary_prose_does_not_hide_a_following_entry():
+    """codex (T529 round 5): quote state belongs to a JSON candidate, not to the
+    surrounding prose — a lone quotation mark used to swallow the entry after it."""
+    from model_api_runtime.v2 import memory_recall
+    entry = {"id": "target", "summary": "灯牌编号 NP-4286", "reason": "与这句相关"}
+    block = "\n".join(["# 相关记忆", "以下是记忆资料", json.dumps(entry, ensure_ascii=False), "尾"])
+    compact = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    # An ODD number of quotes is what poisons a globally-tracked scanner; a
+    # balanced pair cancels out and would not discriminate (checked against the
+    # mutant before writing this).
+    lone = {"role": "user", "content": '屏幕是 27" 的 ' + compact}
+    assert memory_recall.arrival_ids(block, ["target"], [lone]) == (["target"], [], [])
+    unclosed = {"role": "user", "content": '他说"好啊 ' + compact}
+    assert memory_recall.arrival_ids(block, ["target"], [unclosed]) == (["target"], [], [])
+    # a real absence is still a real absence
+    assert memory_recall.arrival_ids(
+        block, ["target"], [{"role": "user", "content": '屏幕是 27" 的'}]) == ([], ["target"], [])
+
+
+def test_text_ending_inside_an_object_or_string_is_unverified_not_missing():
+    """codex (T529 round 7): an unclosed object or string swallows everything
+    after it, so the scan proves nothing about what it did not see."""
+    from model_api_runtime.v2 import memory_recall
+    entry = {"id": "target", "summary": "灯牌编号 NP-4286", "reason": "与这句相关"}
+    block = "\n".join(["# 相关记忆", "以下是记忆资料", json.dumps(entry, ensure_ascii=False), "尾"])
+    compact = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    swallowed = {"role": "user", "content": '{"draft":"' + compact}
+    assert memory_recall.arrival_ids(block, ["target"], [swallowed]) == ([], [], ["target"])
+    # an object that closes normally around the entry still verifies it
+    nested = {"role": "user", "content": '{"draft": ' + compact + "}"}
+    assert memory_recall.arrival_ids(block, ["target"], [nested]) == (["target"], [], [])
+    # and a complete scan that simply does not contain the entry is still missing
+    assert memory_recall.arrival_ids(
+        block, ["target"], [{"role": "user", "content": "没有记忆块"}]) == ([], ["target"], [])
