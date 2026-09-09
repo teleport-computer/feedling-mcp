@@ -2530,7 +2530,11 @@ _RECALL_TURN_STATE: dict[str, Any] = {
 }
 AUTO_MEMORY_TURN_PAGE = 4  # enclave selects against this many trailing messages (T512 query widening)
 AUTO_MEMORY_BUDGET_CHARS = 2500  # ≈1-1.5k tokens; whole cards only, never a sliced card
-AUTO_MEMORY_SUMMARY_CHARS = 120
+# A summary longer than this is not shown at all (id + reason + "fetch" only).
+# We never cut a summary: a half sentence is the input shape that most invites
+# the model to complete it (haoxuan, T529). Whole or nothing.
+AUTO_MEMORY_SUMMARY_MAX_CHARS = 300
+AUTO_MEMORY_TOO_LONG_NOTE = "摘要过长未展示，细节请 memory-fetch"
 _RECALL_LEDGER_KEYS = ("index_calls", "search_calls", "empty_searches", "fetch_cards")
 _turn_ledger_path: str | None = None
 
@@ -2790,9 +2794,10 @@ def _auto_memory_render(picked, quoted_ids, *, budget_chars: int = AUTO_MEMORY_B
         if mid in seen:
             continue
         summary = " ".join(str(card["text"]).split())
-        if len(summary) > AUTO_MEMORY_SUMMARY_CHARS:
-            summary = summary[:AUTO_MEMORY_SUMMARY_CHARS - 1] + "…"
-        line = f"- (id={mid}) {summary} · {_auto_memory_reason(card)}"
+        if len(summary) > AUTO_MEMORY_SUMMARY_MAX_CHARS:
+            line = f"- (id={mid}) [{AUTO_MEMORY_TOO_LONG_NOTE}] · {_auto_memory_reason(card)}"
+        else:
+            line = f"- (id={mid}) {summary} · {_auto_memory_reason(card)}"
         if size + len(line) + 1 > budget_chars:
             continue  # drop this whole card; keep looking for smaller ones
         lines.append(line)
