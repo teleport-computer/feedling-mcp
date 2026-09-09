@@ -211,12 +211,23 @@ class _FakeAdapter:
     def load(self, tenant: str, **filters) -> Snapshot:
         return Snapshot(cards=[], revision="rev-0")
 
+    def maintenance_state(self, tenant: str, *, owner: str, mount: str) -> dict:
+        return {}
+
     def apply(self, tenant, mutations, *, idempotency_key, expected_revision) -> ApplyResult:
         return ApplyResult(results=[], revision="rev-1")
 
 
 def test_structural_conformance():
     assert isinstance(_FakeAdapter(), StoragePort)
+
+
+def test_fake_adapter_maintenance_state_matches_keyword_only_port_contract():
+    assert _FakeAdapter().maintenance_state(
+        "tenant-1", owner="resident", mount="agent-private"
+    ) == {}
+    with pytest.raises(TypeError):
+        _FakeAdapter().maintenance_state("tenant-1", "resident", "agent-private")
 
 
 def test_adapter_missing_apply_is_not_a_port():

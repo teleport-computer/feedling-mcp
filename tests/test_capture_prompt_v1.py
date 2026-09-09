@@ -53,6 +53,10 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert "have just finished a stretch of conversation" in p
     assert "[Your relationship]" in p
     assert "this person's own words worth keeping" in p
+    assert "retrieval_cues: 3-5 short search hints grounded in this card" in p
+    assert "Hints are retrieval pointers, not additional evidence" in p
+    assert "importance_level: choose one of five levels" in p
+    assert '"retrieval_cues": [' in p and '"importance_level": 3' in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
@@ -146,6 +150,24 @@ def test_parse_normal_card():
     assert c["action"] == "add" and c["type"] == "event"
     assert c["importance"] == 0.8 and c["pulse"] == 0.4
     assert c["threads"] == ["加班", "心率"]
+
+
+def test_parse_preserves_retrieval_cues_and_maps_all_importance_levels():
+    for level in range(1, 6):
+        raw = json.dumps({"cards": [{
+            "action": "add",
+            "summary": "取件提醒",
+            "content": "下班后记得去驿站取件。",
+            "retrieval_cues": ["驿站", "什么时候取件", "驿站"],
+            "importance_level": level,
+            "importance": 0.01,
+        }]}, ensure_ascii=False)
+
+        cards, err = parse_capture_cards(raw)
+
+        assert err is None
+        assert cards[0]["retrieval_cues"] == ["驿站", "什么时候取件"]
+        assert cards[0]["importance"] == level / 5.0
 
 
 def test_parse_empty_is_clean():
