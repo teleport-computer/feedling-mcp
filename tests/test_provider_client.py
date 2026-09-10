@@ -160,7 +160,11 @@ def test_async_reliable_deadline_clamps_per_attempt_timeout(monkeypatch):
         )
     )
 
-    assert result == {"reply": "ok"}
+    # The reliable wrapper now guarantees provider_retry_count on every success
+    # exit (0 on this one-shot), so the passthrough reply is augmented with usage
+    # rather than returned byte-for-byte (T550).
+    assert result["reply"] == "ok"
+    assert result["usage"]["provider_retry_count"] == 0
     assert 0 < timeouts[0] <= 0.5
 
 
