@@ -3733,6 +3733,61 @@ def test_prepare_pi_cli_isolated_session_keeps_minted_override(monkeypatch):
     assert "--resume" not in cmd
 
 
+@pytest.mark.parametrize(
+    ("driver", "template"),
+    [
+        (
+            "claude",
+            "claude -p --session-id fixed --mcp-config=user.json "
+            "--allowed-tools Bash --dangerously-skip-permissions {message}",
+        ),
+        (
+            "pi",
+            "pi --mode json --session-id {session_id} -e bridge -t bash {message}",
+        ),
+        (
+            "codex",
+            "codex -c mcp_servers.io.enabled=true --search exec "
+            "--dangerously-bypass-approvals-and-sandbox --json {message}",
+        ),
+    ],
+)
+def test_prepare_timeout_recovery_cli_final_argv_is_isolated_and_tool_free(
+    monkeypatch, driver, template
+):
+    """Pin the final argv product, after normal session/MCP/profile assembly."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", template)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_inject_minimal_runtime_profile", lambda cmd: cmd)
+    _fail_session_store_reads(monkeypatch)
+
+    cmd, _stdin = crc._prepare_cli_command(
+        "hello",
+        lane="background",
+        session_id_override=crc._new_agent_session_id(),
+        tools_disabled=True,
+    )
+
+    flattened = " ".join(cmd)
+    assert "user.json" not in flattened
+    assert "mcp_servers." not in flattened
+    assert "--allowed-tools" not in cmd
+    assert "dangerously" not in flattened
+    assert "--resume" not in cmd and "--session-id" not in cmd
+    if driver == "claude":
+        assert cmd[cmd.index("--tools") + 1] == ""
+        assert "--safe-mode" in cmd and "--no-session-persistence" in cmd
+    elif driver == "pi":
+        assert "--no-tools" in cmd and "--no-extensions" in cmd
+        assert "--no-session" in cmd
+    else:
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+        assert "--search" not in cmd
+        assert "--skip-git-repo-check" in cmd
+        assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
+
+
 def test_prepare_claude_cli_shared_session_still_resumes(monkeypatch):
     # Regression net for the fix: the SHARED path (no override) keeps claude's
     # stored-UUID --resume continuity byte-identical to before.
@@ -13124,6 +13179,281 @@ def test_agent_turn_timeout_default_is_300():
     if os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC"):
         pytest.skip("env override set for FEEDLING_AGENT_TURN_TIMEOUT_SEC")
     assert crc.AGENT_TURN_TIMEOUT_SEC == 300
+
+
+@pytest.mark.parametrize(
+    ("lane", "content_type", "source", "has_attachments", "eligible"),
+    [
+        ("chat", "text", "", False, True),
+        ("background", "text", "", False, False),
+        ("capture", "text", "", False, False),
+        ("dream", "text", "", False, False),
+        ("proactive", "text", "", False, False),
+        ("chat", "image", "", False, False),
+        ("chat", "file", "", False, False),
+        ("chat", "text", "", True, False),
+        ("chat", "text", "verify_ping", False, False),
+        ("chat", "text", crc.RESIDENT_MAINTENANCE_SOURCE, False, False),
+    ],
+)
+def test_foreground_timeout_recovery_gate_uses_the_lane_partition(
+    monkeypatch, lane, content_type, source, has_attachments, eligible
+):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json")
+
+    assert crc.FOREGROUND_TIMEOUT_RECOVERY_LANES == (
+        crc.RESIDENT_AGENT_LANES - crc.RESIDENT_AGENT_BACKGROUND_LANES
+    )
+    assert crc._should_recover_foreground_timeout(
+        subprocess.TimeoutExpired(["codex"], 300),
+        lane=lane,
+        content_type=content_type,
+        source=source,
+        has_attachments=has_attachments,
+    ) is eligible
+
+
+def test_foreground_timeout_recovery_gate_is_cli_timeout_only(monkeypatch):
+    kwargs = {
+        "lane": "chat",
+        "content_type": "text",
+        "source": "",
+        "has_attachments": False,
+    }
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    assert crc._should_recover_foreground_timeout(
+        subprocess.TimeoutExpired(["agent"], 300), **kwargs
+    ) is False
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "hermes chat -q {message}")
+    assert crc._should_recover_foreground_timeout(
+        subprocess.TimeoutExpired(["hermes"], 300), **kwargs
+    ) is False
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex")
+    assert crc._should_recover_foreground_timeout(
+        subprocess.TimeoutExpired(["codex"], 300), **kwargs
+    ) is False
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json")
+    assert crc._should_recover_foreground_timeout(RuntimeError("deadline"), **kwargs) is False
+
+
+@pytest.mark.parametrize(
+    ("command", "driver", "forbidden"),
+    [
+        (
+            [
+                "pi", "-e", "bridge", "-t", "bash,read", "--skill",
+                "/tmp/write-skill", "--approve", "--mode", "json",
+            ],
+            "pi",
+            {
+                "-e", "bridge", "-t", "bash,read", "--skill",
+                "/tmp/write-skill", "--approve",
+            },
+        ),
+        (
+            [
+                "claude", "--mcp-config", "user.json", "--allowed-tools",
+                "Bash", "Read", "--add-dir", "/tmp/a", "/tmp/b",
+                "--permission-mode", "bypassPermissions",
+                "--dangerously-skip-permissions", "-p",
+            ],
+            "claude",
+            {
+                "user.json", "Bash", "Read", "/tmp/a", "/tmp/b",
+                "bypassPermissions", "--dangerously-skip-permissions",
+            },
+        ),
+        (
+            [
+                "codex", "-c", "mcp_servers.io.enabled=true", "--search",
+                "exec", "--dangerously-bypass-approvals-and-sandbox", "--json",
+            ],
+            "codex",
+            {
+                "mcp_servers.io.enabled=true", "--search",
+                "--dangerously-bypass-approvals-and-sandbox",
+            },
+        ),
+    ],
+)
+def test_tool_free_timeout_command_strips_every_side_effect_surface(
+    command, driver, forbidden
+):
+    safe = crc._tool_free_cli_command(command)
+
+    assert forbidden.isdisjoint(safe)
+    if driver == "pi":
+        assert {"--no-tools", "--no-extensions", "--no-session"} <= set(safe)
+    elif driver == "claude":
+        assert {"--safe-mode", "--strict-mcp-config", "--no-session-persistence"} <= set(safe)
+        tools_index = safe.index("--tools")
+        assert safe[tools_index + 1] == ""
+        assert safe[safe.index("--permission-mode") + 1] == "dontAsk"
+    else:
+        sandbox_index = safe.index("--sandbox")
+        assert safe[sandbox_index + 1] == "read-only"
+        assert {
+            "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+            "--ephemeral",
+        } <= set(safe)
+
+
+def test_tool_free_timeout_command_rejects_an_unknown_driver():
+    with pytest.raises(ValueError, match="supports only"):
+        crc._tool_free_cli_command(["hermes", "chat"])
+
+
+def test_tool_free_cli_call_uses_and_removes_a_clean_working_directory(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    monkeypatch.setattr(crc, "_inject_minimal_runtime_profile", lambda cmd: cmd)
+    observed = {}
+
+    def fake_run(cmd, kwargs, stdout_line=None, **_extra):
+        observed["cmd"] = list(cmd)
+        observed["cwd"] = kwargs["cwd"]
+        assert Path(observed["cwd"]).is_dir()
+        stdout = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "fresh"}),
+            json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "recovered"},
+            }),
+        ])
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(crc, "_run_cli_subprocess", fake_run)
+
+    assert crc.call_agent_cli(
+        "hello", isolated_session=True, tools_disabled=True
+    ) == "recovered"
+    assert not Path(observed["cwd"]).exists()
+    assert observed["cmd"][observed["cmd"].index("--sandbox") + 1] == "read-only"
+
+
+def test_foreground_timeout_recovery_uses_its_own_bounded_deadline(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(crc, "FOREGROUND_TIMEOUT_RECOVERY_SEC", 120)
+
+    def fake_call_agent(message, **kwargs):
+        captured.update(kwargs)
+        return {"messages": ["recovered"]}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+
+    assert crc._recover_foreground_timeout(
+        "hello", trace_id="trace-timeout"
+    ) == {"messages": ["recovered"]}
+    assert captured["absolute_deadline"] == 1120.0
+    assert captured["trace_id"] == "trace-timeout"
+
+
+def test_foreground_timeout_recovers_once_without_replaying_actions(monkeypatch):
+    """The first attempt may already have written once before timing out.
+
+    Positive counterexample: without the tool-free kwarg the simulated write
+    happens twice; without the reply-only sanitizer the emitted action executes
+    once more in the resident after recovery.
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json")
+    calls = []
+    simulated_writes = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        if len(calls) == 1:
+            simulated_writes.append("timed-out-attempt")
+            raise subprocess.TimeoutExpired(["codex"], 300)
+        if not kwargs.get("tools_disabled"):
+            simulated_writes.append("recovery-tool")
+        return {
+            "messages": ["recovered reply"],
+            "actions": [{"type": "memory_write", "content": "duplicate"}],
+            "tool_calls": [{"name": "write_file", "arguments": {}}],
+        }
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with (
+        patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post,
+        patch.object(crc, "execute_agent_actions") as mock_execute,
+        patch.object(crc, "_clear_agent_session_id") as mock_clear,
+    ):
+        result_ts = crc._process_messages([
+            {"id": "u-timeout", "role": "user", "content": "hello", "ts": 500.0}
+        ])
+
+    assert result_ts == pytest.approx(500.0)
+    assert len(calls) == 2, "one original attempt plus exactly one recovery"
+    assert crc.FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS == 1
+    recovery_prompt, recovery_kwargs = calls[1]
+    assert "Original user message:\nhello" in recovery_prompt
+    assert recovery_kwargs["lane"] == "background"
+    assert recovery_kwargs["attempt_trigger"] == "timeout_recovery"
+    assert recovery_kwargs["isolated_session"] is True
+    assert recovery_kwargs["tools_disabled"] is True
+    assert simulated_writes == ["timed-out-attempt"]
+    mock_execute.assert_not_called()
+    assert any(
+        call.args
+        and call.args[0] == "foreground hard timeout invalidated native session"
+        for call in mock_clear.call_args_list
+    )
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args[0] == "recovered reply"
+
+
+def test_foreground_timeout_recovery_never_stacks_with_empty_reply_retry(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json")
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(["codex"], 300)
+        return {"messages": [], "provider_reasoning": "thought only"}
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages([
+            {"id": "u-timeout-empty", "role": "user", "content": "hello", "ts": 501.0}
+        ])
+
+    assert len(calls) == 2
+    posted = [call.args[0] for call in mock_post.call_args_list]
+    assert posted.count(crc._empty_reply_fallback("hello")) == 1
+
+
+def test_foreground_timeout_recovery_failure_is_not_retried(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json")
+    calls = []
+
+    def fake_call_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        raise subprocess.TimeoutExpired(["codex"], 300)
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    with patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        crc._process_messages([
+            {"id": "u-timeout-twice", "role": "user", "content": "hello", "ts": 502.0}
+        ])
+
+    assert len(calls) == 2, "a failed recovery must not trigger another recovery"
+    assert mock_post.called, "the existing timeout fallback must remain visible"
 
 
 def test_agent_call_failed_reason_keeps_message_and_prefix():

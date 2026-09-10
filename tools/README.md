@@ -571,6 +571,24 @@ id and retries the current turn fresh once. If a user interrupts an in-flight
 voice turn, its session id is also cleared, so the next turn reconstructs from
 the canonical Enclave history instead of continuing a half-written model state.
 
+A hard CLI subprocess timeout on an ordinary foreground text turn gets one
+reply-only recovery attempt with a fresh native session:
+
+```
+FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC=120
+```
+
+The recovery deadline has a 30-second minimum. It is available only for Codex,
+Claude, and Pi commands whose isolation controls the consumer understands. The
+resident removes user/project tool configuration, disables tools or enforces a
+read-only sandbox, runs from a clean temporary working directory, and discards
+any action/tool-call protocol fields that still appear in the result. This does
+not undo work the timed-out attempt may already have completed; it prevents the
+automatic recovery from replaying that work. A failed or empty recovery is not
+stacked with another retry. HTTP agents, custom/unknown CLI drivers, image/file
+turns, maintenance turns, and background/proactive lanes keep the normal
+user-visible timeout fallback.
+
 For Enclave-backed history, connect/TLS and response-read budgets are separate:
 
 ```
