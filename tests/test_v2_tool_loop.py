@@ -478,7 +478,7 @@ def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
     assert tagged in provider.calls[0]["messages"]
     assert tagged not in provider.calls[1]["messages"]
     assert rejected == ["ProviderError"]
-    assert usage == [None, {}]
+    assert usage == [None, {"provider_retry_count": 0}]
     assert outcome.final_text == "text fallback"
     initial_error = next(
         payload for kind, payload in trajectory if kind == "provider_error"
@@ -3348,7 +3348,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert provider.calls[1]["tools"] is None
     assert "allow_image_output" not in provider.calls[1]
     assert len(provider.calls) == 2
-    assert usage == [None, {}]
+    assert usage == [None, {"provider_retry_count": 0}]
     assert reply.calls == [("fallback answer", True)]
     assert outcome.rounds == 2
     assert [item["reason"] for item in surfaces] == [

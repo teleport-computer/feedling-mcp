@@ -2545,6 +2545,132 @@ def _extract_gemini_stop_reason(body: dict[str, Any]) -> str:
     return str(candidates[0].get("finishReason") or "").strip()
 
 
+# Gemini safety categories are a CLOSED enum set; only these (and their HIGH/…
+# probability + blocked flag) are projected, never any content. Unknown
+# categories are counted but not named, so a future category cannot smuggle text
+# into the trace.
+_GEMINI_SAFETY_CATEGORIES = (
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+)
+_GEMINI_PROBABILITY_ORDER = ("NEGLIGIBLE", "LOW", "MEDIUM", "HIGH")
+# finishReason is PROVIDER-CONTROLLED free text on the wire — it must never reach
+# a (user-readable) trace verbatim. Only these closed enum values pass through;
+# anything else normalizes to "other" so a hostile/novel value cannot leak text.
+_GEMINI_FINISH_REASONS = frozenset({
+    "FINISH_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "RECITATION",
+    "LANGUAGE", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+    "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",
+})
+
+
+def _normalize_gemini_finish_reason(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    return value if value in _GEMINI_FINISH_REASONS else "other"
+
+
+def _gemini_empty_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
+    """Content-free scalars explaining a Gemini response with no usable text.
+
+    Everything here is an enum, a count, a token number, or a boolean — no reply,
+    reasoning, prompt, or error text — so it is safe to carry through the
+    normalized result into a (gated) trace. Projected here, at the provider seam,
+    because ``_empty_response_shape`` downstream only sees ``ProviderResponse.raw``
+    and must never reach back through ``assistant_turn`` (which carries content).
+    """
+    candidates = body.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    first = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+
+    # Parts: did the model return only ``thought`` parts (reasoning) with no
+    # visible-text part? (A common Gemini "empty" shape.)
+    content = first.get("content")
+    parts = content.get("parts") if isinstance(content, dict) else None
+    parts = parts if isinstance(parts, list) else []
+    visible_text_parts = 0
+    thought_parts = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        has_text = isinstance(text, str) and bool(text.strip())
+        if part.get("thought"):
+            if has_text:
+                thought_parts += 1
+        elif has_text:
+            visible_text_parts += 1
+    # Structural definition (not text-count based): a non-empty parts list where
+    # every part is a dict flagged thought=True — this INCLUDES signature-only
+    # thought parts that carry no text, which a text-count would miss.
+    only_thought_parts = bool(parts) and all(
+        isinstance(part, dict) and bool(part.get("thought")) for part in parts
+    )
+
+    # Safety ratings: closed-set categories, highest probability, blocked flags.
+    ratings = first.get("safetyRatings")
+    ratings = ratings if isinstance(ratings, list) else []
+    blocked_known: list[str] = []
+    blocked_unknown = 0
+    max_prob_rank = -1
+    for rating in ratings:
+        if not isinstance(rating, dict):
+            continue
+        category = str(rating.get("category") or "")
+        is_blocked = bool(rating.get("blocked"))
+        if is_blocked:
+            if category in _GEMINI_SAFETY_CATEGORIES:
+                blocked_known.append(category)
+            else:
+                blocked_unknown += 1
+        probability = str(rating.get("probability") or "")
+        if probability in _GEMINI_PROBABILITY_ORDER:
+            max_prob_rank = max(
+                max_prob_rank, _GEMINI_PROBABILITY_ORDER.index(probability)
+            )
+
+    usage = body.get("usageMetadata")
+    usage = usage if isinstance(usage, dict) else {}
+
+    def _count(value: Any) -> int | None:
+        # Pure observability: a malformed provider token count must neither fake a
+        # value (1.5 -> 1, -1 -> 0) nor raise (NaN -> ValueError, Inf ->
+        # OverflowError) and turn a successful parse into a failure. Only a
+        # finite non-negative whole number is a count; everything else is None.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if math.isfinite(value) and value.is_integer() and value >= 0:
+                return int(value)
+            return None
+        return None
+
+    return {
+        "finish_reason": _normalize_gemini_finish_reason(
+            _extract_gemini_stop_reason(body)
+        ),
+        "candidates_count": len(candidates),
+        "only_thought_parts": only_thought_parts,
+        "visible_text_part_count": visible_text_parts,
+        "thought_part_count": thought_parts,
+        "safety_blocked": bool(blocked_known) or blocked_unknown > 0,
+        "safety_blocked_categories": blocked_known,
+        "safety_blocked_unknown_count": blocked_unknown,
+        "safety_max_probability": (
+            _GEMINI_PROBABILITY_ORDER[max_prob_rank] if max_prob_rank >= 0 else ""
+        ),
+        "prompt_token_count": _count(usage.get("promptTokenCount")),
+        "candidates_token_count": _count(usage.get("candidatesTokenCount")),
+        "thoughts_token_count": _count(usage.get("thoughtsTokenCount")),
+    }
+
+
 def _anthropic_supports_thinking(model: str) -> bool:
     lower = (model or "").lower()
     return (
@@ -3138,17 +3264,28 @@ def _with_request_diagnostics(
 
 
 def _with_reliable_retry_count(result: Any, retries: int) -> Any:
-    """Fold outer transient retries into the same non-sensitive counter."""
-    if not isinstance(result, dict) or retries <= 0:
+    """Guarantee a dict result carries ``provider_retry_count`` at the reliable
+    wrapper's single success exit, folding outer transient retries onto whatever
+    a wire already recorded.
+
+    This runs on EVERY reliable success (one-shot included), so wires whose own
+    parse path skips ``_with_request_diagnostics`` — the dedicated image wires
+    and Gemini — still report a count (0 on a clean one-shot) instead of an
+    absent field. Doing it here, not per-wire, is what stops a new wire from
+    silently reintroducing the gap.
+    """
+    if not isinstance(result, dict):
         return result
+    retries = max(0, int(retries))
     out = dict(result)
     usage = dict(out.get("usage") or {})
     try:
         inner = max(0, int(usage.get("provider_retry_count") or 0))
     except (TypeError, ValueError, OverflowError):
         inner = 0
-    usage["provider_retry_count"] = inner + int(retries)
-    usage["transient_retry_count"] = int(retries)
+    usage["provider_retry_count"] = inner + retries
+    if retries > 0:
+        usage["transient_retry_count"] = retries
     out["usage"] = usage
     return out
 
@@ -4326,6 +4463,7 @@ def _parse_gemini_body(
         "model": model,
         "tool_calls": tool_calls,
         "media": media,
+        "gemini_diagnostics": _gemini_empty_diagnostics(body),
         "assistant_turn": {"wire": "gemini", "payload": assistant_payload},
     }
 

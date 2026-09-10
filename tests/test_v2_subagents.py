@@ -331,8 +331,8 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
     assert "Inspect the report for evidence." in first_prompt
     assert "parent history" not in first_prompt
     assert usage == [
-        {"prompt_tokens": 5, "completion_tokens": 1},
-        {"prompt_tokens": 7, "completion_tokens": 2},
+        {"prompt_tokens": 5, "completion_tokens": 1, "provider_retry_count": 0},
+        {"prompt_tokens": 7, "completion_tokens": 2, "provider_retry_count": 0},
     ]
     child_events = [
         event for event in trajectory_events if event[0] == "subagent:parent-task"

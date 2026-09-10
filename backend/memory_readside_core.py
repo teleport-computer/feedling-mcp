@@ -117,8 +117,9 @@ def memory_available(
 
 def memory_score(moment: dict) -> float:
     importance = _float(moment.get("importance"), 0.5)
-    open_bonus = 0.1 if moment.get("is_open_thread") is True else 0.0
-    return round(open_bonus + importance * _decay_multiplier(moment), 4)
+    # Legacy/unvalidated is_open_thread metadata has no maintained lifecycle.
+    # It must not confer a ranking advantage even when present on stored cards.
+    return round(importance * _decay_multiplier(moment), 4)
 
 
 def ambient_score(moment: dict) -> float:
