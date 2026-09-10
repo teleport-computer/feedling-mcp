@@ -373,6 +373,7 @@ jobs:
           tests/test_asgi_admin.py
           tests/test_asgi_chat_remaining.py
           tests/test_asgi_cors.py
+          tests/test_asgi_lifespan_loads_users.py
           tests/test_notification_sound_payload.py
           tests/openapi/test_public_openapi.py
           tests/test_tee_table_registry.py
@@ -969,6 +970,7 @@ jobs:
             tests/test_mcp_probe_tools_required.py \
             tests/test_mcp_status.py \
             tests/test_user_mcp_core.py \
+            tests/test_mcp_core_codex_cert_warning.py \
             tests/test_user_mcp_handshake_probe.py \
             tests/test_user_mcp_probe.py \
             tests/test_user_mcp_routes.py \
