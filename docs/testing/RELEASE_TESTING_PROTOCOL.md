@@ -228,6 +228,13 @@ verify_loop passing → 发消息收回复 → 删号。
 
 ## 4. P1 全功能清单（Claude 半自动执行，1-2 小时）
 
+**跑 P1 深测工具（`tools/e2e/deep.py`）先声明目标环境（T545）**：目标由 `FEEDLING_E2E_API` **显式指定**，且必须是 test 或 pre，否则拒跑（fail-closed）。不再硬编码只准 pre——test 上也能跑 P1 回归：
+```
+FEEDLING_E2E_API=https://test-api.feedling.app python3 -m tools.e2e.deep --areas …
+# 或 https://pre-api.feedling.app
+```
+未设 `FEEDLING_E2E_API`、指向 prod（`api.feedling.app`）、或任何其它 host（含本地 127.0.0.1/localhost）一律 `REFUSING to run`（exit 2）——prod 永不允许，与 `client._refuse_prod` 同精神。deep.py 启动打印 `[deep] target environment: …` 把实际目标写进报告，避免"在错环境报绿"。
+
 在 **claude 官方 + pi 中转站** 两个代表性配置上（一个最稳、一个最刁）过全表；
 其余 driver 若 P0 全绿则免。逐项 ✅/❌/跳过+原因。
 
