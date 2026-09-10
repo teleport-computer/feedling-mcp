@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import profile_store, worker
 
 
-_PROFILE_MAX_AGE_SEC = worker._PROFILE_MAX_AGE_SEC
 _DAY_SEC = 24 * 60 * 60
 
 
@@ -46,23 +45,21 @@ def _iso(timestamp: float) -> str:
 @pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
     monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
-    monkeypatch.setattr(worker, "_PROFILE_MAX_AGE_SEC", _PROFILE_MAX_AGE_SEC)
-
-
-def test_profile_refresh_default_age_is_three_days():
-    assert _PROFILE_MAX_AGE_SEC == 3 * _DAY_SEC
 
 
 @pytest.mark.parametrize(
     ("age_seconds", "stats", "expected"),
     [
-        (_PROFILE_MAX_AGE_SEC - 1, (6, "u6"), False),  # fresh + changed
-        (_PROFILE_MAX_AGE_SEC + 1, (5, "u5"), False),  # stale + unchanged
-        (_PROFILE_MAX_AGE_SEC + 1, (6, "u5"), True),  # stale + count changed
-        (_PROFILE_MAX_AGE_SEC + 1, (5, "u6"), True),  # stale + updated changed
+        (1, (6, "u6"), True),  # fresh + newly added card
+        (1, (5, "u6"), True),  # fresh + updated card, same count
+        (1, (4, "u5"), True),  # fresh + deletion
+        (1, (5, "u5"), False),  # fresh + unchanged
+        (4 * _DAY_SEC, (5, "u5"), False),  # old + unchanged
+        (4 * _DAY_SEC, (6, "u5"), True),  # old + count changed
+        (4 * _DAY_SEC, (5, "u6"), True),  # old + updated changed
     ],
 )
-def test_stale_floor_four_quadrants(monkeypatch, age_seconds, stats, expected):
+def test_source_change_refresh_does_not_wait_for_profile_age(monkeypatch, age_seconds, stats, expected):
     now = 2_000_000_000.0
     document = _ok(generated_at=_iso(now - age_seconds))
     monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
@@ -170,9 +167,9 @@ def test_source_change_retry_only_requeues_after_garden_witness_changes(monkeypa
     assert worker._profile_refresh_due("u", now=2_000_000_000) is True
 
 
-def test_stale_floor_is_independent_of_dream_setting(monkeypatch):
+def test_source_change_refresh_is_independent_of_dream_setting(monkeypatch):
     now = 2_000_000_000.0
-    document = _ok(generated_at=_iso(now - _PROFILE_MAX_AGE_SEC - 1))
+    document = _ok(generated_at=_iso(now - 1))
     monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_args: document)
     monkeypatch.setattr(
         worker.db,
@@ -181,6 +178,60 @@ def test_stale_floor_is_independent_of_dream_setting(monkeypatch):
     )
     # No dream-enabled callback or setting participates in this decision.
     assert worker._profile_refresh_due("u", now=now) is True
+
+
+@pytest.mark.parametrize("generated_at", ["", "not-a-timestamp", _iso(2_000_000_100)])
+def test_source_change_is_not_hidden_by_missing_or_future_generation_time(monkeypatch, generated_at):
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_: _ok(generated_at=generated_at))
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _: (6, "u6"))
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is True
+
+
+def test_fresh_source_change_reaches_real_enqueue_and_coalesces(monkeypatch):
+    """Do not stub the due predicate: old three-day behavior must fail here."""
+    document = _ok(generated_at=_iso(2_000_000_000))
+    monkeypatch.setattr(worker.time, "time", lambda: 2_000_000_001)
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda uid, _: document if uid == "u" else None)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda uid: (6, "u6"))
+    enqueued, wakes = [], []
+
+    def enqueue(uid, lane, **kwargs):
+        enqueued.append((uid, lane, kwargs["reason"]))
+        return 11, len(enqueued) > 1
+
+    monkeypatch.setattr(worker.jobs_store, "enqueue_job", enqueue)
+    monkeypatch.setattr(worker.core_wake_bus, "notify", lambda *args: wakes.append(args))
+    assert asyncio.run(worker._enqueue_profile_if_due("u", reason="post_turn_refresh")) is True
+    assert asyncio.run(worker._enqueue_profile_if_due("u", reason="post_turn_refresh")) is False
+    assert enqueued == [("u", "profile", "post_turn_refresh")] * 2
+    assert wakes == [("v2_jobs", "u")]
+
+    # A successful refresh records the new witness, so it does not loop.
+    document["source"].update(card_count=6, max_updated_at="u6")
+    assert asyncio.run(worker._enqueue_profile_if_due("u", reason="post_turn_refresh")) is False
+    assert len(enqueued) == 2
+
+
+def test_source_stats_failure_is_not_reported_as_unchanged(monkeypatch):
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_: _ok(generated_at=_iso(2_000_000_000)))
+
+    def fail(_uid):
+        raise RuntimeError("synthetic database outage")
+
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", fail)
+    with pytest.raises(RuntimeError, match="synthetic database outage"):
+        worker._profile_refresh_due("u", now=2_000_000_001)
+
+
+def test_disabled_profile_never_reads_source_stats(monkeypatch):
+    document = _ok(generated_at=_iso(1))
+    document["disabled"] = True
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_: document)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _: pytest.fail("disabled profile"))
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is False
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", False)
+    monkeypatch.setattr(worker.db, "get_blob_strict", lambda *_: pytest.fail("feature disabled"))
+    assert worker._profile_refresh_due("u", now=2_000_000_000) is False
 
 
 def test_empty_profile_only_requeues_when_garden_changes(monkeypatch):

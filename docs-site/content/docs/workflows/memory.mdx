@@ -31,6 +31,17 @@ instance; the second Heavy slot remains available for Dream, Capture, and other
 maintenance. Provider and write stages report progress so a slow but advancing
 profile is not mistaken for a hung Job.
 
+For a healthy or empty profile, the next existing post-turn check schedules a
+refresh when the Garden's content-free row count or maximum `updated_at` differs
+from the profile's recorded source. It no longer waits for the profile to be
+three days old. This is a background full-Garden refresh, not incremental
+generation on every write or a guarantee that the current reply uses the update.
+Repeated enqueue requests coalesce; disabled profiles, provider-repair gates,
+and scheduled retry backoff remain in force. An unchanged witness does not
+trigger a refresh. Writes that leave both witness values unchanged cannot be
+detected by this check. More frequent source changes can increase provider work
+and invalidate the profile's stable prompt-cache prefix more often.
+
 On Chat and proactive wake turns, non-empty MEMORY and STYLE fields enter the
 trusted system prefix after the current identity card (or transitional Genesis
 persona fallback) and before general behavior rules. They are presented as the
@@ -69,6 +80,12 @@ states when explicitly requested. All shared cards otherwise use the same read
 contract for direct fetch, ambient recall, profile refresh, Dream, and Capture.
 Legacy card-classification keys in stored envelopes are ignored and are not
 returned by `index` or `fetch`.
+
+The read-side `score` and default candidate ordering no longer add a bonus for
+legacy `is_open_thread=true` metadata. That field has no maintained open/closed
+lifecycle; cards carrying it are scored with the same importance and recency
+decay as other cards. Existing records are not rewritten. Query relevance
+ranking and ambient importance-times-pulse weighting are unchanged.
 
 Runtime V2's `memory_index` tool accepts `bucket` and `thread` filters in
 addition to `limit`, matching the resident CLI's partitioned browsing path.
