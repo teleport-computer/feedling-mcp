@@ -92,9 +92,11 @@ def run_provider(client: SmokeClient, provider: str, cfg: dict, *, turns: int, t
         # 第 1 轮：口令回声
         token = assertions.make_token()
         r1 = client.send(sess, f"请只回复这一个词,不要任何其他内容: {token}")
-        reply1 = client.poll_reply(sess, float(r1["user_message"]["ts"]), timeout)
-        if reply1 is None:
-            return _res(provider, "FAIL", "no-reply", f"turn1 {timeout:.0f}s 内无 agent 回复")
+        out1 = client.poll_turn(sess, str(r1["user_message"]["id"]), timeout)
+        if out1["failed"]:
+            stage = "no-reply" if not out1["settled"] else "turn-failure"
+            return _res(provider, "FAIL", stage, f"turn1: {out1['failure']}")
+        reply1 = out1["reply"]
         if assertions.is_fallback(reply1):
             return _res(provider, "FAIL", "fallback", reply1[:120])
         if not assertions.token_echoed(reply1, token):
@@ -104,9 +106,11 @@ def run_provider(client: SmokeClient, provider: str, cfg: dict, *, turns: int, t
 
         # 第 2 轮：上下文记忆（同一 token 须被记住）
         r2 = client.send(sess, "我上一条让你回复的那个词是什么?请原样再说一遍,只回复那个词。")
-        reply2 = client.poll_reply(sess, float(r2["user_message"]["ts"]), timeout)
-        if reply2 is None:
-            return _res(provider, "FAIL", "no-reply", f"turn2 {timeout:.0f}s 内无回复")
+        out2 = client.poll_turn(sess, str(r2["user_message"]["id"]), timeout)
+        if out2["failed"]:
+            stage = "no-reply" if not out2["settled"] else "turn-failure"
+            return _res(provider, "FAIL", stage, f"turn2: {out2['failure']}")
+        reply2 = out2["reply"]
         if assertions.is_fallback(reply2):
             return _res(provider, "FAIL", "fallback", reply2[:120])
         if not assertions.context_recalled(reply2, token):
