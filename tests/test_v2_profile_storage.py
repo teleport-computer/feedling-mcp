@@ -18,6 +18,7 @@ import conftest
 import db
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
+from model_api_runtime.v2 import worker
 
 
 def _reset(user_id: str) -> None:
@@ -368,6 +369,42 @@ def test_profile_source_stats_tracks_count_and_latest_update_true_pg():
         2,
         "2026-07-31T00:00:00Z",
     )
+
+
+def test_fresh_garden_write_enqueues_profile_with_true_pg_user_isolation(monkeypatch):
+    """Persisted Garden -> real witness/due check -> durable single-flight Job."""
+    uid, other = "u-profile-fresh-write", "u-profile-fresh-other"
+    for user_id in (uid, other):
+        _reset(user_id)
+        document = _ok_doc(user_id, 0)
+        document["source"].update(
+            card_count=0, max_updated_at="", generated_at="2033-05-18T03:33:20+00:00",
+        )
+        db.set_blob_strict(user_id, profile_store.PROFILE_BLOB_KIND, document)
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", True)
+    monkeypatch.setattr(worker.time, "time", lambda: 2_000_000_001)
+    assert worker._profile_refresh_due(uid) is False
+    db.memory_replace_all(uid, [{
+        "id": "fresh-card", "occurred_at": "2033-05-18T03:33:21+00:00",
+        "updated_at": "2033-05-18T03:33:21+00:00",
+    }])
+    assert worker._profile_refresh_due(uid) is True
+    assert worker._profile_refresh_due(other) is False
+    assert asyncio.run(worker._enqueue_profile_if_due(uid, reason="post_turn_refresh")) is True
+    assert asyncio.run(worker._enqueue_profile_if_due(uid, reason="post_turn_refresh")) is False
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id,lane,status FROM agent_jobs WHERE user_id IN (%s,%s) AND lane='profile'",
+            (uid, other),
+        ).fetchall()
+    assert rows == [(uid, "profile", "pending")]
+
+    # Successful publication records the witness; subsequent checks stay quiet.
+    document = db.get_blob_strict(uid, profile_store.PROFILE_BLOB_KIND)
+    count, updated = db.memory_profile_source_stats(uid)
+    document["source"].update(card_count=count, max_updated_at=updated)
+    db.set_blob_strict(uid, profile_store.PROFILE_BLOB_KIND, document)
+    assert worker._profile_refresh_due(uid) is False
 
 
 def test_first_write_uses_empty_expected_and_insert_if_missing(monkeypatch):

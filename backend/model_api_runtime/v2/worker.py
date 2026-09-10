@@ -130,6 +130,7 @@ from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_retry as v2_profile_retry
 from model_api_runtime.v2 import profile_store as v2_profile_store
+from model_api_runtime.v2 import profile_refresh as v2_profile_refresh
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
@@ -683,9 +684,6 @@ _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
 )
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 _PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
-_PROFILE_MAX_AGE_SEC = float(
-    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(3 * 24 * 60 * 60))
-)
 _PROFILE_RETRY_BASE_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_RETRY_BASE_SEC", "300")
 )
@@ -693,9 +691,7 @@ _PROFILE_RETRY_CAP_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_RETRY_CAP_SEC", "21600")
 )
 if (
-    not math.isfinite(_PROFILE_MAX_AGE_SEC)
-    or _PROFILE_MAX_AGE_SEC <= 0
-    or not math.isfinite(_PROFILE_RETRY_BASE_SEC)
+    not math.isfinite(_PROFILE_RETRY_BASE_SEC)
     or _PROFILE_RETRY_BASE_SEC <= 0
     or not math.isfinite(_PROFILE_RETRY_CAP_SEC)
     or _PROFILE_RETRY_CAP_SEC < _PROFILE_RETRY_BASE_SEC
@@ -11659,56 +11655,10 @@ def _memory_write_result_counts(
     return applied_count, skipped_count, failed_count, first_error
 
 
-def _profile_generated_timestamp(value: Any) -> float:
-    raw = str(value or "").strip()
-    if not raw:
-        return 0.0
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
-
-
 def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
-    """Content-free post-turn profile scheduling decision."""
-
-    if not _PROFILE_ENABLED:
-        return False
-    current_time = float(time.time() if now is None else now)
-    raw = db.get_blob_strict(str(user_id), v2_profile_store.PROFILE_BLOB_KIND)
-    if raw is None:
-        return True
-    document = v2_profile_store.validate_profile_document(raw)
-    if document.get("disabled") is True:
-        return False
-    state = str(document.get("state") or "")
-    source = document.get("source") or {}
-    if state == "empty":
-        card_count, max_updated_at = db.memory_profile_source_stats(user_id)
-        return (
-            int(source.get("card_count") or 0) != card_count
-            or str(source.get("max_updated_at") or "") != max_updated_at
-        )
-    if state != "ok":
-        attempt = document.get("last_attempt") or {}
-        disposition = str(attempt.get("retry_disposition") or "")
-        if disposition in v2_profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS:
-            return False
-        if disposition == "source_change":
-            card_count, max_updated_at = db.memory_profile_source_stats(user_id)
-            return (
-                int(source.get("card_count") or 0) != card_count
-                or str(source.get("max_updated_at") or "") != max_updated_at
-            )
-        retry_not_before = float(attempt.get("retry_not_before") or 0)
-        return current_time >= retry_not_before
-    generated_at = _profile_generated_timestamp(source.get("generated_at"))
-    if generated_at <= 0 or current_time - generated_at < _PROFILE_MAX_AGE_SEC:
-        return False
-    card_count, max_updated_at = db.memory_profile_source_stats(user_id)
-    return (
-        int(source.get("card_count") or 0) != card_count
-        or str(source.get("max_updated_at") or "") != max_updated_at
+    """Bind the worker's feature gate to the content-free refresh policy."""
+    return v2_profile_refresh.refresh_due(
+        user_id, enabled=_PROFILE_ENABLED, now=now,
     )
 
 

@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory ranking and V2 profile freshness no longer depend on inactive signals.**
+  Read-side scores ignore legacy `is_open_thread` metadata, including on stored
+  cards. With profiles enabled, a changed Garden row-count or maximum-update
+  witness schedules background profile refresh at the next existing post-turn
+  check without waiting three days. Unchanged sources, disabled profiles and
+  failed-profile retry gates keep their protections. The old
+  `FEEDLING_V2_PROFILE_MAX_AGE_SEC` setting is no longer read. Refresh remains
+  asynchronous and can increase provider work and prompt-cache invalidations;
+  this does not promise an updated profile in the current reply.
+
 - **Foreground CLI timeouts get one side-effect-contained reply recovery.** An
   ordinary text Chat turn that reaches the resident subprocess timeout can make
   one fresh reply-only attempt on supported Codex, Claude, or Pi commands. The
