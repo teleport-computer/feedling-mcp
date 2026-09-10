@@ -1386,6 +1386,9 @@ def test_provider_model_call_trace_cap_keeps_head_and_latest_round():
         range(1, 16)
     )
     assert [event["detail"]["round"] for event in model_events[-2:]] == [18, 18]
+    assert {event["detail"]["driver"] for event in model_events} == {"v2"}
+    assert {event["detail"]["provider"] for event in model_events} == {"anthropic"}
+    assert {event["detail"]["model"] for event in model_events} == {"claude-test"}
     summary = next(
         event for event in captured if event["type"] == "mcp.roundtrip.provider"
     )

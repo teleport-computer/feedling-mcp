@@ -11372,6 +11372,33 @@ def _emit_cli_model_call_terminal(
             except Exception as exc:  # noqa: BLE001 — trace must stay fail-open
                 log.debug("model terminal metrics parse failed: %s", exc)
 
+        # T559: the durable trace writer projects these content-free route
+        # identifiers from detail into its indexed provider/model/lane columns.
+        # Reuse the configured runtime identity (operator env declarations win;
+        # pi can otherwise resolve aliases through models.json).  This is the
+        # declared route, not a claim about the upstream that ultimately served
+        # the request.  Never infer it from stdout/stderr, which may be empty on
+        # the failures this trace exists to diagnose.  Missing values stay absent
+        # so persistence has one missing representation (NULL), rather than a mix
+        # of NULL and empty strings.
+        route_detail = {
+            key: value
+            for key, value in (
+                (
+                    "provider",
+                    _safe_runtime_header(
+                        AGENT_RUNTIME_METADATA.get("provider"), limit=48
+                    ),
+                ),
+                (
+                    "model",
+                    _safe_runtime_header(AGENT_RUNTIME_METADATA.get("model"), limit=96),
+                ),
+                ("lane", _safe_runtime_header(context.get("lane"), limit=48)),
+            )
+            if value
+        }
+
         trace_turn = AgentTurn()
         if succeeded:
             try:
@@ -11442,6 +11469,7 @@ def _emit_cli_model_call_terminal(
             ),
             explain=explain,
             detail={
+                **route_detail,
                 **{
                     key: metrics.get(key)
                     for key in (
