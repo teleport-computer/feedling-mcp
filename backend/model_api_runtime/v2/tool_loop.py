@@ -4,6 +4,7 @@ all side effects injected. One loop for every model — no is_official branch.""
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 import inspect
 import json
 import posixpath
@@ -1148,10 +1149,54 @@ class FinalReplyCorrectionRejected:
     """The one rewrite was usable text but failed the caller's acceptance gate."""
 
 
+def _transport_retry_count_from_usage(usage: object) -> int | None:
+    """This call's transport retries beyond the initial request (0 on a one-shot
+    success), from the normalized usage's ``provider_retry_count`` — which the
+    provider seam sets for EVERY provider and which counts hidden SDK retries as
+    well as our transient retries. ``None`` when the provider did not report it
+    (never invent 0). Read at the call boundary, not from the turn aggregate."""
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("provider_retry_count")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        # A malformed float must not be coerced (1.5 -> 1, NaN -> ValueError) or
+        # fake a one-shot 0; only a finite non-negative whole number is a count.
+        if math.isfinite(value) and value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    return None
+
+
+def _transport_retry_count_from_error(exc: BaseException) -> int | None:
+    """Transport retries beyond the initial request for a FAILED call, derived
+    from the exception's own attempt envelope (``len(attempts) - 1``). ``None``
+    when the envelope is absent — never reuse accumulated turn state or invent 0."""
+    envelope = provider_client.runtime_provider_attempt_trace(exc)
+    if not isinstance(envelope, dict):
+        return None
+    attempts = envelope.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    # The envelope interleaves http_attempt and outer_attempt records; only the
+    # HTTP attempts are real transport requests, so retries-beyond-initial is the
+    # HTTP-attempt count minus one (a single request => 0 retries).
+    http_attempts = sum(
+        1 for entry in attempts
+        if isinstance(entry, dict) and entry.get("kind") == "http_attempt"
+    )
+    if http_attempts <= 0:
+        return None
+    return http_attempts - 1
+
+
 def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
     """Return content-free diagnostics for a provider success with no output."""
     raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
-    return {
+    shape: dict[str, object] = {
         "stop_reason": (
             raw_stop_reason
             if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
@@ -1162,6 +1207,13 @@ def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
         "tool_call_count": len(pr.tool_calls),
         "completion_tokens": pr.usage.completion_tokens,
     }
+    # Provider-owned content-free root-cause diagnostics (currently Gemini:
+    # finishReason / safety categories / thought-only shape / token split),
+    # projected at the provider seam so this never reaches back through content.
+    diagnostics = pr.raw.get("gemini_diagnostics")
+    if isinstance(diagnostics, dict):
+        shape["provider_diagnostics"] = dict(diagnostics)
+    return shape
 
 
 def _with_system_suffix(messages: list, suffix: str) -> list:
@@ -2797,6 +2849,7 @@ async def run_tool_loop(
                         getattr(provider_config, "model", "") or ""
                     ),
                     **provider_error_facts,
+                    "transport_retry_count": _transport_retry_count_from_error(exc),
                     "dur_ms": provider_call_dur_ms,
                 },
             )
@@ -2915,24 +2968,10 @@ async def run_tool_loop(
                 continue
             raise provider_error
         raw_finish_reason = str(result.get("stop_reason") or "").strip().lower()
-        await _provider_call_event(
-            "done",
-            {
-                "round": attempts,
-                "provider": provider_name,
-                "model": str(getattr(provider_config, "model", "") or ""),
-                "finish_reason": (
-                    raw_finish_reason
-                    if raw_finish_reason in _CONTENT_FREE_STOP_REASONS
-                    else ("other" if raw_finish_reason else "unspecified")
-                ),
-                "dur_ms": (
-                    time.monotonic() - provider_call_started_at
-                ) * 1000,
-            },
-        )
-        _progress("provider_complete")
-        add_usage(result.get("usage"))
+        # Determine empty-ness BEFORE emitting the done event, so the provider
+        # call event itself records whether this call produced usable output and
+        # (when empty) carries the content-free root-cause diagnostics. The same
+        # value still gates the success callback below.
         upstream_response_envelope = protocol_leak.is_upstream_response_envelope(
             result.get("reply")
         )
@@ -2944,6 +2983,31 @@ async def run_tool_loop(
             or result.get("tool_calls")
             or result.get("media")
         )
+        done_detail: dict[str, object] = {
+            "round": attempts,
+            "provider": provider_name,
+            "model": str(getattr(provider_config, "model", "") or ""),
+            "finish_reason": (
+                raw_finish_reason
+                if raw_finish_reason in _CONTENT_FREE_STOP_REASONS
+                else ("other" if raw_finish_reason else "unspecified")
+            ),
+            "transport_retry_count": _transport_retry_count_from_usage(
+                result.get("usage")
+            ),
+            "empty": not raw_has_usable_output,
+            "dur_ms": (
+                time.monotonic() - provider_call_started_at
+            ) * 1000,
+        }
+        # The empty marker + transport_retry_count make the done event say
+        # "this call produced no usable output, after N transport retries"; the
+        # full content-free root-cause diagnostics ride the dedicated
+        # ``provider.empty_response`` event (which on_empty_provider_response
+        # emits) to stay under _safe_detail's 20-key cap.
+        await _provider_call_event("done", done_detail)
+        _progress("provider_complete")
+        add_usage(result.get("usage"))
         if (not require_reply or raw_has_usable_output) and on_provider_success is not None:
             try:
                 await on_provider_success()

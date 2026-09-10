@@ -3086,6 +3086,30 @@ class _ProviderRoundtripTrace:
         dur_ms = detail.get("dur_ms")
         if isinstance(dur_ms, (int, float)) and not isinstance(dur_ms, bool):
             safe["dur_ms"] = max(0.0, float(dur_ms))
+        # Transport retries beyond the initial request for THIS provider call
+        # (0 on a one-shot success). Absent when the provider/exception did not
+        # report it — never coerced to 0. This is the plaintext answer to
+        # "did we retry, and how many times" that the encrypted attempt trace
+        # otherwise hides (provider_roundtrips deliberately excludes it).
+        transport_retry_count = detail.get("transport_retry_count")
+        if (
+            isinstance(transport_retry_count, int)
+            and not isinstance(transport_retry_count, bool)
+            and transport_retry_count >= 0
+        ):
+            safe["transport_retry_count"] = transport_retry_count
+        # Whether this provider call produced usable output; when empty, the
+        # closed-set provider diagnostics (finishReason / safety / thought-only /
+        # token split) are flattened to top-level scalars so the done event is
+        # self-explaining without a break-glass decrypt.
+        if isinstance(detail.get("empty"), bool):
+            safe["empty"] = detail["empty"]
+        # NOTE: the full content-free diagnostics deliberately live on the
+        # dedicated ``provider.empty_response`` event (6 base + 13 diagnostics =
+        # 19 keys, under _safe_detail's 20-key cap). Duplicating them here would
+        # push the done event to 22 keys and _safe_detail would SILENTLY drop the
+        # trailing two — so the done event stays lean (empty marker + retry count
+        # + finish_reason) and points to the empty event for the root cause.
         return safe
 
     async def _emit_model_call_event(
@@ -3359,7 +3383,7 @@ def _empty_response_trace_detail(
         else ("other" if raw_stop_reason else "")
     )
     completion_tokens = response_shape.get("completion_tokens")
-    return {
+    detail: dict[str, Any] = {
         "stop_reason": stop_reason,
         "has_visible_text": bool(response_shape.get("has_visible_text")),
         "reasoning_present": bool(response_shape.get("reasoning_present")),
@@ -3372,6 +3396,62 @@ def _empty_response_trace_detail(
             else None
         ),
         "lane": _normalize_provider_trace_lane(lane),
+    }
+    detail.update(_empty_provider_diagnostics_fields(response_shape))
+    return detail
+
+
+def _empty_provider_diagnostics_fields(
+    response_shape: dict[str, Any],
+) -> dict[str, Any]:
+    """Flatten provider-owned empty-response diagnostics into TOP-LEVEL scalars
+    (plus a closed, bounded safety-category list) so ``_safe_detail`` preserves
+    them — a nested dict would be string-collapsed. All values are enums, counts,
+    or booleans; no content. Absent (non-Gemini / no diagnostics) -> no keys.
+    """
+    raw = response_shape.get("provider_diagnostics")
+    if not isinstance(raw, dict):
+        return {}
+
+    def _enum(value: Any) -> str:
+        return str(value or "")
+
+    def _count(value: Any) -> int | None:
+        # Defensive mirror of the provider-seam rule: never fake (1.5 -> 1) or
+        # raise (NaN/Inf) on a malformed count — only a finite non-negative whole
+        # number survives; everything else is None.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if math.isfinite(value) and value.is_integer() and value >= 0:
+                return int(value)
+            return None
+        return None
+
+    categories = raw.get("safety_blocked_categories")
+    categories = [str(c) for c in categories] if isinstance(categories, list) else []
+    # Closed set (<= 5 known categories); cap defensively and report the count so
+    # a future over-long list is visible rather than silently cut.
+    capped = categories[:8]
+
+    return {
+        "provider_finish_reason": _enum(raw.get("finish_reason")),
+        "provider_candidates_count": _count(raw.get("candidates_count")),
+        "provider_only_thought_parts": bool(raw.get("only_thought_parts")),
+        "provider_visible_text_part_count": _count(raw.get("visible_text_part_count")),
+        "provider_thought_part_count": _count(raw.get("thought_part_count")),
+        "provider_safety_blocked": bool(raw.get("safety_blocked")),
+        "provider_safety_blocked_categories": capped,
+        "provider_safety_blocked_category_count": len(categories),
+        "provider_safety_blocked_unknown_count": _count(
+            raw.get("safety_blocked_unknown_count")
+        ),
+        "provider_safety_max_probability": _enum(raw.get("safety_max_probability")),
+        "provider_prompt_token_count": _count(raw.get("prompt_token_count")),
+        "provider_candidates_token_count": _count(raw.get("candidates_token_count")),
+        "provider_thoughts_token_count": _count(raw.get("thoughts_token_count")),
     }
 
 

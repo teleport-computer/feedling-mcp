@@ -55,6 +55,23 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-09-10 — gemini 空回复根因观测 + 传输层重试计数入 trace（T550 A,观测)
+
+**[DONE·观测] 空回复现在带 content-free 根因标量;每次 provider 调用带 transport_retry_count 明文字段。**
+
+背景:T538 查明 gemini-3.6-flash 对 FACT/CONT payload ~27% turn 返 content-empty,但为什么返空未知（trace 不记 finishReason/safety/思考与输出 token）,且 503 重试几次也判不出(provider_roundtrips 刻意 exclude transport retries)。
+
+变更（均 content-free,只加观测,不改回复行为;不做第二次 correction）:
+- A① `provider_client.py` 新增 `_gemini_empty_diagnostics`,在 provider seam 把 finishReason(**闭集 normalize**,未知→other,绝不透传 provider 原文)、safety 类别(闭集)+ blocked/最高 probability、candidates 数、是否**结构上只含 thought parts**(非空 parts 且每个有效 part thought=True,含 signature-only)、prompt/candidates/**thoughts** token 数投影进 normalized result(`gemini_diagnostics`);`tool_loop._empty_response_shape` 提进 shape;`worker._empty_response_trace_detail` 拍平成**顶层** `provider_*` 标量(+ 闭集 bounded 的 safety 类别名单)写入 **`provider.empty_response`** 事件(6 base+13 = 19 键,在 `_safe_detail` 的 20 键上限内)。绝不回读带内容的 `assistant_turn`;non-gemini 不加任何 `provider_*` 键。
+- A② `tool_loop` 在 **provider 调用边界**给 `agent.model.call.done` 事件加精简的 `empty` 标记 + `transport_retry_count`:done 取**本次 result** 的 normalized `provider_retry_count`(retries-beyond-initial,one-shot=0,严格整数——负/非整/NaN→None);`error` 事件取 exception attempt envelope 里 **`kind=http_attempt` 计数 − 1**(不数 outer_attempt);未知一律 None(绝不强写 0),对所有 provider 生效。`worker._safe_model_call_detail` 白名单转发。**done 事件保持精简(不塞全部诊断)**——13 项诊断塞进去会到 22 键、被 `_safe_detail` 静默截断,故根因诊断专走 `provider.empty_response`,done 事件只说「本轮空+重试 N 次」并指向该事件。
+- A③ 新标量放顶层,过 `_safe_detail` 不被拍平(T543 同坑);safety 类别闭集 + 计数,超集不静默截断。
+- 稳健性:`provider_retry_count` 由 **reliable_chat_completion_async 的统一成功出口**保证——`_with_reliable_retry_count` 现对任意 dict result 恒写该字段(inner compatibility 计数 + outer transient retry;one-shot 成功=0),sync/async 两个出口都过它。故那些自身 parse 路径不走 `_with_request_diagnostics` 的 wire——**Gemini** 与**专用 image wire**(openrouter /images、openai_compatible /images/generations)——one-shot 成功也报 transport_retry_count=0(不再缺失/None)。在总出口统一保证、而非逐 wire 补,避免新增 wire 再次静默漏报。empty-diagnostics 的 token `_count` 与 transport 计数一样严格——只收 non-bool、finite、非负整数,1.5/-1/NaN/Inf 一律 None(纯观测不伪造值、不因畸形 usage 把成功解析变异常)。error 事件的 transport_retry_count 由真实 attempt envelope(kind=http_attempt 计数−1)派生,已用真实 run_tool_loop+MockTransport 传输失败端到端钉住(删注入即红)。
+
+测试:`tests/test_t550_empty_diagnostics_and_retry.py` 走全链(raw gemini body → parse → shape → detail → 公开 `_safe_detail`)覆盖空回复四类(safety-block/预算被思考吃光/只含思考块/其他)+ 标量存活 + 未知 safety 类别只计数不命名 + non-gemini 无 `provider_*` 键;A② 覆盖 one-shot=0/重试=N/未知=省略/error-from-envelope/全 provider 镜像。mutation:去掉任一投影字段⇒对应断言转红(已验)。
+
+未做（留后续,不在本变更）:B 根因复现(T538 探针 N≥30 读原始响应按 finishReason/thinking 占比分类空回复成因 + 对最高类候选修法)——待网络窗口;C 明确不做第二次 correction。
+
+
 ## 2026-09-10 — CI 执行面纳入动态发现（T546）
 
 **[DONE] 修正 ci_executed_tests.py 对 `mapfile`+`grep` 动态发现的失明；真未跑 = 0（不是 ~54）。**

@@ -1019,6 +1019,7 @@ jobs:
             tests/test_v2_serve_worker.py \
             tests/test_v2_serve_worker_screen_watch.py \
             tests/test_v2_worker_unit_telemetry.py \
+            tests/test_t550_empty_diagnostics_and_retry.py \
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_p0_pool_safety.py \
