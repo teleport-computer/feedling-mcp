@@ -7377,6 +7377,8 @@ def _pi_stream_shape(raw: str) -> dict:
     update_text_seen = False
     update_text_chars_max = 0
     stop_reasons: list[str] = []
+    stop_length_seen = False
+    stop_max_tokens_seen = False
     parse_error_count = 0
     parse_failed = False
     try:
@@ -7428,6 +7430,10 @@ def _pi_stream_shape(raw: str) -> dict:
                 raw_stop = str(msg.get("stopReason") or obj.get("stopReason") or "").strip().lower()
                 if raw_stop:
                     stop_reason = raw_stop if raw_stop in _PI_STREAM_STOP_REASONS else "other"
+                    # Track truncation independently of the bounded legacy list:
+                    # a late stop reason must not disappear after its eighth item.
+                    stop_length_seen |= stop_reason == "length"
+                    stop_max_tokens_seen |= stop_reason == "max_tokens"
                     if stop_reason not in stop_reasons and len(stop_reasons) < _PI_STREAM_MAX_STOP_REASONS:
                         stop_reasons.append(stop_reason)
             except Exception:  # noqa: BLE001 — one bad event must not hide the rest
@@ -7445,6 +7451,18 @@ def _pi_stream_shape(raw: str) -> dict:
         "stop_reasons": stop_reasons,
         "parse_error_count": parse_error_count,
         "parse_failed": parse_failed,
+        # T543: _safe_detail stringifies nested dict/list values. Keep the old
+        # fields for in-process readers, but expose scalar siblings that survive
+        # persistence. This projection has 16 keys, below the 20-key size cap.
+        # Version identifies coverage, not parse health; partial scans stay flagged.
+        "schema_version": 2,
+        "text_blocks": block_counts["text"],
+        "thinking_blocks": block_counts["thinking"],
+        "tool_blocks": block_counts["toolCall"],
+        "other_blocks": block_counts["other"],
+        "stop_reason_first": stop_reasons[0] if stop_reasons else "",
+        "stop_length_seen": stop_length_seen,
+        "stop_max_tokens_seen": stop_max_tokens_seen,
     }
 
 

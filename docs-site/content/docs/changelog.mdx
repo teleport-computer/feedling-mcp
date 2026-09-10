@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Pi stream diagnostics survive trace serialization.** Model-call traces add
+  versioned scalar block counts and stop-reason indicators without storing reply,
+  reasoning, or tool-argument content in those fields. Operators can distinguish
+  thinking-only, tool-call-only, update-only text, and length-stop candidates
+  after persistence. Partial parses remain flagged; historical string-shaped
+  fields are not backfilled, and missing new fields mean unmeasured coverage.
+
 - **Resident agents again receive captions on plaintext-tier images and files.**
   Plaintext binary history now folds the attachment's plaintext caption into
   the same `content` field used by encrypted history. Plaintext text messages,

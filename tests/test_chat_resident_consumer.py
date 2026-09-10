@@ -14706,7 +14706,7 @@ def test_pi_turn_metrics_carries_stream_shape_into_terminal_detail():
 
 def _terminal_detail(monkeypatch, *, raw, succeeded, cmd=("pi", "--mode", "json")):
     """Drive the real terminal emitter and capture the detail it hands to
-    _emit_debug_trace — the same dict that lands in trace_events."""
+    _emit_debug_trace, BEFORE the durable trace size limiter."""
     captured = []
 
     def fake_emit(subsystem, type_, **kwargs):
@@ -14768,6 +14768,105 @@ def test_terminal_error_detail_flags_truncated_pi_stream(monkeypatch):
     shape = event["detail"]["pi_stream"]
     assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
     assert _SECRET_TEXT not in json.dumps(event["detail"], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("succeeded", [False, True])
+@pytest.mark.parametrize("kind", ["thinking", "tool", "update", "length"])
+def test_durable_pi_shape_four_candidates(monkeypatch, kind, succeeded):
+    """T543: assert the shape AFTER the real persistence limiter, not just
+    the in-process emitter that the original T521 tests observed."""
+    import debug_trace
+
+    events = {
+        "thinking": [_pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}])],
+        "tool": [_pi_assistant_end([{"type": "toolCall", "name": "memory_search",
+                                      "args": {"q": _SECRET_TEXT}}])],
+        "update": [{"type": "message_update", "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+                   _pi_assistant_end([])],
+        "length": [_pi_assistant_end([], stop_reason="length")],
+    }[kind]
+    event = _terminal_detail(monkeypatch, raw=_pi_events(*events), succeeded=succeeded)
+    # Also survive a second application (forwarding/re-ingestion).
+    durable = debug_trace._safe_detail(debug_trace._safe_detail(event["detail"]))
+    shape = durable["pi_stream"]
+    assert shape["schema_version"] == 2
+    assert shape["parse_failed"] is False and shape["parse_error_count"] == 0
+    assert shape["text_blocks"] == 0 and shape["other_blocks"] == 0
+    assert shape["thinking_blocks"] == int(kind == "thinking")
+    assert shape["tool_blocks"] == int(kind == "tool")
+    assert shape["update_text_seen"] == (kind == "update")
+    assert shape["stop_length_seen"] == (kind == "length")
+    assert shape["stop_max_tokens_seen"] is False
+    assert shape["stop_reason_first"] == ("length" if kind == "length" else "")
+    assert shape["text_chars_total"] == 0
+    assert set(shape) == set(event["detail"]["pi_stream"]), "size cap dropped a field"
+    assert len(shape) <= debug_trace._DETAIL_MAX_KEYS
+    dumped = json.dumps(durable, ensure_ascii=False)
+    assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
+    # The old projection really is unusable as nested JSON; no backfill or
+    # reinterpretation of old strings as new counters is part of this fix.
+    legacy = {k: v for k, v in event["detail"]["pi_stream"].items()
+              if k in {"assistant_message_ends", "blocks", "text_chars_total",
+                       "update_text_seen", "update_text_chars_max", "stop_reasons",
+                       "parse_error_count", "parse_failed"}}
+    old_shape = debug_trace._safe_detail({"pi_stream": legacy})["pi_stream"]
+    assert isinstance(old_shape["blocks"], str)
+    assert isinstance(old_shape["stop_reasons"], str)
+    assert "thinking_blocks" not in old_shape and "tool_blocks" not in old_shape
+
+
+def test_durable_pi_shape_stop_flags_survive_reason_list_cap(monkeypatch):
+    import debug_trace
+
+    early = sorted(crc._PI_STREAM_STOP_REASONS - {"length", "max_tokens"})
+    assert len(early) >= crc._PI_STREAM_MAX_STOP_REASONS
+    raw = _pi_events(*[_pi_assistant_end([], stop_reason=reason)
+                       for reason in early + ["length", "max_tokens", _SECRET_TEXT]])
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=False)
+    shape = debug_trace._safe_detail(event["detail"])["pi_stream"]
+    assert "length" not in event["detail"]["pi_stream"]["stop_reasons"]
+    assert shape["stop_length_seen"] is True
+    assert shape["stop_max_tokens_seen"] is True
+    assert shape["stop_reason_first"] == early[0]
+    assert _SECRET_TEXT not in json.dumps(shape, ensure_ascii=False)
+
+
+def test_durable_pi_shape_partial_and_unknown_stay_distinguishable(monkeypatch):
+    import debug_trace
+
+    raw = _pi_events(_pi_assistant_end(
+        [{"type": "text", "text": "ok"}, {"type": _SECRET_TEXT}],
+        stop_reason=_SECRET_THOUGHT)) + '\n{"type":'
+    shape = debug_trace._safe_detail(
+        _terminal_detail(monkeypatch, raw=raw, succeeded=False)["detail"])["pi_stream"]
+    assert shape["schema_version"] == 2
+    assert shape["text_blocks"] == 1 and shape["other_blocks"] == 1
+    assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
+    assert shape["stop_reason_first"] == "other"
+    assert shape["stop_length_seen"] is False and shape["stop_max_tokens_seen"] is False
+    assert _SECRET_TEXT not in json.dumps(shape) and _SECRET_THOUGHT not in json.dumps(shape)
+
+
+def test_durable_pi_shape_overlaps_at_trace_enqueue_boundary(monkeypatch):
+    import debug_trace
+
+    event = _terminal_detail(monkeypatch, raw=_pi_events(_pi_assistant_end(
+        [{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length")),
+        succeeded=False)
+    queued = []
+    monkeypatch.setattr(debug_trace, "_enabled_fast", lambda store: True)
+    monkeypatch.setattr(debug_trace, "_enqueue", lambda uid, item: queued.append(item))
+    # Real trace_event performs the size limiting before the DB write queue.
+    debug_trace.trace_event(types.SimpleNamespace(user_id="usr_t543_fixture"),
+                            subsystem="agent", type=event["type"], detail=event["detail"])
+    assert len(queued) == 1
+    shape = queued[0]["detail"]["pi_stream"]
+    assert shape["schema_version"] == 2
+    assert shape["thinking_blocks"] == 1 and shape["tool_blocks"] == 0
+    assert shape["stop_length_seen"] is True  # same stream, not exclusive diagnoses
+    assert shape["parse_failed"] is False
+    assert _SECRET_THOUGHT not in json.dumps(queued, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
