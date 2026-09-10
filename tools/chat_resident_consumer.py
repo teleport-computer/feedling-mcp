@@ -3588,6 +3588,14 @@ def _fetch_plaintext_or_mixed_history(
             return "plaintext_binary"
         if isinstance(row.get("body"), str):
             return "plaintext_text"
+        # With include_image_body=false the backend strips the body itself.
+        # Its persisted-shape contract keeps these cases distinguishable:
+        # plaintext_v1 pointers report body_size_bytes, while sealed pointers
+        # report body_ct_len (chat.service._chat_history_item). Do not broaden
+        # this predicate to a generic body_omitted check or sealed-only pages
+        # would be intercepted before the enclave bulk reader can decrypt them.
+        if row.get("body_omitted") and row.get("body_size_bytes") is not None:
+            return "plaintext_binary_omitted"
         return "invalid"
 
     if not any(isinstance(row, dict) and _shape(row).startswith("plaintext") for row in rows):
@@ -3602,17 +3610,15 @@ def _fetch_plaintext_or_mixed_history(
             message_id = str(row.get("id") or row.get("message_id") or "")
             decrypted = _fetch_message_body_from_enclave(message_id)
             if decrypted is None:
-                out.append({**row, "body_unavailable": True})
+                resolved = {**row, "body_unavailable": True}
             else:
-                out.append({**row, **decrypted})
-            continue
-        if shape == "plaintext_text":
-            out.append({**row, "content": str(row.get("body") or "")})
-            continue
-        if shape == "plaintext_binary":
-            out.append(_hydrate_plaintext_binary_body(row))
-            continue
-        if row.get("body_omitted") and row.get("body_size_bytes") is not None:
+                resolved = {**row, **decrypted}
+        elif shape == "plaintext_text":
+            resolved = {**row, "content": str(row.get("body") or "")}
+        elif shape == "plaintext_binary":
+            hydrated = _hydrate_plaintext_binary_body(row)
+            resolved = hydrated
+        elif shape == "plaintext_binary_omitted":
             message_id = str(row.get("id") or row.get("message_id") or "")
             try:
                 body_resp = _HTTP.get(
@@ -3631,10 +3637,54 @@ def _fetch_plaintext_or_mixed_history(
                     merged = _hydrate_plaintext_binary_body(merged)
                 elif isinstance(merged.get("body"), str):
                     merged["content"] = merged["body"]
-                out.append(merged)
-                continue
-        out.append({**row, "body_unavailable": True})
+                resolved = merged
+            else:
+                resolved = {**row, "body_unavailable": True}
+        else:
+            resolved = {**row, "body_unavailable": True}
+        out.append(_finalize_plaintext_or_mixed_history_row(resolved))
     return True, _filter_since(out, since)
+
+
+def _finalize_plaintext_or_mixed_history_row(row: dict) -> dict:
+    """Give every attachment-history exit one caption-folding contract.
+
+    Backend ``/body`` replies for plaintext attachments return ``body_b64`` and
+    the persisted ``caption_body`` but leave ``content`` empty. Enclave replies
+    already carry the folded content. Fill an absent/empty local value without
+    replacing a non-empty value supplied by the enclave.
+    """
+    if str(row.get("content_type") or "") not in ("image", "file"):
+        return row
+    if row.get("content") not in (None, ""):
+        return row
+    if row.get("caption_body") is None:
+        if row.get("body_b64") is not None:
+            return {**row, "content": ""}
+        return row
+    return {**row, "content": _read_plaintext_attachment_caption(row)}
+
+
+def _read_plaintext_attachment_caption(row: dict) -> str:
+    """Fold a plaintext image/file caption into the consumer content field."""
+    try:
+        caption_envelope = _core_envelope.caption_envelope_from_row(row)
+        if caption_envelope is None:
+            return ""
+        return _core_envelope.read_caption_envelope_text(
+            caption_envelope,
+            lambda projected: _core_envelope.read_plaintext_envelope_body(
+                projected,
+                owner_user_id=str(row.get("owner_user_id") or ""),
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "plaintext attachment caption unavailable [id=%s]: %s",
+            row.get("id") or row.get("message_id") or "",
+            str(exc),
+        )
+        return ""
 
 
 def _hydrate_plaintext_binary_body(row: dict) -> dict:

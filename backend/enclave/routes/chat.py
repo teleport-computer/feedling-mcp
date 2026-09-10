@@ -20,7 +20,7 @@ from memgarden import observability as mg_observability
 from memgarden.scoring import relevance as memory_relevance
 from memory import card_shape
 from memory import recall_metadata
-from core import chat_images
+from core import chat_images, envelope as core_envelope
 from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
@@ -53,23 +53,16 @@ def _attach_chat_metadata(source: dict, target: dict) -> None:
 def _decrypt_caption(m, authorized_user_id, content_sk, errors):
     """Decrypt the optional caption envelope (user text sent alongside an
     image/file). Returns the caption string, or "" when absent/failed."""
-    cap_ct = m.get("caption_body_ct")
-    cap_body = m.get("caption_body")
-    if not cap_ct and cap_body is None:
+    cap_env = core_envelope.caption_envelope_from_row(m)
+    if cap_env is None:
         return ""
-    cap_env = {
-        "id": m.get("caption_id") or m.get("id"),
-        "v": int(m.get("caption_v", m.get("v", 1)) or m.get("v", 1)),
-        "body_ct": cap_ct,
-        "body": cap_body,
-        "nonce": m.get("caption_nonce"),
-        "K_enclave": m.get("caption_K_enclave"),
-        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
-    }
     try:
-        return envelope.read_envelope(
-            cap_env, authorized_user_id, content_sk
-        ).decode("utf-8", errors="replace")
+        return core_envelope.read_caption_envelope_text(
+            cap_env,
+            lambda projected: envelope.read_envelope(
+                projected, authorized_user_id, content_sk
+            ),
+        )
     except Exception as e:
         errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
         return ""

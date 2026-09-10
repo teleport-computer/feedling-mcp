@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident agents again receive captions on plaintext-tier images and files.**
+  Plaintext binary history now folds the attachment's plaintext caption into
+  the same `content` field used by encrypted history. Plaintext text messages,
+  encrypted rows in mixed history, captionless attachments, and separately
+  hydrated attachment bodies keep their existing behavior.
+
 - **Resident clients report unsupported local IPC explicitly.** Python runtimes
   without `AF_UNIX` now log a disabled listener and return `ipc_unsupported`
   for local attachment/redistill commands; normal HTTP text replies are separate.

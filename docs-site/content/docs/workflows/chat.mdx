@@ -632,11 +632,14 @@ stored.
 }
 ```
 
-To send **text alongside an image or file** (a caption), encrypt that text as its
-own envelope and pass it as `caption_envelope` — the same E2E `EncryptedEnvelope`
-shape as the main `envelope`, wrapped to the enclave (`K_enclave`) so it can be
-decrypted into the message's plaintext content. Without it, an image/file message
-carries no accompanying text and the agent sees only the attachment.
+To send **text alongside an image or file** (a caption), pass that text as its
+own `caption_envelope`. For encrypted-tier accounts this is the same E2E
+`EncryptedEnvelope` shape as the main `envelope`, wrapped to the enclave
+(`K_enclave`). For plaintext-tier accounts it uses the corresponding plaintext
+text-envelope shape (`body`). Both read paths fold the caption into the message's
+plaintext `content`, including on mixed-history pages. Without a caption envelope,
+an image/file message carries no accompanying text and the agent sees only the
+attachment.
 
 ```json
 {
