@@ -56,3 +56,29 @@ totals can be lower than the actual number of rejected values.
 Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.
+
+## Pi stream diagnostics
+
+For resident clients using the pi driver, `agent.model.call.done` and
+`agent.model.call.error` traces may include `detail.pi_stream.schema_version=2`.
+The projection adds scalar `text_blocks`, `thinking_blocks`, `tool_blocks`
+(pi `toolCall` blocks), and `other_blocks` counts from assistant `message_end`
+events. It also records `stop_reason_first` (the first nonempty, allowlisted
+reason, unknown reasons mapped to `other`, or an empty string if none),
+`stop_length_seen`, and `stop_max_tokens_seen`. The two booleans scan all parsed
+assistant end events, even after the legacy stop-reason list reaches its cap.
+These fields contain no reply text, reasoning text, tool arguments, or arbitrary
+upstream stop-reason strings.
+
+Interpret these as observations, not mutually exclusive diagnoses. Check
+`parse_failed=false`, `parse_error_count=0`, and field types before classifying
+thinking-only or tool-call-only output. `update_text_seen=true` with
+`text_chars_total=0` is an update-only-text candidate, not proof of its cause.
+A length flag can coexist with another shape. A successful model-call trace is
+not proof that the reply was delivered to the user.
+
+Older traces lack the versioned scalar fields. Their nested `blocks` and
+`stop_reasons` can be truncated strings after size limiting; they are not JSON
+objects/arrays and are not backfilled. Keep those records outside the new-field
+denominator and report coverage separately during rolling upgrades. The shared
+trace limiter and its size bounds are unchanged.

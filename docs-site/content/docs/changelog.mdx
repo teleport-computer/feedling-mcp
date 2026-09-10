@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Pi stream diagnostics survive trace serialization.** Model-call traces add
+  versioned scalar block counts and stop-reason indicators without storing reply,
+  reasoning, or tool-argument content in those fields. Operators can distinguish
+  thinking-only, tool-call-only, update-only text, and length-stop candidates
+  after persistence. Partial parses remain flagged; historical string-shaped
+  fields are not backfilled, and missing new fields mean unmeasured coverage.
+
 - **Resident clients report unsupported local IPC explicitly.** Python runtimes
   without `AF_UNIX` now log a disabled listener and return `ipc_unsupported`
   for local attachment/redistill commands; normal HTTP text replies are separate.
