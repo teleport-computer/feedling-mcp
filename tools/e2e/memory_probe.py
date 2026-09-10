@@ -70,7 +70,8 @@ def _isolation(c: E2EClient):
     a_id = _id_of(c, mk)
     if not a_id:
         return BLOCKED_EVIDENCE, "could not resolve A's card id to test isolation"
-    b = E2EClient.provision(route="model_api")
+    # Same target as the primary account under test (T545), never the import default.
+    b = E2EClient.provision(route="model_api", api_url=c.api_url)
     result, detail = PASS, "B cannot read, fetch, or mutate A's card"
     try:
         # 1) A's id must be absent from B's index

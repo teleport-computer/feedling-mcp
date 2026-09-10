@@ -128,7 +128,8 @@ def _language_isolated(cfg: dict, p: Probe) -> None:
     dedicated fresh account, so the shared account's Chinese history from other
     probes can't contaminate them. Adds two cases to `p`; a teardown failure adds a
     cleanup PRODUCT_FAIL (account hygiene)."""
-    b = E2EClient.provision(route="model_api")
+    # Same target as the primary (T545): cfg carries the resolved api_url.
+    b = E2EClient.provision(route="model_api", api_url=cfg["api_url"])
     try:
         reactive, proactive = _language_checks(b, cfg)
     except Exception as e:  # noqa: BLE001
