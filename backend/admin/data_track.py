@@ -3395,6 +3395,56 @@ def _debug_content_summary(value) -> dict:
     return out
 
 
+def _reply_parse_failure_public_detail(value) -> dict:
+    """Expose T539's explicitly approved bounded CLI failure diagnostic."""
+    if not isinstance(value, dict) or set(value) != {
+        "raw_bytes",
+        "raw_sha256",
+        "exit_code",
+        "driver",
+        "parse_empty_stage",
+        "captured_at",
+        "raw_preview",
+        "local_path",
+    }:
+        return {}
+    raw_bytes = value.get("raw_bytes")
+    exit_code = value.get("exit_code")
+    driver = value.get("driver")
+    stage = value.get("parse_empty_stage")
+    captured_at = value.get("captured_at")
+    preview = value.get("raw_preview")
+    local_path = value.get("local_path")
+    if (
+        isinstance(raw_bytes, bool)
+        or not isinstance(raw_bytes, int)
+        or raw_bytes <= 0
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not isinstance(driver, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", driver) is None
+        or stage not in {
+            "codex_stream",
+            "codex_stream_sanitization",
+            "claude_stream",
+            "claude_stream_sanitization",
+            "pi_stream",
+            "pi_stream_sanitization",
+            "cli_output",
+            "cli_output_sanitization",
+        }
+        or not isinstance(captured_at, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", captured_at) is None
+        or not isinstance(preview, str)
+        or len(preview) > 80
+        or not isinstance(local_path, str)
+        or len(local_path) > 1024
+        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("raw_sha256") or "")) is None
+    ):
+        return {}
+    return dict(value)
+
+
 _EMPTY_RESPONSE_PUBLIC_ENUMS = {
     "stop_reason": frozenset({
         "", "blocklist", "content_filter", "end_turn", "function_call",
@@ -3792,6 +3842,15 @@ def _debug_event_public_json(
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
+    if (
+        ev.get("type") == "agent.reply.parse_failed"
+        and isinstance(raw_detail, dict)
+    ):
+        # Seven explicitly chose diagnosis-first for this one event: expose the
+        # exact first 80 characters and resident-local artifact path, but only
+        # when the producer's whole closed shape validates. Unknown keys or a
+        # widened preview fail closed to an empty detail object.
+        public_detail = _reply_parse_failure_public_detail(raw_detail)
     if (
         ev.get("type") == "provider.empty_response"
         and isinstance(raw_detail, dict)
@@ -10358,6 +10417,7 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.model.call.error": ("🧠", "调用模型 · 失败"),
+    "agent.reply.parse_failed": ("🧩", "回复解析失败 · 本机原文"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "reply.language_follow": ("🌐", "语言跟随"),
