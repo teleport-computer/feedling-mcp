@@ -126,6 +126,36 @@ def read_plaintext_envelope_body(
     return envelope["body"].encode("utf-8")
 
 
+def caption_envelope_from_row(row: dict) -> dict | None:
+    """Project one attachment row's optional caption into envelope shape.
+
+    Keep this projection shared by enclave and local plaintext readers: caption
+    storage deliberately mirrors the main envelope under ``caption_*`` names,
+    and letting each read path rebuild it independently is how plaintext binary
+    history lost its caption while the sealed path kept it.
+    """
+    caption_body_ct = row.get("caption_body_ct")
+    caption_body = row.get("caption_body")
+    if not caption_body_ct and caption_body is None:
+        return None
+    return {
+        "id": row.get("caption_id") or row.get("id"),
+        "v": int(row.get("caption_v", row.get("v", 1)) or row.get("v", 1)),
+        "body_ct": caption_body_ct,
+        "body": caption_body,
+        "nonce": row.get("caption_nonce"),
+        "K_enclave": row.get("caption_K_enclave"),
+        "owner_user_id": (
+            row.get("caption_owner_user_id") or row.get("owner_user_id")
+        ),
+    }
+
+
+def read_caption_envelope_text(caption_envelope: dict, read_body) -> str:
+    """Read and UTF-8 decode a projected caption with the caller's reader."""
+    return read_body(caption_envelope).decode("utf-8", errors="replace")
+
+
 def envelope_content_token(envelope: dict) -> str:
     """Hash the authoritative stored shape and body for CAS/idempotency checks."""
     shape = classify_envelope_shape(envelope)
