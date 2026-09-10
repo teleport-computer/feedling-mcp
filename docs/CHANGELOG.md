@@ -55,6 +55,42 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-09-10 — CI 执行面纳入动态发现（T546）
+
+**[DONE] 修正 ci_executed_tests.py 对 `mapfile`+`grep` 动态发现的失明；真未跑 = 0（不是 ~54）。**
+
+`.github/workflows/ci.yml` 的 resident consumer regression suite 不字面点名测试文件，
+而是运行时发现：`mapfile -t consumer_tests < <(grep -l -E '<predicate>' tests/test_*.py | sort)`，
+再 `python -m pytest "${consumer_tests[@]}"`。`tools/ci_executed_tests.py` 原先只解析
+字面 pytest 参数，看不到 `${var[@]}`，且那条 pytest 位于 `if (( … ))` 守卫之后（通用
+解析器在 `if` 处 forward-stop）——所以 **53 个其实在跑的文件被算成没跑**（这正是 T534/T536
+「~54 个没跑」的来源：静态盲区，不是真没跑）。
+
+变更：
+- `tools/ci_executed_tests.py` 新增独立的精确动态识别器 `dynamic_executed_in_script`
+  （及 `dynamically_executed_test_files`）：**不改**通用 `executed_in_script` 的
+  `if`/forward-stop 语义；只在 `mapfile -t VAR < <(grep -l -E 'PRED' tests/test_*.py [| sort])`
+  绑定、且同一 VAR 被**顶层** `pytest "${VAR[@]}"` 消费时 credit；predicate 用 argv 调
+  `grep`（非 `shell=True`）对仓库 `tests/test_*.py` 求值,与 CI 同工具;min-count 守卫不满足、
+  变量错配、未消费、消费位于 if/case/loop 内、grep 形状不符 —— 一律不 credit（fail closed）。
+  `executed_test_files` = 字面 ∪ 动态。
+- `tests/test_pytest_coverage_ratchet.py` 新增 `test_every_top_level_test_is_executed_or_exempt`
+  （每个 tests/test_*.py 要么在执行面、要么在豁免名单；当前真未跑=0）、
+  `test_disabling_dynamic_discovery_would_strand_the_consumer_suite`（把「关掉动态发现 ⇒ ≈53
+  变未覆盖」钉成常驻事实），以及动态识别器的合成用例（bind+consume=credit、bind未consume=0、
+  consume未bind=0、consume在条件内=0、变量错配=0、低于/满足 min-count 守卫、grep 形状不符=0）。
+  已本地 mutation 验证:禁用动态识别 ⇒ full-coverage 断言精确转红(≈53)。
+
+**遗留(本 PR 不改,列出供后续逐项处理):** 当前有 9 个测试文件既被显式点名、又被
+consumer predicate 动态命中,因而在 CI 里**跑两遍**(轻微浪费,不是覆盖缺口 —— 动态识别器
+上线后两处都计入执行面):`test_card_leak_signals_wired`、`test_card_user_referent`、
+`test_current_state_docs`、`test_dual_runtime_coexistence`、`test_io_cli_auth`、
+`test_perception_prompt_golden`、`test_pre_runtime_preflight`、`test_reply_language`、
+`test_t534_caption_hop_trace`。建议后续**逐项核对各自显式步骤的 env(PYTHONPATH /
+FEEDLING_TEST_PG 等)**再决定是否从显式步骤移除、只保留 consumer suite 跑;不在本 PR 批量删,
+以免不同 env 变体下的覆盖被误减。
+
+
 ## 2026-08-29 — 收敛 `UserStore` 定向刷新接口
 
 **[DONE] 跨 worker 的 frames/blob 定向刷新不再为旧测试适配器绕过 section 状态。**
