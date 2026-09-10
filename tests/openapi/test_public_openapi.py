@@ -129,6 +129,18 @@ def public_schema() -> dict[str, Any]:
     return _build_public_schema(_load_schema())
 
 
+def test_memory_search_bm25_contract_and_explicit_resource_failure(public_schema):
+    schemas = public_schema["components"]["schemas"]
+    query = schemas["MemoryIndexRequest"]["properties"]["query"]
+    assert "BM25" in query["description"] and "jieba 0.42.1" in query["description"]
+    result = schemas["MemoryIndexResponse"]["properties"]
+    assert result["ranking"]["enum"] == ["bm25-jieba-0.42.1-v1", "substring-legacy"]
+    assert "unavailable_count" in result
+    op = public_schema["paths"]["/v1/memory/index"]["post"]
+    assert "413" in op["responses"]
+    assert "memory_search_resource_limit" in op["responses"]["413"]["description"]
+
+
 @pytest.fixture(scope="module")
 def operations(public_schema: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
     return {
@@ -214,8 +226,9 @@ def test_public_operation_and_parameter_inventory(
     # validators; only the two config mutations carry request bodies.
     # The authenticated resident generation exchange adds one prompt-bearing
     # operation.
-    # GET /v1/chat/workspace/body adds one bodyless Canvas live-read operation.
-    assert len(operations) == 177
+    # GET /v1/chat/workspace/body and GET /v1/chat/canvases add two bodyless
+    # Canvas read operations.
+    assert len(operations) == 178
     assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
@@ -421,6 +434,34 @@ def test_chat_memory_and_perception_contracts_are_concrete(
         "$ref": "#/components/schemas/EncryptedEnvelope"
     }
 
+    canvas_index_operation = operations[("get", "/v1/chat/canvases")]
+    assert _parameters(canvas_index_operation, "query") == {}
+    assert canvas_index_operation["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"] == {"$ref": "#/components/schemas/CanvasIndexResponse"}
+    canvas_index = schemas["CanvasIndexResponse"]
+    assert canvas_index["properties"]["canvases"]["maxItems"] == 500
+    assert canvas_index["properties"]["canvases"]["items"] == {
+        "$ref": "#/components/schemas/CanvasIndexEntry"
+    }
+    canvas_entry = schemas["CanvasIndexEntry"]
+    assert set(canvas_entry["required"]) == {
+        "filename",
+        "revision",
+        "mime_type",
+        "created_at",
+        "updated_at",
+        "message_id",
+        "display_title",
+        "display_subtitle",
+    }
+    message_id_types = {
+        item["type"]
+        for item in canvas_entry["properties"]["message_id"]["anyOf"]
+    }
+    assert message_id_types == {"string", "null"}
+    assert "envelope" not in canvas_entry["properties"]
+
     memory_query = _parameters(
         operations[("get", "/v1/memory/list")], "query"
     )
@@ -440,6 +481,10 @@ def test_chat_memory_and_perception_contracts_are_concrete(
 
     memory_index_properties = set(schemas["MemoryIndexRequest"]["properties"])
     memory_fetch_properties = set(schemas["MemoryFetchRequest"]["properties"])
+    assert "query" in memory_index_properties
+    response_fields = schemas["MemoryFetchResponse"]["properties"]
+    assert response_fields["related_items"]["maxItems"] == 6
+    assert set(response_fields["related_status"]["enum"]) == {"ok", "bounded", "unavailable", "not_needed"}
     retired_memory_fields = {
         "include_sensitive",
         "user_explicit_selection",

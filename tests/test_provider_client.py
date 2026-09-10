@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -179,6 +180,28 @@ def test_provider_http_error_keeps_bounded_internal_response_detail(status_code)
     assert str(caught.value) == (
         f"provider_http_{status_code}: {upstream_detail[:240]}"
     )
+
+
+def test_provider_http_error_keeps_bounded_raw_body_out_of_str_and_repr():
+    sentinel = "PRIVATE_PROVIDER_BODY_MUST_NOT_ESCAPE"
+    raw_body = json.dumps({
+        "error": {
+            "message": "Request failed. Please try again later.",
+            "type": "api_error",
+            "debug": sentinel,
+        },
+        "padding": "x" * (pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS + 100),
+    })
+
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(httpx.Response(403, text=raw_body))
+
+    exc = caught.value
+    assert exc.raw_response_body == raw_body[: pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS]
+    assert len(exc.raw_response_body) == pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS
+    assert sentinel in exc.raw_response_body
+    assert sentinel not in str(exc)
+    assert sentinel not in repr(exc)
 
 
 def _fake_client(monkeypatch, response_body: dict) -> list[dict]:
@@ -365,6 +388,184 @@ def test_deepseek_v4_flash_defaults_to_non_thinking(monkeypatch):
     assert result["provider"] == "deepseek"
     assert calls[0]["json"]["model"] == "deepseek-v4-flash"
     assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "wire_model"),
+    [
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek-v4-flash", "deepseek-v4-flash"),
+        ("deepseek-reasoner", "deepseek-v4-flash"),
+    ],
+)
+def test_deepseek_required_tool_choice_disables_thinking_for_that_request(
+    configured_model,
+    wire_model,
+):
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+
+    assert payload["model"] == wire_model
+    assert payload["tool_choice"] == "required"
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        None,
+        "auto",
+        {"type": "function", "function": {"name": "ping"}},
+    ],
+)
+def test_deepseek_non_required_tool_choice_preserves_default_thinking(
+    tool_choice,
+):
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice=tool_choice,
+    )
+
+    assert "thinking" not in payload
+    if tool_choice is None:
+        assert "tool_choice" not in payload
+    else:
+        assert payload["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "expected_thinking"),
+    [
+        ("deepseek-v4-flash", {"type": "disabled"}),
+        ("deepseek-reasoner", {"type": "enabled"}),
+    ],
+)
+def test_deepseek_auto_choice_preserves_explicit_model_thinking_mode(
+    configured_model,
+    expected_thinking,
+):
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="auto",
+    )
+
+    assert payload["tool_choice"] == "auto"
+    assert payload["thinking"] == expected_thinking
+
+
+def test_deepseek_required_choice_without_tools_never_reaches_the_wire():
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "No tools are offered."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=None,
+        tool_choice="required",
+    )
+
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "openai_compatible"])
+def test_non_deepseek_required_tool_choice_never_injects_thinking(provider):
+    payload = pc._build_openai_compat_payload(
+        provider=provider,
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+
+    assert payload["tool_choice"] == "required"
+    assert "thinking" not in payload
+
+
+def test_deepseek_host_does_not_override_openai_compatible_adapter(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(200, {
+                "id": "chatcmpl-relay-test",
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call-ping",
+                            "type": "function",
+                            "function": {"name": "ping", "arguments": "{}"},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            })
+
+    monkeypatch.setattr(pc, "_shared_async_client", FakeAsyncClient())
+
+    asyncio.run(
+        pc.chat_completion_async(
+            pc.ProviderConfig(
+                "openai_compatible",
+                "deepseek-v4-flash-vision-exp",
+                "sk-relay-test",
+                base_url="https://api.deepseek.com",
+            ),
+            [{"role": "user", "content": "Call ping."}],
+            tools=[ToolSpec(
+                "ping", "Ping.", {"type": "object", "properties": {}}
+            )],
+            tool_choice="required",
+        ),
+    )
+
+    assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
+    assert calls[0]["json"]["tool_choice"] == "required"
+    assert "thinking" not in calls[0]["json"]
 
 
 def test_openrouter_legacy_deepseek_model_maps_to_v4_flash(monkeypatch):
@@ -1650,7 +1851,16 @@ def test_generate_image_openai_mainline_uses_hosted_image_tool(monkeypatch):
     assert result["media"][0]["data_base64"] == "aW1hZ2U="
 
 
-def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("deepseek", "deepseek-v4-flash"),
+        ("gemini", "gemini-2.5-flash"),
+    ),
+)
+def test_generate_image_without_name_marker_fails_before_provider_request(
+    monkeypatch, provider, model,
+):
     import asyncio
 
     class ExplodingAsyncClient:
@@ -1664,10 +1874,158 @@ def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
     with pytest.raises(pc.ProviderError, match="image_generation_model_unsupported"):
         asyncio.run(
             pc.generate_image_async(
-                pc.ProviderConfig("deepseek", "deepseek-v4-flash", "sk-test"),
+                pc.ProviderConfig(provider, model, "sk-test"),
                 "draw a moonlit lake",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("deepseek", "qwen-image-3.0"),
+        ("gemini", "qwen-image-3.0"),
+    ),
+)
+def test_ordinary_chat_keeps_provider_family_image_gate(
+    monkeypatch, provider, model,
+):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError):
+        asyncio.run(
+            pc.chat_completion_async(
+                pc.ProviderConfig(provider, model, "sk-test"),
+                [{"role": "user", "content": "hello"}],
+                allow_image_output=True,
+            )
+        )
+
+    assert len(calls) == 1
+    if provider == "gemini":
+        assert "responseModalities" not in calls[0]["json"]["generationConfig"]
+    else:
+        assert "modalities" not in calls[0]["json"]
+
+
+def test_ordinary_chat_on_relay_keeps_unmarked_model_off_the_image_wire(monkeypatch):
+    """T535 opened the dedicated image endpoint for relay PROBES regardless of
+    the model id. This locks the other side: a normal chat turn on the same
+    relay (no probe) with an unmarked model must NOT be diverted onto the image
+    wire — it stays on /chat/completions with no image modalities, so an
+    ordinary chat model is never billed an image request on a hunch."""
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError):
+        asyncio.run(
+            pc.chat_completion_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "some-text-only-model", "sk-relay", _RELAY_BASE
+                ),
+                [{"role": "user", "content": "hello"}],
+                allow_image_output=True,
+                # image_generation_probe defaults to False: this is a live chat
+                # turn, not a setup probe.
+            )
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/chat/completions")
+    assert "/images/generations" not in calls[0]["url"]
+    assert "modalities" not in calls[0]["json"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "url_marker"),
+    (
+        ("deepseek", "qwen-image-3.0", "/chat/completions"),
+        ("gemini", "qwen-image-3.0", ":generateContent"),
+    ),
+)
+def test_named_image_models_reach_http_across_provider_families(
+    monkeypatch, provider, model, url_marker,
+):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(provider, model, "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+    assert len(calls) == 1
+    assert url_marker in calls[0]["url"]
+    if provider == "gemini":
+        assert calls[0]["json"]["generationConfig"]["responseModalities"] == [
+            "TEXT",
+            "IMAGE",
+        ]
+    else:
+        assert calls[0]["json"]["modalities"] == ["text", "image"]
+    assert raised.value.status_code == 401
+
+
+def test_newly_admitted_named_model_still_requires_nonempty_media(monkeypatch):
+    import asyncio
+
+    calls: list[str] = []
+
+    class TextOnlyAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append(url)
+            return FakeResponse(
+                200,
+                {"choices": [{"message": {"content": "I cannot draw that."}}]},
+            )
+
+    monkeypatch.setattr(pc, "_shared_async_client", TextOnlyAsyncClient())
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig("deepseek", "qwen-image-3.0", "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+    assert len(calls) == 1
 
 
 def test_blocking_image_generation_isolates_each_event_loop(monkeypatch):
@@ -1784,6 +2142,58 @@ def test_relay_image_uses_dedicated_endpoint_first(monkeypatch):
 
     assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
     assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_relay_probe_reaches_dedicated_endpoint_for_unmarked_image_model(monkeypatch):
+    """T535: an explicit setup probe declares "this is my image model", so the
+    dedicated /images/generations endpoint is tried for a relay model whose id
+    carries none of the name markers. ``nai-diffusion-4-5-full`` (NovelAI on a
+    relay) used to be reported "can't generate images" before any request left
+    the box, because the probe silently fell through to the chat wire."""
+    import asyncio
+
+    assert not pc._model_name_has_image_output("nai-diffusion-4-5-full")
+
+    def handler(url, payload):
+        assert url.endswith("/images/generations"), url
+        return FakeResponse(200, {"data": [{"b64_json": _TINY_PNG_B64}]})
+
+    calls = _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "nai-diffusion-4-5-full", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
+    assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_relay_probe_unmarked_model_still_rejected_when_endpoint_denies(monkeypatch):
+    """Opening the wire for unmarked relay models cannot pass a non-image model:
+    a relay that genuinely does not serve images answers the dedicated endpoint
+    with a 4xx that carries no fall-back shape, so the probe still fails."""
+    import asyncio
+
+    def handler(url, payload):
+        return FakeResponse(404, {"error": {"message": "model not found"}})
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "some-text-only-model", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+    assert raised.value.status_code == 404
 
 
 def test_relay_image_falls_back_to_chat_when_dedicated_endpoint_rejects(monkeypatch):

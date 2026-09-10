@@ -179,3 +179,64 @@ def test_a_signal_that_only_ever_arrives_absent_is_named_too():
     cov = report._coverage(_Conn(), "u")
     assert cov["signals_never_observed"] == ["health_sleep"]
     assert "health_sleep" not in cov["signals_never_seen"], "它有行，不属于'从没见过'"
+
+
+def test_screen_change_needs_a_phash_that_no_client_currently_sends():
+    """screen_change 零数据的根因，钉在这里免得下一个人当成"接线没接好"。
+
+    产出条件是 `phash 存在 且 broadcast_state ∈ {on, broadcasting}`，而 iOS
+    的 device event 只有 unlock_after_absence（带 state 不带 phash）和
+    app_presence。条件的前一半从来不可能满足 —— 缺的是**产出方**。
+
+    这条测试不主张"应该这样"，它只是把「给了 state 但没有 phash 就不产出」
+    这个事实钉住：哪天客户端开始发 phash 了，它自然还是绿的。
+    """
+    from perception.perceptkit_adapter import events
+    from datetime import datetime, timezone
+    env = events.device_event_envelope(
+        {"type": "unlock_after_absence",
+         "payload": {"wake_trigger": "unlock_after_absence",
+                     "broadcast_state": "on", "idle_sec": 900}},
+        occurred_at=datetime(2026, 8, 27, 10, tzinfo=timezone.utc))
+    signals = {o["signal"] for o in (env or {}).get("observations", [])}
+    assert "screen_change" not in signals, \
+        "没有 phash 就不该产出 screen_change —— 产出了说明它在编"
+
+
+# ---------------------------------------------------------------------------
+# presence_recovery 的证据（外部复核 §3.2）
+#
+# 这条防的是**一句编出来的话**：app 回到前台只说明 app 回到了前台，
+# 手机可能一直没锁过。没有证据这一格，下游只有"回来了"可说，而实际发生过的
+# 是有人把它讲成了"用户刚刚解锁了手机"。
+# ---------------------------------------------------------------------------
+
+def _presence(payload):
+    from datetime import datetime, timezone
+    from perception.perceptkit_adapter import events
+    env = events.device_event_envelope(
+        {"type": "unlock_after_absence", "payload": payload},
+        occurred_at=datetime(2026, 8, 27, 10, tzinfo=timezone.utc))
+    return [o["value"] for o in env["observations"]
+            if o["signal"] == "presence_recovery"][0]
+
+
+def test_the_evidence_the_client_reported_is_carried_through():
+    v = _presence({"wake_trigger": "unlock_after_absence",
+                   "presence_evidence": "app_entered_foreground"})
+    assert v["evidence"] == "app_entered_foreground"
+
+
+def test_a_client_that_says_nothing_gets_unknown_not_a_guess():
+    """事件类型叫 unlock_after_absence 是历史名字，**不是证据**。
+    从名字反推出"解锁"就是拿命名当事实。"""
+    v = _presence({"wake_trigger": "unlock_after_absence"})
+    assert v["evidence"] == "unknown"
+
+
+def test_an_unrecognised_evidence_is_never_upgraded_to_a_stronger_one():
+    """客户端说 `user_unlocked_phone`，我们也不能认 —— 三种已知证据没有
+    一种能证明解锁，凭一个没见过的字符串就更不能。宁可说"不知道凭什么"。"""
+    v = _presence({"wake_trigger": "unlock_after_absence",
+                   "evidence": "user_unlocked_phone"})
+    assert v["evidence"] == "unknown"

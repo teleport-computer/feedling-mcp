@@ -23,7 +23,7 @@ import pathlib
 import pytest
 
 from memory.capture_prompt_v1 import build_capture_prompt as build_via_shell
-from memgarden.policies import CURATED_ARCHIVE, HISTORY_IMPORT
+from memgarden.policies import CONVERSATION_CAPTURE, CURATED_ARCHIVE, HISTORY_IMPORT
 from memgarden.prompts.capture import build_capture_prompt as build_via_kernel
 
 _FIXTURE = (
@@ -230,24 +230,41 @@ def _kernel_args() -> dict:
 
 
 @pytest.mark.parametrize("policy", [HISTORY_IMPORT, CURATED_ARCHIVE])
-def test_other_policies_are_rejected_until_template_is_policy_aware(policy):
-    """其余两档必须**明确拒绝**，不能只换 rubric 就放行。
+def test_other_policies_now_render_instead_of_being_rejected(policy):
+    """其余两档现在真的能用了（memgarden 0.18.0）。
 
-    这个模板的其余部分还写死着「并入（优先）」、输出 schema 里没有 occurred_at、
-    也没有 tags→threads 的指令。只替换 rubric 会产出自相矛盾的 prompt：
-    一边说「宁多勿漏」，一边说「并入优先」且无处放日期。
-    （codex code_review 2026-08-14 指出。）
+    这条以前断言它们抛 ``NotImplementedError`` —— 当时模板写死着「并入优先」、
+    输出 schema 里没有 occurred_at、也没有 tags→threads，只换 rubric 会产出
+    自相矛盾的 prompt。那条测试自己写着「届时会失败，那是提醒信号不是回归」。
 
-    完整策略化和 genesis 接线一起做（批 7）。这条测试届时会失败 ——
-    **那是提醒信号，不是回归**：改的时候要连同各档位的 golden 一起补上。
+    信号到了：模板已经按 ``CapturePolicy`` 的标志位渲染开场白、动作偏好、
+    日期字段、tags 播种和张数上限。所以这里改成验**渲染结果符合该档的语义**。
     """
-    with pytest.raises(NotImplementedError) as excinfo:
-        build_via_kernel(**_kernel_args(), policy=policy)
-    assert policy.name in str(excinfo.value)
+    prompt = build_via_kernel(**_kernel_args(), policy=policy)
+    assert prompt.strip()
+    # keep_dates 的档必须有地方放日期，否则模型只能把它塞进正文
+    assert ("occurred_at" in prompt) is policy.keep_dates
+    # 不设上限的档要**明说**，否则模型会自己保守
+    assert ("no cap" in prompt) is (policy.max_cards is None)
+    # 宁多勿漏的档，add 要排在前面并标 preferred
+    assert ("add (preferred)" in prompt) is (not policy.prefer_merge)
+
+
+def test_the_default_ruler_is_unchanged_by_policy_support():
+    """🔴 io 走的是默认档，它的产出必须**逐字未变**。
+
+    这是这一组测试真正要守的东西：库支持了新档位，不能把线上正在跑的那条路
+    带偏。默认档和显式传 conversation_capture 也必须完全一致。
+    """
+    default = build_via_kernel(**_kernel_args())
+    explicit = build_via_kernel(**_kernel_args(), policy=CONVERSATION_CAPTURE)
+    assert default == explicit
 
 
 @pytest.mark.parametrize("policy", ["curated_archive", "history_import"])
-def test_rejection_is_the_same_whether_passed_by_name_or_object(policy):
+def test_passing_by_name_and_by_object_agree(policy):
     """按名字传和按对象传走同一条路径。"""
-    with pytest.raises(NotImplementedError):
-        build_via_kernel(**_kernel_args(), policy=policy)
+    from memgarden.policies import get_policy
+
+    assert (build_via_kernel(**_kernel_args(), policy=policy)
+            == build_via_kernel(**_kernel_args(), policy=get_policy(policy)))

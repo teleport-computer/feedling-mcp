@@ -1,4 +1,5 @@
 """Unit tests for the Dream prompt + parser (A-full tail-2 / PR D, no DB)."""
+import json
 import sys
 from pathlib import Path
 
@@ -36,6 +37,10 @@ def test_prompt_renders_with_context_and_escaped_json():
     assert "everything you remember about this person" in p
     assert "You are not in a conversation right now" in p
     assert "saved to ask this person" in p
+    assert "For old cards without retrieval_cues" in p
+    assert "retrieval_cues are only navigation hints, not evidence" in p
+    assert "Reassess each proposed result with importance_level 1-5" in p
+    assert '"retrieval_cues": [' in p and '"importance_level": 3' in p
 
 
 def test_prompt_falls_back_to_neutral_defaults():
@@ -105,6 +110,32 @@ def test_parse_normal_consolidation():
     assert c["rationale"] == "同一加班事件的连续记录"
     assert c["result"]["summary"] == "合并卡" and c["result"]["importance"] == 0.7
     assert qs == ["要不要问 TA X"]
+
+
+def test_parse_preserves_retrieval_cues_and_maps_all_importance_levels():
+    for level in range(1, 6):
+        raw = json.dumps({
+            "consolidations": [{
+                "op": "thicken",
+                "card_ids": ["card-1"],
+                "rationale": "补齐已有卡的检索线索",
+                "result": {
+                    "summary": "取件提醒",
+                    "content": "下班后记得去驿站取件。",
+                    "retrieval_cues": ["驿站", "什么时候取件", "驿站"],
+                    "importance_level": level,
+                    "importance": 0.01,
+                },
+            }],
+            "questions_to_ask": [],
+        }, ensure_ascii=False)
+
+        consolidations, _questions, err = parse_dream_consolidations(raw)
+
+        assert err is None
+        result = consolidations[0]["result"]
+        assert result["retrieval_cues"] == ["驿站", "什么时候取件"]
+        assert result["importance"] == level / 5.0
 
 
 def test_parse_ignores_fake_json_inside_thinking():

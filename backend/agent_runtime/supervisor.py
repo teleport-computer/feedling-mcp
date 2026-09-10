@@ -1122,18 +1122,33 @@ def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url:
     return [r for r in results if r is not None]
 
 
-def _post_verify_loop(api_url: str, headers: dict) -> bool:
+def _post_verify_loop(api_url: str, headers: dict) -> dict:
     """POST /v1/chat/verify_loop — a synthetic ping the consumer answers, which
     flips the user's ``chat_loop_verified`` and opens the bootstrap gate. Returns
-    whether the verify passed (an agent reply landed)."""
+    ``{"passing": bool, "already_verified": bool}``: ``already_verified`` means
+    the server short-circuited because the gate was already open — no ping was
+    sent and no agent reply landed, so it must not be read as a fresh pass."""
     try:
+        # only_if_unverified: this caller only exists to open the bootstrap gate
+        # (see the host-all tick). ``autoverify_state`` lives in process memory,
+        # so every runner restart would otherwise re-probe EVERY hosted resident
+        # with a real model call on their own key (prod 2026-09-04 / 09-06:
+        # 226 pings, 140 failures, within 15 minutes of each deploy). The server
+        # answers passing=True without a ping when it already knows the user
+        # is verified.
         resp = _HTTP.post(f"{api_url.rstrip('/')}/v1/chat/verify_loop",
-                          headers=headers, json={"timeout_sec": 30}, timeout=40)
+                          headers=headers,
+                          json={"timeout_sec": 30, "only_if_unverified": True},
+                          timeout=40)
         resp.raise_for_status()
-        return bool(resp.json().get("passing"))
+        body = resp.json() or {}
+        return {
+            "passing": bool(body.get("passing")),
+            "already_verified": body.get("already_verified") is True,
+        }
     except Exception as e:  # noqa: BLE001
         log.warning("autoverify post failed: %s", e)
-        return False
+        return {"passing": False, "already_verified": False}
 
 
 # Backoff (seconds) between verify_loop attempts, indexed by consecutive failure
@@ -1149,16 +1164,24 @@ def _maybe_autoverify(user_id: str, *, mint_token, api_url: str, state: dict,
     """Open the bootstrap gate for a freshly-hosted user by running verify_loop.
     ``state`` (user_id -> {"done", "fails", "next"}) makes it idempotent AND backed
     off: a passed user is marked ``done`` and never re-probed; a failed attempt
-    schedules the next try with increasing backoff instead of every tick."""
+    schedules the next try with increasing backoff instead of every tick.
+    Returns True only when a FRESH probe passed on this call."""
     s = state.get(user_id)
     if s is not None and s.get("done"):
         return False
     t = now()
     if s is not None and t < s.get("next", 0.0):
         return False                            # within the backoff window
-    if post_verify(api_url, _auth_headers(runtime_token=mint_token(user_id))):
+    result = post_verify(api_url, _auth_headers(runtime_token=mint_token(user_id)))
+    if isinstance(result, bool):                # legacy/simple probes: bool
+        result = {"passing": result, "already_verified": False}
+    if result.get("passing"):
         state[user_id] = {"done": True}
-        return True
+        # A server-side short-circuit opened nothing new: no ping, no agent
+        # reply. Mark done (never re-probe) but do not report a fresh pass, or
+        # the host-all tick would run its introduction recovery for a user who
+        # merely had history.
+        return not result.get("already_verified")
     fails = (s.get("fails", 0) if s else 0) + 1
     delay = _AUTOVERIFY_BACKOFF[min(fails, len(_AUTOVERIFY_BACKOFF) - 1)]
     state[user_id] = {"done": False, "fails": fails, "next": t + delay}

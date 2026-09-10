@@ -6,6 +6,7 @@ import importlib
 from contextlib import asynccontextmanager
 
 import anyio.to_thread
+import memory_bm25
 from fastapi import FastAPI
 
 from enclave import backend_client, config
@@ -24,6 +25,7 @@ async def lifespan(app):
     # 无关，用 FEEDLING_ENCLAVE_THREADS（默认 32，env 名沿用免动 compose）。
     limiter = anyio.to_thread.current_default_thread_limiter()
     limiter.total_tokens = config.ENCLAVE_THREADS
+    await anyio.to_thread.run_sync(memory_bm25.prewarm)
     yield
     import provider_client
     await backend_client.aclose()

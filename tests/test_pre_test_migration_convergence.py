@@ -26,7 +26,15 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0107_perceptkit_mirror_source"]
+    assert script.get_heads() == ["0110_divergence_observed_at"]
+    assert (
+        script.get_revision("0109_divergence_skew").down_revision
+        == "0108_perceptkit_retraction"
+    )
+    assert (
+        script.get_revision("0108_perceptkit_retraction").down_revision
+        == "0107_perceptkit_mirror_source"
+    )
     assert (
         script.get_revision("0107_perceptkit_mirror_source").down_revision
         == "0106_perceptkit_objects"
@@ -115,7 +123,15 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0041_perceptkit_mirror_source"]
+    assert script.get_heads() == ["0044_divergence_observed_at"]
+    assert (
+        script.get_revision("0043_divergence_skew").down_revision
+        == "0042_perceptkit_retraction"
+    )
+    assert (
+        script.get_revision("0042_perceptkit_retraction").down_revision
+        == "0041_perceptkit_mirror_source"
+    )
     assert (
         script.get_revision("0041_perceptkit_mirror_source").down_revision
         == "0040_perceptkit_objects"
@@ -229,13 +245,28 @@ def test_tee_chain_carries_test_runtime_schema():
 def test_tee_migrations_reuse_the_rds_contract_sql():
     rds = _scripts("alembic")
     tee = _scripts("alembic_tee")
+    tee_perception = tee.get_revision(
+        "0011_perception_signal_state_v2"
+    ).module
+    rds_perception = rds.get_revision(
+        "0077_perception_signal_state_v2"
+    ).module
+    assert tee_perception._UP.replace(
+        "CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1
+    ) == rds_perception._UP, (
+        "TEE may adopt the RDS-created table only while both chains define "
+        "the same schema"
+    )
+    assert "DROP TABLE IF EXISTS perception_signal_state_v2" in (
+        Path(tee_perception.__file__).read_text(encoding="utf-8")
+    )
     assert (
         tee.get_revision("0040_perceptkit_objects").module._UP
         == rds.get_revision("0106_perceptkit_objects").module._UP
     ), "the PerceptKit DDL must be byte-identical on both chains"
     assert (
-        tee.get_revision("0041_perceptkit_mirror_source").module._UP
-        == rds.get_revision("0107_perceptkit_mirror_source").module._UP
+        tee.get_revision("0043_divergence_skew").module._UP
+        == rds.get_revision("0109_divergence_skew").module._UP
     ), "the mirror-source migration must be byte-identical on both chains"
     # The adapter and its conformance tests run against schema.DDL. If the
     # migration drifts from it, the suite goes green against tables production
@@ -377,6 +408,59 @@ def test_tee_0029_upgrades_to_voice_merge_head(monkeypatch):
                 "SELECT convert_from(value,'UTF8')::jsonb->'tee_heads' "
                 "FROM server_config WHERE key='phase4_primary_prepared'"
             ).fetchone() == ([expected_head],)
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname=%s",
+                (database,),
+            )
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {}").format(
+                    sql.Identifier(database)
+                )
+            )
+
+
+def test_tee_head_adopts_matching_preexisting_perception_state_table(monkeypatch):
+    """A TEE upgrade must converge when the RDS chain already created the table."""
+    admin_url = os.environ.get(
+        "FEEDLING_TEST_PG",
+        "postgresql://postgres:test@127.0.0.1:55432/postgres",
+    )
+    database = f"tee_perception_adopt_{uuid.uuid4().hex[:10]}"
+    database_url = _database_url(admin_url, database)
+    cfg = Config(str(ROOT / "backend/alembic_tee/alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "backend/alembic_tee"))
+    expected_head = _scripts("alembic_tee").get_current_head()
+    assert expected_head is not None
+
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+
+    monkeypatch.setenv("TEE_MIGRATION_DATABASE_URL", database_url)
+    try:
+        command.upgrade(cfg, "0010_v2_chat_tail_anchor")
+        rds_perception = _scripts("alembic").get_revision(
+            "0077_perception_signal_state_v2"
+        ).module
+        with psycopg.connect(database_url, autocommit=True) as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_tee_version"
+            ).fetchall() == [("0010_v2_chat_tail_anchor",)]
+            conn.execute(rds_perception._UP)
+            assert conn.execute(
+                "SELECT to_regclass('public.perception_signal_state_v2')"
+            ).fetchone() == ("perception_signal_state_v2",)
+
+        command.upgrade(cfg, "head")
+        with psycopg.connect(database_url, autocommit=True) as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_tee_version"
+            ).fetchall() == [(expected_head,)]
+            assert conn.execute(
+                "SELECT to_regclass('public.perception_signal_state_v2')"
+            ).fetchone() == ("perception_signal_state_v2",)
     finally:
         with psycopg.connect(admin_url, autocommit=True) as admin:
             admin.execute(

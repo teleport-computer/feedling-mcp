@@ -12,6 +12,153 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident clients report unsupported local IPC explicitly.** Python runtimes
+  without `AF_UNIX` now log a disabled listener and return `ipc_unsupported`
+  for local attachment/redistill commands; normal HTTP text replies are separate.
+  Windows consumer and CLI defaults agree on the native temporary directory.
+  Update warnings now protect local configuration/state instead of suggesting
+  a generic stash. Unrelated untracked files no longer stall self-update;
+  checkout refuses to overwrite conflicting untracked or ignored files.
+  This does not introduce TCP IPC or full Windows support.
+
+- **Image-model setup no longer rejects valid models by name.** Adding an image
+  model on a relay (`openai_compatible`, which uses `/images/generations`, or
+  `openrouter`, which uses `/images`) now probes that dedicated endpoint
+  regardless of the model id, so a real image model whose name carries none of
+  the known markers (e.g. `nai-diffusion-4-5-full` on a relay serving NovelAI)
+  is tested for real instead of being reported "this model can't generate images"
+  before any request is sent. A model that genuinely cannot generate is still
+  rejected by the endpoint's error or empty result.
+
+- **Memory queries rank token matches with BM25.** Nonblank `query` uses pinned
+  jieba 0.42.1 Chinese segmentation and whole case-insensitive ASCII identifiers.
+  The enclave ranks the complete readable corpus across both storage tiers before
+  applying filters and limit; item `score` keeps its old meaning. Query responses
+  add `ranking` and `unavailable_count`; `substring-legacy` explicitly marks a
+  rolling-upgrade fallback, never an auth/timeout fallback. Search resource limits
+  return HTTP 413 `memory_search_resource_limit` rather than partial rankings.
+  All nonblank queries now require the enclave path, including plaintext-tier
+  cards. Blank-query browsing and fetch are unchanged.
+
+- **Rejected agent replies are traced, and attachments degrade instead of looping.**
+  `POST /v1/chat/response` now records a `chat.response.rejected` route trace
+  (status, error code, followup counts; no content) whenever it answers 4xx.
+  The resident consumer keeps the server's reason in its log, resends a reply
+  whose image/file followups were rejected **without** the attachments, and
+  posts a system notice that the picture/file could not be delivered — instead
+  of re-running the whole turn (which regenerated the image and looped).
+
+- **Injected memory summaries are never truncated, and a profile-covered card
+  keeps its ID.** Summaries up to 300 characters appear whole; a longer one is
+  replaced by its ID, reason and a fetch hint instead of a cut-off sentence. A
+  card whose summary is already verbatim in the profile now keeps its ID with an
+  empty summary, so its fuller body can still be fetched. Arrival accounting
+  matches each rendered card entry against the final provider messages —
+  whitespace-normalized or as an equal JSON object, across string and multi-part
+  content — instead of comparing the whole block for equality. Where that check
+  is cut short or fails, the affected IDs are reported as `unverified_ids` with
+  `injected_is_lower_bound`, so an unchecked turn is no longer indistinguishable
+  from an uninjected one; `injected_chars` is documented as the normalized size
+  of the rendered block, not of the provider payload.
+
+- **Memory recall adds bounded navigation metadata and recent-card context.**
+  Optional encrypted `retrieval_cues` reach search and lightweight indexes;
+  fetch adds up to six readable one-hop pointers with explicit coverage status.
+  V2 supplements its profile with up to three cards created in the last seven
+  days inside the existing eight-card/2500-character limit. Memory capture and
+  dreaming now use memgarden 0.20.0 prompts that generate or repair 3–5 grounded
+  `retrieval_cues` and choose a five-level `importance_level`; cues are navigation
+  hints rather than evidence, and the host maps the level to 0.2–1.0 importance.
+
+- **Memory navigation guidance clarified.** The former literal-substring query
+  contract is superseded by BM25 above (and retained only for rolling compatibility).
+  Empty results do not prove memory absence. Agent guidance describes the navigation order
+  locate → pick → relate (follow `threads`) → fetch, and reads the auto-injected
+  related-memory block as evidence before searching.
+
+- **Runtime V2 now consumes per-turn related-memory summaries.** Enclave selection
+  uses the last four conversation messages. Bounded, non-system memory blocks
+  carry IDs and selection reasons, with full details available through fetch.
+  Recall diagnostics measure actual request inclusion and normalized tool-result
+  completeness, separately from selection. Model guidance requires checking
+  supporting memories before asserting specific remembered facts.
+
+- **Runtime V2 memory results now preserve complete JSON and card content.**
+  Compact index/search views use a 6000-character budget; fetched cards share a
+  12000-character budget without the former per-string 2000-character cut.
+  Overflow drops whole cards with explicit counts, including in mixed tool
+  batches. Public memory HTTP responses and resident CLI output are unchanged.
+  Recall diagnostics separate selection from injection and report unknown
+  counts explicitly instead of presenting missing observations as zero.
+
+- **World Book entries now reach the model on their own.** Matching used to be
+  left to the model: ordinary chat prefetched nothing, and the model was
+  expected to call `worldbook-match` when it judged the setting mattered. In
+  practice it rarely did — of the users who had entries, most never got a single
+  query-bearing match, so carefully written setting data silently never
+  appeared. Every foreground turn now runs the same deterministic scan the
+  proactive lane already used: the recent window is matched against each entry's
+  keywords, `alwaysOn` entries always apply, and matched entries are injected
+  under the existing World Book header with the existing cap and explicit
+  truncation marker. The `worldbook-match` tool still exists for the model to
+  look something up on demand. Only the user's own message and Feedling's own
+  replies are used as matching signals — screen-share text never selects
+  entries. Self-hosted runtimes can restore the old behaviour with
+  `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=tool`.
+
+- **Image-generation setup now verifies image-named models across provider
+  families with a real request.** A model id containing an existing image
+  marker is no longer rejected solely because its provider is outside the
+  former local allowlist or, for Gemini, because the id lacks a `gemini-`
+  prefix. The setup check can therefore incur one provider request; it succeeds
+  only when that request returns non-empty image media. Model ids without an
+  image marker are still rejected locally without contacting the provider.
+  Ordinary Chat requests keep their existing provider-specific modality gate.
+
+- **DeepSeek proactive wakes can again complete their required final choice.**
+  When a DeepSeek turn must select a tool, the backend disables native thinking
+  for that one request. Other DeepSeek requests keep their configured thinking
+  behavior, and other providers are unchanged.
+
+- **Image-generation setup errors now preserve actionable provider causes.**
+  HTTP 401/403 credential rejection, 402 quota exhaustion, 404 missing model or
+  endpoint, and 400/415/422 incompatibility now return their existing distinct
+  public error codes instead of collapsing into one model-incompatible result.
+  Chinese and English guidance now tells users which setting to correct.
+
+- **Canvas libraries can now load directly from the current workspace index.**
+  `GET /v1/chat/canvases` returns up to 500 metadata-only IO Canvas entries for
+  the authenticated user, newest workspace update first. It includes the
+  newest matching Chat card identifier and display labels when available, but
+  never returns Canvas bodies or envelopes; a Canvas without a matching Chat
+  row remains visible with nullable card metadata. Suffix matching is
+  case-insensitive and the original filename case is preserved.
+
+- **`POST /v1/chat/verify_loop` accepts `only_if_unverified`.** When the JSON
+  literal `true` is sent and the server already holds a sticky live-loop
+  verification for the user, the endpoint inserts no hidden ping, takes no
+  liveness measurement, and answers `passing: true` with `already_verified:
+  true` (`loop_alive` and `response_time_sec` are `null`). The hosted runner supervisor
+  now sends this flag, so a runtime restart no longer re-probes every resident
+  with a real model call on the user's own key. Requests without the flag are
+  unchanged.
+
+- **A relay's own `403` refusal is no longer reported as an invalid API key.**
+  When an upstream relay declines a request for its own reasons, it can answer
+  `403` with a generic OpenAI-shaped envelope
+  (`{"message":"Request failed. Please try again later.","type":"api_error"}`)
+  that carries no authentication semantics. Chat previously classified any
+  `403` as `auth_invalid`, so this transient relay condition told users their
+  key was invalid or expired and directed them to re-save a key that was never
+  the problem. That exact shape — the `403`, the generic `message` field, and
+  `"type":"api_error"`, in any order — now uses the existing
+  `upstream_unavailable` handling instead. The same distinction now applies to
+  image-generation and vision provider checks, which reuse their existing
+  unavailable guidance instead of adding new copy. A `403` that does carry
+  authentication semantics, such as an invalid or unauthorized key, still
+  uses the lane's authentication error; a different `provider_http_403` body
+  remains fail-closed as authentication-related, and `401` is unchanged.
+
 - **Chat now distinguishes relay tool-history failures from tool-schema
   incompatibility.** When a relay rejects the native tool-result transcript,
   Runtime V2 stops after that provider call instead of dropping tools and

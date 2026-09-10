@@ -23,6 +23,7 @@ import base64
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -125,6 +126,7 @@ def test_all_routes_bad_auth_is_fixed_401(user):
         ("DELETE", "/v1/chat/history", {"confirm": "clear-chat-history"}),
         ("GET", "/v1/chat/messages/whatever/body", None),
         ("GET", "/v1/chat/workspace/body?filename=work.io.html", None),
+        ("GET", "/v1/chat/canvases", None),
         ("POST", "/v1/chat/verify_loop", {"timeout_sec": 0}),
     ]:
         status, resp = _asgi(method, path, headers=bad, json=body)
@@ -420,6 +422,211 @@ def test_workspace_canvas_body_never_reads_another_users_entry(user):
         params={"filename": filename, "user_id": other_uid},
     )
     assert (status, body) == (404, {"error": "workspace_entry_not_found"})
+
+
+def test_canvas_index_returns_workspace_metadata_and_latest_agent_card(user):
+    uid, api_key = user
+    store = core_store.get_store(uid)
+    filename = "Living-Letter.io.html"
+    old_card = store.append_chat(
+        "openclaw",
+        "model_api",
+        _env(uid, "canvas-card-old"),
+        content_type="file",
+        extra={
+            "file_name": filename,
+            "file_mime": "text/html",
+            "file_display_title": "旧标题",
+            "file_display_subtitle": "旧副标题",
+        },
+        strict=True,
+    )
+    latest_card = store.append_chat(
+        "agent",
+        "chat",
+        _env(uid, "canvas-card-latest"),
+        content_type="file",
+        extra={
+            "file_name": filename,
+            "file_mime": "text/html",
+            "file_display_title": "Living Letter",
+            "file_display_subtitle": "The current card metadata",
+        },
+        strict=True,
+    )
+    newer_user_file = store.append_chat(
+        "user",
+        "chat",
+        _env(uid, "canvas-card-user-upload"),
+        content_type="file",
+        extra={
+            "file_name": filename,
+            "file_mime": "text/html",
+            "file_display_title": "User upload",
+            "file_display_subtitle": "Must not replace the agent card",
+        },
+        strict=True,
+    )
+    assert len({old_card["id"], latest_card["id"], newer_user_file["id"]}) == 3
+
+    current = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        f"/workspace/{filename}",
+        kind="workspace",
+        content_envelope={"body": "must never appear in the index"},
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    orphan = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        "/workspace/Orphan.io.html",
+        kind="workspace",
+        content_envelope={"body_ct": "also private"},
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    assert current is not None and orphan is not None
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_workspace_entries SET "
+            "created_at=TIMESTAMPTZ '2026-09-05 10:00:00+00',"
+            "updated_at=TIMESTAMPTZ '2026-09-06 10:00:00+00' "
+            "WHERE user_id=%s AND path=%s",
+            (uid, f"/workspace/{filename}"),
+        )
+        conn.execute(
+            "UPDATE v2_workspace_entries SET "
+            "created_at=TIMESTAMPTZ '2026-09-04 10:00:00+00',"
+            "updated_at=TIMESTAMPTZ '2026-09-05 10:00:00+00' "
+            "WHERE user_id=%s AND path='/workspace/Orphan.io.html'",
+            (uid,),
+        )
+
+    status, body = _asgi("GET", "/v1/chat/canvases", headers=_hk(api_key))
+
+    assert status == 200
+    assert set(body) == {"canvases"}
+    assert [card["filename"] for card in body["canvases"]] == [
+        filename,
+        "Orphan.io.html",
+    ]
+    current_card = dict(body["canvases"][0])
+    current_created_at = current_card.pop("created_at")
+    current_updated_at = current_card.pop("updated_at")
+    assert current_card == {
+        "filename": filename,
+        "revision": current["revision"],
+        "mime_type": "text/html",
+        "message_id": latest_card["id"],
+        "display_title": "Living Letter",
+        "display_subtitle": "The current card metadata",
+    }
+    assert datetime.fromisoformat(current_created_at) == datetime(
+        2026, 9, 5, 10, tzinfo=timezone.utc
+    )
+    assert datetime.fromisoformat(current_updated_at) == datetime(
+        2026, 9, 6, 10, tzinfo=timezone.utc
+    )
+    orphan_card = dict(body["canvases"][1])
+    orphan_created_at = orphan_card.pop("created_at")
+    orphan_updated_at = orphan_card.pop("updated_at")
+    assert orphan_card == {
+        "filename": "Orphan.io.html",
+        "revision": orphan["revision"],
+        "mime_type": "text/html",
+        "message_id": None,
+        "display_title": None,
+        "display_subtitle": None,
+    }
+    assert datetime.fromisoformat(orphan_created_at) == datetime(
+        2026, 9, 4, 10, tzinfo=timezone.utc
+    )
+    assert datetime.fromisoformat(orphan_updated_at) == datetime(
+        2026, 9, 5, 10, tzinfo=timezone.utc
+    )
+    assert "envelope" not in str(body)
+    assert "must never appear" not in str(body)
+
+
+def test_canvas_index_filters_non_canvas_kinds_and_isolates_users(user):
+    uid, api_key = user
+    store = core_store.get_store(uid)
+    source = store.append_chat(
+        "openclaw",
+        "model_api",
+        _env(uid, "artifact-source"),
+        content_type="file",
+        extra={"file_name": "artifact.io.html", "file_mime": "text/html"},
+        strict=True,
+    )
+    artifact = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        "/workspace/artifact.io.html",
+        kind="artifact",
+        content_envelope={"body_ct": "artifact"},
+        mime_type="text/html",
+        source_ref=source["id"],
+        expected_revision=0,
+    )
+    non_canvas = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        "/workspace/readme.html",
+        kind="workspace",
+        content_envelope={"body_ct": "not-io-canvas"},
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    mixed_case_suffix = v2_jobs_store.put_workspace_entry_cas(
+        uid,
+        "/workspace/Foo.IO.HTML",
+        kind="workspace",
+        content_envelope={"body_ct": "mixed-case-canvas"},
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    assert artifact is not None and non_canvas is not None
+    assert mixed_case_suffix is not None
+
+    other = make_client().post(
+        "/v1/users/register",
+        json={"public_key": _b64(b"\x33" * 32), "archive_language": "en"},
+    )
+    assert other.status_code == 201
+    other_uid = other.get_json()["user_id"]
+    foreign = v2_jobs_store.put_workspace_entry_cas(
+        other_uid,
+        "/workspace/foreign.io.html",
+        kind="workspace",
+        content_envelope={"body": "other user's content"},
+        mime_type="text/html",
+        source_ref="",
+        expected_revision=0,
+    )
+    assert foreign is not None
+
+    status, body = _asgi(
+        "GET",
+        "/v1/chat/canvases",
+        headers=_hk(api_key),
+        params={"user_id": other_uid},
+    )
+
+    assert status == 200
+    assert len(body["canvases"]) == 1
+    assert body["canvases"][0] == {
+        "filename": "Foo.IO.HTML",
+        "revision": mixed_case_suffix["revision"],
+        "mime_type": "text/html",
+        "created_at": mixed_case_suffix["created_at"].isoformat(),
+        "updated_at": mixed_case_suffix["updated_at"].isoformat(),
+        "message_id": None,
+        "display_title": None,
+        "display_subtitle": None,
+    }
 
 
 # --------------------------------------------------------------------------- #

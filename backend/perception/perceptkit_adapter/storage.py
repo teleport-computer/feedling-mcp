@@ -249,9 +249,13 @@ class PostgresStorage:
     def get_current(self, *, subject_id, signals):
         if not signals:
             return {}
+        # 列名写全，不用 `SELECT *` —— 按位置取值时，加一列就会让后面每一列
+        # 都错位，而错位的结果仍然是合法的 dataclass。
         rows = self._q(
-            "SELECT * FROM perceptkit_current "
-            "WHERE subject_id=%s AND signal = ANY(%s)",
+            "SELECT subject_id, signal, dimension_key, typed_value, availability,"
+            " observed_at, received_at, expires_at, source_observation_id,"
+            " source_revision, source, source_event_id, version, content_digest"
+            " FROM perceptkit_current WHERE subject_id=%s AND signal = ANY(%s)",
             (subject_id, list(signals)),
         )
         out: dict[str, list[CurrentProjection]] = {}
@@ -260,7 +264,8 @@ class PostgresStorage:
                 subject_id=r[0], signal=r[1], dimension_key=r[2], typed_value=r[3],
                 availability=r[4], observed_at=r[5], received_at=r[6],
                 expires_at=r[7], source_observation_id=r[8], source_revision=r[9],
-                version=r[10], content_digest=r[11],
+                source=r[10], source_event_id=r[11],
+                version=r[12], content_digest=r[13],
             ))
         return out
 
@@ -269,16 +274,19 @@ class PostgresStorage:
         p = projection
         cols = (p.subject_id, p.signal, p.dimension_key, _j(p.typed_value),
                 p.availability, p.observed_at, p.received_at, p.expires_at,
-                p.source_observation_id, _rev(p.source_revision), p.version,
-                p.content_digest)
+                p.source_observation_id, _rev(p.source_revision),
+                # 不写这两格，撤回就永远匹配不上这条当前值（见 schema.py）。
+                p.source, p.source_event_id,
+                p.version, p.content_digest)
         if expected_version < 0:
             rows = self._q(
                 """
                 INSERT INTO perceptkit_current
                   (subject_id, signal, dimension_key, typed_value, availability,
                    observed_at, received_at, expires_at, source_observation_id,
-                   source_revision, version, content_digest)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   source_revision, source, source_event_id,
+                   version, content_digest)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (subject_id, signal, dimension_key) DO NOTHING
                 RETURNING 1
                 """, cols)
@@ -292,6 +300,7 @@ class PostgresStorage:
             UPDATE perceptkit_current
                SET typed_value=%s, availability=%s, observed_at=%s, received_at=%s,
                    expires_at=%s, source_observation_id=%s, source_revision=%s,
+                   source=%s, source_event_id=%s,
                    version=%s, content_digest=%s
              WHERE subject_id=%s AND signal=%s AND dimension_key=%s
                AND version=%s
@@ -299,6 +308,7 @@ class PostgresStorage:
             """,
             (_j(p.typed_value), p.availability, p.observed_at, p.received_at,
              p.expires_at, p.source_observation_id, _rev(p.source_revision),
+             p.source, p.source_event_id,
              p.version, p.content_digest,
              p.subject_id, p.signal, p.dimension_key, expected_version),
         )
@@ -663,40 +673,59 @@ class PostgresStorage:
         ]
 
     def delete_source_items(self, *, subject_id, source, collection_kind,
-                            source_item_ids) -> int:
-        """Deletions the source explicitly reported -- not inferred ones.
+                            deleted_items) -> int:
+        """Deletions the source stated outright, scoped to exactly one item.
 
-        Separate from ``apply_source_snapshot`` on purpose:
-
-            snapshot    "inside coverage, not mentioned this round" -- inferred,
-                        so only a full sync may do it, and only in its window
-            this one    "the source says this one is gone" -- a fact, so an
-                        incremental sync must do it too
-
-        Without it an incremental sync has only bad options: delete nothing
-        (an event the user removed on their phone stays in the agent's view
-        forever, and keeps showing up under "what's coming up"), or treat a
-        partial list as a full one, which is worse and irreversible.
+        The scope is all five parts: subject + source + account + collection +
+        item id. Dropping any one of them hits a namesake sibling -- two
+        accounts under one source routinely reuse an event id, and they are
+        different events. Every one of those is irreversible, and what the
+        user sees is "my calendar lost something".
         """
-        ids = [str(i) for i in (source_item_ids or ()) if str(i).strip()]
-        if not ids:
+        if not deleted_items:
             return 0
         if collection_kind == "calendar":
-            table, id_col = "perceptkit_calendar_mirror", "source_event_id"
-        elif collection_kind == "reminders":
-            table, id_col = "perceptkit_reminder_mirror", "source_reminder_id"
+            table, coll, item = ("perceptkit_calendar_mirror",
+                                 "source_calendar_id", "source_event_id")
         else:
-            return 0
+            table, coll, item = ("perceptkit_reminder_mirror",
+                                 "source_list_id", "source_reminder_id")
+        total = 0
         with self.conn.cursor() as cur:
-            cur.execute(
-                # `source` is part of the delete scope. Without it an `ios`
-                # deletion hits a row in another source system that happens
-                # to share the id.
-                f"DELETE FROM {table} WHERE subject_id = %s AND source = %s "
-                f"AND {id_col} = ANY(%s)",
-                (subject_id, source, ids),
-            )
-            return cur.rowcount
+            for d in deleted_items:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE subject_id=%s AND source=%s "
+                    f"AND source_account_id=%s AND {coll}=%s AND {item}=%s",
+                    (subject_id, source, d.source_account_id,
+                     d.source_collection_id, d.source_item_id),
+                )
+                total += cur.rowcount
+        return total
+
+    def record_retraction(self, retraction) -> bool:
+        rows = self._q(
+            """
+            INSERT INTO perceptkit_retraction
+              (subject_id, signal, source, source_event_id, observed_at)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (subject_id, signal, source, source_event_id)
+            DO NOTHING
+            RETURNING 1
+            """,
+            (retraction.subject_id, retraction.signal, retraction.source,
+             retraction.source_event_id, retraction.observed_at),
+        )
+        return bool(rows)
+
+    def list_retractions(self, *, subject_id, signal, source_event_ids=None):
+        from perceptkit.contracts.retraction import Retraction
+        sql = ("SELECT subject_id, signal, source_event_id, source, observed_at "
+               "FROM perceptkit_retraction WHERE subject_id=%s AND signal=%s")
+        params: list[Any] = [subject_id, signal]
+        if source_event_ids is not None:
+            sql += " AND source_event_id = ANY(%s)"
+            params.append(list(source_event_ids))
+        return [Retraction(*r) for r in self._q(sql, params)]
 
     def apply_source_snapshot(self, *, subject_id, source, collection_kind,
                               sync_id, coverage_start, coverage_end,

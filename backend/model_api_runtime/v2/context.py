@@ -64,7 +64,8 @@ AGENT_MEMORY_HEADER = (
     "# 你的记忆\n"
     "你们之间的人、事、约定,你记住的都在这里。\n"
     "像人回忆那样用:该想起时自然带出,不用当清单念。\n"
-    "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。"
+    "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。\n"
+    "涉及具体的人、物、编号、约定,先查再答;查不到就说没记住。"
 )
 USER_PROFILE_HEADER = (
     "# 说话的分寸\n"
@@ -234,8 +235,11 @@ _CHAT_REPLY_POLICY = (
 )
 
 _CHAT_MEMORY_EVIDENCE_POLICY = (
-    "只把搜到的相关记忆当作依据。没搜到相关记忆就直说；别拿无关偏好或事件冒充这个"
-    "问题的答案。"
+    "涉及具体事实(编号、数字、日期、地点、人名、约定、东西放在哪、上面写着什么)，"
+    "只能说记忆卡、「相关记忆」块或 memory_search/memory_fetch 结果里写着的内容。"
+    "没有这些支撑就先去查；查了还没有，就直说不记得、请对方告诉你。"
+    "不要顺着话头猜一个像样的值，也不要往记忆里补它没写的细节(颜色、场景、次数、时间)。"
+    "不确定就说不确定。也别拿无关偏好或事件冒充这个问题的答案。"
 )
 
 _CHAT_MEMORY_POLICY = _join_policy_blocks(
@@ -617,6 +621,7 @@ def build_turn_messages(
     trusted_system_blocks: Sequence[str] = (),
     agent_memory: str = "",
     user_profile: str = "",
+    related_memories: str = "",
     worldbook_context: str = "",
     worldbook_context_char_cap: int = WORLD_BOOK_CONTEXT_CHAR_CAP,
     coverage_hole_notice: str = "",
@@ -650,6 +655,11 @@ def build_turn_messages(
     trusted_parts.extend((system_prompt, _RUNTIME_CONTEXT_POLICY))
     trusted_system = "\n\n".join(trusted_parts).strip()
     messages: list[dict] = [{"role": "system", "content": trusted_system}]
+
+    # Retrieved cards are data, not durable privileged instructions. Keep this
+    # per-turn block after profile/system context and before conversation replay.
+    if related_memories:
+        messages.append({"role": application_data_role, "content": related_memories})
 
     bounded_worldbook = bound_worldbook_context(
         worldbook_context,

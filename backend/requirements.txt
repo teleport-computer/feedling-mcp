@@ -127,7 +127,8 @@ Pillow>=11,<13
 # self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
-memgarden==0.16.0
+memgarden==0.20.0
+jieba==0.42.1  # deterministic Chinese BM25 tokenization; hash in requirements.lock
 
 # 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
@@ -154,4 +155,34 @@ memgarden==0.16.0
 # 配套迁移是 0107（RDS）/ 0041（tee）—— 少了它，一次 source="ios" 的全量
 # 同步会把概念上属于别的来源的日程一起删掉，不可逆。装着 0.2.7 跑本分支
 # 会在 import 时就炸（缺 StoragePort.delete_source_items）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.3.0/perceptkit-0.3.0-py3-none-any.whl
+#
+# 0.3.0 → 0.4.0（2026-09-06，外部复核第二轮 + 产品拍板的信号拆分）。
+# **带破坏性变更**，而且这一版的 pin 和代码耦合得比前几次都紧：
+#
+#   健康信号拆成单指标  health_body / health_vitals / health_metabolic
+#                       在**存储侧**拆成十二个（23 信号 → 32）。
+#                       ⚠️ **上报契约没拆** —— 客户端仍然按 HealthKit 的授权
+#                       分组一次报一整包，catalog.SIGNALS 和四张声明表
+#                       (history.SHAPE / attribution / trend_models /
+#                       retention) 仍然按上报键建索引。这两套词表混起来
+#                       在 0.4.0 的开发过程中翻过三次车，每次都不报错。
+#   来源撤回            用户在健康 app 里删掉的记录，这边跟着不作数。
+#                       配套迁移 0108（RDS）/ 0042（tee）。
+#
+# 装着 0.3.0 跑本分支会在 import 时就炸（缺 contracts.Retraction、
+# StoragePort.record_retraction / list_retractions、
+# PerceptionKit.apply_retractions）。
+#
+# 0.4.0 → 0.4.1（2026-09-07）。**带破坏性变更**：`AGGREGATION_VERSION` 1 → 2。
+# 睡眠的聚合语义换了（此前 duration_minutes 取的是各阶段的 max 而不是和，
+# 「昨晚睡了多久」会答 250 而不是 430）。两版聚合是并排存着的，所以读日聚合
+# **必须挑最高版本** —— 配套改动在 perceptkit_adapter/history.py。
+# 装着 0.4.0 跑本分支不会 import 报错，但睡眠会读到空聚合。
+#
+# 0.4.1 → 0.5.0（2026-09-07）。**这次 pin 和代码必须一起改**：
+# io 已经在 presence_recovery 里发 `evidence`，而 0.4.1 的 manifest 没有这个
+# 字段 —— 装着 0.4.1 跑本分支不会报错，但那一格会被当未声明字段静默丢掉，
+# 于是下游又只剩"回来了"可说。
+# 同批还有：EventDefinition 动态装配、Workout 三投影（当日求和而不是取 max）、
+# 累计型允许向下修订（counter_epoch_id）。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.5.0/perceptkit-0.5.0-py3-none-any.whl

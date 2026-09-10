@@ -24,6 +24,7 @@ from chat import language_follow
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
+from model_api_runtime.v2 import memory_recall
 import provider_client
 
 
@@ -1019,7 +1020,7 @@ def _normalize_tool_results(
                 "...[memory result truncated; this query returned "
                 f"{returned if isinstance(returned, int) else '?'} of "
                 f"{total if isinstance(total, int) else '?'} total cards. "
-                "Use memory_index with bucket or thread filters to browse partitions.]"
+                "Fetch visible ids or use memory_search with a narrower query.]"
             )
         else:
             markers.append(_RESULT_TRUNCATION_MARKER)
@@ -1187,6 +1188,7 @@ def _with_system_suffix(messages: list, suffix: str) -> list:
     return updated
 
 
+@memory_recall.traced
 async def run_tool_loop(
     *,
     provider_config,
@@ -2765,6 +2767,13 @@ async def run_tool_loop(
                 and isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
                 and attempts < max_calls
+                # A regular wake gets one useful schema recovery: its broad
+                # first-round catalog may collapse to the minimal
+                # reply/stay_silent choice. Once that forced choice is already
+                # on the wire there is no smaller valid wake surface to try.
+                # Retrying would send the identical rejected request until the
+                # whole turn budget is exhausted (15 calls in production).
+                and not wake_choice_required
                 and _is_probably_tool_schema_rejection(exc)
             )
             if (

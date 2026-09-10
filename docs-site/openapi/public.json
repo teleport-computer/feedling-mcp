@@ -989,6 +989,39 @@
         "x-feedling-contract-level": "compatibility"
       }
     },
+    "/v1/chat/canvases": {
+      "get": {
+        "summary": "Chat Canvases",
+        "operationId": "chat_canvases_v1_chat_canvases_get",
+        "responses": {
+          "200": {
+            "description": "The caller's current Canvas workspace metadata, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasIndexResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "List up to 500 current IO Canvas workspace entries for the authenticated user, ordered by most recent workspace update. This metadata-only index matches the .io.html suffix case-insensitively while preserving filename case, and never returns Canvas bodies or envelopes. message_id and display metadata come from the newest matching agent-authored Chat file row and are null when no such row exists."
+      }
+    },
     "/v1/chat/history": {
       "get": {
         "summary": "Chat History",
@@ -1698,7 +1731,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
+        "description": "Unless the only_if_unverified short-circuit below applies, insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether that exact reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded. Optional request field only_if_unverified: when it is the JSON literal true and the server already holds a sticky live-loop verification for this user, no ping is inserted and no liveness measurement is taken; the response is passing=true, already_verified=true, loop_alive=null, response_time_sec=null and an empty ping_id. Any other value, or an unverified user, runs the ordinary ping. Intended for automated gate-opening callers such as the hosted runner supervisor, so a runtime restart does not re-probe every resident with a real model call."
       }
     },
     "/v1/chat/workspace/body": {
@@ -4324,7 +4357,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed."
+        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed. Optional related_items contains up to six readable one-hop id/summary pointers; related_status distinguishes complete, bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
       }
     },
     "/v1/memory/get": {
@@ -4378,11 +4411,11 @@
         "operationId": "memory_index_v1_memory_index_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Lightweight discovery/search result and explicit ranking mode.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryIndexResponse"
                 }
               }
             }
@@ -4392,6 +4425,16 @@
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "memory_search_resource_limit: complete-corpus resource bound exceeded; no partial search result.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4415,7 +4458,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today."
+        "description": "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 in the enclave, then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking."
       }
     },
     "/v1/memory/legacy_batch": {
@@ -10638,6 +10681,95 @@
         },
         "additionalProperties": false
       },
+      "CanvasIndexEntry": {
+        "type": "object",
+        "required": [
+          "filename",
+          "revision",
+          "mime_type",
+          "created_at",
+          "updated_at",
+          "message_id",
+          "display_title",
+          "display_subtitle"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Newest matching agent-authored Chat file row, or null when the Canvas has no published attachment row."
+          },
+          "display_title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "display_subtitle": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CanvasIndexResponse": {
+        "type": "object",
+        "required": [
+          "canvases"
+        ],
+        "properties": {
+          "canvases": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/CanvasIndexEntry"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "ChatTransportRequest": {
         "type": "object",
         "required": [
@@ -10951,6 +11083,11 @@
       "MemoryIndexRequest": {
         "type": "object",
         "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."
+          },
           "limit": {
             "type": "integer",
             "minimum": 0,
@@ -10979,6 +11116,51 @@
           "bucket": "Collaboration",
           "thread": "communication style"
         }
+      },
+      "MemoryIndexResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "limit",
+          "truncated",
+          "user_card_count"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "description": "Lightweight card projections, no full content or BM25 scores. With query: BM25 descending, occurred_at descending, then ID ascending. Existing item score remains importance/recency, not BM25."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."
+          },
+          "user_card_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ranking": {
+            "type": "string",
+            "enum": [
+              "bm25-jieba-0.42.1-v1",
+              "substring-legacy"
+            ],
+            "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."
+          },
+          "unavailable_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryFetchRequest": {
         "type": "object",
@@ -11024,6 +11206,54 @@
           "truncation"
         ],
         "properties": {
+          "related_status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "bounded",
+              "unavailable",
+              "not_needed"
+            ]
+          },
+          "related_items": {
+            "type": "array",
+            "maxItems": 6,
+            "description": "Same-user readable one-hop pointers only, not full bodies. Superseded cards appear only through explicit anchor/supersedes links and are marked historical.",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "summary",
+                "source_id",
+                "relation",
+                "status"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string",
+                  "maxLength": 120
+                },
+                "source_id": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "anchor",
+                    "supersedes",
+                    "thread"
+                  ]
+                },
+                "status": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
           "items": {
             "type": "array",
             "items": {

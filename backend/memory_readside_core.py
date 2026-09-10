@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
+import memory_search_contract as search_contract
 
 from core import envelope as core_envelope
 from enclave import readside as enclave_readside
 from memory import service as memory_service
+from memory import recall_metadata
 from memgarden import timestamps as memory_timestamps
 
 
@@ -195,10 +197,8 @@ def readside_candidates(
             reverse=True,
         )
     if exact_query:
-        # Exact private-content search must inspect every eligible ciphertext.
-        # The caller pages this ordered list through the enclave in bounded
-        # batches, so HARD_MAX remains a per-request resource bound rather than
-        # a recall boundary that can hide an old/low-score match forever.
+        # Search sends the complete corpus for one global enclave ranking;
+        # HARD_MAX only bounds the result count and enclave decrypt chunks.
         return candidates, len(candidates)
     capped_limit = int(ambient_top_n or 0) if ambient and ambient_top_n else effective_readside_limit(limit)
     if capped_limit <= 0:
@@ -242,8 +242,17 @@ def post_enclave_readside(
     except httpx.HTTPError as e:
         raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
     if resp.status_code >= 400:
+        if resp.status_code == 413:
+            try:
+                if resp.json().get("error") == "memory_search_resource_limit":
+                    raise search_contract.SearchLimitExceeded()
+            except (ValueError, AttributeError):
+                pass
         raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
-    response = resp.json()
+    try:
+        response = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("enclave_invalid_readside_response") from exc
     if not isinstance(response, dict):
         raise RuntimeError("enclave_invalid_readside_response")
     return response
@@ -371,11 +380,7 @@ def memory_index_core(
             raise ValueError("invalid ambient_top_n")
     limit = effective_readside_limit(payload.get("limit"))
     query = str(payload.get("query") or "")[:500]
-    # ``limit`` is the caller's requested *result* count. A private-content
-    # query can only be evaluated after enclave decryption, so applying either
-    # it or HARD_MAX to the ciphertext candidates creates deterministic false
-    # negatives. Exact query search therefore walks every eligible card in
-    # score order, using HARD_MAX only as the enclave request page size.
+    # ``limit`` bounds results, never the corpus used for global statistics.
     candidates, user_card_count = readside_candidates(
         memory_service._load_moments(store),
         store.user_id,
@@ -393,20 +398,8 @@ def memory_index_core(
             "query": query,
     }
     if query.strip():
-        items: list = []
-        page_size = readside_hard_max()
-        for offset in range(0, len(candidates), page_size):
-            remaining = limit - len(items)
-            if remaining <= 0:
-                break
-            page = candidates[offset:offset + page_size]
-            items.extend(_memory_index_partition(
-                api_key,
-                page,
-                store.user_id,
-                {**payload_base, "limit": remaining},
-                post=post,
-            ))
+        result = _memory_search(api_key, candidates, store.user_id, payload_base, post=post)
+        items = result.pop("items")
     else:
         items = _memory_index_partition(
             api_key,
@@ -420,7 +413,42 @@ def memory_index_core(
         "limit": limit,
         "truncated": False if query.strip() else user_card_count > len(candidates),
         "user_card_count": user_card_count,
+        **(result if query.strip() else {}),
     }
+
+
+def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict:
+    # Do not build plaintext search projections or rank partitions in backend.
+    # Strip shadow plaintext from sealed rows using the existing shape guard.
+    plain, sealed, invalid = _partition_memory_candidates(candidates, owner_user_id)
+    by_id = {str(row.get("id") or ""): row for row in plain + sealed}
+    corpus = [by_id[str(row.get("id") or "")] for row in candidates
+              if str(row.get("id") or "") in by_id]
+    request = {**payload, "search_protocol": search_contract.VERSION}
+    search_contract.check_request({**request, "moments": corpus})
+    response = post(api_key, corpus, operation="index", payload=request)
+    # A successful previous-protocol response has this exact envelope. Missing
+    # ranking on that known shape is rolling compatibility, not permission to
+    # swallow HTTP/auth/timeouts or unknown/malformed future protocols.
+    if (not isinstance(response, dict) or response.get("user_id") != owner_user_id
+            or not isinstance(response.get("items"), list)
+            or not isinstance(response.get("unavailable_ids"), list)):
+        raise RuntimeError("enclave_invalid_readside_response")
+    ranking = response.get("ranking", search_contract.LEGACY)
+    if ranking not in (search_contract.VERSION, search_contract.LEGACY):
+        raise RuntimeError("enclave_invalid_readside_response")
+    items = []
+    for item in response["items"]:
+        if not isinstance(item, dict) or str(item.get("id") or "") not in by_id:
+            raise RuntimeError("enclave_invalid_readside_response")
+        clean = _public_memory_item(item)
+        clean.pop("content", None)
+        clean.pop("_search_content", None)
+        clean.pop("_bm25_score", None)
+        items.append(clean)
+    # Preserve enclave BM25 order; _ordered_items would restore importance order.
+    return {"items": items[:int(payload["limit"])], "ranking": ranking,
+            "unavailable_count": len(invalid) + len(response["unavailable_ids"])}
 
 
 def _bool_payload(value: Any) -> bool:
@@ -502,6 +530,36 @@ def memory_fetch_core(
     unavailable_ids = [
         memory_id for memory_id in ids if memory_id in unavailable_set
     ]
+    related_items: list[dict] = []
+    related_status = "not_needed"
+    source_items = [items_by_id[mid] for mid in ids if mid in items_by_id]
+    if any(item.get("threads") or item.get("anchor_memory_ids") or item.get("supersedes")
+           for item in source_items):
+        try:
+            # Reuse the authenticated, lifecycle-filtered index projection;
+            # decrypted bodies stay within the existing enclave boundary.
+            linked_ids = {mid for item in source_items for key in ("anchor_memory_ids", "supersedes")
+                          for mid in recall_metadata.links(item.get(key))}
+            neighbors = [m for m in moments if memory_available(
+                m, store.user_id, include_superseded=True)]
+            # Explicit links win seats before thread discovery. A superseded
+            # card is returned only along an explicit link, marked historical.
+            neighbors.sort(key=lambda m: (m.get("id") not in linked_ids, str(m.get("id") or "")))
+            bound = readside_hard_max()
+            neighbor_items = _memory_index_partition(
+                api_key, neighbors[:bound], store.user_id, {"limit": bound},
+                post=post_enclave or post_enclave_readside)
+            related_items = recall_metadata.one_hop(source_items, neighbor_items, cap=7)
+            complete_window = {m.get("id") for m in neighbors[:bound]} <= {i.get("id") for i in neighbor_items}
+            related_status = "bounded" if (len(neighbors) > bound or len(related_items) > 6
+                                             or not complete_window) else "ok"
+            if neighbors and not neighbor_items:
+                related_status = "unavailable"
+            related_items = related_items[:6]
+        except RuntimeError:
+            # Primary fetch remains useful, but missing relation evidence is
+            # explicitly unknown rather than a false claim of no neighbors.
+            related_status = "unavailable"
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
     if referenced_ids:
         now = _now_iso()
@@ -520,6 +578,8 @@ def memory_fetch_core(
                 memory_service._save_moments(store, fresh)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
+        "related_items": related_items,
+        "related_status": related_status,
         "missing_ids": missing_ids,
         "unavailable_ids": unavailable_ids,
         "truncation": {

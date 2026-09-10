@@ -123,8 +123,8 @@ def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
             if isinstance(total, int) and isinstance(returned, int):
                 marker = (
                     "...[memory result truncated; this query returned "
-                    f"{returned} of {total} total cards. Use memory_index with "
-                    "bucket or thread filters to browse partitions.]"
+                    f"{returned} of {total} total cards. Fetch visible ids or "
+                    "use memory_search with a narrower query.]"
                 )
         legacy_cap = result_cap + len("...[truncated]")
         prefix_cap = max(0, legacy_cap - len(marker))
@@ -275,6 +275,13 @@ async def dispatch_tool_calls(
                 or activity_metadata.perception_result_metadata(tc.name, data)
                 or None
             )
+            if tc.name in result_budget.MEMORY_TOOL_NAMES and data.get("ok"):
+                payload = data.get("data") or {}
+                metadata = {
+                    **(metadata or {}),
+                    result_budget.RESULT_KIND_METADATA_KEY: tc.name,
+                    "memory_matched": payload.get("matched"),
+                }
             if tc.name == "web_fetch" and data.get("ok"):
                 metadata = {
                     **(metadata or {}),

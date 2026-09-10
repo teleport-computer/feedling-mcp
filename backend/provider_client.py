@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+_MAX_RAW_PROVIDER_ERROR_BODY_CHARS = 64 * 1024
+
+
 class ProviderError(Exception):
     def __init__(
         self,
@@ -42,6 +45,7 @@ class ProviderError(Exception):
         *,
         status_code: int | None = None,
         response_detail: str = "",
+        raw_response_body: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -49,6 +53,14 @@ class ProviderError(Exception):
         # bounded fragment may enter an operator-only sink; tenant-visible
         # response/trace surfaces must not serialize this attribute.
         self.response_detail = str(response_detail or "")[:240]
+        # Classification-only carrier for callers that must distinguish a real
+        # credential rejection from a relay's generic 403 shell.  The body is
+        # already resident in httpx.Response; retaining a bounded prefix on the
+        # short-lived exception avoids an unbounded second copy.  It must never
+        # enter str/repr, traces, ledgers, notices, stderr, or durable storage.
+        self.raw_response_body = str(raw_response_body or "")[
+            :_MAX_RAW_PROVIDER_ERROR_BODY_CHARS
+        ]
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -57,8 +69,9 @@ class ProviderError(Exception):
 # blast radius is small. Why it exists: cheap relay providers fail transiently
 # (timeout / 429 / 5xx / empty reply) across the dozens of serial LLM calls a
 # genesis import makes, and today one blip kills the whole job. Retry the
-# transient ones; NEVER retry user-config ones (402 out-of-credits / 401·403 bad
-# key / 4xx config) — those need the user to fix their provider, not us to hammer it.
+# transient ones; NEVER retry user-config/access ones (402 out-of-credits / 401
+# bad key / 403 access or credential rejection / other 4xx config). The finer
+# user-facing classifier separately recognizes the relay's generic 403 shell.
 _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
@@ -113,8 +126,8 @@ def classify_provider_error(exc: BaseException) -> str:
     """Classify an LLM-call failure for retry decisions.
 
     - "transient"       → retry (network/timeout, 429, 5xx, empty / no-usable / bad-json reply)
-    - "provider_config" → DON'T retry; user must fix key / credits / config
-                          (402 out of credits, 401·403 bad key, other 4xx config)
+    - "provider_config" → DON'T retry; key / credits / access / other 4xx config
+                          (the user-facing layer distinguishes generic relay 403)
     - "unknown"         → treat as transient but capped (better a few retries than
                           silently giving up on an unrecognised blip)
     """
@@ -432,24 +445,71 @@ def _runtime_model(provider: str, model: str) -> tuple[str, dict[str, Any]]:
     return raw, {}
 
 
+def _model_name_has_image_output(model: str) -> bool:
+    """Return whether a model id carries one of the existing image markers."""
+    lower = str(model or "").strip().lower()
+    return any(
+        marker in lower
+        for marker in (
+            "image",
+            "flux",
+            "dall-e",
+            "stable-diffusion",
+            "seedream",
+        )
+    )
+
+
 def _model_has_native_image_output(provider: str, model: str) -> bool:
-    """Conservative gate for wires that require explicit image modalities."""
+    """Keep ordinary chat image modalities on their established provider wires."""
     normalized_provider = normalize_provider(provider)
     lower = str(model or "").strip().lower()
     if normalized_provider == "gemini":
         return lower.startswith("gemini-") and "image" in lower
     if normalized_provider in {"openai", "openrouter", "openai_compatible"}:
-        return any(
-            marker in lower
-            for marker in (
-                "image",
-                "flux",
-                "dall-e",
-                "stable-diffusion",
-                "seedream",
-            )
-        )
+        return _model_name_has_image_output(model)
     return False
+
+
+def _relay_serves_dedicated_image_endpoint(provider: str) -> bool:
+    """Bring-your-own-base_url relays whose image model is reached through a
+    dedicated images endpoint (``openrouter`` → ``/images``; ``openai_compatible``
+    → ``/images/generations``; see ``post_dedicated_image``).
+
+    Canonical ``openai`` is deliberately excluded: its reasoning models
+    generate images through the Responses API's hosted image tool, not a
+    dedicated images endpoint, so it keeps the name-marker gate (gpt-image-* →
+    dedicated; gpt-5.6 → Responses image tool).
+    """
+    return normalize_provider(provider) in {"openrouter", "openai_compatible"}
+
+
+def _image_output_wire_enabled(
+    provider: str,
+    model: str,
+    *,
+    image_generation_probe: bool = False,
+) -> bool:
+    """Whether to try the provider's dedicated images endpoint for this call.
+
+    An explicit setup probe is the user declaring "this is my image model", so
+    the dedicated endpoint is tried for any relay-style provider regardless of
+    the model id. The name marker used to gate the probe too, but it only knew
+    ``image``/``flux``/``dall-e``/``stable-diffusion``/``seedream`` — so a real
+    image model whose id carries none of them (measured: ``nai-diffusion-4-5-
+    full`` on a relay serving NovelAI) was reported "can't generate images"
+    before any request left the box, because the probe silently fell through to
+    the chat wire and got no media (T535). Trying the dedicated endpoint is a
+    cheap pre-flight: a genuinely non-image model is still rejected by the 4xx
+    it returns (or by producing no media), so opening the wire cannot pass a
+    model that does not actually generate.
+
+    Outside a probe (a live chat turn), the name marker still governs so an
+    ordinary chat model is never diverted onto the image wire on a hunch.
+    """
+    if image_generation_probe:
+        return _model_name_has_image_output(model) or _relay_serves_dedicated_image_endpoint(provider)
+    return _model_has_native_image_output(provider, model)
 
 
 def public_config(config: dict) -> dict:
@@ -613,12 +673,14 @@ def _response_error_detail(resp: httpx.Response) -> str:
 def _raise_for_provider_status(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
+    raw_response_body = resp.text
     detail = _response_error_detail(resp)
     suffix = f": {detail}" if detail else ""
     raise ProviderError(
         f"provider_http_{resp.status_code}{suffix}",
         status_code=resp.status_code,
         response_detail=detail,
+        raw_response_body=raw_response_body,
     )
 
 
@@ -2809,6 +2871,7 @@ def _build_openai_compat_payload(
     prompt_cache_key: str = "",
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
     assistant_prefill: str = "",
 ) -> dict[str, Any]:
     encoded_messages = _encode_messages_openai_chat(messages)
@@ -2830,12 +2893,28 @@ def _build_openai_compat_payload(
         payload.update(extra_body)
     if include_reasoning and provider == "openrouter":
         payload.setdefault("reasoning", {"enabled": True, "exclude": False})
-    if allow_image_output and _model_has_native_image_output(provider, model):
+    if allow_image_output and _image_output_wire_enabled(
+        provider,
+        model,
+        image_generation_probe=image_generation_probe,
+    ):
         payload["modalities"] = ["text", "image"]
     if tools:
         payload["tools"] = _encode_tools_openai_chat(tools)
         if tool_choice is not None:
             payload["tool_choice"] = copy.deepcopy(tool_choice)
+        # DeepSeek supports tools in thinking mode, but its Chat Completions
+        # endpoint rejects the narrower combination of native thinking and the
+        # literal ``required`` tool choice.  Keep thinking for ordinary/auto
+        # rounds and disable it only for the request whose wire contract must
+        # force a tool call.  Key this on the declared provider, never the URL:
+        # an openai_compatible route remains owned by that adapter even when it
+        # happens to point at a DeepSeek host.
+        if (
+            normalize_provider(provider) == "deepseek"
+            and payload.get("tool_choice") == "required"
+        ):
+            payload["thinking"] = {"type": "disabled"}
     if cache_key := _cache_key(prompt_cache_key):
         if provider == "openai":
             payload["prompt_cache_key"] = cache_key
@@ -4162,6 +4241,7 @@ def _build_gemini_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
     tool_choice: str | dict[str, Any] | None = None,
     assistant_prefill: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
@@ -4181,7 +4261,11 @@ def _build_gemini_payload(
             "thinkingBudget": min(1024, max(128, int(max_tokens) // 2)),
             "includeThoughts": True,
         }
-    if allow_image_output and _model_has_native_image_output("gemini", model):
+    if allow_image_output and _image_output_wire_enabled(
+        "gemini",
+        model,
+        image_generation_probe=image_generation_probe,
+    ):
         generation_config["responseModalities"] = ["TEXT", "IMAGE"]
 
     payload: dict[str, Any] = {
@@ -4743,6 +4827,10 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
                            timeout=timeout) as resp:
             status = resp.status_code
             if status >= 400:
+                # Catalog classification intentionally uses status only: 401 is
+                # key rejection, while 403 is the existing access_denied class.
+                # It is not a chat/vision/image sink and therefore does not
+                # retain raw_response_body on this streaming GET exception.
                 raise ProviderError(f"provider_http_{status}", status_code=status)
             for chunk in resp.iter_bytes():
                 if time.monotonic() >= deadline:
@@ -4976,6 +5064,7 @@ async def _chat_completion_async_impl(
     assistant_prefill: str = "",
     _attempt_trace: list[dict[str, Any]] | None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -5009,7 +5098,11 @@ async def _chat_completion_async_impl(
     if (
         provider in {"openai", "openrouter", "openai_compatible"}
         and allow_image_output
-        and _model_has_native_image_output(provider, request_model)
+        and _image_output_wire_enabled(
+            provider,
+            request_model,
+            image_generation_probe=image_generation_probe,
+        )
     ):
         dedicated_may_fall_back = provider == "openai_compatible"
         payload = _build_openrouter_images_payload(
@@ -5265,6 +5358,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             allow_image_output=allow_image_output,
+            image_generation_probe=image_generation_probe,
             tool_choice=tool_choice,
             assistant_prefill=effective_prefill,
         )
@@ -5395,6 +5489,7 @@ async def _chat_completion_async_impl(
         prompt_cache_key=config.prompt_cache_key,
         tool_choice=tool_choice,
         allow_image_output=allow_image_output,
+        image_generation_probe=image_generation_probe,
         assistant_prefill=effective_prefill,
     )
 
@@ -5478,6 +5573,7 @@ async def chat_completion_async(
     tools: "list[ToolSpec] | None" = None,
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
     assistant_prefill: str = "",
 ) -> dict[str, Any]:
     """Native async completion, optionally retaining every HTTP attempt.
@@ -5504,6 +5600,7 @@ async def chat_completion_async(
             tools=tools,
             tool_choice=tool_choice,
             allow_image_output=allow_image_output,
+            image_generation_probe=image_generation_probe,
             assistant_prefill=assistant_prefill,
             _attempt_trace=attempt_trace,
         )
@@ -5525,9 +5622,14 @@ async def generate_image_async(
 ) -> dict[str, Any]:
     """Generate one image through a provider-neutral saved route.
 
-    Mainline OpenAI routes use the Responses hosted image tool; dedicated
-    OpenAI/OpenRouter/Gemini-compatible image models use their native image
-    wire. Text-only routes fail before a second paid provider request.
+    Mainline OpenAI routes use the Responses hosted image tool. On a relay
+    (``openai_compatible`` / ``openrouter``) the model id is an explicit image
+    declaration, so the call reaches the provider's dedicated images endpoint
+    regardless of name and is judged by the real response — the endpoint's 4xx
+    or empty media, not a local name guess (T535). On non-relay providers
+    (deepseek / gemini) an image marker in the id still admits the call and a
+    marker-less model fails locally. Either way, only non-empty media proves the
+    route supports image generation.
     """
     provider, model, _ = validate_config(
         config.provider,
@@ -5540,8 +5642,16 @@ async def generate_image_async(
     if len(normalized_prompt) > 16_000:
         raise ProviderError("image prompt too long")
 
-    supported = _model_has_native_image_output(provider, model) or (
-        provider == "openai" and _openai_uses_responses_for_reasoning(model)
+    # A dedicated generate-image call (setup probe or a resident's real
+    # generation) is an explicit image-model declaration, so a relay-style
+    # provider is admitted regardless of the model id (T535). The name marker
+    # still admits image models on non-relay providers (e.g. deepseek /
+    # gemini). A truly non-image model is caught downstream by the endpoint's
+    # 4xx or by producing no media — not by guessing from the name here.
+    supported = (
+        _model_name_has_image_output(model)
+        or _relay_serves_dedicated_image_endpoint(provider)
+        or (provider == "openai" and _openai_uses_responses_for_reasoning(model))
     )
     if not supported:
         exc = ProviderError("image_generation_model_unsupported")
@@ -5564,6 +5674,7 @@ async def generate_image_async(
         include_reasoning=False,
         tools=None,
         allow_image_output=True,
+        image_generation_probe=True,
     )
     if not isinstance(result.get("media"), list) or not result["media"]:
         exc = ProviderError("image_generation_invalid_output")

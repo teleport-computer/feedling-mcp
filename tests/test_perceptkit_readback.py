@@ -144,7 +144,8 @@ def test_the_declared_unit_conversion_is_undone_on_the_way_back():
     """kit 存比率、老路存百分比。翻回去的时候要换回来，
     否则 agent 会读到 0.184% 的体脂。"""
     snap, _, _ = readback.merged_snapshot(
-        {}, {"health_body": [P("health_body", {"body_fat_ratio": 0.184})]},
+        {}, {"health_body_fat": [P("health_body_fat",
+                                   {"body_fat_ratio": 0.184})]},
         wanted={"body_fat_pct": 86400}, now=NOW,
     )
     assert snap["body_fat_pct"] == pytest.approx(18.4)

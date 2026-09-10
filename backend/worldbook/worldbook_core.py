@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import os
+import time
 
 from content.content_core import _apply_envelope_fields, _swap_envelope_missing
 from core import envelope as core_envelope
@@ -69,6 +70,7 @@ def _trace_match(
     job_id: str = "",
     lane: str = "",
     actor: str = "backend",
+    dur_ms: float | None = None,
 ) -> None:
     normalized_lane = str(lane or "").strip().lower()
     if normalized_lane not in _TRACE_LANES:
@@ -88,6 +90,9 @@ def _trace_match(
         trace_id=str(trace_id or ""),
         turn_id=str(trace_id or ""),
         job_id=str(job_id or ""),
+        # 这条曾经不带耗时,于是「每轮预注入到底贵不贵」在线上无法回答 ——
+        # 2026-09-07 排查世界书时就卡在这里,只能标 UNMEASURED。
+        dur_ms=dur_ms,
         detail={
             "operation": "match",
             "outcome": outcome,
@@ -251,6 +256,7 @@ def match(
     store, payload: dict, *, api_key: str | None, runtime_token: str | None,
     trace_id: str = "", job_id: str = "", lane: str = "", actor: str = "backend",
 ) -> tuple[dict, int]:
+    started = time.monotonic()
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     current = str(payload.get("message") or "").strip()
     if current:
@@ -263,6 +269,7 @@ def match(
             unavailable_count=0, message_count=len(messages), block_chars=0,
             outcome="no_entries", trace_id=trace_id, job_id=job_id,
             lane=lane, actor=actor,
+            dur_ms=(time.monotonic() - started) * 1000.0,
         )
         return {"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": []}, 200
     parts: list[dict] = []
@@ -328,6 +335,7 @@ def match(
                     outcome="unavailable", status="error",
                     reason="readside_unavailable", trace_id=trace_id,
                     job_id=job_id, lane=lane, actor=actor,
+                    dur_ms=(time.monotonic() - started) * 1000.0,
                 )
                 return {"error": "worldbook_match_unavailable", "detail": str(e)}, 503
             result["unavailable_ids"] = [
@@ -359,6 +367,7 @@ def match(
         block_chars=len(block),
         outcome=outcome,
         status=trace_status,
+        dur_ms=(time.monotonic() - started) * 1000.0,
         trace_id=trace_id,
         job_id=job_id,
         lane=lane,

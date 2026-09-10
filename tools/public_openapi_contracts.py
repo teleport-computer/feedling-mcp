@@ -1421,6 +1421,58 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
     },
+    "CanvasIndexEntry": {
+        "type": "object",
+        "required": [
+            "filename",
+            "revision",
+            "mime_type",
+            "created_at",
+            "updated_at",
+            "message_id",
+            "display_title",
+            "display_subtitle",
+        ],
+        "properties": {
+            "filename": {"type": "string", "minLength": 1, "maxLength": 120},
+            "revision": {"type": "integer", "minimum": 1},
+            "mime_type": {"type": "string"},
+            "created_at": {"type": "string", "format": "date-time"},
+            "updated_at": {"type": "string", "format": "date-time"},
+            "message_id": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 160},
+                    {"type": "null"},
+                ],
+                "description": "Newest matching agent-authored Chat file row, or null when the Canvas has no published attachment row.",
+            },
+            "display_title": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 120},
+                    {"type": "null"},
+                ],
+            },
+            "display_subtitle": {
+                "anyOf": [
+                    {"type": "string", "minLength": 1, "maxLength": 160},
+                    {"type": "null"},
+                ],
+            },
+        },
+        "additionalProperties": False,
+    },
+    "CanvasIndexResponse": {
+        "type": "object",
+        "required": ["canvases"],
+        "properties": {
+            "canvases": {
+                "type": "array",
+                "maxItems": 500,
+                "items": {"$ref": "#/components/schemas/CanvasIndexEntry"},
+            },
+        },
+        "additionalProperties": False,
+    },
     "ChatTransportRequest": {
         "type": "object",
         "required": ["envelope"],
@@ -1635,6 +1687,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "MemoryIndexRequest": {
         "type": "object",
         "properties": {
+            "query": {"type": "string", "maxLength": 500, "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."},
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
@@ -1643,6 +1696,22 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
         "example": {"limit": 50, "bucket": "Collaboration", "thread": "communication style"},
+    },
+    "MemoryIndexResponse": {
+        "type": "object",
+        "required": ["items", "limit", "truncated", "user_card_count"],
+        "properties": {
+            "items": {"type": "array", "items": {"type": "object", "additionalProperties": True},
+                      "description": "Lightweight card projections, no full content or BM25 scores. With query: BM25 descending, occurred_at descending, then ID ascending. Existing item score remains importance/recency, not BM25."},
+            "limit": {"type": "integer", "minimum": 1},
+            "truncated": {"type": "boolean", "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."},
+            "user_card_count": {"type": "integer", "minimum": 0},
+            "ranking": {"type": "string", "enum": ["bm25-jieba-0.42.1-v1", "substring-legacy"],
+                        "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."},
+            "unavailable_count": {"type": "integer", "minimum": 0,
+                                  "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."},
+        },
+        "additionalProperties": False,
     },
     "MemoryFetchRequest": {
         "type": "object",
@@ -1660,6 +1729,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["items", "missing_ids", "unavailable_ids", "truncation"],
         "properties": {
+            "related_status": {"type": "string", "enum": ["ok", "bounded", "unavailable", "not_needed"]},
+            "related_items": {
+                "type": "array", "maxItems": 6,
+                "description": "Same-user readable one-hop pointers only, not full bodies. Superseded cards appear only through explicit anchor/supersedes links and are marked historical.",
+                "items": {"type": "object", "required": ["id", "summary", "source_id", "relation", "status"],
+                          "properties": {"id": {"type": "string"}, "summary": {"type": "string", "maxLength": 120},
+                                         "source_id": {"type": "string"}, "relation": {"type": "string", "enum": ["anchor", "supersedes", "thread"]},
+                                         "status": {"type": "string"}}, "additionalProperties": False},
+            },
             "items": {
                 "type": "array",
                 "items": {"type": "object", "additionalProperties": True},
@@ -2492,7 +2570,23 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
-    ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
+    ("post", "/v1/chat/verify_loop"): (
+        "Unless the only_if_unverified short-circuit below applies, insert a "
+        "hidden liveness ping and wait for its exact hidden reply "
+        "(source=verify_ping and reply_to_message_id equal to this ping). "
+        "loop_alive reports whether that exact reply arrived; passing "
+        "additionally requires resident decrypt health to satisfy the "
+        "onboarding policy before sticky live-loop verification is recorded. "
+        "Optional request field only_if_unverified: when it is the JSON "
+        "literal true and the server already holds a sticky live-loop "
+        "verification for this user, no ping is inserted and no liveness "
+        "measurement is taken; the response is passing=true, "
+        "already_verified=true, loop_alive=null, response_time_sec=null and "
+        "an empty ping_id. Any other value, or an unverified user, runs the "
+        "ordinary ping. Intended for automated gate-opening callers such as "
+        "the hosted runner supervisor, so a runtime restart does not re-probe "
+        "every resident with a real model call."
+    ),
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("post", "/v1/model_api/setup"): (
         "Create or update the active hosted model route. context_window_tokens "
@@ -2529,6 +2623,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
+    ("get", "/v1/chat/canvases"): (
+        "List up to 500 current IO Canvas workspace entries for the authenticated "
+        "user, ordered by most recent workspace update. This metadata-only index "
+        "matches the .io.html suffix case-insensitively while preserving filename "
+        "case, and "
+        "never returns Canvas bodies or envelopes. message_id and display metadata "
+        "come from the newest matching agent-authored Chat file row and are null "
+        "when no such row exists."
+    ),
     ("get", "/v1/chat/workspace/body"): (
         "Read the authenticated user's current IO Canvas workspace envelope by "
         "the original .io.html file_name stored on its Chat attachment. The "
@@ -2540,12 +2643,14 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ),
     ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
-    ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
+    ("post", "/v1/memory/index"): "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 in the enclave, then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking.",
     ("post", "/v1/memory/fetch"): (
         "Fetch full records for selected memory IDs in request order. All shared "
         "cards use the same read contract; legacy card-classification metadata is "
         "ignored. Inspect the truncation object instead of assuming every "
-        "requested ID was processed."
+        "requested ID was processed. Optional related_items contains up to six "
+        "readable one-hop id/summary pointers; related_status distinguishes complete, "
+        "bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
     ),
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
@@ -2657,6 +2762,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/chat/canvases"): {
+        "200": {
+            "description": "The caller's current Canvas workspace metadata, newest first.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/CanvasIndexResponse"}
+                }
+            },
+        },
+    },
     ("get", "/v1/chat/workspace/body"): {
         "200": {
             "description": "The current Canvas workspace revision and opaque shared envelope.",
@@ -2730,6 +2845,12 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                 }
             },
         },
+    },
+    ("post", "/v1/memory/index"): {
+        "200": {"description": "Lightweight discovery/search result and explicit ranking mode.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MemoryIndexResponse"}}}},
+        "413": {"description": "memory_search_resource_limit: complete-corpus resource bound exceeded; no partial search result.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
     },
     ("post", "/v1/memory/fetch"): {
         "200": {

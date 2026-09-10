@@ -50,11 +50,11 @@ _BEHAVIOR_TRANSLATION_PAIRS = (
     ),
     (
         "Use only relevant returned memories as evidence.",
-        "只把搜到的相关记忆当作依据。",
+        "只能说记忆卡、「相关记忆」块或 memory_search/memory_fetch 结果里写着的内容。",
     ),
     (
         "If no relevant memory exists, say that plainly; do not substitute unrelated preferences or events as if they answered the requested subject.",
-        "没搜到相关记忆就直说；别拿无关偏好或事件冒充这个问题的答案。",
+        "没有这些支撑就先去查；查了还没有，就直说不记得、请对方告诉你。",
     ),
     (
         "Treat missing, disabled, or null tool readings as unavailable, never as zero or evidence of a broken device.",
@@ -1440,7 +1440,8 @@ def test_identity_memory_and_style_headers_match_seven_exactly():
         "# 你的记忆\n"
         "你们之间的人、事、约定,你记住的都在这里。\n"
         "像人回忆那样用:该想起时自然带出,不用当清单念。\n"
-        "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。"
+        "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。\n"
+        "涉及具体的人、物、编号、约定,先查再答;查不到就说没记住。"
     )
     assert context.USER_PROFILE_HEADER == (
         "# 说话的分寸\n"

@@ -107,6 +107,29 @@ def photo_envelope(photo_id: str, *, occurred_at: float | datetime,
 # Device events
 # ---------------------------------------------------------------------------
 
+#: 客户端报的证据 -> manifest 的枚举。认不出的一律 `unknown`。
+_PRESENCE_EVIDENCE = {
+    "app_entered_foreground": "app_entered_foreground",
+    "foreground": "app_entered_foreground",
+    "app_became_active": "app_became_active",
+    "active": "app_became_active",
+    "protected_data_became_available": "protected_data_became_available",
+    "protected_data": "protected_data_became_available",
+}
+
+
+def _presence_evidence(payload: Mapping[str, Any]) -> str:
+    """凭什么说这个人回来了。
+
+    🔴 **认不出就是 `unknown`，不往强了猜。** 三种证据没有一种能证明解锁，
+    而下游一旦以为拿到了解锁证据，就会对 agent 说"用户刚解锁了手机" ——
+    那是一句编出来的事实。宁可说"不知道凭什么"，也不要说错。
+    """
+    raw = str(payload.get("presence_evidence")
+              or payload.get("evidence") or "").strip().lower()
+    return _PRESENCE_EVIDENCE.get(raw, "unknown")
+
+
 def device_event_envelope(event: Mapping[str, Any], *,
                           occurred_at: float | datetime,
                           timezone_id: str | None = None) -> dict[str, Any] | None:
@@ -139,11 +162,29 @@ def device_event_envelope(event: Mapping[str, Any], *,
                 "absence_quality": "measured" if isinstance(
                     seconds, (int, float)) and not isinstance(seconds, bool)
                     else "estimated",
+                # 凭什么说这个人回来了。客户端不给就是 `unknown` ——
+                # **不猜一个更强的证据**：`presence_recovery` 不等于解锁，
+                # 编强了下游就会说出"用户刚解锁了手机"这句没发生过的话。
+                # 事件类型叫 unlock_after_absence 是历史名字，不是证据。
+                "evidence": _presence_evidence(payload),
             },
             occurred_at=at, timezone_id=timezone_id,
             source_event_id=event_id or None,
         ))
 
+    # ⚠️ **这一段今天（2026-09-07）为止一次都没执行过**，原因不是接线问题：
+    #
+    #     iOS 的 /v1/device/events 只发两种事件 —— unlock_after_absence
+    #     （带 broadcast_state，不带 phash）和 app_presence（时区/语言）。
+    #     iOS 代码里 "phash" 出现 0 次，git 全历史也没有过。
+    #
+    # 也就是说条件的前一半**从来不可能满足**。同一个条件同时挡着老路的
+    # `screen_phash`（ingress_v2 里那段），所以那条唤醒也是死的 —— 没人发现
+    # 是因为 unlock_after_absence 不需要 phash，整条链看起来还活着。
+    #
+    # 要让它活过来得先决定：屏幕指纹在哪算（端上？还是服务端从 broadcast
+    # 的帧流算？），以及它该不该出设备。**在那之前不要把它当成"漏接"去修** ——
+    # 缺的是产出方，不是这一段。
     phash = payload.get("safe_screen_phash") or payload.get("screen_phash")
     broadcast_state = str(payload.get("broadcast_state") or "").strip().lower()
     if phash and broadcast_state in {"on", "broadcasting"}:

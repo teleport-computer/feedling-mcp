@@ -1,8 +1,9 @@
 """V2 记忆抽取（capture / dream）的**纯**核心：BYOK LLM 调用 + 解析 + 卡片→memory action。
 
-依赖方向：只 import provider_client（底层）和 stdlib/typing。**绝不**依赖任何托管运行时、
-数据库/持久化层或记忆落库模块 —— prompt 构造、解析函数、信封构造与落库都由调用方（worker）
-经参数/注入回调提供，这样本模块可以保持零 I/O、可单测（见源码顶层的依赖方向 grep 测试）。
+依赖方向：只 import provider_client、共享的 notices.error_contract（均为底层）和
+stdlib/typing。**绝不**依赖任何托管运行时、数据库/持久化层或记忆落库模块 —— prompt
+构造、解析函数、信封构造与落库都由调用方（worker）经参数/注入回调提供，这样本模块
+可以保持零 I/O、可单测（见源码顶层的依赖方向 grep 测试）。
 
 `cards_to_actions` / `consolidations_to_actions` 是从 `tools/chat_resident_consumer.py`
 的 `_capture_actions_from_cards` 移植过来的纯映射逻辑（spec §3.3）。resident 保留它自己的
@@ -16,6 +17,7 @@ import os
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
+from notices import error_contract
 
 _MAX_OUTPUT_TOKEN_SETTINGS = {
     "capture": ("FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS", 1500),
@@ -104,7 +106,7 @@ def provider_failure_code_from_reason(reason: str) -> str | None:
 
 
 def _provider_failure_code(exc: BaseException) -> str:
-    """Return a content-free provider failure class; never inspect messages."""
+    """Classify without inspecting user messages; provider error bodies are allowed."""
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):
         trace = provider_client.runtime_provider_attempt_trace(exc) or {}
@@ -117,7 +119,13 @@ def _provider_failure_code(exc: BaseException) -> str:
     if status == 402:
         return "quota_insufficient"
     if status in {401, 403}:
-        return "auth_invalid"
+        return (
+            "auth_invalid"
+            if error_contract.provider_response_is_auth_failure(
+                status, getattr(exc, "raw_response_body", "")
+            )
+            else "upstream_unavailable"
+        )
     if status == 404:
         return "model_not_found"
     if status == 429:
@@ -394,6 +402,14 @@ def _inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
+    # Optional future-package field: keep it inside the encrypted body. Old
+    # parsers omit it; no dependency on an unpublished memgarden API.
+    raw_cues = card.get("retrieval_cues")
+    cues = list(dict.fromkeys(" ".join(c.split())[:120] for c in
+                             (raw_cues if isinstance(raw_cues, list) else [])
+                             if isinstance(c, str) and c.strip()))[:5]
+    if cues:
+        inner["retrieval_cues"] = cues
     # 溯源提示:这张卡来自一个含该通电话的 capture 窗口,agent 可据此调
     # voice_transcript_read 回看原文。只在窗口"恰好含一通电话"时打——多通电话
     # 的窗口无法判断某张卡属于哪一通,给了就是假精度。放在加密正文里(不放

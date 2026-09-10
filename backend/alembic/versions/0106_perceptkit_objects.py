@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_current (
   expires_at            TIMESTAMPTZ,
   source_observation_id TEXT,
   source_revision       TEXT,
+  -- 🔴 这条当前值来自**上游的哪条事实**。撤回按 (source, source_event_id)
+  -- 精确匹配找它 —— 少了这两列，撤回记下来了、当前值却一条都重选不了，
+  -- 而且不报错。迁移 0108 给已有库补了这两列；新建的库走的是这份 DDL，
+  -- 两边必须一致。
+  source                TEXT,
+  source_event_id       TEXT,
   version               INT         NOT NULL DEFAULT 0,
   content_digest        TEXT,
   PRIMARY KEY (subject_id, signal, dimension_key)
@@ -193,6 +199,21 @@ CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
 -- and `last_attempted_at` a failed sync is indistinguishable from one that
 -- never ran, and "the calendar has been failing for three days" cannot be
 -- answered at all.
+-- Facts the source withdrew. Append-only: the observation stays so "why is
+-- there a gap on that day" remains answerable; this table is what keeps the
+-- withdrawn value out of the current projection and the day's aggregate.
+--
+-- `source` is in the key because two sources routinely reuse a
+-- source_event_id, and they are different facts.
+CREATE TABLE IF NOT EXISTS perceptkit_retraction (
+  subject_id      TEXT        NOT NULL,
+  signal          TEXT        NOT NULL,
+  source          TEXT        NOT NULL,
+  source_event_id TEXT        NOT NULL,
+  observed_at     TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (subject_id, signal, source, source_event_id)
+);
+
 CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
   subject_id              TEXT        NOT NULL,
   source                  TEXT        NOT NULL,
@@ -228,6 +249,25 @@ CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
   last_kit       TEXT,
   last_report_id TEXT,
   note           TEXT,
+  -- How far apart the two sides' readings were taken, seconds, for the most
+  -- recent occurrence; and the running max.
+  --
+  -- Without this a `differ` row is unreadable: two paths hold different
+  -- values either because one read the sensor later than the other, or
+  -- because one is wrong -- and the values alone cannot separate those. The
+  -- first is expected on anything that changes by the second; only the
+  -- second is worth acting on. 0.09% of prod comparisons came back `differ`
+  -- with no way to tell which, and that is what blocks retiring the live path.
+  last_skew_sec  DOUBLE PRECISION,
+  max_skew_sec   DOUBLE PRECISION,
+  -- 🔴 两边**各自的**取值时刻，不只是它们的差。
+  --
+  -- 差值回答了「谁读得晚多久」，但丢了两件事：谁更晚（skew 取了绝对值），
+  -- 以及绝对时间（没法和别的东西对时间线）。外部复核要的就是这两格 ——
+  -- 「取值时刻不同」和「其中一条路算错了」，光看值和次数分不开，
+  -- 而分不开就不能下线老路。
+  last_live_at   TIMESTAMPTZ,
+  last_kit_at    TIMESTAMPTZ,
   PRIMARY KEY (subject_id, signal, field, verdict)
 );
 """

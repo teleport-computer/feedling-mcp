@@ -118,30 +118,29 @@ COMPARABLE: dict[str, dict[str, Any]] = {
         # the correct thing for it to read.
         "step_count": "step_count",
     },
-    "health_vitals": {
-        "resting_heart_rate": "resting_heart_rate",
-        "current_heart_rate": "current_heart_rate",
-        "hrv_sdnn_ms": "hrv_sdnn_ms",
-        "respiratory_rate": "respiratory_rate",
-        "oxygen_saturation_pct": "oxygen_saturation_pct",
-        "vo2_max": "vo2_max",
-    },
+    # 0.4.0 之后 kit 这一侧按单指标拆开了，活路径没有 —— 它仍然把整包体征
+    # 写进同一份扁平 state。所以这里是「一个活字段 : 一个 kit 信号」，
+    # 字段名两边一样，只是 kit 那侧各自成信号。
+    "health_resting_hr": {"resting_heart_rate": "resting_heart_rate"},
+    "health_current_hr": {"current_heart_rate": "current_heart_rate"},
+    "health_hrv": {"hrv_sdnn_ms": "hrv_sdnn_ms"},
+    "health_respiratory": {"respiratory_rate": "respiratory_rate"},
+    "health_oxygen": {"oxygen_saturation_pct": "oxygen_saturation_pct"},
+    "health_vo2max": {"vo2_max": "vo2_max"},
     "health_activity": {
         "active_energy_kcal": "active_energy_kcal",
         "exercise_minutes": "exercise_minutes",
         "stand_minutes": "stand_minutes",
         "mindful_minutes": "mindful_minutes",
     },
-    "health_body": {
-        "weight_kg": "weight_kg",
-        "bmi": "bmi",
-        "height_cm": "height_cm",
-        # Paired across a real unit difference; the conversion is declared in
-        # UNIT_BRIDGE below rather than assumed here.
-        "body_fat_ratio": "body_fat_pct",
-    },
-    "health_metabolic": {
-        "blood_glucose_mmol_l": "blood_glucose_mmol_l",
+    "health_weight": {"weight_kg": "weight_kg"},
+    "health_bmi": {"bmi": "bmi"},
+    "health_height": {"height_cm": "height_cm"},
+    # Paired across a real unit difference; the conversion is declared in
+    # UNIT_BRIDGE below rather than assumed here.
+    "health_body_fat": {"body_fat_ratio": "body_fat_pct"},
+    "health_glucose": {"blood_glucose_mmol_l": "blood_glucose_mmol_l"},
+    "health_blood_pressure": {
         "blood_pressure_systolic_mmhg": "blood_pressure_systolic",
         "blood_pressure_diastolic_mmhg": "blood_pressure_diastolic",
     },
@@ -191,6 +190,12 @@ KIT_ONLY: dict[tuple[str, str], str] = {
     ("health_cycle", "end_at"): "live stores no cycle interval",
     ("health_mood", "labels"): "live stores a count, the kit stores the labels",
     ("health_mood", "recorded_at"): "live stores a same-day boolean, not a time",
+    ("presence_recovery", "evidence"):
+        "凭什么说人回来了 —— 老路只记「回来了」这件事本身，没有证据这一格",
+    # 计数器纪元是 kit 用来区分「重置」和「修订」的记账，老路没有对应概念 ——
+    # 它一味取 max，所以压根不需要知道计数器重置过。
+    ("steps", "counter_epoch_id"): "kit-only：老路取 max，不区分重置和修订",
+    ("health_activity", "counter_epoch_id"): "kit-only：同 steps",
     ("app_usage", "app_id"): "no bundle id on the Shortcut path; same string as app_name",
     ("app_usage", "open_count"): "the kit counts opens by aggregating; the live path keeps no counter",
     ("location_city", "region"): "iOS releases the locality and country, not the administrative region",
@@ -234,6 +239,13 @@ SHAPE_DIFFERS: dict[str, str] = {
         "live keeps label_count and a same-day boolean; the kit keeps the "
         "labels themselves and a recorded_at."
     ),
+    # ⚠️ `app_usage` **刻意不放进来**，尽管外部复核怀疑它「比对方法根本不适用」
+    # （occurrence 流，"当前值"本身是竞态：live wechat/open vs kit douyin/close
+    # 是两个不同的事件，不是同一个值的两个精度）。
+    #
+    # 那是个假设，而现在有了两边各自的 observed_at 就能让数据自己回答：
+    # 分歧全都带着非零时差 → 竞态成立，那时再放进来；时差为 0 却值不同
+    # → 是真 bug，放进来就把它藏起来了。**先收证据，再下结论。**
 }
 
 #: Pairs whose live holder may be the bare value rather than an object.
@@ -272,7 +284,7 @@ LIVE_VOCABULARY: dict[tuple[str, str], dict[str, str]] = {
 #: the comparison goes red.
 UNIT_BRIDGE: dict[tuple[str, str], Any] = {
     # iOS reports body fat as a percentage; the manifest declares a ratio.
-    ("health_body", "body_fat_ratio"): lambda v: v / 100.0,
+    ("health_body_fat", "body_fat_ratio"): lambda v: v / 100.0,
 }
 
 
@@ -330,6 +342,27 @@ class Divergence:
     live: Any = None
     kit: Any = None
     note: str = ""
+    #: When each side's value was observed, epoch seconds. Both may be None.
+    #:
+    #: 🔴 Without these a `differ` is unreadable. Two paths can hold different
+    #: values for two completely different reasons -- one of them read the
+    #: sensor a minute later than the other, or one of them is wrong -- and
+    #: the values alone cannot tell them apart. The first is expected on
+    #: anything that changes by the second (battery, weather, heart rate);
+    #: the second is the only one worth waking anyone up for.
+    #:
+    #: Recorded because 0.09% of prod comparisons came back `differ` and the
+    #: table had no way to say which kind they were, which is what blocks
+    #: retiring the live path.
+    live_at: float | None = None
+    kit_at: float | None = None
+
+    @property
+    def skew_seconds(self) -> float | None:
+        """How far apart the two readings were taken. None if either is unknown."""
+        if self.live_at is None or self.kit_at is None:
+            return None
+        return abs(float(self.live_at) - float(self.kit_at))
 
     @property
     def interesting(self) -> bool:
@@ -355,6 +388,23 @@ def _same(live: Any, kit: Any) -> bool:
         return len(live) == len(kit) and all(
             _same(a, b) for a, b in zip(live, kit))
     return live == kit
+
+
+def _live_at(state: Mapping[str, Any], where: Any) -> float | None:
+    """When the live path last wrote this cell, epoch seconds.
+
+    The cell is ``{"v": value, "ts": epoch}``; a nested ``where`` reads the
+    same cell, because the live path timestamps the whole object, not each
+    key inside it.
+    """
+    field = where[0] if isinstance(where, tuple) else where
+    cell = state.get(field)
+    if not isinstance(cell, Mapping):
+        return None
+    try:
+        return float(cell.get("ts")) if cell.get("ts") is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _live_value(state: Mapping[str, Any], where: Any, signal: str = "") -> Any:
@@ -452,7 +502,12 @@ def compare(
                 verdict = "agree"
             else:
                 verdict = "differ"
-            findings.append(Divergence(signal, kit_field, verdict, live, kit, note))
+            kit_at = None
+            if projection is not None and projection.observed_at is not None:
+                kit_at = projection.observed_at.timestamp()
+            findings.append(Divergence(
+                signal, kit_field, verdict, live, kit, note,
+                live_at=_live_at(live_state, live_where), kit_at=kit_at))
 
         for kit_field in sorted(typed):
             if kit_field in pairs:
@@ -505,16 +560,37 @@ def undeclared_pairs(signals: Mapping[str, Any]) -> list[str]:
 _UPSERT = """
 INSERT INTO perceptkit_shadow_divergence
   (subject_id, signal, field, verdict, occurrences,
-   first_seen_at, last_seen_at, last_live, last_kit, last_report_id, note)
-VALUES (%s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s)
+   first_seen_at, last_seen_at, last_live, last_kit, last_report_id, note,
+   last_skew_sec, max_skew_sec, last_live_at, last_kit_at)
+VALUES (%s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (subject_id, signal, field, verdict) DO UPDATE SET
   occurrences    = perceptkit_shadow_divergence.occurrences + 1,
   last_seen_at   = EXCLUDED.last_seen_at,
   last_live      = EXCLUDED.last_live,
   last_kit       = EXCLUDED.last_kit,
   last_report_id = EXCLUDED.last_report_id,
-  note           = EXCLUDED.note
+  note           = EXCLUDED.note,
+  last_skew_sec  = EXCLUDED.last_skew_sec,
+  -- GREATEST ignores NULL, so a run that could not measure the skew does not
+  -- wipe the max an earlier run established.
+  max_skew_sec   = GREATEST(perceptkit_shadow_divergence.max_skew_sec,
+                            EXCLUDED.last_skew_sec),
+  -- 两边各自的时刻。skew 是它们的差且取了绝对值 —— 差值答得了「差多久」，
+  -- 答不了「谁更晚」和「什么时候」。
+  last_live_at   = EXCLUDED.last_live_at,
+  last_kit_at    = EXCLUDED.last_kit_at
 """
+
+
+def _at(epoch: float | None):
+    """epoch 秒 -> aware datetime。给不出来就是 None，不编。"""
+    if epoch is None:
+        return None
+    from datetime import datetime, timezone
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 def record(conn: Any, subject_id: str, findings: Sequence[Divergence], *,
@@ -531,6 +607,10 @@ def record(conn: Any, subject_id: str, findings: Sequence[Divergence], *,
             sample(d.kit) if keep else None,
             report_id if keep else None,
             d.note or None,
+            d.skew_seconds if keep else None,
+            d.skew_seconds if keep else None,
+            _at(d.live_at) if keep else None,
+            _at(d.kit_at) if keep else None,
         ))
     with conn.cursor() as cur:
         cur.executemany(_UPSERT, rows)
@@ -556,7 +636,18 @@ def summarize(conn: Any, *, subject_id: str | None = None,
         "       COUNT(DISTINCT subject_id) AS subjects, "
         "       MAX(last_seen_at) AS last_seen, "
         "       (array_agg(last_live ORDER BY last_seen_at DESC))[1] AS live, "
-        "       (array_agg(last_kit  ORDER BY last_seen_at DESC))[1] AS kit "
+        "       (array_agg(last_kit  ORDER BY last_seen_at DESC))[1] AS kit, "
+        # 这两个是读 `differ` 的钥匙：偏斜大 = 两边读取时刻不同（快变量的
+        # 正常现象），偏斜接近 0 而值不同 = 真的有一边算错了。
+        "       (array_agg(last_skew_sec ORDER BY last_seen_at DESC))[1] "
+        "         AS last_skew_sec, "
+        "       MAX(max_skew_sec) AS max_skew_sec, "
+        # 两边各自的时刻要一起报出来，否则存了也没人看得到 ——
+        # 报告是这张表唯一的出口。
+        "       (array_agg(last_live_at ORDER BY last_seen_at DESC))[1] "
+        "         AS last_live_at, "
+        "       (array_agg(last_kit_at  ORDER BY last_seen_at DESC))[1] "
+        "         AS last_kit_at "
         "FROM perceptkit_shadow_divergence "
         f"WHERE {' AND '.join(where)} "
         "GROUP BY signal, field, verdict "

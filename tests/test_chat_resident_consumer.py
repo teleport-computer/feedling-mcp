@@ -7,6 +7,7 @@ Run with: pytest tests/test_chat_resident_consumer.py -v
 
 import ast
 import base64
+import collections
 import json
 import os
 import shlex
@@ -1359,7 +1360,532 @@ def test_screen_context_tool_mode_never_prefetches(monkeypatch):
     assert crc._screen_context_for_message("你能看到我的屏幕吗") == ("", [], [])
 
 
-def test_foreground_worldbook_tool_mode_never_prefetches(monkeypatch):
+def _worldbook_mode_from_fresh_import(configured: str | None) -> str:
+    """在**干净子进程**里读默认值。
+
+    不能拿本进程的 crc.FOREGROUND_WORLDBOOK_CONTEXT_MODE 来断言:跑测试的机器/CI
+    只要显式设了这个变量，断言就会静默地测不到默认值（第一版用了 skip，等于在带
+    配置的环境里这条回归根本不存在）。形状照 tests/test_io_cli_auth.py 的
+    `_foreground_context_limit_from_fresh_import`。
+    """
+    env = os.environ.copy()
+    if configured is None:
+        env.pop("FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT", None)
+    else:
+        env["FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT"] = configured
+    root = Path(__file__).resolve().parent.parent
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(root / "tools"), str(root / "backend"), env.get("PYTHONPATH")])
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import chat_resident_consumer as resident; "
+            "print(resident.FOREGROUND_WORLDBOOK_CONTEXT_MODE)",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip().splitlines()[-1]
+
+
+def test_foreground_worldbook_default_is_eager():
+    """默认必须是 eager —— 这条规则的全部价值就在默认值上。
+
+    改成 "tool"（让模型自己去调）在线上被证伪:近 3 天有世界书条目的 47 个用户里
+    只有 9 个拿到过一次带 query 的匹配。默认值一旦被改回去，用户写的设定又会静默
+    地不生效，而且没有任何报错 —— 所以这里钉死它。
+    """
+    assert _worldbook_mode_from_fresh_import(None) == "eager"
+
+
+def test_foreground_worldbook_mode_honors_environment_override():
+    assert _worldbook_mode_from_fresh_import("tool") == "tool"
+
+
+def test_foreground_worldbook_sends_the_recent_window_not_just_this_message(
+    monkeypatch,
+):
+    """扫描深度必须对齐 worldbook_match.WORLD_BOOK_SCAN_MESSAGES。
+
+    只传当前一条等于深度 1，「上一句提了地名、这一句问它」这类跨句触发会全漏。
+    深度从被测模块派生，不写死 5。
+    """
+    import worldbook_match as _wbm
+
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(
+        crc, "_worldbook_signal_window", collections.deque(maxlen=crc.WORLDBOOK_SIGNAL_WINDOW)
+    )
+    crc._remember_worldbook_signal("user", "我们去青岚学院吧")
+    crc._remember_worldbook_signal("assistant", "好啊")
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    crc._worldbook_context_for_foreground("那边现在什么季节")
+
+    sent = post.call_args.kwargs["json"]
+    assert [m["content"] for m in sent["messages"]] == ["我们去青岚学院吧", "好啊"]
+    assert sent["message"] == "那边现在什么季节"
+    # 窗口容量必须跟着匹配器走，不是各写各的；且 = N-1，给本轮那一句留位
+    assert crc.WORLDBOOK_SIGNAL_WINDOW == _wbm.WORLD_BOOK_SCAN_MESSAGES - 1
+    assert crc._worldbook_signal_window.maxlen == _wbm.WORLD_BOOK_SCAN_MESSAGES - 1
+
+
+def test_foreground_worldbook_full_window_sends_exactly_scan_depth(monkeypatch):
+    """满窗时送出 prior=N-1 条,后端再追加当前句,总数恰好 = N。
+
+    第一版 deque maxlen=N,于是满窗实际送 N+1 条:matcher 只取最后 N,trace 的
+    counts.messages 却虚报扫描量(codex 复审实测 prior=5、backend message_count=6)。
+    """
+    import worldbook_match as _wbm
+
+    n = _wbm.WORLD_BOOK_SCAN_MESSAGES
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=crc.WORLDBOOK_SIGNAL_WINDOW))
+    for i in range(n + 3):                       # 故意超量,验证 deque 自己裁
+        crc._remember_worldbook_signal("user" if i % 2 == 0 else "assistant", f"第{i}句")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    crc._worldbook_context_for_foreground("当前句")
+
+    sent = post.call_args.kwargs["json"]
+    assert len(sent["messages"]) == n - 1
+    assert len(sent["messages"]) + 1 == n            # + 当前 `message` = 匹配器深度
+    assert sent["messages"][-1]["content"] == f"第{n + 2}句"   # 留下的是最新的
+
+
+def test_worldbook_signal_window_capacity_handles_scan_depth_of_one(monkeypatch):
+    """N<=1 时容量为 0:deque(maxlen=0) 永远为空,只送当前句,不能负数也不能崩。"""
+    import worldbook_match as _wbm
+
+    monkeypatch.setattr(_wbm, "WORLD_BOOK_SCAN_MESSAGES", 1)
+    cap = max(0, _wbm.WORLD_BOOK_SCAN_MESSAGES - 1)
+    assert cap == 0
+    window = collections.deque(maxlen=cap)
+    window.append({"role": "user", "content": "x"})
+    assert list(window) == []
+
+
+def test_foreground_worldbook_match_seeds_the_window_before_asking(monkeypatch):
+    """光测 seed 函数本身抓不到「调用点被删掉」——那样窗口又退回 session-local。"""
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    seeded: list[float] = []
+    monkeypatch.setattr(
+        crc, "_seed_worldbook_signal_window", lambda before_ts: seeded.append(before_ts)
+    )
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    monkeypatch.setattr(crc._HTTP, "post", MagicMock(return_value=response))
+
+    crc._worldbook_context_for_foreground("那边现在什么季节", before_ts=4600.0)
+
+    assert seeded == [4600.0]
+
+
+def test_worldbook_signal_window_refuses_empty_text(monkeypatch):
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=5))
+    crc._remember_worldbook_signal("user", "   ")
+    crc._remember_worldbook_signal("user", "")
+    assert list(crc._worldbook_signal_window) == []
+
+
+def test_foreground_worldbook_never_matches_on_untrusted_screen_text(monkeypatch):
+    """屏幕文本绝不能参与选世界书条目。
+
+    调用点上方就把屏幕文本拼进了 content；拿那个 content 去匹配，等于让屏幕上的
+    字决定 prompt 里出现什么，绕开「屏幕文本 pull-only」的防注入姿态 —— 与
+    `_worldbook_context_for_wake` 的 docstring 是同一条红线。本测试锁的是:送进
+    匹配器的文本必须是**用户自己那句**，不含屏幕注入。
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(
+        crc,
+        "_worldbook_context_for_foreground",
+        lambda text, **_kwargs: (seen.append(text), "")[1],
+    )
+    monkeypatch.setattr(
+        crc,
+        "_screen_context_for_message",
+        lambda _content: (
+            "UNTRUSTED LIVE SCREEN-SHARE FRAMES\nocr_text: 青岚学院的校规",
+            [],
+            [],
+        ),
+    )
+    msg = _make_msg(role="user", content="今天过得怎么样", ts=3300.0)
+
+    with patch.object(crc, "call_agent", return_value="ok"), patch.object(
+        crc, "post_reply"
+    ):
+        crc._process_messages([msg])
+
+    assert seen == ["今天过得怎么样"]
+    assert not any("ocr_text" in text or "SCREEN-SHARE" in text for text in seen)
+
+
+def test_worldbook_window_is_not_written_until_the_turn_settles(monkeypatch):
+    """回合没落定就写窗口 = 重试后留下幽灵副本。
+
+    transient 写失败会 `_unmark_seen` 把同一条消息放回去重跑。第一版在匹配处就
+    入窗口，于是第二次尝试时窗口里出现两条一模一样的 user 行 —— 既挤掉真实的最近
+    行，又让同一句重复触发（codex 复审实测到这个读数）。
+    """
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=5))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)   # 本测试不测 seed
+    seen_windows: list[list[str]] = []
+
+    def _fake_match(text, **_kwargs):
+        seen_windows.append([m["content"] for m in crc._worldbook_signal_window])
+        return ""
+
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", _fake_match)
+    monkeypatch.setattr(
+        crc, "post_reply", MagicMock(side_effect=RuntimeError("transient write"))
+    )
+    msg = _make_msg(role="user", content="青岚学院在哪", ts=4400.0)
+
+    with patch.object(crc, "call_agent", return_value="在北边"):
+        crc._process_messages([msg])
+        crc._process_messages([msg])          # 重试同一条
+
+    assert len(seen_windows) == 2
+    assert seen_windows[0] == []
+    assert seen_windows[1] == [], f"重试看到了幽灵副本: {seen_windows[1]}"
+
+
+def test_worldbook_window_records_user_then_reply_once_a_turn_settles(monkeypatch):
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=5))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *_a, **_k: "")
+    monkeypatch.setattr(crc, "post_reply", MagicMock(return_value={"ok": True}))
+    msg = _make_msg(role="user", content="青岚学院在哪", ts=4500.0)
+
+    with patch.object(crc, "call_agent", return_value="在北边"):
+        crc._process_messages([msg])
+
+    assert [
+        (m["role"], m["content"]) for m in crc._worldbook_signal_window
+    ] == [("user", "青岚学院在哪"), ("assistant", "在北边")]
+
+
+def test_worldbook_window_seed_backfills_from_durable_history(monkeypatch):
+    """进程重启后不能只剩 session-local 的一两条。
+
+    重启前第 1 句写了关键词、重启后第 2 句才指代它 —— 那正是本单要修的跨句形状，
+    不能用「退化成 1~2 条不影响正确性」含糊过去。
+    """
+    import worldbook_match as _wbm
+
+    monkeypatch.setattr(
+        crc, "_worldbook_signal_window", collections.deque(maxlen=crc.WORLDBOOK_SIGNAL_WINDOW)
+    )
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    history = [
+        _make_msg(role="user", content="我们去青岚学院", ts=100.0),
+        _make_msg(role="openclaw", content="好啊", ts=101.0),
+        _make_msg(role="system", content="上游报错提醒", ts=102.0),
+        _make_msg(role="user", content="带上地图", ts=103.0),
+        _make_msg(role="openclaw", content="收到", ts=104.0),
+        _make_msg(role="user", content="更早之前", ts=1.0),
+        _make_msg(role="user", content="这条比本轮新，不许进", ts=999.0),
+    ]
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)
+
+    contents = [m["content"] for m in crc._worldbook_signal_window]
+    assert "这条比本轮新，不许进" not in contents
+    assert "上游报错提醒" not in contents          # system 通知不是发言过的话
+    # 至多 WINDOW-1 条,给本轮那条留位置
+    assert len(contents) <= _wbm.WORLD_BOOK_SCAN_MESSAGES - 1
+    assert contents[-1] == "收到"
+    assert "我们去青岚学院" in contents
+
+
+def test_worldbook_window_seed_retries_after_transient_none_then_backfills(monkeypatch):
+    """首次 None(无可用源)/异常不能永久记成「已补齐」。
+
+    第一版在读之前就置 seeded=True,又把 None 经 `history or []` 当成功空历史:
+    codex 实测 first=None、second=可用历史时 history_calls=1、seeded=True、window=[]
+    —— 本进程此后永不补齐,重启后跨句匹配仍退回深度 1。
+    """
+    outcomes = iter([None, RuntimeError("decrypt source down"), [
+        _make_msg(role="user", content="我们去青岚学院", ts=100.0),
+        _make_msg(role="openclaw", content="好啊", ts=101.0),
+    ]])
+    calls = {"n": 0}
+
+    def _history(**_kw):
+        calls["n"] += 1
+        item = next(outcomes)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    monkeypatch.setattr(crc, "get_decrypted_history", _history)
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # None → 未补齐
+    assert crc._worldbook_window_seeded is False and list(crc._worldbook_signal_window) == []
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 节流窗口内 → 不打源
+    assert calls["n"] == 1
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 异常 → 仍未补齐
+    assert calls["n"] == 2 and crc._worldbook_window_seeded is False
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 拿到 list → 补齐
+    assert calls["n"] == 3 and crc._worldbook_window_seeded is True
+    assert [m["content"] for m in crc._worldbook_signal_window] == ["我们去青岚学院", "好啊"]
+
+
+def test_worldbook_window_seed_merges_with_live_turns_without_duplicates(monkeypatch):
+    """瞬断期间已落定的回合，恢复补齐时不能再 append 一遍。
+
+    codex r2 实测：first seed=None → 落定 remember(user, assistant) → 61s 后 history 返回
+    同一对 → 窗口 = [用户,回复,用户,回复]，重复且挤掉更早信号。正确语义：durable 快照
+    是更早信号的权威来源；live 里尚未出现在 durable 中的回合保留在其后；同
+    (role, content) 只计一次，且尽可能多地保留真实最近信号。
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    outcomes = iter([None, [
+        _make_msg(role="user", content="更早的用户句", ts=50.0),
+        _make_msg(role="openclaw", content="更早的回复", ts=51.0),
+        _make_msg(role="user", content="上一轮用户", ts=100.0),
+        _make_msg(role="openclaw", content="上一轮回复", ts=101.0),
+    ]])
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: next(outcomes))
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # None → 未补齐
+    crc._remember_worldbook_signal("user", "上一轮用户", ts=100.0)      # 瞬断期间回合落定
+    crc._remember_worldbook_signal("assistant", "上一轮回复", ts=101.0)
+    crc._remember_worldbook_signal("assistant", "只在 live 里的新回复", ts=102.0)  # durable 尚未看到
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # 恢复 → 合并
+
+    contents = [m["content"] for m in crc._worldbook_signal_window]
+    assert contents.count("上一轮用户") == 1 and contents.count("上一轮回复") == 1
+    # maxlen=4 下保留尽可能多的最近信号：durable 更早 2 条 + live 3 条 → 留最新 4
+    assert contents == ["更早的回复", "上一轮用户", "上一轮回复", "只在 live 里的新回复"]
+    assert crc._worldbook_window_seeded is True
+
+
+def test_worldbook_window_seed_keeps_legitimate_repeats_from_different_moments(monkeypatch):
+    """同文 ≠ 同事件。
+
+    codex r3 实测：durable=[user:"好"@旧, assistant:"旧回复"]，读侧滞后期间
+    live=[user:"好"@新, assistant:"这是新一轮回复"]；按 (role, content) 去重会把新的那条
+    user:"好" 吞掉。最近 N 条允许内容相同，身份是时间，不是文本。
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    outcomes = iter([None, [
+        _make_msg(role="user", content="好", ts=10.0),
+        _make_msg(role="openclaw", content="旧回复", ts=11.0),
+    ]])
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: next(outcomes))
+
+    crc._seed_worldbook_signal_window(before_ts=500.0)          # None
+    crc._remember_worldbook_signal("user", "好", ts=100.0)        # 新一轮，同文
+    crc._remember_worldbook_signal("assistant", "这是新一轮回复", ts=101.0)
+    clock["t"] += crc._WORLDBOOK_SEED_RETRY_SEC + 1
+    crc._seed_worldbook_signal_window(before_ts=500.0)
+
+    assert [(m["role"], m["content"]) for m in crc._worldbook_signal_window] == [
+        ("user", "好"), ("assistant", "旧回复"),
+        ("user", "好"), ("assistant", "这是新一轮回复"),
+    ]
+
+
+def _proactive_job_for_worldbook(ts: float = 123.0) -> dict:
+    # job_id 从 ts 派生：consumer 对已处理 job 有进程内去重，两格若共用同一个 id，
+    # 第二格根本不会发（单跑绿、合跑红的那种漏）。每格传不同 ts。
+    return {
+        "schema_version": 2, "job_id": f"pj_wb_{int(ts)}", "wake_id": "wake_wb",
+        "gate_decision_id": "gd_wb", "source": crc.PROACTIVE_JOB_SOURCE, "ts": ts,
+        "trigger": "screen_tick", "wake_kind": "screen", "user_state": "default",
+        "ai_state": "present", "broadcast_state": "on", "current_app": "Docs",
+        "frame_ids": ["frame_1"],
+    }
+
+
+def _wire_proactive_harness(monkeypatch, *, replies: list[str], post_result):
+    monkeypatch.setattr(crc, "call_agent", lambda *_a, **_k: "\n\n".join(replies))
+    posted: list[str] = []
+
+    def _post(reply, **_kwargs):
+        posted.append(reply)
+        return post_result
+
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda: False)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda job: "")
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids",
+                        lambda frame_ids: ("screen: reading", [{"data": "x"}], ["/tmp/f.jpg"]))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    return posted
+
+
+def test_successful_proactive_reply_enters_worldbook_window_once(monkeypatch):
+    """主动道确认发出的回复 = Feedling 自己的回复，必须进窗口（seed 之后不再拉历史，
+    不记就永远漏）。"""
+    posted = _wire_proactive_harness(
+        monkeypatch, replies=["青岚学院今年的观星祭快到了。"], post_result={"id": "msg_p1"})
+
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=201.0)])
+
+    assert posted == ["青岚学院今年的观星祭快到了。"]
+    assert [(m["role"], m["content"]) for m in crc._worldbook_signal_window] == [
+        ("assistant", "青岚学院今年的观星祭快到了。")
+    ]
+
+
+def test_failed_proactive_post_leaves_no_ghost_in_worldbook_window(monkeypatch):
+    _wire_proactive_harness(
+        monkeypatch, replies=["不该进窗口的段"], post_result={"error": "transient"})
+
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=202.0)])
+
+    assert list(crc._worldbook_signal_window) == []
+
+
+def test_proactive_multi_segment_records_only_successfully_posted_segments(monkeypatch):
+    """多段回复逐条记、只记成功的段。段来自 `_split_agent_turn` 的结构化结果，不是
+    按空行切文本，所以这里直接给一个三段的 AgentTurn。"""
+    results = iter([{"id": "ok1"}, {"error": "transient"}, {"id": "ok3"}])
+    monkeypatch.setattr(crc, "call_agent", lambda *_a, **_k: "raw")
+    monkeypatch.setattr(
+        crc, "_split_agent_turn",
+        lambda *_a, **_k: crc.AgentTurn(messages=["第一段", "第二段", "第三段"]),
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **_k: next(results))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(crc, "_proactive_chat_collision", lambda: False)
+    monkeypatch.setattr(crc, "_worldbook_context_for_wake", lambda job: "")
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids",
+                        lambda frame_ids: ("screen: reading", [{"data": "x"}], ["/tmp/f.jpg"]))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=203.0)])
+
+    assert [m["content"] for m in crc._worldbook_signal_window] == ["第一段", "第三段"]
+
+
+def test_proactive_reply_then_keywordless_question_reaches_the_matcher(monkeypatch):
+    """主动先说「青岚学院…」，用户随后只问「那里呢？」：foreground 的 payload 必须带上
+    那条主动回复 —— 旧代码（主动道不记窗口）必红。"""
+    _wire_proactive_harness(
+        monkeypatch, replies=["青岚学院今年的观星祭快到了。"], post_result={"id": "msg_p1"})
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=204.0)])
+
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"block": "", "matched_names": []}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+
+    crc._worldbook_context_for_foreground("那里呢？")
+
+    sent = post.call_args.kwargs["json"]
+    assert sent["message"] == "那里呢？"
+    assert {"role": "assistant", "content": "青岚学院今年的观星祭快到了。"} in sent["messages"]
+
+
+def test_worldbook_signal_payload_never_carries_local_ts(monkeypatch):
+    """ts 是本地身份，不外传：送给 /v1/worldbook/match 的窗口只有 role/content。"""
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    crc._remember_worldbook_signal("user", "x", ts=1.0)
+    assert crc._worldbook_signal_payload() == [{"role": "user", "content": "x"}]
+
+
+def test_foreground_worldbook_context_applied_trace_is_content_free(monkeypatch):
+    """resident V1 **前台**的 worldbook.context.applied：事件闭集、无 content_excerpt、
+    不带条目正文也不带用户原文。live /v1/debug/trace 的投影可能已脱敏，证不了 emitter
+    从未写入正文 —— 只有这格能。现有格只钉了唤醒道。"""
+    block = "<world_book>私密世界设定正文</world_book>"
+    events: list[dict] = []
+    monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "eager")
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", True)
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *_a, **_k: block)
+    monkeypatch.setattr(crc, "_screen_context_for_message", lambda _c: ("", [], []))
+    monkeypatch.setattr(
+        crc, "_emit_debug_trace",
+        lambda subsystem, event_type, **fields: events.append(
+            {"subsystem": subsystem, "type": event_type, **fields}),
+    )
+    monkeypatch.setattr(crc, "post_reply", MagicMock(return_value={"ok": True}))
+    user_text = "私密的用户提问原文"
+    msg = _make_msg(role="user", content=user_text, ts=4700.0)
+
+    with patch.object(crc, "call_agent", return_value="ok"):
+        crc._process_messages([msg])
+
+    event = next(e for e in events if e["type"] == "worldbook.context.applied")
+    assert set(event) == {"subsystem", "type", "status", "trace_id", "summary", "explain", "detail"}
+    assert "content_excerpt" not in event
+    assert set(event["detail"]) == {"runtime", "lane", "source", "carrier_chars", "truncated"}
+    assert event["detail"]["lane"] == "chat" and event["detail"]["source"] == "eager_context"
+    assert event["detail"]["carrier_chars"] > 0
+    dumped = json.dumps(event, ensure_ascii=False)
+    assert "私密世界设定正文" not in dumped and user_text not in dumped
+
+
+def test_worldbook_window_seed_treats_empty_list_as_done_and_does_not_refetch(monkeypatch):
+    """合法空 list = 账号确实没历史,算补齐,不重复拉。"""
+    calls = {"n": 0}
+
+    def _empty(**_kw):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(crc, "_worldbook_signal_window", collections.deque(maxlen=4))
+    monkeypatch.setattr(crc, "_worldbook_window_seeded", False)
+    monkeypatch.setattr(crc, "_worldbook_seed_next_try_at", 0.0)
+    monkeypatch.setattr(crc, "get_decrypted_history", _empty)
+
+    crc._seed_worldbook_signal_window(before_ts=10.0)
+    crc._seed_worldbook_signal_window(before_ts=11.0)
+
+    assert calls["n"] == 1
+    assert crc._worldbook_window_seeded is True
+    assert list(crc._worldbook_signal_window) == []
+
+
+def test_foreground_worldbook_tool_mode_is_the_documented_rollback(monkeypatch):
     monkeypatch.setattr(crc, "FOREGROUND_WORLDBOOK_CONTEXT_MODE", "tool")
     monkeypatch.setattr(
         crc._HTTP,
@@ -1372,7 +1898,7 @@ def test_foreground_worldbook_tool_mode_never_prefetches(monkeypatch):
     assert crc._worldbook_context_for_foreground("今天是什么日子") == ""
 
 
-def test_foreground_worldbook_eager_mode_remains_as_rollback(monkeypatch):
+def test_foreground_worldbook_eager_mode_posts_and_carries_the_trace_id(monkeypatch):
     response = MagicMock(status_code=200)
     response.json.return_value = {
         "block": "<world_book>影月历</world_book>",
@@ -3940,6 +4466,72 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
     }
     assert any(s[:3] == ("pj_1", "realizing", "") for s in captured["statuses"])
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
+
+
+@pytest.mark.parametrize("response_status", [200, 400])
+def test_proactive_http_text_chain_without_af_unix(monkeypatch, response_status):
+    """Real poll/claim -> HTTP agent -> sealing/post_reply -> status, fake wire.
+
+    This is a capability simulation, not a Windows or deployed-provider smoke.
+    A rejected reply must remain failed even though the agent returned text.
+    """
+    monkeypatch.delattr(crc.socket, "AF_UNIX", raising=False)
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "simple")
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://agent.invalid/chat")
+    monkeypatch.setattr(crc, "FEEDLING_API_URL", "https://io.invalid")
+    monkeypatch.setattr(crc, "_HOSTED", False)
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: {})
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "synthetic-owner")
+    monkeypatch.setitem(crc._whoami_cache, "user_pk", b"\x11" * 32)
+    monkeypatch.setitem(crc._whoami_cache, "enclave_pk", b"\x22" * 32)
+    monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", "on")
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    job = {
+        "schema_version": 2, "job_id": "synthetic-wake", "ts": 123.0,
+        "source": crc.PROACTIVE_JOB_SOURCE, "trigger": "scheduled_wake",
+        "wake_kind": "ambient", "broadcast_state": "on", "frame_ids": [],
+    }
+    seen = []
+
+    def wire(request):
+        payload = json.loads(request.content) if request.content else {}
+        seen.append((request.method, str(request.url), payload))
+        if request.url.path == "/v1/proactive/jobs/poll":
+            return crc.httpx.Response(200, json={"jobs": [job]})
+        if request.url.path.endswith("/claim"):
+            return crc.httpx.Response(200, json={"claimed": True})
+        if request.url.host == "agent.invalid":
+            return crc.httpx.Response(200, json={"response": "这是一条合成的提醒。"})
+        if request.url.path == "/v1/chat/response":
+            body = {"id": "synthetic-delivered"} if response_status == 200 else {
+                "error": "envelope_missing_fields",
+            }
+            return crc.httpx.Response(response_status, json=body)
+        return crc.httpx.Response(200, json={})  # ancillary reads/status/trace
+
+    with crc.httpx.Client(transport=crc.httpx.MockTransport(wire)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        polled = crc.poll_proactive_jobs(0)
+        assert crc._process_proactive_jobs(polled["jobs"]) == 123.0
+    agent_calls = [row for row in seen if row[1] == "http://agent.invalid/chat"]
+    replies = [row[2] for row in seen if row[1] == "https://io.invalid/v1/chat/response"]
+    statuses = [row[2]["status"] for row in seen if row[1].endswith("/status")]
+    assert len(agent_calls) == 1
+    assert len(replies) == 1
+    assert "reply_to_message_id" not in replies[0]
+    assert replies[0]["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert replies[0]["proactive_job_id"] == job["job_id"]
+    assert replies[0]["envelope"]["body_ct"]
+    assert "body" not in replies[0]["envelope"]
+    assert "realizing" in statuses
+    assert ("posted" in statuses) is (response_status == 200)
+    if response_status == 400:
+        assert "failed" in statuses
 
 
 def _install_capture_job_harness(monkeypatch, agent_reply):
@@ -7136,7 +7728,12 @@ def test_call_agent_http_openai_raw_text_returns_bare_cards_body(monkeypatch):
         ("openai", crc._call_agent_http_openai),
     ],
 )
-def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, call):
+@pytest.mark.parametrize("remaining", [None, 45.0])
+@pytest.mark.parametrize("has_unix", [True, False])
+def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, call, remaining, has_unix):
+    if not has_unix:
+        monkeypatch.delattr(crc.socket, "AF_UNIX", raising=False)
+
     class _Resp:
         headers = {}
 
@@ -7159,9 +7756,11 @@ def test_http_agent_calls_honor_configured_turn_timeout(monkeypatch, protocol, c
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_agent_session_key", lambda: "")
     monkeypatch.setattr(crc._HTTP, "post", post)
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)
 
-    assert call("make a canvas") == "ok"
-    assert seen["timeout"] == 600
+    deadline = None if remaining is None else 100.0 + remaining
+    assert call("make a canvas", absolute_deadline=deadline) == "ok"
+    assert seen["timeout"] == (600 if remaining is None else remaining)
 
 
 def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_from_text_block():
@@ -13949,3 +14548,500 @@ def test_claude_observer_never_publishes_a_partial_prefixed_tag_head():
             prefix,
         )
         assert published == [(0, "正文", False)], (prefix, published)
+
+
+# ---------------------------------------------------------------------------
+# T521 (2026-09-08): content-free pi stream shape in the model-call trace.
+# ---------------------------------------------------------------------------
+def _pi_events(*events):
+    return "\n".join(json.dumps(e, ensure_ascii=False) for e in events)
+
+
+def _pi_assistant_end(content, stop_reason=None, usage=None):
+    msg = {"role": "assistant", "content": content, "usage": usage or {"input": 10, "output": 7}}
+    if stop_reason is not None:
+        msg["stopReason"] = stop_reason
+    return {"type": "message_end", "message": msg}
+
+
+_SECRET_TEXT = "秘密正文 usr_do_not_leak_9f2c"
+_SECRET_THOUGHT = "私密推理 do_not_leak_thought_77"
+
+
+def test_pi_stream_shape_text_only_message_end():
+    shape = crc._pi_stream_shape(_pi_events(
+        {"type": "session", "id": "s1"},
+        {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}},
+        _pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"),
+    ))
+    assert shape["assistant_message_ends"] == 1
+    assert shape["blocks"] == {"text": 1, "thinking": 0, "toolCall": 0, "other": 0}
+    assert shape["text_chars_total"] == len(_SECRET_TEXT)
+    assert shape["update_text_seen"] is False
+    assert shape["update_text_chars_max"] == 0
+    assert shape["stop_reasons"] == ["stop"]
+
+
+def test_pi_stream_shape_thinking_only_is_shape_a():
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"),
+    ))
+    assert shape["blocks"]["thinking"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["text_chars_total"] == 0
+    assert shape["stop_reasons"] == ["length"]
+
+
+def test_pi_stream_shape_tool_call_only_is_shape_b():
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "toolCall", "name": "memory_search", "args": {"q": _SECRET_TEXT}}]),
+    ))
+    assert shape["blocks"]["toolCall"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["blocks"]["other"] == 0
+
+
+def test_pi_stream_shape_update_only_text_is_shape_c():
+    """Text seen in cumulative message_update snapshots but absent from the
+    final message_end — the parser-bug candidate."""
+    shape = crc._pi_stream_shape(_pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT[:4]}]}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+        _pi_assistant_end([], stop_reason="stop"),
+    ))
+    assert shape["update_text_seen"] is True
+    assert shape["update_text_chars_max"] == len(_SECRET_TEXT)
+    assert shape["assistant_message_ends"] == 1
+    assert shape["blocks"]["text"] == 0 and shape["text_chars_total"] == 0
+
+
+def test_pi_stream_shape_counts_unknown_blocks_and_keeps_stop_reasons_enumerated():
+    ends = [_pi_assistant_end([{"type": "image", "x": 1}, "junk"], stop_reason=f"r{i}") for i in range(12)]
+    shape = crc._pi_stream_shape(_pi_events(*ends))
+    assert shape["assistant_message_ends"] == 12
+    assert shape["blocks"]["other"] == 24
+    # Twelve distinct unknown reasons collapse to the single enum "other".
+    assert shape["stop_reasons"] == ["other"]
+
+
+def test_pi_stream_shape_stop_reason_is_whitelisted_enum_never_free_text():
+    """codex2 early review: an upstream can put free text into stopReason; the
+    trace must carry an enum, never the text."""
+    sentinel = "leak-" + _SECRET_TEXT
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason=sentinel),
+        _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason="Length"),
+        _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason=""),
+    ))
+    assert shape["stop_reasons"] == ["other", "length"]
+    dumped = json.dumps(shape, ensure_ascii=False)
+    assert sentinel not in dumped and "leak-" not in dumped and _SECRET_TEXT not in dumped
+    assert set(shape["stop_reasons"]) <= (crc._PI_STREAM_STOP_REASONS | {"other"})
+
+
+def test_pi_stream_shape_is_content_free_and_never_raises():
+    raw = _pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}, {"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"),
+    )
+    dumped = json.dumps(crc._pi_stream_shape(raw), ensure_ascii=False)
+    assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
+    assert "do_not_leak" not in dumped
+    empty = crc._pi_stream_shape("")
+    assert empty["parse_failed"] is False and empty["parse_error_count"] == 0
+    garbage = crc._pi_stream_shape("not json at all {{{")
+    assert garbage["parse_failed"] is True and garbage["parse_error_count"] == 1
+
+
+def test_pi_stream_shape_truncated_jsonl_is_flagged_not_all_zero():
+    """codex2 review r1: a session-only stream and a session + truncated
+    assistant message_end must NOT be byte-identical all-zero shapes."""
+    clean = crc._pi_stream_shape(_pi_events({"type": "session", "id": "s1"}))
+    truncated_line = json.dumps(_pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}]))[:-25]
+    truncated = crc._pi_stream_shape(_pi_events({"type": "session", "id": "s1"}) + "\n" + truncated_line)
+    assert clean["parse_failed"] is False and clean["parse_error_count"] == 0
+    assert truncated["parse_failed"] is True and truncated["parse_error_count"] == 1
+    assert clean != truncated
+    assert _SECRET_TEXT not in json.dumps(truncated, ensure_ascii=False)
+
+
+def test_pi_stream_shape_structural_oddity_keeps_partial_counts_but_flags():
+    """codex2 review r1: content=7 used to abort the scan after incrementing
+    ends, returning half data with no flag. Partial observation is allowed
+    only when flagged, and later events must still be counted."""
+    shape = crc._pi_stream_shape(_pi_events(
+        _pi_assistant_end([{"type": "text", "text": "ok"}]),
+        {"type": "message_end", "message": {"role": "assistant", "content": 7}},
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="stop"),
+    ))
+    assert shape["assistant_message_ends"] == 3
+    assert shape["blocks"]["text"] == 1 and shape["blocks"]["thinking"] == 1
+    assert shape["stop_reasons"] == ["stop"]
+    assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
+
+
+def test_pi_stream_shape_whitespace_only_update_is_not_shape_c():
+    """codex2 review r1: _pi_turn_from_stream strips text, so a whitespace-only
+    snapshot is unusable and must not read as 'text seen in updates'."""
+    shape = crc._pi_stream_shape(_pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "  \n\t "}]}},
+        _pi_assistant_end([], stop_reason="stop"),
+    ))
+    assert shape["update_text_seen"] is False
+    assert shape["update_text_chars_max"] == 0
+    assert shape["parse_failed"] is False
+
+
+def test_pi_turn_metrics_carries_stream_shape_into_terminal_detail():
+    raw = _pi_events(_pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"))
+    metrics = crc._pi_turn_metrics(raw)
+    assert metrics["output_tokens"] == 7
+    assert metrics["pi_stream"]["blocks"]["thinking"] == 1
+    assert metrics["pi_stream"]["stop_reasons"] == ["length"]
+    # The terminal trace merges _cli_turn_metrics into detail; the pi branch must
+    # keep carrying the shape so agent.model.call.error can be read off the DB.
+    completed = subprocess.CompletedProcess(args=["pi", "--mode", "json"], returncode=0, stdout=raw, stderr="")
+    detail = crc._cli_turn_metrics(["pi", "--mode", "json"], completed, 123)
+    assert detail["driver"] == "pi"
+    assert detail["pi_stream"]["text_chars_total"] == 0
+
+
+def _terminal_detail(monkeypatch, *, raw, succeeded, cmd=("pi", "--mode", "json")):
+    """Drive the real terminal emitter and capture the detail it hands to
+    _emit_debug_trace — the same dict that lands in trace_events."""
+    captured = []
+
+    def fake_emit(subsystem, type_, **kwargs):
+        captured.append({"subsystem": subsystem, "type": type_, **kwargs})
+
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    monkeypatch.setattr(crc, "_emit_recall_completed", lambda *a, **k: None)
+    monkeypatch.setattr(crc, "_recall_turn_reset", lambda *a, **k: None)
+    context = {
+        "started": True,
+        "cmd": list(cmd),
+        "result": subprocess.CompletedProcess(args=list(cmd), returncode=0, stdout=raw, stderr=""),
+        "started_at": time.monotonic(),
+    }
+    crc._emit_cli_model_call_terminal(
+        context, trace_id="tr_t521", succeeded=succeeded,
+        failure=None if succeeded else RuntimeError(f"{crc.EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply"),
+    )
+    assert len(captured) == 1
+    return captured[0]
+
+
+def test_terminal_error_detail_carries_pi_stream_shape(monkeypatch):
+    raw = _pi_events(
+        {"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": _SECRET_TEXT}]}},
+        _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"),
+    )
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=False)
+    assert event["type"] == "agent.model.call.error"
+    shape = event["detail"]["pi_stream"]
+    assert shape["parse_failed"] is False and shape["parse_error_count"] == 0
+    assert shape["blocks"]["thinking"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["update_text_seen"] is True
+    assert shape["update_text_chars_max"] == len(_SECRET_TEXT)
+    assert shape["stop_reasons"] == ["length"]
+    dumped = json.dumps(event["detail"], ensure_ascii=False)
+    assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
+
+
+def test_terminal_done_detail_carries_pi_stream_shape(monkeypatch):
+    raw = _pi_events(_pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"))
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=True)
+    assert event["type"] == "agent.model.call.done"
+    assert event["detail"]["pi_stream"]["text_chars_total"] == len(_SECRET_TEXT)
+    assert event["detail"]["pi_stream"]["stop_reasons"] == ["stop"]
+
+
+def test_terminal_detail_has_no_pi_stream_for_other_drivers(monkeypatch):
+    event = _terminal_detail(monkeypatch, raw="{}", succeeded=True, cmd=("claude", "-p", "x"))
+    assert event["detail"]["driver"] == "claude"
+    assert "pi_stream" not in event["detail"]
+
+
+def test_terminal_error_detail_flags_truncated_pi_stream(monkeypatch):
+    raw = _pi_events({"type": "session", "id": "s1"}) + "\n" + json.dumps(
+        _pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}])
+    )[:-30]
+    event = _terminal_detail(monkeypatch, raw=raw, succeeded=False)
+    shape = event["detail"]["pi_stream"]
+    assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
+    assert _SECRET_TEXT not in json.dumps(event["detail"], ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# T526 (2026-09-09): content-free send-file rejection reason on the trace.
+# usr_1baf saw ~30% send-file failures with no persisted reason, so a blank
+# Canvas ("有过程无内容") could not be attributed.
+# ---------------------------------------------------------------------------
+# Every actionable reject string the staging path can emit, with its enum.
+# codex2 review r1: the closed set previously dropped chat_turn_finished /
+# too_many_staged_files / unsupported_file_suffix into "other", and the
+# invalid-subtitle message misclassified as the missing-pair reason.
+_SEND_FILE_REJECTION_CASES = [
+    ("request_id_required", "request_id_required"),
+    ("path_required", "path_required"),
+    ("no_active_chat_turn", "no_active_chat_turn"),
+    ("chat_turn_finished", "chat_turn_finished"),
+    ("too_many_staged_files", "too_many_staged_files"),
+    ("path_outside_allowed_file_roots", "path_outside_allowed_file_roots"),
+    ("file_name_required", "file_name_required"),
+    ("unsupported_file_suffix", "unsupported_file_suffix"),
+    ("wrong_file_suffix", "wrong_file_suffix"),
+    ("file_source_empty_or_too_large", "file_source_empty_or_too_large"),
+    ("canvas_file_too_large", "canvas_file_too_large"),
+    ("rendered_file_empty_or_too_large", "rendered_file_empty_or_too_large"),
+    ("file_source_must_be_utf8", "file_source_must_be_utf8"),
+    ("Canvas delivery requires title and subtitle", "canvas_title_subtitle_required"),
+    ("file display metadata requires a Canvas filename", "canvas_metadata_invalid"),
+    ("invalid file_display_title", "canvas_metadata_invalid"),
+    # The substring "title" lives inside "subtitle": this must NOT fold into the
+    # missing-pair reason.
+    ("invalid file_display_subtitle", "canvas_metadata_invalid"),
+    ("weird new backend message with secret usr_leak_x", "other"),
+    ("", "other"),
+    (None, "other"),
+]
+
+
+@pytest.mark.parametrize(("error", "expected"), _SEND_FILE_REJECTION_CASES)
+def test_classify_send_file_rejection_is_closed_set(error, expected):
+    got = crc._classify_send_file_rejection(error)
+    assert got == expected
+    assert got in (crc._SEND_FILE_REJECTION_REASONS | {"other"})
+
+
+def test_send_file_rejection_table_covers_every_impl_exit():
+    """Source-scan guard: every literal reject reason in the staging path must
+    classify to a real enum, so the table cannot drift back into 'other'."""
+    import inspect
+    import re
+
+    sources = inspect.getsource(crc._stage_file_ipc_impl) + inspect.getsource(
+        crc._safe_outbound_file_name
+    )
+    literals = set(re.findall(r'"error":\s*"([a-z0-9_]+)"', sources))
+    literals |= set(re.findall(r'ValueError\("([a-z0-9_]+)"\)', sources))
+    assert literals, "guard failed to locate any reject literals"
+    drifted = {code for code in literals if crc._classify_send_file_rejection(code) == "other"}
+    assert not drifted, f"unmapped stage-file reject reasons: {sorted(drifted)}"
+
+
+def test_stage_file_rejection_emits_content_free_reason(monkeypatch):
+    """A rejected send-file must emit exactly one content-free trace whose
+    detail carries the reason enum and the is_canvas flag — no path/name/body."""
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "turn_t526")
+    secret_path = "/tmp/secret_usr_leak/哄猫猫-绝密.io.html"
+    monkeypatch.setattr(
+        crc, "_stage_file_ipc_impl",
+        lambda _msg: {"ok": False, "error": "Canvas delivery requires title and subtitle"},
+    )
+    out = crc._handle_stage_file_ipc({"path": secret_path, "name": "哄猫猫.io.html"})
+    assert out["ok"] is False
+    assert len(events) == 1
+    args, kwargs = events[0]
+    assert args[:2] == ("agent", "resident.send_file.rejected")
+    assert kwargs["status"] == "error"
+    assert kwargs["trace_id"] == "turn_t526"
+    assert kwargs["detail"] == {"reason": "canvas_title_subtitle_required", "is_canvas": True}
+    dumped = json.dumps({"a": [str(x) for x in args], "k": {kk: str(vv) for kk, vv in kwargs.items()}}, ensure_ascii=False)
+    assert "哄猫猫" not in dumped and "secret" not in dumped and "usr_leak" not in dumped
+
+
+def test_stage_file_success_emits_no_rejection_trace(monkeypatch):
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": True, "request_id": "r1"})
+    out = crc._handle_stage_file_ipc({"path": "/x", "name": "a.io.html"})
+    assert out["ok"] is True
+    assert events == []
+
+
+def test_stage_file_non_canvas_rejection_flags_is_canvas_false(monkeypatch):
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "t")
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": False, "error": "wrong_file_suffix"})
+    crc._handle_stage_file_ipc({"path": "/x", "name": "report.pdf"})
+    assert events[0][1]["detail"] == {"reason": "wrong_file_suffix", "is_canvas": False}
+
+
+def test_stage_file_rejection_uses_turn_id_captured_before_impl(monkeypatch):
+    """codex2 review r1: a concurrent chat_turn_finished advances the active
+    turn id while the impl runs; the rejection must hang off the ORIGIN turn,
+    captured before staging, not whatever it became."""
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    crc._active_outbound_file_turn_id = "turn_old"
+
+    def _impl(_msg):
+        crc._active_outbound_file_turn_id = "turn_new"  # turn advanced mid-stage
+        return {"ok": False, "error": "chat_turn_finished"}
+
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", _impl)
+    try:
+        crc._handle_stage_file_ipc({"path": "/x", "name": "a.io.html"})
+    finally:
+        crc._active_outbound_file_turn_id = ""
+    assert events[0][1]["trace_id"] == "turn_old"
+    assert events[0][1]["detail"]["reason"] == "chat_turn_finished"
+
+
+def test_stage_file_is_canvas_mirrors_name_or_path_suffix(monkeypatch):
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: events.append((a, k)))
+    monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "t")
+    monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": False, "error": "file_source_empty_or_too_large"})
+    # name absent — the impl falls back to the path's basename, so telemetry must too.
+    crc._handle_stage_file_ipc({"path": "/tmp/report.io.html"})
+    assert events[-1][1]["detail"]["is_canvas"] is True
+    events.clear()
+    crc._handle_stage_file_ipc({"path": "/tmp/notes.pdf"})
+    assert events[-1][1]["detail"]["is_canvas"] is False
+    # codex2 review r2: the impl strips name/path before deciding; telemetry must
+    # apply the SAME normalization or a whitespaced Canvas reads as non-Canvas.
+    events.clear()
+    crc._handle_stage_file_ipc({"name": " report.io.html ", "path": "/tmp/x"})
+    assert events[-1][1]["detail"]["is_canvas"] is True
+    events.clear()
+    crc._handle_stage_file_ipc({"path": " /tmp/report.io.html "})
+    assert events[-1][1]["detail"]["is_canvas"] is True
+    # An unresolvable/empty name canonicalizes to a non-Canvas, never raises.
+    events.clear()
+    crc._handle_stage_file_ipc({"path": "   "})
+    assert events[-1][1]["detail"]["is_canvas"] is False
+# ── T528: reply with attachments rejected by the server ────────────────────
+# A hosted user's generated images were staged, sent, and bounced with a bare
+# 400 for two days: the consumer re-raised, released the turn, the model re-ran
+# (generating a fresh image each time), and the user saw "Send Image ok" loops
+# with no picture. Fix = keep the server's reason, resend the words without
+# the attachments, then tell the user the picture did not make it.
+
+class _FakeResponse:
+    def __init__(self, status_code: int, body=None):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no json")
+        return self._body
+
+    def raise_for_status(self):
+        raise AssertionError("raise_for_status must not be reached for a 4xx with a body")
+
+
+def test_post_reply_4xx_keeps_the_servers_reason():
+    with pytest.raises(crc.ChatResponseRejected) as info:
+        crc._handle_post_reply_response(
+            _FakeResponse(400, {"error": "invalid image_followup size", "detail": ["image_byte_count"]})
+        )
+    assert info.value.status_code == 400
+    assert info.value.error == "invalid image_followup size"
+    assert "invalid image_followup size" in str(info.value)
+
+
+def test_post_reply_4xx_without_body_still_names_the_status():
+    with pytest.raises(crc.ChatResponseRejected) as info:
+        crc._handle_post_reply_response(_FakeResponse(422, None))
+    assert info.value.status_code == 422 and info.value.error == ""
+
+
+def test_dropped_attachment_notice_text_follows_the_users_language():
+    assert crc._dropped_attachments_notice_text("画一张", ["image"]) == "这条回复里的图片没能发出来。"
+    assert crc._dropped_attachments_notice_text("画一张", ["image", "file"]) == "这条回复里的图片和文件没能发出来。"
+    assert crc._dropped_attachments_notice_text("draw one", ["file"]) == "The file in this reply could not be delivered."
+    assert crc._dropped_attachments_notice_text("draw one", ["image"]) == "The image in this reply could not be delivered."
+
+
+def _staged_image():
+    return crc.StagedChatImage(source_path="/tmp/x.png", name="x.png", mime_type="image/png", data=b"png")
+
+
+def _arm_staged_image_turn(monkeypatch):
+    monkeypatch.setattr(crc, "_agent_can_stage_outbound_attachments", lambda: True)
+    monkeypatch.setattr(crc, "_required_outbound_file_suffixes", lambda _text: None)
+    monkeypatch.setattr(crc, "_begin_outbound_file_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(crc, "_staged_outbound_file_snapshot", lambda _t: [])
+    monkeypatch.setattr(crc, "_staged_outbound_image_snapshot", lambda _t: [_staged_image()])
+    monkeypatch.setattr(crc, "_finish_outbound_attachment_turn", lambda _t: ([], [_staged_image()]))
+
+
+def test_rejected_image_reply_is_resent_without_the_image_and_the_user_is_told(monkeypatch):
+    _arm_staged_image_turn(monkeypatch)
+    unmarked: list = []
+    monkeypatch.setattr(crc, "_unmark_seen", lambda keys: unmarked.extend(keys))
+    traces: list[tuple] = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **k: traces.append((a, k)))
+    calls: list[dict] = []
+
+    def _post_reply(text, **kwargs):
+        calls.append({"text": text, **kwargs})
+        if kwargs.get("image_followups"):
+            raise crc.ChatResponseRejected(400, {"error": "invalid image_followup size"})
+        return {"ok": True}
+
+    monkeypatch.setattr(crc, "post_reply", _post_reply)
+    msg = _make_msg(role="user", content="给我画一张海边", ts=5300.0)
+    msg["source"] = "chat"   # staging only arms for chat/model_api turns
+    with patch.object(crc, "call_agent", return_value="画好了,给你"):
+        crc._process_messages([msg])
+
+    # 1st attempt carried the image and was rejected; 2nd is the same words without it.
+    assert calls[0]["image_followups"] and calls[0]["text"] == "画好了,给你"
+    assert "image_followups" not in calls[1] and calls[1]["text"] == "画好了,给你"
+    # The user is told, in their language, AFTER the words landed.
+    notice = calls[2]
+    assert notice["role"] == "system" and notice["notice_kind"] == "upstream_error"
+    assert notice["text"] == "这条回复里的图片没能发出来。"
+    # The turn settled: no release-for-retry (that is what produced the loop).
+    assert unmarked == []
+    # The reason is on the trace, content-free.
+    dropped = [k for a, k in traces if a[1] == "chat.reply.attachments_dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["detail"] == {
+        "status_class": "400", "error_class": "image_followup_invalid",
+        "image_followups": 1, "file_followups": 0,
+    }
+    assert dropped[0]["summary"] == "reply attachments dropped: image_followup_invalid"
+
+
+def test_reply_rejection_classifier_is_closed_and_content_free():
+    cases = {
+        "invalid image_followup size": ("image_followup_invalid", "400"),
+        "image_followup_envelope_missing_fields": ("image_followup_invalid", "400"),
+        "shared image_followup requires K_enclave": ("image_followup_invalid", "400"),
+        "invalid file_followup mime": ("file_followup_invalid", "400"),
+        "reply followups are chat-only": ("followups_not_allowed", "400"),
+        "content_pk_fpr_mismatch": ("stale_key", "409"),
+        "something new the server says with user text inside": ("other", "4xx"),
+    }
+    for error, (error_class, status_class) in cases.items():
+        code = 409 if error == "content_pk_fpr_mismatch" else (418 if error_class == "other" else 400)
+        got = crc.classify_reply_rejection(crc.ChatResponseRejected(code, {"error": error}))
+        assert (got.error_class, got.status_class) == (error_class, status_class), error
+        assert got.error_class in crc._REPLY_REJECTION_CLASS_VALUES
+        assert error not in (got.error_class, got.status_class) or error_class != "other"
+
+
+def test_rejected_reply_without_attachments_still_releases_the_turn(monkeypatch):
+    """The degrade path is ONLY for attachments. A bare-text 4xx keeps the old
+    contract (release the turn), so this change cannot swallow other rejections."""
+    unmarked: list = []
+    monkeypatch.setattr(crc, "_unmark_seen", lambda keys: unmarked.extend(keys))
+    calls: list[dict] = []
+
+    def _post_reply(text, **kwargs):
+        calls.append({"text": text, **kwargs})
+        raise crc.ChatResponseRejected(400, {"error": "invalid source"})
+
+    monkeypatch.setattr(crc, "post_reply", _post_reply)
+    msg = _make_msg(role="user", content="你好", ts=5400.0)
+    with patch.object(crc, "call_agent", return_value="你好呀"):
+        crc._process_messages([msg])
+
+    assert len(calls) == 1 and "image_followups" not in calls[0]
+    assert unmarked, "a rejected text reply must still release the turn for retry"

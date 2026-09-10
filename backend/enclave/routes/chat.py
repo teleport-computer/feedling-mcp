@@ -17,11 +17,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from memgarden import observability as mg_observability
-from memgarden.scoring.relevance import (
-    select_context_memories,
-    select_context_memories_with_trace,
-)
+from memgarden.scoring import relevance as memory_relevance
 from memory import card_shape
+from memory import recall_metadata
 from core import chat_images
 from enclave import auth, backend_client, envelope, readside
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
@@ -301,18 +299,16 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
 
 def _build_context_memories(moments, decrypted, query_args):
     """纯同步 context_memories 选择（在 to_thread 里跑）。函数体 = 旧
-    L1554-1585 逐字：latest_user_text 从 decrypted 提取，context_mode/
+    最近四条对话作为选卡 query（含上一条 AI 回复），context_mode/
     want_trace 已由路由层预解析进 query_args dict（不能跨线程读
     request.query_params）。_load_decrypted_moments 的解密部分 →
     readside.moments_to_cards(moments, ...)（拉取已上移到路由层）。
-    返回 (context_memories, context_memory_trace | None)。"""
-    latest_user_text = ""
-    for m in reversed(decrypted):
-        if m.get("role") == "user" and m.get("content"):
-            latest_user_text = m["content"]
-            break
+    返回 (context_memories, context_memory_trace, context_memory_log)。"""
+    recent_text = [m["content"] for m in decrypted
+                   if m.get("role") in {"user", "human", "assistant", "agent", "openclaw"}
+                   and isinstance(m.get("content"), str) and m["content"].strip()][-4:]
+    latest_user_text = "\n".join(recent_text)
 
-    context_mode = query_args["context_mode"]
     want_trace = query_args["want_trace"]
 
     context_memories: list[dict] = []
@@ -348,14 +344,30 @@ def _build_context_memories(moments, decrypted, query_args):
     # Resident 与 Hosted Runtime V2 固定走同一套分桶策略，确保用户切换
     # runtime 时召回不漂移。context_mode/context_strict 仍作为兼容参数接收，
     # 但不再选择不同 policy。
-    mode = "bucketed:unified"
-    picked, selection_trace = select_context_memories_with_trace(
+    # PR-1 is independently releasable. Keep the published 0.19.0 pin working;
+    # adopt its opt-in relevance gate only after the released package has it.
+    selector = getattr(memory_relevance, "select_relevant_context_memories_with_trace", None)
+    mode = "relevant:unified" if selector is not None else "bucketed:unified"
+    selector = selector or memory_relevance.select_context_memories_with_trace
+    picked, selection_trace = selector(
         garden_cards,
         latest_user_text,
-        # 固定 default；兼容参数不得恢复旧的 strict 分叉。
-        mode="default",
     )
     context_memories = _back_to_original(picked)
+    if query_args.get("context_recent"):
+        fresh = recall_metadata.recent_cards(selectable)
+        fresh_ids = {c["id"] for c in fresh}
+        context_memories = fresh + [c for c in context_memories if c.get("id") not in fresh_ids]
+        context_memories = context_memories[:8]
+        selection_trace = dict(selection_trace or {})
+        selected = selection_trace.get("selected") or []
+        # Distinguish recency from relevance; it is not a claim of a query hit.
+        selection_trace["selected"] = [
+            {"id": c["id"], "bucket": "fresh_recent", "score": 2.0,
+             "reason": "created_within_7_days"} for c in fresh
+        ] + [s for s in selected if s.get("id") not in fresh_ids
+             and s.get("id") in {c.get("id") for c in context_memories}]
+        mode += ":recent7d"
     context_memory_trace = selection_trace if want_trace else None
 
     context_memory_log = mg_observability.injection_record(
@@ -450,6 +462,8 @@ async def v1_chat_history(request: Request):
         memory_limit = readside.memory_readside_model_api_limit()
         query_args = {
             "context_mode": context_mode,
+            "context_recent": str(request.query_params.get("context_recent") or "").lower()
+                              in {"1", "true", "yes", "on"},
             "want_trace": want_trace,
             "authorized_user_id": user_id,
             "content_sk": content_sk,

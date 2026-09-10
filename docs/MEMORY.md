@@ -125,24 +125,60 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 
 过滤归档卡 → 按 `occurred_at` 倒序 → 截断 limit 返回。
 
-### 4.2 上下文记忆选择（聊天补记忆，重点）
+### 4.2 上下文记忆选择与注入（聊天补记忆，重点）
 
-入口在 `/v1/chat/history`（`backend/enclave/routes/chat.py`），核心是
-`_build_context_memories()` 调用外部包的 `select_context_memories_with_trace()`。
+**选卡**入口在 `/v1/chat/history`（`backend/enclave/routes/chat.py::_build_context_memories`），
+调用外部包 `memgarden.scoring.relevance` 的选卡器：已发布的 0.19.0 走
+`select_context_memories_with_trace`（转折卡 ≤3 / 最新 ≤2 / 相关 ≤3，去重 ≤8，mode
+`bucketed:unified`）；当依赖升级到带 `select_relevant_context_memories_with_trace`
+的版本时，按特性探测切到相关性阈值 + 软配额策略（mode `relevant:unified`），
+io 不依赖未发布行为。选卡 query 是**最近四条对话**（含上一条 AI 回复）拼接，
+不再只看最后一句。转折角色只认卡片显式 `roles`（`backend/memory/card_shape.py::roles_of`），
+不再从标题前缀猜。`context_trace=1` 返回不含卡片正文的逐卡选择原因（bucket / reason /
+matched_phrases / score）。
 
-Resident 与 Hosted Runtime V2 固定使用同一套 `default` 分桶策略：
+**注入**（2026-09-08 起真实到达 prompt，此前只选不注）：
 
-- 转折卡按时间倒序 ≤3；
-- 最新创建 ≤2；
-- 与最后一条用户消息相关性最高 ≤3；
-- 去重后总数 ≤8。
+- **V1 resident**（`tools/chat_resident_consumer.py`）：每条用户消息组装前用它自己的
+  `seq` 单独请求 `GET /v1/chat/history?before_seq=seq+1&limit=4&context_trace=1`
+  （`_auto_memory_fetch_for_turn`），页尾用户消息必须就是本条；把选中卡渲染成
+  「相关记忆」块（`_auto_memory_render`：每张 id + 整句摘要 + 一句命中原因；摘要**永不截断**，
+  超过 300 字的只给 id + 命中原因 + 「细节请 memory-fetch」（T529：半句话最诱发补全）；
+  按 score 排序，与用户显式引用的卡去重，预算 2500 字，超出按整卡丢弃，**永不放正文**），
+  拼在用户消息之前、`quoted_memories` 块之上。无 `seq`、拉取失败、`mode=failed`
+  或页不匹配 ⇒ 记 unknown 且不注入，不复用旧卡。
+- **V2**（`backend/model_api_runtime/v2/memory_context.py::render`）：serve-worker 以本轮
+  冻结的 seq 边界读同一接口（`serve_worker._read_context_memories`），块以
+  application-data 角色放在 profile/system 之后、对话回放之前（不是特权前缀），
+  JSON 条目 id / summary / reason；与 profile 摘要逐字去重时**只省摘要、保留 id**
+  （reason=「档案已涵盖，细节可 fetch」，模型仍能取正文）；摘要超过 300 字只给 id + reason；
+  2500 字整条丢。到达判定（`memory_recall.py`）按逐卡渲染行、空白归一、content 为字符串或
+  分片数组均认，不再整块全等（T529，浩轩指出全等在适配器重排后恒报「未到达」）。
 
-`context_mode`、`contextMode` 和 `context_strict` 仍作为兼容 query 参数接收，但不再
-选择不同策略；`context_trace=1` 继续返回不含候选记忆正文的选择 trace（其中仍包含
-用户 query 派生的匹配词）。候选集先在 enclave 内完成生命周期过滤和卡片形状翻译，
-再交给 selector；注入模型的仍是原始卡片形状。
+**到达证据**（口径：选出 ≠ 注入）：`memory.select.traced` 只记 enclave 选卡；
+`memory.context.applied` 在最终发给驱动 / provider 的 payload 上核对整块是否到达
+（V1 逐条渲染行，V2 整块相等），记 ids / chars / profile_used；每轮
+`memory.recall.completed` 汇总 injected / selected / index / search / fetch 计数，
+缺读数记 `unknown`（null），不写 0。
 
-> 相关性**不是向量检索**，而是分层关键词评分。
+> 相关性**不是向量检索**，而是分层关键词评分（§4.3）；这是刻意决定，见
+> `docs/HISTORY_SEARCH_SPEC.zh.md`。
+
+**T513 增量（读侧已实现；写侧 cues 的产出依赖外部包升级）**：
+
+- `retrieval_cues`：卡片可选字段，`list[str]`，严格只收字符串，≤5 条、每条 ≤120 字，去空去重；
+  缺字段的旧卡密文形状不变。io 两侧写路径（V1 consumer `_capture_inner_from_card`、V2
+  `extraction._inner_from_card`）已能透传该字段，读侧并入 `_search_content` 与 V2 一行索引。
+  **已发布的 memgarden 0.19.0 尚无产出 cues 的 capture / dream parser**；产出方在外部仓
+  PR-1+PR-2（未发版、io 未升 pin），发版并升 pin 前线上不会出现该字段。
+- `memory_fetch` 一跳关联：返回 `related_items`（≤6 条 id / summary / source_id / relation /
+  status）与 `related_status`（`ok` / `bounded` / `unavailable` / `not_needed`），只含同用户可读且
+  经生命周期过滤的卡；`superseded` 关系只沿显式 `anchor_memory_ids` / `supersedes` 给出并带历史
+  status，按 thread 关联不返回已退休卡；主卡正文优先占预算，预算不够时可省略 related 元信息——
+  **缺失不证明无关联**。不回填用户数据。
+- V2 摘要新鲜度：history 请求带 `context_recent=1` 时，最近 7 天 `created_at` 的新卡最多 3 张优先占
+  `context_memories` 的 8 席，不新增 prompt 预算，「最近」不等于「相关」，profile / quoted 去重照旧；
+  旧端忽略该 flag 自然降级。
 
 ### 4.3 相关性评分：`_memory_relevance()`
 
@@ -203,8 +239,11 @@ Resident 与 Hosted Runtime V2 固定使用同一套 `default` 分桶策略：
 |------|------|
 | 路由 `GET /v1/memory/list` | `backend/app.py:14017` |
 | `db.memory_load` | `backend/db.py:751` |
-| Chat 上下文宿主入口 | `backend/enclave/routes/chat.py::_build_context_memories` |
-| 卡片形状与生命周期适配 | `backend/memory/card_shape.py` |
+| Chat 上下文宿主入口（选卡） | `backend/enclave/routes/chat.py::_build_context_memories` |
+| V1 逐轮注入 | `tools/chat_resident_consumer.py::_auto_memory_fetch_for_turn` / `_auto_memory_render` / `_auto_memory_arrival` |
+| V2 逐轮注入 | `backend/model_api_runtime/v2/memory_context.py::render`、`serve_worker._read_context_memories` |
+| 召回观测事件 | `memory.select.traced` / `memory.context.applied` / `memory.recall.tool_result` / `memory.recall.completed`（`backend/model_api_runtime/v2/memory_recall.py`、consumer `_emit_recall_completed`） |
+| 卡片形状、生命周期与显式角色 | `backend/memory/card_shape.py` |
 | 上下文选择主算法 | `memgarden/scoring/relevance.py`（外部包） |
 | 相关性评分与通用词表 | `memgarden/scoring/relevance.py`（外部包） |
-| 当前回归测试 | `tests/test_context_memories.py`、`tests/test_enclave_context_recall.py` |
+| 当前回归测试 | `tests/test_context_memories.py`、`tests/test_enclave_context_recall.py`、`tests/test_io_cli_auth.py`（V1 注入/到达）、`tests/test_v2_context.py` / `tests/test_v2_worker.py`（V2 注入） |

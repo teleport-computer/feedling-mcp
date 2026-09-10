@@ -263,6 +263,9 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_memory_bm25.py",
+        "test_memory_bm25_readside.py",
+        "test_memory_result_budget.py",
         # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
         # 零 DB / 零网络 / 不调用 claude。**它最需要能跑的时刻正是本地无 PG 时**——
         # 不登记就会被 collect_ignore 静默跳过，量具的守卫恰好在那时消失。
@@ -348,6 +351,9 @@ if not _provisioned:
         "test_provider_tools_gemini.py",
         "test_provider_catalog_unit.py",
         "test_provider_health_unit.py",
+        # T504 provider-403 boundary: pure classifiers and monkeypatched sinks;
+        # no database or network access.
+        "test_t504_provider_403_sinks.py",
         "test_provider_usage.py",
         "test_history_import_identity.py",
         "test_model_api_file_payload.py",

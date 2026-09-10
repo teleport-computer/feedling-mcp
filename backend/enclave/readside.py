@@ -6,6 +6,7 @@ import json
 import os
 
 from enclave import envelope
+from memory import recall_metadata
 
 
 MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
@@ -153,6 +154,7 @@ def memory_public_item(item: dict) -> dict:
 def build_memory_index_item(envelope: dict, inner: dict) -> dict:
     adapted = memory_inner_to_v1(inner, envelope)
     return {
+        **recall_metadata.fields(inner, envelope),
         "id": envelope.get("id", ""),
         "summary": adapted.get("summary", ""),
         "bucket": adapted.get("bucket", ""),
@@ -177,13 +179,15 @@ def build_memory_search_item(envelope: dict, inner: dict) -> dict:
     """
     adapted = memory_inner_to_v1(inner, envelope)
     item = build_memory_index_item(envelope, inner)
-    item["_search_content"] = adapted.get("content", "")
+    item["_search_content"] = "\n".join([adapted.get("content", ""),
+                                           *recall_metadata.cues(inner.get("retrieval_cues"))])
     return item
 
 
 def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
     adapted = memory_inner_to_v1(inner, envelope)
     return {
+        **recall_metadata.fields(inner, envelope),
         "id": envelope.get("id", ""),
         "summary": adapted.get("summary", ""),
         "content": adapted.get("content", ""),
@@ -279,7 +283,17 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
         except (envelope.DecryptFailure, json.JSONDecodeError):
             continue
         out.append({
+            **recall_metadata.fields(inner, m),
             "id": m.get("id"),
+            "bucket": inner.get("bucket"),
+            "threads": memory_readside_list(inner.get("threads"))[:8],
+            "roles": inner.get("roles") if isinstance(inner.get("roles"), list) else [],
+            "status": memory_readside_status(m, inner),
+            "archived_at": m.get("archived_at"),
+            "is_archived": m.get("is_archived"),
+            "archived": m.get("archived"),
+            "archive_reason": m.get("archive_reason"),
+            "superseded_by": m.get("superseded_by"),
             "title": inner.get("title"),
             "description": inner.get("description"),
             # v1 memories keep their real text in summary/content with

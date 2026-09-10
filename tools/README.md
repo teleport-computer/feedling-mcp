@@ -177,7 +177,17 @@ same checkout — no separate update.
   manage updates manually (the verification steps above).
 - **Dirty working tree is never touched.** If you have local uncommitted edits,
   the consumer logs a warning and skips the update instead of clobbering them.
-  `git stash` / commit (or set `FEEDLING_AUTO_UPDATE=0`) to control this.
+  Unrelated untracked files no longer block it. Checkout refuses to overwrite
+  conflicting untracked or ignored files; the `self-update checkout failed`
+  log names those paths, and dependency installation/restart does not proceed.
+  Older consumers count untracked files as dirty too. First back up `consumer.env`, `identity.json`,
+  and local state outside the checkout in a private location, then inspect
+  `git status` and decide how to preserve your edits. Do not use `git stash -u`,
+  `git stash -a`, or `git clean` just to clear the warning; they can remove
+  runtime files from the working directory. Plain `git stash` does not include
+  untracked files. Never commit secrets.
+  An agent must not move, stash, or delete operator files without permission.
+  Keep `FEEDLING_AUTO_UPDATE=0` if you want to manage updates manually.
 - **Detached HEAD after update.** Updating pins the checkout to the backend's
   exact commit (detached HEAD). To take over manually, `git checkout main`.
 - **If requirements changed**, the consumer runs `pip install -r` for the
@@ -204,6 +214,35 @@ incoming message and never replies. You'd see this as: iOS app shows
 your messages going out, but the agent never produces a response.
 
 ### Agent backend modes
+
+Both HTTP protocols (`simple` and `openai`) and CLI agent calls use
+`FEEDLING_AGENT_TURN_TIMEOUT_SEC` (default 300 seconds, minimum 30). A shorter
+remaining turn deadline still wins. This does not extend timeouts imposed by
+your HTTP server, proxy, or model provider; switching agent modes is not required
+just to change the consumer's timeout. Older consumer builds used 60 seconds
+for simple HTTP: check the running commit, not only files updated on disk.
+
+### Windows local IPC limitation
+
+The consumer and `io_cli.py` use the same `FEEDLING_HOME`. An explicit value is
+unchanged; without one, Windows uses Python's native temporary directory plus
+`feedling_home_<fingerprint>`, while POSIX retains `/tmp/feedling_home_<fingerprint>`.
+Set an explicit private directory for persistent state and give both processes
+the same setting. A fingerprint is a naming convention, not an access-control
+boundary; hosted keyless processes require their pinned per-user paths.
+
+On Python runtimes without `socket.AF_UNIX`, the local listener logs
+`ipc_unsupported` and does not start; `io_cli` returns a structured error for
+`identity-redistill`, `send-file`, and `send-image`. There is no TCP fallback.
+This does **not** disable HTTP polling or text replies. IPC never implemented
+text `send`; `io_cli send` and `wait-for-wake` are still explicit unsupported
+verbs. In HTTP mode the agent returns its reply to the consumer's request,
+and the consumer posts the envelope to IO. Proactive jobs follow the same
+outbound HTTP mechanism and remain subject to their normal wake/delivery gates.
+An absent IPC listener is not evidence of why a text reply failed.
+
+These diagnostics do not establish a Windows support guarantee or recommend
+migrating to CLI or Runtime V2.
 
 #### `AGENT_MODE=http`
 
@@ -382,9 +421,13 @@ Cold/rebuilt sessions receive at most eight meaningful recent chat rows by
 default (`FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT=8`). Voice-call archive cards
 are not replayed into that bridge; the model can inspect a relevant call with
 `voice-transcript-list` / `voice-transcript-read`. Foreground World Book matching
-also defaults to `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=tool`, using
-`worldbook-match --query ...` only when the model decides the setting matters.
-Set the World Book mode to `eager` as a rollback.
+defaults to `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=eager`: every foreground turn
+runs the same deterministic keyword scan the proactive lane already used, over a
+recent-turn window (seeded from stored history on the first match after start).
+Only the user's own messages and Feedling's own replies feed that window —
+screen-share text never selects entries. `worldbook-match --query ...` remains
+available for the model to look something up on demand. Set the World Book mode
+to `tool` to restore the old model-invoked-only behaviour.
 
 ##### Hermes example
 

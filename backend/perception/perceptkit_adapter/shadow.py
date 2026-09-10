@@ -388,7 +388,24 @@ def observe_location(user_id: str, values: Mapping[str, Any], *,
 _MIRROR_SOURCE = "ios"
 
 
-def _sync_mirror(user_id: str, collection_kind: str, items, received):
+def _coverage_window(payload: Mapping[str, Any]) -> tuple[Any, Any] | None:
+    """这批镜像覆盖的时间窗，客户端自己声明的。
+
+    没有窗口就不能声明「全量」—— 没有范围的全量，删的是**全部**。
+    """
+    from datetime import datetime
+    start = payload.get("calendar_window_start")
+    end = payload.get("calendar_window_end")
+    if not start or not end:
+        return None
+    try:
+        return datetime.fromisoformat(str(start)), datetime.fromisoformat(str(end))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sync_mirror(user_id: str, collection_kind: str, items, received,
+                 coverage: tuple[Any, Any] | None = None):
     """Write a mirror batch through the kit's own orchestration.
 
     Not ``upsert_*`` directly. The kit's entry is what stamps the batch's
@@ -419,10 +436,18 @@ def _sync_mirror(user_id: str, collection_kind: str, items, received):
     )
 
     from .storage import PostgresStorage
+    # 有覆盖窗口才敢声明全量：**窗口内没出现的条目 = 被删了**，
+    # 这也是「删除范围五段全比」那段代码唯一会被走到的路径。
+    # 没窗口（客户端太老、或者这批被截断了）就退回增量：宁可漏掉删除，
+    # 也不能把没看全的那部分当成"用户删了"—— 那是不可逆的。
+    from perceptkit.processing.source_sync import FULL
+    kind = FULL if coverage else INCREMENTAL
     batch = SyncBatch(
         source=_MIRROR_SOURCE, collection_kind=collection_kind,
         sync_id=f"{collection_kind}-{received.isoformat()}",
-        snapshot_kind=INCREMENTAL, items=items,
+        snapshot_kind=kind, items=items,
+        coverage_start=coverage[0] if coverage else None,
+        coverage_end=coverage[1] if coverage else None,
         attempted_at=received, completed_at=received,
     )
     with db.get_pool().connection() as conn:
@@ -452,7 +477,12 @@ def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         events = [CalendarEventMirror(subject_id=user_id, source=_MIRROR_SOURCE,
                                       updated_at=received, **row)
                   for row in rows]
-        return _sync_mirror(user_id, "calendar", events, received) or {
+        # ⚠️ 被截断（事件数超过客户端上限）时**不能**声明全量：那批不是窗口
+        # 内的全部，被截掉的会被当成"已删除"删掉。截断时 coverage 传 None。
+        coverage = None if payload.get("calendar_events_truncated") else \
+            _coverage_window(payload)
+        return _sync_mirror(user_id, "calendar", events, received,
+                            coverage=coverage) or {
                 "ran": True, "producer": "ios_calendar_mirror",
                 "report_id": "-", "observations": len(rows), "applied": len(rows),
                 "rejected": 0, "duplicates": 0, "events": 0,
@@ -485,3 +515,84 @@ __all__ = [
     "observe_photo", "observe_device_event", "observe_app_event",
     "observe_location", "mirror_calendar", "mirror_reminders",
 ]
+
+
+# ---------------------------------------------------------------------------
+# 来源撤回：用户在健康 app 里删掉一条记录，这边跟着不作数
+# ---------------------------------------------------------------------------
+
+#: 哪些信号能走撤回，以及客户端发的样本 id 对应哪个信号。
+#:
+#: 判据只有一条：**一条上游样本是不是就等于一条事实。**
+#:
+#:     是   体重 / BMI / 体脂 / 身高 / 血糖 / 血压 / 运动
+#:          删掉那条样本 = 那条事实不作数了 → 撤回
+#:     否   睡眠：一夜由几十条 HealthKit 样本聚成一条事实。删掉其中一条，
+#:          "那一夜"这件事没有消失、只是数字变了 —— 那是**修订**，
+#:          客户端重新上报那一夜即可（同一个锚点 id、新内容 = 新版本）。
+#:          硬走撤回还会对不上：HealthKit 给的是被删样本自己的 uuid，
+#:          而我们存的是从锚点样本派生的子 id。
+RETRACTABLE_SIGNALS = frozenset({
+    "health_weight", "health_bmi", "health_body_fat", "health_height",
+    "health_glucose", "health_blood_pressure", "health_workout",
+})
+
+
+def apply_deletions(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """iOS 报来「这些样本被删了」→ kit 的撤回。
+
+    载荷形状：``{"deleted": [{"signal": ..., "sample_id": ...}, ...]}``。
+    信号名用**存储侧**的名字（health_weight 这类）——客户端知道自己把哪个
+    指标发进了哪个信号，这比让服务端猜要可靠。
+    """
+    def build():
+        import db
+        from datetime import datetime, timezone
+        from perceptkit.contracts.retraction import Retraction
+        from perceptkit.kit import PerceptionKit
+        from .storage import PostgresStorage
+
+        raw = payload.get("deleted")
+        if not isinstance(raw, (list, tuple)) or not raw:
+            return None
+
+        now = datetime.now(timezone.utc)
+        wanted: list[Retraction] = []
+        skipped: list[str] = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            signal = str(item.get("signal") or "").strip()
+            sample_id = str(item.get("sample_id") or "").strip()
+            if not signal or not sample_id:
+                continue
+            if signal not in RETRACTABLE_SIGNALS:
+                # 明确记下来而不是安静丢掉：睡眠走的是重述那条路，
+                # 而"我发了但什么都没发生"是最难查的一种。
+                skipped.append(signal)
+                continue
+            wanted.append(Retraction(subject_id=user_id, signal=signal,
+                                     source_event_id=sample_id,
+                                     source=_MIRROR_SOURCE, observed_at=now))
+        if not wanted and not skipped:
+            return None
+
+        recorded = reselected = 0
+        days = 0
+        if wanted:
+            with db.get_pool().connection() as conn:
+                conn.autocommit = True
+                kit = PerceptionKit(storage=PostgresStorage(conn))
+                outcome = kit.apply_retractions(wanted, now=now)
+            recorded = outcome.recorded
+            reselected = outcome.reselected
+            days = len(outcome.affected_days)
+        return {"ran": True, "producer": "ios_health_deletion",
+                "report_id": "-", "observations": len(raw),
+                "applied": recorded, "rejected": len(skipped),
+                "duplicates": 0, "events": 0,
+                "warnings": ([f"这些信号不走撤回（走重述）：{sorted(set(skipped))}"]
+                             if skipped else []),
+                "rejections": [], "verdicts": {},
+                "reselected": reselected, "affected_days": days}
+    return _guarded("health_deletion", build, user_id)

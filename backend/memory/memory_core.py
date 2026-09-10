@@ -38,6 +38,7 @@ from memory import migration as memory_migration
 from memory import service as memory_service
 from memgarden import timestamps as memory_timestamps
 import memory_readside_core
+import memory_search_contract as search_contract
 
 
 # --------------------------------------------------------------------------- #
@@ -192,11 +193,22 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
         debug_trace.trace_event(
             store, subsystem="memory", type=event_type, actor="agent",
             status="failed", summary=f"{operation_label} failed", detail=detail)
+        if isinstance(e, search_contract.SearchLimitExceeded):
+            return {"error": "memory_search_resource_limit"}, 413
         return _readside_error_body(e), 503
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
+        if response.get("ranking") in (search_contract.VERSION, search_contract.LEGACY):
+            detail["ranking"] = response["ranking"]
+            detail["counts"]["unavailable"] = response.get("unavailable_count", 0)
         detail["query_fingerprint"] = query_fingerprint
+        # debug_trace bounds lists at 20; make that sampling explicit rather
+        # than suggesting that unlogged matches did not exist. Never log text.
+        returned_ids = [item["id"] for item in _items
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        detail["ids"] = returned_ids[:20]
+        detail["ids_omitted"] = max(0, len(returned_ids) - 20)
     debug_trace.trace_event(
         store, subsystem="memory", type=event_type, actor="agent",
         summary=f"{operation_label} returned {len(_items)} items",
