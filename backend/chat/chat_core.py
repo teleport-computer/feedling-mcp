@@ -63,11 +63,36 @@ def _ignore_voice_reply(*_args, **_kwargs) -> bool:
 # avoids making the foundational chat package depend on the voice feature.
 publish_voice_reply = _ignore_voice_reply
 
-_ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 _FILE_NAME_BIDI_CONTROLS = frozenset(
     chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
 )
 _CANVAS_FILENAME_MAX_CHARS = 120
+
+
+def _image_followup_gate_error(gate_err: dict) -> dict:
+    """Re-shape the shared envelope validator's error back to an image-specific
+    body carrying the ``image_followup`` marker.
+
+    The consumer's ``classify_reply_rejection`` recognises an attachment
+    rejection by the substring ``image_followup`` and only then runs the T528
+    drop-attachment recovery (resend without the picture) instead of releasing
+    the whole turn. The generic validator returns marker-less strings
+    (``envelope_missing_fields`` …), so without this remap a rejected sealed
+    image_followup would be classified ``other`` and bypass that recovery. The
+    three sealed bodies are restored verbatim to their pre-T558 wording; any
+    other (plaintext-shape) reason keeps its detail but gains the marker.
+    """
+    err = str(gate_err.get("error") or "")
+    if err == "envelope_missing_fields":
+        return {"error": "image_followup_envelope_missing_fields",
+                "detail": gate_err.get("detail")}
+    if err.startswith("envelope.visibility"):
+        return {"error": "invalid image_followup visibility"}
+    if err == "envelope with visibility=shared requires K_enclave":
+        return {"error": "shared image_followup requires K_enclave"}
+    return {"error": f"image_followup_{err}", **{
+        k: v for k, v in gate_err.items() if k != "error"
+    }}
 
 
 def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | None:
@@ -1055,22 +1080,22 @@ def write_response(
             followup_envelope = raw_followup.get("envelope")
             if not isinstance(followup_envelope, dict):
                 return {"error": "image_followup envelope required"}, 400
-            missing = [
-                field for field in _ENVELOPE_REQUIRED
-                if not followup_envelope.get(field)
-            ]
-            if missing:
-                return {
-                    "error": "image_followup_envelope_missing_fields",
-                    "detail": missing,
-                }, 400
-            if followup_envelope["visibility"] not in ("shared", "local_only"):
-                return {"error": "invalid image_followup visibility"}, 400
-            if (
-                followup_envelope["visibility"] == "shared"
-                and not followup_envelope.get("K_enclave")
-            ):
-                return {"error": "shared image_followup requires K_enclave"}, 400
+            # Shape-aware, exactly like the file_followup gate above: a sealed
+            # envelope keeps its full contract (body_ct/nonce/K_user + shared⇒
+            # K_enclave via validate_uploaded_envelope), and a plaintext-tier
+            # account's body_b64 image envelope is accepted too. The old
+            # sealed-only `_ENVELOPE_REQUIRED` list rejected every plaintext-tier
+            # image_followup with `image_followup_envelope_missing_fields`, so a
+            # plaintext/mixed-storage user could NEVER receive a generated image
+            # (T558; the T528 degrade notice fired, but the picture never landed).
+            gate_err = core_envelope.validate_uploaded_chat_envelope(
+                followup_envelope,
+                user_id=store.user_id,
+                content_type="image",
+                max_binary_bytes=generated_image.MAX_GENERATED_IMAGE_STORED_BYTES,
+            )
+            if gate_err is not None:
+                return _image_followup_gate_error(gate_err), 400
             conflict = _stale_key_conflict(store, followup_envelope)
             if conflict is not None:
                 return conflict

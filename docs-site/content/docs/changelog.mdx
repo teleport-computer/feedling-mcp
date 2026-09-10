@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Generated images now reach plaintext-tier accounts.** The image-followup
+  validator on `POST /v1/chat/response` accepted only the sealed envelope shape
+  (`body_ct`/`nonce`/`K_user`), so an account on the plaintext storage tier —
+  whose followup envelope is a `body_b64` plaintext shape, the same one file
+  followups already use — had every generated-image reply rejected with
+  `image_followup_envelope_missing_fields` and never received the picture. The
+  validator is now shape-aware (reusing the file-followup gate): a plaintext
+  `body_b64` image envelope is accepted when the account's encryption is off, and
+  the sealed shape keeps its full contract (still requires K_enclave for shared).
+
 - **Memory ranking and V2 profile freshness no longer depend on inactive signals.**
   Read-side scores ignore legacy `is_open_thread` metadata, including on stored
   cards. With profiles enabled, a changed Garden row-count or maximum-update

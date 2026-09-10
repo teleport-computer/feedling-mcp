@@ -36,6 +36,7 @@ import db  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from chat import chat_core  # noqa: E402
 from core import store as core_store  # noqa: E402
+from core import envelope as _core_envelope  # noqa: E402
 from model_api_runtime.v2 import document_render  # noqa: E402
 from tools import chat_resident_consumer as resident  # noqa: E402
 
@@ -1378,3 +1379,133 @@ def test_resident_posts_primary_and_encrypted_file_followup_together(monkeypatch
     assert followup["file_name"] == "计划.pdf"
     assert followup["file_mime"] == document_render.PDF_MIME
     assert followup["file_byte_count"] == len(b"%PDF-real-bytes")
+
+
+# ── T558: plaintext-tier image_followup envelope must be accepted ───────────
+# A plaintext-tier account's generated-image followup carries a body_b64 (no
+# body_ct/nonce/K_user) envelope — the same shape plaintext file followups
+# already use. The old sealed-only gate rejected it with
+# image_followup_envelope_missing_fields, so a plaintext/mixed-storage user
+# could NEVER receive a generated image (T558). The sealed path is unchanged
+# (test_v1_text_and_images_commit_as_one_ordered_reply above still exercises it).
+
+
+def _plaintext_image_envelope(user_id: str, msg_id: str, data: bytes) -> dict:
+    return {
+        "v": 1,
+        "id": msg_id,
+        "body_b64": base64.b64encode(data).decode("ascii"),
+        "body_size_bytes": len(data),
+        "owner_user_id": user_id,
+        "visibility": "shared",
+    }
+
+
+def test_v1_plaintext_tier_image_followup_is_accepted(store, monkeypatch):
+    _quiet_response_side_effects(monkeypatch)
+    monkeypatch.setattr(_core_envelope, "resolve_content_encryption", lambda uid: "off")
+    parent = store.append_chat("user", "chat", _envelope(store.user_id, "v1_pt_parent"))
+    img = _png_bytes()
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_pt_primary"),
+            "reply_to_message_id": parent["id"],
+            "image_followups": [
+                {
+                    "envelope": _plaintext_image_envelope(store.user_id, "v1_pt_img", img),
+                    "image_mime": "image/png",
+                    "image_byte_count": len(img),
+                },
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+    assert status == 200, body
+    rows = {row["id"]: row for row in db.chat_load(store.user_id)}
+    assert rows["v1_pt_img"]["content_type"] == "image"
+    assert rows["v1_pt_img"]["reply_to_message_id"] == parent["id"]
+
+
+def test_v1_plaintext_image_followup_rejected_on_encrypted_account(store, monkeypatch):
+    """Safety mirror: the plaintext body_b64 shape is only admissible when the
+    account's effective encryption is 'off'. An encrypted account presenting a
+    plaintext image_followup must still be rejected — otherwise any client could
+    unilaterally downgrade its encrypted store to plaintext."""
+    _quiet_response_side_effects(monkeypatch)
+    monkeypatch.setattr(_core_envelope, "resolve_content_encryption", lambda uid: "on")
+    parent = store.append_chat("user", "chat", _envelope(store.user_id, "v1_enc_parent"))
+    img = _png_bytes()
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_enc_primary"),
+            "reply_to_message_id": parent["id"],
+            "image_followups": [
+                {
+                    "envelope": _plaintext_image_envelope(store.user_id, "v1_enc_img", img),
+                    "image_mime": "image/png",
+                    "image_byte_count": len(img),
+                },
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+    assert status == 400, body
+    assert body["error"] == "image_followup_plaintext_envelope_not_enabled_for_this_account"
+    assert "v1_enc_img" not in {row["id"] for row in db.chat_load(store.user_id)}
+
+
+def _sealed_variant(user_id: str, msg_id: str, **overrides) -> dict:
+    env = _envelope(user_id, msg_id)
+    for k, v in overrides.items():
+        if v is _DROP:
+            env.pop(k, None)
+        else:
+            env[k] = v
+    return env
+
+
+_DROP = object()
+
+
+def _image_followup_error(store, monkeypatch, envelope) -> tuple[int, str]:
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat("user", "chat", _envelope(store.user_id, envelope["id"] + "_p"))
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, envelope["id"] + "_primary"),
+            "reply_to_message_id": parent["id"],
+            "image_followups": [
+                {"envelope": envelope, "image_mime": "image/png", "image_byte_count": 10},
+            ],
+        },
+        consumer_id="resident-v1", consumer_info={}, allow_verify_reply=False,
+    )
+    return status, body.get("error", "")
+
+
+def test_v1_sealed_image_followup_missing_fields_keeps_legacy_error(store, monkeypatch):
+    # Downstream classify_reply_rejection recognises attachment failures by the
+    # `image_followup` substring; the legacy body must be preserved (T558 r2).
+    status, err = _image_followup_error(
+        store, monkeypatch, _sealed_variant(store.user_id, "v1_seal_missing", body_ct=_DROP))
+    assert status == 400 and err == "image_followup_envelope_missing_fields"
+
+
+def test_v1_sealed_image_followup_bad_visibility_keeps_legacy_error(store, monkeypatch):
+    status, err = _image_followup_error(
+        store, monkeypatch, _sealed_variant(store.user_id, "v1_seal_vis", visibility="bogus"))
+    assert status == 400 and err == "invalid image_followup visibility"
+
+
+def test_v1_sealed_shared_image_followup_requires_k_enclave_keeps_legacy_error(store, monkeypatch):
+    status, err = _image_followup_error(
+        store, monkeypatch,
+        _sealed_variant(store.user_id, "v1_seal_ke", visibility="shared", K_enclave=_DROP))
+    assert status == 400 and err == "shared image_followup requires K_enclave"
