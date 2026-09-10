@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident CLI parse failures retain bounded local evidence.** When Codex or
+  Claude exits zero with non-empty structured stdout but no deliverable reply,
+  the resident stores a private, rotated raw artifact under `FEEDLING_HOME`.
+  Backend traces receive correlation metadata plus the exact first 80 characters
+  and local artifact path for direct diagnosis; they never receive the complete
+  stdout. Successful turns and genuinely empty provider responses remain
+  unchanged.
+
 - **Pi stream diagnostics survive trace serialization.** Model-call traces add
   versioned scalar block counts and stop-reason indicators without storing reply,
   reasoning, or tool-argument content in those fields. Operators can distinguish

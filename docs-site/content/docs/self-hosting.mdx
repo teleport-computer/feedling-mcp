@@ -32,6 +32,18 @@ persistent directory for both processes when state must survive temporary-file
 cleanup. The fingerprint is not an authorization boundary; hosted keyless
 consumers still require per-user pinned paths.
 
+When a CLI driver exits successfully with non-empty stdout but the resident
+cannot parse a deliverable turn, the consumer keeps a local diagnostic copy in
+`$FEEDLING_HOME/reply-parse-failures`. Each `.raw` file is mode `0600`, the
+directory is mode `0700`, each body is capped at 256 KiB, and rotation retains at
+most 20 files and 2 MiB total. A larger body is stored as a bounded prefix; the
+SHA-256 in its filename describes the complete stdout. The corresponding backend
+trace includes the byte length, SHA-256, exit code, driver, parse-empty stage,
+timestamp, the exact first 80 characters, and the local artifact path so an
+operator can correlate the failure directly. It never carries the complete
+stdout. Successful turns and genuinely empty provider responses do not create
+these files.
+
 The current simple/OpenAI HTTP and CLI agent paths already share
 `FEEDLING_AGENT_TURN_TIMEOUT_SEC` (300 seconds by default, minimum 30), bounded
 by any shorter remaining turn deadline. Older simple-HTTP builds used a fixed

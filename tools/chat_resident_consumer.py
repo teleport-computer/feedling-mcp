@@ -52,6 +52,10 @@ CLI mode:
   FEEDLING_AGENT_IMAGE_GENERATION
                         Set true only when the configured resident agent exposes
                         a callable native image-generation capability.
+  Reply parse failures  Non-empty CLI stdout that yields no deliverable turn is
+                        retained under FEEDLING_HOME/reply-parse-failures for
+                        local diagnosis. Backend trace gets the first 80 chars
+                        and local path; retention is bounded and rotated.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp.
@@ -422,6 +426,21 @@ FEEDLING_HOME = Path(os.environ.get("FEEDLING_HOME") or _resident_home_default()
 RESIDENT_IPC_SOCK = FEEDLING_HOME / "resident_ipc.sock"
 RESIDENT_IPC_STATE_FILE = FEEDLING_HOME / "resident_ipc_state.json"
 OUTBOUND_FILE_DIR = FEEDLING_HOME / "outbound-files"
+# A reply which the local parser cannot turn into a usable resident turn is
+# valuable diagnostic evidence, but it can contain the user's whole prompt and
+# the model's whole response. Keep it on the resident host, under the same
+# per-user root as IPC/outbound state, and bound both each file and the retained
+# set. The backend trace receives only the bounded prefix explicitly approved
+# for this diagnostic, never the complete body.
+REPLY_PARSE_FAILURE_MAX_BYTES = 256 * 1024
+REPLY_PARSE_FAILURE_MAX_FILES = 20
+REPLY_PARSE_FAILURE_TOTAL_BYTES = 2 * 1024 * 1024
+REPLY_PARSE_FAILURE_PREVIEW_CHARS = 80
+_REPLY_PARSE_FAILURE_FILE_PREFIX = "reply-parse-failed-"
+_reply_parse_failure_lock = threading.Lock()
+_reply_parse_failure_capture: ContextVar[dict[str, Any] | None] = ContextVar(
+    "reply_parse_failure_capture", default=None
+)
 # The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
 # non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
 # collides for every user on the host and the /tmp defaults become ONE shared
@@ -1784,6 +1803,147 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
         threading.Thread(target=_dispatch, daemon=True).start()
     except Exception:
         pass  # observability must never affect the turn
+
+
+def _reply_parse_failure_driver(cmd: list[str]) -> str:
+    if _is_codex_cmd(cmd):
+        return "codex"
+    if _is_claude_code_cmd(cmd):
+        return "claude"
+    if _is_pi_cmd(cmd):
+        return "pi"
+    return Path(cmd[0]).name[:80] if cmd else "cli"
+
+
+def _reply_parse_failure_stage(cmd: list[str], *, sanitized: bool = False) -> str:
+    if _is_codex_cmd(cmd):
+        base = "codex_stream"
+    elif _is_claude_code_cmd(cmd):
+        base = "claude_stream"
+    elif _is_pi_cmd(cmd):
+        base = "pi_stream"
+    else:
+        base = "cli_output"
+    return f"{base}_sanitization" if sanitized else base
+
+
+def _rotate_reply_parse_failures(directory: Path) -> None:
+    """Keep only this feature's oldest-to-newest bounded local artifacts."""
+    candidates: list[tuple[int, str, Path, int]] = []
+    for path in directory.glob(f"{_REPLY_PARSE_FAILURE_FILE_PREFIX}*.raw"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat = path.stat()
+            candidates.append((stat.st_mtime_ns, path.name, path, stat.st_size))
+        except OSError:
+            continue
+    candidates.sort()
+    total = sum(item[3] for item in candidates)
+    while (
+        len(candidates) > REPLY_PARSE_FAILURE_MAX_FILES
+        or total > REPLY_PARSE_FAILURE_TOTAL_BYTES
+    ):
+        _mtime, _name, path, size = candidates.pop(0)
+        try:
+            path.unlink()
+            total -= size
+        except OSError:
+            # A concurrent process may already have removed it. Recompute on
+            # the next failure instead of risking deletion outside our prefix.
+            break
+
+
+def _preserve_reply_parse_failure(
+    raw: str,
+    *,
+    cmd: list[str],
+    exit_code: int,
+    parse_empty_stage: str,
+    trace_id: str = "",
+) -> Path | None:
+    """Persist bounded raw stdout locally and emit bounded correlation data.
+
+    The SHA-256 always describes the complete stdout. A body larger than the
+    per-file cap is stored as its first bounded prefix; the full digest in both
+    the filename and trace still lets an operator correlate the occurrence.
+    Failure to preserve diagnostics must never replace the original turn error.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    captured_at_epoch = time.time()
+    captured_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(captured_at_epoch)
+    )
+    raw_bytes = raw.encode("utf-8", errors="replace")
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    driver = _reply_parse_failure_driver(cmd)
+    stored = raw_bytes[:REPLY_PARSE_FAILURE_MAX_BYTES]
+    path: Path | None = None
+
+    try:
+        with _reply_parse_failure_lock:
+            directory = FEEDLING_HOME / "reply-parse-failures"
+            directory.mkdir(parents=True, exist_ok=True)
+            if directory.is_symlink() or not directory.is_dir():
+                raise OSError("reply parse failure directory is not a real directory")
+            os.chmod(directory, 0o700)
+            safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "-", trace_id).strip("-.")[:80]
+            if not safe_trace:
+                safe_trace = "no-trace"
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(captured_at_epoch))
+            stem = (
+                f"{_REPLY_PARSE_FAILURE_FILE_PREFIX}{stamp}-{safe_trace}-"
+                f"{driver}-{raw_sha256}"
+            )
+            for suffix in ("", f"-{uuid.uuid4().hex[:8]}"):
+                candidate = directory / f"{stem}{suffix}.raw"
+                try:
+                    fd = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                except FileExistsError:
+                    continue
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(stored)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                path = candidate
+                break
+            if path is None:
+                raise OSError("could not allocate reply parse failure artifact")
+            _rotate_reply_parse_failures(directory)
+    except OSError as exc:
+        log.warning(
+            "could not preserve reply parse failure locally: %s",
+            type(exc).__name__,
+        )
+
+    # The complete body stays local. Seven explicitly approved this exact
+    # prefix plus its local path for T539 diagnostics; do not grow the preview
+    # independently of REPLY_PARSE_FAILURE_PREVIEW_CHARS and its guard test.
+    _emit_debug_trace(
+        "agent",
+        "agent.reply.parse_failed",
+        status="error",
+        trace_id=trace_id,
+        summary="resident reply parser produced no usable turn",
+        explain="resident 本地解析器未得到可交付回复；完整原始输出仅保留在用户本机",
+        detail={
+            "raw_bytes": len(raw_bytes),
+            "raw_sha256": raw_sha256,
+            "exit_code": int(exit_code),
+            "driver": driver,
+            "parse_empty_stage": parse_empty_stage,
+            "captured_at": captured_at,
+            "raw_preview": raw[:REPLY_PARSE_FAILURE_PREVIEW_CHARS],
+            "local_path": str(path or ""),
+        },
+    )
+    return path
 
 
 # Stage D: when hosted, the supervisor writes a short-lived runtime token to this
@@ -11778,6 +11938,22 @@ def call_agent_cli(
             _model_call_trace=model_call_trace,
         )
     except Exception as exc:
+        result = model_call_trace.get("result")
+        cmd = list(model_call_trace.get("cmd") or [])
+        if (
+            isinstance(exc, ValueError)
+            and "cli agent produced no usable output" in str(exc)
+            and result is not None
+            and int(getattr(result, "returncode", -1)) == 0
+            and str(getattr(result, "stdout", "") or "").strip()
+        ):
+            _preserve_reply_parse_failure(
+                str(result.stdout),
+                cmd=cmd,
+                exit_code=int(result.returncode),
+                parse_empty_stage=_reply_parse_failure_stage(cmd),
+                trace_id=trace_id,
+            )
         _emit_cli_model_call_terminal(
             model_call_trace,
             trace_id=trace_id,
@@ -11785,6 +11961,15 @@ def call_agent_cli(
             failure=exc,
         )
         raise
+    capture = _reply_parse_failure_capture.get()
+    if capture is not None:
+        result = model_call_trace.get("result")
+        if result is not None:
+            capture.update({
+                "raw": str(getattr(result, "stdout", "") or ""),
+                "cmd": list(model_call_trace.get("cmd") or []),
+                "exit_code": int(getattr(result, "returncode", 0)),
+            })
     _emit_cli_model_call_terminal(
         model_call_trace,
         trace_id=trace_id,
@@ -12070,6 +12255,7 @@ def call_agent(
     # often, so an explicit per-turn reset keeps the signal turn-scoped.
     global _turn_reply_parse_failed
     _turn_reply_parse_failed = ""
+    cli_parse_failure_source: dict[str, Any] = {}
 
     def _invoke() -> Any:
         if AGENT_MODE == "http":
@@ -12108,7 +12294,13 @@ def call_agent(
                 cli_kwargs["isolated_session"] = True
             if absolute_deadline is not None:
                 cli_kwargs["absolute_deadline"] = absolute_deadline
-            return call_agent_cli(message, **cli_kwargs)
+            capture_token = _reply_parse_failure_capture.set(
+                cli_parse_failure_source
+            )
+            try:
+                return call_agent_cli(message, **cli_kwargs)
+            finally:
+                _reply_parse_failure_capture.reset(capture_token)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -12171,6 +12363,19 @@ def call_agent(
     failure_class = (
         "reply_parse_failed" if model_said_something else "provider_empty_reply"
     )
+    if failure_class == "reply_parse_failed" and cli_parse_failure_source:
+        source_raw = str(cli_parse_failure_source.get("raw") or "")
+        source_cmd = list(cli_parse_failure_source.get("cmd") or [])
+        if source_raw.strip():
+            _preserve_reply_parse_failure(
+                source_raw,
+                cmd=source_cmd,
+                exit_code=int(cli_parse_failure_source.get("exit_code") or 0),
+                parse_empty_stage=_reply_parse_failure_stage(
+                    source_cmd, sanitized=True
+                ),
+                trace_id=trace_id,
+            )
     if SEND_FALLBACK_ON_AGENT_ERROR:
         _turn_reply_parse_failed = failure_class
         return [FALLBACK_REPLY]
