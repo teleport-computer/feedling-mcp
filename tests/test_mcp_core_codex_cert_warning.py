@@ -87,7 +87,7 @@ def _fake_decrypt(monkeypatch):
     from core import enclave as core_enclave
     monkeypatch.setattr(
         core_enclave, "_decrypt_envelope_via_enclave",
-        lambda env, key, *, purpose, runtime_token="": json.dumps(
+        lambda env, key, *, purpose, caller_user_id, runtime_token="": json.dumps(
             {"url": "https://mcp.example.com/mcp", "headers": {}}).encode())
 
 

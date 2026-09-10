@@ -32,6 +32,15 @@ python3 -m pytest -q <你要跑的文件>
 看第一行，别看最后的 assert。（这条 §6 早就记过，但埋在第 300 多行——
 所以搬到这里。知识要出现在你需要它的那一刻。）
 
+**同族假红：缺 `pytest-asyncio`。** `@pytest.mark.asyncio` 的异步测试（例如
+`test_asgi_lifespan_loads_users.py`、`test_memory_bm25_readside.py::test_lifespan_prewarms_before_serving`）
+在没装 `pytest-asyncio` 的环境里会红成 `async def functions are not natively supported`
++ `PytestUnknownMarkWarning: Unknown pytest.mark.asyncio`——**这是缺插件，不是代码缺陷**。
+临时用 `uv run --with pytest ...` 手搓命令时最容易漏（`--with pytest` 不含 asyncio 插件），
+要显式加 `--with pytest-asyncio`；上面 §① 那条带环境变量的命令在装好仓库依赖的环境里本就有它。
+CI 的 `python-tests` job 在 `pip install pytest-asyncio` 之后才跑这些用例。
+⚠️ 别把「3.10 绿 / 3.12 红」当解释器差异——真变量常常是两次跑的**插件集**不同（2026-09-11 T537 实撞）。
+
 ### ② 别猜该跑哪些测试 —— 有工具
 
 仓库有 **651 个测试文件**，跑全量太贵、乱跑等于没跑：
