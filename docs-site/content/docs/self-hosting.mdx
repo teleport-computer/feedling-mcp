@@ -51,6 +51,16 @@ by any shorter remaining turn deadline. Older simple-HTTP builds used a fixed
 setting cannot extend an upstream server or proxy timeout and is not a
 recommendation to migrate runtimes.
 
+After an ordinary foreground text CLI subprocess reaches that hard timeout,
+supported Codex, Claude, and Pi commands get one fresh, reply-only recovery
+attempt. The recovery has its own 120-second deadline (configurable with
+`FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC`, minimum 30), removes user/project
+tool surfaces, and discards executable actions from the result. It does not
+undo anything the timed-out turn may already have completed; the isolation is
+there to prevent the automatic recovery from repeating it. Attachment turns,
+HTTP/custom drivers, and background/proactive work retain the existing visible
+timeout fallback.
+
 For direct `POST /v1/chat/response`, authenticate with the account's API key and
 send a valid envelope for that account's encryption tier. A whoami public key
 is an encryption recipient, not an API credential. Plain-text-only chat messages
@@ -251,6 +261,7 @@ these settings:
 | `FEEDLING_DECRYPT_DEGRADE_AFTER` | Optional number of consecutive claimed-but-unreadable messages before the resident reports `degraded` (default 2, minimum 1). A real ordinary user-message decrypt resets the streak; a server maintenance turn does not. |
 | `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC` | Optional backend persistence window before an explicit decrypt failure can inject a maintenance Chat turn for an established resident (default 1800 seconds, minimum 1). New onboarding remains immediately actionable, and all explicit failures can still produce an in-app notice before this window elapses. |
 | `FEEDLING_AGENT_TURN_TIMEOUT_SEC` | Optional per-turn timeout in seconds for one resident agent call (default 300, minimum 30). It applies to both CLI subprocesses and HTTP agent requests. Raise it for slow self-hosted stacks (cold starts, heavy MCP, long-thinking models); the cap always exists so a hung agent cannot wedge the single-flight chat lane. |
+| `FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC` | Optional deadline for the single reply-only recovery after an ordinary foreground text CLI subprocess hits its hard timeout (default 120 seconds, minimum 30). Recovery is limited to Codex, Claude, and Pi commands whose isolation controls are known: it uses a fresh session and clean working directory, removes user/project tool configuration, disables tools or enforces a read-only sandbox, and drops action/tool-call output. It never stacks with the empty-reply retry. HTTP agents, custom CLI drivers, attachment turns, and non-foreground lanes keep the normal visible timeout fallback. |
 | `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI` | Defaults to `false`. Set it to `true` only when an `AGENT_MODE=http` agent runs on the same machine, can execute commands in the Feedling checkout, and inherits the resident's `FEEDLING_HOME`. It then receives the local `io_cli` catalog and can stage downloadable files, images, and self-contained `.io.html` Canvas cards. Canvas `send-file` calls include a user-language `--title` and `--subtitle` for the app card. Leave it off for ordinary or remote HTTP model servers. |
 | `FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS` | Required with the local HTTP `io_cli` opt-in when generated files remain in the agent workspace. Set it to the exact workspace root, or a platform path-separated list of narrow roots. `send-file` may read files inside these roots but leaves the originals intact. Never set it to a home directory or filesystem root. |
 | `FEEDLING_AGENT_IMAGE_GENERATION` | Set to `true` only when the configured resident agent entry exposes a callable native image-generation tool and can deliver its PNG, JPEG, or WebP through `io_cli.py send-image`. VPS is only a deployment location and is not treated as proof of support or non-support. The companion decides when to generate an image and calls `io_cli.py generate-image` itself; a selected dedicated image route is the model it draws with, not a path that bypasses it. Residents that advertise neither a dedicated route nor a native capability continue to receive setup guidance. |

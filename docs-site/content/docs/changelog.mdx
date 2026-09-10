@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Foreground CLI timeouts get one side-effect-contained reply recovery.** An
+  ordinary text Chat turn that reaches the resident subprocess timeout can make
+  one fresh reply-only attempt on supported Codex, Claude, or Pi commands. The
+  recovery runs without user/project tools, strips executable action output,
+  and cannot stack with the existing empty-reply retry. Attachment turns,
+  background/proactive work, HTTP agents, and unknown CLI drivers retain the
+  existing visible timeout fallback. Operators can bound the recovery with
+  `FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC` (default 120 seconds, minimum 30).
+
 - **Resident CLI parse failures retain bounded local evidence.** When Codex or
   Claude exits zero with non-empty structured stdout but no deliverable reply,
   the resident stores a private, rotated raw artifact under `FEEDLING_HOME`.
