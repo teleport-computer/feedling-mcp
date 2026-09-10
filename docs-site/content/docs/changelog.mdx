@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident model-call diagnostics identify their upstream route.** Terminal
+  model-call traces from the Pi, Claude, and Codex CLI runtimes now carry the
+  configured provider and model identifiers, matching the existing V2 trace
+  shape. They also carry the execution lane, so operators can separate chat
+  from background failures without inspecting prompts or model output. Missing
+  route facts remain unset rather than creating an empty-string bucket.
+
 - **Generated images now reach plaintext-tier accounts.** The image-followup
   validator on `POST /v1/chat/response` accepted only the sealed envelope shape
   (`body_ct`/`nonce`/`K_user`), so an account on the plaintext storage tier —
