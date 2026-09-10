@@ -28,6 +28,9 @@ from tools.e2e.hosted import run_hosted_cell  # noqa: E402
 from tools.e2e.vps import run_vps_cell  # noqa: E402
 
 _ICON = {"ok": "✅", "fail": "❌", "skip": "⏭️", "warn": "⚠️",
+         # 「量具型号已下架」自己的一格:既不是 PASS 也不是 FAIL(见
+         # hosted.RESULT_INSTRUMENT_STALE 与 p0_blocks_release)。
+         "instrument_stale": "🧪",
          # 「回来了，但交付给用户的是失败话术」自己的一格。之前它没有词，
          # 才被 "ok" 冒名顶替(T406:hosted 格实测交付兜底 9/12，判 FAIL 只 4/12)。
          VERDICT_FALLBACK: "🟠"}
