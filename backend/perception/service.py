@@ -1312,19 +1312,78 @@ def _perceptkit_primary() -> bool:
         not in ("0", "false", "no", "off")
 
 
+#: 字段 -> 它的单指标 Capability(查询档)。
+#:
+#: perceptkit 0.4.0（提交 9f999e4）把健康信号拆成单指标：上报键
+#: ``health_vitals / health_body / health_metabolic`` 的 Capability 只当「报告闸」，
+#: 不再带 ``query_tool``；标志挪到了 ``health_resting_hr`` 这些单指标 Capability 上，
+#: 而它们不被任何 Signal 引用。catalog 自己没有「字段 -> 单指标 Capability」的映射，
+#: 所以 ``_wanted_snapshot_fields`` 只按 Signal 的 Capability 判时，这三组共 14 个
+#: 输出字段从不进 pull 快照，agent 投影恒 None——kit / live 两条路一样（T561）。
+#: 这张表让判定落到**字段**上：一个字段的单指标 Capability 有 query_tool 就放它，
+#: 不因此整组放开。表的完整性由 tests/test_perception_wanted_metric_caps.py 对着
+#: 真 catalog 钉住（多一个未映射的输出、少一个 Capability 都会红）。
+QUERY_METRIC_CAPABILITY_BY_FIELD: dict[str, str | None] = {
+    # health_vitals
+    "resting_heart_rate": "health_resting_hr",
+    "current_heart_rate": "health_current_hr",
+    "hrv_sdnn_ms": "health_hrv",
+    "respiratory_rate": "health_respiratory",
+    "oxygen_saturation_pct": "health_oxygen",
+    "vo2_max": "health_vo2max",
+    # catalog 没有 ``steps`` Capability（manifest.minimal 的 steps 信号仍挂在
+    # health_vitals 下）。step_count 在 0.3.0 时就在 pull 快照里，agent 侧
+    # ``steps`` 是既有查询信号且有独立权限键（SIGNAL_PERMISSION_KEYS["steps"]），
+    # 这里按 include_query_tools 收入，恢复原有行为；长期正解是 perceptkit 补
+    # Capability("steps")，届时把这行改成它。
+    "step_count": None,
+    # health_body
+    "weight_kg": "health_weight",
+    "bmi": "health_bmi",
+    "body_fat_pct": "health_body_fat",
+    "height_cm": "health_height",
+    # health_metabolic（血压两个字段是同一次读数，共一个 Capability）
+    "blood_glucose_mmol_l": "health_glucose",
+    "blood_pressure_systolic": "health_blood_pressure",
+    "blood_pressure_diastolic": "health_blood_pressure",
+}
+
+#: 表里映到 None 的字段——没有单指标 Capability 可查，但按查询档收入。
+#: 显式列出，免得 None 被当成「忘了填」。
+QUERY_FIELDS_WITHOUT_METRIC_CAPABILITY: frozenset[str] = frozenset(
+    f for f, cap in QUERY_METRIC_CAPABILITY_BY_FIELD.items() if cap is None
+)
+
+
+def _field_is_query_tool(field: str) -> bool:
+    """字段自己的单指标 Capability 是不是查询档。"""
+    if field not in QUERY_METRIC_CAPABILITY_BY_FIELD:
+        return False
+    cap_name = QUERY_METRIC_CAPABILITY_BY_FIELD[field]
+    if cap_name is None:
+        return True
+    cap = catalog.CAPABILITIES.get(cap_name)
+    return bool(cap and cap.query_tool)
+
+
 def _wanted_snapshot_fields(*, include_query_tools: bool) -> dict[str, float]:
     """这次快照该出现哪些字段，各自的过期秒数是多少。
 
     过期判据仍然按**老路的目录**算。切换要换的是数据来源，不是「什么算过期」;
     两件事一起改，出了问题分不清是谁的。
+
+    Signal 的 Capability 是「报告闸」；查询档可能挂在**字段**自己的单指标
+    Capability 上（QUERY_METRIC_CAPABILITY_BY_FIELD）。cheap ``now``
+    （include_query_tools=False）只看前者，与拆分前逐项相同。
     """
     wanted: dict[str, float] = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
-        if not cap or not (cap.context_field or (include_query_tools and cap.query_tool)):
-            continue
+        signal_wanted = bool(cap and (cap.context_field or (include_query_tools and cap.query_tool)))
         for f in sig.outputs:
-            if f != "user_state":
+            if f == "user_state":
+                continue
+            if signal_wanted or (include_query_tools and _field_is_query_tool(f)):
                 wanted[f] = sig.ttl_sec
     return wanted
 

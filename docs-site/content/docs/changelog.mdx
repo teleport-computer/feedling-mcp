@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `GET /v1/agent/perception` (and the proactive agent's perception tools) again
+  return the `steps`, `vitals`, `body`, and `metabolic` fields the client reports.
+  Since the perception catalog split health signals into per-metric query
+  capabilities, the pull snapshot only consulted the report-level capability and
+  silently dropped these 14 fields; it now also honours each field's per-metric
+  capability. The cheap `perception.now` snapshot is unchanged.
 - **Resident model-call diagnostics identify their upstream route.** Terminal
   model-call traces from the Pi, Claude, and Codex CLI runtimes now carry the
   configured provider and model identifiers, matching the existing V2 trace
