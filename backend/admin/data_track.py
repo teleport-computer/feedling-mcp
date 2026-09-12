@@ -272,7 +272,10 @@ def _capture_window_cursor(job: Mapping[str, Any] | None) -> dict[str, Any]:
         value = str(window.get(key) or "")[:160]
         if value:
             out[key] = value
-    for key in ("after_seq", "through_seq", "message_count"):
+    for key in ("after_seq", "through_seq", "message_count",
+                # 窗口指纹 —— 定位「模型为什么吐出坏 JSON」用。
+                # 全是计数，见 memory/window_fingerprint。
+                "window_chars", "ascii_double_quotes"):
         raw = window.get(key)
         if raw is None:
             continue
@@ -280,6 +283,18 @@ def _capture_window_cursor(job: Mapping[str, Any] | None) -> dict[str, Any]:
             out[key] = int(float(raw))
         except (TypeError, ValueError):
             continue
+    raw = window.get("per_kchars")
+    if raw is not None:
+        try:
+            out["per_kchars"] = round(float(raw), 2)
+        except (TypeError, ValueError):
+            pass
+    # roles / sources 是**白名单枚举**（window_fingerprint 已经把未知值
+    # 归成 "other"），所以可以原样带出，不会漏出用户内容。
+    for key in ("roles", "sources"):
+        raw = window.get(key)
+        if isinstance(raw, (list, tuple)):
+            out[key] = sorted(str(x)[:24] for x in raw)[:12]
     return out
 
 
