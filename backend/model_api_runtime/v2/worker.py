@@ -3372,11 +3372,11 @@ def _empty_response_trace_detail(
     response_shape: dict[str, Any], lane: str
 ) -> dict[str, Any]:
     """Normalize provider-empty metadata once for every trace consumer."""
-    raw_stop_reason = str(response_shape.get("stop_reason") or "")
+    stop_reason_in = str(response_shape.get("stop_reason") or "")
     stop_reason = (
-        raw_stop_reason
-        if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
-        else ("other" if raw_stop_reason else "")
+        stop_reason_in
+        if stop_reason_in in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+        else ("other" if stop_reason_in else "")
     )
     completion_tokens = response_shape.get("completion_tokens")
     detail: dict[str, Any] = {
@@ -3393,6 +3393,16 @@ def _empty_response_trace_detail(
         ),
         "lane": _normalize_provider_trace_lane(lane),
     }
+    # T568: when the closed-set ``stop_reason`` collapsed a real marker to
+    # "other", surface the verbatim provider value carried up from the shape so
+    # the empty is root-causable directly on the trace. Only in that masked case
+    # (recognized/empty reasons already show themselves in ``stop_reason``). Per
+    # the 2026-09-10 trace-content policy this raw provider value is permitted
+    # here, unlike the content-free provider_* fields below. Added before the
+    # provider-diagnostics update so it stays within the _safe_detail key cap.
+    shape_raw = response_shape.get("raw_stop_reason")
+    if stop_reason == "other" and shape_raw:
+        detail["raw_stop_reason"] = str(shape_raw)
     detail.update(_empty_provider_diagnostics_fields(response_shape))
     return detail
 
