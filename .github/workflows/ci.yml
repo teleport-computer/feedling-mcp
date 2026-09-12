@@ -1339,10 +1339,25 @@ jobs:
         run: python3 evals/language.py
 
       - name: Verify the memory kernel's build provenance
-        # 锁里的 sha256 只证明「装进镜像的字节 = Release 上那份字节」。这一步再证明
+        # 锁里的 sha256 只证明「装进镜像的字节 = 上游发布的那份字节」。这一步再证明
         # 「那份字节由 memgarden 仓库的 CI 从公开 tag 编出来」—— 有仓库权限的人换掉
         # wheel 时，哈希会变（构建直接失败）；但如果他们连哈希一起改了，只有出处
         # 凭证能拆穿。两道合起来才是完整的一环。
+        #
+        # 🔴 2026-09-12 修：这一步原来只认 0.12.9 之前的钉法（`memgarden @ https://….whl`）。
+        # 钉法早就换成了 PyPI 版本号，于是它每次都掉进「找不到 wheel URL」那条分支，
+        # 报一句红字，再被 continue-on-error 放行 —— **出处校验从换钉法那天起就没再
+        # 真验过任何东西**，同时每次发版都制造一条假警报（zhihao 09-12 又问了一次）。
+        # 紧挨着的「装记忆内核」那步 2026-08-31 踩过同一个坑后改成两种钉法都收，
+        # 这一步漏改了。装饰性的检查比没有检查更糟，这是第二个实例。
+        #
+        # 现在：两种钉法都收；PyPI 那种按版本号问 PyPI 要 wheel 的真实 URL 和 sha256，
+        # 并且多验一道 —— PyPI 现在发的那份 wheel 的 sha256 必须出现在 lock 里，
+        # 否则锁描述的就不是上游现在发的字节。下载回来还会再核一次本地 sha256，
+        # 免得「验的字节」和「装的字节」是两份。
+        #
+        # agent-protocol-core 2026-09-04 起搬进 backend/agent_protocol_core/，不再是
+        # 外部依赖，所以缺席不算错；万一将来又拆出去，这里会自动重新开始验它。
         #
         # 失败不阻断构建（continue-on-error）：凭证是 2026-08-23 起才有的，
         # 旧版本没有，而且 GitHub 的凭证服务挂掉不该让整条 CI 红。
@@ -1352,36 +1367,96 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          python - <<'PY' > /tmp/mg_urls.txt
-          import re, pathlib
+          if ! python - <<'PY' > /tmp/mg_artifacts.tsv
+          import json, pathlib, re, sys, urllib.request
+
+          REQUIRED = {"memgarden": "teleport-computer/memgarden"}
+          OPTIONAL = {"agent-protocol-core": "teleport-computer/agent-protocol-core"}
+
           lock = pathlib.Path("backend/requirements.lock").read_text()
-          for line in lock.splitlines():
-              m = re.match(r"^(memgarden|agent-protocol-core) @ (\S+\.whl)", line)
-              if m:
-                  print(m.group(2))
+          entries, current = {}, None
+          for raw in lock.splitlines():
+              line = raw.rstrip().rstrip("\\").rstrip()
+              direct = re.match(r"^([A-Za-z0-9_.-]+) @ (\S+\.whl)$", line)
+              pinned = re.match(r"^([A-Za-z0-9_.-]+)==([^\s;]+)$", line)
+              digest = re.match(r"^\s+--hash=sha256:([0-9a-f]{64})$", line)
+              if direct:
+                  current = direct.group(1).lower()
+                  entries[current] = {"kind": "url", "value": direct.group(2), "hashes": []}
+              elif pinned:
+                  current = pinned.group(1).lower()
+                  entries[current] = {"kind": "version", "value": pinned.group(2), "hashes": []}
+              elif digest and current:
+                  entries[current]["hashes"].append(digest.group(1))
+              elif line and not line.startswith((" ", "#")):
+                  current = None
+
+          missing = [name for name in REQUIRED if name not in entries]
+          if missing:
+              print(f"::error::backend/requirements.lock 里没有 {', '.join(missing)} —— 依赖被删掉了？", file=sys.stderr)
+              raise SystemExit(1)
+
+          for name, repo in {**REQUIRED, **OPTIONAL}.items():
+              entry = entries.get(name)
+              if entry is None:
+                  continue
+              if entry["kind"] == "url":
+                  print(f"{name}\t{repo}\t{entry['value']}\t{entry['hashes'][0] if entry['hashes'] else '-'}")
+                  continue
+              url = f"https://pypi.org/pypi/{name}/{entry['value']}/json"
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  release = json.load(response)
+              wheels = [f for f in release["urls"] if f["packagetype"] == "bdist_wheel"]
+              if not wheels:
+                  print(f"::error::PyPI 上 {name}=={entry['value']} 没有 wheel", file=sys.stderr)
+                  raise SystemExit(1)
+              for wheel in wheels:
+                  sha = wheel["digests"]["sha256"]
+                  if entry["hashes"] and sha not in entry["hashes"]:
+                      print(
+                          f"::error::{name}=={entry['value']} 在 PyPI 上的 wheel 哈希不在 lock 里"
+                          " —— 锁描述的不是上游现在发的那份字节",
+                          file=sys.stderr,
+                      )
+                      raise SystemExit(1)
+                  print(f"{name}\t{repo}\t{wheel['url']}\t{sha}")
           PY
-          if [ ! -s /tmp/mg_urls.txt ]; then
-            echo "::error::lock 里找不到 memgarden 的 wheel URL —— 依赖形态被改过？"
+          then
+            {
+              echo "### 记忆内核的构建出处"
+              echo "❌ 解析 backend/requirements.lock 失败，见步骤日志里的 error"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+          if [ ! -s /tmp/mg_artifacts.tsv ]; then
+            echo "::error::没有解析出任何待验证的构建产物 —— 依赖形态被改过？"
+            exit 1
+          fi
+          cat /tmp/mg_artifacts.tsv
           ok=1
-          while read -r url; do
+          while IFS="$(printf '\t')" read -r name repo url sha; do
             f="/tmp/$(basename "$url")"
             curl -sSL -o "$f" "$url"
             echo "--- $(basename "$f") ---"
-            if gh attestation verify "$f" --repo teleport-computer/memgarden; then
+            actual="$(sha256sum "$f" | cut -d' ' -f1)"
+            if [ "$sha" != "-" ] && [ "$actual" != "$sha" ]; then
+              echo "::error::$(basename "$f") 下载到的字节和记录的 sha256 对不上 —— 验的和装的不是同一份"
+              ok=0
+              continue
+            fi
+            if gh attestation verify "$f" --repo "$repo"; then
               echo "  出处已验证"
             else
               echo "::warning::$(basename "$f") 没有可验证的构建出处凭证"
               ok=0
             fi
-          done < /tmp/mg_urls.txt
+          done < /tmp/mg_artifacts.tsv
           {
             echo "### 记忆内核的构建出处"
             if [ "$ok" = "1" ]; then
-              echo "✅ 两个 wheel 都能验证由 memgarden 仓库的 CI 从公开 tag 构建"
+              echo "✅ 锁里钉的每个 wheel 都能验证由上游仓库的 CI 从公开 tag 构建"
             else
-              echo "⚠️ 有 wheel 缺少出处凭证 —— 哈希仍然锁着字节，但无法证明它由公开源码编出"
+              echo "⚠️ 有 wheel 缺少出处凭证或字节对不上 —— 哈希仍然锁着字节，但无法证明它由公开源码编出"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
