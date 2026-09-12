@@ -432,3 +432,72 @@ def test_gemini_oneshot_reports_zero_retry_via_reliable_exit(monkeypatch):
     out = asyncio.run(pc.reliable_chat_completion_async(
         cfg, [{"role": "user", "content": "hi"}], max_attempts=1))
     assert _tl._transport_retry_count_from_usage(out["usage"]) == 0
+
+
+# ---------------------------------------------------------------- T568: raw stop reason behind "other"
+def test_t568_raw_stop_reason_surfaces_value_behind_other():
+    # An unrecognized finishReason collapses the closed-set ``stop_reason`` to
+    # "other", but ``raw_stop_reason`` carries the verbatim provider value so a
+    # prod empty can be root-caused to the exact reason. (Trace-content policy
+    # 2026-09-10 permits the raw value on the trace.)
+    body = {
+        "candidates": [{"finishReason": "SOME_NOVEL_REASON", "content": {"parts": []}}],
+        "usageMetadata": {"promptTokenCount": 7, "thoughtsTokenCount": 50},
+    }
+    d = _full_chain(body)
+    assert d["stop_reason"] == "other"
+    assert d["raw_stop_reason"] == "SOME_NOVEL_REASON"
+
+
+def test_t568_no_raw_stop_reason_when_reason_is_recognized():
+    # A recognized reason is not masked, so there is nothing to surface: the value
+    # already lives in stop_reason and raw_stop_reason is omitted (only the masked
+    # "other" case carries it).
+    body = {
+        "candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": []}}],
+        "usageMetadata": {"promptTokenCount": 7, "thoughtsTokenCount": 7},
+    }
+    d = _full_chain(body)
+    assert d["stop_reason"] == "max_tokens"
+    assert "raw_stop_reason" not in d
+
+
+def test_t568_raw_stop_reason_survives_safe_detail_at_key_cap():
+    # The projected empty-response detail sits at the _safe_detail key cap; the
+    # raw value must not be the field that gets dropped.
+    from debug_trace import _DETAIL_MAX_KEYS
+    body = {
+        "candidates": [{"finishReason": "SOME_NOVEL_REASON", "content": {"parts": []}}],
+        "usageMetadata": {"promptTokenCount": 7, "thoughtsTokenCount": 50},
+    }
+    d = _full_chain(body)  # already passed through _safe_detail
+    assert len(d) <= _DETAIL_MAX_KEYS
+    assert d.get("raw_stop_reason") == "SOME_NOVEL_REASON"
+
+
+def test_t568_raw_stop_reason_is_gemini_scoped_mirror():
+    # Mirror guard (codex2): the SAME unknown stop marker is surfaced raw for a
+    # real Gemini response (owned gemini_diagnostics shape) but NEVER for a
+    # non-Gemini one — a relay/OpenAI-compatible stop string must not open a raw
+    # plaintext trace surface.
+    from model_api_runtime.v2 import tool_loop as tl
+
+    class _PR:
+        def __init__(self, raw):
+            self.raw = raw
+            self.text = ""
+            self.tool_calls = []
+
+        class _U:
+            completion_tokens = 0
+
+        usage = _U()
+
+    marker = "NOVEL_STOP_MARKER"
+    gemini = tl._empty_response_shape(_PR({"stop_reason": marker, "gemini_diagnostics": {}}))
+    assert gemini["stop_reason"] == "other"
+    assert gemini["raw_stop_reason"] == marker
+
+    non_gemini = tl._empty_response_shape(_PR({"stop_reason": marker}))
+    assert non_gemini["stop_reason"] == "other"
+    assert "raw_stop_reason" not in non_gemini
