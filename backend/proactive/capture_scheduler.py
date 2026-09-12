@@ -224,6 +224,39 @@ def _poison_skip_patch(state: Mapping, window: Mapping | None, *,
     }
 
 
+def _capture_failure_patch(state, window, *, now_ts: float):
+    """一次落卡失败要怎么改状态。返回 ``(补丁, streak, 是否跳过)``。
+
+    三种情形：
+
+        拿不到窗口标识  → 照老行为累加 streak，**绝不跳过**
+        同一个游标      → 累加；到阈值就跳过
+        换了游标        → streak 从 1 重数
+
+    🔴 第一种必须保持老行为。落卡退避告警是按 streak 到 3 才发的
+    （见 tests/test_memory_backoff_notice.py），拿不到窗口时如果把 streak
+    重置成 1，**整个退避机制就哑了** —— 那是我第一版引入的回归，CI 抓到的。
+
+    抽成一个函数是因为 V1 / V2 两条线各写一遍必然漂，而漂了不报错。
+    """
+    key = _window_key(window)
+    if not key:
+        # 说不清是哪个窗口 —— 只累加，不跳过（跳过需要知道推到哪）。
+        streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
+        return ({"capture_fail_streak": streak,
+                 "last_capture_failed_at": now_ts}, streak, False)
+    same = key == str(state.get("capture_fail_window_key") or "")
+    streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
+              if same else 1)
+    skip = (_poison_skip_patch({**state, "capture_fail_streak": streak - 1},
+                               window, now_ts=now_ts) if same else None)
+    if skip is not None:
+        return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
+    return ({"capture_fail_streak": streak,
+             "capture_fail_window_key": key,
+             "last_capture_failed_at": now_ts}, streak, False)
+
+
 def _record_skipped_window(store, *, window: Mapping | None, streak: int,
                            job_id: str = "") -> None:
     """把"跳过了一批"记成一条可查的事件。
@@ -745,33 +778,13 @@ def record_v2_capture_status(
             expected_frontier_id=after_id,
         )
     elif status_text == "failed":
-        key = _window_key(processed)
-        same_window = key and key == str(state.get("capture_fail_window_key") or "")
-        # 换了窗口就从 1 开始数 —— 三次互不相干的偶发失败不该被当成
-        # "同一条毒消息卡住了"，那会误跳过一批好数据。
-        streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-                  if same_window else 1)
-        skip = (_poison_skip_patch(
-            {**state, "capture_fail_streak": streak - 1}, processed, now_ts=now_ts)
-            if same_window else None)
-        if skip is not None:
+        patch, streak, skipped = _capture_failure_patch(
+            state, processed, now_ts=now_ts)
+        if skipped:
             _record_skipped_window(store, window=processed, streak=streak,
                                    job_id=_capture_trace_job_id(job))
-            state = _patch_capture_state(
-                store, {"pending_capture_key": "", "last_capture_failed_at": now_ts,
-                        **skip},
-                now=now_ts)
-        else:
-            state = _patch_capture_state(
-                store,
-                {
-                    "pending_capture_key": "",
-                    "capture_fail_streak": streak,
-                    "capture_fail_window_key": key,
-                    "last_capture_failed_at": now_ts,
-                },
-                now=now_ts,
-            )
+        state = _patch_capture_state(
+            store, {"pending_capture_key": "", **patch}, now=now_ts)
     capture_jobs.notify_backoff(
         store,
         lane="capture",
@@ -904,24 +917,15 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         failed_window = (job.get("capture_window")
                          if isinstance(job.get("capture_window"), Mapping)
                          else job.get("window"))
-        failed_window = failed_window if isinstance(failed_window, Mapping) else {}
-        key = _window_key(failed_window)
-        same_window = key and key == str(state.get("capture_fail_window_key") or "")
-        streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-                  if same_window else 1)
-        skip = (_poison_skip_patch(
-            {**state, "capture_fail_streak": streak - 1}, failed_window,
-            now_ts=now_ts) if same_window else None)
-        if skip is not None:
+        failed_window = failed_window if isinstance(failed_window, Mapping) else None
+        patch, streak, skipped = _capture_failure_patch(
+            state, failed_window, now_ts=now_ts)
+        if skipped:
             # 🔴 同一批消息连续失败到阈值 —— 推过它。那批记忆就此丢掉，
             # 但这个用户后面还能继续记。见 CAPTURE_POISON_SKIP_AFTER。
             _record_skipped_window(store, window=failed_window, streak=streak,
                                    job_id=_capture_trace_job_id(job))
-            state.update(skip)
-        else:
-            state["capture_fail_streak"] = streak
-            state["capture_fail_window_key"] = key
-        state["last_capture_failed_at"] = now_ts
+        state.update(patch)
     state = save_capture_state(store, state, now=now_ts)
     capture_jobs.notify_backoff(store, lane="capture", status=status_text,
                                 streak=int(state.get("capture_fail_streak") or 0))

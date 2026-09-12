@@ -39,18 +39,11 @@ W2 = {"after_message_id": "msg_c", "until_message_id": "msg_f",
       "through_seq": 140, "until_ts": 2000.0, "message_count": 5}
 
 
-def _fail_once(state: dict, window: dict) -> dict:
-    """照生产那两处分支的算法走一次失败。"""
-    key = cs._window_key(window)
-    same = key and key == str(state.get("capture_fail_window_key") or "")
-    streak = (int(state.get("capture_fail_streak") or 0) + 1) if same else 1
-    skip = (cs._poison_skip_patch({**state, "capture_fail_streak": streak - 1},
-                                  window, now_ts=9999.0)
-            if same else None)
-    if skip is not None:
-        return {**state, **skip, "_skipped": True}
-    return {**state, "capture_fail_streak": streak,
-            "capture_fail_window_key": key, "_skipped": False}
+def _fail_once(state: dict, window: dict | None) -> dict:
+    """走生产用的那个共用函数（V1/V2 两条线都调它）。"""
+    patch, _streak, skipped = cs._capture_failure_patch(
+        state, window, now_ts=9999.0)
+    return {**state, **patch, "_skipped": skipped}
 
 
 def test_the_same_window_failing_three_times_advances_the_cursor():
@@ -141,3 +134,32 @@ def test_the_threshold_is_high_enough_to_ride_out_transient_failures():
     定成 1 的话，一次网络抖动就会丢掉一批真实记忆。
     """
     assert cs.CAPTURE_POISON_SKIP_AFTER >= 2
+
+
+def test_a_job_without_window_info_still_accumulates_the_backoff_streak():
+    """🔴 拿不到窗口标识时，streak 必须照老行为累加。
+
+    落卡退避告警是按 streak 到 3 才发的（tests/test_memory_backoff_notice.py）。
+    我第一版在拿不到窗口时把 streak 重置成 1 —— **整个退避机制就哑了**，
+    是 CI 抓到的回归。
+
+    拿不到窗口时也**绝不能跳过**：跳过要知道把游标推到哪。
+    """
+    state: dict = {}
+    for expected in (1, 2, 3, 4):
+        state = _fail_once(state, None)
+        assert state["capture_fail_streak"] == expected, (
+            f"第 {expected} 次失败后 streak 是 {state['capture_fail_streak']} "
+            "—— 退避告警会发不出来")
+        assert not state["_skipped"], "没有窗口信息竟然敢跳过"
+    # 也不许因为没窗口就把游标动了
+    assert "last_captured_until_message_id" not in state
+
+
+def test_an_empty_window_dict_is_treated_as_no_window():
+    """空 dict 和 None 一样处理 —— 都是"说不清是哪个窗口"。"""
+    state: dict = {}
+    for expected in (1, 2, 3):
+        state = _fail_once(state, {})
+        assert state["capture_fail_streak"] == expected
+        assert not state["_skipped"]
