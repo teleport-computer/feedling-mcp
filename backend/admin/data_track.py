@@ -255,6 +255,34 @@ def _memory_stats(store: UserStore) -> dict:
     }
 
 
+def _capture_window_cursor(job: Mapping[str, Any] | None) -> dict[str, Any]:
+    """落卡窗口的游标，**只取标识和计数，绝不带正文**。
+
+    判断队头阻塞就靠它：连续几个失败任务如果 ``after_*`` 相同，
+    说明游标没推进、同一批消息在被反复重放。
+    """
+    src = job if isinstance(job, Mapping) else {}
+    window = src.get("capture_window")
+    if not isinstance(window, Mapping):
+        window = src.get("window")
+    if not isinstance(window, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("after_message_id", "until_message_id"):
+        value = str(window.get(key) or "")[:160]
+        if value:
+            out[key] = value
+    for key in ("after_seq", "through_seq", "message_count"):
+        raw = window.get(key)
+        if raw is None:
+            continue
+        try:
+            out[key] = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _data_track_capture_doc(value, *, max_items: int = 20):
     if isinstance(value, dict):
         return {
@@ -332,6 +360,15 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
                     or ""
                 ),
                 "capture_result": _data_track_capture_doc(result, max_items=20),
+                # 🔴 窗口游标。**不含任何对话原文**，只有 id / seq / 条数。
+                #
+                # 少了它就只看得到「每天失败几次」，看不出「是不是同一批消息
+                # 在反复失败」—— 而这两件事的处置完全不同：前者是偶发，
+                # 后者是队头阻塞（一条毒消息把这个用户永久锁死）。
+                #
+                # 2026-09-12 查 58 个用户零落卡时踩到：诊断里没有游标，
+                # 因果链只能靠读代码推，没法用数据证实。
+                "capture_window": _capture_window_cursor(job),
                 "memory_action_status": _data_track_capture_doc(
                     job.get("memory_action_status") or {}, max_items=20
                 ),
