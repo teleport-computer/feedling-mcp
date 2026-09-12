@@ -4,10 +4,30 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import memory_readside_core as readside_core  # noqa: E402
+
+
+@pytest.mark.parametrize("flag", [True, False, None, "true", 1])
+def test_legacy_open_thread_metadata_does_not_boost_score(monkeypatch, flag):
+    monkeypatch.setattr(readside_core, "_now_ts", lambda: 2_000_000_000)
+    card = {"importance": 0.6, "updated_at": "2033-05-17T03:33:20Z"}
+    assert readside_core.memory_score(dict(card, is_open_thread=flag)) == readside_core.memory_score(card)
+
+
+def test_legacy_open_thread_does_not_displace_more_important_card(monkeypatch):
+    monkeypatch.setattr(readside_core, "_now_ts", lambda: 2_000_000_000)
+    cards = [
+        _moment("legacy_flag", importance=0.5, is_open_thread=True, occurred_at="2033-05-17T03:33:20Z"),
+        _moment("higher_importance", importance=0.55, occurred_at="2033-05-17T03:33:20Z"),
+    ]
+    selected, total = readside_core.readside_candidates(cards, "usr_core", limit=1)
+    assert total == 2
+    assert [card["id"] for card in selected] == ["higher_importance"]
 
 
 def _moment(
@@ -235,7 +255,7 @@ def test_index_core_limit_zero_opens_window_but_keeps_eligibility_and_sort(monke
 
     body = readside_core.memory_index_core(store, "key_core", {"query": "猫"})
 
-    assert captured["ids"] == ["high_new", "open_thread", "low_old"]
+    assert captured["ids"] == ["high_new", "low_old", "open_thread"]
     assert captured["payload"]["query"] == "猫"
     assert captured["payload"]["limit"] == 1000
     assert body["limit"] == 1000

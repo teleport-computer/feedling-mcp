@@ -130,6 +130,7 @@ from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_retry as v2_profile_retry
 from model_api_runtime.v2 import profile_store as v2_profile_store
+from model_api_runtime.v2 import profile_refresh as v2_profile_refresh
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
@@ -683,9 +684,6 @@ _VOICE_TRANSCRIPT_PROMPT_CHARS = _positive_int_env(
 )
 _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200")
 _PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
-_PROFILE_MAX_AGE_SEC = float(
-    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(3 * 24 * 60 * 60))
-)
 _PROFILE_RETRY_BASE_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_RETRY_BASE_SEC", "300")
 )
@@ -693,9 +691,7 @@ _PROFILE_RETRY_CAP_SEC = float(
     os.environ.get("FEEDLING_V2_PROFILE_RETRY_CAP_SEC", "21600")
 )
 if (
-    not math.isfinite(_PROFILE_MAX_AGE_SEC)
-    or _PROFILE_MAX_AGE_SEC <= 0
-    or not math.isfinite(_PROFILE_RETRY_BASE_SEC)
+    not math.isfinite(_PROFILE_RETRY_BASE_SEC)
     or _PROFILE_RETRY_BASE_SEC <= 0
     or not math.isfinite(_PROFILE_RETRY_CAP_SEC)
     or _PROFILE_RETRY_CAP_SEC < _PROFILE_RETRY_BASE_SEC
@@ -3086,6 +3082,30 @@ class _ProviderRoundtripTrace:
         dur_ms = detail.get("dur_ms")
         if isinstance(dur_ms, (int, float)) and not isinstance(dur_ms, bool):
             safe["dur_ms"] = max(0.0, float(dur_ms))
+        # Transport retries beyond the initial request for THIS provider call
+        # (0 on a one-shot success). Absent when the provider/exception did not
+        # report it — never coerced to 0. This is the plaintext answer to
+        # "did we retry, and how many times" that the encrypted attempt trace
+        # otherwise hides (provider_roundtrips deliberately excludes it).
+        transport_retry_count = detail.get("transport_retry_count")
+        if (
+            isinstance(transport_retry_count, int)
+            and not isinstance(transport_retry_count, bool)
+            and transport_retry_count >= 0
+        ):
+            safe["transport_retry_count"] = transport_retry_count
+        # Whether this provider call produced usable output; when empty, the
+        # closed-set provider diagnostics (finishReason / safety / thought-only /
+        # token split) are flattened to top-level scalars so the done event is
+        # self-explaining without a break-glass decrypt.
+        if isinstance(detail.get("empty"), bool):
+            safe["empty"] = detail["empty"]
+        # NOTE: the full content-free diagnostics deliberately live on the
+        # dedicated ``provider.empty_response`` event (6 base + 13 diagnostics =
+        # 19 keys, under _safe_detail's 20-key cap). Duplicating them here would
+        # push the done event to 22 keys and _safe_detail would SILENTLY drop the
+        # trailing two — so the done event stays lean (empty marker + retry count
+        # + finish_reason) and points to the empty event for the root cause.
         return safe
 
     async def _emit_model_call_event(
@@ -3352,14 +3372,14 @@ def _empty_response_trace_detail(
     response_shape: dict[str, Any], lane: str
 ) -> dict[str, Any]:
     """Normalize provider-empty metadata once for every trace consumer."""
-    raw_stop_reason = str(response_shape.get("stop_reason") or "")
+    stop_reason_in = str(response_shape.get("stop_reason") or "")
     stop_reason = (
-        raw_stop_reason
-        if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
-        else ("other" if raw_stop_reason else "")
+        stop_reason_in
+        if stop_reason_in in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+        else ("other" if stop_reason_in else "")
     )
     completion_tokens = response_shape.get("completion_tokens")
-    return {
+    detail: dict[str, Any] = {
         "stop_reason": stop_reason,
         "has_visible_text": bool(response_shape.get("has_visible_text")),
         "reasoning_present": bool(response_shape.get("reasoning_present")),
@@ -3372,6 +3392,72 @@ def _empty_response_trace_detail(
             else None
         ),
         "lane": _normalize_provider_trace_lane(lane),
+    }
+    # T568: when the closed-set ``stop_reason`` collapsed a real marker to
+    # "other", surface the verbatim provider value carried up from the shape so
+    # the empty is root-causable directly on the trace. Only in that masked case
+    # (recognized/empty reasons already show themselves in ``stop_reason``). Per
+    # the 2026-09-10 trace-content policy this raw provider value is permitted
+    # here, unlike the content-free provider_* fields below. Added before the
+    # provider-diagnostics update so it stays within the _safe_detail key cap.
+    shape_raw = response_shape.get("raw_stop_reason")
+    if stop_reason == "other" and shape_raw:
+        detail["raw_stop_reason"] = str(shape_raw)
+    detail.update(_empty_provider_diagnostics_fields(response_shape))
+    return detail
+
+
+def _empty_provider_diagnostics_fields(
+    response_shape: dict[str, Any],
+) -> dict[str, Any]:
+    """Flatten provider-owned empty-response diagnostics into TOP-LEVEL scalars
+    (plus a closed, bounded safety-category list) so ``_safe_detail`` preserves
+    them — a nested dict would be string-collapsed. All values are enums, counts,
+    or booleans; no content. Absent (non-Gemini / no diagnostics) -> no keys.
+    """
+    raw = response_shape.get("provider_diagnostics")
+    if not isinstance(raw, dict):
+        return {}
+
+    def _enum(value: Any) -> str:
+        return str(value or "")
+
+    def _count(value: Any) -> int | None:
+        # Defensive mirror of the provider-seam rule: never fake (1.5 -> 1) or
+        # raise (NaN/Inf) on a malformed count — only a finite non-negative whole
+        # number survives; everything else is None.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if math.isfinite(value) and value.is_integer() and value >= 0:
+                return int(value)
+            return None
+        return None
+
+    categories = raw.get("safety_blocked_categories")
+    categories = [str(c) for c in categories] if isinstance(categories, list) else []
+    # Closed set (<= 5 known categories); cap defensively and report the count so
+    # a future over-long list is visible rather than silently cut.
+    capped = categories[:8]
+
+    return {
+        "provider_finish_reason": _enum(raw.get("finish_reason")),
+        "provider_candidates_count": _count(raw.get("candidates_count")),
+        "provider_only_thought_parts": bool(raw.get("only_thought_parts")),
+        "provider_visible_text_part_count": _count(raw.get("visible_text_part_count")),
+        "provider_thought_part_count": _count(raw.get("thought_part_count")),
+        "provider_safety_blocked": bool(raw.get("safety_blocked")),
+        "provider_safety_blocked_categories": capped,
+        "provider_safety_blocked_category_count": len(categories),
+        "provider_safety_blocked_unknown_count": _count(
+            raw.get("safety_blocked_unknown_count")
+        ),
+        "provider_safety_max_probability": _enum(raw.get("safety_max_probability")),
+        "provider_prompt_token_count": _count(raw.get("prompt_token_count")),
+        "provider_candidates_token_count": _count(raw.get("candidates_token_count")),
+        "provider_thoughts_token_count": _count(raw.get("thoughts_token_count")),
     }
 
 
@@ -11659,56 +11745,10 @@ def _memory_write_result_counts(
     return applied_count, skipped_count, failed_count, first_error
 
 
-def _profile_generated_timestamp(value: Any) -> float:
-    raw = str(value or "").strip()
-    if not raw:
-        return 0.0
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except (TypeError, ValueError, OverflowError):
-        return 0.0
-
-
 def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
-    """Content-free post-turn profile scheduling decision."""
-
-    if not _PROFILE_ENABLED:
-        return False
-    current_time = float(time.time() if now is None else now)
-    raw = db.get_blob_strict(str(user_id), v2_profile_store.PROFILE_BLOB_KIND)
-    if raw is None:
-        return True
-    document = v2_profile_store.validate_profile_document(raw)
-    if document.get("disabled") is True:
-        return False
-    state = str(document.get("state") or "")
-    source = document.get("source") or {}
-    if state == "empty":
-        card_count, max_updated_at = db.memory_profile_source_stats(user_id)
-        return (
-            int(source.get("card_count") or 0) != card_count
-            or str(source.get("max_updated_at") or "") != max_updated_at
-        )
-    if state != "ok":
-        attempt = document.get("last_attempt") or {}
-        disposition = str(attempt.get("retry_disposition") or "")
-        if disposition in v2_profile_store.PROFILE_STUCK_RETRY_DISPOSITIONS:
-            return False
-        if disposition == "source_change":
-            card_count, max_updated_at = db.memory_profile_source_stats(user_id)
-            return (
-                int(source.get("card_count") or 0) != card_count
-                or str(source.get("max_updated_at") or "") != max_updated_at
-            )
-        retry_not_before = float(attempt.get("retry_not_before") or 0)
-        return current_time >= retry_not_before
-    generated_at = _profile_generated_timestamp(source.get("generated_at"))
-    if generated_at <= 0 or current_time - generated_at < _PROFILE_MAX_AGE_SEC:
-        return False
-    card_count, max_updated_at = db.memory_profile_source_stats(user_id)
-    return (
-        int(source.get("card_count") or 0) != card_count
-        or str(source.get("max_updated_at") or "") != max_updated_at
+    """Bind the worker's feature gate to the content-free refresh policy."""
+    return v2_profile_refresh.refresh_due(
+        user_id, enabled=_PROFILE_ENABLED, now=now,
     )
 
 

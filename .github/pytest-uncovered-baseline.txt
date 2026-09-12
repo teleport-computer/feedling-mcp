@@ -25,7 +25,6 @@ tests/test_asgi_hosted_chat_send.py
 tests/test_asgi_hosted_import_validation.py
 tests/test_asgi_hosted_setup.py
 tests/test_asgi_json_content_type.py
-tests/test_asgi_lifespan_loads_users.py
 tests/test_asgi_onboarding_archive.py
 tests/test_asgi_poll_native.py
 tests/test_asgi_proactive_remaining.py
@@ -134,7 +133,6 @@ tests/test_loadtest_harness_smoke.py
 tests/test_loadtest_mock_provider.py
 tests/test_log_trim_caps.py
 tests/test_mcp_ca_fetch.py
-tests/test_mcp_core_codex_cert_warning.py
 tests/test_model_api_file_payload.py
 tests/test_model_api_models_route.py
 tests/test_model_api_path.py

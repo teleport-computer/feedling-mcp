@@ -21,10 +21,90 @@ from .client import (
 )
 from .config import HostedCell
 
+# ``.client`` put the repo's ``backend`` on sys.path at import time, so the
+# canonical BYOK model-catalog fetcher is importable here. Reusing it (rather
+# than hand-rolling an HTTP GET) inherits its contract: OpenRouter's key-scoped
+# ``/models/user`` route, provider default base URLs, real TLS verification, and
+# the strict parse that distinguishes a valid-empty catalogue from a malformed
+# one. Imported at module top (not lazily) so tests can monkeypatch it.
+from provider_client import (  # noqa: E402 — backend path set by .client
+    list_provider_models as _list_provider_models,
+    model_catalog_error_slug as _model_catalog_error_slug,
+)
+
 FIRST_REPLY_TIMEOUT = 300.0   # includes provider cold start and queue wait
 NEXT_REPLY_TIMEOUT = 180.0
 MEMORY_POLL_SEC = 300.0
 SEND_RETRY_SEC = 90.0         # post-deploy worker/policy readiness window
+
+# Relay providers carry their own base_url and expose an OpenAI-style /models
+# catalogue; official providers do not need (and are not asked for) a preflight.
+_RELAY_PROVIDERS = {"openai_compatible", "openrouter"}
+
+# Cell result reserved for "the test instrument itself is stale" — the relay no
+# longer sells the model the key pool names. It is neither PASS nor FAIL: a
+# configured model that is off-sale self-tests as 503 "no available channel",
+# which is indistinguishable from a real product failure (T544; also seen
+# 2026-08-17, keys.env line 9). ``p0_blocks_release`` deliberately does not list
+# it, so it is surfaced on its own line without blocking or greening a release.
+RESULT_INSTRUMENT_STALE = "instrument_stale"
+
+
+def relay_model_preflight(provider: str, base_url: str, api_key: str,
+                          candidates: list[str]) -> tuple[str, str]:
+    """Before setup, confirm a relay still sells one of the configured models.
+
+    Returns ``(status, detail)`` with status one of:
+      - ``in_list``      at least one candidate is on sale now → run setup
+      - ``stale``        the relay returned a VALID catalogue (possibly empty)
+                         that lists none of the candidates → INSTRUMENT_STALE
+      - ``unverifiable`` the catalogue could not be read or was malformed →
+                         inconclusive; do NOT gate, fall through to setup
+      - ``skip``         not a relay provider, or an openai_compatible relay with
+                         no base_url → no preflight
+
+    Uses the canonical ``list_provider_models`` fetcher, so OpenRouter is queried
+    on its key-scoped ``/models/user`` route (public ``/models`` ignores the
+    key's privacy/ZDR/guardrail eligibility) and OpenRouter's default base URL is
+    supplied when the cell carries none. ``detail`` carries only model ids /
+    error slugs — never the api_key. ``unverifiable`` stays distinct from
+    ``stale``: 'could not ask' must never be reported as 'confirmed off-sale',
+    and a VALID empty catalogue IS off-sale (a real 200 ``data: []``), not
+    unverifiable.
+    """
+    if provider not in _RELAY_PROVIDERS:
+        return "skip", ""
+    # openai_compatible has no default endpoint; without a base_url there is
+    # nothing to query. OpenRouter carries its own canonical default.
+    if provider == "openai_compatible" and not base_url:
+        return "skip", ""
+    try:
+        result = _list_provider_models(provider, api_key, base_url)
+    except Exception as exc:  # noqa: BLE001 — any fetch/parse error is inconclusive
+        try:
+            slug = _model_catalog_error_slug(exc)
+        except Exception:  # noqa: BLE001
+            slug = type(exc).__name__
+        return "unverifiable", f"catalogue unreadable: {slug}"
+    if not result.get("catalog_supported", True):
+        return "unverifiable", "provider does not expose a model catalogue"
+    offered = {
+        str(m.get("id")) for m in result.get("models", [])
+        if isinstance(m, dict) and m.get("id")
+    }
+    present = [m for m in candidates if m in offered]
+    if present:
+        # Presence is proven even from a partial prefix — the candidate is here.
+        return "in_list", f"model on sale: {present[0]}"
+    # Absence is only proven from a COMPLETE catalogue. list_provider_models
+    # returns complete=False when a later page failed/truncated; the candidate
+    # could be on a page we never fetched, so "not seen" is not "off-sale".
+    # Treat that as unverifiable (do NOT gate) rather than stale (fail-open bug).
+    if not result.get("complete", True):
+        warns = "; ".join(str(w) for w in (result.get("warnings") or []))[:160]
+        return "unverifiable", f"catalogue incomplete (truncated/partial): {warns or 'no detail'}"
+    sample = ", ".join(sorted(offered)[:8]) if offered else "(empty catalogue)"
+    return "stale", f"none of {candidates} on sale; relay offers: {sample}"
 
 FACT_MSG = "你好呀。顺便记住一件小事：我最喜欢的颜色是青色。"
 CONTINUITY_MSG = "我刚才说我最喜欢的颜色是什么来着？"
@@ -89,9 +169,26 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
         return {"cell": cell.name, "result": "skip",
                 "steps": [("model", "skip", "no model candidates configured")]}
 
+    # Model-list preflight (relay only), BEFORE provisioning an account: a
+    # configured model the relay no longer sells is a stale instrument, not a
+    # product failure. Doing it first avoids creating a throwaway account we
+    # would only tear down. `unverifiable` is inconclusive and does not gate.
+    pf_status, pf_detail = relay_model_preflight(
+        cell.provider, cell.base_url(pool), key, models)
+    if pf_status == "stale":
+        return {"cell": cell.name, "result": RESULT_INSTRUMENT_STALE,
+                "steps": [("model_preflight", RESULT_INSTRUMENT_STALE, pf_detail)]}
+
     with E2EClient.provision(route="model_api") as c:
         active_client = c
         c.configure_failure_evidence(cell=f"hosted:{cell.name}")
+        # Record the preflight outcome as a (non-gating) step for the report.
+        # `unverifiable` is a warn: we could not confirm the catalogue, so we let
+        # setup proceed rather than block on our own inability to ask.
+        if pf_status == "in_list":
+            step("model_preflight", True, pf_detail)
+        elif pf_status == "unverifiable":
+            step("model_preflight", True, pf_detail, warn=True)
         # -- setup: try model candidates until the live self-test passes ------
         setup_detail, ok = "", False
         for model in models:

@@ -770,7 +770,7 @@ def test_snapshot_table_rds_only_row_is_not_ok():
 
 def test_snapshot_table_partial_lag_is_advisory_ok_but_strict_flags_it():
     """SNAPSHOT 是 tick 级整表替换，两次 tick 之间 RDS 比 TEE 多几行是正常滞后，
-    不该拖垮 report["ok"]——但 strict_rows_ok 必须如实记录"这一刻两边不相等"，
+    不该拖垮该表的 rows_ok——但 strict_rows_ok 必须如实记录"这一刻两边不相等"，
     否则 M9/M10 想保留给人看的 strict 信号在测试里也会隐身不被验证。"""
     days = ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"]
     with db.get_pool().connection() as c:
@@ -787,7 +787,10 @@ def test_snapshot_table_partial_lag_is_advisory_ok_but_strict_flags_it():
     assert snap["tee_rows"] == 3
     assert snap["strict_rows_ok"] is False
     assert snap["rows_ok"] is True
-    assert report["ok"] is True
+    # verify.run() 是全库扫描：进程内尚未退出的后台 writer 如果碰巧写了另一张
+    # covered table，顶层 ok 会（正确地）变成 False，与本测试要验证的 snapshot
+    # 判据无关。全库干净时的顶层聚合由
+    # test_consistent_dbs_report_ok_with_zero_mismatches 单独覆盖。
 
 
 def test_kind_none_ciphertext_table_skips_content_sampling():

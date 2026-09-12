@@ -46,7 +46,7 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 # ⚠️ 这个数**只许往下改**。调大它意味着又有一个测试文件退出了 CI ——
 # 那需要在 PR 里说明理由,而不是顺手 +1。缩小名单时请一并把这个数改小,
 # 否则棘轮会松掉。
-MAX_EXEMPTED = 276
+MAX_EXEMPTED = 274
 
 
 def _baseline_entries() -> list[str]:
@@ -258,8 +258,11 @@ def test_real_workflow_coverage_stays_within_the_workflow_text():
     """
     executed = ci_executed_tests.executed_test_files(CI_WORKFLOW)
     mentioned = ci_executed_tests.mentioned_test_files(CI_WORKFLOW)
+    dynamic = ci_executed_tests.dynamically_executed_test_files(CI_WORKFLOW)
 
-    assert executed <= mentioned
+    # 动态发现的文件是运行时 grep 仓库树挑出来的,**本就不在 workflow 文本里**,
+    # 所以子集关系扩成 `executed <= 文本提到 ∪ 动态发现`;两类以外的名字才算凭空捏造。
+    assert executed <= mentioned | dynamic
     missing = sorted(name for name in executed if not (ROOT / name).exists())
     assert missing == [], f"判为「被执行」但仓库里不存在的文件:{missing}"
 
@@ -345,3 +348,391 @@ def test_step_file_count_labels_match_the_actual_command():
         "这些 step 的文件数标签与实际不符(标签, 实际):\n"
         + "\n".join(f"  {n}: 标签={l} 实际={a}" for n, l, a in mismatched)
     )
+
+
+# ---------------------------------------------------------------------------
+# 全覆盖断言 + 动态发现识别器的合成用例(T546)
+# ---------------------------------------------------------------------------
+
+def _all_top_level_tests() -> set[str]:
+    """tests/test_*.py(maxdepth 1)—— 与 ci.yml 的 `find tests -maxdepth 1
+    -name 'test_*.py'` 同口径。"""
+    return {("tests/" + p.name) for p in (ROOT / "tests").glob("test_*.py")}
+
+
+def test_every_top_level_test_is_executed_or_exempt():
+    """每个 tests/test_*.py 要么被 CI 执行(字面 ∪ 动态发现),要么在豁免名单里。
+
+    这是 T534/T536「静态盲区」的正面堵口:只要有文件既不跑、又不豁免,它就是
+    「悄悄没跑」的测试,这条让它在 CI 里必须现形。动态 consumer suite 的覆盖现在
+    经 ci_executed_tests 的动态识别器纳入执行面,所以真未跑 = 0。
+    """
+    all_tests = _all_top_level_tests()
+    executed = ci_executed_tests.executed_test_files(CI_WORKFLOW)
+    exempt = set(_baseline_entries())
+    uncovered = sorted(all_tests - executed - exempt)
+
+    assert uncovered == [], (
+        "这些 top-level 测试既不在 CI 执行面(字面 ∪ 动态 grep 发现)、也不在豁免名单里,"
+        "等于悄悄没跑:\n" + "\n".join(uncovered)
+    )
+
+
+def test_disabling_dynamic_discovery_would_strand_the_consumer_suite():
+    """动态发现是 load-bearing:只用字面解析,真 workflow 上会漏掉一批只靠 grep
+    命中的 consumer 测试(当前 ≈53),它们会从已覆盖掉到未覆盖。
+
+    这条把「有人悄悄关掉动态识别」钉成会红:它独立计算「仅字面执行面」与豁免名单之差,
+    断言这个差非空 —— 即存在只靠动态发现才覆盖的文件。配合对 ci_executed_tests
+    的 mutation(dynamic 返回空)会让 test_every_top_level_test_is_executed_or_exempt
+    精确转红,这里则把「缺口确实存在」作为不依赖 mutation 的常驻事实钉住。
+    """
+    import yaml as _yaml
+
+    workflow = _yaml.safe_load(CI_WORKFLOW.read_text())
+    literal_only: set[str] = set()
+    for job in (workflow.get("jobs") or {}).values():
+        for step in (job.get("steps") or []):
+            if isinstance(step, dict) and isinstance(step.get("run"), str):
+                literal_only |= ci_executed_tests.executed_in_script(step["run"])
+
+    exempt = set(_baseline_entries())
+    all_tests = _all_top_level_tests()
+    would_be_uncovered = sorted(all_tests - literal_only - exempt)
+
+    assert would_be_uncovered, (
+        "关掉动态发现后没有任何文件变未覆盖 —— 要么动态 idiom 失效,"
+        "要么它已无独占覆盖(那 full-coverage 断言就完全靠豁免名单兜着,危险)。"
+    )
+
+
+# --- dynamic_executed_in_script 合成用例(codex2 清单) ---
+
+_PRED = r"MARKER_CONSUMER"
+
+
+def _fixture_repo(tmp_path, matching: int, non_matching: int = 1):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    made = []
+    for i in range(matching):
+        f = tests / f"test_match_{i}.py"
+        f.write_text("# MARKER_CONSUMER\nassert True\n")
+        made.append("tests/" + f.name)
+    for i in range(non_matching):
+        (tests / f"test_plain_{i}.py").write_text("assert True\n")
+    return tmp_path, sorted(made)
+
+
+def _dyn(script: str, repo_root) -> set:
+    return ci_executed_tests.dynamic_executed_in_script(script, repo_root)
+
+
+def test_dynamic_bind_and_consume_credits_matches(tmp_path):
+    repo, made = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set(made)
+
+
+def test_dynamic_bind_without_consume_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "echo built"
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_consume_without_bind_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    assert _dyn('python -m pytest "${v[@]}" -v', repo) == set()
+
+
+def test_dynamic_consume_inside_conditional_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if true; then\n"
+        '  python -m pytest "${v[@]}" -v\n'
+        "fi"
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_variable_mismatch_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${other[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_below_min_count_guard_credits_nothing(tmp_path):
+    repo, made = _fixture_repo(tmp_path, matching=2)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if (( ${#v[@]} < 5 )); then\n"
+        "  echo too few\n"
+        "  exit 1\n"
+        "fi\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    # predicate matches only 2 < guard 5 ⇒ CI would exit before pytest ran
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_meets_min_count_guard_credits_matches(tmp_path):
+    repo, made = _fixture_repo(tmp_path, matching=6)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if (( ${#v[@]} < 5 )); then\n"
+        "  echo too few\n"
+        "  exit 1\n"
+        "fi\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set(made)
+
+
+def test_dynamic_unsupported_grep_shape_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    # double-quoted predicate / different glob are not the trusted shape
+    script = (
+        'mapfile -t v < <(grep -l -E "MARKER_CONSUMER" tests/unit/*.py | sort)\n'
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+# --- codex2 的 6 个 false-green 反例(固化 state machine 的 fail-closed 语义) ---
+# 早期「全局找 binding + 任意顶层 array token」的实现对这六种脚本都错误 credit 了
+# 全量 predicate 命中;state machine 必须对每一种都返回空集。
+
+def test_fg_consume_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        'python -m pytest "${v[@]}" -v\n'
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)"
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_leading_exit_guard_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "if true; then\n  exit 0\nfi\n"
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_binding_in_dead_false_branch(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "if false; then\n"
+        "  mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "fi\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_collect_only_runs_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest --collect-only "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_variable_reset_to_empty_after_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "v=()\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_consume_inside_unbalanced_if(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if true; then\n"
+        '  python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_second_unmodelled_mapfile_fails_closed(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "mapfile -t w < <(ls tests)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+# --- round6 反例:benign 首命令不得掩护终止/变量改写(逐 segment 严格校验) ---
+
+def test_fg_direct_exit_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "exit 0\n"
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_benign_prefix_hiding_exit_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "printf setup; exit 0\n"
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_benign_prefix_hiding_variable_reset(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf ok; v=()\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_benign_prefix_hiding_false_terminator(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf ok; false\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+# --- round8 反例:printf -v 变量改写 / 可失败 printf / consume 重定向失败 ---
+
+def test_fg_printf_dash_v_rewrites_the_array(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'printf -v v %s ""\n'   # 把数组改写成单元素空串
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_failable_printf_format_before_consume(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf %d nope\n"      # bash -e 下 rc=1,pytest 不可达
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_consume_with_failed_input_redirection(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v < /definitely/missing/input'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_only_the_exact_ci_running_log_is_accepted(tmp_path):
+    """日志行按**当前 CI 固定 format** verbatim 绑定:真 step 的
+    ``printf 'Running %d resident consumer test files\\n' "${#v[@]}"`` 接受;
+    任何漂移的 format(哪怕同样只有 %d)都 fail closed —— 防止 ``printf -v`` /
+    ``printf --help`` 等用选项冒充 format 溜过去。"""
+    repo, made = _fixture_repo(tmp_path, matching=6)
+    exact = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf 'Running %d resident consumer test files\\n' \"${#v[@]}\"\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(exact, repo) == set(made)
+
+    drifted = exact.replace(
+        "Running %d resident consumer test files", "Running %d files"
+    )
+    assert _dyn(drifted, repo) == set()
+
+
+def test_fg_printf_option_masquerading_as_format(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    for masq in ('printf -v "${#v[@]}"', 'printf --help "${#v[@]}"'):
+        script = (
+            "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+            + masq + "\n"
+            'python -m pytest "${v[@]}" -v'
+        )
+        assert _dyn(script, repo) == set(), masq
+
+
+def test_fg_printf_without_format(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_printf_invalid_conversion(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'printf %Q "${#v[@]}"\n'   # bash -e 下 rc=1,pytest 不可达
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_pytest_k_filter_deselects_everything(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -k __T546_NO_TEST_CAN_MATCH__'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_pytest_ignore_excludes_the_files(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" --ignore=tests'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_exact_real_step_shape_is_accepted(tmp_path):
+    """把真实 step 的完整形状(binding + min-count guard + Running 日志 + consume)
+    当正例钉住,确保 exact recognizer 没收窄到连真 step 都拒。"""
+    repo, made = _fixture_repo(tmp_path, matching=6)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if (( ${#v[@]} < 5 )); then\n"
+        '  echo "resident consumer test discovery unexpectedly found only ${#v[@]} files"\n'
+        "  exit 1\n"
+        "fi\n"
+        "printf 'Running %d resident consumer test files\\n' \"${#v[@]}\"\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set(made)

@@ -52,6 +52,10 @@ CLI mode:
   FEEDLING_AGENT_IMAGE_GENERATION
                         Set true only when the configured resident agent exposes
                         a callable native image-generation capability.
+  Reply parse failures  Non-empty CLI stdout that yields no deliverable turn is
+                        retained under FEEDLING_HOME/reply-parse-failures for
+                        local diagnosis. Backend trace gets the first 80 chars
+                        and local path; retention is bounded and rotated.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp.
@@ -102,6 +106,11 @@ Optional:
                         turns, use App Server deltas when the configured command
                         can be translated without changing user model/reasoning
                         settings; otherwise keep the existing exec path.
+  FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC
+                        Deadline for the single reply-only retry after a
+                        foreground text CLI turn hits its hard timeout (default
+                        120 seconds, minimum 30). Unsupported/custom drivers and
+                        attachment turns keep the normal timeout fallback.
   IMAGE_TEMP_DIR        Where decrypted chat images are written for CLI agents
   SCREEN_CONTEXT_MODE   "tool" (default), "auto"/"always", or "off". In tool
                         mode the model uses screen-recent/screen-read on demand.
@@ -365,8 +374,27 @@ AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 # raise via env; the cap still exists so a hung agent can never wedge the
 # single-flight chat lane forever.
 AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
+FOREGROUND_TIMEOUT_RECOVERY_SEC = max(
+    30,
+    int(os.environ.get("FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC", "120")),
+)
+# Not configurable: a timed-out turn may already have completed work, so the
+# recovery path gets exactly one chance to produce visible text.
+FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS = 1
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
+
+# Every lane literal supplied to call_agent in this resident. Recovery is
+# permitted from the user-present lane only; deriving the allow-set from the
+# complete lane partition keeps a newly added background lane fail-closed.
+RESIDENT_AGENT_BACKGROUND_LANES = frozenset(
+    {"background", "capture", "dream", "proactive"}
+)
+RESIDENT_AGENT_LANES = RESIDENT_AGENT_BACKGROUND_LANES | {"chat"}
+FOREGROUND_TIMEOUT_RECOVERY_LANES = (
+    RESIDENT_AGENT_LANES - RESIDENT_AGENT_BACKGROUND_LANES
+)
+FOREGROUND_TIMEOUT_RECOVERY_CONTENT_TYPES = frozenset({"text"})
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
 CHECKPOINT_FILE = Path(
@@ -422,6 +450,21 @@ FEEDLING_HOME = Path(os.environ.get("FEEDLING_HOME") or _resident_home_default()
 RESIDENT_IPC_SOCK = FEEDLING_HOME / "resident_ipc.sock"
 RESIDENT_IPC_STATE_FILE = FEEDLING_HOME / "resident_ipc_state.json"
 OUTBOUND_FILE_DIR = FEEDLING_HOME / "outbound-files"
+# A reply which the local parser cannot turn into a usable resident turn is
+# valuable diagnostic evidence, but it can contain the user's whole prompt and
+# the model's whole response. Keep it on the resident host, under the same
+# per-user root as IPC/outbound state, and bound both each file and the retained
+# set. The backend trace receives only the bounded prefix explicitly approved
+# for this diagnostic, never the complete body.
+REPLY_PARSE_FAILURE_MAX_BYTES = 256 * 1024
+REPLY_PARSE_FAILURE_MAX_FILES = 20
+REPLY_PARSE_FAILURE_TOTAL_BYTES = 2 * 1024 * 1024
+REPLY_PARSE_FAILURE_PREVIEW_CHARS = 80
+_REPLY_PARSE_FAILURE_FILE_PREFIX = "reply-parse-failed-"
+_reply_parse_failure_lock = threading.Lock()
+_reply_parse_failure_capture: ContextVar[dict[str, Any] | None] = ContextVar(
+    "reply_parse_failure_capture", default=None
+)
 # The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
 # non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
 # collides for every user on the host and the /tmp defaults become ONE shared
@@ -1784,6 +1827,147 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
         threading.Thread(target=_dispatch, daemon=True).start()
     except Exception:
         pass  # observability must never affect the turn
+
+
+def _reply_parse_failure_driver(cmd: list[str]) -> str:
+    if _is_codex_cmd(cmd):
+        return "codex"
+    if _is_claude_code_cmd(cmd):
+        return "claude"
+    if _is_pi_cmd(cmd):
+        return "pi"
+    return Path(cmd[0]).name[:80] if cmd else "cli"
+
+
+def _reply_parse_failure_stage(cmd: list[str], *, sanitized: bool = False) -> str:
+    if _is_codex_cmd(cmd):
+        base = "codex_stream"
+    elif _is_claude_code_cmd(cmd):
+        base = "claude_stream"
+    elif _is_pi_cmd(cmd):
+        base = "pi_stream"
+    else:
+        base = "cli_output"
+    return f"{base}_sanitization" if sanitized else base
+
+
+def _rotate_reply_parse_failures(directory: Path) -> None:
+    """Keep only this feature's oldest-to-newest bounded local artifacts."""
+    candidates: list[tuple[int, str, Path, int]] = []
+    for path in directory.glob(f"{_REPLY_PARSE_FAILURE_FILE_PREFIX}*.raw"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat = path.stat()
+            candidates.append((stat.st_mtime_ns, path.name, path, stat.st_size))
+        except OSError:
+            continue
+    candidates.sort()
+    total = sum(item[3] for item in candidates)
+    while (
+        len(candidates) > REPLY_PARSE_FAILURE_MAX_FILES
+        or total > REPLY_PARSE_FAILURE_TOTAL_BYTES
+    ):
+        _mtime, _name, path, size = candidates.pop(0)
+        try:
+            path.unlink()
+            total -= size
+        except OSError:
+            # A concurrent process may already have removed it. Recompute on
+            # the next failure instead of risking deletion outside our prefix.
+            break
+
+
+def _preserve_reply_parse_failure(
+    raw: str,
+    *,
+    cmd: list[str],
+    exit_code: int,
+    parse_empty_stage: str,
+    trace_id: str = "",
+) -> Path | None:
+    """Persist bounded raw stdout locally and emit bounded correlation data.
+
+    The SHA-256 always describes the complete stdout. A body larger than the
+    per-file cap is stored as its first bounded prefix; the full digest in both
+    the filename and trace still lets an operator correlate the occurrence.
+    Failure to preserve diagnostics must never replace the original turn error.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    captured_at_epoch = time.time()
+    captured_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(captured_at_epoch)
+    )
+    raw_bytes = raw.encode("utf-8", errors="replace")
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    driver = _reply_parse_failure_driver(cmd)
+    stored = raw_bytes[:REPLY_PARSE_FAILURE_MAX_BYTES]
+    path: Path | None = None
+
+    try:
+        with _reply_parse_failure_lock:
+            directory = FEEDLING_HOME / "reply-parse-failures"
+            directory.mkdir(parents=True, exist_ok=True)
+            if directory.is_symlink() or not directory.is_dir():
+                raise OSError("reply parse failure directory is not a real directory")
+            os.chmod(directory, 0o700)
+            safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "-", trace_id).strip("-.")[:80]
+            if not safe_trace:
+                safe_trace = "no-trace"
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(captured_at_epoch))
+            stem = (
+                f"{_REPLY_PARSE_FAILURE_FILE_PREFIX}{stamp}-{safe_trace}-"
+                f"{driver}-{raw_sha256}"
+            )
+            for suffix in ("", f"-{uuid.uuid4().hex[:8]}"):
+                candidate = directory / f"{stem}{suffix}.raw"
+                try:
+                    fd = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                except FileExistsError:
+                    continue
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(stored)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                path = candidate
+                break
+            if path is None:
+                raise OSError("could not allocate reply parse failure artifact")
+            _rotate_reply_parse_failures(directory)
+    except OSError as exc:
+        log.warning(
+            "could not preserve reply parse failure locally: %s",
+            type(exc).__name__,
+        )
+
+    # The complete body stays local. Seven explicitly approved this exact
+    # prefix plus its local path for T539 diagnostics; do not grow the preview
+    # independently of REPLY_PARSE_FAILURE_PREVIEW_CHARS and its guard test.
+    _emit_debug_trace(
+        "agent",
+        "agent.reply.parse_failed",
+        status="error",
+        trace_id=trace_id,
+        summary="resident reply parser produced no usable turn",
+        explain="resident 本地解析器未得到可交付回复；完整原始输出仅保留在用户本机",
+        detail={
+            "raw_bytes": len(raw_bytes),
+            "raw_sha256": raw_sha256,
+            "exit_code": int(exit_code),
+            "driver": driver,
+            "parse_empty_stage": parse_empty_stage,
+            "captured_at": captured_at,
+            "raw_preview": raw[:REPLY_PARSE_FAILURE_PREVIEW_CHARS],
+            "local_path": str(path or ""),
+        },
+    )
+    return path
 
 
 # Stage D: when hosted, the supervisor writes a short-lived runtime token to this
@@ -3588,6 +3772,14 @@ def _fetch_plaintext_or_mixed_history(
             return "plaintext_binary"
         if isinstance(row.get("body"), str):
             return "plaintext_text"
+        # With include_image_body=false the backend strips the body itself.
+        # Its persisted-shape contract keeps these cases distinguishable:
+        # plaintext_v1 pointers report body_size_bytes, while sealed pointers
+        # report body_ct_len (chat.service._chat_history_item). Do not broaden
+        # this predicate to a generic body_omitted check or sealed-only pages
+        # would be intercepted before the enclave bulk reader can decrypt them.
+        if row.get("body_omitted") and row.get("body_size_bytes") is not None:
+            return "plaintext_binary_omitted"
         return "invalid"
 
     if not any(isinstance(row, dict) and _shape(row).startswith("plaintext") for row in rows):
@@ -3602,17 +3794,15 @@ def _fetch_plaintext_or_mixed_history(
             message_id = str(row.get("id") or row.get("message_id") or "")
             decrypted = _fetch_message_body_from_enclave(message_id)
             if decrypted is None:
-                out.append({**row, "body_unavailable": True})
+                resolved = {**row, "body_unavailable": True}
             else:
-                out.append({**row, **decrypted})
-            continue
-        if shape == "plaintext_text":
-            out.append({**row, "content": str(row.get("body") or "")})
-            continue
-        if shape == "plaintext_binary":
-            out.append(_hydrate_plaintext_binary_body(row))
-            continue
-        if row.get("body_omitted") and row.get("body_size_bytes") is not None:
+                resolved = {**row, **decrypted}
+        elif shape == "plaintext_text":
+            resolved = {**row, "content": str(row.get("body") or "")}
+        elif shape == "plaintext_binary":
+            hydrated = _hydrate_plaintext_binary_body(row)
+            resolved = hydrated
+        elif shape == "plaintext_binary_omitted":
             message_id = str(row.get("id") or row.get("message_id") or "")
             try:
                 body_resp = _HTTP.get(
@@ -3631,10 +3821,54 @@ def _fetch_plaintext_or_mixed_history(
                     merged = _hydrate_plaintext_binary_body(merged)
                 elif isinstance(merged.get("body"), str):
                     merged["content"] = merged["body"]
-                out.append(merged)
-                continue
-        out.append({**row, "body_unavailable": True})
+                resolved = merged
+            else:
+                resolved = {**row, "body_unavailable": True}
+        else:
+            resolved = {**row, "body_unavailable": True}
+        out.append(_finalize_plaintext_or_mixed_history_row(resolved))
     return True, _filter_since(out, since)
+
+
+def _finalize_plaintext_or_mixed_history_row(row: dict) -> dict:
+    """Give every attachment-history exit one caption-folding contract.
+
+    Backend ``/body`` replies for plaintext attachments return ``body_b64`` and
+    the persisted ``caption_body`` but leave ``content`` empty. Enclave replies
+    already carry the folded content. Fill an absent/empty local value without
+    replacing a non-empty value supplied by the enclave.
+    """
+    if str(row.get("content_type") or "") not in ("image", "file"):
+        return row
+    if row.get("content") not in (None, ""):
+        return row
+    if row.get("caption_body") is None:
+        if row.get("body_b64") is not None:
+            return {**row, "content": ""}
+        return row
+    return {**row, "content": _read_plaintext_attachment_caption(row)}
+
+
+def _read_plaintext_attachment_caption(row: dict) -> str:
+    """Fold a plaintext image/file caption into the consumer content field."""
+    try:
+        caption_envelope = _core_envelope.caption_envelope_from_row(row)
+        if caption_envelope is None:
+            return ""
+        return _core_envelope.read_caption_envelope_text(
+            caption_envelope,
+            lambda projected: _core_envelope.read_plaintext_envelope_body(
+                projected,
+                owner_user_id=str(row.get("owner_user_id") or ""),
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "plaintext attachment caption unavailable [id=%s]: %s",
+            row.get("id") or row.get("message_id") or "",
+            str(exc),
+        )
+        return ""
 
 
 def _hydrate_plaintext_binary_body(row: dict) -> dict:
@@ -7327,6 +7561,8 @@ def _pi_stream_shape(raw: str) -> dict:
     update_text_seen = False
     update_text_chars_max = 0
     stop_reasons: list[str] = []
+    stop_length_seen = False
+    stop_max_tokens_seen = False
     parse_error_count = 0
     parse_failed = False
     try:
@@ -7378,6 +7614,10 @@ def _pi_stream_shape(raw: str) -> dict:
                 raw_stop = str(msg.get("stopReason") or obj.get("stopReason") or "").strip().lower()
                 if raw_stop:
                     stop_reason = raw_stop if raw_stop in _PI_STREAM_STOP_REASONS else "other"
+                    # Track truncation independently of the bounded legacy list:
+                    # a late stop reason must not disappear after its eighth item.
+                    stop_length_seen |= stop_reason == "length"
+                    stop_max_tokens_seen |= stop_reason == "max_tokens"
                     if stop_reason not in stop_reasons and len(stop_reasons) < _PI_STREAM_MAX_STOP_REASONS:
                         stop_reasons.append(stop_reason)
             except Exception:  # noqa: BLE001 — one bad event must not hide the rest
@@ -7395,10 +7635,24 @@ def _pi_stream_shape(raw: str) -> dict:
         "stop_reasons": stop_reasons,
         "parse_error_count": parse_error_count,
         "parse_failed": parse_failed,
+        # T543: _safe_detail stringifies nested dict/list values. Keep the old
+        # fields for in-process readers, but expose scalar siblings that survive
+        # persistence. This projection has 16 keys, below the 20-key size cap.
+        # Version identifies coverage, not parse health; partial scans stay flagged.
+        "schema_version": 2,
+        "text_blocks": block_counts["text"],
+        "thinking_blocks": block_counts["thinking"],
+        "tool_blocks": block_counts["toolCall"],
+        "other_blocks": block_counts["other"],
+        "stop_reason_first": stop_reasons[0] if stop_reasons else "",
+        "stop_length_seen": stop_length_seen,
+        "stop_max_tokens_seen": stop_max_tokens_seen,
     }
 
 
-_PROVIDER_ATTEMPT_TRIGGERS = frozenset({"first", "stream_cut_retry", "redelivery"})
+_PROVIDER_ATTEMPT_TRIGGERS = frozenset(
+    {"first", "stream_cut_retry", "redelivery", "timeout_recovery"}
+)
 _PROVIDER_REQUEST_ID_KEYS = frozenset({
     "provider_request_id", "providerRequestId", "request_id", "requestId",
 })
@@ -8220,7 +8474,7 @@ def _call_agent_http_simple(
                     sent_bytes=len(message.encode("utf-8")),
                     received_bytes=_response_text_len(resp),
                 )
-        except Exception:
+        except OSError:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
             raise
@@ -10255,6 +10509,186 @@ def _strip_cli_option_value(cmd: list[str], flags: set[str]) -> tuple[list[str],
     return out, removed
 
 
+def _strip_cli_options(
+    cmd: list[str],
+    *,
+    scalar: frozenset[str] = frozenset(),
+    variadic: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Remove CLI options and their values without touching the prompt carrier.
+
+    Tool configuration on Claude is variadic (values continue until the next
+    option); Codex/Pi options used here take one value. Recovery calls have
+    already moved the user prompt to stdin and carry no images, so removing a
+    variadic tail cannot consume user-authored text.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(cmd):
+        token = cmd[index]
+        name, equals, _value = token.partition("=")
+        if name in scalar:
+            index += 1
+            if not equals and index < len(cmd):
+                index += 1
+            continue
+        if name in variadic:
+            index += 1
+            if not equals:
+                while index < len(cmd) and not cmd[index].startswith("-"):
+                    index += 1
+            continue
+        out.append(token)
+        index += 1
+    return out
+
+
+def _strip_codex_unsafe_config_overrides(cmd: list[str]) -> list[str]:
+    """Keep response/model config while dropping tool/sandbox/hook overrides."""
+    safe_prefixes = (
+        "model=",
+        "model_provider=",
+        "model_providers.",
+        "model_reasoning_effort=",
+        "model_reasoning_summary=",
+    )
+    out: list[str] = []
+    index = 0
+    while index < len(cmd):
+        token = cmd[index]
+        name, equals, inline_value = token.partition("=")
+        if name not in {"-c", "--config"}:
+            out.append(token)
+            index += 1
+            continue
+        if equals:
+            value = inline_value
+            index += 1
+        elif index + 1 < len(cmd):
+            value = cmd[index + 1]
+            index += 2
+        else:
+            index += 1
+            continue
+        if value.startswith(safe_prefixes):
+            out.extend((name, value))
+    return out
+
+
+def _tool_free_cli_command(cmd: list[str]) -> list[str]:
+    """Return a driver command whose model cannot replay turn side effects.
+
+    This is intentionally closed to the three CLI shapes whose no-tool/read-only
+    controls we own. Unknown/operator wrappers are not guessed at; callers keep
+    the ordinary timeout fallback instead of launching an unsafe recovery.
+    """
+    if _is_pi_cmd(cmd):
+        stripped = _strip_cli_options(
+            cmd,
+            scalar=frozenset({
+                "-e", "--extension", "-t", "--tools", "-xt", "--exclude-tools",
+                "--skill", "--prompt-template", "--theme",
+                "--session", "--session-id", "--session-dir", "--fork",
+            }),
+        )
+        stripped, _ = _strip_cli_flags(
+            stripped,
+            {
+                "-nt", "--no-tools", "-ne", "--no-extensions",
+                "--no-session", "-ns", "--no-skills",
+                "-np", "--no-prompt-templates", "-nc", "--no-context-files",
+                "--approve", "-a",
+            },
+        )
+        return [
+            stripped[0],
+            "--no-tools",
+            "--no-extensions",
+            "--no-session",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            *stripped[1:],
+        ]
+    if _is_claude_code_cmd(cmd):
+        stripped = _strip_cli_options(
+            cmd,
+            scalar=frozenset({
+                "--settings", "--setting-sources", "--plugin-dir", "--plugin-url",
+                "--agent", "--agents", "--permission-mode",
+                "--resume", "-r", "--session-id", "--from-pr", "--worktree",
+                "--remote-control", "--remote-control-session-name-prefix",
+            }),
+            variadic=frozenset({
+                "--mcp-config", "--allowed-tools", "--allowedTools", "--tools",
+                "--disallowed-tools", "--disallowedTools", "--add-dir", "--file",
+            }),
+        )
+        stripped, _ = _strip_cli_flags(
+            stripped,
+            {
+                "--safe-mode", "--strict-mcp-config", "--no-session-persistence",
+                "--brief", "--chrome", "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+                "--continue", "-c", "--fork-session", "--tmux",
+            },
+        )
+        return [
+            stripped[0],
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--no-session-persistence",
+            *stripped[1:],
+        ]
+    if _is_codex_cmd(cmd):
+        stripped = _strip_cli_options(
+            cmd,
+            scalar=frozenset({
+                "-s", "--sandbox", "-C", "--cd", "-p", "--profile",
+                "--add-dir", "--output-schema",
+            }),
+            variadic=frozenset({"-i", "--image"}),
+        )
+        stripped = _strip_codex_unsafe_config_overrides(stripped)
+        stripped = _strip_cli_options(
+            stripped,
+            scalar=frozenset({"--enable", "--disable"}),
+        )
+        stripped, _ = _strip_cli_flags(
+            stripped,
+            {
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "--approve-for-me",
+                "--search",
+                "--skip-git-repo-check",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
+            },
+        )
+        try:
+            exec_index = stripped.index("exec")
+        except ValueError as exc:
+            raise ValueError("tool-free recovery requires codex exec") from exc
+        insert_at = exec_index + 1
+        return [
+            *stripped[:insert_at],
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            *stripped[insert_at:],
+        ]
+    raise ValueError("tool-free recovery supports only codex, claude, and pi CLI drivers")
+
+
 def _strip_missing_mcp_config(cmd: list[str]) -> tuple[list[str], str | None]:
     """Drop a ``--mcp-config <path>`` pair when ``<path>`` does not exist.
 
@@ -10405,6 +10839,7 @@ def _prepare_cli_command(
     *,
     session_id_override: str | None = None,
     outbound_fence: bool = False,
+    tools_disabled: bool = False,
 ) -> tuple[list[str], str | None]:
     sid = (
         _load_agent_session_id()
@@ -10536,7 +10971,7 @@ def _prepare_cli_command(
         cmd = _inject_codex_images(cmd, image_paths or [])
     if pi_native_images:
         cmd = _inject_pi_images(cmd, image_paths or [])
-    if "{mcp}" not in AGENT_CLI_CMD:
+    if "{mcp}" not in AGENT_CLI_CMD and not tools_disabled:
         # Self-hosted claude templates written before the placeholder existed.
         # 这条旧模板路径必须和上面 `{mcp}` 那条同口径:2026-08-21 起屏幕像素轮
         # 不再摘用户 MCP。两处只改一处的话,老模板用户的屏幕轮仍然对不齐 cache
@@ -10552,6 +10987,12 @@ def _prepare_cli_command(
         and _codex_resume_supported(cmd[0])
     ):
         cmd = _codex_resume_command(cmd, sid)
+    # Apply the recovery deny profile last. Normal session/MCP/profile assembly
+    # above is allowed to preserve its established behavior; the final product
+    # handed to subprocess must not let any of those steps re-introduce a tool,
+    # extension, persisted session, or writable sandbox.
+    if tools_disabled:
+        cmd = _tool_free_cli_command(cmd)
     return cmd, stdin_msg
 
 
@@ -10931,6 +11372,33 @@ def _emit_cli_model_call_terminal(
             except Exception as exc:  # noqa: BLE001 — trace must stay fail-open
                 log.debug("model terminal metrics parse failed: %s", exc)
 
+        # T559: the durable trace writer projects these content-free route
+        # identifiers from detail into its indexed provider/model/lane columns.
+        # Reuse the configured runtime identity (operator env declarations win;
+        # pi can otherwise resolve aliases through models.json).  This is the
+        # declared route, not a claim about the upstream that ultimately served
+        # the request.  Never infer it from stdout/stderr, which may be empty on
+        # the failures this trace exists to diagnose.  Missing values stay absent
+        # so persistence has one missing representation (NULL), rather than a mix
+        # of NULL and empty strings.
+        route_detail = {
+            key: value
+            for key, value in (
+                (
+                    "provider",
+                    _safe_runtime_header(
+                        AGENT_RUNTIME_METADATA.get("provider"), limit=48
+                    ),
+                ),
+                (
+                    "model",
+                    _safe_runtime_header(AGENT_RUNTIME_METADATA.get("model"), limit=96),
+                ),
+                ("lane", _safe_runtime_header(context.get("lane"), limit=48)),
+            )
+            if value
+        }
+
         trace_turn = AgentTurn()
         if succeeded:
             try:
@@ -11001,6 +11469,7 @@ def _emit_cli_model_call_terminal(
             ),
             explain=explain,
             detail={
+                **route_detail,
                 **{
                     key: metrics.get(key)
                     for key in (
@@ -11055,6 +11524,7 @@ def _call_agent_cli_impl(
     stream_update: Callable[[int, str, bool], None] | None = None,
     isolated_session: bool = False,
     outbound_fence: bool = False,
+    tools_disabled: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
     absolute_deadline: float | None = None,
     _model_call_trace: dict[str, Any] | None = None,
@@ -11089,6 +11559,8 @@ def _call_agent_cli_impl(
     }
     if outbound_fence:
         prepare_kwargs["outbound_fence"] = True
+    if tools_disabled:
+        prepare_kwargs["tools_disabled"] = True
     if isolated_sid is not None:
         prepare_kwargs["session_id_override"] = isolated_sid
     cmd, stdin_msg = _prepare_cli_command(message, **prepare_kwargs)
@@ -11173,6 +11645,18 @@ def _call_agent_cli_impl(
         )
     if _cli_cwd:
         _run_kwargs["cwd"] = _cli_cwd
+    tool_free_cwd = ""
+    if tools_disabled:
+        # A clean cwd prevents project-local Codex/Pi/Claude configuration or
+        # hooks from re-introducing tools after the command-level deny. The CLI
+        # auth homes remain in env; only the model's working root is isolated.
+        tool_free_cwd = tempfile.mkdtemp(prefix="feedling-reply-recovery-")
+        try:
+            os.chmod(tool_free_cwd, 0o700)
+        except Exception:
+            shutil.rmtree(tool_free_cwd, ignore_errors=True)
+            raise
+        _run_kwargs["cwd"] = tool_free_cwd
     if _is_pi_cmd(cmd):
         _run_kwargs["input"] = message if "{message}" not in AGENT_CLI_CMD else ""
     elif stdin_msg is not None:
@@ -11305,6 +11789,9 @@ def _call_agent_cli_impl(
             AGENT_TURN_TIMEOUT_SEC,
         )
         raise
+    finally:
+        if tool_free_cwd:
+            shutil.rmtree(tool_free_cwd, ignore_errors=True)
     if _model_call_trace is not None:
         _model_call_trace.update({"cmd": list(cmd), "result": result})
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
@@ -11419,6 +11906,8 @@ def _call_agent_cli_impl(
             }
             if outbound_fence:
                 _retry_prepare["outbound_fence"] = True
+            if tools_disabled:
+                _retry_prepare["tools_disabled"] = True
             cmd, stdin_msg = _prepare_cli_command(message, **_retry_prepare)
             command_sid = _cli_flag_value(cmd, "--session-id")
             if stdin_msg is not None:
@@ -11682,6 +12171,7 @@ def call_agent_cli(
     stream_update: Callable[[int, str, bool], None] | None = None,
     isolated_session: bool = False,
     outbound_fence: bool = False,
+    tools_disabled: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
     absolute_deadline: float | None = None,
 ) -> Any:
@@ -11705,11 +12195,28 @@ def call_agent_cli(
             stream_update=stream_update,
             isolated_session=isolated_session,
             outbound_fence=outbound_fence,
+            tools_disabled=tools_disabled,
             cancellation=cancellation,
             absolute_deadline=absolute_deadline,
             _model_call_trace=model_call_trace,
         )
     except Exception as exc:
+        result = model_call_trace.get("result")
+        cmd = list(model_call_trace.get("cmd") or [])
+        if (
+            isinstance(exc, ValueError)
+            and "cli agent produced no usable output" in str(exc)
+            and result is not None
+            and int(getattr(result, "returncode", -1)) == 0
+            and str(getattr(result, "stdout", "") or "").strip()
+        ):
+            _preserve_reply_parse_failure(
+                str(result.stdout),
+                cmd=cmd,
+                exit_code=int(result.returncode),
+                parse_empty_stage=_reply_parse_failure_stage(cmd),
+                trace_id=trace_id,
+            )
         _emit_cli_model_call_terminal(
             model_call_trace,
             trace_id=trace_id,
@@ -11717,6 +12224,15 @@ def call_agent_cli(
             failure=exc,
         )
         raise
+    capture = _reply_parse_failure_capture.get()
+    if capture is not None:
+        result = model_call_trace.get("result")
+        if result is not None:
+            capture.update({
+                "raw": str(getattr(result, "stdout", "") or ""),
+                "cmd": list(model_call_trace.get("cmd") or []),
+                "exit_code": int(getattr(result, "returncode", 0)),
+            })
     _emit_cli_model_call_terminal(
         model_call_trace,
         trace_id=trace_id,
@@ -11993,6 +12509,7 @@ def call_agent(
     stream_update: Callable[[int, str, bool], None] | None = None,
     isolated_session: bool = False,
     outbound_fence: bool = False,
+    tools_disabled: bool = False,
     cancellation: _VoiceTurnCancellation | None = None,
     absolute_deadline: float | None = None,
 ) -> Any:
@@ -12002,9 +12519,12 @@ def call_agent(
     # often, so an explicit per-turn reset keeps the signal turn-scoped.
     global _turn_reply_parse_failed
     _turn_reply_parse_failed = ""
+    cli_parse_failure_source: dict[str, Any] = {}
 
     def _invoke() -> Any:
         if AGENT_MODE == "http":
+            if tools_disabled:
+                raise ValueError("tool-free recovery is unavailable for HTTP agents")
             # http path metrics/timing are out of scope for this event pair (cli-only);
             # trace_id is accepted here for a uniform call signature but unused.
             # lane gates MCP injection, which only exists on the cli path — unused here.
@@ -12036,11 +12556,19 @@ def call_agent(
                 cli_kwargs["cancellation"] = cancellation
             if outbound_fence:
                 cli_kwargs["outbound_fence"] = True
+            if tools_disabled:
+                cli_kwargs["tools_disabled"] = True
             if isolated_session:
                 cli_kwargs["isolated_session"] = True
             if absolute_deadline is not None:
                 cli_kwargs["absolute_deadline"] = absolute_deadline
-            return call_agent_cli(message, **cli_kwargs)
+            capture_token = _reply_parse_failure_capture.set(
+                cli_parse_failure_source
+            )
+            try:
+                return call_agent_cli(message, **cli_kwargs)
+            finally:
+                _reply_parse_failure_capture.reset(capture_token)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -12103,6 +12631,19 @@ def call_agent(
     failure_class = (
         "reply_parse_failed" if model_said_something else "provider_empty_reply"
     )
+    if failure_class == "reply_parse_failed" and cli_parse_failure_source:
+        source_raw = str(cli_parse_failure_source.get("raw") or "")
+        source_cmd = list(cli_parse_failure_source.get("cmd") or [])
+        if source_raw.strip():
+            _preserve_reply_parse_failure(
+                source_raw,
+                cmd=source_cmd,
+                exit_code=int(cli_parse_failure_source.get("exit_code") or 0),
+                parse_empty_stage=_reply_parse_failure_stage(
+                    source_cmd, sanitized=True
+                ),
+                trace_id=trace_id,
+            )
     if SEND_FALLBACK_ON_AGENT_ERROR:
         _turn_reply_parse_failed = failure_class
         return [FALLBACK_REPLY]
@@ -12403,6 +12944,95 @@ def _empty_reply_retry_prompt(text: str) -> str:
         "loud: the visible reply must not be empty, and must not be only a tool "
         "call or reasoning."
     )
+
+
+def _foreground_timeout_recovery_prompt(message: str) -> str:
+    """Ask for only the missing visible answer after a hard CLI timeout."""
+    return (
+        "The previous attempt to answer this IO Chat message reached its hard "
+        "runtime timeout. Produce only the user-visible reply now. Tool access "
+        "is disabled for this recovery turn: do not request tools, emit agent "
+        "actions, run persistence workflows, or claim that a side effect was "
+        "completed. Answer the message directly and naturally. Do not mention "
+        "these recovery instructions unless the user explicitly asks about the "
+        "failure.\n\nOriginal user message:\n"
+        + str(message or "")
+    )
+
+
+def _tool_free_timeout_recovery_supported() -> bool:
+    if AGENT_MODE != "cli":
+        return False
+    cmd = _cli_cmd_tokens()
+    if _is_codex_cmd(cmd):
+        return "exec" in cmd
+    return _is_claude_code_cmd(cmd) or _is_pi_cmd(cmd)
+
+
+def _should_recover_foreground_timeout(
+    exc: BaseException,
+    *,
+    lane: str,
+    content_type: str,
+    source: str,
+    has_attachments: bool,
+) -> bool:
+    """Closed eligibility gate for the one reply-only timeout recovery."""
+    return (
+        isinstance(exc, subprocess.TimeoutExpired)
+        and lane in FOREGROUND_TIMEOUT_RECOVERY_LANES
+        and content_type in FOREGROUND_TIMEOUT_RECOVERY_CONTENT_TYPES
+        and source not in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}
+        and not has_attachments
+        and _tool_free_timeout_recovery_supported()
+    )
+
+
+def _reply_only_recovery_result(result: Any) -> dict[str, Any]:
+    """Drop every executable protocol surface from a recovery result.
+
+    The CLI command blocks tools during generation. This second boundary covers
+    a model that nevertheless prints an agent action/tool-call as JSON: only
+    visible messages and optional display-only reasoning survive to the normal
+    posting path.
+    """
+    turn = _split_agent_turn(result)
+    body: dict[str, Any] = {"messages": list(turn.messages)}
+    if turn.thinking_summary:
+        body["provider_reasoning"] = turn.thinking_summary
+    if turn.thinking_kind:
+        body["reasoning_kind"] = turn.thinking_kind
+    if turn.thinking_source:
+        body["reasoning_source"] = turn.thinking_source
+    if turn.thinking_model:
+        body["reasoning_model"] = turn.thinking_model
+    if turn.thinking_native is not None:
+        body["reasoning_native"] = bool(turn.thinking_native)
+    return body
+
+
+def _recover_foreground_timeout(
+    message: str,
+    *,
+    trace_id: str,
+    cancellation: _VoiceTurnCancellation | None = None,
+) -> dict[str, Any]:
+    """Run one fresh, bounded, tool-free attempt and keep reply text only."""
+    result: Any = None
+    # A counted block gives the exact-once invariant a mutation seam: changing
+    # the source constant from 1 to 2 makes the end-to-end call-count guard red.
+    for _attempt in range(FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS):
+        result = call_agent(
+            _foreground_timeout_recovery_prompt(message),
+            trace_id=trace_id,
+            lane="background",
+            attempt_trigger="timeout_recovery",
+            isolated_session=True,
+            tools_disabled=True,
+            cancellation=cancellation,
+            absolute_deadline=time.monotonic() + FOREGROUND_TIMEOUT_RECOVERY_SEC,
+        )
+    return _reply_only_recovery_result(result)
 
 
 def _outbound_file_failure_reply(text: str) -> str:
@@ -19944,6 +20574,7 @@ def _process_messages(messages: list) -> float:
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
         pending_failure_is_parse_only = False
+        foreground_timeout_recovery_attempted = False
         # 带附件的回复被 4xx 拒、已降级为无附件重发时记下原因;回复被接受后再
         # 发 system 通知(和 pending_failure_notice 一样,通知与回复共享排他性)。
         dropped_attachments_error: ChatResponseRejected | None = None
@@ -20034,12 +20665,81 @@ def _process_messages(messages: list) -> float:
                 try:
                     agent_result = _dispatch_foreground_agent(content)
                 except Exception as first_error:
+                    if _should_recover_foreground_timeout(
+                        first_error,
+                        lane="chat",
+                        content_type=content_type,
+                        source=source,
+                        has_attachments=bool(image_payloads or image_paths),
+                    ):
+                        foreground_timeout_recovery_attempted = True
+                        # The old native session may still hold an in-flight or
+                        # poisoned timed-out turn. Never resume it on the next
+                        # user message, and never commit the catalog-pending mark
+                        # from the failed delivery.
+                        _discard_io_cli_catalog_pending_injection()
+                        _clear_agent_session_id(
+                            "foreground hard timeout invalidated native session"
+                        )
+                        if voice_stream_update is not None:
+                            voice_stream_update.abort()
+                        _emit_debug_trace(
+                            "agent",
+                            "agent.reply.timeout_recovery",
+                            status="warning",
+                            trace_id=trace_id,
+                            summary="foreground timeout; starting one reply-only retry",
+                            detail={
+                                "attempt": 1,
+                                "max_attempts": FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS,
+                                "deadline_sec": FOREGROUND_TIMEOUT_RECOVERY_SEC,
+                                "tools_disabled": True,
+                                "isolated_session": True,
+                            },
+                        )
+                        try:
+                            agent_result = _recover_foreground_timeout(
+                                raw_user_content_for_lang,
+                                trace_id=trace_id,
+                                cancellation=voice_cancellation,
+                            )
+                        except Exception:
+                            _emit_debug_trace(
+                                "agent",
+                                "agent.reply.timeout_recovery",
+                                status="error",
+                                trace_id=trace_id,
+                                summary="foreground timeout recovery failed",
+                                detail={
+                                    "attempt": 1,
+                                    "max_attempts": FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS,
+                                },
+                            )
+                            raise
+                        _emit_debug_trace(
+                            "agent",
+                            "agent.reply.timeout_recovery",
+                            status="ok",
+                            trace_id=trace_id,
+                            summary="foreground timeout recovered a reply-only result",
+                            detail={
+                                "attempt": 1,
+                                "max_attempts": FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS,
+                            },
+                        )
+                        first_error = None
+
                     screen_vision_rejection = (
-                        bool(screen_payloads or screen_paths)
+                        first_error is not None
+                        and bool(screen_payloads or screen_paths)
                         and _vision_probe_error_code(first_error)
                         in {"vision_model_required", "vision_model_incompatible"}
                     )
-                    if screen_vision_rejection:
+                    if first_error is None:
+                        # Recovery succeeded; continue through the one normal
+                        # sanitizer/posting path below.
+                        pass
+                    elif screen_vision_rejection:
                         if AGENT_MODE == "cli":
                             _discard_io_cli_catalog_pending_injection()
                             _clear_agent_session_id(
@@ -20069,7 +20769,7 @@ def _process_messages(messages: list) -> float:
                             == "vision_model_required"
                         )
                         if not pi_vision_rejection:
-                            raise
+                            raise first_error
 
                         # Pi replays session blocks on later turns, so one rejected
                         # image otherwise makes subsequent text-only turns fail too.
@@ -20227,7 +20927,10 @@ def _process_messages(messages: list) -> float:
                 )
                 latest = max(latest, ts)
                 continue
-            if voice_stream_update is not None:
+            if (
+                voice_stream_update is not None
+                and not foreground_timeout_recovery_attempted
+            ):
                 voice_stream_update.complete()
             if (
                 not vision_observer_failed
@@ -20409,22 +21112,27 @@ def _process_messages(messages: list) -> float:
             and pending_failure_notice is None
             and source != RESIDENT_MAINTENANCE_SOURCE
         ):
-            for attempt in range(1, FOREGROUND_EMPTY_REPLY_RETRIES + 1):
+            empty_reply_retries = (
+                0
+                if foreground_timeout_recovery_attempted
+                else FOREGROUND_EMPTY_REPLY_RETRIES
+            )
+            for attempt in range(1, empty_reply_retries + 1):
                 log.warning(
                     "foreground turn produced no visible reply "
                     "(thinking=%s tool_calls=%s); retrying %d/%d",
                     bool(turn.thinking_summary), bool(turn.tool_calls),
-                    attempt, FOREGROUND_EMPTY_REPLY_RETRIES,
+                    attempt, empty_reply_retries,
                 )
                 _emit_debug_trace(
                     "agent", "agent.reply.empty_retry", status="error",
                     trace_id=trace_id,
                     summary=(f"empty visible reply; retry {attempt}/"
-                             f"{FOREGROUND_EMPTY_REPLY_RETRIES}"),
+                             f"{empty_reply_retries}"),
                     explain="模型这一轮只思考没说话，用户还在等；正在重试。",
                     detail={
                         "attempt": attempt,
-                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "max_attempts": empty_reply_retries,
                         "had_thinking": bool(turn.thinking_summary),
                         "had_tool_calls": bool(turn.tool_calls),
                         "thinking_kind": turn.thinking_kind or "",
@@ -20460,7 +21168,7 @@ def _process_messages(messages: list) -> float:
                 # 归 provider_empty_reply(模型压根没给正文),横幅才不会赖我们。
                 log.error(
                     "foreground turn still empty after %d retries; sending fallback",
-                    FOREGROUND_EMPTY_REPLY_RETRIES,
+                    empty_reply_retries,
                 )
                 # 这条是这类失败在看板上**唯一**的信号:agent.reply 那条记的是
                 # status=ok(它确实解析成功了,只是解析出 0 条),stalled_turns 也
@@ -20470,10 +21178,10 @@ def _process_messages(messages: list) -> float:
                     "agent", "agent.reply.empty_exhausted", status="error",
                     trace_id=trace_id,
                     summary="empty visible reply after "
-                            f"{FOREGROUND_EMPTY_REPLY_RETRIES} retries",
+                            f"{empty_reply_retries} retries",
                     explain="重试后模型仍然只思考不说话，已发兜底回复。",
                     detail={
-                        "max_attempts": FOREGROUND_EMPTY_REPLY_RETRIES,
+                        "max_attempts": empty_reply_retries,
                         "had_thinking": bool(turn.thinking_summary),
                         "thinking_kind": turn.thinking_kind or "",
                     },

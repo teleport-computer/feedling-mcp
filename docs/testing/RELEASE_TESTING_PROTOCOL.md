@@ -56,6 +56,22 @@ canonical_owner: self
   E2E_KEY_DEEPSEEK=…`。
 - 建池动作（待 Seven/志豪提供 key）：额度各留最低档即可，P0 单轮消耗很小。
 
+**中转型号预检（T544）**：hosted P0 的中转格（`openai_compatible`/`openrouter`）
+在 setup 前先查中转的型号目录（同 key）确认配置型号仍在售。目录用后端权威抓取器
+`provider_client.list_provider_models`：`openai_compatible` 查 `{base_url}/models`，
+`openrouter` 走其默认端点的 key 范围路由 `.../api/v1/models/user`（公共 `/models`
+不看这把 key 的隐私/ZDR 资格）。四种走向：
+- 在售（配置型号在目录里，哪怕目录是部分结果也算证到）→ 正常跑 setup；
+- 确认不在售（目录**完整**返回但没有该型号，含合法空目录）→ 该格结果
+  `🧪 instrument_stale`，**单列，不计 PASS 也不计 FAIL、不阻断发布**
+  （`p0_blocks_release` 不含它）。日志给出该 relay 当前在售的候选型号，据此更新
+  key 池的 `E2E_RELAY_MODEL`/cell 型号。
+- 读不到 / 目录畸形 / **分页截断未取全（complete=false）** → `unverifiable`，
+  **不 gate**，照常进 setup（"没问成 / 没看全"不等于"确认下架"）。
+官方 provider 不做此预检；TLS 校验始终开启（不得 `verify=False`）。缘由：下架型号会
+self-test 成 503 "no available channel"，与产品红同形（2026-08-17 已误判过一次）。
+改动仅在 `tools/e2e/`，不碰产品代码。
+
 **待建（§9）：mock relay** —— key 池的"中转站代表"只能测到当天恰好发生的坏；
 真实故障族（SSE 中断/假模型名/慢首 token/间歇 5xx）要用 `tools/e2e/` 的 mock
 openai_compatible 代理主动注入（见 §4.7 故障注入四连）。
@@ -211,6 +227,13 @@ verify_loop passing → 发消息收回复 → 删号。
 > 尤其验 `pre` 分支的 Runtime V2 时以 §10 为准。
 
 ## 4. P1 全功能清单（Claude 半自动执行，1-2 小时）
+
+**跑 P1 深测工具（`tools/e2e/deep.py`）先声明目标环境（T545）**：目标由 `FEEDLING_E2E_API` **显式指定**，且必须是 test 或 pre，否则拒跑（fail-closed）。不再硬编码只准 pre——test 上也能跑 P1 回归：
+```
+FEEDLING_E2E_API=https://test-api.feedling.app python3 -m tools.e2e.deep --areas …
+# 或 https://pre-api.feedling.app
+```
+未设 `FEEDLING_E2E_API`、指向 prod（`api.feedling.app`）、或任何其它 host（含本地 127.0.0.1/localhost）一律 `REFUSING to run`（exit 2）——prod 永不允许，与 `client._refuse_prod` 同精神。deep.py 启动打印 `[deep] target environment: …` 把实际目标写进报告，避免"在错环境报绿"。
 
 在 **claude 官方 + pi 中转站** 两个代表性配置上（一个最稳、一个最刁）过全表；
 其余 driver 若 P0 全绿则免。逐项 ✅/❌/跳过+原因。

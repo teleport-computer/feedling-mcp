@@ -12,6 +12,69 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `GET /v1/agent/perception` (and the proactive agent's perception tools) again
+  return the `steps`, `vitals`, `body`, and `metabolic` fields the client reports.
+  Since the perception catalog split health signals into per-metric query
+  capabilities, the pull snapshot only consulted the report-level capability and
+  silently dropped these 14 fields; it now also honours each field's per-metric
+  capability. The cheap `perception.now` snapshot is unchanged.
+- **Resident model-call diagnostics identify their upstream route.** Terminal
+  model-call traces from the Pi, Claude, and Codex CLI runtimes now carry the
+  configured provider and model identifiers, matching the existing V2 trace
+  shape. They also carry the execution lane, so operators can separate chat
+  from background failures without inspecting prompts or model output. Missing
+  route facts remain unset rather than creating an empty-string bucket.
+
+- **Generated images now reach plaintext-tier accounts.** The image-followup
+  validator on `POST /v1/chat/response` accepted only the sealed envelope shape
+  (`body_ct`/`nonce`/`K_user`), so an account on the plaintext storage tier —
+  whose followup envelope is a `body_b64` plaintext shape, the same one file
+  followups already use — had every generated-image reply rejected with
+  `image_followup_envelope_missing_fields` and never received the picture. The
+  validator is now shape-aware (reusing the file-followup gate): a plaintext
+  `body_b64` image envelope is accepted when the account's encryption is off, and
+  the sealed shape keeps its full contract (still requires K_enclave for shared).
+
+- **Memory ranking and V2 profile freshness no longer depend on inactive signals.**
+  Read-side scores ignore legacy `is_open_thread` metadata, including on stored
+  cards. With profiles enabled, a changed Garden row-count or maximum-update
+  witness schedules background profile refresh at the next existing post-turn
+  check without waiting three days. Unchanged sources, disabled profiles and
+  failed-profile retry gates keep their protections. The old
+  `FEEDLING_V2_PROFILE_MAX_AGE_SEC` setting is no longer read. Refresh remains
+  asynchronous and can increase provider work and prompt-cache invalidations;
+  this does not promise an updated profile in the current reply.
+
+- **Foreground CLI timeouts get one side-effect-contained reply recovery.** An
+  ordinary text Chat turn that reaches the resident subprocess timeout can make
+  one fresh reply-only attempt on supported Codex, Claude, or Pi commands. The
+  recovery runs without user/project tools, strips executable action output,
+  and cannot stack with the existing empty-reply retry. Attachment turns,
+  background/proactive work, HTTP agents, and unknown CLI drivers retain the
+  existing visible timeout fallback. Operators can bound the recovery with
+  `FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC` (default 120 seconds, minimum 30).
+
+- **Resident CLI parse failures retain bounded local evidence.** When Codex or
+  Claude exits zero with non-empty structured stdout but no deliverable reply,
+  the resident stores a private, rotated raw artifact under `FEEDLING_HOME`.
+  Backend traces receive correlation metadata plus the exact first 80 characters
+  and local artifact path for direct diagnosis; they never receive the complete
+  stdout. Successful turns and genuinely empty provider responses remain
+  unchanged.
+
+- **Pi stream diagnostics survive trace serialization.** Model-call traces add
+  versioned scalar block counts and stop-reason indicators without storing reply,
+  reasoning, or tool-argument content in those fields. Operators can distinguish
+  thinking-only, tool-call-only, update-only text, and length-stop candidates
+  after persistence. Partial parses remain flagged; historical string-shaped
+  fields are not backfilled, and missing new fields mean unmeasured coverage.
+
+- **Resident agents again receive captions on plaintext-tier images and files.**
+  Plaintext binary history now folds the attachment's plaintext caption into
+  the same `content` field used by encrypted history. Plaintext text messages,
+  encrypted rows in mixed history, captionless attachments, and separately
+  hydrated attachment bodies keep their existing behavior.
+
 - **Resident clients report unsupported local IPC explicitly.** Python runtimes
   without `AF_UNIX` now log a disabled listener and return `ipc_unsupported`
   for local attachment/redistill commands; normal HTTP text replies are separate.

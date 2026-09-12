@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
 from . import config
-from .client import E2EClient, TEST_API
+from .client import E2EClient
 from .config import HOSTED_CELLS
 from .memory_probe import run_memory_probe
 from .continuity_probe import run_continuity_probe
@@ -47,6 +48,41 @@ except Exception as _e:  # noqa: BLE001
     _IMPORT_ERR["perception"] = f"{type(_e).__name__}: {_e}"
 
 SETUP_RETRY_SEC = 90.0
+
+# The only deployments this P1 suite may qualify — the exact canonical HTTPS
+# origins. prod is never listed (a run against prod must always be refused, like
+# client._refuse_prod); local is out too — P1 qualifies a real test/pre CVM, not
+# a workstation. A host-only allowlist is deliberately NOT used: it would admit
+# http://, a nondefault port, userinfo, or a path/query that redirects the run.
+_DEEP_ALLOWED_TARGETS = (
+    "https://test-api.feedling.app",
+    "https://pre-api.feedling.app",
+)
+
+
+def _resolve_deep_target() -> tuple[str | None, str]:
+    """Resolve the target deployment, fail-closed.
+
+    Returns ``(api_url, "")`` only when FEEDLING_E2E_API is EXPLICITLY set to one
+    of the exact canonical HTTPS origins (a single trailing slash tolerated);
+    otherwise ``(None, reason)``. The explicit check reads os.environ directly
+    rather than trusting the client's TEST_API, because TEST_API silently
+    defaults to test when the var is unset — 'unset' must refuse, not run against
+    a guessed target. The match is on the whole origin, not just the hostname, so
+    ``http://``, a nondefault port, ``user@host``, or a trailing path/query
+    cannot smuggle in a cleartext or noncanonical endpoint.
+    """
+    raw = os.environ.get("FEEDLING_E2E_API", "").strip()
+    if not raw:
+        return None, ("FEEDLING_E2E_API is not set; name the target explicitly "
+                      f"(allowed: {', '.join(_DEEP_ALLOWED_TARGETS)})")
+    canonical = raw[:-1] if raw.endswith("/") else raw
+    if canonical not in _DEEP_ALLOWED_TARGETS:
+        return None, (f"target {raw!r} is not an allowed P1 target "
+                      f"(allowed exactly: {', '.join(_DEEP_ALLOWED_TARGETS)}; "
+                      f"prod is never allowed, and only https origins with no port/"
+                      f"userinfo/path are accepted)")
+    return canonical, ""
 
 
 def _setup(c: E2EClient, cell, pool) -> tuple[bool, str, str]:
@@ -79,7 +115,7 @@ def _setup(c: E2EClient, cell, pool) -> tuple[bool, str, str]:
     return False, "", detail
 
 
-def run_provider(cell, pool, *, run_invariants: bool, areas: set[str]) -> dict:
+def run_provider(cell, pool, *, run_invariants: bool, areas: set[str], api_url: str) -> dict:
     key = cell.key(pool)
     if not key:
         return {"cell": cell.name, "provider": cell.provider, "setup": "no_key",
@@ -93,11 +129,15 @@ def run_provider(cell, pool, *, run_invariants: bool, areas: set[str]) -> dict:
         "experience": run_experience_probe,
     }
     # context manager guarantees teardown AND _http.close() on every exit
-    with E2EClient.provision(route="model_api") as c:
+    with E2EClient.provision(route="model_api", api_url=api_url) as c:
         ok, model, detail = _setup(c, cell, pool)
         cfg = {"cell": cell.name, "provider": cell.provider, "model": model,
                "key": key, "base_url": cell.base_url(pool) or "",
-               "run_invariants": run_invariants and ok}
+               "run_invariants": run_invariants and ok,
+               # Secondary accounts (memory cross-user isolation, language
+               # isolation) must land on the SAME resolved target as the primary
+               # (T545): threading api_url keeps the run single-environment.
+               "api_url": api_url}
         if not ok:
             block = BLOCKED_DEPLOYMENT if "runtime" in detail or "503" in detail else BLOCKED_CREDENTIAL
             return {"cell": cell.name, "provider": cell.provider, "setup": f"FAIL {detail}",
@@ -142,13 +182,17 @@ def main() -> int:
                          "exits nonzero for EVERY non-PASS per qa SOP")
     args = ap.parse_args()
 
-    # Fail closed: never qualify the wrong deployment. This suite exists to test
-    # pre Runtime V2; an unset/wrong FEEDLING_E2E_API must abort, not silently run
-    # against the default test env and report a green pre.
-    if TEST_API.rstrip("/") != "https://pre-api.feedling.app":
-        print(f"[deep] REFUSING to run: target is {TEST_API}, expected "
-              f"https://pre-api.feedling.app (set FEEDLING_E2E_API)", file=sys.stderr)
+    # Fail closed: never qualify the wrong deployment. The target must be named
+    # EXPLICITLY via FEEDLING_E2E_API and resolve to an allowed non-prod host —
+    # test or pre. This used to hard-code pre only, which left the release
+    # regression with no way to run P1 against test (T545). An unset var (which
+    # would silently default the client to test), prod, or any other host is
+    # refused, mirroring the client's own prod refusal.
+    target, target_err = _resolve_deep_target()
+    if target is None:
+        print(f"[deep] REFUSING to run: {target_err}", file=sys.stderr)
         return 2
+    print(f"[deep] target environment: {target}")
 
     known_areas = {"memory", "continuity", "proactive", "perception", "experience"}
     areas = {a.strip() for a in args.areas.split(",") if a.strip()}
@@ -178,7 +222,7 @@ def main() -> int:
     for cell in cells:
         run_inv = not invariants_done
         print(f"\n===== provider: {cell.name} (invariants={run_inv}) =====", flush=True)
-        prov = run_provider(cell, pool, run_invariants=run_inv, areas=areas)
+        prov = run_provider(cell, pool, run_invariants=run_inv, areas=areas, api_url=target)
         report.append(prov)
         print(f"  setup: {prov['setup']}", flush=True)
         for probe in prov.get("probes", []):
@@ -212,7 +256,7 @@ def main() -> int:
     stamp = int(time.time())
     out_path = f"/tmp/pre_v2_deep_{stamp}.json"
     with open(out_path, "w") as f:
-        json.dump({"target": TEST_API, "overall": overall, "report": report}, f,
+        json.dump({"target": target, "overall": overall, "report": report}, f,
                   ensure_ascii=False, indent=1)
     print(f"full report → {out_path}")
     # qualification mode (default): ANY non-PASS fails (qa SOP — overall PASS needs

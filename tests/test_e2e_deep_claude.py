@@ -202,6 +202,15 @@ def test_local_only_excludes_by_id(monkeypatch):
     assert _r(mem._local_only(make([], {"items": [], "missing_ids": ["other"], "unavailable_ids": [mid, "x"]}))) == PRODUCT_FAIL
 
 
+# Primary account stub for _isolation: the isolation probe reads c.api_url to
+# provision the secondary account on the SAME target (T545). mem_add/_id_of/
+# mem_index/mem_supersede are monkeypatched per test, so nothing else on it
+# is touched.
+class _Primary:
+    api_url = "https://pre-api.feedling.app"
+
+_PRIMARY = _Primary()
+
 def test_cross_user_fetch_must_be_exactly_missing(monkeypatch):
     aid = "aid1"
     monkeypatch.setattr(mem, "mem_add", lambda c, **kw: (200, {}))
@@ -211,7 +220,7 @@ def test_cross_user_fetch_must_be_exactly_missing(monkeypatch):
     # contradictory {missing:[A], unavailable:[A]} is NOT clean isolation
     bad = FakeClient(lambda m, p, **kw: FakeResp(200, {"items": [], "missing_ids": [aid], "unavailable_ids": [aid]}))
     monkeypatch.setattr(mem.E2EClient, "provision", classmethod(lambda cls, **kw: bad))
-    assert _r(mem._isolation(object())) == PRODUCT_FAIL
+    assert _r(mem._isolation(_PRIMARY)) == PRODUCT_FAIL
 
 
 # -- injected-text empty fetch is not a pass ---------------------------------
@@ -224,11 +233,11 @@ def test_cross_user_mutation_requires_exact_404(monkeypatch):
     monkeypatch.setattr(mem.E2EClient, "provision", classmethod(lambda cls, **kw: fakeB))
 
     monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (404, {"error": "not_found"}))
-    assert _r(mem._isolation(object())) == PASS                        # exact denial → isolated
+    assert _r(mem._isolation(_PRIMARY)) == PASS                        # exact denial → isolated
     monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (500, {"error": "boom"}))
-    assert _r(mem._isolation(object())) == PRODUCT_FAIL                # server error ≠ isolation
+    assert _r(mem._isolation(_PRIMARY)) == PRODUCT_FAIL                # server error ≠ isolation
     monkeypatch.setattr(mem, "mem_supersede", lambda b, i, **kw: (200, {}))
-    assert _r(mem._isolation(object())) == PRODUCT_FAIL                # mutation succeeded → broken
+    assert _r(mem._isolation(_PRIMARY)) == PRODUCT_FAIL                # mutation succeeded → broken
 
 
 def test_cross_user_index_leak_fails(monkeypatch):
@@ -237,7 +246,7 @@ def test_cross_user_index_leak_fails(monkeypatch):
     monkeypatch.setattr(mem, "_id_of", lambda c, mk: aid)
     monkeypatch.setattr(mem, "mem_index", lambda c, **kw: [{"id": aid}])   # B sees A's card
     monkeypatch.setattr(mem.E2EClient, "provision", classmethod(lambda cls, **kw: FakeClient(lambda *a, **k: FakeResp(200, {}))))
-    assert _r(mem._isolation(object())) == PRODUCT_FAIL
+    assert _r(mem._isolation(_PRIMARY)) == PRODUCT_FAIL
 
 
 def test_injected_text_blocks_on_empty_fetch(monkeypatch):

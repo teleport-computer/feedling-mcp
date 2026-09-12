@@ -36,6 +36,7 @@ import argparse
 import json
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Iterable
 
@@ -376,12 +377,251 @@ def executed_in_script(script: str) -> set[str]:
     return found
 
 
-def executed_test_files(workflow_path: Path = CI_WORKFLOW) -> set[str]:
-    """Test files some CI step actually executes."""
+# ---------------------------------------------------------------------------
+# Dynamic discovery (T546)
+#
+# One step does not name its test files literally — it discovers them at run
+# time and feeds the list to pytest via a shell array:
+#
+#     mapfile -t consumer_tests < <(grep -l -E '<predicate>' tests/test_*.py | sort)
+#     if (( ${#consumer_tests[@]} < 30 )); then ... exit 1; fi
+#     python -m pytest "${consumer_tests[@]}" -v
+#
+# ``executed_in_script`` cannot see those files: the target is ``${var[@]}`` (not
+# a literal), and the ``pytest`` sits *after* an ``if`` guard, where the general
+# parser deliberately forward-stops. Rather than teach the general parser to
+# reason across ``if`` (which would hand every post-``fi`` command new coverage
+# credit, far beyond this one step), this is a SEPARATE, exact recognizer. It
+# credits files only when the full bind->consume relationship is present:
+#
+#   1. exactly one ``mapfile -t VAR < <( grep -l -E 'PRED' tests/test_*.py [| sort] )``
+#      in the block (the process-substitution body must be exactly that shape);
+#   2. the SAME VAR is consumed by a TOP-LEVEL (depth 0) ``pytest``/``python -m
+#      pytest "${VAR[@]}"`` — a consume inside if/case/loop, a different variable,
+#      a bare grep, or a bare mapfile all credit nothing;
+#   3. if a ``(( ${#VAR[@]} < N ))`` min-count guard is present and the predicate
+#      currently matches fewer than N files, nothing is credited (CI would exit
+#      before pytest ran — crediting would be a false green).
+#
+# The predicate is applied to the repo's ``tests/test_*.py`` by invoking ``grep``
+# with an argv list (never ``shell=True``), so the match is byte-for-byte the
+# same tool the workflow uses and cannot drift onto a re-implemented regex.
+# Anything that does not match this exact grammar yields no credit (fail closed).
+# ---------------------------------------------------------------------------
+
+# Array reference ``${VAR[@]}`` (quotes are stripped by the posix lexer).
+_ARRAY_REF = re.compile(r"^\$\{([A-Za-z_]\w*)\[@\]\}$")
+# The ONLY binding shape trusted: ``mapfile -t VAR < <( grep -l -E 'PRED'
+# tests/test_*.py [| sort] )``. The process substitution routinely spans several
+# physical lines, so it is matched against the whole (``\``-joined) script with
+# DOTALL and then collapsed to one sentinel line before the state machine walks
+# the script, keeping the binding's position (top-level, before consume) intact.
+_MAPFILE_BINDING = re.compile(
+    r"mapfile\s+-t\s+([A-Za-z_]\w*)\s*<\s*<\(\s*"
+    r"grep\s+-l\s+-E\s+'([^']+)'\s+tests/test_\*\.py\s*(?:\|\s*sort\s*)?\)",
+    re.DOTALL,
+)
+# Any ``mapfile`` command word (to notice a binding shape we do NOT model).
+_ANY_MAPFILE = re.compile(r"(?:^|[;&|]|\s)mapfile\b")
+_BINDING_SENTINEL = "\x00mapfile_binding\x00"
+# The ONLY intervening control flow allowed: a ``(( ${#VAR[@]} < N ))`` min-count
+# fail-fast guard opened as a single ``if (( ... )); then`` logical line.
+_MIN_COUNT_GUARD_OPEN = re.compile(
+    r"^if\s+\(\(\s*\$\{#([A-Za-z_]\w*)\[@\]\}\s*<\s*([0-9]+)\s*\)\)\s*;\s*then$"
+)
+# Operators that join two commands on one logical line. A benign first command
+# could otherwise hide a terminator or a variable rewrite after ``;``/``&&``/…,
+# so any line carrying one of these is rejected (the real target step has none).
+_COMMAND_SEPARATORS = {"&&", "||", ";", "|", "&", ";;", ";&", ";;&", "|&"}
+# ``${#VAR[@]}`` — an array-length expansion, always a number, so it cannot make a
+# ``printf '%d'`` fail (unlike a literal argument under ``bash -e``).
+_COUNT_EXPANSION = re.compile(r"^\$\{#[A-Za-z_]\w*\[@\]\}$")
+
+
+# The EXACT "Running N test files" log the current CI step prints (the single-
+# quoted format keeps ``\\n`` literal through the posix lexer). Bound verbatim so
+# an option masquerading as the format (``printf -v …`` writes a variable,
+# ``printf --help …`` / ``printf %Q …`` exit non-zero under ``bash -e`` and strand
+# the later pytest) cannot slip through. If the step's log text ever changes the
+# recogniser goes red and is re-modelled here — never silently credits.
+_RUNNING_LOG_FORMAT = "Running %d resident consumer test files\\n"
+
+
+def _printf_log_is_exact(tokens: list[str], var: str) -> bool:
+    """The one logging line the real step runs, matched verbatim:
+    ``printf 'Running %d resident consumer test files\\n' "${#VAR[@]}"``.
+    """
+    return tokens == ["printf", _RUNNING_LOG_FORMAT, "${#%s[@]}" % var]
+
+
+def _is_exit_line(tokens: list[str]) -> bool:
+    """The guard's fail-fast ``exit`` / ``exit N`` (N a literal integer)."""
+    if tokens == ["exit"]:
+        return True
+    return len(tokens) == 2 and tokens[0] == "exit" and tokens[1].isdigit()
+
+
+def _is_plain_echo(tokens: list[str]) -> bool:
+    """The guard body's diagnostic ``echo …`` — one simple command, no operator
+    or redirection hiding anything after it."""
+    if not tokens or tokens[0] != "echo":
+        return False
+    return not any(
+        t in _COMMAND_SEPARATORS or _REDIRECT.match(t) or _PUNCTUATION_ONLY.match(t)
+        for t in tokens
+    )
+
+
+def _grep_discover(predicate: str, repo_root: Path) -> set[str] | None:
+    """Apply ``grep -l -E PREDICATE`` to ``tests/test_*.py`` exactly as CI does,
+    via an argv list (never ``shell=True``). Returns the matched set, or ``None``
+    when grep is unavailable or errors (returncode > 1) — the caller fails closed.
+    """
+    test_files = sorted((repo_root / "tests").glob("test_*.py"))
+    if not test_files:
+        return None
+    try:
+        result = subprocess.run(
+            ["grep", "-l", "-E", predicate, *[str(path) for path in test_files]],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return None
+    if result.returncode > 1:  # 0 = matches, 1 = no matches, >1 = real error
+        return None
+    return {"tests/" + Path(p).name for p in result.stdout.split() if p.strip()}
+
+
+def dynamic_executed_in_script(script: str, repo_root: Path = ROOT) -> set[str]:
+    """Credit the consumer suite's files ONLY for the exact CI step that discovers
+    them — ``mapfile`` + ``grep`` -> optional min-count guard -> optional Running
+    log -> ``python -m pytest "${VAR[@]}" -v``.
+
+    This is an EXACT recogniser, not a general shell/pytest interpreter: each line
+    after the binding must match one precise token shape (guard open with the
+    bound var, the guard's ``echo``/``exit``/``fi``, the ``printf '…%d…'
+    "${#VAR[@]}"`` log, or the ``python -m pytest "${VAR[@]}" -v`` consume).
+    Anything else at all — a line before the binding, a second binding, an extra
+    pytest option (``-k``/``--ignore``/``--collect-only``), a redirection, a
+    failable ``printf``, a variable write, unmodelled control flow — fails closed
+    and credits nothing. The real step is fixed; any drift should go red and be
+    re-modelled here, never silently credited.
+    """
+    normalised = re.sub(r"\\\n\s*", " ", script)  # join ``\``-continuations
+
+    mapfile_count = len(_ANY_MAPFILE.findall(normalised))
+    if mapfile_count == 0:
+        return set()
+    bindings = list(_MAPFILE_BINDING.finditer(normalised))
+    if mapfile_count != 1 or len(bindings) != 1:
+        return set()
+    bound_var, bound_predicate = bindings[0].group(1), bindings[0].group(2)
+    normalised = (
+        normalised[: bindings[0].start()]
+        + _BINDING_SENTINEL
+        + normalised[bindings[0].end():]
+    )
+
+    lines = _logical_lines(normalised)
+    if lines is None:
+        return set()
+
+    var: str | None = None
+    predicate: str | None = None
+    threshold: int | None = None
+    state = "pre"          # pre -> bound
+    consumed = False
+    in_guard = False
+    guard_closed = False
+    log_seen = False
+
+    for line in lines:
+        if line.strip() == _BINDING_SENTINEL:
+            if state != "pre":
+                return set()
+            var, predicate = bound_var, bound_predicate
+            state = "bound"
+            continue
+        if state != "bound":
+            return set()  # any line before the binding — fail closed
+        tokens = _tokenize(line)
+        if tokens is None:
+            return set()
+        if consumed:
+            return set()  # nothing may follow the consume
+
+        if in_guard:
+            if tokens == ["fi"]:
+                in_guard = False
+                guard_closed = True
+                continue
+            if _is_plain_echo(tokens) or _is_exit_line(tokens):
+                continue
+            return set()  # unmodelled content in the guard body
+
+        guard = _MIN_COUNT_GUARD_OPEN.match(line)
+        if guard is not None:
+            if guard_closed or threshold is not None or log_seen or guard.group(1) != var:
+                return set()
+            threshold = int(guard.group(2))
+            in_guard = True
+            continue
+
+        if _printf_log_is_exact(tokens, var):
+            if log_seen:
+                return set()
+            log_seen = True
+            continue
+
+        if tokens == ["python", "-m", "pytest", "${%s[@]}" % var, "-v"]:
+            consumed = True
+            continue
+
+        return set()  # any other top-level line — fail closed
+
+    if state != "bound" or in_guard or not consumed:
+        return set()
+    matched = _grep_discover(predicate, repo_root)
+    if matched is None:
+        return set()
+    if threshold is not None and len(matched) < threshold:
+        return set()
+    return matched
+
+
+def executed_test_files(
+    workflow_path: Path = CI_WORKFLOW, repo_root: Path = ROOT
+) -> set[str]:
+    """Test files some CI step actually executes (literal + dynamic discovery).
+
+    ``repo_root`` is where the dynamic recogniser resolves its ``grep`` predicate
+    against ``tests/test_*.py``; it defaults to this repository (the workflow file
+    may live anywhere — a mutated copy in a tmp dir still discovers the real
+    repo's tests, which is what CI would run).
+    """
     workflow = yaml.safe_load(workflow_path.read_text())
     found: set[str] = set()
     for script in _run_scripts(workflow):
         found |= executed_in_script(script)
+        found |= dynamic_executed_in_script(script, repo_root)
+    return found
+
+
+def dynamically_executed_test_files(
+    workflow_path: Path = CI_WORKFLOW, repo_root: Path = ROOT
+) -> set[str]:
+    """Only the files credited via the dynamic mapfile+grep->pytest idiom.
+
+    Exposed so the ratchet's "no hallucinated names" invariant can account for
+    the dynamically discovered files, which are deliberately NOT present in the
+    workflow text (they are found on disk by the predicate at run time).
+    """
+    workflow = yaml.safe_load(workflow_path.read_text())
+    found: set[str] = set()
+    for script in _run_scripts(workflow):
+        found |= dynamic_executed_in_script(script, repo_root)
     return found
 
 

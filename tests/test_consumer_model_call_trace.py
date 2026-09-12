@@ -7,9 +7,11 @@ tools/chat_resident_consumer.py:
 Run with: pytest tests/test_consumer_model_call_trace.py -v
 """
 
+import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -58,6 +60,102 @@ def _recorder():
     return calls, _fake_emit
 
 
+@pytest.mark.parametrize(
+    ("cmd", "expected_driver"),
+    [
+        (["pi", "--mode", "json"], "pi"),
+        (["claude", "--print"], "claude"),
+        (["codex", "exec", "--json"], "codex"),
+    ],
+)
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_cli_terminal_routes_carry_configured_provider_model_and_lane(
+    monkeypatch, cmd, expected_driver, succeeded
+):
+    """All CLI drivers expose the same route identity on both terminals."""
+    private_output = "PRIVATE USER CONTENT MUST NOT ENTER DETAIL"
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "openrouter",
+            "model": "upstream-model-id",
+            "input_modalities": ["text"],
+            "input_modalities_source": "explicit",
+        },
+    )
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    monkeypatch.setattr(crc, "_emit_recall_completed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(crc, "_recall_turn_reset", lambda: None)
+    result = subprocess.CompletedProcess(
+        args=cmd,
+        returncode=0 if succeeded else 1,
+        stdout=private_output,
+        stderr="",
+    )
+    failure = None if succeeded else subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+
+    crc._emit_cli_model_call_terminal(
+        {
+            "started": True,
+            "started_at": time.monotonic(),
+            "cmd": cmd,
+            "result": result,
+            "lane": "chat",
+        },
+        trace_id=f"trace-{expected_driver}",
+        succeeded=succeeded,
+        failure=failure,
+    )
+
+    assert len(calls) == 1
+    detail = calls[0]["detail"]
+    assert calls[0]["type"] == (
+        "agent.model.call.done" if succeeded else "agent.model.call.error"
+    )
+    assert detail["driver"] == expected_driver
+    assert detail["provider"] == "openrouter"
+    assert detail["model"] == "upstream-model-id"
+    assert detail["lane"] == "chat"
+    assert private_output not in json.dumps(detail)
+
+
+def test_cli_terminal_omits_unknown_route_identity(monkeypatch):
+    """Missing route facts persist as NULL, never as empty-string buckets."""
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "",
+            "model": "",
+            "input_modalities": [],
+            "input_modalities_source": "",
+        },
+    )
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    monkeypatch.setattr(crc, "_emit_recall_completed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(crc, "_recall_turn_reset", lambda: None)
+
+    crc._emit_cli_model_call_terminal(
+        {
+            "started": True,
+            "started_at": time.monotonic(),
+            "cmd": ["pi"],
+            "result": None,
+        },
+        trace_id="trace-missing-route",
+        succeeded=False,
+        failure=RuntimeError("driver failed"),
+    )
+
+    detail = calls[0]["detail"]
+    assert "provider" not in detail
+    assert "model" not in detail
+    assert "lane" not in detail
+
+
 def test_call_agent_cli_emits_start_then_done(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
@@ -71,7 +169,7 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
 
-    crc.call_agent_cli("hi", trace_id="trace-123")
+    crc.call_agent_cli("hi", trace_id="trace-123", lane="chat")
 
     types_seen = [c["type"] for c in calls]
     assert types_seen == ["agent.model.call.start", "agent.model.call.done"]
@@ -85,6 +183,7 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
     assert done["dur_ms"] is not None
     assert done["detail"]["driver"] == "claude"
     assert done["detail"]["rc"] == 0
+    assert done["detail"]["lane"] == "chat"
     assert done["detail"]["thinking_present"] is False
     assert done["detail"]["thinking_source"] == ""
     assert done["detail"]["thinking_len"] == 0

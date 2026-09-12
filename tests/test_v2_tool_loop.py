@@ -478,7 +478,7 @@ def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
     assert tagged in provider.calls[0]["messages"]
     assert tagged not in provider.calls[1]["messages"]
     assert rejected == ["ProviderError"]
-    assert usage == [None, {}]
+    assert usage == [None, {"provider_retry_count": 0}]
     assert outcome.final_text == "text fallback"
     initial_error = next(
         payload for kind, payload in trajectory if kind == "provider_error"
@@ -1053,7 +1053,7 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         {
             "reply": "",
             "reasoning": "private trajectory content",
-            "stop_reason": "private trajectory content " * 100,
+            "stop_reason": "NOVEL_STOP_MARKER",
             "tool_calls": [],
             "usage": {"completion_tokens": 4096},
         },
@@ -1103,6 +1103,13 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         },
         "action": "semantic_correction",
     }]
+    # T568 non-Gemini mirror: a non-Gemini provider's unknown stop marker still
+    # collapses to "other" and must NOT surface raw_stop_reason — the raw
+    # projection is scoped to real Gemini responses (owned gemini_diagnostics).
+    assert empty_events[0]["response_shape"]["stop_reason"] == "other"
+    assert "raw_stop_reason" not in empty_events[0]["response_shape"]
+    assert "NOVEL_STOP_MARKER" not in str(empty_events)
+    # Reasoning/message content is still never carried.
     assert "private trajectory content" not in str(empty_events)
     assert "messages" not in str(empty_events)
     assert debug_shapes == [empty_events[0]["response_shape"]]
@@ -3348,7 +3355,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert provider.calls[1]["tools"] is None
     assert "allow_image_output" not in provider.calls[1]
     assert len(provider.calls) == 2
-    assert usage == [None, {}]
+    assert usage == [None, {"provider_retry_count": 0}]
     assert reply.calls == [("fallback answer", True)]
     assert outcome.rounds == 2
     assert [item["reason"] for item in surfaces] == [
