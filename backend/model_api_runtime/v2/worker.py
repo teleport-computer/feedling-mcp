@@ -12570,6 +12570,16 @@ async def _run_extraction(
                     "message_count": len(tail),
                 }
             )
+            # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
+            # 用来定位「模型为什么吐出坏 JSON」——见 memory/window_fingerprint。
+            # 窗口文本此刻还没渲染，所以这里只取 role/source；
+            # 引号计数在 prompt 拼好之后补上。
+            try:
+                from memory import window_fingerprint
+
+                capture_window.update(window_fingerprint.fingerprint(messages=tail))
+            except Exception:  # noqa: BLE001 —— 指纹算不出来不该挡住落卡
+                log.exception("capture window fingerprint failed")
         if lane == "capture" and not tail:
             # A stale scheduler can enqueue just after an earlier Capture
             # advances the frontier and releases single-flight. The successor
@@ -12837,6 +12847,15 @@ async def _run_extraction(
                     cards=ctx.get("cards", ""),
                     locale=capture_locale,
                 )
+                # 引号压力：失败窗口 >0 而成功窗口 =0 就坐实了引号假说。
+                # 只出个数和每千字符密度，不出位置、不出上下文。
+                try:
+                    from memory import window_fingerprint
+
+                    capture_window.update(
+                        window_fingerprint.quote_pressure(window))
+                except Exception:  # noqa: BLE001
+                    log.exception("capture quote pressure failed")
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
             if deps.authorize_capture_provider_call is None or not claimed_by:

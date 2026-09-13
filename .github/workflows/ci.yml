@@ -416,6 +416,9 @@ jobs:
             tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
+            tests/test_capture_poison_window_escape.py \
+            tests/test_capture_window_cursor_diagnostics.py \
+            tests/test_window_fingerprint.py \
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_garden_language_flip.py \
@@ -1011,6 +1014,9 @@ jobs:
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_capture_poison_window_escape.py \
+            tests/test_capture_window_cursor_diagnostics.py \
+            tests/test_window_fingerprint.py \
             tests/test_contract_rejection_stats.py \
             tests/test_admin_data_quality_status.py \
             tests/test_data_track_runtime_view.py \
