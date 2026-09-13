@@ -365,13 +365,25 @@ def _force_pressure(monkeypatch):
         "oversized optional manual " * 6_000,
     )
     monkeypatch.setattr(tool_loop, "_CATALOG", None)
-    return provider_client.ProviderConfig(
+    pressure_config = provider_client.ProviderConfig(
         provider="anthropic",
         model="claude-sonnet-4-test",
         api_key="sk-user-byok",
         base_url="",
         context_window_tokens=40_000,
     )
+    # Pressure is an explicit test constraint. Accepted route metadata can be
+    # raised to an audited family bound, so it cannot force this smaller window.
+    monkeypatch.setitem(
+        worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+        "anthropic:claude-sonnet-4-test", 40_000,
+    )
+    limit = worker.v2_prompt_frontier.resolve_model_limit_from_config(
+        pressure_config, deployment_overrides=worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    assert limit.context_window_tokens == 40_000
+    assert limit.source == "deployment_override"
+    return pressure_config
 
 
 def test_wake_pressure_folded_platform_schema_is_searchable(monkeypatch):

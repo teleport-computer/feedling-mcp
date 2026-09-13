@@ -116,6 +116,7 @@ class ModelPromptLimit:
     override_key: str | None = None
     rejected_provider_metadata_tokens: int | None = None
     provider_metadata_floor_tokens: int | None = None
+    raised_provider_metadata_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -376,8 +377,12 @@ _AUDITED_FAMILIES: tuple[_AuditedFamily, ...] = (
     _AuditedFamily(
         "deepseek",
         "deepseek_modern",
-        ("deepseek-chat", "deepseek-reasoner", "deepseek-v4"),
-        64_000,
+        ("deepseek-chat", "deepseek-reasoner", "deepseek-v4", "deepseek-flash"),
+        # 2026-09-14, api.deepseek.com: 1.1M-token requests returned HTTP 400
+        # with maximum context length 1048576 for all six audited IDs:
+        # deepseek-v4-flash, deepseek-flash, deepseek-v4-pro, deepseek-chat,
+        # deepseek-reasoner, and deepseek-v4-flash-vision-exp.
+        1_048_576,
     ),
     _AuditedFamily(
         "openrouter",
@@ -618,15 +623,22 @@ def resolve_model_limit(
     provider_context_window_tokens: Any | None = None,
     deployment_overrides: Mapping[str, Any] | None = None,
 ) -> ModelPromptLimit:
-    """Resolve deployment override > trusted provider metadata > audited family.
+    """Resolve overrides first, then the larger of trusted metadata and audit.
+
+    On an audited destination and model family, accepted route metadata cannot
+    lower the audited bound. iOS omits context_window_tokens for first-party
+    providers, so saved metadata can echo an older server-derived limit rather
+    than a provider measurement. Keep larger/equal metadata (and its source);
+    when the audit raises it, retain the old value in the result for diagnostics.
+    Custom destinations never inherit this family lower bound.
 
     Override lookup is deterministic and most-specific first:
     ``provider:model``, ``provider:*``, ``*:model``, then ``*:*``.
     Provider metadata below the deployment-tunable floor is not trusted and
     falls through to audited-family/default resolution. Deployment overrides
-    intentionally apply even to custom destinations; a
-    custom route without one never inherits a first-party model assumption and
-    fails before any provider request. Because override keys do not encode a
+    intentionally apply even to custom destinations; a custom route without
+    one uses accepted metadata or the configured unaudited default. Because
+    override keys do not encode a
     destination, an override must be a safe lower bound for every route it
     matches.
     """
@@ -650,6 +662,7 @@ def resolve_model_limit(
                 override_key=key,
             )
 
+    accepted_provider_metadata_tokens: int | None = None
     rejected_provider_metadata_tokens: int | None = None
     provider_metadata_floor_tokens: int | None = None
     if provider_context_window_tokens is not None:
@@ -659,14 +672,10 @@ def resolve_model_limit(
         )
         floor_tokens = provider_metadata_context_window_floor()
         if reported_tokens >= floor_tokens:
-            return ModelPromptLimit(
-                provider=normalized_provider,
-                model=normalized_model,
-                context_window_tokens=reported_tokens,
-                source="provider_metadata",
-            )
-        rejected_provider_metadata_tokens = reported_tokens
-        provider_metadata_floor_tokens = floor_tokens
+            accepted_provider_metadata_tokens = reported_tokens
+        else:
+            rejected_provider_metadata_tokens = reported_tokens
+            provider_metadata_floor_tokens = floor_tokens
 
     if _is_audited_destination(normalized_provider, base_url):
         for family in _AUDITED_FAMILIES:
@@ -675,6 +684,11 @@ def resolve_model_limit(
             if any(
                 normalized_model.startswith(prefix) for prefix in family.model_prefixes
             ):
+                if (
+                    accepted_provider_metadata_tokens is not None
+                    and accepted_provider_metadata_tokens >= family.lower_bound_tokens
+                ):
+                    break
                 return ModelPromptLimit(
                     provider=normalized_provider,
                     model=normalized_model,
@@ -685,7 +699,16 @@ def resolve_model_limit(
                         rejected_provider_metadata_tokens
                     ),
                     provider_metadata_floor_tokens=provider_metadata_floor_tokens,
+                    raised_provider_metadata_tokens=accepted_provider_metadata_tokens,
                 )
+
+    if accepted_provider_metadata_tokens is not None:
+        return ModelPromptLimit(
+            provider=normalized_provider,
+            model=normalized_model,
+            context_window_tokens=accepted_provider_metadata_tokens,
+            source="provider_metadata",
+        )
 
     # Lowest-precedence fallback: an unaudited route (custom relay / unknown
     # model) with nothing more specific configured gets a conservative default

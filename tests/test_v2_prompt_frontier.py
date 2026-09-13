@@ -185,6 +185,74 @@ def test_known_model_uses_audited_family_lower_bound():
     assert resolved.family == "openai_modern"
 
 
+@pytest.mark.parametrize("model", [
+    "deepseek-v4-flash",
+    "deepseek-flash",
+    "deepseek-v4-pro",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-v4-flash-vision-exp",
+])
+@pytest.mark.parametrize("base_url", ["", "https://api.deepseek.com"])
+def test_deepseek_audited_models_use_measured_context_window(model, base_url):
+    family = next(
+        family for family in frontier._AUDITED_FAMILIES
+        if family.provider == "deepseek" and family.name == "deepseek_modern"
+    )
+    # Independent evidence floor: 2026-09-14 first-party over-limit probes.
+    # Deriving only the resolved value from the family would miss a rollback
+    # of the audited constant itself.
+    assert family.lower_bound_tokens >= 1_048_576
+    resolved = frontier.resolve_model_limit("deepseek", model, base_url=base_url)
+    assert resolved.context_window_tokens == family.lower_bound_tokens
+    assert resolved.source == "audited_family"
+    assert resolved.family == family.name
+
+
+def test_deepseek_stale_metadata_is_raised_to_audited_window(monkeypatch):
+    monkeypatch.delenv(frontier._PROVIDER_METADATA_FLOOR_ENV, raising=False)
+    audited = frontier.resolve_model_limit("deepseek", "deepseek-v4-flash-vision-exp")
+    resolved = frontier.resolve_model_limit(
+        "deepseek", "deepseek-v4-flash-vision-exp",
+        provider_context_window_tokens=64_000,
+    )
+    assert resolved.context_window_tokens == audited.context_window_tokens
+    assert resolved.source == "audited_family"
+    assert resolved.family == audited.family
+    assert resolved.raised_provider_metadata_tokens == 64_000
+    assert resolved.rejected_provider_metadata_tokens is None
+    assert resolved.provider_metadata_floor_tokens is None
+
+
+@pytest.mark.parametrize("reported_tokens", [128_000, 200_000])
+def test_audited_family_preserves_equal_or_larger_provider_metadata(reported_tokens):
+    resolved = frontier.resolve_model_limit(
+        "anthropic", "claude-sonnet-4.5",
+        provider_context_window_tokens=reported_tokens,
+    )
+    assert resolved.context_window_tokens == reported_tokens
+    assert resolved.source == "provider_metadata"
+    assert resolved.family is None
+    assert resolved.raised_provider_metadata_tokens is None
+
+
+def test_deepseek_custom_destination_does_not_raise_provider_metadata():
+    resolved = frontier.resolve_model_limit(
+        "deepseek", "deepseek-v4-flash",
+        base_url="https://relay.example/v1",
+        provider_context_window_tokens=64_000,
+    )
+    assert resolved.context_window_tokens == 64_000
+    assert resolved.source == "provider_metadata"
+    assert resolved.raised_provider_metadata_tokens is None
+
+
+def test_openrouter_deepseek_keeps_its_separate_audited_window():
+    resolved = frontier.resolve_model_limit("openrouter", "deepseek/deepseek-v4-flash")
+    assert resolved.context_window_tokens == 64_000
+    assert resolved.family == "openrouter_deepseek"
+
+
 def test_openrouter_known_family_is_resolved_separately():
     resolved = frontier.resolve_model_limit(
         "openrouter",
