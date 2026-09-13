@@ -18,6 +18,15 @@ change must not be interpreted as an API guarantee.
   capabilities, the pull snapshot only consulted the report-level capability and
   silently dropped these 14 fields; it now also honours each field's per-metric
   capability. The cheap `perception.now` snapshot is unchanged.
+
+- **DeepSeek routes no longer remain constrained by an old 64K context value.**
+  Runtime V2 uses a 1,048,576-token audited window for the first-party DeepSeek
+  family, including `deepseek-flash`. At audited destinations, the larger of
+  accepted route metadata and the audited family lower bound now determines
+  the window. Larger metadata and deployment overrides keep their precedence;
+  stored routes are not rewritten. Custom endpoints and OpenRouter's separate
+  DeepSeek window remain unchanged.
+
 - **Resident model-call diagnostics identify their upstream route.** Terminal
   model-call traces from the Pi, Claude, and Codex CLI runtimes now carry the
   configured provider and model identifiers, matching the existing V2 trace
