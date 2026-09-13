@@ -15474,3 +15474,169 @@ def test_rejected_reply_without_attachments_still_releases_the_turn(monkeypatch)
 
     assert len(calls) == 1 and "image_followups" not in calls[0]
     assert unmarked, "a rejected text reply must still release the turn for retry"
+
+
+# T576: hidden agent-body generation must never post invented/local rows.
+def _body_test_rows():
+    return [[1] * 24 for _ in range(24)]
+
+
+def _body_test_job():
+    return {"agent_body_job": {"job_id": "body-job-1", "expires_at_epoch": time.time() + 85,
+                                "palette_count": 2, "prompt": "fixed drawing instructions #112233"}}
+
+
+@pytest.mark.parametrize("mode", ["cli", "http"])
+def test_hidden_agent_body_generates_with_local_context(monkeypatch, mode):
+    calls, posts = [], []
+    monkeypatch.setattr(crc, "AGENT_MODE", mode)
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {"agent_name": "private-identity"})
+    def index(path, *, payload, timeout):
+        assert path == "/v1/memory/index" and payload == {"limit": 12}
+        return {"items": [{"summary": "private-memory"}]}
+    monkeypatch.setattr(crc, "_capture_post_json", index)
+    def call(prompt, **kwargs):
+        calls.append((prompt, kwargs))
+        return json.dumps({"rows": _body_test_rows()})
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, **kwargs: posts.append((url, kwargs)) or MagicMock())
+    before = time.monotonic()
+    crc._process_agent_body_job(_body_test_job())
+    assert len(calls) == 1 and "private-identity" in calls[0][0] and "private-memory" in calls[0][0]
+    kwargs = calls[0][1]
+    assert kwargs["raw_text"] is True and kwargs["isolated_session"] is True and kwargs["lane"] == "background"
+    assert before < kwargs["absolute_deadline"] <= time.monotonic() + 70
+    assert kwargs.get("tools_disabled") is (True if mode == "cli" else None)
+    assert len(posts) == 1 and posts[0][0].endswith("/v1/internal/agent-body/generate/result")
+    assert posts[0][1]["json"] == {"job_id": "body-job-1", "status": "ok", "rows": _body_test_rows(), "attempts": 1}
+    assert "private-identity" not in json.dumps(posts) and "private-memory" not in json.dumps(posts)
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+def test_hidden_agent_body_repairs_once_without_local_fallback(monkeypatch, repair_succeeds):
+    calls, posts = [], []
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {})
+    monkeypatch.setattr(crc, "_capture_post_json", lambda *a, **k: {})
+    def call(prompt, **kwargs):
+        calls.append(prompt)
+        return json.dumps({"rows": _body_test_rows() if len(calls) == 2 and repair_succeeds else []})
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, **kwargs: posts.append(kwargs["json"]) or MagicMock())
+    crc._process_agent_body_job(_body_test_job())
+    assert len(calls) == 2 and "24 行" in calls[1]
+    if repair_succeeds:
+        assert posts == [{"job_id": "body-job-1", "status": "ok", "rows": _body_test_rows(), "attempts": 2}]
+    else:
+        assert posts == [{"job_id": "body-job-1", "status": "failed", "error_code": "agent_body_generation_invalid_output", "attempts": 2}]
+        assert all("rows" not in payload for payload in posts)
+
+
+@pytest.mark.parametrize("rows", [[], [[0] * 24 for _ in range(24)], [[3] * 24 for _ in range(24)],
+                                  [[True] * 24 for _ in range(24)], [[1] * 23 for _ in range(24)], _body_test_rows()])
+def test_agent_body_grid_contract_matches_backend(rows):
+    from hosted import agent_body_core
+    reply = json.dumps({"rows": rows})
+    try:
+        backend_rows = agent_body_core.parse_rows(reply, 2)
+    except ValueError as error:
+        with pytest.raises(ValueError) as consumer_error:
+            crc._agent_body_rows(reply, 2)
+        assert str(consumer_error.value) == str(error)
+    else:
+        assert crc._agent_body_rows(reply, 2) == backend_rows
+
+
+def test_hidden_body_drops_shared_trace_and_raw_archive(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {"agent_name": "private-identity"})
+    monkeypatch.setattr(crc, "_capture_post_json", lambda *a, **k: {})
+    monkeypatch.setattr(crc, "_debug_trace_probably_enabled", lambda: (True, True))
+    traces = []
+    monkeypatch.setattr(crc, "_post_debug_trace_event", lambda payload: traces.append(payload))
+    def call(prompt, **kwargs):
+        crc.log.warning("private-log-content %s", prompt)
+        crc._emit_debug_trace("agent", "agent.model.call.start", content_excerpt={"prompt": prompt})
+        assert crc._preserve_reply_parse_failure("private-output", cmd=["codex", "exec"],
+            exit_code=0, parse_empty_stage="test") is None
+        return json.dumps({"rows": _body_test_rows()})
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc._HTTP, "post", lambda *a, **k: MagicMock())
+    crc._process_agent_body_job(_body_test_job())
+    assert not traces and "private-log-content" not in caplog.text
+    assert crc._AGENT_BODY_PRIVATE.get() is False
+
+
+def test_hidden_body_deadline_prevents_second_attempt(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(crc.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {})
+    monkeypatch.setattr(crc, "_capture_post_json", lambda *a, **k: {})
+    calls, posts = [], []
+    def call(prompt, **kwargs):
+        calls.append(kwargs)
+        clock[0] += 60
+        return '{"rows": []}'
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, **kwargs: posts.append(kwargs["json"]) or MagicMock())
+    crc._process_agent_body_job(_body_test_job())
+    assert len(calls) == 1 and posts[0]["error_code"] == "agent_body_generation_timeout"
+    assert "rows" not in posts[0]
+
+
+def test_hidden_body_uses_real_http_dispatch_without_session_writes(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8080/chat/completions")
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {"agent_name": "private-local-agent"})
+    monkeypatch.setattr(crc, "_capture_post_json", lambda *a, **k: {})
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    def no_session(*args, **kwargs):
+        pytest.fail("hidden body must not read or persist the active HTTP session")
+    monkeypatch.setattr(crc, "_load_agent_session_id", no_session)
+    monkeypatch.setattr(crc, "_remember_http_session", no_session)
+    requests = []
+    def post(url, **kwargs):
+        requests.append((url, kwargs))
+        response = MagicMock()
+        response.headers = {"Content-Type": "application/json"}
+        response.json.return_value = {"choices": [{"message": {"content": json.dumps({"rows": _body_test_rows()})}}]}
+        return response
+    monkeypatch.setattr(crc._HTTP, "post", post)
+    crc._process_agent_body_job(_body_test_job())
+    assert len(requests) == 2
+    model_request = requests[0][1]["json"]
+    assert requests[0][0] == crc.AGENT_HTTP_URL
+    assert "private-local-agent" in model_request["messages"][0]["content"]
+    assert "tools" not in model_request and len(model_request["messages"]) == 1
+    assert requests[1][1]["json"]["rows"] == _body_test_rows()
+
+
+@pytest.mark.parametrize("outcome,expected_status,expected_error,attempts", [
+    ("valid", "ok", "", 1),
+    ("invalid", "failed", "agent_body_generation_invalid_output", 2),
+    ("exception", "failed", "agent_body_generation_failed", 1),
+])
+def test_hidden_body_logs_content_free_completion(monkeypatch, caplog, outcome, expected_status, expected_error, attempts):
+    import logging
+    clock = [100.0]
+    monkeypatch.setattr(crc.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {"agent_name": "private-identity"})
+    monkeypatch.setattr(crc, "_capture_post_json", lambda *a, **k: {"items": [{"summary": "private-memory"}]})
+    def call(prompt, **kwargs):
+        clock[0] += 0.25
+        crc.log.warning("private-model-output %s", prompt)
+        if outcome == "exception":
+            raise RuntimeError("private-provider-key")
+        return json.dumps({"rows": _body_test_rows() if outcome == "valid" else []})
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc, "_refresh_auth_header", lambda: None)
+    monkeypatch.setattr(crc._HTTP, "post", lambda *a, **k: MagicMock())
+    with caplog.at_level(logging.INFO, logger=crc.log.name):
+        crc._process_agent_body_job(_body_test_job())
+    records = [r.getMessage() for r in caplog.records if r.name == crc.log.name]
+    assert records == [f"agent_body job_id=body-job-1 status={expected_status} error_code={expected_error} attempts={attempts} dur_ms={250 * attempts}"]
+    assert crc._AGENT_BODY_PRIVATE.get() is False

@@ -24,6 +24,18 @@ canonical_owner: self
 > 校验类错误，走 `invalid_payload`/`detail` 通用兜底文案，不需要逐条本地化）。
 > `enclave/*` 是独立的 backend↔enclave 内网面，iOS 从不直连，见文末单独一节。
 
+## Agent 拼豆身体生成
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `agent_body_invalid_request` | 400 | — | schema_version/grid_size/client_request_id/allowed_palette 无效 | |
+| `agent_body_resident_update_required` | 409 | — | resident 离线、太旧或未宣告 agent_body_generate_v1 | ✅ |
+| `agent_body_agent_unavailable` | 409 | — | official_import 接入未运行 agent | ✅ |
+| `agent_body_provider_config_failed` | 409 | user_provider | provider 鉴权、额度、权限或配置错误 | ✅ |
+| `agent_body_generation_timeout` | 504 | system | 85 秒截止或不足 25 秒进行修复重试 | ✅ |
+| `agent_body_generation_failed` | 429/502；内部 409/410/503 | provider_transient/system | provider 限流、失败/空回复或任务冲突；内部 reason=consumer_mismatch/expired/state_unavailable 标识绑定、过期、CAS 失败；不返回 rows | ✅ |
+| `agent_body_generation_invalid_output` | 502 | system | 一次修复重试后仍不符合网格硬规则；不返回 rows | ✅ |
+
 ## 通用
 
 ### 本地 resident CLI（不是 HTTP API）

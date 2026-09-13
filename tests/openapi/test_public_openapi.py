@@ -59,6 +59,7 @@ EXPECTED_PUBLIC_OPERATIONS = {
 }
 
 EXPECTED_API_KEY_ONLY_OPERATIONS = {
+    ("post", "/v1/agent-body/generate"),
     ("get", "/v1/web/settings"),
     ("post", "/v1/web/settings"),
     ("post", "/v1/access/link-token"),
@@ -72,6 +73,7 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 }
 
 EXPECTED_CORE_BODY_REFS = {
+    ("post", "/v1/agent-body/generate"): "AgentBodyGenerateRequest",
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
     ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
@@ -228,8 +230,9 @@ def test_public_operation_and_parameter_inventory(
     # operation.
     # GET /v1/chat/workspace/body and GET /v1/chat/canvases add two bodyless
     # Canvas read operations.
-    assert len(operations) == 178
-    assert sum("requestBody" in operation for operation in operations.values()) == 84
+    # Agent body generation adds one API-key-only JSON operation.
+    assert len(operations) == 179
+    assert sum("requestBody" in operation for operation in operations.values()) == 85
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

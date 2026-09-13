@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `POST /v1/agent-body/generate` generates a validated 24×24 bead body for
+  hosted and resident accounts, including upgraded self-hosted backends.
+  Hosted accounts use their chat model; residents receive a hidden job through
+  `GET /v1/chat/poll` and run their own agent with locally read identity and memory.
+  Generation does not save or apply a preset; failures never return a local
+  substitute. The API-key-only request has an 85-second budget and at most one
+  repair attempt. Residents must upgrade to advertise `agent_body_generate_v1`;
+  test deployment alone does not update consumers following the production
+  release channel. See [the API contract](/docs/api-reference) and
+  [errors](/docs/errors#agent-body-generation).
+
 - `GET /v1/agent/perception` (and the proactive agent's perception tools) again
   return the `steps`, `vitals`, `body`, and `metabolic` fields the client reports.
   Since the perception catalog split health signals into per-metric query
