@@ -76,6 +76,7 @@ def poll_context(store: UserStore, consumer_info: dict | None = None) -> dict:
         # deliberately not a chat row: no history, push, capture, summary, or
         # Live Activity can observe it. The expected answer never leaves the
         # server.
+        "agent_body_job": chat_consumer.agent_body_job_for_poll(store, consumer_info or {}),
         "vision_probe": chat_consumer.vision_probe_for_poll(
             store, consumer_info=consumer_info or {}
         ),
@@ -154,6 +155,7 @@ def build_response(
         "client_release": context["client_release"],
         "user_mcp": context["user_mcp"],
         "vision_probe": context.get("vision_probe"),
+        "agent_body_job": context.get("agent_body_job"),
         "web_policy": context.get("web_policy"),
         "timed_out": timed_out,
         "consumer_id": consumer_id,

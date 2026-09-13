@@ -67,6 +67,7 @@ RELAY_TOKEN_OPERATIONS = {
 # These operations intentionally reject runtime tokens. Perception report is
 # API-key-only until sensitive-signal credentials are forwarded to the enclave.
 API_KEY_ONLY_OPERATIONS = {
+    ("post", "/v1/agent-body/generate"),
     ("get", "/v1/web/settings"),
     ("post", "/v1/web/settings"),
     ("post", "/v1/access/link-token"),

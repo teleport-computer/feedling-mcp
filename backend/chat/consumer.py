@@ -19,6 +19,7 @@ CONTRACT_REJECTION_HEADER = rejection_stats.HEADER_NAME
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
 VISION_OBSERVER_CAPABILITY = "vision_observer_v1"
 VISION_PROBE_CAPABILITY = "vision_probe_v2"
+AGENT_BODY_CAPABILITY = "agent_body_generate_v1"
 IMAGE_GENERATION_CAPABILITY = "image_generation_v1"
 AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
 # Advertised by a consumer build whose io_cli carries the V1 web verbs. An older
@@ -987,3 +988,150 @@ def resident_vision_validation(
             **runtime,
         }
     return {"status": "untested", "error_code": "", **runtime}
+
+
+# Short-lived body jobs share the existing cross-worker CAS mailbox. The prompt
+# contains only fixed drawing instructions and palette colors, never user context.
+def begin_agent_body_job(store, *, prompt, palette_count, client_request_id,
+                         expires_at_epoch, now_epoch=None):
+    now = time.time() if now_epoch is None else float(now_epoch)
+    validation = _consumer_validation_state(store, now_epoch=now)
+    binding = _vision_binding(validation)
+    if (not validation.get("passing")
+            or AGENT_BODY_CAPABILITY not in validation.get("consumer_capabilities", [])
+            or not binding["consumer_id"] or not binding["agent_entry_signature"]):
+        return None, "agent_body_resident_update_required"
+    job = {"job_id": uuid.uuid4().hex, **binding, "prompt": prompt,
+           "palette_count": palette_count, "client_request_id": client_request_id,
+           "created_at_epoch": now, "expires_at_epoch": min(now + 90, expires_at_epoch)}
+
+    def mutate(state):
+        if not _vision_binding_matches(binding, _vision_binding({
+            **state, "agent_provider": state.get("agent_provider"),
+            "agent_model": state.get("agent_model"),
+        })):
+            return False
+        pending = state.get("resident_agent_body_job") or {}
+        result = state.get("resident_agent_body_result") or {}
+        if (float(pending.get("expires_at_epoch") or 0) > now
+                or ("finished_at" not in result and float(result.get("expires_at_epoch") or 0) > now)):
+            return False
+        state["resident_agent_body_job"] = job
+        state.pop("resident_agent_body_result", None)
+        return True
+    changed = _mutate_consumer_state(store, mutate)
+    if changed is None or not changed[1]:
+        return None, "agent_body_generation_failed"
+    return job, ""
+
+
+def agent_body_job_for_poll(store, consumer_info, *, now_epoch=None):
+    if (not isinstance(consumer_info, dict) or not consumer_info.get("official")
+            or AGENT_BODY_CAPABILITY not in consumer_info.get("consumer_capabilities", [])):
+        return None
+    now = time.time() if now_epoch is None else float(now_epoch)
+    state = _load_consumer_state(store)
+    job = state.get("resident_agent_body_job")
+    result = state.get("resident_agent_body_result") or {}
+    if "rows" in result and float(result.get("expires_at_epoch") or 0) <= now:
+        retire_agent_body_job(store, result["job_id"], expired=True)
+    if not isinstance(job, dict):
+        return None
+    if float(job.get("expires_at_epoch") or 0) <= now:
+        retire_agent_body_job(store, job["job_id"], expired=True)
+        return None
+    if not _vision_binding_matches(_vision_binding(consumer_info), job):
+        return None
+    return {key: job[key] for key in ("job_id", "expires_at_epoch", "prompt", "palette_count")}
+
+
+def complete_agent_body_job(store, payload, consumer_info, *, now_epoch=None):
+    if not isinstance(payload, dict) or not isinstance(payload.get("job_id"), str):
+        return {"error": "agent_body_invalid_request"}, 400
+    if (not isinstance(consumer_info, dict) or not consumer_info.get("official")
+            or AGENT_BODY_CAPABILITY not in consumer_info.get("consumer_capabilities", [])):
+        return {"error": "agent_body_generation_failed", "reason": "consumer_mismatch"}, 409
+    if payload.get("status") not in ("ok", "failed"):
+        return {"error": "agent_body_invalid_request"}, 400
+    # Bound untrusted result size before a CAS write. Semantic
+    # grid validation remains the shared generator's responsibility.
+    payload = dict(payload)
+    rows = payload.get("rows")
+    if payload["status"] == "ok" and not (
+        isinstance(rows, list) and len(rows) <= 24 and all(
+            isinstance(row, list) and len(row) <= 24
+            and all(type(value) is int and 0 <= value <= 255 for value in row)
+            for row in rows)
+    ):
+        payload.update(status="failed", error_code="agent_body_generation_invalid_output")
+    content = {"rows": rows} if payload["status"] == "ok" else {}
+    binding = _vision_binding(consumer_info)
+    now = time.time() if now_epoch is None else float(now_epoch)
+    job_id = payload["job_id"]
+    state = _load_consumer_state(store)
+    job = state.get("resident_agent_body_job") or {}
+    previous = state.get("resident_agent_body_result") or {}
+    if (previous.get("job_id") == job_id and _vision_binding_matches(binding, _vision_binding(state))
+            and previous.get("status") != "expired"):
+        return {"job_id": job_id, "status": "accepted"}, 200
+    if job.get("job_id") != job_id or float(job.get("expires_at_epoch") or 0) <= now:
+        if job.get("job_id") == job_id:
+            retire_agent_body_job(store, job_id, expired=True)
+        return {"error": "agent_body_generation_failed", "reason": "expired"}, 410
+    if not _vision_binding_matches(binding, job):
+        return {"error": "agent_body_generation_failed", "reason": "consumer_mismatch"}, 409
+    allowed_errors = {"agent_body_generation_timeout", "agent_body_generation_invalid_output",
+                      "agent_body_generation_failed", "agent_body_provider_config_failed"}
+    error_code = payload.get("error_code")
+    if not isinstance(error_code, str) or error_code not in allowed_errors:
+        error_code = "agent_body_generation_failed"
+    attempts = payload.get("attempts")
+    attempts = attempts if type(attempts) is int and attempts in (0, 1, 2) else 0
+
+    def mutate(current):
+        pending = current.get("resident_agent_body_job") or {}
+        previous = current.get("resident_agent_body_result") or {}
+        if (previous.get("job_id") == job_id and _vision_binding_matches(binding, _vision_binding(current))
+                and previous.get("status") != "expired"):
+            return "accepted"
+        if pending.get("job_id") != job_id or float(pending.get("expires_at_epoch") or 0) <= time.time():
+            return "expired"
+        if not _vision_binding_matches(binding, pending):
+            return "consumer_mismatch"
+        current["resident_agent_body_result"] = {
+            "job_id": job_id, **binding, "status": payload["status"],
+            "error_code": error_code if payload["status"] == "failed" else "",
+            "attempts": attempts, **content,
+            "expires_at_epoch": pending["expires_at_epoch"],
+        }
+        current.pop("resident_agent_body_job", None)
+        return "accepted"
+    changed = _mutate_consumer_state(store, mutate)
+    outcome = changed[1] if changed is not None else "state_unavailable"
+    if outcome != "accepted":
+        return {"error": "agent_body_generation_failed", "reason": outcome}, {
+            "expired": 410, "consumer_mismatch": 409, "state_unavailable": 503}[outcome]
+    return {"job_id": job_id, "status": "accepted"}, 200
+
+
+def agent_body_result(store, job_id):
+    result = _load_consumer_state(store).get("resident_agent_body_result")
+    return result if isinstance(result, dict) and result.get("job_id") == job_id else None
+
+
+def retire_agent_body_job(store, job_id, *, expired=False):
+    """Remove payloads; retain only the latest content-free completion receipt."""
+    def mutate(state):
+        pending = state.get("resident_agent_body_job") or {}
+        result = state.get("resident_agent_body_result") or {}
+        if pending.get("job_id") == job_id:
+            state.pop("resident_agent_body_job", None)
+            result = {"job_id": job_id, "status": "expired", "error_code": "agent_body_generation_timeout"}
+        if result.get("job_id") == job_id:
+            state["resident_agent_body_result"] = {
+                "job_id": job_id,
+                "status": "expired" if expired else result.get("status", "failed"),
+                "error_code": result.get("error_code", ""),
+                "finished_at": time.time(),
+            }
+    return _mutate_consumer_state(store, mutate) is not None
