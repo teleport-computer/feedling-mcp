@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+import conftest
 import httpx
 import pytest
 
@@ -94,9 +95,8 @@ def test_startup_probe_deterministic_4xx_is_not_retried(probe, status):
 def test_startup_probe_retries_transient_status_with_bounded_backoff(
     probe, monkeypatch, status
 ):
-    sleeps = []
     monkeypatch.setattr(consumer, "ENCLAVE_FETCH_BACKOFF_SEC", 0.5)
-    monkeypatch.setattr(consumer.time, "sleep", sleeps.append)
+    sleeps = conftest.capture_sleeps(monkeypatch, consumer)
     requests = probe(lambda request, count: httpx.Response(status))
     assert consumer._verify_decrypt_sources() is False
     assert len(requests) == consumer.ENCLAVE_FETCH_MAX_ATTEMPTS
