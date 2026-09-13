@@ -248,6 +248,18 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("feedling.resident")
+# Hidden body generation must not inherit the ordinary chat prompt/reply
+# excerpts or raw-output archives. Scoped to this call, never a global toggle.
+_AGENT_BODY_PRIVATE: ContextVar[bool] = ContextVar("agent_body_private", default=False)
+
+
+class _AgentBodyLogFilter(logging.Filter):
+    def filter(self, record):
+        return not _AGENT_BODY_PRIVATE.get()
+
+
+log.addFilter(_AgentBodyLogFilter())
+
 
 
 @dataclass
@@ -1638,7 +1650,7 @@ def _consumer_capabilities(hosted: bool = False) -> str:
     keys ``_runtime_supported`` off this header, so omitting the web caps makes
     web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1", "agent_body_generate_v1"]
     if _agent_image_generation_enabled():
         caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
@@ -1805,6 +1817,8 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
     immediately, so it never blocks or slows a turn — even if the backend is
     slow/unreachable. When the cache is warm and says disabled, this is a
     zero-cost no-op: no thread spawned, no network at all."""
+    if _AGENT_BODY_PRIVATE.get():
+        return
     try:
         known, enabled = _debug_trace_probably_enabled()
         if known and not enabled:
@@ -1893,6 +1907,8 @@ def _preserve_reply_parse_failure(
     the filename and trace still lets an operator correlate the occurrence.
     Failure to preserve diagnostics must never replace the original turn error.
     """
+    if _AGENT_BODY_PRIVATE.get():
+        return None
     if not isinstance(raw, str) or not raw.strip():
         return None
 
@@ -15137,6 +15153,108 @@ def _vision_probe_error_code(exc: BaseException) -> str:
     }.get(notice.error_class, "vision_model_failed")
 
 
+def _agent_body_rows(reply: str, palette_count: int) -> list[list[int]]:
+    """Standalone distribution copy of the backend grid contract (parity tested)."""
+    text = str(reply or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        text = text[3:-3].strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        body = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError("输出不是合法 JSON 对象") from None
+    rows = body.get("rows") if isinstance(body, dict) else None
+    if not isinstance(rows, list) or len(rows) != 24:
+        raise ValueError("rows 必须恰好有 24 行")
+    nonzero = False
+    for number, row in enumerate(rows, 1):
+        if not isinstance(row, list) or len(row) != 24:
+            raise ValueError(f"第 {number} 行必须恰好有 24 个整数")
+        for value in row:
+            if type(value) is not int:
+                raise ValueError(f"第 {number} 行含非整数值")
+            if not 0 <= value <= palette_count:
+                raise ValueError(f"第 {number} 行含越界索引，允许范围为 0..{palette_count}")
+            nonzero = nonzero or value != 0
+    if not nonzero:
+        raise ValueError("rows 全空，不能全是 0")
+    return rows
+
+
+def _process_agent_body_job(result: dict) -> None:
+    """Run one hidden generation, using local context and no chat output sinks."""
+    job = result.get("agent_body_job")
+    if not isinstance(job, dict):
+        return
+    job_id = job.get("job_id")
+    palette_count = job.get("palette_count")
+    prompt = job.get("prompt")
+    if (not isinstance(job_id, str) or not job_id
+            or type(palette_count) is not int or not 1 <= palette_count <= 255
+            or not isinstance(prompt, str) or not prompt):
+        return
+    payload = {"job_id": job_id, "status": "failed", "attempts": 0,
+               "error_code": "agent_body_generation_failed"}
+    started = time.monotonic()
+    private_token = _AGENT_BODY_PRIVATE.set(True)
+    try:
+        remaining = float(job.get("expires_at_epoch") or 0) - time.time() - 5
+        deadline = time.monotonic() + min(80.0, remaining)
+        if remaining <= 0:
+            raise TimeoutError()
+        identity = _resident_existing_identity()
+        memory = _capture_post_json(
+            "/v1/memory/index", payload={"limit": 12},
+            timeout=_remaining_deadline_timeout(deadline, cap_sec=15),
+        )
+        summaries = [item["summary"][:160] for item in (memory.get("items") or [])[:12]
+                     if isinstance(item, dict) and isinstance(item.get("summary"), str)]
+        prompt += "\n\n身份卡：\n" + (json.dumps(identity, ensure_ascii=False)
+                                               if identity else "当前不可用或尚无内容。")
+        prompt += "\n\n记忆样本：\n" + (json.dumps(summaries, ensure_ascii=False)
+                                               if summaries else "当前不可用或尚无内容。")
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (attempt and remaining < 25):
+                raise TimeoutError()
+            payload["attempts"] = attempt + 1
+            kwargs = {"raw_text": True, "lane": "background", "isolated_session": True,
+                      "absolute_deadline": min(deadline, time.monotonic() + 70)}
+            if AGENT_MODE == "cli":
+                kwargs["tools_disabled"] = True
+            reply = call_agent(prompt, **kwargs)
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
+            try:
+                rows = _agent_body_rows(reply, palette_count)
+            except ValueError as exc:
+                payload["error_code"] = "agent_body_generation_invalid_output"
+                prompt += f"\n\n上次输出违反规则：{exc}。请重新输出完整合法 rows JSON。"
+                continue
+            payload = {"job_id": job_id, "status": "ok", "rows": rows, "attempts": attempt + 1}
+            break
+    except (TimeoutError, subprocess.TimeoutExpired):
+        payload["error_code"] = "agent_body_generation_timeout"
+    except Exception:
+        # Never send an exception's text: it can contain upstream output or keys.
+        payload["error_code"] = "agent_body_generation_failed"
+    finally:
+        _AGENT_BODY_PRIVATE.reset(private_token)
+        log.info("agent_body job_id=%s status=%s error_code=%s attempts=%s dur_ms=%s",
+                 job_id, payload["status"], payload.get("error_code", ""),
+                 payload["attempts"], round((time.monotonic() - started) * 1000))
+    try:
+        _refresh_auth_header()
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/internal/agent-body/generate/result",
+            json=payload, headers=_HEADERS, timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        log.warning("agent_body result delivery failed job_id=%s error_class=%s", job_id, type(exc).__name__)
+
+
 def _process_vision_probe(result: dict) -> None:
     """Run the hidden two-image control probe outside chat/session state."""
     probe = result.get("vision_probe")
@@ -23174,6 +23292,7 @@ def run() -> None:
 
             # Hidden control-plane capability probe. It never becomes a chat
             # message and uses a fresh isolated model session.
+            _process_agent_body_job(result)
             _process_vision_probe(result)
 
             if result.get("timed_out"):

@@ -29,6 +29,21 @@ If the probe fails, the consumer logs an error, reports decrypt health as
 are skipped; later cycles can recover when the source becomes reachable.
 Startup authentication and encryption-module checks still must succeed.
 
+## Agent body generation
+
+Upgrade both backend and consumer for `POST /v1/agent-body/generate`. Hosted
+Model API accounts use their active tested chat route. Resident accounts use
+their own CLI or HTTP agent through a hidden job, even when a server-side model
+credential also exists. An offline or old consumer causes
+`409 agent_body_resident_update_required`. Consumers following `main` need a
+production-channel release; deploying only test does not update them.
+
+The direct ASGI path temporarily sees authorized context; residents read identity
+and memory through their authenticated APIs. Protect plaintext and agent/provider
+credentials on your infrastructure. A generic VPS does not gain confidential-VM
+guarantees by upgrading. The endpoint returns a grid without saving or applying
+a preset. See [the contract](/docs/errors#agent-body-generation).
+
 ## Choose the trust model first
 
 ### Resident clients on Windows

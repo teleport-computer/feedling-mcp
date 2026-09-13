@@ -24,6 +24,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
 
+from identity import card_policy
 from model_api_runtime.v2 import model_identity, serve_worker
 from workspace.backends import InMemoryWorkspaceBackend
 
@@ -172,9 +173,9 @@ def test_workspace_prompt_prefers_complete_identity_card_without_loading_persona
         "dimensions": [{"name": "curiosity", "value": 88}],
         "days_with_user": 23,
     }
-    for key in serve_worker.card_policy.PROFILE_STRING_FIELDS:
+    for key in card_policy.PROFILE_STRING_FIELDS:
         card[key] = f"value-{key}"
-    for key in serve_worker.card_policy.PROFILE_LIST_FIELDS:
+    for key in card_policy.PROFILE_LIST_FIELDS:
         card[key] = [f"value-{key}"]
 
     monkeypatch.setattr(
@@ -203,8 +204,8 @@ def test_workspace_prompt_prefers_complete_identity_card_without_loading_persona
     block = rendered["identity_card_or_persona"]
 
     canonical_fields = tuple(dict.fromkeys((
-        *serve_worker.card_policy.PROFILE_STRING_FIELDS,
-        *serve_worker.card_policy.PROFILE_LIST_FIELDS,
+        *card_policy.PROFILE_STRING_FIELDS,
+        *card_policy.PROFILE_LIST_FIELDS,
         "dimensions",
         "days_with_user",
     )))
