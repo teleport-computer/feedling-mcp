@@ -1367,8 +1367,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          if ! python - <<'PY' > /tmp/mg_artifacts.tsv
-          import json, pathlib, re, sys, urllib.request
+          python - <<'PY' > /tmp/mg_artifacts.tsv
+          import json, pathlib, re, sys, time, urllib.error, urllib.request
 
           REQUIRED = {"memgarden": "teleport-computer/memgarden"}
           OPTIONAL = {"agent-protocol-core": "teleport-computer/agent-protocol-core"}
@@ -1404,8 +1404,23 @@ jobs:
                   print(f"{name}\t{repo}\t{entry['value']}\t{entry['hashes'][0] if entry['hashes'] else '-'}")
                   continue
               url = f"https://pypi.org/pypi/{name}/{entry['value']}/json"
-              with urllib.request.urlopen(url, timeout=30) as response:
-                  release = json.load(response)
+              release, last_error = None, None
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as response:
+                          release = json.load(response)
+                      break
+                  except urllib.error.HTTPError as error:
+                      # 404 之类是「PyPI 上根本没有这个版本」，是锁的问题，不是网络问题。
+                      print(f"::error::PyPI 上查不到 {name}=={entry['value']}（HTTP {error.code}）", file=sys.stderr)
+                      raise SystemExit(1)
+                  except (urllib.error.URLError, OSError) as error:
+                      last_error = error
+                      time.sleep(2 * (attempt + 1))
+              if release is None:
+                  # 退出码 2 专门表示「网络不通，本轮没验成」，下面据此写出正确的原因。
+                  print(f"::warning::查询 PyPI 失败（{type(last_error).__name__}），本轮无法验证 {name} 的出处", file=sys.stderr)
+                  raise SystemExit(2)
               wheels = [f for f in release["urls"] if f["packagetype"] == "bdist_wheel"]
               if not wheels:
                   print(f"::error::PyPI 上 {name}=={entry['value']} 没有 wheel", file=sys.stderr)
@@ -1421,10 +1436,15 @@ jobs:
                       raise SystemExit(1)
                   print(f"{name}\t{repo}\t{wheel['url']}\t{sha}")
           PY
-          then
+          rc=$?
+          if [ "$rc" != 0 ]; then
             {
               echo "### 记忆内核的构建出处"
-              echo "❌ 解析 backend/requirements.lock 失败，见步骤日志里的 error"
+              if [ "$rc" = 2 ]; then
+                echo "⚠️ 查询 PyPI 失败（网络），本轮未能验证出处 —— 不是依赖或字节有问题"
+              else
+                echo "❌ backend/requirements.lock 与上游对不上，见步骤日志里的 error"
+              fi
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
