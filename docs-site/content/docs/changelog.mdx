@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident consumers now retry transient startup decrypt-source failures using
+  the runtime enclave retry and timeout settings. A failed probe reports
+  `unreachable` and continues polling instead of exiting, allowing recovery
+  without restarting the consumer. Deterministic HTTP failures are not retried
+  within the probe; cycles with failed decrypt-history reads remain skipped.
+
 - `GET /v1/agent/perception` (and the proactive agent's perception tools) again
   return the `steps`, `vitals`, `body`, and `metabolic` fields the client reports.
   Since the perception catalog split health signals into per-metric query

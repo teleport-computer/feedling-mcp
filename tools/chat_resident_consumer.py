@@ -3675,33 +3675,47 @@ def _verify_decrypt_sources() -> bool:
     Returns True if at least one configured source is reachable.
     Each unreachable source is logged at ERROR level so the operator
     can distinguish "configured but broken" from "not configured at all".
+    Uses the runtime enclave timeout and bounded transient-failure retries.
     Also seeds the reported decrypt-health status.
     """
     any_ok = False
 
     if FEEDLING_ENCLAVE_URL:
-        try:
-            client = _client_for(FEEDLING_ENCLAVE_URL)
-            resp = client.get(
-                f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-                params={"limit": 1},
-                headers=_HEADERS,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
-            any_ok = True
-            # Reachability outcomes ALWAYS route through _apply_infra_health so
-            # they can never clobber a standing per-user `degraded` (at startup
-            # status is `unknown`, so this behaves identically to a bare set —
-            # the routing is the invariant, uniform across every call site).
-            _apply_infra_health("ok")
-        except Exception as e:
-            log.error(
-                "decrypt source UNREACHABLE: enclave at %s — %s",
-                FEEDLING_ENCLAVE_URL, e,
-            )
-            _apply_infra_health("unreachable")
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        for attempt in range(ENCLAVE_FETCH_MAX_ATTEMPTS):
+            try:
+                resp = client.get(
+                    f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+                    params={"limit": 1},
+                    headers=_HEADERS,
+                )
+                resp.raise_for_status()
+                log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
+                any_ok = True
+                # Reachability must not clobber a standing per-user degraded
+                # status; only a real successful decrypt may clear that state.
+                _apply_infra_health("ok")
+                break
+            except Exception as e:
+                retryable = isinstance(e, httpx.TransportError) or (
+                    isinstance(e, httpx.HTTPStatusError)
+                    and e.response.status_code in _RETRYABLE_ENCLAVE_STATUS
+                )
+                if retryable and attempt < ENCLAVE_FETCH_MAX_ATTEMPTS - 1:
+                    delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
+                    log.warning(
+                        "decrypt startup probe transient failure (attempt %d/%d) "
+                        "— retrying in %.1fs: %s",
+                        attempt + 1, ENCLAVE_FETCH_MAX_ATTEMPTS, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+                log.error(
+                    "decrypt source UNREACHABLE: enclave at %s after %d attempts — %s",
+                    FEEDLING_ENCLAVE_URL, attempt + 1, e,
+                )
+                _apply_infra_health("unreachable")
+                break
     else:
         _apply_infra_health("unconfigured")
 
@@ -22919,12 +22933,13 @@ def run() -> None:
 
     if FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():
-            log.critical(
-                "Decrypt source unreachable (enclave=%s). "
-                "Cannot decrypt user messages — exiting.",
-                FEEDLING_ENCLAVE_URL,
+            # Keep the consumer alive so later poll cycles can recover without
+            # a supervisor restart; failed history reads already skip the cycle.
+            log.error(
+                "decrypt source unreachable at startup after up to %d attempts; "
+                "continuing — poll cycles will be skipped until it recovers",
+                ENCLAVE_FETCH_MAX_ATTEMPTS,
             )
-            sys.exit(1)
     else:
         # No decrypt source at all. Establish the reported health immediately so
         # the FIRST poll already carries `unconfigured` — otherwise the initial

@@ -14,6 +14,21 @@ managed confidential-compute environment.
 Read [architecture and trust boundaries](/docs/architecture) first for the
 logical component, data-flow, and encryption model used by this guide.
 
+## Resident startup during enclave outages
+
+Hosted and self-hosted resident consumers retry the startup decrypt-source probe
+on transport errors and HTTP 429, 502, 503, or 504. The probe shares the runtime
+settings: `FEEDLING_ENCLAVE_FETCH_ATTEMPTS` (default 3), exponential backoff from
+`FEEDLING_ENCLAVE_FETCH_BACKOFF_SEC` (default 0.5 seconds), and
+`FEEDLING_ENCLAVE_CONNECT_TIMEOUT_SEC` / `FEEDLING_ENCLAVE_READ_TIMEOUT_SEC`
+(default 5 / 20 seconds). Other HTTP failures, including deterministic 4xx
+responses, end the probe immediately.
+
+If the probe fails, the consumer logs an error, reports decrypt health as
+`unreachable`, and continues polling. Cycles whose decrypt-history reads fail
+are skipped; later cycles can recover when the source becomes reachable.
+Startup authentication and encryption-module checks still must succeed.
+
 ## Choose the trust model first
 
 ### Resident clients on Windows
