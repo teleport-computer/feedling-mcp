@@ -7,6 +7,22 @@ canonical_owner: self
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
+## Synchronous agent body generation
+
+`POST /v1/agent-body/generate` returns a validated grid without saving a preset.
+Hosted requests run inside the managed confidential-VM boundary: ASGI reads the
+caller's authorized identity/persona/memory context and calls the active chat
+provider directly, outside the Chat queue. The decrypt service retains the
+content private keys.
+
+For resident accounts, the user-scoped CAS consumer mailbox carries fixed
+instructions and palette colors. The bound consumer reads identity and memory
+at its own authenticated boundary and runs its agent. A temporary grid result
+passes through the mailbox to the waiting API request, then is removed. Expiry
+is enforced on reads; after a process crash cleanup occurs at the next access.
+The result never becomes a Chat row or memory. Both paths share the server grid
+validator. See [the contract](/docs/errors#agent-body-generation).
+
 ## Multi-worker chat consistency
 
 PostgreSQL is the durable source of truth for chat. Each backend worker keeps a bounded per-user hot projection and advances it with versioned change events delivered through PostgreSQL `LISTEN/NOTIFY`. Notifications are only wake hints: workers verify durable versions, apply contiguous events, and fall back to a bounded snapshot when events are missing, reset, or too far behind.
