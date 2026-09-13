@@ -1414,7 +1414,10 @@ jobs:
                       # 404 之类是「PyPI 上根本没有这个版本」，是锁的问题，不是网络问题。
                       print(f"::error::PyPI 上查不到 {name}=={entry['value']}（HTTP {error.code}）", file=sys.stderr)
                       raise SystemExit(1)
-                  except (urllib.error.URLError, OSError) as error:
+                  except Exception as error:  # noqa: BLE001
+                      # 除「PyPI 明确说没有」之外的一切（断网、代理坏了、TLS 抖动）都是
+                      # 环境问题。「锁与上游对不上」只能由上面的显式检查得出，不能由一个
+                      # 意料外的异常顺手得出 —— 否则又是一次报错与真实原因无关。
                       last_error = error
                       time.sleep(2 * (attempt + 1))
               if release is None:
