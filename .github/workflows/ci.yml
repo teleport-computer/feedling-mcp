@@ -1436,8 +1436,14 @@ jobs:
           ok=1
           while IFS="$(printf '\t')" read -r name repo url sha; do
             f="/tmp/$(basename "$url")"
-            curl -sSL -o "$f" "$url"
             echo "--- $(basename "$f") ---"
+            # -f：HTTP 错误不写出一页 HTML 冒充 wheel。下载失败要报成「下载失败」，
+            # 不能落到下面的哈希比对里被说成「字节对不上」—— 那是另一种、严重得多的结论。
+            if ! curl -fsSL --retry 3 --retry-all-errors -o "$f" "$url"; then
+              echo "::warning::$(basename "$f") 下载失败，本轮无法验证出处（不是字节不一致）"
+              ok=0
+              continue
+            fi
             actual="$(sha256sum "$f" | cut -d' ' -f1)"
             if [ "$sha" != "-" ] && [ "$actual" != "$sha" ]; then
               echo "::error::$(basename "$f") 下载到的字节和记录的 sha256 对不上 —— 验的和装的不是同一份"
