@@ -55,6 +55,18 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-09-12 — 空回复 trace 补 raw_stop_reason(被 "other" 掩盖的原始值)（T568)
+
+**[DONE] 当 **Gemini** 的 finishReason 被闭集归一成 "other" 时,空回复 trace 额外带明文 `raw_stop_reason` 字段,记下 **Gemini 的原始 finishReason**(**仅 Gemini**;其余 provider 的未知 stop 一律保持 "other"、不加该字段),供生产环境定位。**
+
+背景:T550 把 finishReason 闭集 normalize(未知→"other")以保持 trace content-free。归因要分清:**T567 用自有 E2E key 直连只直接实测到 MAX_TOKENS**(已在闭集内的机制),闭集外的 "other" 原始值**未能直接复现**;而生产那批 "other-9" 是「非空、闭集外」这一点,是**从 T550 的归一代码路径推断的**(缺失/空→归一成 ""、非空且不在闭集→归一成 "other"),**不是 T567 直接测到的原始值**。结论:只看归一后的 "other" 无法定位具体是哪个原始 finishReason。Seven 2026-09-10 定的 trace-content 政策:trace/遥测为排查方便可带原始值,不必刻意避开。Seven 授权的范围是 **Gemini 的 finishReason**。据此:
+
+- `tool_loop._empty_response_shape` / `worker._empty_response_trace_detail`:**仅当**①响应是真 Gemini 响应(provider_client 产出的 `gemini_diagnostics` 自有结构在场)且 ②归一后的 `stop_reason == "other"`(闭集把一个真实非空 stop 标记掩掉)时,才额外加 `raw_stop_reason` 字段,带 Gemini 原始 finishReason(原样,未闭集化)。**非 Gemini provider(relay / OpenAI 兼容 / Anthropic)的未知 stop 标记一律保持闭集 "other"、不加 raw 字段**——它们的 stop 串可能夹带上游原始错误正文,不在 Seven 的授权内、不开新明文面。被识别/为空的 stop 原因也不加(值本就在 `stop_reason` 里)⇒ 对非-"other"/非-Gemini 的既有 trace 零改动。
+- ⚠️这**局部反转**了 T550 entry 里「finishReason 闭集 normalize,绝不透传 provider 原文」那一条——但只对这一个字段、只对 Gemini、只在 "other" 掩盖态、且按 Seven 的新 trace 政策与 Gemini-only 授权。其余 `provider_*` 诊断字段保持 content-free 不变。
+- 键数:仅 "other" + gemini 诊断在场时达到 20 键,正好在 `_safe_detail` 的 20 键上限内;`raw_stop_reason` 放在 provider 诊断 update 之前,确保不被上限丢掉。
+- 测试:**raw-正向(Gemini)在 `test_t550…`**——Gemini 未知 finishReason 下 `raw_stop_reason` 带原始值且过 `_safe_detail` 存活、识别态(MAX_TOKENS)不加、键上限,外加 Gemini-scoped 镜像(同一 marker:Gemini 侧带 raw / 非 Gemini 侧不带)。**raw-负向镜像在 `test_v2_tool_loop` 的 content-free 合同**——非 Gemini scripted provider 的未知 stop 仍收敛成 "other" 且**不**加 `raw_stop_reason`,reasoning/messages 正文绝不进 trace。突变验证:去掉 Gemini 门控 ⇒ 镜像 + 非 Gemini 合同双红;detail 的 raw 改用归一值冒充 ⇒ other 正向测试红。
+- 部署:先 test;main/prod 由 Seven 另行确认。
+
 ## 2026-09-10 — gemini 空回复根因观测 + 传输层重试计数入 trace（T550 A,观测)
 
 **[DONE·观测] 空回复现在带 content-free 根因标量;每次 provider 调用带 transport_retry_count 明文字段。**

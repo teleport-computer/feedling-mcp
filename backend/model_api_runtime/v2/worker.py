@@ -3372,11 +3372,11 @@ def _empty_response_trace_detail(
     response_shape: dict[str, Any], lane: str
 ) -> dict[str, Any]:
     """Normalize provider-empty metadata once for every trace consumer."""
-    raw_stop_reason = str(response_shape.get("stop_reason") or "")
+    stop_reason_in = str(response_shape.get("stop_reason") or "")
     stop_reason = (
-        raw_stop_reason
-        if raw_stop_reason in v2_tool_loop._CONTENT_FREE_STOP_REASONS
-        else ("other" if raw_stop_reason else "")
+        stop_reason_in
+        if stop_reason_in in v2_tool_loop._CONTENT_FREE_STOP_REASONS
+        else ("other" if stop_reason_in else "")
     )
     completion_tokens = response_shape.get("completion_tokens")
     detail: dict[str, Any] = {
@@ -3393,6 +3393,16 @@ def _empty_response_trace_detail(
         ),
         "lane": _normalize_provider_trace_lane(lane),
     }
+    # T568: when the closed-set ``stop_reason`` collapsed a real marker to
+    # "other", surface the verbatim provider value carried up from the shape so
+    # the empty is root-causable directly on the trace. Only in that masked case
+    # (recognized/empty reasons already show themselves in ``stop_reason``). Per
+    # the 2026-09-10 trace-content policy this raw provider value is permitted
+    # here, unlike the content-free provider_* fields below. Added before the
+    # provider-diagnostics update so it stays within the _safe_detail key cap.
+    shape_raw = response_shape.get("raw_stop_reason")
+    if stop_reason == "other" and shape_raw:
+        detail["raw_stop_reason"] = str(shape_raw)
     detail.update(_empty_provider_diagnostics_fields(response_shape))
     return detail
 
@@ -12560,6 +12570,16 @@ async def _run_extraction(
                     "message_count": len(tail),
                 }
             )
+            # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
+            # 用来定位「模型为什么吐出坏 JSON」——见 memory/window_fingerprint。
+            # 窗口文本此刻还没渲染，所以这里只取 role/source；
+            # 引号计数在 prompt 拼好之后补上。
+            try:
+                from memory import window_fingerprint
+
+                capture_window.update(window_fingerprint.fingerprint(messages=tail))
+            except Exception:  # noqa: BLE001 —— 指纹算不出来不该挡住落卡
+                log.exception("capture window fingerprint failed")
         if lane == "capture" and not tail:
             # A stale scheduler can enqueue just after an earlier Capture
             # advances the frontier and releases single-flight. The successor
@@ -12827,6 +12847,15 @@ async def _run_extraction(
                     cards=ctx.get("cards", ""),
                     locale=capture_locale,
                 )
+                # 引号压力：失败窗口 >0 而成功窗口 =0 就坐实了引号假说。
+                # 只出个数和每千字符密度，不出位置、不出上下文。
+                try:
+                    from memory import window_fingerprint
+
+                    capture_window.update(
+                        window_fingerprint.quote_pressure(window))
+                except Exception:  # noqa: BLE001
+                    log.exception("capture quote pressure failed")
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
             if deps.authorize_capture_provider_call is None or not claimed_by:

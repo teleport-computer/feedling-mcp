@@ -1053,7 +1053,7 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         {
             "reply": "",
             "reasoning": "private trajectory content",
-            "stop_reason": "private trajectory content " * 100,
+            "stop_reason": "NOVEL_STOP_MARKER",
             "tool_calls": [],
             "usage": {"completion_tokens": 4096},
         },
@@ -1103,6 +1103,13 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         },
         "action": "semantic_correction",
     }]
+    # T568 non-Gemini mirror: a non-Gemini provider's unknown stop marker still
+    # collapses to "other" and must NOT surface raw_stop_reason — the raw
+    # projection is scoped to real Gemini responses (owned gemini_diagnostics).
+    assert empty_events[0]["response_shape"]["stop_reason"] == "other"
+    assert "raw_stop_reason" not in empty_events[0]["response_shape"]
+    assert "NOVEL_STOP_MARKER" not in str(empty_events)
+    # Reasoning/message content is still never carried.
     assert "private trajectory content" not in str(empty_events)
     assert "messages" not in str(empty_events)
     assert debug_shapes == [empty_events[0]["response_shape"]]

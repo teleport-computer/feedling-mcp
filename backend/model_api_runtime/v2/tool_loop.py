@@ -1194,19 +1194,42 @@ def _transport_retry_count_from_error(exc: BaseException) -> int | None:
 
 
 def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
-    """Return content-free diagnostics for a provider success with no output."""
+    """Diagnostics for a provider success with no output.
+
+    Mostly content-free (enums/counts/bools). ``raw_stop_reason`` is the one
+    field that carries a provider's verbatim stop marker, and only for real
+    Gemini responses: Seven's authorization is the Gemini finishReason
+    specifically, so an unknown Gemini ``finishReason`` that ``stop_reason``
+    collapsed to "other" is surfaced raw (per the 2026-09-10 trace-content
+    policy), while every other provider's unknown stop marker stays closed to
+    "other" — a relay/OpenAI-compatible stop string can embed a raw upstream
+    error body and must not open a new plaintext surface. ``stop_reason`` keeps
+    the closed-set value for enum consumers. (T568.)
+    """
     raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
+    normalized_stop = (
+        raw_stop_reason
+        if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
+        else ("other" if raw_stop_reason else "")
+    )
     shape: dict[str, object] = {
-        "stop_reason": (
-            raw_stop_reason
-            if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
-            else ("other" if raw_stop_reason else "")
-        ),
+        "stop_reason": normalized_stop,
         "has_visible_text": bool(pr.text.strip()),
         "reasoning_present": bool(str(pr.raw.get("reasoning") or "").strip()),
         "tool_call_count": len(pr.tool_calls),
         "completion_tokens": pr.usage.completion_tokens,
     }
+    # Surface the verbatim marker ONLY for a real Gemini response (the owned
+    # ``gemini_diagnostics`` shape set by provider_client._parse_gemini_body) whose
+    # reason the closed set collapsed to "other". Scope is deliberate: Seven
+    # authorized the Gemini finishReason specifically, and a non-Gemini unknown
+    # stop marker (relay / OpenAI-compatible / Anthropic) can carry a raw upstream
+    # error body, so those stay closed to "other" with no raw field. Recognized /
+    # empty reasons already show themselves in ``stop_reason``. (T568.)
+    if normalized_stop == "other" and isinstance(
+        pr.raw.get("gemini_diagnostics"), dict
+    ):
+        shape["raw_stop_reason"] = str(pr.raw.get("stop_reason") or "").strip()
     # Provider-owned content-free root-cause diagnostics (currently Gemini:
     # finishReason / safety categories / thought-only shape / token split),
     # projected at the provider seam so this never reaches back through content.

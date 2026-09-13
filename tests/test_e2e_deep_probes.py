@@ -254,25 +254,39 @@ def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monk
     assert [path for path, _body in client.posts] == ["/v1/proactive/tick"]
 
 
-def test_proactive_reply_correlation_has_exact_and_unrelated_job_extremes(monkeypatch):
-    exact = {"role": "agent", "id": "reply-1", "proactive_job_id": "pj-1", "ts": 1}
-    unrelated = {"role": "agent", "id": "reply-2", "proactive_job_id": "pj-2", "ts": 1}
+def test_wait_for_scheduled_fire_returns_exact_agent_job_then_times_out(monkeypatch):
+    # Green: the REAL V2 scheduler attaches fired_job_id to the due timer.
+    fired = {"v2_scheduled_wakes": [
+        {"timer_id": "timer-1", "status": "fired", "fired_job_id": 15113},
+        {"timer_id": "timer-2", "status": "fired", "fired_job_id": 42},
+    ]}
     monkeypatch.setattr(proactive_probe.time, "time", lambda: 0.0)
-    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [exact])
-    assert proactive_probe._wait_for_proactive_reply(
-        object(), "pj-1", 0.0, timeout=1.0,
-    ) == exact
 
+    class _DebugClient:
+        def get(self, _path, **_kw):
+            return _Response(200, fired)
+
+    assert proactive_probe._wait_for_scheduled_fire(
+        _DebugClient(), "timer-1", timeout=1.0,
+    ) == 15113
+
+    # Red: the compat fire path leaves the timer without a real agent_job; the
+    # real scheduler never attaches fired_job_id -> bounded PRODUCT_FAIL.
     times = iter((0.0, 0.0, 2.0))
     monkeypatch.setattr(proactive_probe.time, "time", lambda: next(times))
     capture_sleeps(monkeypatch, proactive_probe)
-    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [unrelated])
+    pending = {"v2_scheduled_wakes": [
+        {"timer_id": "timer-1", "status": "scheduled", "fired_job_id": 0},
+    ]}
+
+    class _PendingClient:
+        def get(self, _path, **_kw):
+            return _Response(200, pending)
+
     with pytest.raises(proactive_probe._ProbeIssue) as exc:
-        proactive_probe._wait_for_proactive_reply(
-            object(), "pj-1", 0.0, timeout=1.0,
-        )
+        proactive_probe._wait_for_scheduled_fire(_PendingClient(), "timer-1", timeout=1.0)
     assert exc.value.result == "PRODUCT_FAIL"
-    assert "no correlated must-deliver reply" in exc.value.detail
+    assert "did not fire due timer" in exc.value.detail
 
 
 def test_user_turn_priority_runs_no_competition_control_without_echo_requirement(monkeypatch):
@@ -364,52 +378,62 @@ def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
     assert exc.value.result == "PRODUCT_FAIL"
 
 
-def test_scheduled_must_deliver_has_queued_green_and_not_queued_red(monkeypatch):
+def test_scheduled_must_deliver_uses_real_scheduler_exact_job_not_compat_fire(monkeypatch):
+    # Pins codex2's P0: the probe must NOT drive the compat /scheduled/fire path,
+    # and delivery must be keyed on the EXACT agent_jobs id the real scheduler
+    # attaches (not the legacy pj).
     class Client:
-        fire_queued = 1
-
         def post(self, path, *, json):
             if path == "/v1/proactive/scheduled/actions":
                 return _Response(200, {
                     "results": [{"status": "scheduled", "timer_id": "timer-1"}],
                 })
-            if path == "/v1/proactive/scheduled/fire":
-                return _Response(200, {
-                    "queued": self.fire_queued,
-                    "results": [{
-                        "status": "fired",
-                        "timer_id": "timer-1",
-                        "wake_id": "wake-1",
-                    }],
-                    "jobs": [{"job_id": "pj-1", "wake_id": "wake-1"}],
-                })
-            raise AssertionError(path)
+            raise AssertionError(f"must NOT POST the compat fire path: {path}")
 
     client = Client()
     monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
     monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
     monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
     monkeypatch.setattr(
-        proactive_probe,
-        "_wait_for_proactive_reply",
-        lambda _c, job_id, _since: {
-            "role": "agent", "id": "scheduled-reply", "proactive_job_id": job_id,
-        },
-    )
+        proactive_probe, "_wait_for_scheduled_fire", lambda _c, _timer, **_kw: 15113)
+    captured: dict = {}
+
+    def _deliver(_c, _since, fired_job_id, *, timeout=None):
+        captured["job_id"] = fired_job_id
+        return {"role": "agent", "id": "scheduled-reply", "ts": 11}
+
+    monkeypatch.setattr(proactive_probe, "_wait_for_scheduled_delivery", _deliver)
     monkeypatch.setattr(
-        proactive_probe,
-        "_decrypt",
-        lambda *_a, **_kw: "到时间了，这是你要的提醒。",
-    )
+        proactive_probe, "_decrypt", lambda *_a, **_kw: "到时间了，这是你要的提醒。")
 
     detail = proactive_probe._case_scheduled_must_deliver(client)
-    assert "one correlated decryptable reply" in detail
+    assert "exact V2 scheduled agent_job" in detail
+    assert "agent_job=15113" in detail
+    assert captured["job_id"] == 15113  # exact agent_jobs id, never the pj
 
-    client.fire_queued = 0
+
+def test_scheduled_must_deliver_propagates_when_real_scheduler_never_fires(monkeypatch):
+    class Client:
+        def post(self, path, *, json):
+            if path == "/v1/proactive/scheduled/actions":
+                return _Response(200, {
+                    "results": [{"status": "scheduled", "timer_id": "timer-1"}],
+                })
+            raise AssertionError(path)
+
+    monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
+    monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
+
+    def _never(_c, timer_id, **_kw):
+        raise proactive_probe._ProbeIssue(
+            "PRODUCT_FAIL", f"the V2 scheduler did not fire due timer={timer_id}")
+
+    monkeypatch.setattr(proactive_probe, "_wait_for_scheduled_fire", _never)
     with pytest.raises(proactive_probe._ProbeIssue) as exc:
-        proactive_probe._case_scheduled_must_deliver(client)
+        proactive_probe._case_scheduled_must_deliver(Client())
     assert exc.value.result == "PRODUCT_FAIL"
-    assert "did not fire exactly once" in exc.value.detail
+    assert "did not fire due timer" in exc.value.detail
 
 
 class _PriorityClient:
@@ -419,3 +443,138 @@ class _PriorityClient:
     def post(self, _path, **_kwargs):
         self.posts.append((_path, _kwargs.get("json")))
         return _Response(200, {})
+
+
+def test_sanitize_wake_reason_passes_closed_set_and_redacts_everything_else():
+    # Closed-set codes pass through verbatim.
+    assert proactive_probe._sanitize_wake_reason(
+        "wake_failed:v2_summary_frontier_integrity_error"
+    ) == "wake_failed:v2_summary_frontier_integrity_error"
+    assert proactive_probe._sanitize_wake_reason("failed") == "failed"
+    assert proactive_probe._sanitize_wake_reason("") == "unspecified"
+    # A relay raw error body appended to a known prefix must NEVER be echoed —
+    # last_error is only length-truncated server-side, not reduced to an enum.
+    secret = "wake_failed:providererror quota=50000 user=alice@example.com body={...}"
+    assert proactive_probe._sanitize_wake_reason(secret) == "redacted"
+    assert "alice@example.com" not in proactive_probe._sanitize_wake_reason(secret)
+    assert proactive_probe._sanitize_wake_reason("arbitrary free text") == "redacted"
+
+
+def test_wake_terminal_state_redacts_nonenumerated_failure_reason():
+    # Pins the privacy P0 at the shared terminal surface every waiter uses: a
+    # last_error carrying a raw body reaches the caller only as "redacted".
+    user = {
+        "v2_recent_jobs": {"jobs": [{"job_id": 15113, "status": "failed"}]},
+        "v2_wake_activity": {
+            "recent_failures": [{
+                "job_id": 15113,
+                "lane": "scheduled",
+                "reason": 'wake_failed:providererror 429 {"error":"quota","email":"a@b.co"}',
+            }],
+            "recent_silences": [],
+        },
+    }
+    state, detail = proactive_probe._wake_terminal_state(user, "15113")
+    assert state == "failed"
+    assert detail == "redacted"
+    assert "quota" not in detail and "a@b.co" not in detail
+
+
+def test_admin_user_classifies_transport_failure_not_raw_httpx(monkeypatch):
+    # A transport error reading the admin surface must become a classified
+    # BLOCKED_EVIDENCE, never a raw httpx.HTTPError that aborts the case verdict.
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "token")
+
+    def _boom(*_a, **_kw):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(proactive_probe.httpx, "get", _boom)
+
+    class _C:
+        api_url = "https://example.invalid"
+        user_id = "usr_1"
+
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._admin_user(_C())
+    assert exc.value.result == "BLOCKED_EVIDENCE"
+    assert "transport failed" in exc.value.detail
+
+
+def test_scheduled_delivery_requires_exact_activity_job_id_over_concurrent_wake(monkeypatch):
+    # Green: a reply correlated to THIS scheduled job by activity_job_id passes,
+    # and a concurrent heartbeat bubble does not stand in for it.
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: 0.0)
+    rows = [
+        {"role": "agent", "id": "heartbeat", "activity_job_id": "999", "ts": 5},
+        {"role": "agent", "id": "scheduled", "activity_job_id": "15113", "ts": 6},
+    ]
+    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: rows)
+    monkeypatch.setattr(
+        proactive_probe, "_admin_user",
+        lambda _c: (_ for _ in ()).throw(AssertionError("exact reply must not consult admin")))
+
+    reply = proactive_probe._wait_for_scheduled_delivery(object(), 0.0, 15113, timeout=1.0)
+    assert reply["id"] == "scheduled"
+
+
+def test_scheduled_delivery_fails_when_exact_job_failed_despite_concurrent_reply(monkeypatch):
+    # Red (codex2's counterexample): a concurrent heartbeat reply exists, but THIS
+    # scheduled job failed on the backend -> PRODUCT_FAIL, never green off the
+    # unrelated bubble.
+    times = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: next(times))
+    capture_sleeps(monkeypatch, proactive_probe)
+    monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [
+        {"role": "agent", "id": "heartbeat", "activity_job_id": "999", "ts": 5},
+    ])
+    monkeypatch.setattr(proactive_probe, "_admin_user", lambda _c: {
+        "v2_recent_jobs": {"jobs": [{"job_id": 15113, "status": "failed"}]},
+        "v2_wake_activity": {
+            "recent_failures": [{"job_id": 15113, "lane": "scheduled",
+                                 "reason": "wake_failed:empty_reply"}],
+            "recent_silences": [],
+        },
+    })
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._wait_for_scheduled_delivery(object(), 0.0, 15113, timeout=1.0)
+    assert exc.value.result == "PRODUCT_FAIL"
+    assert "wake job=15113 failed" in exc.value.detail
+    assert "wake_failed:empty_reply" in exc.value.detail
+
+
+def test_scheduled_must_deliver_watermark_captured_before_schedule_post(monkeypatch):
+    # P1 race regression guard: `started` (the delivery watermark) MUST be taken
+    # before the schedule POST — a reply published between the POST returning and
+    # a later timestamp would otherwise be hidden. Distinct clock values make the
+    # ordering observable; a constant clock (as the other case test uses) cannot,
+    # so this guard goes red if `started` is moved back after the POST.
+    clock = iter([100.0, 200.0, 300.0, 400.0, 500.0])
+    monkeypatch.setattr(proactive_probe.time, "time", lambda: next(clock))
+    post_times: list[float] = []
+
+    class Client:
+        def post(self, path, *, json):
+            if path == "/v1/proactive/scheduled/actions":
+                post_times.append(proactive_probe.time.time())
+                return _Response(200, {
+                    "results": [{"status": "scheduled", "timer_id": "timer-1"}],
+                })
+            raise AssertionError(path)
+
+    monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
+    monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
+    monkeypatch.setattr(
+        proactive_probe, "_wait_for_scheduled_fire", lambda _c, _timer, **_kw: 15113)
+    captured: dict = {}
+
+    def _deliver(_c, since, _fired, *, timeout=None):
+        captured["since"] = since
+        return {"role": "agent", "id": "scheduled-reply", "ts": 1}
+
+    monkeypatch.setattr(proactive_probe, "_wait_for_scheduled_delivery", _deliver)
+    monkeypatch.setattr(proactive_probe, "_decrypt", lambda *_a, **_kw: "到时间了。")
+
+    proactive_probe._case_scheduled_must_deliver(Client())
+    assert post_times, "schedule POST was never issued"
+    # The watermark must predate the schedule POST boundary.
+    assert captured["since"] < post_times[0]

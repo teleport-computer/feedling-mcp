@@ -17886,6 +17886,21 @@ def _process_capture_jobs(jobs: list) -> float:
                 window_text = _capture_window_text(
                     messages, user_label=user_name, agent_label=ai_name
                 )
+                # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
+                #
+                # 2026-09-12 事故查到最后卡在「毒引号从哪来」——用户打的？
+                # 语音转写？图片 caption？还是代码把消息 json.dumps 出来的？
+                # 诊断里刻意不存原文，所以只能靠这种指纹反推：
+                # 失败窗口的 ascii_double_quotes 显著 >0 而成功窗口 =0，
+                # 引号假说就坐实了；再看哪个 role/source 在场时才爆，
+                # 源头就指出来了。
+                try:
+                    from memory import window_fingerprint
+
+                    window = {**window,
+                              **window_fingerprint.fingerprint(window_text, messages)}
+                except Exception:  # noqa: BLE001 —— 指纹算不出来不该挡住落卡
+                    log.exception("capture window fingerprint failed id=%s", job_id)
             except Exception as exc:  # noqa: BLE001
                 # 取归档全文失败(backend/enclave 抖动)。这条 job 已经 claim 并标
                 # realizing,异常直接冒出去会把它留在 realizing、还会打断整批 job。
