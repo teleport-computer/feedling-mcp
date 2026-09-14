@@ -55,6 +55,14 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-09-15 — 显式 off 用户的历史内容单用户明文化迁移
+
+**[DONE] 新增默认 dry-run、三闸 apply 的单用户迁移工具，处理 Chat（含 R2 与 thinking/caption）、Memory、World Book、Identity 和 Frame。**
+
+- 只接受精确 `--user`，apply 时要求数据库中显式 `content_encryption=off`、命令行 `--allow-plaintext-rewrite` 和环境变量 `FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1`；默认输出仅含分类计数。
+- 内联行使用 exact-old-doc CAS，并在写事务内再次锁定/校验用户偏好；`local_only` 或缺 `K_enclave` 的内容保留不动。Chat R2 复用既有 upload guard；Frame 写入独立 `frames-plaintext` 键，CAS 成功后才退役旧密文对象。
+- 支持 `--limit` canary 和 `--rate` 限速；运维步骤记录在 `CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`。
+
 ## 2026-09-12 — 空回复 trace 补 raw_stop_reason(被 "other" 掩盖的原始值)（T568)
 
 **[DONE] 当 **Gemini** 的 finishReason 被闭集归一成 "other" 时,空回复 trace 额外带明文 `raw_stop_reason` 字段,记下 **Gemini 的原始 finishReason**(**仅 Gemini**;其余 provider 的未知 stop 一律保持 "other"、不加该字段),供生产环境定位。**
