@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import db
+from psycopg.types.json import Jsonb
+from tee_replicator import transforms
 
 
 APPLY_ENV = "FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION"
@@ -205,6 +207,121 @@ def inventory(user_id: str) -> Iterable[Item]:
     return items
 
 
+def _mark_requeue(user_id: str, item: Item) -> None:
+    from tee_shadow import mirror
+
+    table_for = {
+        "chat_live": "chat_messages",
+        "chat_archive": "chat_message_archive",
+        "memory": "memory_moments",
+        "world_book": "world_book_entries",
+        "identity": "identity",
+    }
+    table = table_for.get(item.surface)
+    if table:
+        mirror.mark_pending(user_id, table, item.item_id, "requeue_plaintext_migration")
+
+
+def cas_inline_doc(user_id: str, item: Item, new_doc: dict) -> bool:
+    """Install one transformed doc iff preference and exact old doc still match."""
+    if not isinstance(item.doc, dict):
+        return False
+    won = False
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT doc->>'content_encryption' FROM users "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                preference = cur.fetchone()
+                if preference is None or str(preference[0] or "").strip().lower() != "off":
+                    return False
+
+                if item.surface == "chat_live":
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=%s "
+                        "WHERE user_id=%s AND msg_id=%s AND doc=%s RETURNING 1",
+                        (Jsonb(new_doc), user_id, item.item_id, Jsonb(item.doc)),
+                    )
+                    won = cur.fetchone() is not None
+                elif item.surface == "chat_archive":
+                    # Archive UPDATE is intentionally forbidden by a trigger.
+                    # Delete+insert occurs in one transaction after exact-doc CAS.
+                    cur.execute(
+                        "DELETE FROM chat_message_archive "
+                        "WHERE user_id=%s AND source_seq=%s AND doc=%s "
+                        "RETURNING msg_id,ts,storage_generation,clear_generation,cleared_at",
+                        (user_id, int(item.item_id), Jsonb(item.doc)),
+                    )
+                    old = cur.fetchone()
+                    if old is not None:
+                        cur.execute(
+                            "INSERT INTO chat_message_archive"
+                            "(user_id,source_seq,msg_id,ts,doc,storage_generation,"
+                            "clear_generation,cleared_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (
+                                user_id,
+                                int(item.item_id),
+                                old[0],
+                                old[1],
+                                Jsonb(new_doc),
+                                old[2],
+                                old[3],
+                                old[4],
+                            ),
+                        )
+                        won = True
+                elif item.surface == "memory":
+                    cur.execute(
+                        "UPDATE memory_moments SET doc=%s "
+                        "WHERE user_id=%s AND moment_id=%s AND doc=%s RETURNING 1",
+                        (Jsonb(new_doc), user_id, item.item_id, Jsonb(item.doc)),
+                    )
+                    won = cur.fetchone() is not None
+                elif item.surface == "world_book":
+                    cur.execute(
+                        "UPDATE world_book_entries SET doc=%s "
+                        "WHERE user_id=%s AND entry_id=%s AND doc=%s RETURNING 1",
+                        (Jsonb(new_doc), user_id, item.item_id, Jsonb(item.doc)),
+                    )
+                    won = cur.fetchone() is not None
+                elif item.surface == "identity":
+                    cur.execute(
+                        "UPDATE user_blobs SET doc=%s WHERE user_id=%s "
+                        "AND kind='identity' AND doc=%s RETURNING 1",
+                        (Jsonb(new_doc), user_id, Jsonb(item.doc)),
+                    )
+                    won = cur.fetchone() is not None
+                else:
+                    raise ValueError(f"surface is not inline-migratable: {item.surface}")
+    if won:
+        _mark_requeue(user_id, item)
+    return won
+
+
+def _transform_inline(item: Item, decrypt) -> dict:
+    if not isinstance(item.doc, dict):
+        raise ValueError("content doc is not an object")
+    if item.surface in {"chat_live", "chat_archive"}:
+        return transforms.plaintext_chat_doc(item.doc, decrypt)
+    if item.surface == "memory":
+        return transforms.plaintext_memory_doc(item.doc, decrypt)
+    if item.surface == "world_book":
+        return transforms.plaintext_world_book_doc(item.doc, decrypt)
+    if item.surface == "identity":
+        return transforms.plaintext_identity_doc(item.doc, decrypt)
+    raise ValueError(f"surface is not inline-migratable: {item.surface}")
+
+
+def migrate_item(user_id: str, item: Item, decrypt) -> str:
+    if item.surface == "frame" or item.body_key:
+        return "failed_unsupported_storage"
+    new_doc = _transform_inline(item, decrypt)
+    return "migrated" if cas_inline_doc(user_id, item, new_doc) else "cas_conflict"
+
+
 def run(user_id: str, *, apply: bool = False) -> Result:
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -213,9 +330,26 @@ def run(user_id: str, *, apply: bool = False) -> Result:
         raise PermissionError("content_encryption must be explicitly off")
 
     items = inventory(user_id)
-    counts = Counter(item.classification for item in items)
+    counts: Counter[str] = Counter()
+    decrypt = None
+    for item in items:
+        if not apply or item.classification != "migratable_shared":
+            counts[item.classification] += 1
+            continue
+        if decrypt is None:
+            decrypt = make_decrypt(user_id)
+        try:
+            counts[migrate_item(user_id, item, decrypt)] += 1
+        except Exception:  # noqa: BLE001 - report only redacted failure class
+            counts["failed_transform_or_storage"] += 1
+    failures = sum(
+        count
+        for status, count in counts.items()
+        if status.startswith("failed_") or status == "cas_conflict"
+    )
     return Result(
         apply=bool(apply),
         user_id=user_id,
         counts=dict(sorted(counts.items())),
+        failures=failures,
     )

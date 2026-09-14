@@ -254,3 +254,143 @@ def test_chat_with_undecryptable_encrypted_subcontent_is_skipped():
     }
 
     assert plaintext_migration.classify_chat(doc) == "skipped_local_only"
+
+
+def test_apply_cas_migrates_all_inline_documents_and_is_idempotent(monkeypatch):
+    user_id = "usr_apply_inline"
+    seed_user(user_id, content_encryption="off")
+    chat = _encrypted("chat-inline")
+    chat.update(
+        {
+            "thinking_body_ct": "thinking-ciphertext",
+            "thinking_nonce": "nonce",
+            "thinking_K_user": "user-key",
+            "thinking_K_enclave": "enclave-key",
+            "thinking_visibility": "shared",
+        }
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages(user_id,msg_id,ts,doc) VALUES (%s,%s,1,%s)",
+            (user_id, "chat-inline", Jsonb(chat)),
+        )
+        source_seq = conn.execute(
+            "SELECT seq FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (user_id, "chat-inline"),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO chat_message_archive"
+            "(user_id,source_seq,msg_id,ts,doc,storage_generation,clear_generation) "
+            "VALUES (%s,%s,'archive-inline',2,%s,0,1)",
+            (user_id, source_seq, Jsonb(_encrypted("archive-inline"))),
+        )
+        conn.execute(
+            "INSERT INTO memory_moments(user_id,moment_id,occurred_at,doc) "
+            "VALUES (%s,'memory-inline','2026-01-01',%s)",
+            (user_id, Jsonb(_encrypted("memory-inline"))),
+        )
+        conn.execute(
+            "INSERT INTO world_book_entries(user_id,entry_id,updated_at,doc) "
+            "VALUES (%s,'world-inline','2026-01-02',%s)",
+            (user_id, Jsonb(_encrypted("world-inline"))),
+        )
+        conn.execute(
+            "INSERT INTO user_blobs(user_id,kind,doc) VALUES (%s,'identity',%s)",
+            (user_id, Jsonb(_encrypted("identity-inline"))),
+        )
+
+    decrypt_calls = []
+
+    def decrypt(_envelope, purpose):
+        decrypt_calls.append(purpose)
+        return f"plain:{purpose}".encode()
+
+    monkeypatch.setattr(plaintext_migration, "make_decrypt", lambda _uid: decrypt)
+
+    first = plaintext_migration.run(user_id, apply=True)
+
+    assert first.failures == 0
+    assert first.counts == {"migrated": 5}
+    assert len(decrypt_calls) == 6
+    with db.get_pool().connection() as conn:
+        docs = [
+            conn.execute(
+                "SELECT doc FROM chat_messages WHERE user_id=%s AND msg_id='chat-inline'",
+                (user_id,),
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT doc FROM chat_message_archive WHERE user_id=%s AND source_seq=%s",
+                (user_id, source_seq),
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT doc FROM memory_moments WHERE user_id=%s AND moment_id='memory-inline'",
+                (user_id,),
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT doc FROM world_book_entries WHERE user_id=%s AND entry_id='world-inline'",
+                (user_id,),
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT doc FROM user_blobs WHERE user_id=%s AND kind='identity'",
+                (user_id,),
+            ).fetchone()[0],
+        ]
+    assert all(isinstance(doc.get("body"), str) for doc in docs)
+    assert docs[0]["thinking"]["body"].startswith("plain:")
+    assert all("body_ct" not in doc and "K_enclave" not in doc for doc in docs)
+
+    monkeypatch.setattr(
+        plaintext_migration,
+        "make_decrypt",
+        lambda _uid: pytest.fail("idempotent rerun must not decrypt plaintext"),
+    )
+    second = plaintext_migration.run(user_id, apply=True)
+    assert second.counts == {"already_plaintext": 5}
+    assert second.failures == 0
+
+
+def test_inline_cas_refuses_a_concurrent_document_change():
+    user_id = "usr_inline_cas"
+    seed_user(user_id, content_encryption="off")
+    original = _encrypted("memory-cas")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO memory_moments(user_id,moment_id,occurred_at,doc) "
+            "VALUES (%s,'memory-cas','2026-01-01',%s)",
+            (user_id, Jsonb(original)),
+        )
+    item = next(item for item in plaintext_migration.inventory(user_id)
+                if item.surface == "memory")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE memory_moments SET doc=doc || '{\"concurrent\":true}'::jsonb "
+            "WHERE user_id=%s AND moment_id='memory-cas'",
+            (user_id,),
+        )
+
+    assert plaintext_migration.cas_inline_doc(
+        user_id, item, {"id": "memory-cas", "body": "plain"}
+    ) is False
+
+
+def test_inline_cas_rechecks_explicit_off_in_the_write_transaction():
+    user_id = "usr_inline_pref_flip"
+    seed_user(user_id, content_encryption="off")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO memory_moments(user_id,moment_id,occurred_at,doc) "
+            "VALUES (%s,'memory-pref','2026-01-01',%s)",
+            (user_id, Jsonb(_encrypted("memory-pref"))),
+        )
+    item = next(item for item in plaintext_migration.inventory(user_id)
+                if item.surface == "memory")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE users SET doc=doc || '{\"content_encryption\":\"on\"}'::jsonb "
+            "WHERE user_id=%s",
+            (user_id,),
+        )
+
+    assert plaintext_migration.cas_inline_doc(
+        user_id, item, {"id": "memory-pref", "body": "plain"}
+    ) is False
