@@ -49,6 +49,15 @@ SECRET = "PRIVATE-PROMPT-ECHO-7f3a"
         (f"RuntimeError: wrote 500 tokens then gave up {SECRET}", "unknown"),
         (f"ValueError: something odd {SECRET}", "unknown"),
         ("RuntimeError", "unknown"),
+        # Real prod tails (09-2026) keep their class.
+        ('RuntimeError: cli agent exited 1: Failed to authenticate. API Error: 401 '
+         '{"error":"Insufficient balance"} (api_status=401)', "quota_insufficient"),
+        ("RuntimeError: Failed to authenticate: OAuth session expired and could not "
+         "be refreshed", "resident_agent_cli_logged_out"),
+        ("RuntimeError: 403 Your request was blocked", "auth_invalid"),
+        ("RuntimeError: invalid key", "auth_invalid"),
+        ('RuntimeError: {"error": {"message": "Insufficient balance"}}', "quota_insufficient"),
+        ("RuntimeError: HTTP 400: context_length_exceeded", "context_overflow"),
     ],
 )
 def test_memory_lane_reasons_classify_into_content_free_codes(raw_tail, expected):
@@ -59,6 +68,37 @@ def test_memory_lane_reasons_classify_into_content_free_codes(raw_tail, expected
         assert db._LANE_ROLLUP_CODE_RE.fullmatch(code)
         # Display redaction keeps the whole classified code.
         assert status_reason.sanitize_status_reason(code) == code
+
+
+@pytest.mark.parametrize(
+    "raw_tail",
+    [
+        # A failure tail can echo the request. A registry keyword in that echo
+        # must not blame the user's key, balance or model.
+        f"RuntimeError: agent failed; prompt text says insufficient balance between goals {SECRET}",
+        f"RuntimeError: unknown field authentication {SECRET}",
+        f"RuntimeError: prompt mentions quota planning {SECRET}",
+        f"RuntimeError: payload contained model not found in user text {SECRET}",
+        f"RuntimeError: prompt mentioned 403 items {SECRET}",
+        f"KeyError: invalid key 'mood' in payload {SECRET}",
+        f"RuntimeError: echo: the model does not exist in our story {SECRET}",
+        f"RuntimeError: user wrote about content policy and safety {SECRET}",
+        f"RuntimeError: prompt says rate limit yourself {SECRET}",
+        f"RuntimeError: that feature is not supported in the diary {SECRET}",
+    ],
+)
+def test_request_echo_keywords_without_error_evidence_are_unknown(raw_tail):
+    for prefix in sorted(agent_call_failure.AGENT_CALL_FAILED_PREFIXES):
+        assert agent_call_failure.normalize_reason(f"{prefix}:{raw_tail}") == f"{prefix}:unknown"
+
+
+def test_echoed_keyword_does_not_hide_a_real_error_later_in_the_tail():
+    """The first registry match lacking evidence falls through to the next one."""
+    raw = (
+        f"RuntimeError: unknown field authentication {SECRET}; "
+        "upstream answered 503 Service Unavailable"
+    )
+    assert agent_call_failure.classify_failure_text(raw) == "upstream_unavailable"
 
 
 def test_normalization_is_idempotent_and_leaves_other_reasons_alone():

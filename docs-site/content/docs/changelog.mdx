@@ -58,7 +58,11 @@ change must not be interpreted as an API guarantee.
   status is reported, so older self-hosted consumers are covered, and no
   provider error text is stored in these fields for new reports. A provider
   message reporting an insufficient balance is now classified as
-  `quota_insufficient` even when it arrives with HTTP 401.
+  `quota_insufficient` even when it arrives with HTTP 401. An account or
+  request class is only assigned with provider error evidence (an HTTP status,
+  a provider error code, or the phrase inside an error field); a keyword that
+  merely appears in echoed request text, such as "quota" or "authentication",
+  is recorded as `…:unknown`.
 
 - Hosted Runtime V2 Dream no longer reports a run as completed when the
   Memory Garden is below the memory kernel's consolidation minimum. Such a run

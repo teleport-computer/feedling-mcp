@@ -11,11 +11,11 @@ Feedling bug.
 This module turns the tail into one registered error class **at the backend
 boundary**, so it also covers self-hosted consumers that lag behind on
 versions. The text is matched with the producer-owned registry
-(``notices.error_contract.classify_text``) — no second keyword list — with one
-deliberate tightening: that registry's ``upstream_unavailable`` matcher also
-accepts any bare 5xx-looking number, which is too weak for a free-form CLI
-message ("… 500 tokens …"), so here it additionally requires HTTP/status
-context or an explicit transport/overload phrase.
+(``notices.error_contract`` matchers, in registry order) plus a strong-evidence
+gate per class: a CLI failure tail can echo the request, so a bare registry
+keyword ("authentication", "quota", "model not found", a 5xx-looking number)
+is not enough — the class also needs an explicit provider error code, an HTTP
+status in a status position, or the term inside a JSON error field.
 
 The raw tail is never returned or stored by this module.
 """
@@ -68,16 +68,156 @@ _STRONG_UPSTREAM_EVIDENCE = re.compile(
 _RELAY_403 = re.compile(r"\b403\b|provider_http_403", re.IGNORECASE)
 
 
+# --------------------------------------------------------------------------- #
+# Strong evidence for the account/request classes
+# --------------------------------------------------------------------------- #
+#
+# The registry matchers are tuned for provider error strings, where a bare word
+# ("authentication", "quota", "model not found") is reliable. A resident agent
+# failure tail is free CLI text that can echo the request — a prompt about
+# "quota planning" or a payload saying "model not found" must not tell the user
+# their key, balance or model is broken. So every class below additionally
+# needs one of: an explicit provider error code, an HTTP status in a status
+# position (``HTTP 401``, ``api_status=401``, ``provider_http_402``, a status
+# leading the message, ``401 Unauthorized``), or the term inside a JSON error
+# field (``{"error": "Insufficient balance"}``). When the registry's first
+# match lacks that evidence, the next registry match is tried; nothing left
+# means ``unknown``.
+
+
+def _status_position(codes: str) -> str:
+    return (
+        rf"provider_http_(?:{codes})\b"
+        rf"|\b(?:https?|status(?:[ _-]?code)?|error[ _-]?code|api[ _-]?error"
+        rf"|api_status|code)\b\W{{0,3}}(?:{codes})\b"
+        # a status leading the message after an exception type / CLI prefix
+        rf"|(?:\A|:\s)(?:{codes})\b(?=\s*(?:[-:{{(]|[A-Za-z]))"
+    )
+
+
+def _json_error_field(term: str) -> str:
+    return (
+        r"""["'](?:error|message|errorMessage|detail|code|type)["']\s*:\s*"""
+        rf"""(?:\{{[^}}]{{0,200}}?)?["'][^"']{{0,200}}?(?:{term})"""
+    )
+
+
+def _evidence(*, codes: str, term: str, tokens: str = "") -> re.Pattern:
+    """``tokens`` alone suffice; ``term`` needs a nearby status or a JSON error field."""
+    parts = [
+        rf"(?:{_status_position(codes)})[\s\S]{{0,160}}?(?:{term})",
+        _json_error_field(term),
+    ]
+    if tokens:
+        parts.insert(0, tokens)
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+_QUOTA_TERM = (
+    r"insufficient[ _-]?(?:balance|quota|credits?|funds)|quota|credit balance"
+    r"|余额|额度|payment required|out of credits|requires more credits"
+)
+_AUTH_TERM = (
+    r"unauthori[sz]ed|authentication|invalid[ _-]?(?:x-)?api[ _-]?key|invalid[ _-]?key"
+    r"|incorrect api key|forbidden|blocked|permission"
+)
+_MODEL_TERM = (
+    r"model[ _-]?not[ _-]?found|no such model|unknown model|invalid model name"
+    r"|not a valid model|does not exist|model"
+)
+
+_STRONG_EVIDENCE: dict[str, re.Pattern] = {
+    "quota_insufficient": _evidence(
+        codes="401|402|403|429",
+        term=_QUOTA_TERM,
+        tokens=(
+            r"provider_http_402\b|insufficient_quota|insufficient_user_quota"
+            r"|insufficient_balance|billing_hard_limit_reached"
+            r"|credit balance is too low|余额不足|额度不足"
+            rf"|{_status_position('402')}"
+        ),
+    ),
+    "provider_account_expired": _evidence(
+        codes="401|402|403", term=r"expired", tokens=r"account_expired",
+    ),
+    "auth_invalid": _evidence(
+        codes="401|403",
+        term=_AUTH_TERM,
+        tokens=(
+            r"invalid_api_key|authentication_error|incorrect api key"
+            r"|invalid[ _-]?(?:x-)?api[ _-]?key|failed to authenticate"
+            rf"|{_status_position('401|403')}"
+        ),
+    ),
+    "model_not_found": _evidence(
+        codes="400|404|422", term=_MODEL_TERM,
+        tokens=rf"\bmodel_not_found\b|{_status_position('404')}",
+    ),
+    "provider_incompatible": _evidence(
+        codes="400|404|415|422",
+        term=r"not supported|unsupported|unknown variant|invalid_request_error",
+        tokens=r"unsupported_parameter|unsupported_value",
+    ),
+    "context_overflow": _evidence(
+        codes="400|413|422",
+        term=r"context|too many tokens|prompt is too long",
+        tokens=(
+            r"context_length_exceeded|maximum context length is \d+"
+            r"|prompt is too long: \d+ tokens"
+        ),
+    ),
+    "content_filtered": _evidence(
+        codes="400|403|422",
+        term=r"content[ _]?filter|content policy|safety|blocked",
+        tokens=r"\bcontent_filter\b|content_policy_violation",
+    ),
+    "rate_limited": _evidence(
+        codes="429",
+        term=r"too many requests|rate.?limit",
+        tokens=(
+            rf"rate_limit_exceeded|rate_limit_error|{_status_position('429')}"
+            r"|\b429\s+too many requests"
+        ),
+    ),
+}
+# The pi relay's whole provider message is "invalid key"; only that position
+# ("RuntimeError: invalid key", end of text) counts, not the phrase in prose.
+_BARE_INVALID_KEY_MESSAGE = re.compile(r":\s*invalid[ _-]?key\s*\.?\s*\Z", re.IGNORECASE)
+# Emitted only by resident code with an exact, non-echoable phrase (the
+# registry matchers are the whole sentence), so no extra evidence is required.
+_SELF_EVIDENT = frozenset({"cli_config_invalid", "resident_agent_cli_logged_out"})
+
+
+def _has_strong_evidence(code: str, text: str) -> bool:
+    if code in _SELF_EVIDENT:
+        return True
+    if code == "upstream_unavailable":
+        return bool(_STRONG_UPSTREAM_EVIDENCE.search(text) or _RELAY_403.search(text))
+    pattern = _STRONG_EVIDENCE.get(code)
+    return bool(pattern is not None and pattern.search(text))
+
+
 def classify_failure_text(text: object) -> str:
-    """Map free provider/CLI error text to one ``AGENT_CALL_FAILURE_CLASSES`` value."""
+    """Map free provider/CLI error text to one ``AGENT_CALL_FAILURE_CLASSES`` value.
+
+    Walks the producer-owned registry (``error_contract.matcher_specs``) in its
+    own order and returns the first matching class that also has strong
+    evidence in ``text`` (see ``_STRONG_EVIDENCE``).
+    """
     candidate = str(text or "")
-    spec = error_contract.classify_text(candidate)
-    code = spec.code if spec is not None else "unknown"
-    if code == "upstream_unavailable" and not (
-        _STRONG_UPSTREAM_EVIDENCE.search(candidate) or _RELAY_403.search(candidate)
-    ):
-        return "unknown"
-    return code if code in AGENT_CALL_FAILURE_CLASSES else "unknown"
+    for spec in error_contract.matcher_specs():
+        if spec.code not in AGENT_CALL_FAILURE_CLASSES:
+            continue
+        matcher = spec.matcher()
+        if matcher is None or not matcher.search(candidate):
+            continue
+        if _has_strong_evidence(spec.code, candidate):
+            return spec.code
+    # Outside the registry: the pi relay's bare "invalid key" message, which the
+    # resident consumer itself already treats as an auth failure.
+    if _BARE_INVALID_KEY_MESSAGE.search(candidate):
+        return "auth_invalid"
+    return "unknown"
 
 
 def normalize_reason(raw: object) -> str:
