@@ -2522,3 +2522,14 @@ def test_provider_setup_failures_tell_the_user_to_fix_settings(resolver_error, u
         assert notice["blame"] == "user_provider" and "设置" in notice["user_text"]
     else:
         assert notice["blame"] == "system" and "设置" not in notice["user_text"]
+
+
+def test_provider_setup_codes_are_registered_public_failure_codes():
+    """provider_setup:<slug> 必须在产生方公开词表里：否则 admin 时间线遮蔽、rollup 当未知码。"""
+    from admin import data_track
+    from memory import capture_failure
+
+    visible = data_track._load_worker_failure_codes()
+    for slug in capture_failure.PROVIDER_SETUP_USER_ERRORS:
+        assert f"provider_setup:{slug}" in visible
+    assert "provider_unavailable" in visible

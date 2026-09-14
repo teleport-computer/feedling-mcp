@@ -842,8 +842,15 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         if (failed_window is not None
                 and not str(failed_window.get("after_message_id") or "")
                 and failed_window.get("after_seq") in (None, "")
-                and not str(state.get("last_captured_until_message_id") or "")):
-            # 老任务（修复前入队）没带 after_seq：起点没有 id 且游标从未推进 = 首次落卡，起点就是 0。
+                and not str(state.get("last_captured_until_message_id") or "")
+                and not bool(state.get("capture_seq_initialized"))
+                and int(_safe_float(state.get("last_captured_until_seq"), 0.0)) == 0
+                and str(failed_window.get("until_message_id") or "")
+                and db.chat_seq_for_msg_id(store.user_id,
+                                           str(failed_window.get("until_message_id"))) is not None):
+            # 老任务（修复前入队）没带 after_seq，而游标确实从未推进过（id、seq 都没有）= 首次落卡，
+            # 起点就是 0。额外要求窗口终点那条消息**还在**：Chat Clear 会删掉落卡状态，但不会作废
+            # 清空前入队的 V1 任务，那种旧任务回报失败时不能并进清空后的新窗口（Codex 第 11 轮）。
             failed_window = {**failed_window, "after_seq": 0}
         patch, streak, skipped = _capture_failure_patch(
             state, failed_window, now_ts=now_ts, reason=_failure_reason_of(job))

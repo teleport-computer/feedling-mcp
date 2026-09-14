@@ -324,3 +324,29 @@ def test_v1_first_capture_escape_valve_fires_while_new_messages_keep_arriving(tm
         t = max(t, _seed_chat(store, f"new-{attempt}")) + 6 * 3600 + 20
     state = capture_scheduler.load_capture_state(store)
     assert int(state["capture_skipped_windows"]) == 1, "终点一直在变，逃生阀没触发"
+
+
+def test_legacy_after_seq_fallback_is_guarded(tmp_path, monkeypatch):
+    """老任务补 after_seq=0 的兜底：游标推进过（只有 seq）不补；窗口终点消息已被清空不补。"""
+    store = _store(tmp_path, monkeypatch, "usr_capture_legacy_fallback_guard")
+    _seed_chat(store, "m1")
+    legacy = {"job_id": "cap_legacy", "source": "memory_capture", "status": "failed",
+              "status_reason": "json_decode_error:JSONDecodeError",
+              "window": {"after_message_id": "", "until_message_id": "m1",
+                         "until_ts": 1.0, "message_count": 1}}
+
+    # ① 真首次落卡、终点还在 → 补 0，窗口 key 锚在起点
+    capture_scheduler.record_capture_job_status(store, legacy, status="failed", now=10.0)
+    assert capture_scheduler.load_capture_state(store)["capture_fail_window_key"] == "after_seq:0"
+
+    # ② 只有 seq 的已推进状态（id 缺失）→ 不补
+    capture_scheduler.save_capture_state(store, {"last_captured_until_seq": 5,
+                                                 "capture_seq_initialized": True})
+    capture_scheduler.record_capture_job_status(store, legacy, status="failed", now=20.0)
+    assert capture_scheduler.load_capture_state(store)["capture_fail_window_key"] != "after_seq:0"
+
+    # ③ 清空前的旧任务：终点消息已不存在 → 不补，不会并进清空后的新窗口
+    capture_scheduler.save_capture_state(store, {})
+    gone = {**legacy, "window": {**legacy["window"], "until_message_id": "deleted-before-clear"}}
+    capture_scheduler.record_capture_job_status(store, gone, status="failed", now=30.0)
+    assert capture_scheduler.load_capture_state(store)["capture_fail_window_key"] != "after_seq:0"

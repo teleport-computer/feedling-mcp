@@ -1917,6 +1917,13 @@ PUBLIC_FAILURE_CODES = frozenset(
         f"extraction_failed:{kind}"
         for kind in _EXTRACTION_FAILURE_KINDS
     }
+    # 落卡 provider 前置失败里用户要去设置里修的那几种（封闭集合，见 capture_failure）。
+    # 不登记的话 admin 时间线会把它遮掉、rollup 按未知码归类（Codex 第 11 轮）。
+    | {
+        f"{capture_failure.PROVIDER_SETUP_ACCOUNT_CODE}:{slug}"
+        for slug in capture_failure.PROVIDER_SETUP_USER_ERRORS
+    }
+    | {"provider_unavailable"}
 )
 
 
