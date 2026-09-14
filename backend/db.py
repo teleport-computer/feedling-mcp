@@ -18135,6 +18135,129 @@ def frame_upsert(
     return _frame_write_row(user_id, frame_id, ts, doc, env_meta, None)
 
 
+def migrate_frame_to_plaintext(
+    user_id: str,
+    frame_id: str,
+    *,
+    ts: float,
+    old_doc: dict | None,
+    old_env_meta: dict | None,
+    old_body_key: str | None,
+    plaintext: bytes,
+    semantic_meta: dict,
+) -> bool:
+    """CAS one legacy frame to plaintext without overwriting its ciphertext.
+
+    With R2 enabled, plaintext is uploaded under the distinct
+    ``frames-plaintext`` prefix before the row is promoted.  The legacy object
+    remains authoritative until that CAS commits.  Without R2, the row becomes
+    a verified inline ``body_b64`` document.  A CAS loser never retires the old
+    object and best-effort removes its unreferenced candidate upload.
+    """
+    if not isinstance(plaintext, bytes):
+        raise TypeError("plaintext must be bytes")
+    if not isinstance(semantic_meta, dict):
+        raise TypeError("semantic_meta must be a dict")
+
+    expected_doc = Jsonb(old_doc) if old_doc is not None else None
+    expected_meta = Jsonb(old_env_meta) if old_env_meta is not None else None
+
+    def _lock_matches(cur) -> bool:
+        cur.execute(
+            "SELECT doc->>'content_encryption' FROM users "
+            "WHERE user_id=%s FOR UPDATE",
+            (user_id,),
+        )
+        preference = cur.fetchone()
+        if preference is None or str(preference[0] or "").strip().lower() != "off":
+            return False
+        cur.execute(
+            "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND frame_id=%s "
+            "AND ts=%s AND doc IS NOT DISTINCT FROM %s "
+            "AND env_meta IS NOT DISTINCT FROM %s "
+            "AND body_key IS NOT DISTINCT FROM %s FOR UPDATE",
+            (
+                user_id, frame_id, float(ts), expected_doc, expected_meta,
+                old_body_key,
+            ),
+        )
+        return cur.fetchone() is not None
+
+    # Do not perform network writes until the exact source shape and tier have
+    # both been checked under locks.
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if not _lock_matches(cur):
+                    return False
+
+    digest = hashlib.sha256(plaintext).hexdigest()
+    common = dict(semantic_meta)
+    common.update({
+        "body_object_format": "plaintext_v1",
+        "body_sha256": digest,
+        "body_size_bytes": len(plaintext),
+    })
+    candidate_key = None
+    if object_storage.enabled():
+        candidate_key = object_storage.put_frame_plaintext_body(
+            user_id, frame_id, plaintext,
+        )
+        new_doc = None
+        new_meta = common
+    else:
+        new_doc = {
+            **common,
+            "body_b64": base64.b64encode(plaintext).decode("ascii"),
+        }
+        new_meta = None
+
+    won = False
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if _lock_matches(cur):
+                    cur.execute(
+                        "UPDATE frame_envelopes SET doc=%s,env_meta=%s,body_key=%s "
+                        "WHERE user_id=%s AND frame_id=%s AND ts=%s "
+                        "AND doc IS NOT DISTINCT FROM %s "
+                        "AND env_meta IS NOT DISTINCT FROM %s "
+                        "AND body_key IS NOT DISTINCT FROM %s RETURNING 1",
+                        (
+                            Jsonb(new_doc) if new_doc is not None else None,
+                            Jsonb(new_meta) if new_meta is not None else None,
+                            candidate_key,
+                            user_id,
+                            frame_id,
+                            float(ts),
+                            expected_doc,
+                            expected_meta,
+                            old_body_key,
+                        ),
+                    )
+                    won = cur.fetchone() is not None
+
+    if candidate_key and not won:
+        with get_pool().connection() as conn:
+            referenced = conn.execute(
+                "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND body_key=%s LIMIT 1",
+                (user_id, candidate_key),
+            ).fetchone() is not None
+        if not referenced:
+            object_storage.delete_frame_body_key(candidate_key, user_id)
+    if not won:
+        return False
+
+    from tee_shadow import mirror
+
+    mirror.mark_pending(
+        user_id, "frame_envelopes", frame_id, "requeue_plaintext_migration"
+    )
+    if old_body_key and old_body_key != candidate_key:
+        object_storage.delete_frame_body_key(old_body_key, user_id)
+    return True
+
+
 def frame_exists(user_id: str, frame_id: str) -> bool:
     """Cheap existence check (avoids pulling the heavy body_ct) for the proxy
     guards in frame_decrypt / frame_image."""
@@ -18213,7 +18336,12 @@ def frame_get(
         body = None
         for attempt in range(2):
             try:
-                body = object_storage.get_frame_body_strict(user_id, frame_id)
+                if body_key == object_storage.frame_key(user_id, frame_id):
+                    body = object_storage.get_frame_body_strict(user_id, frame_id)
+                else:
+                    body = object_storage.get_frame_body_by_key_strict(
+                        body_key, user_id,
+                    )
                 break
             except Exception as e:  # noqa: BLE001
                 if attempt == 0:

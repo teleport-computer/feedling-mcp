@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -12,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 from content import plaintext_migration  # noqa: E402
 import migrate_user_content_to_plaintext as cli  # noqa: E402
 import db  # noqa: E402
+import object_storage  # noqa: E402
 from conftest import seed_user  # noqa: E402
 
 
@@ -394,3 +397,330 @@ def test_inline_cas_rechecks_explicit_off_in_the_write_transaction():
     assert plaintext_migration.cas_inline_doc(
         user_id, item, {"id": "memory-pref", "body": "plain"}
     ) is False
+
+
+def test_chat_r2_body_uses_existing_crash_safe_pointer_migration(monkeypatch):
+    key = "chatfiles/usr_chat_r2/g0/msg-r2/old"
+    item = plaintext_migration.Item(
+        surface="chat_live",
+        item_id="msg-r2",
+        classification="migratable_shared",
+        doc={
+            "id": "msg-r2",
+            "content_type": "file",
+            "visibility": "shared",
+            "owner_user_id": "usr_chat_r2",
+            "body_key": key,
+            "body_ct_len": 12,
+            "K_enclave": "enclave-key",
+            "nonce": "nonce",
+            "K_user": "user-key",
+        },
+        storage_generation=0,
+        body_key=key,
+    )
+    monkeypatch.setattr(object_storage, "chat_key_owned_by", lambda k, u: True)
+    monkeypatch.setattr(
+        object_storage,
+        "get_chat_body",
+        lambda k, u: base64.b64encode(b"sealed").decode(),
+    )
+    captured = {}
+
+    def migrate(user_id, **kwargs):
+        captured["user_id"] = user_id
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(db, "migrate_chat_r2_pointer_to_plaintext", migrate)
+
+    status = plaintext_migration.migrate_item(
+        "usr_chat_r2", item, lambda env, purpose: b"plain-file-bytes"
+    )
+
+    assert status == "migrated"
+    assert captured["table"] == "live"
+    assert captured["item_id"] == "msg-r2"
+    assert captured["old_body_key"] == key
+    assert captured["plaintext"] == b"plain-file-bytes"
+    assert captured["content_type"] == "file"
+
+
+def test_chat_r2_promotion_then_cas_migrates_encrypted_subcontent(monkeypatch):
+    user_id = "usr_chat_r2_sub"
+    seed_user(user_id, content_encryption="off")
+    key = f"chatimages/{user_id}/g0/msg-r2-sub/old"
+    old_doc = {
+        **_encrypted("msg-r2-sub"),
+        "content_type": "image",
+        "body_key": key,
+        "body_ct_len": 12,
+        "body_ct": None,
+        "caption_body_ct": "caption-sealed",
+        "caption_nonce": "caption-nonce",
+        "caption_K_user": "caption-user-key",
+        "caption_K_enclave": "caption-enclave-key",
+        "caption_visibility": "shared",
+    }
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages(user_id,msg_id,ts,doc) VALUES (%s,%s,1,%s)",
+            (user_id, "msg-r2-sub", Jsonb(old_doc)),
+        )
+    item = next(iter(plaintext_migration.inventory(user_id)))
+    monkeypatch.setattr(object_storage, "chat_key_owned_by", lambda k, u: True)
+    monkeypatch.setattr(
+        object_storage,
+        "get_chat_body",
+        lambda k, u: base64.b64encode(b"sealed-main").decode(),
+    )
+
+    def promote(_user_id, **_kwargs):
+        pointer = {
+            "body_key": f"chatimages/{user_id}/g0/msg-r2-sub/new",
+            "body_object_format": "plaintext_v1",
+            "body_size_bytes": 10,
+            "body_sha256": "a" * 64,
+        }
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE chat_messages SET doc=(doc-'body_ct'-'body_ct_len'-'K_enclave'"
+                "-'K_user'-'nonce') || %s WHERE user_id=%s AND msg_id=%s",
+                (Jsonb(pointer), user_id, "msg-r2-sub"),
+            )
+        return True
+
+    monkeypatch.setattr(db, "migrate_chat_r2_pointer_to_plaintext", promote)
+
+    status = plaintext_migration.migrate_item(
+        user_id,
+        item,
+        lambda env, purpose: b"caption-plain" if "caption" in purpose else b"main-plain",
+    )
+
+    assert status == "migrated"
+    with db.get_pool().connection() as conn:
+        doc = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (user_id, "msg-r2-sub"),
+        ).fetchone()[0]
+    assert doc["body_object_format"] == "plaintext_v1"
+    assert doc["caption"]["body"] == "caption-plain"
+    assert "caption_body_ct" not in doc
+
+
+def test_inline_frame_migrates_to_plaintext_without_r2(monkeypatch):
+    user_id = "usr_frame_inline_migrate"
+    seed_user(user_id, content_encryption="off")
+    frame_doc = _encrypted("frame-inline")
+    frame_doc["source"] = "screen"
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc) VALUES (%s,%s,1,%s)",
+            (user_id, "frame-inline", Jsonb(frame_doc)),
+        )
+    item = next(iter(plaintext_migration.inventory(user_id)))
+    monkeypatch.setattr(object_storage, "enabled", lambda: False)
+
+    assert plaintext_migration.migrate_item(
+        user_id, item, lambda env, purpose: b"plain-frame"
+    ) == "migrated"
+
+    with db.get_pool().connection() as conn:
+        doc, meta, key = conn.execute(
+            "SELECT doc,env_meta,body_key FROM frame_envelopes "
+            "WHERE user_id=%s AND frame_id='frame-inline'",
+            (user_id,),
+        ).fetchone()
+    assert base64.b64decode(doc["body_b64"]) == b"plain-frame"
+    assert doc["body_size_bytes"] == len(b"plain-frame")
+    assert doc["body_sha256"] == hashlib.sha256(b"plain-frame").hexdigest()
+    assert "body_ct" not in doc and "K_enclave" not in doc
+    assert meta is None and key is None
+
+
+def test_r2_frame_uses_fresh_plaintext_key_then_cas_and_retires_old(monkeypatch):
+    user_id = "usr_frame_r2_migrate"
+    seed_user(user_id, content_encryption="off")
+    old_key = f"frames/{user_id}/frame-r2"
+    meta = _encrypted("frame-r2")
+    meta.pop("body_ct")
+    meta["source"] = "photo"
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'frame-r2',1,NULL,%s,%s)",
+            (user_id, Jsonb(meta), old_key),
+        )
+    item = next(iter(plaintext_migration.inventory(user_id)))
+    monkeypatch.setattr(object_storage, "enabled", lambda: True)
+    monkeypatch.setattr(
+        object_storage,
+        "get_frame_body_by_key_strict",
+        lambda key, uid: base64.b64encode(b"sealed-frame").decode(),
+    )
+    puts = []
+    deleted = []
+
+    def put(uid, frame_id, raw):
+        puts.append((uid, frame_id, raw))
+        return f"frames-plaintext/{uid}/{frame_id}/digest"
+
+    monkeypatch.setattr(object_storage, "put_frame_plaintext_body", put)
+    monkeypatch.setattr(
+        object_storage,
+        "delete_frame_body_key",
+        lambda key, uid: deleted.append((key, uid)) or True,
+    )
+
+    assert plaintext_migration.migrate_item(
+        user_id, item, lambda env, purpose: b"plain-r2-frame"
+    ) == "migrated"
+
+    with db.get_pool().connection() as conn:
+        doc, stored_meta, stored_key = conn.execute(
+            "SELECT doc,env_meta,body_key FROM frame_envelopes "
+            "WHERE user_id=%s AND frame_id='frame-r2'",
+            (user_id,),
+        ).fetchone()
+    assert doc is None
+    assert stored_key.startswith(f"frames-plaintext/{user_id}/frame-r2/")
+    assert stored_meta["body_object_format"] == "plaintext_v1"
+    assert stored_meta["body_sha256"] == hashlib.sha256(b"plain-r2-frame").hexdigest()
+    assert puts == [(user_id, "frame-r2", b"plain-r2-frame")]
+    assert deleted == [(old_key, user_id)]
+
+
+def test_r2_frame_missing_object_fails_before_decrypt(monkeypatch):
+    user_id = "usr_frame_r2_missing"
+    seed_user(user_id, content_encryption="off")
+    old_key = f"frames/{user_id}/missing"
+    meta = _encrypted("missing")
+    meta.pop("body_ct")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'missing',1,NULL,%s,%s)",
+            (user_id, Jsonb(meta), old_key),
+        )
+    item = next(iter(plaintext_migration.inventory(user_id)))
+    monkeypatch.setattr(object_storage, "get_frame_body_strict", lambda *_a: None)
+
+    status = plaintext_migration.migrate_item(
+        user_id,
+        item,
+        lambda *_a, **_kw: pytest.fail("missing object must not decrypt"),
+    )
+
+    assert status == "failed_r2_object_missing"
+
+
+def test_frame_preference_flip_blocks_before_r2_upload(monkeypatch):
+    user_id = "usr_frame_pref_flip"
+    seed_user(user_id, content_encryption="off")
+    doc = _encrypted("frame-pref")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc) VALUES (%s,%s,1,%s)",
+            (user_id, "frame-pref", Jsonb(doc)),
+        )
+    item = next(iter(plaintext_migration.inventory(user_id)))
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE users SET doc=doc || '{\"content_encryption\":\"on\"}'::jsonb "
+            "WHERE user_id=%s",
+            (user_id,),
+        )
+    monkeypatch.setattr(object_storage, "enabled", lambda: True)
+    monkeypatch.setattr(
+        object_storage,
+        "put_frame_plaintext_body",
+        lambda *_a: pytest.fail("preference flip must block before R2 upload"),
+    )
+
+    assert plaintext_migration.migrate_item(
+        user_id, item, lambda *_a, **_kw: b"plain"
+    ) == "cas_conflict"
+
+
+def test_frame_cas_loss_cleans_candidate_and_preserves_legacy_object(monkeypatch):
+    user_id = "usr_frame_cas_loss"
+    seed_user(user_id, content_encryption="off")
+    old_key = f"frames/{user_id}/frame-race"
+    meta = _encrypted("frame-race")
+    meta.pop("body_ct")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'frame-race',1,NULL,%s,%s)",
+            (user_id, Jsonb(meta), old_key),
+        )
+    item = next(iter(plaintext_migration.inventory(user_id)))
+    monkeypatch.setattr(object_storage, "enabled", lambda: True)
+    monkeypatch.setattr(
+        object_storage,
+        "get_frame_body_strict",
+        lambda *_a: base64.b64encode(b"sealed").decode(),
+    )
+    candidate = f"frames-plaintext/{user_id}/frame-race/digest"
+
+    def put_then_race(*_args):
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE frame_envelopes SET env_meta=env_meta || "
+                "'{\"concurrent\":true}'::jsonb WHERE user_id=%s AND frame_id='frame-race'",
+                (user_id,),
+            )
+        return candidate
+
+    deleted = []
+    monkeypatch.setattr(object_storage, "put_frame_plaintext_body", put_then_race)
+    monkeypatch.setattr(
+        object_storage,
+        "delete_frame_body_key",
+        lambda key, uid: deleted.append((key, uid)) or True,
+    )
+
+    assert plaintext_migration.migrate_item(
+        user_id, item, lambda *_a, **_kw: b"plain"
+    ) == "cas_conflict"
+    assert deleted == [(candidate, user_id)]
+    with db.get_pool().connection() as conn:
+        stored_key = conn.execute(
+            "SELECT body_key FROM frame_envelopes WHERE user_id=%s AND frame_id='frame-race'",
+            (user_id,),
+        ).fetchone()[0]
+    assert stored_key == old_key
+
+
+def test_frame_get_follows_persisted_plaintext_migration_key(monkeypatch):
+    user_id = "usr_frame_key_read"
+    seed_user(user_id, content_encryption="off")
+    raw = b"frame-body"
+    key = f"frames-plaintext/{user_id}/frame-key/{hashlib.sha256(raw).hexdigest()}"
+    meta = {
+        "id": "frame-key",
+        "body_object_format": "plaintext_v1",
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+        "body_size_bytes": len(raw),
+    }
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'frame-key',1,NULL,%s,%s)",
+            (user_id, Jsonb(meta), key),
+        )
+    monkeypatch.setattr(
+        object_storage,
+        "get_frame_body_strict",
+        lambda *_a: pytest.fail("reader must follow the persisted versioned key"),
+    )
+    monkeypatch.setattr(
+        object_storage,
+        "get_frame_body_by_key_strict",
+        lambda stored_key, uid: base64.b64encode(raw).decode(),
+    )
+
+    loaded = db.frame_get(user_id, "frame-key", unavailable_raises=True)
+
+    assert base64.b64decode(loaded["body_b64"]) == raw

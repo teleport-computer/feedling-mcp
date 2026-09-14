@@ -8,10 +8,11 @@ this module so the command can be exercised without exposing content values.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 import db
+import object_storage
 from psycopg.types.json import Jsonb
 from tee_replicator import transforms
 
@@ -24,11 +25,11 @@ class Item:
     surface: str
     item_id: str
     classification: str
-    doc: dict | None = None
+    doc: dict | None = field(default=None, repr=False)
     sort_value: str | int | float | None = None
     storage_generation: int = 0
     body_key: str | None = None
-    env_meta: dict | None = None
+    env_meta: dict | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -315,9 +316,133 @@ def _transform_inline(item: Item, decrypt) -> dict:
     raise ValueError(f"surface is not inline-migratable: {item.surface}")
 
 
+def _chat_has_encrypted_subcontent(doc: dict) -> bool:
+    return any(doc.get(f"{prefix}body_ct") is not None
+               for prefix in ("thinking_", "caption_"))
+
+
+def _reload_chat_item(user_id: str, item: Item) -> Item | None:
+    with db.get_pool().connection() as conn:
+        if item.surface == "chat_live":
+            row = conn.execute(
+                "SELECT msg_id,seq,storage_generation,doc FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s",
+                (user_id, item.item_id),
+            ).fetchone()
+            if row is None:
+                return None
+            msg_id, seq, generation, doc = row
+            return Item(
+                "chat_live", str(msg_id), classify_chat(doc), doc,
+                int(seq), int(generation),
+                str(doc.get("body_key")) if doc.get("body_key") else None,
+            )
+        row = conn.execute(
+            "SELECT source_seq,msg_id,storage_generation,doc "
+            "FROM chat_message_archive WHERE user_id=%s AND source_seq=%s",
+            (user_id, int(item.item_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        source_seq, msg_id, generation, doc = row
+        return Item(
+            "chat_archive", str(source_seq), classify_chat(doc), doc,
+            str(msg_id), int(generation),
+            str(doc.get("body_key")) if doc.get("body_key") else None,
+        )
+
+
+def _migrate_chat_pointer(user_id: str, item: Item, decrypt) -> str:
+    doc = dict(item.doc or {})
+    if doc.get("body_object_format") != "plaintext_v1":
+        old_key = str(item.body_key or "")
+        if not object_storage.chat_key_owned_by(old_key, user_id):
+            return "failed_foreign_body_key"
+        body_ct = object_storage.get_chat_body(old_key, user_id)
+        if body_ct is None:
+            return "failed_r2_object_missing"
+        envelope = dict(doc)
+        for key in (
+            "body_key", "body_ct_len", "body_object_format",
+            "body_size_bytes", "body_sha256", "body_ct",
+        ):
+            envelope.pop(key, None)
+        envelope["body_ct"] = body_ct
+        plaintext = decrypt(
+            envelope,
+            purpose=f"chat_r2_plaintext_migration:{item.item_id}",
+        )
+        promoted = db.migrate_chat_r2_pointer_to_plaintext(
+            user_id,
+            table="live" if item.surface == "chat_live" else "archive",
+            item_id=item.item_id,
+            old_body_key=old_key,
+            storage_generation=item.storage_generation,
+            plaintext=plaintext,
+            content_type=str(doc.get("content_type") or ""),
+        )
+        if not promoted:
+            return "cas_conflict"
+        if not _chat_has_encrypted_subcontent(doc):
+            return "migrated"
+        item = _reload_chat_item(user_id, item)
+        if item is None:
+            return "cas_conflict"
+
+    if item.classification == "already_plaintext":
+        return "migrated"
+    new_doc = transforms.plaintext_chat_doc(item.doc or {}, decrypt)
+    return "migrated" if cas_inline_doc(user_id, item, new_doc) else "cas_conflict"
+
+
+_FRAME_CRYPTO_FIELDS = {
+    "v", "body_ct", "body_b64", "nonce", "K_user", "K_enclave",
+    "enclave_pk_fpr", "content_pk_fpr", "body_object_format",
+    "body_sha256", "body_size_bytes", "body_key",
+}
+
+
+def _migrate_frame(user_id: str, item: Item, decrypt) -> str:
+    carrier = item.doc if isinstance(item.doc, dict) else item.env_meta
+    if not isinstance(carrier, dict):
+        return "failed_invalid_shape"
+    envelope = dict(carrier)
+    if item.body_key:
+        if item.body_key == object_storage.frame_key(user_id, item.item_id):
+            body_ct = object_storage.get_frame_body_strict(user_id, item.item_id)
+        else:
+            body_ct = object_storage.get_frame_body_by_key_strict(
+                item.body_key, user_id,
+            )
+        if body_ct is None:
+            return "failed_r2_object_missing"
+        envelope["body_ct"] = body_ct
+    plaintext = decrypt(
+        envelope,
+        purpose=f"frame_plaintext_migration:{item.item_id}",
+    )
+    semantic_meta = {
+        key: value for key, value in carrier.items()
+        if key not in _FRAME_CRYPTO_FIELDS
+    }
+    won = db.migrate_frame_to_plaintext(
+        user_id,
+        item.item_id,
+        ts=float(item.sort_value or 0),
+        old_doc=item.doc,
+        old_env_meta=item.env_meta,
+        old_body_key=item.body_key,
+        plaintext=plaintext,
+        semantic_meta=semantic_meta,
+    )
+    return "migrated" if won else "cas_conflict"
+
+
 def migrate_item(user_id: str, item: Item, decrypt) -> str:
-    if item.surface == "frame" or item.body_key:
-        return "failed_unsupported_storage"
+    if item.surface in {"chat_live", "chat_archive"} and item.body_key:
+        return _migrate_chat_pointer(user_id, item, decrypt)
+    if item.surface == "frame":
+        return _migrate_frame(user_id, item, decrypt)
     new_doc = _transform_inline(item, decrypt)
     return "migrated" if cas_inline_doc(user_id, item, new_doc) else "cas_conflict"
 

@@ -93,7 +93,12 @@ def replicate(user_id: str, frame_id: str, ts: float, row: dict, reencrypt,
         # gone server-side, unrecoverable by retrying) is a pending-style skip
         # so it never wedges the cursor; transient R2 failures raise here and
         # keep the freeze-and-retry semantics.
-        body_ct = object_storage.get_frame_body_strict(user_id, frame_id)
+        if body_key == object_storage.frame_key(user_id, frame_id):
+            body_ct = object_storage.get_frame_body_strict(user_id, frame_id)
+        else:
+            body_ct = object_storage.get_frame_body_by_key_strict(
+                body_key, user_id,
+            )
         if body_ct is None:
             raise PendingDeviceMigration("r2_body_missing_orphan")
         envelope = {**(env_meta or {}), "body_ct": body_ct}
@@ -128,7 +133,12 @@ def replicate_plaintext(
     meta_src = dict(doc if doc is not None else (env_meta or {}))
     body_b64 = None
     if body_key:
-        body_b64 = object_storage.get_frame_body_strict(user_id, frame_id)
+        if body_key == object_storage.frame_key(user_id, frame_id):
+            body_b64 = object_storage.get_frame_body_strict(user_id, frame_id)
+        else:
+            body_b64 = object_storage.get_frame_body_by_key_strict(
+                body_key, user_id,
+            )
         if body_b64 is None:
             raise PendingDeviceMigration("r2_body_missing_orphan")
     elif isinstance(doc, dict):
