@@ -416,6 +416,7 @@ jobs:
             tests/test_runtime_v2_default_flag.py \
             tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_garden_io_capture_policy.py \
             tests/test_dream_prompt_v1.py \
             tests/test_capture_poison_window_escape.py \
             tests/test_capture_window_cursor_diagnostics.py \
@@ -1018,6 +1019,7 @@ jobs:
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_garden_io_capture_policy.py \
             tests/test_capture_poison_window_escape.py \
             tests/test_capture_window_cursor_diagnostics.py \
             tests/test_window_fingerprint.py \

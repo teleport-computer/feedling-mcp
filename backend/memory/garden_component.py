@@ -32,30 +32,16 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from memgarden import GardenComponent
-from memgarden import component as _kernel_component
 from memgarden.contracts import Step
 
 from memory.card_leak_signals import IO_LEAK_SIGNALS
-from memory.capture_prompt_v1 import (
-    CONVERSATION_CAPTURE,
-    IO_CONVERSATION_CAPTURE_POLICY,
-)
 
-
-# memgarden 0.16.0 的 prompt 以对象 identity 限定唯一已实现的模板；replace
-# 出来的同档 policy 因而会在解析前被误认成「另一档」。只在 prompt 边界把
-# io 的同档副本还原成钉版对象：rubric/prompt 字节不变，状态机随后仍拿原 request
-# 里的 replace policy 做 parse，max_cards=50 才真正生效。升级内核后删掉此垫片。
-_kernel_build_capture_prompt = _kernel_component.build_capture_prompt
-
-
-def _build_capture_prompt_with_io_policy(**kwargs):
-    if kwargs.get("policy") is IO_CONVERSATION_CAPTURE_POLICY:
-        kwargs["policy"] = CONVERSATION_CAPTURE
-    return _kernel_build_capture_prompt(**kwargs)
-
-
-_kernel_component.build_capture_prompt = _build_capture_prompt_with_io_policy
+# io 的落卡档位（``IO_CONVERSATION_CAPTURE_POLICY``，max_cards=50）由调用点经
+# ``CaptureRequest.policy`` 传给组件 —— 走公开入口，不改内核的模块属性。
+# 以前这里有一处对 ``memgarden.component.build_capture_prompt`` 的 monkeypatch
+# （0.16.0 按对象 identity 选模板，replace 出来的同档 policy 会被误认）；
+# 0.20.1 起模板按 ``policy.name`` / 标志位渲染，垫片已删。
+# tests/test_garden_io_capture_policy.py 守着「上限真生效 + 不许再打补丁」。
 
 #: 打回重问最多一次。两条 runtime 共用 —— 各给各的次数，
 #: 同一个模型在托管和自建上会得到不同的重问行为。

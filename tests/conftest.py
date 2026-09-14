@@ -290,6 +290,7 @@ if not _provisioned:
         # 会被静默跳过，本地「全绿」就是假的。
         "test_orchestration_is_not_reimplemented.py",
         "test_garden_component_parity.py",
+        "test_garden_io_capture_policy.py",
         "test_memgarden_dream_migrate_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",
