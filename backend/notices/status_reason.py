@@ -70,6 +70,7 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "coalesced_into",
     "degenerate_reply_suppressed",
     "dream_agent_call_failed",
+    "dream_context_unavailable",
     "dream_invalid_memory_action",
     "dream_memory_actions_applied",
     "dream_memory_actions_failed",

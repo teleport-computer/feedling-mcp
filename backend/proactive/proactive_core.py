@@ -588,6 +588,9 @@ def job_status(store, job_id, payload: dict):
             "expected_consumer_id": current_consumer,
         }, 409
     prev_status = str((current or {}).get("status") or "").strip().lower()
+    # Older resident consumers report a failed Dream card read as "no cards";
+    # never let that advance the Dream ledger while the garden has cards.
+    patch = dream_scheduler.reclassify_unverified_no_cards_completion(store, current, patch)
     job = store.update_proactive_job(job_id, patch)
     if job is None:
         return {"error": "job_not_found"}, 404

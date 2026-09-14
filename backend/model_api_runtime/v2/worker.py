@@ -1877,6 +1877,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_fence_incomplete",
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
+        "dream_context_unavailable",
         "dream_no_memory_actions",
         "dream_source_occurred_at_unavailable",
         "empty_reply",
@@ -12578,6 +12579,17 @@ async def _run_extraction(
                     component="cards",
                     outcome=cards_outcome,
                 )
+            if cards_outcome == "unavailable":
+                # The card read failed (enclave/readside timeout, non-200,
+                # incomplete fetch). Dreaming on nothing would complete as a
+                # no-op and advance the Dream ledger, so the scheduler reports
+                # ``already_dreamed`` until enough NEW cards arrive — an
+                # inactive user is silenced for good (prod, 09-10 / 09-13).
+                # Fail instead: the job goes through the Dream failure backoff
+                # and the ledger stays put. ``truncated`` (the 60k-char prompt
+                # cap) stays an intentional partial context, and the other
+                # context items (buckets/threads/identity) keep degrading.
+                raise RuntimeError("dream_context_unavailable")
         if lane == "capture" and deps.read_capture_state is not None and tail:
             last = tail[-1]
             last_id = str(last.get("id") or "")

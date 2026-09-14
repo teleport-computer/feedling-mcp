@@ -2056,6 +2056,109 @@ def test_dream_completion_advances_state(tmp_path, monkeypatch):
     assert second.get_json()["reason"] == "already_dreamed"
 
 
+def _dream_no_cards_setup(monkeypatch, tmp_path, user_id, *, cards):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    core_store._stores.clear()
+    api_key = f"test_key_{user_id}"
+    registry._key_to_user[registry._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, f"mem_{i}") for i in range(cards)])
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+    tick = client.post("/v1/dream/tick", headers=headers, json={"now": 2000.0})
+    assert tick.get_json()["enqueued"] is True
+    return store, client, headers, tick.get_json()["job"]
+
+
+def _legacy_no_cards_payload(**dream_result_extra):
+    # Exactly what resident consumers before the strict Dream read sent after a
+    # timed-out card read (and after a genuinely empty one).
+    return {
+        "status": "completed",
+        "reason": "dream_no_cards_available",
+        "dream_result": {
+            "status": "noop",
+            "reason": "dream_no_cards_available",
+            "job_kind": "memory_dream",
+            **dream_result_extra,
+        },
+        "cards_merged": 0,
+        "cards_superseded": 0,
+        "questions": [],
+        "noop_reason": "dream_no_cards_available",
+    }
+
+
+def test_legacy_no_cards_completion_with_live_cards_is_a_read_failure(tmp_path, monkeypatch):
+    """Old self-hosted consumers report a failed card read as ``completed`` +
+    ``dream_no_cards_available``. With cards in the garden that must not advance
+    the Dream ledger (prod 09-10 / 09-13 silenced Dream as ``already_dreamed``)."""
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_legacy_no_cards", cards=2
+    )
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json=_legacy_no_cards_payload(),
+    )
+    after = client.post("/v1/dream/tick", headers=headers, json={"now": 2100.0})
+
+    assert done.status_code == 200
+    patched = done.get_json()["job"]
+    assert patched["status"] == "failed"
+    assert patched["status_reason"] == "dream_context_unavailable"
+    assert patched["noop_reason"] == "dream_context_unavailable"
+    assert patched["dream_result"]["status"] == "failed"
+    assert patched["dream_result"]["reason"] == "dream_context_unavailable"
+    assert "completed_at" not in patched and patched.get("failed_at")
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["dream_fail_streak"] == 1
+    assert after.get_json()["enqueued"] is False
+    assert after.get_json()["reason"] == "failure_backoff"
+
+
+def test_verified_empty_no_cards_completion_is_trusted(tmp_path, monkeypatch):
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_verified_empty", cards=2
+    )
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json=_legacy_no_cards_payload(cards_read="empty"),
+    )
+
+    assert done.get_json()["job"]["status"] == "completed"
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] > 0
+    assert state["dream_fail_streak"] == 0
+
+
+def test_legacy_no_cards_completion_with_no_live_cards_stays_completed(tmp_path, monkeypatch):
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_cards_gone", cards=1
+    )
+    db.memory_replace_all(store.user_id, [])  # the only card was deleted before the run
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json=_legacy_no_cards_payload(),
+    )
+
+    assert done.get_json()["job"]["status"] == "completed"
+    assert done.get_json()["job"]["status_reason"] == "dream_no_cards_available"
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["dream_fail_streak"] == 0
+
+
 def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
     tmp_path, monkeypatch
 ):

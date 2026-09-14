@@ -465,6 +465,63 @@ def _tick_memory_dream(
     }
 
 
+#: Resident "no cards" completion. Consumers before the strict Dream read also
+#: sent it when the card read itself failed (timeout/5xx swallowed into ``{}``).
+LEGACY_NO_CARDS_REASON = "dream_no_cards_available"
+#: Content-free failure code for a Dream whose card read failed (V1 and V2).
+CONTEXT_UNAVAILABLE_REASON = "dream_context_unavailable"
+
+
+def reclassify_unverified_no_cards_completion(
+    store, job: Mapping[str, Any] | None, patch: dict[str, Any]
+) -> dict[str, Any]:
+    """Turn an old consumer's "no cards" completion into a read failure when the
+    garden provably has cards.
+
+    Before the strict read, a resident consumer answered a timed-out card read
+    with ``completed`` + ``dream_no_cards_available``. Recording that as a
+    completion advances the Dream ledger, and the scheduler then answers
+    ``already_dreamed`` until enough new cards arrive (prod, 09-10 / 09-13).
+    Current consumers mark a genuinely empty read with
+    ``dream_result.cards_read == "empty"``; only unmarked reports are checked,
+    against the same live, owner-scoped card count the scheduler enqueues on
+    (a Dream is only ever enqueued with ``card_count > 0``). Any doubt — marker
+    present, zero live cards, or the count itself failing — keeps the patch
+    exactly as sent.
+    """
+    if not capture_jobs.is_memory_dream_job(job):
+        return patch
+    if str(patch.get("status") or "") != "completed":
+        return patch
+    dream_result = patch.get("dream_result") if isinstance(patch.get("dream_result"), Mapping) else {}
+    reasons = {
+        str(patch.get("status_reason") or ""),
+        str(patch.get("noop_reason") or ""),
+        str(dream_result.get("reason") or ""),
+    }
+    if LEGACY_NO_CARDS_REASON not in reasons or dream_result.get("cards_read") == "empty":
+        return patch
+    try:
+        card_count = int(_dream_snapshot(store).get("card_count") or 0)
+    except Exception:  # noqa: BLE001 — a failed count must not change what the consumer said
+        return patch
+    if card_count <= 0:
+        return patch
+    rewritten = {
+        key: value for key, value in patch.items() if key != "completed_at"
+    }
+    rewritten["status"] = "failed"
+    rewritten["failed_at"] = patch.get("completed_at") or datetime.now().isoformat()
+    rewritten["status_reason"] = CONTEXT_UNAVAILABLE_REASON
+    rewritten["noop_reason"] = CONTEXT_UNAVAILABLE_REASON
+    rewritten["dream_result"] = {
+        **dict(dream_result),
+        "status": "failed",
+        "reason": CONTEXT_UNAVAILABLE_REASON,
+    }
+    return rewritten
+
+
 def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     if not capture_jobs.is_memory_dream_job(job):
         return load_dream_state(store)

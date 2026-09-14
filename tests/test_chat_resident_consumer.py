@@ -4788,6 +4788,13 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
     monkeypatch.setattr(crc, "_capture_post_json", _post_json)
+    # Dream's card read goes through the strict helper (a failed read must not
+    # look like an empty garden); the harness answers it from the same fixtures.
+    monkeypatch.setattr(
+        crc,
+        "_dream_post_items",
+        lambda path, *, payload, timeout: _post_json(path, payload=payload)["items"],
+    )
     monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(
         crc,
@@ -5696,6 +5703,151 @@ def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
         "memory.dream.error",
     ]
     assert captured["traces"][-1]["detail"]["outcome"] == "parse_rejected"
+
+
+class _DreamReadsideClient:
+    """Stands in for the pooled httpx client under the real strict Dream read.
+
+    ``answers`` maps a path suffix to an ``httpx.Response`` factory or an
+    exception instance; the request/response objects are real httpx ones so
+    ``raise_for_status`` / ``json`` behave exactly as in production.
+    """
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.paths = []
+
+    def post(self, url, *, json=None, headers=None, timeout=None):
+        import httpx
+
+        path = next(p for p in self.answers if url.endswith(p))
+        self.paths.append(path)
+        answer = self.answers[path]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer(httpx.Request("POST", url), json)
+
+
+def _json_response(status, body):
+    import httpx
+
+    def _make(request, _payload):
+        return httpx.Response(status, json=body, request=request)
+
+    return _make
+
+
+def _raw_response(status, content):
+    import httpx
+
+    def _make(request, _payload):
+        return httpx.Response(status, content=content, request=request)
+
+    return _make
+
+
+def _install_real_dream_read(monkeypatch, client):
+    """Undo the harness shortcut: the job reads cards through the real strict
+    helper and the real ``_client_for`` seam, answered by ``client``."""
+    monkeypatch.setattr(crc, "_dream_post_items", _REAL_DREAM_POST_ITEMS)
+    monkeypatch.setattr(crc, "_client_for", lambda _root: client)
+
+    def _no_lenient_read(path, **_kwargs):
+        raise AssertionError(f"Dream must not read {path} through the lenient helper")
+
+    monkeypatch.setattr(crc, "_capture_post_json", _no_lenient_read)
+
+
+_REAL_DREAM_POST_ITEMS = crc._dream_post_items
+_DREAM_INDEX_OK = {"items": [
+    {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life"},
+    {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life"},
+]}
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        pytest.param({"/v1/memory/index": "timeout"}, id="index-timeout"),
+        pytest.param({"/v1/memory/index": _json_response(503, {"error": "enclave"})}, id="index-503"),
+        pytest.param({"/v1/memory/index": _raw_response(200, b"<html>gateway</html>")}, id="index-not-json"),
+        pytest.param({"/v1/memory/index": _json_response(200, {"error": "x"})}, id="index-no-items"),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK), "/v1/memory/fetch": "timeout"},
+            id="fetch-timeout",
+        ),
+    ],
+)
+def test_dream_job_failed_card_read_fails_instead_of_completing_as_no_cards(monkeypatch, answers):
+    """Prod 09-10 / 09-13: the index read timed out, the lenient helper returned
+    {}, and the job completed as ``dream_no_cards_available`` — the backend then
+    advanced the Dream ledger and silenced Dream. A failed read must fail."""
+    import httpx
+
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    answers = {
+        path: (httpx.ReadTimeout("timed out") if answer == "timeout" else answer)
+        for path, answer in answers.items()
+    }
+    client = _DreamReadsideClient(answers)
+    _install_real_dream_read(monkeypatch, client)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert client.paths == list(answers)
+    assert captured["prompts"] == []  # no model call on an unreadable garden
+    assert captured["actions"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (job_id, status, reason) == ("dream_dispatch", "failed", "dream_context_unavailable")
+    extra = kwargs["extra"]
+    assert extra["dream_result"] == {
+        "status": "failed",
+        "reason": "dream_context_unavailable",
+        "job_kind": "memory_dream",
+    }
+    assert extra["noop_reason"] == "dream_context_unavailable"
+    assert all(row[1] != "completed" for row in captured["statuses"])
+    assert [row["type"] for row in captured["traces"]][-2:] == [
+        "memory.extraction.context.error",
+        "memory.dream.error",
+    ]
+    assert captured["traces"][-1]["detail"]["outcome"] == "context_unavailable"
+
+
+def test_dream_job_genuinely_empty_garden_still_completes_as_verified_no_cards(monkeypatch):
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    client = _DreamReadsideClient(
+        {"/v1/memory/index": _json_response(200, {"items": [], "unavailable_ids": []})}
+    )
+    _install_real_dream_read(monkeypatch, client)
+
+    crc._process_resident_jobs([job])
+
+    assert captured["prompts"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (job_id, status, reason) == ("dream_dispatch", "completed", "dream_no_cards_available")
+    assert kwargs["extra"]["dream_result"]["cards_read"] == "empty"
+    assert captured["traces"][-1]["detail"]["outcome"] == "noop"
+
+
+def test_dream_job_reads_full_cards_through_the_strict_read(monkeypatch):
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    client = _DreamReadsideClient({
+        "/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+        "/v1/memory/fetch": _json_response(200, {"items": [
+            {"id": "mem_a", "content": "Full card A body."},
+            {"id": "mem_b", "content": "Full card B body."},
+        ]}),
+    })
+    _install_real_dream_read(monkeypatch, client)
+
+    crc._process_resident_jobs([job])
+
+    assert client.paths == ["/v1/memory/index", "/v1/memory/fetch"]
+    assert "Full card A body." in captured["prompts"][0]
+    assert _dream_final_status(captured)[:3] == (
+        "dream_dispatch", "completed", "dream_nothing_to_consolidate",
+    )
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):

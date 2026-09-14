@@ -531,26 +531,170 @@ def test_dream_metric_failure_does_not_emit_a_second_overall_terminal(monkeypatc
     assert metrics.flush_calls == 2
 
 
-def test_dream_context_degradation_is_not_indistinguishable_from_model_noop(
+def _stub_dream_readside(monkeypatch, *, index, fetch=None):
+    """Drive the production Dream context reader with a stubbed readside.
+
+    ``serve_worker._read_dream_memory_context`` runs for real; only the
+    enclave-bound ``memory_core`` calls and the token/identity helpers are
+    replaced, so the reader's own outcome classification is what is tested.
+    """
+    from model_api_runtime.v2 import serve_worker
+
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker, "_load_identity_card_view", lambda _store, *, runtime_token: {}
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    monkeypatch.setattr("memory.memory_core.index", index)
+    if fetch is not None:
+        monkeypatch.setattr("memory.memory_core.fetch", fetch)
+    return serve_worker
+
+
+def _raise(exc):
+    def _call(*_a, **_k):
+        raise exc
+
+    return _call
+
+
+@pytest.mark.parametrize(
+    "index, fetch",
+    [
+        pytest.param(lambda *a, **k: ({"error": "readside_unavailable"}, 503), None, id="index-503"),
+        pytest.param(_raise(RuntimeError("enclave_error:ReadTimeout")), None, id="index-timeout"),
+        pytest.param(
+            lambda *a, **k: ({"items": [{"id": f"mem_{i}"} for i in range(12)]}, 200),
+            lambda *a, **k: ({"error": "readside_unavailable"}, 503),
+            id="fetch-503",
+        ),
+    ],
+)
+def test_dream_failed_card_read_fails_with_backoff_instead_of_advancing_ledger(
+    monkeypatch, index, fetch,
+):
+    """Prod 09-10 / 09-13: a failed card read used to complete as a no-op and
+    advance the Dream ledger (``already_dreamed`` forever after)."""
+    from proactive import dream_scheduler
+
+    uid = "u_x_dream_card_read_failed"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(12)])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    serve_worker = _stub_dream_readside(monkeypatch, index=index, fetch=fetch)
+    provider_calls = []
+
+    async def _provider(*_a, **_k):
+        provider_calls.append(1)
+        raise AssertionError("an unreadable garden must not reach the provider")
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    traces, emit_trace = _trace_collector()
+    recorded = []
+
+    def _record(user_id, lane, status, detail):
+        recorded.append((lane, status))
+        serve_worker._record_extraction_status(user_id, lane, status, detail)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=serve_worker._read_dream_memory_context,
+            emit_debug_trace=emit_trace,
+            record_extraction_status=_record,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_context_unavailable")
+    assert recorded == [("dream", "failed")]
+    context_error = next(
+        row for row in traces if row["type"] == "memory.extraction.context.error"
+    )
+    assert context_error["detail"]["outcome"] == "unavailable"
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.error"
+    assert terminal["detail"]["outcome"] == "context_unavailable"
+    assert terminal["detail"]["degraded_context"] is True
+
+    store = core_store.get_store_per_load_mode(uid, reason="test dream ledger")
+    state = dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["last_dreamed_seed_card_count"] == 0
+    assert state["dream_fail_streak"] == 1
+    assert state["last_dream_failed_at"] > 0.0
+    # The next tick backs off instead of saying ``already_dreamed``.
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    tick = dream_scheduler.tick_memory_dream(
+        store, submit=lambda *_a, **_k: {"enqueued": True}
+    )
+    assert tick["reason"] == "failure_backoff"
+
+
+def test_dream_empty_successful_card_read_keeps_the_noop_completion(monkeypatch):
+    uid = "u_x_dream_empty_read"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    serve_worker = _stub_dream_readside(
+        monkeypatch, index=lambda *a, **k: ({"items": [], "unavailable_ids": []}, 200)
+    )
+    _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=serve_worker._read_dream_memory_context,
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert _job_row(job_id) == ("completed", None)
+    assert "memory.extraction.context.error" not in [row["type"] for row in traces]
+    assert traces[-1]["type"] == "memory.dream.done"
+    assert traces[-1]["detail"]["outcome"] == "noop"
+    assert traces[-1]["detail"]["degraded_context"] is False
+
+
+def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_context(
     monkeypatch,
 ):
-    uid = "u_x_dream_degraded_trace"
+    """The 60k-char card cap is a deliberate partial context, not a read failure."""
+    uid = "u_x_dream_truncated_context"
     _seed_v2(uid)
-    jobs_store.enqueue_job(uid, "dream")
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
     job = jobs_store.claim_next_job("w")
+    calls = []
 
-    async def _empty(**_kwargs):
-        return [], None
+    async def _provider(_cfg, _messages, **_kwargs):
+        calls.append(1)
+        return {"reply": '{"consolidations": []}', "stop_reason": "end_turn"}
 
-    monkeypatch.setattr(extraction, "extract", _empty)
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
     traces, emit_trace = _trace_collector()
     status = asyncio.run(worker.process_job(
         job,
         _deps(
             read_dream_memory_context=lambda _uid: {
-                "cards": "",
-                "card_items": [],
-                "_diagnostic_cards_outcome": "unavailable",
+                "cards": "C", "card_items": cards,
+                "_diagnostic_cards_outcome": "truncated",
             },
             emit_debug_trace=emit_trace,
         ),
@@ -560,28 +704,9 @@ def test_dream_context_degradation_is_not_indistinguishable_from_model_noop(
     ))
 
     assert status == "completed"
-    context_error = next(
-        row for row in traces
-        if row["type"] == "memory.extraction.context.error"
-    )
-    assert context_error["detail"] == {
-        "runtime": "hosted_v2",
-        "lane": "dream",
-        "component": "cards",
-        "outcome": "unavailable",
-    }
-    terminal = traces[-1]
-    assert terminal["type"] == "memory.dream.done"
-    assert terminal["status"] == "warning"
-    assert terminal["detail"]["outcome"] == "noop"
-    assert terminal["detail"]["degraded_context"] is True
-    # An unreadable card set is not "too few cards": it must never be
-    # recorded as a small-garden skip (which would space the next attempt).
-    with db.get_pool().connection() as conn:
-        assert conn.execute(
-            "SELECT wake_result FROM agent_jobs WHERE lane='dream' AND user_id=%s",
-            (uid,),
-        ).fetchone() == (None,)
+    assert calls == [1]
+    assert _job_row(job_id) == ("completed", None)
+    assert traces[-1]["detail"]["degraded_context"] is True
 
 
 def _dream_job_outcome(job_id):

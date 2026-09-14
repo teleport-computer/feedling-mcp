@@ -12,6 +12,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Memory Dream no longer treats a failed card read as an empty Memory Garden.
+  When reading the cards times out or errors (for example an enclave decrypt
+  timeout), the Dream job now fails with `dream_context_unavailable` (V2 job
+  code `extraction_failed:dream_context_unavailable`), goes through the
+  existing Dream failure backoff, and leaves the "last dreamed" record
+  untouched, so Dream runs again once reading recovers. Previously such a run
+  completed as a no-op (`dream_no_cards_available` on resident V1 and
+  self-hosted consumers) and Dream then stayed silent as `already_dreamed`
+  until enough new cards arrived. A read that succeeds and returns no cards
+  still completes as before. The backend also applies this to status reports
+  from older self-hosted consumers: a "no cards" completion is recorded as
+  `dream_context_unavailable` when the garden has active cards.
+
 - Resident (V1 and self-hosted) memory capture, dream and migrate failures
   caused by the agent call now keep a content-free cause in job status and
   lane diagnostics, such as `dream_agent_call_failed:auth_invalid`,
