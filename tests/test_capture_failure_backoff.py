@@ -228,3 +228,41 @@ def test_duplicate_failed_report_does_not_double_streak(tmp_path, monkeypatch):
     proactive_core.job_status(store2, job2_id, {"status": "failed", "reason": "boom again"})
     state2 = capture_scheduler.load_capture_state(store2)
     assert int(state2.get("capture_fail_streak") or 0) == 1
+
+
+def test_v1_skip_keeps_the_seq_cursor_honest(tmp_path, monkeypatch):
+    """🔴 V1 逃生阀跳过时，不能把 seq 游标写成「0 且已初始化」。
+
+    V1 的窗口来自 _current_window()，**没有 through_seq**。以前跳过时照样写
+    seq=0 + capture_seq_initialized=True，调度器从此信任这个 0，从历史起点
+    重新发现消息 —— 已经跳过/记过的消息又被算成「新消息」。
+
+    这里走真实调度器生成的窗口（不手工拼 through_seq，那正是之前测试漏掉它的原因）。
+    """
+    from memory import capture_failure
+
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "10")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    store = _store(tmp_path, monkeypatch, "usr_capture_skip_seq_honest")
+    _seed_chat(store, "m1")
+    t = _seed_chat(store, "m2") + 20
+
+    for attempt in range(1, capture_failure.CAPTURE_POISON_SKIP_AFTER + 1):
+        tick = capture_scheduler.tick_quiet_capture(store, now=t)
+        assert tick["enqueued"] is True, (attempt, tick.get("reason"))
+        assert "through_seq" not in (tick["job"].get("capture_window") or {}), (
+            "V1 窗口带上了 through_seq —— 这条测试的前提变了，重新看一下跳过补丁")
+        failed = store.update_proactive_job(tick["job"]["job_id"], {
+            "status": "failed",
+            "status_reason": "json_decode_error:JSONDecodeError",
+        })
+        t += 5
+        capture_scheduler.record_capture_job_status(store, failed, status="failed", now=t)
+        t += 6 * 3600 + 1  # 跳过退避上限
+
+    state = capture_scheduler.load_capture_state(store)
+    assert int(state["capture_skipped_windows"]) == 1
+    assert state["last_captured_until_message_id"] == "m2"
+    assert state["capture_seq_initialized"] is False, "拿不到 seq 却声明已初始化"
+    # 下次读游标按 m2 翻译出真实 seq：m1/m2 不再被当成新消息。
+    assert capture_scheduler._live_messages_after_capture(store, state) == []

@@ -3790,6 +3790,12 @@ def commit_capture_batch(
                             user_id=str(user_id),
                             claimed_by=str(claimed_by),
                             error=rejection,
+                            # 批次已锁定且 after_seq 就是当前游标（上面校验过），
+                            # 能证明是同一个窗口。不带的话 worker 看到 rejected 直接
+                            # 返回、不会再走带窗口的 fail_capture_job —— 同一窗口
+                            # 每次都被拒，streak 无限涨却永不跳过。
+                            # batch_unavailable / frontier_changed 证明不了是同一窗口，不传。
+                            window=capture_failure.window_from_batch_row(batch),
                         )
                         result = {
                             "committed": False,

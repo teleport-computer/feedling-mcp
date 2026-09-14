@@ -31,7 +31,7 @@ os.environ.setdefault("FEEDLING_DATA_DIR",
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import jobs_store  # noqa: E402
-from proactive import capture_scheduler as cs  # noqa: E402
+from memory import capture_failure as cf  # noqa: E402
 
 WINDOW = {"after_message_id": "msg_a", "after_seq": 100,
           "until_message_id": "msg_c", "until_ts": 1000.0,
@@ -74,7 +74,7 @@ def test_v2_parse_failures_skip_after_three_on_the_same_frontier():
     assert code == "extraction_failed:json_decode_error"
     state: dict = {"last_captured_until_message_id": "msg_a",
                    "last_captured_until_seq": 100}
-    for i in range(1, cs.CAPTURE_POISON_SKIP_AFTER):
+    for i in range(1, cf.CAPTURE_POISON_SKIP_AFTER):
         state = _fail(state, error=code, window=WINDOW)
         assert state["last_captured_until_seq"] == 100, f"第 {i} 次就跳了"
     state = _fail(state, error=code, window=WINDOW)
@@ -87,7 +87,7 @@ def test_v2_write_failures_get_the_patient_threshold():
     """V2 上「存不进去」同样走 6 次档 —— 和 V1 用的是同一个判断函数。"""
     state: dict = {"last_captured_until_seq": 100}
     reason = "capture_memory_write_failed:RuntimeError"
-    for _ in range(cs.CAPTURE_TRANSIENT_SKIP_AFTER - 1):
+    for _ in range(cf.CAPTURE_TRANSIENT_SKIP_AFTER - 1):
         state = _fail(state, error=reason, window=WINDOW)
     assert state["last_captured_until_seq"] == 100
     state = _fail(state, error=reason, window=WINDOW)
@@ -112,7 +112,7 @@ def test_without_a_window_the_behaviour_is_byte_identical():
 def test_no_backoff_means_no_streak_and_no_skip():
     """increment_backoff=False（落卡被关这类）：不累加、更不跳，即使带了窗口。"""
     state = {"capture_fail_streak": 2, "last_captured_until_seq": 100,
-             "capture_fail_window_key": cs._window_key(WINDOW)}
+             "capture_fail_window_key": cf.window_key(WINDOW)}
     out = _fail(state, error="json_decode_error:X", window=WINDOW,
                 increment_backoff=False)
     assert out["capture_fail_streak"] == 2

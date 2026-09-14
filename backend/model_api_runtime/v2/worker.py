@@ -95,6 +95,7 @@ from core import provider_usage
 from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory import capture_failure
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
 from memgarden import contracts as mg_contracts
@@ -1917,27 +1918,6 @@ PUBLIC_FAILURE_CODES = frozenset(
         for kind in _EXTRACTION_FAILURE_KINDS
     }
 )
-
-
-def _capture_window_from_prepared_batch(batch: dict[str, Any]) -> dict[str, Any]:
-    """Prepared 批次行 → 失败处理/逃生阀认得的窗口形状（只取游标字段，不碰内容）。"""
-    def _int(value: Any) -> int:
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    try:
-        until_ts = float(batch.get("until_ts") or 0.0)
-    except (TypeError, ValueError):
-        until_ts = 0.0
-    return {
-        "after_message_id": str(batch.get("after_message_id") or "")[:160],
-        "after_seq": _int(batch.get("after_seq")),
-        "until_message_id": str(batch.get("until_message_id") or "")[:160],
-        "until_ts": until_ts,
-        "through_seq": _int(batch.get("through_seq")),
-    }
 
 
 def _extraction_failure_code(exc: BaseException) -> str:
@@ -12461,7 +12441,7 @@ async def _run_extraction(
                 # 要不要跳过；还停在上面那个 until_message_id="" 的空壳的话，
                 # 逃生阀永远不触发，这个批次就成了新的队头阻塞。
                 capture_window.update(
-                    _capture_window_from_prepared_batch(prepared_retry)
+                    capture_failure.window_from_batch_row(prepared_retry)
                 )
                 await _ensure_capture_not_halted("prepared_retry_commit")
                 committed_retry = await asyncio.to_thread(

@@ -136,13 +136,17 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
     streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
     if streak < threshold:
         return None
+    through_seq = max(0, int(_safe_float(w.get("through_seq"), 0.0)))
     return {
         "last_captured_until_message_id": until_id,
         "last_captured_until_ts": _safe_float(w.get("until_ts"), 0.0),
-        "last_captured_until_seq": max(
-            0, int(_safe_float(w.get("through_seq"), 0.0))
-        ),
-        "capture_seq_initialized": True,
+        # 🔴 V1 的窗口（capture_scheduler._current_window）**没有 through_seq**。
+        # 以前这里照样写 seq=0 + 已初始化，调度器从此信任这个 0，从历史起点
+        # 重新发现消息（Codex 2026-09-14 抓到，V1 逃生阀上线时就带着）。
+        # 拿不到可靠 seq 时标成「未初始化」：下次读游标会按 until_message_id
+        # 重新翻译出真实 seq —— 和老数据升级走的是同一条路。
+        "last_captured_until_seq": through_seq,
+        "capture_seq_initialized": through_seq > 0,
         # 跳过之后 streak 归零：下一批是干净的，不该带着旧账退避。
         "capture_fail_streak": 0,
         "capture_fail_window_key": "",
@@ -199,3 +203,18 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     return ({"capture_fail_streak": streak,
              "capture_fail_window_key": key,
              "last_capture_failed_at": now_ts}, streak, False)
+
+
+def window_from_batch_row(batch: Mapping[str, Any]) -> dict[str, Any]:
+    """V2 持久批次行（v2_capture_batches）→ 逃生阀认得的窗口。只取游标字段，不碰内容。
+
+    prepared 批次重试、以及提交时被语义拒绝，这两处手上都只有批次行、没有
+    worker 那边算好的窗口 —— 不还原的话窗口是空壳，逃生阀永远不触发。
+    """
+    return {
+        "after_message_id": str(batch.get("after_message_id") or "")[:160],
+        "after_seq": max(0, int(_safe_float(batch.get("after_seq"), 0.0))),
+        "until_message_id": str(batch.get("until_message_id") or "")[:160],
+        "until_ts": _safe_float(batch.get("until_ts"), 0.0),
+        "through_seq": max(0, int(_safe_float(batch.get("through_seq"), 0.0))),
+    }

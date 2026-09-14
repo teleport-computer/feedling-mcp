@@ -32,6 +32,7 @@ os.environ.setdefault("FEEDLING_DATA_DIR",
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from proactive import capture_scheduler as cs  # noqa: E402
+from memory import capture_failure as cf  # noqa: E402
 
 W1 = {"after_message_id": "msg_a", "until_message_id": "msg_c",
       "through_seq": 120, "until_ts": 1000.0, "message_count": 8}
@@ -88,10 +89,10 @@ def test_a_window_without_an_end_is_never_skipped():
     """拿不到窗口终点 → 不跳。把游标推到说不清的位置比继续卡着更糟。"""
     blind = {"after_message_id": "msg_a", "through_seq": 120}
     state = {"capture_fail_streak": 5, "capture_fail_window_key":
-             cs._window_key(blind)}
-    assert cs._poison_skip_patch(state, blind, now_ts=1.0) is None
-    assert cs._poison_skip_patch(state, None, now_ts=1.0) is None
-    assert cs._poison_skip_patch(state, {}, now_ts=1.0) is None
+             cf.window_key(blind)}
+    assert cf.poison_skip_patch(state, blind, now_ts=1.0) is None
+    assert cf.poison_skip_patch(state, None, now_ts=1.0) is None
+    assert cf.poison_skip_patch(state, {}, now_ts=1.0) is None
 
 
 def test_a_moving_window_end_does_not_reset_the_streak():
@@ -138,7 +139,7 @@ def test_the_threshold_is_high_enough_to_ride_out_transient_failures():
 
     定成 1 的话，一次网络抖动就会丢掉一批真实记忆。
     """
-    assert cs.CAPTURE_POISON_SKIP_AFTER >= 2
+    assert cf.CAPTURE_POISON_SKIP_AFTER >= 2
 
 
 def test_a_job_without_window_info_still_accumulates_the_backoff_streak():
@@ -198,8 +199,8 @@ def test_a_write_failure_gets_more_retries_than_a_parse_failure():
     """
     write_skip = _fail_until_skip("capture_memory_write_failed:RuntimeError")
     parse_skip = _fail_until_skip("json_decode_error:JSONDecodeError")
-    assert parse_skip == cs.CAPTURE_POISON_SKIP_AFTER
-    assert write_skip == cs.CAPTURE_TRANSIENT_SKIP_AFTER
+    assert parse_skip == cf.CAPTURE_POISON_SKIP_AFTER
+    assert write_skip == cf.CAPTURE_TRANSIENT_SKIP_AFTER
     assert write_skip > parse_skip, "写入失败没比解析失败多给机会"
 
 
@@ -207,7 +208,7 @@ def test_parse_failures_still_skip_fast():
     """修写入那边，不能把解析失败也拖慢 —— 那一类重试一万次也一样。"""
     for reason in ("json_decode_error:JSONDecodeError", "no_json_object",
                    "not_an_object"):
-        assert _fail_until_skip(reason) == cs.CAPTURE_POISON_SKIP_AFTER, reason
+        assert _fail_until_skip(reason) == cf.CAPTURE_POISON_SKIP_AFTER, reason
 
 
 def test_an_unknown_failure_defaults_to_the_patient_threshold():
@@ -216,15 +217,15 @@ def test_an_unknown_failure_defaults_to_the_patient_threshold():
     白名单只列确定性失败。反过来用黑名单的话，下一种新冒出来的
     「会自己好的失败」会被 3 次就跳掉，又开始悄悄丢记忆。
     """
-    assert _fail_until_skip("some_brand_new_failure") == cs.CAPTURE_TRANSIENT_SKIP_AFTER
-    assert _fail_until_skip("") == cs.CAPTURE_TRANSIENT_SKIP_AFTER
+    assert _fail_until_skip("some_brand_new_failure") == cf.CAPTURE_TRANSIENT_SKIP_AFTER
+    assert _fail_until_skip("") == cf.CAPTURE_TRANSIENT_SKIP_AFTER
 
 
 def test_even_transient_failures_eventually_skip():
     """会自己好的失败也**必须有上限** —— 不然某批写入失败其实是确定性的时候，
     用户又会被永久卡死，也就是这整套逃生阀要修的问题。"""
     assert _fail_until_skip("capture_memory_write_failed:RuntimeError") is not None
-    assert cs.CAPTURE_TRANSIENT_SKIP_AFTER > cs.CAPTURE_POISON_SKIP_AFTER
+    assert cf.CAPTURE_TRANSIENT_SKIP_AFTER > cf.CAPTURE_POISON_SKIP_AFTER
 
 
 def test_the_reason_is_read_from_either_place_on_the_job():
@@ -261,7 +262,7 @@ def test_the_real_v1_call_site_passes_the_failure_reason(monkeypatch):
            "capture_result": {"status": "failed",
                               "reason": "json_decode_error:JSONDecodeError"}}
     # 解析失败 → 第 3 次就该跳过、游标推过去
-    for _ in range(cs.CAPTURE_POISON_SKIP_AFTER):
+    for _ in range(cf.CAPTURE_POISON_SKIP_AFTER):
         try:
             cs.record_capture_job_status(object(), job, status="failed", now=1.0)
         except Exception:  # noqa: BLE001 —— 下游 trace 之类的副作用不关心

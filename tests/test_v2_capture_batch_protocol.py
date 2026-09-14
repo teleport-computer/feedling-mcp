@@ -2091,3 +2091,42 @@ def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeyp
         assert conn.execute(
             "SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)
         ).fetchone()[0] == 0
+
+
+def test_commit_rejected_on_the_same_window_is_eventually_skipped():
+    """🔴 同一窗口每次提交都被语义拒绝（例如 supersede 的目标已不存在）：到上限后跳过。
+
+    拒绝分支会删批次、标失败，worker 看到 rejected 直接返回，**不会**再走带窗口的
+    fail_capture_job。以前这里不带窗口 → streak 无限涨、永不跳过。
+    """
+    from memory import capture_failure
+
+    uid = "u_capture_poison_commit_rejected"
+    _seed(uid)
+    limit = capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
+    for attempt in range(1, limit + 1):
+        owner = f"reject-owner-{attempt}"
+        job_id, _job = _running(uid, owner=owner)
+        batch = jobs_store.prepare_capture_batch(
+            job_id=job_id, user_id=uid, claimed_by=owner,
+            window=_window(after=0, through=3),
+            actions=[{
+                "type": "memory.supersede",
+                "supersedes": "deleted-target",
+                "envelope": _envelope(uid, f"mom-reject-{attempt}"),
+            }],
+        )
+        assert batch is not None
+        result = jobs_store.commit_capture_batch(
+            job_id=job_id, user_id=uid, claimed_by=owner, batch_id=batch["id"],
+        )
+        assert result["rejected"] is True
+        state = _capture_state(uid)
+        if attempt < limit:
+            assert int(state.get("last_captured_until_seq") or 0) == 0, f"第 {attempt} 次就跳了"
+            assert int(state["capture_fail_streak"]) == attempt
+
+    assert int(state["last_captured_until_seq"]) == 3
+    assert state["last_captured_until_message_id"] == "m3"
+    assert state["capture_seq_initialized"] is True
+    assert int(state["capture_skipped_windows"]) == 1

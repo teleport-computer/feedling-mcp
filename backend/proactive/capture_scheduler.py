@@ -18,15 +18,7 @@ from psycopg.types.json import Jsonb
 from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
-from memory.capture_failure import (  # noqa: F401 — 逃生阀判断和 V2 共用，见该模块
-    CAPTURE_POISON_SKIP_AFTER,
-    CAPTURE_TRANSIENT_SKIP_AFTER,
-    DETERMINISTIC_FAILURE_KINDS as _DETERMINISTIC_FAILURE_PREFIXES,
-    capture_failure_patch as _capture_failure_patch,
-    poison_skip_patch as _poison_skip_patch,
-    skip_threshold_for as _skip_threshold_for,
-    window_key as _window_key,
-)
+from memory.capture_failure import capture_failure_patch as _capture_failure_patch
 
 log = logging.getLogger(__name__)
 
