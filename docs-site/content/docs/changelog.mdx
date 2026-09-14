@@ -25,6 +25,16 @@ change must not be interpreted as an API guarantee.
   from older self-hosted consumers: a "no cards" completion is recorded as
   `dream_context_unavailable` when the garden has active cards.
 
+- Hosted Runtime V2 Capture and Dream now treat a model reply that stops at the
+  output-token limit without any visible text (typically a thinking model that
+  spent the whole budget on reasoning) as an output truncation instead of an
+  unavailable provider. It is no longer re-sent three times with the same
+  budget; it takes the lane's truncation retry (for Dream, a 24,000-token
+  budget) and, if that also runs out, fails as `output_truncated` rather than
+  `upstream_unavailable`. Stop markers from every supported wire count
+  (`length`, `max_tokens`, `max_output_tokens`). Chat and other provider
+  callers are unchanged.
+
 - Resident (V1 and self-hosted) memory capture, dream and migrate failures
   caused by the agent call now keep a content-free cause in job status and
   lane diagnostics, such as `dream_agent_call_failed:auth_invalid`,

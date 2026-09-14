@@ -709,6 +709,75 @@ def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_conte
     assert traces[-1]["detail"]["degraded_context"] is True
 
 
+@pytest.mark.parametrize("second_reply_truncated", [False, True])
+def test_dream_thinking_model_spending_the_budget_gets_the_truncation_retry(
+    monkeypatch, second_reply_truncated,
+):
+    """Prod: thinking models answered HTTP 200 with only a thinking block and
+    stop_reason=max_tokens. Dream re-sent the same prompt three times at the
+    same budget and failed as ``upstream_unavailable``. Real transport + real
+    Anthropic parser + real retry wrapper + real extract + real worker."""
+    import httpx
+
+    uid = "u_x_dream_thinking_budget"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    requests = []
+    thinking_only = {
+        "id": "msg_t", "type": "message", "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "...", "signature": "s"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 9000, "output_tokens": 12000},
+    }
+    answered = {
+        "id": "msg_a", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": '{"consolidations": []}'}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 9000, "output_tokens": 40},
+    }
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        body = thinking_only if len(requests) == 1 or second_reply_truncated else answered
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_async_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(provider_client.asyncio, "sleep", _no_sleep)
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C", "card_items": cards,
+        }),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    budget = extraction.max_output_tokens_for_lane("dream")
+    retry_budget = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    assert [row["max_tokens"] for row in requests] == [budget, retry_budget]
+    if second_reply_truncated:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    else:
+        assert status == "completed"
+        assert _job_row(job_id) == ("completed", None)
+
+
 def _dream_job_outcome(job_id):
     with db.get_pool().connection() as conn:
         return conn.execute(

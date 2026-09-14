@@ -173,6 +173,32 @@ def _provider_failure_code(exc: BaseException) -> str:
     return "unknown"
 
 
+def _response_shape(stop_reason: Any, usage: Any, budget: int) -> dict[str, Any]:
+    """Content-free shape of one provider answer, used for truncation handling.
+
+    Every wire's output-cap marker (OpenAI ``length``, Anthropic/Bedrock/Gemini
+    ``max_tokens``, Responses ``max_output_tokens``) is recorded as ``length``.
+    """
+    raw_stop_reason = str(stop_reason or "").strip()
+    raw_completion_tokens = (
+        usage.get("completion_tokens") if isinstance(usage, dict) else None
+    )
+    return {
+        "stop_reason": (
+            "length"
+            if provider_client.is_token_limit_stop_reason(raw_stop_reason)
+            else ("other" if raw_stop_reason else "")
+        ),
+        "completion_tokens": (
+            max(0, int(raw_completion_tokens))
+            if isinstance(raw_completion_tokens, (int, float))
+            and not isinstance(raw_completion_tokens, bool)
+            else None
+        ),
+        "max_tokens": budget,
+    }
+
+
 async def extract(
     *,
     provider_config: Any,
@@ -241,8 +267,38 @@ async def extract(
                 temperature=_TEMPERATURE,
                 timeout=_TIMEOUT_SEC,
                 progress_cb=progress_cb,
+                # An empty reply that stopped at the token cap is this lane's
+                # truncation (handled below), not a transport blip to re-send
+                # three times at the budget that just ran out.
+                retry_output_truncation=False,
             )
         except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
+            if provider_client.is_output_truncation_error(e):
+                # HTTP 200, success shape, no usable text, stop marker = output
+                # cap: typically a thinking model that spent the whole budget on
+                # hidden reasoning. The route answered, so this is recorded as a
+                # response (usage, route liveness), and the empty reply carries
+                # the length shape so the truncation retry below owns it.
+                truncated_usage = getattr(e, "truncation_usage", None)
+                if usage_out is not None:
+                    usage_out(truncated_usage)
+                if trajectory_out is not None:
+                    await trajectory_out(
+                        "provider_response",
+                        {
+                            "response": {
+                                "reply": "",
+                                "stop_reason": str(getattr(e, "stop_reason", "") or ""),
+                                "usage": truncated_usage,
+                                "provider_attempt_trace": (
+                                    provider_client.runtime_provider_attempt_trace(e)
+                                ),
+                            }
+                        },
+                    )
+                return None, "empty_reply", _response_shape(
+                    "length", truncated_usage, budget
+                )
             error_code = _provider_failure_code(e)
             if trajectory_out is not None:
                 await trajectory_out(
@@ -261,25 +317,9 @@ async def extract(
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if trajectory_out is not None:
             await trajectory_out("provider_response", {"response": result})
-        raw_stop_reason = str((result or {}).get("stop_reason") or "").strip().lower()
-        usage = (result or {}).get("usage")
-        raw_completion_tokens = (
-            usage.get("completion_tokens") if isinstance(usage, dict) else None
+        response_shape = _response_shape(
+            (result or {}).get("stop_reason"), (result or {}).get("usage"), budget
         )
-        response_shape = {
-            "stop_reason": (
-                "length"
-                if raw_stop_reason == "length"
-                else ("other" if raw_stop_reason else "")
-            ),
-            "completion_tokens": (
-                max(0, int(raw_completion_tokens))
-                if isinstance(raw_completion_tokens, (int, float))
-                and not isinstance(raw_completion_tokens, bool)
-                else None
-            ),
-            "max_tokens": budget,
-        }
         reply = str((result or {}).get("reply") or "").strip()
         if not reply:
             return None, "empty_reply", response_shape
@@ -329,6 +369,7 @@ async def extract(
         # provider 那一步走的是上面同一个 _call —— 截断、用量、失败分类、
         # 轨迹全部照旧，不因为换了驱动方式而分家。
         seen_truncation = False
+        last_truncated_shape: dict[str, Any] | None = None
         while True:
             attempt_prompt = session.next_prompt()
             if attempt_prompt is None:
@@ -337,18 +378,30 @@ async def extract(
                 attempt_prompt,
                 retry_budget if seen_truncation else max_tokens,
             )
-            if call_error is not None:
+            truncated = (
+                call_error is None or call_error == "empty_reply"
+            ) and await _report_truncated(
+                shape, attempt=2 if seen_truncation else 1
+            )
+            if call_error is not None and not truncated:
                 return None, call_error
-            truncated = await _report_truncated(shape, attempt=2 if seen_truncation else 1)
             if truncated:
                 if seen_truncation:
                     # 换过一版更简短的提示词还是被截 —— 不再试，如实报。
                     _record_truncation_failure(shape)
                     return None, "output_truncated"
                 seen_truncation = True
+            # An empty reply cut at the output cap (thinking spent the budget)
+            # is still a truncation: the component decides whether to re-ask.
+            last_truncated_shape = shape if truncated and not reply else None
             session.feed(reply or "", truncated=truncated)
             await _emit_component_steps()
         outcome = session.result()
+        if outcome.error and last_truncated_shape is not None:
+            # The component had no retry left for that empty, cut-off reply, so
+            # it parsed "" — report the real cause, not a bogus format error.
+            _record_truncation_failure(last_truncated_shape)
+            return None, "output_truncated"
         if outcome.error:
             return None, str(outcome.error)
         # 两条 lane 的「原始产物」字段名不同 —— capture 是卡，dream 是合并方案。

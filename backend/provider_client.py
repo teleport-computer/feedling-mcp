@@ -61,6 +61,14 @@ class ProviderError(Exception):
         self.raw_response_body = str(raw_response_body or "")[
             :_MAX_RAW_PROVIDER_ERROR_BODY_CHARS
         ]
+        # Set only by ``_mark_output_truncation``: an HTTP-2xx success shape
+        # with no usable reply whose provider stop marker says the output-token
+        # cap was hit (typically a thinking model that spent the whole budget
+        # on hidden reasoning). Content-free: normalized stop marker and the
+        # provider's normalized usage counts only.
+        self.output_truncated = False
+        self.stop_reason = ""
+        self.truncation_usage: dict | None = None
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -103,6 +111,31 @@ def is_token_limit_stop_reason(value: Any) -> bool:
         "max_tokens",
         "max_output_tokens",
     }
+
+
+def _mark_output_truncation(
+    exc: ProviderError, *, stop_reason: Any, usage: dict | None
+) -> ProviderError:
+    """Tag a "no usable reply" error whose response stopped at the token cap.
+
+    Every wire parser raises the same ``ProviderError`` (same class, message and
+    ``status_code=None``) when a required reply is empty, so every existing
+    caller keeps its classification, retry and error mapping. The tag only lets
+    a caller that owns an output-budget policy tell "the model ran out of
+    output budget" apart from a relay returning garbage — see
+    ``is_output_truncation_error`` and ``reliable_chat_completion_async``'s
+    ``retry_output_truncation``.
+    """
+    if is_token_limit_stop_reason(stop_reason):
+        exc.output_truncated = True
+        exc.stop_reason = normalize_stop_reason(stop_reason)
+        exc.truncation_usage = dict(usage) if isinstance(usage, dict) else None
+    return exc
+
+
+def is_output_truncation_error(exc: BaseException) -> bool:
+    """A 2xx reply with no usable text that the provider stopped at its output cap."""
+    return isinstance(exc, ProviderError) and getattr(exc, "output_truncated", False) is True
 
 
 def cap_chat_output_tokens(value: Any) -> int:
@@ -2874,23 +2907,29 @@ def _parse_openai_responses_body(
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_openai_responses(body)
     media = _extract_openai_responses_media(body)
+    stop_reason = str(
+        (
+            body.get("incomplete_details")
+            if isinstance(body.get("incomplete_details"), dict)
+            else {}
+        ).get("reason")
+        or body.get("status")
+        or "",
+    ).strip()
+    usage = _normalize_usage("openai", body.get("usage"))
     if require_reply and not reply and not tool_calls and not media:
-        raise ProviderError("provider response had no usable reply text")
+        raise _mark_output_truncation(
+            ProviderError("provider response had no usable reply text"),
+            stop_reason=stop_reason,
+            usage=usage,
+        )
     output = body.get("output")
     return {
         "reply": reply,
         "reasoning": reasoning,
-        "usage": _normalize_usage("openai", body.get("usage")),
+        "usage": usage,
         "raw_id": body.get("id", ""),
-        "stop_reason": str(
-            (
-                body.get("incomplete_details")
-                if isinstance(body.get("incomplete_details"), dict)
-                else {}
-            ).get("reason")
-            or body.get("status")
-            or "",
-        ).strip(),
+        "stop_reason": stop_reason,
         "provider": "openai",
         "model": model,
         "tool_calls": tool_calls,
@@ -3767,10 +3806,17 @@ def _parse_openai_compat_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
-    reply = _extract_reply(
-        body, required=require_reply and not tool_calls and not media
-    )
     stop_reason = _extract_openai_compatible_stop_reason(body)
+    try:
+        reply = _extract_reply(
+            body, required=require_reply and not tool_calls and not media
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=stop_reason,
+            usage=_normalize_usage(provider, body.get("usage")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -3977,10 +4023,17 @@ def _parse_anthropic_body(
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_anthropic(body)
     content = body.get("content")
-    reply = _extract_anthropic_reply(
-        body, required=require_reply and not tool_calls
-    )
     stop_reason = str(body.get("stop_reason") or "").strip()
+    try:
+        reply = _extract_anthropic_reply(
+            body, required=require_reply and not tool_calls
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=stop_reason,
+            usage=_normalize_usage("anthropic", body.get("usage")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -4264,14 +4317,20 @@ def _parse_bedrock_body(
 ) -> dict[str, Any]:
     tool_calls = _decode_tool_calls_bedrock(body)
     content = _bedrock_output_content(body)
-    return {
-        "reply": _extract_bedrock_reply(
+    stop_reason = str(body.get("stopReason") or "").strip()
+    usage = _normalize_usage("bedrock", body.get("usage"))
+    try:
+        reply = _extract_bedrock_reply(
             body, required=require_reply and not tool_calls
-        ),
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(exc, stop_reason=stop_reason, usage=usage)
+    return {
+        "reply": reply,
         "reasoning": _extract_bedrock_reasoning(body),
-        "usage": _normalize_usage("bedrock", body.get("usage")),
+        "usage": usage,
         "raw_id": str(body.get("requestId") or ""),
-        "stop_reason": str(body.get("stopReason") or "").strip(),
+        "stop_reason": stop_reason,
         "provider": "bedrock",
         "model": model,
         "tool_calls": tool_calls,
@@ -4447,10 +4506,19 @@ def _parse_gemini_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
-    reply = _extract_gemini_reply(
-        body, required=require_reply and not tool_calls and not media
-    )
     stop_reason = _extract_gemini_stop_reason(body)
+    try:
+        reply = _extract_gemini_reply(
+            body, required=require_reply and not tool_calls and not media
+        )
+    except ProviderError as exc:
+        # Only the closed Gemini enum can reach the marker (MAX_TOKENS ->
+        # "max_tokens"); a novel provider string normalizes to "other".
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=_normalize_gemini_finish_reason(stop_reason),
+            usage=_normalize_usage("gemini", body.get("usageMetadata")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -5865,6 +5933,7 @@ async def reliable_chat_completion_async(
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
     absolute_deadline: float | None = None,
+    retry_output_truncation: bool = True,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
@@ -5874,6 +5943,14 @@ async def reliable_chat_completion_async(
     `provider_config` failures. On final failure the raised exception carries
     `.feedling_error_class` ("transient_exhausted" | "provider_config") so the
     caller can label the job/turn.
+
+    ``retry_output_truncation=False`` is for callers that own an output-budget
+    policy (background extraction): a required reply that came back empty with
+    a token-limit stop marker (``is_output_truncation_error``) is raised on the
+    first attempt with ``.feedling_error_class == "output_truncated"`` instead
+    of being retried as a transient shape error. Re-sending the same prompt at
+    the same budget to a thinking model reliably burns the budget again. The
+    default keeps every other caller's retry, classification and labels.
     """
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
@@ -5984,8 +6061,12 @@ async def reliable_chat_completion_async(
                 absolute_deadline is not None
                 and time.monotonic() >= float(absolute_deadline)
             )
+            truncation_terminal = (
+                not retry_output_truncation and is_output_truncation_error(exc)
+            )
             terminal = (
                 cls == "provider_config"
+                or truncation_terminal
                 or attempt >= attempts
                 or deadline_exhausted
             )
@@ -6029,6 +6110,8 @@ async def reliable_chat_completion_async(
                 exc.feedling_error_class = (
                     "provider_config"
                     if cls == "provider_config"
+                    else "output_truncated"
+                    if truncation_terminal
                     else "transient_exhausted"
                 )
                 if provider_attempt_trace is not None:
