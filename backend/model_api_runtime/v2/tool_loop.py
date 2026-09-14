@@ -149,8 +149,8 @@ _WAKE_REPLY_TOOL = "reply"
 _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     name=_WAKE_REPLY_TOOL,
     description=(
-        "Reply when you want to speak and end this proactive wake turn. "
-        "Use stay_silent instead when quiet company feels right this time."
+        "Reply with what you want to say and end this proactive wake. "
+        "This is the normal way to end a wake."
     ),
     parameters={
         "type": "object",
@@ -183,9 +183,9 @@ _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "When you are done looking around, end the wake by calling exactly one of the "
-    "two tools: reply with what you want to say, or stay_silent with a short note "
-    "on why not this time."
+    "When you are done looking around, end the wake by calling reply with what "
+    "you want to say. Call stay_silent only if you have a concrete reason not to "
+    "speak this time."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
@@ -1361,6 +1361,7 @@ async def run_tool_loop(
     prompt_context_window_overrides=None,
     prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
     file_output_max_tokens: int = provider_client.CHAT_OUTPUT_MAX_TOKENS,
+    wake_output_max_tokens: int = 4096,
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
@@ -1457,6 +1458,10 @@ async def run_tool_loop(
     file_output_max_tokens = _positive_limit(
         file_output_max_tokens,
         name="file_output_max_tokens",
+    )
+    wake_output_max_tokens = _positive_limit(
+        wake_output_max_tokens,
+        name="wake_output_max_tokens",
     )
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
@@ -2682,13 +2687,20 @@ async def run_tool_loop(
                 # tools and truncates even modest documents into malformed
                 # JSON. File generation owns a separate output budget: the
                 # prompt frontier's reserve is input accounting, and increasing
-                # it would silently evict otherwise usable history. Wake/child/
-                # screen lanes omit on_file_reply and keep their existing limits.
+                # it would silently evict otherwise usable history. This branch
+                # keeps priority over the regular-wake output budget below.
                 provider_kwargs["max_tokens"] = (
                     min(file_output_max_tokens, 512)
                     if compact_delivery_phase
                     else file_output_max_tokens
                 )
+            elif regular_wake_choice_required:
+                # Prod 2026-09-07..14 trace: of 425 silent_empty_response events
+                # on choice_invalid jobs, 421 were length + reasoning_present
+                # + completion_tokens>=700. Wake lanes used provider_client's
+                # 700-token default, leaving reasoning models no room to choose
+                # reply/stay_silent. Keep input reserve accounting independent.
+                provider_kwargs["max_tokens"] = wake_output_max_tokens
             if on_provider_tool_surface is not None:
                 candidate_names = {
                     str(spec.name) for spec in surface_candidate_tools

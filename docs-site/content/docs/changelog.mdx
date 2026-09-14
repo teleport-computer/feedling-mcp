@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Regular V2 wakes now treat speaking as the default.** Silence requires a
+  concrete reason in the model instructions. The existing structured
+  `reply`/`stay_silent` validation remains in place, and free-form text still
+  cannot become a proactive bubble. Regular wake calls now have a 4,096-token
+  output budget by default, configurable with
+  `FEEDLING_V2_WAKE_OUTPUT_MAX_TOKENS`, so reasoning models have more room to
+  produce a terminal choice. Scheduled reminder behavior and file-output
+  budget precedence are unchanged.
+
 - Memory capture no longer stops permanently when one batch of chat keeps
   failing. If the same batch fails 3 times in a row with an unreadable model
   output, or 6 times for any reason, capture skips that batch and continues with

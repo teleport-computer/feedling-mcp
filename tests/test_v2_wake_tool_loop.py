@@ -232,7 +232,10 @@ def _status_events(uid):
 # Terminal plain text is not a valid proactive delivery decision.
 # ------------------------------------------------------------------
 
-def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch):
+@pytest.mark.parametrize("output_limit", [None, 8192])
+def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch, output_limit):
+    if output_limit is not None:
+        monkeypatch.setattr(worker, "WAKE_OUTPUT_MAX_TOKENS", output_limit)
     uid = "u_wake_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
@@ -267,6 +270,9 @@ def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch):
 
     assert status == "failed"
     assert len(calls) == 3
+    # The budget must reach the initial call and both structured-choice retries.
+    expected_limit = output_limit if output_limit is not None else 4096
+    assert all(call["max_tokens"] == expected_limit for call in calls)
     assert all(call["tool_choice"] == "required" for call in calls[1:])
     assert _bubbles(uid) == []
     assert sink_calls == []
@@ -368,6 +374,7 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
+        assert "max_tokens" not in _kwargs  # Scheduled output policy is unchanged.
         # 必须返**非空**正文。本用例测的是空 tail 下的 prompt 形状（不触发
         # `no_user_messages` 闸、不造用户角色消息），空回复只是早期图省事的载体；
         # scheduled 道打开 require_reply 之后，空回复本身就会让这一轮判失败，

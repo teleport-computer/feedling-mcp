@@ -86,6 +86,21 @@ Applications should make them configurable for self-hosted deployments.
 
 ## Provider health and proactive retries
 
+Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
+choice. Speaking is the default; `stay_silent` needs a concrete reason, such as
+an explicit do-not-disturb request, sleeping hours while the user is offline,
+having spoken within the last hour, or the user being visibly busy. These are
+model instructions, not new scheduler gates. Missing or invalid choices still
+fail without a visible bubble; free-form text cannot bypass the validated reply
+path. Explicitly scheduled reminders retain their must-deliver behavior.
+
+Regular wake provider calls, including choice-correction retries, receive a
+4,096-token output budget by default, giving reasoning models room to make the
+terminal tool call. Operators can tune it with
+`FEEDLING_V2_WAKE_OUTPUT_MAX_TOKENS`. This setting is separate from the
+prompt-frontier output reserve and does not change the input frontier;
+file-capable calls retain their separate file-output budget and precedence.
+
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours
 and its latest failures have continuously required user action for at least one
