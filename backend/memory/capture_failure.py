@@ -149,6 +149,7 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
         "capture_seq_initialized": through_seq > 0,
         # 跳过之后 streak 归零：下一批是干净的，不该带着旧账退避。
         "capture_fail_streak": 0,
+        "capture_parse_fail_streak": 0,
         "capture_fail_window_key": "",
         "capture_skipped_windows": max(
             0, int(_safe_float(state.get("capture_skipped_windows"), 0.0))
@@ -181,6 +182,18 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     （见 tests/test_memory_backoff_notice.py），拿不到窗口时如果把 streak
     重置成 1，**整个退避机制就哑了** —— 那是我第一版引入的回归，CI 抓到的。
 
+    ## 两档阈值各数各的
+
+    ``capture_fail_streak`` 是同一窗口的**总失败数**，到 6 次兜底跳过；
+    ``capture_parse_fail_streak`` 只数**连续的**解析类失败，到 3 次快速跳过，
+    中间夹一次别的失败就清零。
+
+    以前两档共用一个 streak、阈值只看本次原因，于是
+
+        写入失败 → 写入失败 → 解析失败   streak=3，按「解析 3 次」立刻跳
+
+    一次解析失败就继承了前两次写入失败，绕过了 6 次保护（Codex 第四轮抓到）。
+
     抽成一个函数是因为 V1 / V2 两条线各写一遍必然漂，而漂了不报错。
     """
     key = window_key(window)
@@ -190,17 +203,23 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
         return ({"capture_fail_streak": streak,
                  "last_capture_failed_at": now_ts}, streak, False)
     same = key == str(state.get("capture_fail_window_key") or "")
+    parse_failure = skip_threshold_for(reason) == CAPTURE_POISON_SKIP_AFTER
     streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
               if same else 1)
-    # 阈值看**这一次**的失败原因：解析失败是确定性的，3 次就跳；
-    # 存不进去这类会自己好的，给 6 次机会。见 CAPTURE_TRANSIENT_SKIP_AFTER。
-    skip = (poison_skip_patch({**state, "capture_fail_streak": streak - 1},
-                               window, now_ts=now_ts,
-                               threshold=skip_threshold_for(reason))
-            if same else None)
+    prev_parse = (int(_safe_float(state.get("capture_parse_fail_streak"), 0.0))
+                  if same else 0)
+    parse_streak = prev_parse + 1 if parse_failure else 0
+    if parse_streak >= CAPTURE_POISON_SKIP_AFTER:
+        # 用阈值 1 只是复用「推游标」的补丁；是否该跳已经在这里判断过。
+        skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
+    elif streak >= CAPTURE_TRANSIENT_SKIP_AFTER:
+        skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
+    else:
+        skip = None
     if skip is not None:
         return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
     return ({"capture_fail_streak": streak,
+             "capture_parse_fail_streak": parse_streak,
              "capture_fail_window_key": key,
              "last_capture_failed_at": now_ts}, streak, False)
 
@@ -218,3 +237,9 @@ def window_from_batch_row(batch: Mapping[str, Any]) -> dict[str, Any]:
         "until_ts": _safe_float(batch.get("until_ts"), 0.0),
         "through_seq": max(0, int(_safe_float(batch.get("through_seq"), 0.0))),
     }
+
+
+def window_after_seq(window: Mapping[str, Any] | None) -> int:
+    """窗口起点 seq（缺失/非法按 0）。"""
+    w = window if isinstance(window, Mapping) else {}
+    return max(0, int(_safe_float(w.get("after_seq"), 0.0)))

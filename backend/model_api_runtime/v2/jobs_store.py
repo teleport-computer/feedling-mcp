@@ -3377,6 +3377,17 @@ def _capture_fail_on_cursor(
         }
     )
     if skip_applied:
+        # 跳过的那批如果有 prepared 批次（加密的模型产出），同一事务里删掉。
+        # 不删的话：跳过后用户不再发消息 → 不会有下一个落卡任务 → 也就没有
+        # get_prepared_capture_batch 那次顺带清理 → 已声明丢弃的派生内容永久留库。
+        cur.execute(
+            "DELETE FROM v2_capture_batches WHERE user_id=%s AND status='prepared' "
+            "AND after_seq=%s AND runtime_generation=("
+            "SELECT expected_runtime_generation FROM agent_jobs WHERE id=%s)",
+            (str(user_id),
+             capture_failure.window_after_seq(window),
+             job_id),
+        )
         # 跳过 = 那一批对话的记忆永久丢了。事务里不发 trace（副作用失败会
         # 把整个事务带崩），但状态字段是原子写进去的，诊断面看得见。
         log.warning(

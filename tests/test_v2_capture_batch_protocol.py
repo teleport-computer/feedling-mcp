@@ -2093,6 +2093,13 @@ def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeyp
     assert state["last_captured_until_message_id"] == "m4"
     assert int(state["capture_skipped_windows"]) == 1
 
+    # 🔴 跳过的同一事务里就要删掉那个 prepared 批次 —— 生产上跳过后用户可能
+    # 不再发消息、不会有下一个任务来顺带清理（Codex 第四轮）。
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0, "跳过后加密的批次内容还留在库里"
+
     # 游标推过去之后，那个旧批次不能再被捡起来重放。
     next_id, _job = _running(uid, owner="after-skip")
     assert jobs_store.get_prepared_capture_batch(

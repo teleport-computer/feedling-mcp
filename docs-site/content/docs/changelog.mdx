@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Memory capture no longer stops permanently when one batch of chat keeps
+  failing. If the same batch fails 3 times in a row with an unreadable model
+  output, or 6 times for any reason, capture skips that batch and continues with
+  newer messages. The skipped batch produces no memories, and the skip is recorded
+  in capture diagnostics. Previously a single bad batch could block all future
+  memories for that account.
+
 - Resident consumers now retry transient startup decrypt-source failures using
   the runtime enclave retry and timeout settings. A failed probe reports
   `unreachable` and continues polling instead of exiting, allowing recovery

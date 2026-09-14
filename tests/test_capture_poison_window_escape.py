@@ -270,3 +270,32 @@ def test_the_real_v1_call_site_passes_the_failure_reason(monkeypatch):
     assert saved.get("last_captured_until_message_id") == W1["until_message_id"], (
         "解析失败连续 3 次后游标没推过去 —— 调用点大概漏传了失败原因，"
         "所有失败都掉进了 6 次那一档")
+
+
+def _run_reasons(reasons, window=None):
+    """按顺序喂失败原因，返回第几次跳过（没跳返回 None）。"""
+    w = window or {"after_message_id": "msg_a", "until_message_id": "msg_c",
+                   "until_ts": 1.0, "through_seq": 120}
+    state: dict = {}
+    for i, reason in enumerate(reasons, start=1):
+        patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=float(i), reason=reason)
+        state.update(patch)
+        if skipped:
+            return i
+    return None
+
+
+def test_one_parse_failure_cannot_inherit_earlier_write_failures():
+    """🔴 写入、写入、解析 —— 第三次不能按「解析 3 次」就跳。
+
+    以前两档共用一个计数、阈值只看本次原因，一次解析失败就继承了前面的写入失败，
+    绕过 6 次保护，把本来重试能保住的记忆提前丢掉（Codex 第四轮复现）。
+    """
+    write, parse = "capture_memory_write_failed", "extraction_failed:json_decode_error"
+    assert _run_reasons([write, write, parse]) is None
+    # 解析连续 3 次才快速跳；中间夹一次别的失败，解析计数清零。
+    assert _run_reasons([parse, parse, parse]) == 3
+    assert _run_reasons([parse, parse, write, parse]) is None
+    assert _run_reasons([write, parse, parse, parse]) == 4
+    # 总失败数到 6 次兜底，不管混成什么样。
+    assert _run_reasons([write, parse, write, parse, write, parse]) == 6

@@ -129,6 +129,10 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         #: 当前 streak 属于哪个窗口。**不带这个的话 streak 会跨窗口累加** ——
         #: 三次互不相干的偶发失败会被当成"同一条毒消息卡住了"，误跳过一批好数据。
         "capture_fail_window_key": str(doc.get("capture_fail_window_key") or "")[:340],
+        #: 同一窗口**连续**解析类失败几次（到 3 快速跳过）；总失败数仍看 capture_fail_streak。
+        "capture_parse_fail_streak": max(
+            0, int(_safe_float(doc.get("capture_parse_fail_streak"), 0.0))
+        ),
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))
