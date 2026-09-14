@@ -482,6 +482,7 @@ jobs:
             tests/test_memgarden_dreaming.py \
             tests/test_self_thinking_prompt_probe.py \
             tests/test_self_thinking_instruction.py \
+            tests/test_self_thinking_aside_tag.py \
             tests/test_aup_gate_probe.py \
             -v
 

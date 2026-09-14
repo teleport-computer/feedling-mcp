@@ -5124,7 +5124,8 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
 
     Structured reasoning fields remain the preferred path. This only handles
     plain terminal text where an upstream wrapper serialized reasoning as
-    `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
+    `<think>...</think>`, `<reasoning>...</reasoning>`, `<thought>...</thought>`,
+    or the Claude-driver `<aside>...</aside>` (T587).
 
     2026-08-08 起委托 ``agent_protocol_core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
     各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
@@ -12735,13 +12736,32 @@ def _wake_self_thinking_allowed() -> bool:
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
 
+def _self_thinking_tag() -> str:
+    """协议标签按 driver 选:Claude Code 用 ``aside``,pi / codex 保持 ``think``。
+
+    T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
+    用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
+    隐藏思维链,Opus 5 家族每轮拒答。标签按 driver 不按模型:矩阵里 sonnet-4-6 /
+    opus-4-8 / opus-5 / opus-5[1m] 用 ``aside`` 全部正常,不用维护型号名单。
+    只有 ``AGENT_MODE == "cli"`` 且 ``cmd[0]`` 是 ``claude`` 才算 Claude Code;
+    pi / codex / http 模式(哪怕留着一条 claude 命令)/ 其他 CLI 的指令渲染逐字节
+    不变(见 tests)。"""
+    from agent_protocol_core import self_thinking as _self_thinking_v1
+
+    # Only a turn that really runs the Claude Code CLI gets the aside tag: in
+    # http mode AGENT_CLI_CMD is dead configuration and must not change copy.
+    if AGENT_MODE == "cli" and _is_claude_code_cmd(_cli_cmd_tokens()):
+        return _self_thinking_v1.TAG_ASIDE
+    return _self_thinking_v1.TAG_THINK
+
+
 def _foreground_self_thinking_instruction() -> str:
     """前台强制思考指令；与主动道共享同一开关，只保留强度差异。"""
     if not _wake_self_thinking_allowed():
         return ""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
-    return _self_thinking_v1.INSTRUCTION.strip()
+    return _self_thinking_v1.instruction(_self_thinking_tag()).strip()
 
 
 def _wake_think_permission_line(presence: dict | None = None) -> str:
@@ -12749,6 +12769,24 @@ def _wake_think_permission_line(presence: dict | None = None) -> str:
     if not _wake_self_thinking_allowed():
         return ""
     policy = _resident_reply_language(presence)
+    tag = _self_thinking_tag()
+    if tag == "aside":
+        # Claude Code driver: same permission, truthfully described — the block
+        # is folded under 「参考内容」 in the app, never rendered as message text.
+        if policy.language != "en":
+            return (
+                " 你可以在 JSON 前先写一个平常的 <aside>...</aside> 块；它会折叠在"
+                "「参考内容」里展示，不会显示成消息正文。如果选择写，从第一个字到最后"
+                "一个字都使用用户所用的语言。保持你自己的口气；不要写成对用户的评估，"
+                "也不要写成他们应该做什么的行动方案。"
+            )
+        return (
+            " You may open with your usual <aside>...</aside> block before the JSON; "
+            "it is shown folded under the reply, never as message text. Write the "
+            "whole block in the language the user uses, from first word to last. "
+            "Keep it in your own voice; do not turn it into an assessment of the user "
+            "or an action plan for what they should do."
+        )
     if policy.language != "en":
         return (
             " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
