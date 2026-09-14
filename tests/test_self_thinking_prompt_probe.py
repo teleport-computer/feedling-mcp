@@ -302,7 +302,7 @@ def test_matrix_has_all_provider_axes_small_models_and_relays():
     assert "flash" in small["gemini-small"]
     assert "mini" in small["openai-small"]
     ids = {cell.id for cell in probe.MATRIX_CELLS}
-    assert {"hojimi-relay", "relay-openai-compatible"} <= ids
+    assert {"jiushi-relay", "zhailian-relay", "relay-openai-compatible"} <= ids
 
 
 def test_profiles_keep_canary_small_and_full_matrix_explicit():

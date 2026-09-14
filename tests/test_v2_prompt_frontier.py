@@ -84,9 +84,6 @@ def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
     assert int(file_default) not in {4096, 8192}
     assert reserve_env == "FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS"
     assert int(reserve_default) == 4096
-    wake_env, wake_default = positive_env_defaults["WAKE_OUTPUT_MAX_TOKENS"]
-    assert wake_env == "FEEDLING_V2_WAKE_OUTPUT_MAX_TOKENS"
-    assert int(wake_default) == int(reserve_default)
 
 
 _REAL_TOOL_COUNT = 69

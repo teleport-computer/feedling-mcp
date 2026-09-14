@@ -1361,7 +1361,6 @@ async def run_tool_loop(
     prompt_context_window_overrides=None,
     prompt_output_reserve_tokens: int = prompt_frontier.DEFAULT_OUTPUT_RESERVE_TOKENS,
     file_output_max_tokens: int = provider_client.CHAT_OUTPUT_MAX_TOKENS,
-    wake_output_max_tokens: int = 4096,
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
@@ -1458,10 +1457,6 @@ async def run_tool_loop(
     file_output_max_tokens = _positive_limit(
         file_output_max_tokens,
         name="file_output_max_tokens",
-    )
-    wake_output_max_tokens = _positive_limit(
-        wake_output_max_tokens,
-        name="wake_output_max_tokens",
     )
     normalized_empty_response_correction = str(
         empty_response_correction or _EMPTY_RESPONSE_CORRECTION
@@ -2688,7 +2683,7 @@ async def run_tool_loop(
                 # JSON. File generation owns a separate output budget: the
                 # prompt frontier's reserve is input accounting, and increasing
                 # it would silently evict otherwise usable history. This branch
-                # keeps priority over the regular-wake output budget below.
+                # keeps priority over the regular-wake branch below.
                 provider_kwargs["max_tokens"] = (
                     min(file_output_max_tokens, 512)
                     if compact_delivery_phase
@@ -2699,8 +2694,9 @@ async def run_tool_loop(
                 # on choice_invalid jobs, 421 were length + reasoning_present
                 # + completion_tokens>=700. Wake lanes used provider_client's
                 # 700-token default, leaving reasoning models no room to choose
-                # reply/stay_silent. Keep input reserve accounting independent.
-                provider_kwargs["max_tokens"] = wake_output_max_tokens
+                # reply/stay_silent. Reuse the established chat/file output
+                # budget; keep input reserve accounting independent.
+                provider_kwargs["max_tokens"] = file_output_max_tokens
             if on_provider_tool_surface is not None:
                 candidate_names = {
                     str(spec.name) for spec in surface_candidate_tools

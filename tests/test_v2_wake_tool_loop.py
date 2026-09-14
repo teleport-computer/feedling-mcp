@@ -232,10 +232,10 @@ def _status_events(uid):
 # Terminal plain text is not a valid proactive delivery decision.
 # ------------------------------------------------------------------
 
-@pytest.mark.parametrize("output_limit", [None, 8192])
+@pytest.mark.parametrize("output_limit", [None, 16384])
 def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch, output_limit):
     if output_limit is not None:
-        monkeypatch.setattr(worker, "WAKE_OUTPUT_MAX_TOKENS", output_limit)
+        monkeypatch.setattr(worker, "FILE_OUTPUT_MAX_TOKENS", output_limit)
     uid = "u_wake_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
@@ -271,7 +271,10 @@ def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch, ou
     assert status == "failed"
     assert len(calls) == 3
     # The budget must reach the initial call and both structured-choice retries.
-    expected_limit = output_limit if output_limit is not None else 4096
+    expected_limit = (
+        output_limit if output_limit is not None
+        else provider_client.CHAT_OUTPUT_MAX_TOKENS
+    )
     assert all(call["max_tokens"] == expected_limit for call in calls)
     assert all(call["tool_choice"] == "required" for call in calls[1:])
     assert _bubbles(uid) == []

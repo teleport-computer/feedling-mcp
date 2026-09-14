@@ -509,9 +509,6 @@ PROMPT_OUTPUT_RESERVE_TOKENS = _positive_int_env(
 FILE_OUTPUT_MAX_TOKENS = _positive_int_env(
     "FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS", "32768"
 )
-WAKE_OUTPUT_MAX_TOKENS = _positive_int_env(
-    "FEEDLING_V2_WAKE_OUTPUT_MAX_TOKENS", "4096"
-)
 PROMPT_SAFETY_MARGIN_TOKENS = _nonnegative_int_env(
     "FEEDLING_V2_PROMPT_SAFETY_MARGIN_TOKENS", "1024"
 )
@@ -11413,7 +11410,7 @@ async def _run_wake(
                 max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
                 prompt_context_window_overrides=(PROMPT_CONTEXT_WINDOW_OVERRIDES),
                 prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
-                wake_output_max_tokens=WAKE_OUTPUT_MAX_TOKENS,
+                file_output_max_tokens=FILE_OUTPUT_MAX_TOKENS,
                 prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
                 prompt_estimator_utf8_bytes_per_token=(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
