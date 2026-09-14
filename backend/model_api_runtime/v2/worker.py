@@ -12485,6 +12485,27 @@ async def _run_extraction(
                     _CAPTURE_BATCH_LIMIT,
                     through_seq=capture_snapshot_through_seq,
                 )
+                if tail:
+                    # 🔴 读到这批就立刻定下窗口终点，**先于**后面任何可能失败的步骤（通话转写、
+                    # 渲染…）。以前终点在转写循环之后才填，转写取不到时失败带出去的窗口没有终点，
+                    # 逃生阀永远不跳 —— 一张转写丢失的通话卡就能让用户永久卡死（独立审查复现）。
+                    last = tail[-1]
+                    last_id = str(last.get("id") or "")
+                    last_seq = last.get("seq")
+                    if last_seq is None and last_id:
+                        last_seq = await asyncio.to_thread(
+                            db.chat_seq_for_msg_id, user_id, last_id
+                        )
+                    if last_seq is None or not last_id:
+                        raise RuntimeError("capture_batch_frontier_unavailable")
+                    capture_window.update(
+                        {
+                            "until_message_id": last_id,
+                            "until_ts": _float_or_zero(last.get("ts")),
+                            "through_seq": int(last_seq),
+                            "message_count": len(tail),
+                        }
+                    )
             elif deps.read_tail_after_seq is not None:
                 through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
                 tail = await asyncio.to_thread(
@@ -12552,23 +12573,6 @@ async def _run_extraction(
                     outcome=cards_outcome,
                 )
         if lane == "capture" and deps.read_capture_state is not None and tail:
-            last = tail[-1]
-            last_id = str(last.get("id") or "")
-            last_seq = last.get("seq")
-            if last_seq is None and last_id:
-                last_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, last_id
-                )
-            if last_seq is None or not last_id:
-                raise RuntimeError("capture_batch_frontier_unavailable")
-            capture_window.update(
-                {
-                    "until_message_id": last_id,
-                    "until_ts": _float_or_zero(last.get("ts")),
-                    "through_seq": int(last_seq),
-                    "message_count": len(tail),
-                }
-            )
             # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
             # 用来定位「模型为什么吐出坏 JSON」——见 memory/window_fingerprint。
             # 窗口文本此刻还没渲染，所以这里只取 role/source；
@@ -17638,13 +17642,28 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             best_effort=True,
         )
         log.warning("[v2.worker] job %s outer turn failure code=%s", job_id, message)
-        owned = await asyncio.to_thread(
-            jobs_store.mark_failed,
-            job_id,
-            message,
-            claimed_by=claimed_by,
-            error_class=_turn_failure_error_class(e),
-        )
+        owned = False
+        if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+            # 落卡在外层就挂了（mint token / provider 解析抛异常等）：同样要累计退避、
+            # 记本任务 id，否则调度器每轮重建同一个任务、用户也看不到提示。不带窗口 → 不跳过。
+            try:
+                owned = bool(await asyncio.to_thread(
+                    deps.fail_capture_job,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    error=message,
+                ))
+            except Exception:  # noqa: BLE001 — 退回通用终态，绝不留下未终结的任务
+                owned = False
+        if not owned:
+            owned = await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                message,
+                claimed_by=claimed_by,
+                error_class=_turn_failure_error_class(e),
+            )
         if owned and lane in {"chat", "scheduled"}:
             if lane == "chat":
                 await _settle_legacy_traced_chat_failure(message)

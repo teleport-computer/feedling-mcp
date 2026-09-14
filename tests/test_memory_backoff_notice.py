@@ -88,7 +88,7 @@ def test_v1_capture_notice_names_the_account_cause():
     n = _rows(uid)["memory_backoff:capture"]
     assert "API Key 无效" in n["user_text"] or "额度不足" in n["user_text"], n["user_text"]
     assert n["blame"] == "user_provider"
-    assert "自动补记" in n["user_text"]
+    assert "自动继续整理" in n["user_text"]
     capture_scheduler.record_capture_job_status(store, job, status="completed")
     assert _rows(uid)["memory_backoff:capture"]["resolved"] is True
 
@@ -145,7 +145,7 @@ def test_v2_capture_failures_now_notify_the_user():
         deps, {"lane": "capture", "user_id": uid, "id": last_job_id}, "failed"))
     n = _rows(uid)["memory_backoff:capture"]
     assert "额度不足" in n["user_text"] and n["blame"] == "user_provider"
-    assert "7 天" in n["user_text"], "提示不能只承诺补记，要说清长期不恢复会跳过"
+    assert "7 天" in n["user_text"] and "较早的聊天可能无法补记" in n["user_text"], "提示不能承诺全部补记"
 
     # 其他 lane 不碰
     asyncio.run(worker._notify_capture_backoff(

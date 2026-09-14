@@ -397,10 +397,13 @@ def test_account_failures_skip_only_after_persisting_seven_days():
     day = 86400.0
     state: dict = {}
     t0 = 1_000_000.0
-    for t in (t0, t0 + 1 * day, t0 + 3 * day, t0 + 6.9 * day):
+    # 正常退避下每 6 小时重试一次（中断超过 24 小时会重新计时，见 long_gap 那条测试）
+    t = t0
+    while t < t0 + 7 * day - 6 * 3600:
         patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t, reason=balance)
         state.update(patch)
         assert not skipped, f"第 {(t - t0) / day:.1f} 天就跳了"
+        t += 6 * 3600
     assert state["capture_account_fail_since"] == t0
     patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0 + 7 * day, reason=balance)
     assert skipped, "账号类失败持续 7 天仍没跳"
@@ -413,3 +416,24 @@ def test_account_failures_skip_only_after_persisting_seven_days():
     w2 = {**w, "after_message_id": "msg_z"}
     patch, _s, skipped = cf.capture_failure_patch(state, w2, now_ts=t0 + 8 * day, reason=balance)
     assert not skipped and patch["capture_account_fail_since"] == t0 + 8 * day
+
+
+def test_account_clock_restarts_after_a_long_gap_without_retries():
+    """「429 一次 → 关掉落卡 8 天 → 重开又 429 一次」不能立刻跳过：那 8 天没在重试。"""
+    w = {"after_message_id": "msg_a", "until_message_id": "msg_c", "until_ts": 1.0, "through_seq": 120}
+    day = 24 * 3600
+    t0 = 1_000_000.0
+    state: dict = {}
+    patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0, reason="extraction_failed:rate_limited")
+    state.update(patch)
+    patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0 + 8 * day,
+                                                  reason="extraction_failed:rate_limited")
+    assert not skipped
+    assert patch["capture_account_fail_since"] == t0 + 8 * day
+
+
+def test_our_own_database_failures_are_not_account_problems():
+    for reason in ("extraction_failed:database_pool_timeout",
+                   "capture_memory_write_failed:TimeoutError: timed out"):
+        assert cf.failure_class(reason) == "other", reason
+        assert cf.account_error_code(reason) == "", reason

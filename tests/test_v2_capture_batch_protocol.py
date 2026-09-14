@@ -2371,12 +2371,20 @@ def test_v2_account_failure_skips_after_seven_days_through_the_store(monkeypatch
             job_id=job_id, user_id=uid, claimed_by=owner,
             error="extraction_failed:quota_insufficient", window=_window(after=0, through=3))
 
-    fail("seven-0")
-    clock["now"] += limit - 60
-    fail("seven-1")
+    # 正常退避下每 6 小时重试一次（中断超过 24 小时会重新计时）
+    start = clock["now"]
+    attempt = 0
+    while clock["now"] < start + limit - 60:
+        fail(f"seven-{attempt}")
+        attempt += 1
+        clock["now"] = min(clock["now"] + 6 * 3600, start + limit - 60)
+        if clock["now"] == start + limit - 60:
+            fail(f"seven-{attempt}")
+            attempt += 1
+            break
     assert int(_capture_state(uid).get("capture_skipped_windows") or 0) == 0, "未满 7 天就跳了"
-    clock["now"] += 120
-    fail("seven-2")
+    clock["now"] = start + limit + 60
+    fail("seven-last")
     state = _capture_state(uid)
     assert int(state["capture_skipped_windows"]) == 1
     assert int(state["last_captured_until_seq"]) == 3
@@ -2438,3 +2446,53 @@ def test_provider_resolution_failure_uses_the_capture_failure_path():
     assert int(state.get("capture_skipped_windows") or 0) == 0
     keys = {r["dedupe_key"] for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
     assert "memory_backoff:capture" in keys
+
+
+def test_missing_call_transcript_batch_is_eventually_skipped(monkeypatch):
+    """🔴 批次里有一张通话卡、它的转写取不到：以前窗口没有终点，逃生阀永远不跳 → 永久卡死。
+
+    窗口终点现在在读到这批之后立刻定下，先于取转写。独立审查复现过 12 次失败 0 次跳过。
+    """
+    from memory import capture_failure
+
+    uid = "u_capture_voice_transcript_missing"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    messages = [
+        {"id": "m1", "seq": 1, "ts": 1.0, "role": "user", "raw_role": "user",
+         "source": "voice_call_transcript", "voice_call_id": "call_x",
+         "capture_eligible": True, "content": "preview"},
+        {"id": "m2", "seq": 2, "ts": 2.0, "role": "user", "raw_role": "user",
+         "source": "chat", "capture_eligible": True, "content": "hi"},
+    ]
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 2)
+
+    def missing(_uid, _call):
+        raise RuntimeError("voice_transcript_not_found")
+
+    deps = _poison_deps(uid, messages=messages, read_voice_transcript=missing)
+    limit = capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
+    for attempt in range(limit):
+        _jid, job = _running(uid, owner=f"voice-{attempt}")
+        assert _run_capture(uid, job, deps, f"voice-{attempt}") == "failed"
+    state = _capture_state(uid)
+    assert int(state.get("capture_skipped_windows") or 0) == 1
+    assert int(state["last_captured_until_seq"]) == 2
+
+
+def test_outer_turn_failure_on_capture_arms_backoff(monkeypatch):
+    """落卡在 _run_turn_body 外层就抛异常（例如 provider 解析抛错）：也要累计退避、发得出提示。"""
+    uid = "u_capture_outer_turn_failure"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+
+    def boom(_uid):
+        raise RuntimeError("enclave down")
+
+    deps = _poison_deps(uid, messages=[], capture_enabled=lambda _uid: True, resolve_provider=boom)
+    for attempt in range(3):
+        _job_id, job = _running(uid, owner=f"outer-{attempt}", start=False)
+        assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+    state = _capture_state(uid)
+    assert int(state["capture_fail_streak"]) == 3
+    assert int(state.get("capture_skipped_windows") or 0) == 0

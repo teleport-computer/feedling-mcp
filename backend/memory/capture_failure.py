@@ -128,6 +128,19 @@ ACCOUNT_ERROR_CONTRACT_CODES = frozenset({
 CAPTURE_ACCOUNT_SKIP_AFTER_SEC = 7 * 86400
 
 
+#: 账号类失败的 7 天计时，中间超过这么久没有新失败就重新计时。
+#: 退避上限是 6 小时，正常重试时两次失败间隔不会超过它；留 4 倍余量。
+ACCOUNT_CLOCK_GAP_RESET_SEC = 24 * 3600
+
+
+#: 明确是我们这边的故障前缀（剥掉 extraction_failed: 之后比对）。见 account_error_code。
+OUR_SIDE_FAILURE_PREFIXES = (
+    "database_pool_timeout",
+    "capture_memory_write_failed",
+    "memory_write_rejected",
+)
+
+
 def window_key(window: Mapping | None) -> str:
     """这次失败卡在哪个**游标**上。用来判断"和上次是同一个队头阻塞吗"。
 
@@ -231,6 +244,10 @@ def account_error_code(reason: str) -> str:
     kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
     if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
         return ""
+    if any(kind.startswith(p) for p in OUR_SIDE_FAILURE_PREFIXES):
+        # 我们自己的数据库/写库超时，不是用户的模型服务 —— 不能提示「你的模型服务不可用」，
+        # 也不该按账号类等 7 天（独立审查）。
+        return ""
     if kind in ACCOUNT_FAILURE_KINDS:
         return kind
     # 先认对照表之外的原话：prod 上某中转站回「401 {"error":"Insufficient balance"}」，
@@ -329,6 +346,11 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     window_count = prev_count if kind == "account" else prev_count + 1
     prev_since = (_safe_float(state.get("capture_account_fail_since"), 0.0)
                   if same else 0.0)
+    last_failed = _safe_float(state.get("last_capture_failed_at"), 0.0)
+    if prev_since and last_failed and now_ts - last_failed > ACCOUNT_CLOCK_GAP_RESET_SEC:
+        # 中间很久没失败（用户关了落卡、VPS 离线一周…）：那段时间没在重试，不算「持续失败」。
+        # 否则「429 一次 → 关掉落卡 8 天 → 重开又 429 一次」就会立刻跳过（独立审查复现）。
+        prev_since = 0.0
     account_since = (prev_since or now_ts) if kind == "account" else prev_since
     account_expired = (kind == "account" and account_since > 0
                        and now_ts - account_since >= CAPTURE_ACCOUNT_SKIP_AFTER_SEC)

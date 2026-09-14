@@ -90,8 +90,8 @@ def notify_backoff(store, *, lane: str, status: str, streak: int,
             notices.emit(store, source="memory", error_class="memory_backoff",
                          blame=spec.blame, severity="warning",
                          user_text=(f"记忆整理暂停了：{spec.safe_text_zh}"
-                                    "修好后会自动补记这段时间的聊天；"
-                                    "如果超过 7 天仍未恢复，最早那段聊天可能无法补记。"),
+                                    "修好后会自动继续整理；"
+                                    "积压太多或超过 7 天仍未恢复时，较早的聊天可能无法补记。"),
                          detail=f"lane={lane} streak={streak} cause={account_code}",
                          dedupe_key=f"memory_backoff:{lane}")
         else:

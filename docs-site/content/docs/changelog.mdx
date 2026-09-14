@@ -17,8 +17,9 @@ change must not be interpreted as an API guarantee.
   same batch is unreadable 3 times in a row, capture skips that batch. Failures
   caused by the account or model provider (invalid key, insufficient balance,
   expired login, rate limits, provider unavailable) keep retrying with backoff
-  so pending messages can be captured once the account works again; if they
-  persist for 7 days, the oldest pending batch is skipped. Other failures skip
+  and capture resumes once the account works again; if they persist for 7 days,
+  the oldest pending batch is skipped. Self-hosted consumers capture only the
+  most recent messages after a long backlog, so older chat may not be captured. Other failures skip
   the batch after 6 attempts. A skipped batch produces no memories and is
   recorded in capture diagnostics. While capture is blocked, the app shows a
   notice naming the cause when it is known. Previously a single bad batch could
