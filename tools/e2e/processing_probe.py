@@ -15,7 +15,7 @@
 
 用法:
     python3 -m tools.e2e.processing_probe                 # 全部已配 key 的 provider
-    python3 -m tools.e2e.processing_probe --only hojimi   # 指定格子
+    python3 -m tools.e2e.processing_probe --only jiushi-relay   # 指定格子
     python3 -m tools.e2e.processing_probe --large         # 加跑多窗大素材(慢,~3 分钟)
 
 目标环境由 FEEDLING_E2E_API 决定(默认 test)。client 硬拒 prod。

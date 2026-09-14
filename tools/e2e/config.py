@@ -59,10 +59,29 @@ HOSTED_CELLS: list[HostedCell] = [
                [], base_url_env="E2E_RELAY_BASE"),   # models from E2E_RELAY_MODEL
     HostedCell("deepseek-official", "deepseek", "E2E_KEY_DEEPSEEK",
                ["deepseek-chat"]),
-    # 第二个中转站:不同中转站的 /models 目录格式差异很大(带日期后缀 /
-    # 带方括号标签 / 裸名),推荐链路(§2-10)必须都能匹配 —— 只测一个不够。
-    HostedCell("hojimi-relay", "openai_compatible", "E2E_KEY_HOJIMI",
-               ["claude-haiku-4-5-20251001"], base_url_env="E2E_HOJIMI_BASE"),
+    # 第二、第三个中转站:不同中转站的 /models 目录格式差异很大,推荐链路(§2-10)
+    # 必须都能匹配 —— 只测一个不够。2026-09-14 hojimi 退役(Seven 定,连续两轮把
+    # 兜底话术当正文复读),换成玖时 + 宅恋。当日实测 /models 形状(去内容化):
+    #   (四类计数按特征各自统计,会重叠,不是互斥分布)
+    #   relay-openai-compatible  171 个:方括号标签 143(其中 1 个同时带 8 位日期后缀
+    #                            [MAX-CC]claude-opus-4-5-20251101)/ 无标签 28 = 裸名 27
+    #                            + 斜杠 1(BAAI/bge-m3)
+    #   jiushi-relay             140 个:方括号标签 122 / 裸名 18(gpt-*/gemini-*)
+    #   zhailian-relay             6 个:全是「[标签]厂商/型号」带斜杠的形状
+    #   空悲切(.env KONGBEIQIE_*)的 key+base 与 E2E_RELAY_* 逐字节相同 ⇒ 它就是
+    #   relay-openai-compatible 这一格,不另开格(同一家两个名字会测两遍)。
+    # ⚠️ hojimi 原来覆盖的「裸名 + 8 位日期后缀」(claude-haiku-4-5-20251001)形状
+    # 两家都没有;换来的是 zhailian 的斜杠形状。两家目录里都没有 haiku,候选取
+    # 当日目录里的 claude 系 + 一个非 claude 兜底(未比价)。宅恋 09-14 22:5x 观测:
+    # 本机直打 opus-5/deepseek/GLM 各 1 次 60s ReadTimeout、kimi-k3 1 次 45s 通过后
+    # 下一次 429;test 后端 setup 对 opus-5、deepseek 各 1 次 ReadTimeout。kimi-k3
+    # 作为 setup 候选尚未在 p0 里跑过。该格 setup 红时先看中转连通性再看产品。
+    HostedCell("jiushi-relay", "openai_compatible", "E2E_KEY_JIUSHI",
+               ["[AG4]claude-sonnet-4-6", "gemini-3-flash-preview"],
+               base_url_env="E2E_JIUSHI_BASE"),
+    HostedCell("zhailian-relay", "openai_compatible", "E2E_KEY_ZHAILIAN",
+               ["[0.01]限时/claude-opus-5", "[0.01]限时/kimi-k3"],
+               base_url_env="E2E_ZHAILIAN_BASE"),
 ]
 
 
