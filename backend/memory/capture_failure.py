@@ -80,53 +80,54 @@ DETERMINISTIC_FAILURE_KINDS = (
 
 _V2_FAILURE_SCOPE = "extraction_failed:"
 
-#: **永远不跳过**的失败：问题出在账号或模型服务上，不在这批消息里。
+#: 问题出在**账号或模型服务**上、不在这批消息里的失败：不按次数跳过。
 #:
 #: 跳过只对「这批消息本身有毒」有用。账号坏了（余额不足、密钥失效、登录过期）
 #: 或服务不可用时跳过这批，下一批照样失败、照样被跳 —— 账号坏多久，那段时间的
-#: 记忆就丢多久；而不跳过的话，用户充值/重新登录后积压的记忆能一次补上。
+#: 记忆就丢多久；而不跳过的话，用户充值/重新登录后积压的记忆能补上。
 #:
-#: 2026-09-13 prod 实测：触发过逃生阀的 42 人里 41 人后续仍失败，**0 人是引号复发**，
+#: 2026-09-13 prod 实测：触发过旧逃生阀的 42 人里 41 人后续仍失败，**0 人是引号复发**，
 #: 41 人全卡在模型调用：33 人是自己的账号问题（密钥失效/余额不足），其余是渠道/上游不可用。
-#: 也就是说旧逃生阀在 prod 上几乎只干了一件事：替账号坏掉的用户一批批丢记忆。
 #:
-#: V2 用 extraction 的公开 provider 分类（剥掉 ``extraction_failed:`` 后）；
-#: ``content_filtered`` / ``provider_incompatible`` / ``unknown`` 可能真是内容引起的，不在此列。
+#: V2 用 extraction 的公开 provider 分类（剥掉 ``extraction_failed:`` 后）。
+#: 🔴 ``provider_config`` **不在此列**：provider_client 把 400/415/422 全归到它，
+#: 其中包括「消息太长超出上下文」这种内容引起的失败 —— 当账号问题永不跳过会把人永久卡死。
 ACCOUNT_FAILURE_KINDS = frozenset({
     "auth_invalid",
     "quota_insufficient",
-    "provider_config",
     "model_not_found",
     "rate_limited",
     "upstream_unavailable",
 })
 
-#: V1 报的是 CLI/模型原始错误文本（如 ``capture_agent_call_failed:RuntimeError: cli agent
-#: exited 1: Failed to authenticate. API Error: 401 {"error":"Insufficient balance"}``），
-#: 只能按关键词认。只收**明确指向账号/服务**的词，拿不准的仍走 6 次档。
+#: V1 报的是 CLI/模型原始错误文本，交给仓库统一的错误对照表（notices.error_contract）认 ——
+#: App 给用户弹的原因提示也查这张表，两边不会再各认各的（上一版自己列关键词，漏了
+#: 「Not logged in · Please run /login」）。这里列的是对照表里属于账号/服务的那些类别。
+ACCOUNT_ERROR_CONTRACT_CODES = frozenset({
+    "quota_insufficient",
+    "provider_account_expired",
+    "auth_invalid",
+    "model_not_found",
+    "rate_limited",
+    "upstream_unavailable",
+    "resident_agent_cli_logged_out",
+    "cli_config_invalid",
+})
+
+#: 对照表之外、V1 consumer 自己也按账号问题处理的原始文本（见 chat_resident_consumer 的
+#: 失败分类：``"invalid key" in lowered`` → provider_auth）。
 ACCOUNT_FAILURE_MARKERS = (
+    "invalid key",
     "insufficient balance",
-    "insufficient_balance",
-    "insufficient quota",
-    "insufficient_quota",
-    "credit balance",
-    "quota exceeded",
-    "failed to authenticate",
-    "authentication failed",
-    "unauthorized",
-    "invalid api key",
-    "invalid_api_key",
-    "incorrect api key",
-    "oauth session expired",
-    "api error: 401",
-    "api error: 402",
-    "api error: 403",
-    "api error: 429",
-    "rate limit",
-    "rate_limit",
-    "service unavailable",
-    "overloaded",
 )
+
+#: 账号/服务类失败**同一批**持续这么久仍没好，才跳过。
+#:
+#: 为什么不是「永不跳过」：有的模型服务「内容被拒」和「密钥无效」回的都是 403，
+#: 被判成账号问题的失败里可能混着真正的毒消息。永不跳过 = 这类用户永久卡死，
+#: 正是逃生阀要修的问题。7 天足够用户发现提示、去充值或重新登录；
+#: 退避间隔会拉长到最多 6 小时一次，7 天内也就重试几十次。
+CAPTURE_ACCOUNT_SKIP_AFTER_SEC = 7 * 86400
 
 
 def window_key(window: Mapping | None) -> str:
@@ -199,6 +200,7 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
         "capture_fail_streak": 0,
         "capture_parse_fail_streak": 0,
         "capture_window_fail_count": 0,
+        "capture_account_fail_since": 0.0,
         "capture_fail_window_key": "",
         "capture_skipped_windows": max(
             0, int(_safe_float(state.get("capture_skipped_windows"), 0.0))
@@ -208,13 +210,20 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
 
 
 def failure_class(reason: str) -> str:
-    """一次失败属于哪类：``parse``（坏 JSON，3 次快跳）/ ``account``（永不跳）/ ``other``（6 次兜底）。"""
-    text = str(reason or "").strip().lower()
+    """一次失败属于哪类：``parse``（坏 JSON，连续 3 次快跳）/ ``account``（账号或服务，
+    持续 7 天才跳）/ ``other``（6 次兜底）。"""
+    raw = str(reason or "").strip()
+    text = raw.lower()
     kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
-    if kind in ACCOUNT_FAILURE_KINDS or any(m in text for m in ACCOUNT_FAILURE_MARKERS):
-        return "account"
     if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
         return "parse"
+    if kind in ACCOUNT_FAILURE_KINDS or any(m in text for m in ACCOUNT_FAILURE_MARKERS):
+        return "account"
+    from notices import error_contract  # 延迟导入：只在失败路径上用
+
+    spec = error_contract.classify_text(raw)
+    if spec is not None and spec.code in ACCOUNT_ERROR_CONTRACT_CODES:
+        return "account"
     return "other"
 
 
@@ -246,7 +255,8 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
 
     ``capture_window_fail_count`` 数同一窗口里**非账号类**的失败，到 6 次兜底跳过；
     ``capture_parse_fail_streak`` 只数**连续的**解析类失败，到 3 次快速跳过，
-    中间夹一次别的失败就清零。账号类失败（见 ACCOUNT_FAILURE_KINDS）永不跳过、也不计数。
+    中间夹一次别的失败就清零。账号类失败不计次数，同一批从第一次账号类失败起持续
+    ``CAPTURE_ACCOUNT_SKIP_AFTER_SEC``（7 天）仍失败才跳（``capture_account_fail_since``）。
     ``capture_fail_streak`` 仍是退避和告警用的总连续失败数。
 
     以前两档共用一个 streak、阈值只看本次原因，于是
@@ -273,11 +283,17 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     prev_count = (int(_safe_float(state.get("capture_window_fail_count"), 0.0))
                   if same else 0)
     parse_streak = prev_parse + 1 if kind == "parse" else 0
-    # 账号类失败**不计入**跳过计数：否则余额不足失败 8 次、充值后再偶发一次超时，
-    # 就会因为「已经 9 次了」立刻跳掉。
+    # 账号类失败**不计入**次数：否则余额不足失败 8 次、充值后再偶发一次超时，
+    # 就会因为「已经 9 次了」立刻跳掉。账号类按**持续时间**算，见 CAPTURE_ACCOUNT_SKIP_AFTER_SEC。
     window_count = prev_count if kind == "account" else prev_count + 1
-    if kind != "account" and (parse_streak >= CAPTURE_POISON_SKIP_AFTER
-                              or window_count >= CAPTURE_TRANSIENT_SKIP_AFTER):
+    prev_since = (_safe_float(state.get("capture_account_fail_since"), 0.0)
+                  if same else 0.0)
+    account_since = (prev_since or now_ts) if kind == "account" else prev_since
+    account_expired = (kind == "account" and account_since > 0
+                       and now_ts - account_since >= CAPTURE_ACCOUNT_SKIP_AFTER_SEC)
+    if account_expired or (kind != "account" and (
+            parse_streak >= CAPTURE_POISON_SKIP_AFTER
+            or window_count >= CAPTURE_TRANSIENT_SKIP_AFTER)):
         # 阈值 1 只是复用「推游标」的补丁；该不该跳已经在这里判断过。
         skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
     else:
@@ -287,6 +303,7 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     return ({"capture_fail_streak": streak,
              "capture_parse_fail_streak": parse_streak,
              "capture_window_fail_count": window_count,
+             "capture_account_fail_since": account_since,
              "capture_fail_window_key": key,
              "last_capture_failed_at": now_ts}, streak, False)
 

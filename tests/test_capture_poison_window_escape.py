@@ -314,7 +314,14 @@ def test_one_parse_failure_cannot_inherit_earlier_write_failures():
     ("extraction_failed:quota_insufficient", "account"),
     ("extraction_failed:rate_limited", "account"),
     ("extraction_failed:upstream_unavailable", "account"),
-    # 可能真是内容引起的 —— 不能归到永不跳过
+    # V1 仓库错误对照表里已有的形状（Codex 第 5 轮：上一版关键词漏了它们，第 6 次照样跳）
+    ("capture_agent_call_failed:RuntimeError: Not logged in · Please run /login", "account"),
+    ("capture_agent_call_failed:RuntimeError: cli agent exited 1: invalid key", "account"),
+    # 🔴 provider_config 混着 400/415/422，含「消息太长」这种内容引起的 —— 不能算账号
+    ("extraction_failed:provider_config", "other"),
+    ("capture_agent_call_failed:RuntimeError: Provider API error 400: maximum context length exceeded",
+     "other"),
+    # 可能真是内容引起的 —— 不能归到账号类
     ("extraction_failed:content_filtered", "other"),
     ("extraction_failed:unknown", "other"),
     ("capture_agent_call_failed:RuntimeError: openai-compatible response carried no assistant text",
@@ -327,8 +334,8 @@ def test_failure_class(reason, expected):
     assert cf.failure_class(reason) == expected
 
 
-def test_account_failures_never_skip_and_do_not_count_toward_skipping():
-    """🔴 余额不足失败再多次也不跳；充值后偶发的别的失败也不能继承这些次数立刻跳。"""
+def test_account_failures_do_not_skip_within_seven_days_and_do_not_count():
+    """🔴 余额不足失败再多次也不跳（7 天内）；充值后偶发的别的失败也不能继承这些次数立刻跳。"""
     balance = "extraction_failed:quota_insufficient"
     other = "capture_memory_write_failed"
     assert _run_reasons([balance] * 30) is None
@@ -366,3 +373,32 @@ def test_frontier_seq_takes_the_later_of_seq_and_message_id():
     # 老数据只有数字、没有标志位：数字可信
     assert cf.frontier_seq({"last_captured_until_seq": 77}, seq_of) == 77
     assert cf.frontier_seq({}, seq_of) == 0
+
+
+def test_account_failures_skip_only_after_persisting_seven_days():
+    """账号类失败按**持续时间**兜底：同一批从第一次账号类失败起满 7 天仍失败才跳。
+
+    防的是 403「内容被拒」被误判成「密钥无效」—— 永不跳过会把真正的毒消息永久卡住。
+    """
+    w = {"after_message_id": "msg_a", "until_message_id": "msg_c",
+         "until_ts": 1.0, "through_seq": 120}
+    balance = "extraction_failed:quota_insufficient"
+    day = 86400.0
+    state: dict = {}
+    t0 = 1_000_000.0
+    for t in (t0, t0 + 1 * day, t0 + 3 * day, t0 + 6.9 * day):
+        patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t, reason=balance)
+        state.update(patch)
+        assert not skipped, f"第 {(t - t0) / day:.1f} 天就跳了"
+    assert state["capture_account_fail_since"] == t0
+    patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0 + 7 * day, reason=balance)
+    assert skipped, "账号类失败持续 7 天仍没跳"
+    assert patch["capture_account_fail_since"] == 0.0
+
+    # 换了一批（游标变了）重新计时
+    state = {}
+    patch, _s, _ = cf.capture_failure_patch(state, w, now_ts=t0, reason=balance)
+    state.update(patch)
+    w2 = {**w, "after_message_id": "msg_z"}
+    patch, _s, skipped = cf.capture_failure_patch(state, w2, now_ts=t0 + 8 * day, reason=balance)
+    assert not skipped and patch["capture_account_fail_since"] == t0 + 8 * day

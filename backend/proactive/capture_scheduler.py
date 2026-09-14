@@ -138,6 +138,8 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "capture_window_fail_count": max(
             0, int(_safe_float(doc.get("capture_window_fail_count"), 0.0))
         ),
+        #: 同一窗口第一次账号/服务类失败的时间；持续 7 天仍失败才跳过。
+        "capture_account_fail_since": _safe_float(doc.get("capture_account_fail_since"), 0.0),
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))
