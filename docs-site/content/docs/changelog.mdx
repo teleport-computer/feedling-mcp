@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
+  The block is the user-visible first-person aside shown under the reply, and the
+  instruction now says so; it is no longer described as private inner thoughts.
+  Anthropic's request safeguards on the Opus 5 family classified the previous
+  `<think>` wording as a request for hidden reasoning and rejected every resident
+  turn. The shared thinking-leak gate now recognises `<aside>` on every path
+  that uses it (Runtime V2 chat and wake, resident V1 chat, proactive messages):
+  an `<aside>…</aside>` block is stripped exactly like `<think>`, and a
+  truncated opener such as `<asid` fails closed instead of reaching the user.
+  Prompt text and driver selection for pi, codex, and Runtime V2 are unchanged.
+
 - **Regular V2 wakes now treat speaking as the default.** Silence requires a
   concrete reason in the model instructions. The existing structured
   `reply`/`stay_silent` validation remains in place, and free-form text still
