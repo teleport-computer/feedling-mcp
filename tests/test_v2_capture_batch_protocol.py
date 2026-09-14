@@ -2039,11 +2039,17 @@ def test_v2_first_window_parse_failure_is_skipped_after_three_real_runs(monkeypa
     assert int(state["capture_fail_streak"]) == 0
 
 
-def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeypatch):
+@pytest.mark.parametrize("entry", ["run_turn", "run_extraction"])
+def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeypatch, entry):
     """🔴 prepared 批次每次提交都抛异常（比如写入时拿不到密钥）：到上限后跳过。
 
     以前 prepared 重试时窗口是个 until_message_id="" 的空壳，逃生阀认为
     「说不清推到哪」而永远不跳 —— 那个批次就成了新的队头阻塞。
+
+    prepared 批次在 worker 里有两处恢复：
+    - run_turn：生产入口 _run_turn_body 在进 _run_extraction **之前**就恢复（真实流量走这里）
+    - run_extraction：_run_extraction 内部那段兜底
+    两处各漏过一次窗口（第一轮修了后者，第三轮 review 才发现前者），所以两条都测。
     """
     from memory import capture_failure
 
@@ -2066,13 +2072,18 @@ def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeyp
         commit_calls.append(kwargs["batch_id"])
         raise RuntimeError("capture_memory_write_failed")
 
-    deps = _poison_deps(uid, messages=[], commit_capture_batch=commit_raises)
+    deps = _poison_deps(uid, messages=[], commit_capture_batch=commit_raises,
+                        capture_enabled=lambda _uid: True)
     limit = capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
     for attempt in range(1, limit + 1):
         owner = f"retry-owner-{attempt}"
-        _job_id, job = _running(uid, owner=owner, start=False)
-        assert jobs_store.mark_running(job["id"], claimed_by=owner)
-        assert _run_capture(uid, job, deps, owner) == "failed"
+        if entry == "run_turn":
+            _job_id, job = _running(uid, owner=owner, start=False)
+            assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+        else:
+            _job_id, job = _running(uid, owner=owner, start=False)
+            assert jobs_store.mark_running(job["id"], claimed_by=owner)
+            assert _run_capture(uid, job, deps, owner) == "failed"
         state = _capture_state(uid)
         if attempt < limit:
             assert int(state.get("last_captured_until_seq") or 0) == 0, f"第 {attempt} 次就跳了"

@@ -13472,12 +13472,19 @@ async def _terminalize_extraction_gate(
     tm: "TurnMetrics",
     code: str,
     cancel: bool,
+    window: dict[str, Any] | None = None,
 ) -> str:
-    """Settle a background extraction gate without any chat-visible error."""
+    """Settle a background extraction gate without any chat-visible error.
+
+    ``window`` 只在「能证明是哪一批消息失败了」时给（目前只有 prepared 批次恢复），
+    落卡逃生阀靠它识别同一批反复失败。其余门禁（开关关闭、协议不可用、停机）
+    不是毒消息场景，不传 —— 调用参数和以前逐字节一致。
+    """
     landed = False
     if lane == "capture":
         callback = deps.cancel_capture_job if cancel else deps.fail_capture_job
         if callback is not None and claimed_by:
+            extra = {"window": window} if (window and not cancel) else {}
             landed = bool(
                 await asyncio.to_thread(
                     callback,
@@ -13485,6 +13492,7 @@ async def _terminalize_extraction_gate(
                     user_id=user_id,
                     claimed_by=claimed_by,
                     error=code,
+                    **extra,
                 )
             )
     if not landed:
@@ -17277,6 +17285,7 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                     cancel=False,
                 )
             recovery_recorder = None
+            prepared = None
             try:
                 state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
                 raw_seq = state.get("last_captured_until_seq")
@@ -17391,6 +17400,14 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                         "capture_recovery_failed", recovery_exc
                     ),
                     cancel=False,
+                    # 🔴 生产上 prepared 批次的恢复走的是这里（不是 _run_extraction 里
+                    # 那段）。提交反复抛异常时不带窗口，逃生阀永远不触发，这个批次
+                    # 就是新的队头阻塞（Codex 第三轮抓到）。拿到批次之前就挂了则不传。
+                    window=(
+                        capture_failure.window_from_batch_row(prepared)
+                        if isinstance(prepared, dict)
+                        else None
+                    ),
                 )
     recorder = _make_trajectory_recorder(job, deps)
     try:
