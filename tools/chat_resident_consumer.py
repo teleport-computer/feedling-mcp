@@ -322,6 +322,7 @@ class ProactiveChatContext:
     last_user_message_age_sec: float | None = None
     last_visible_proactive_age_sec: float | None = None
     visible_proactive_count_24h: int = 0
+    memory_anchor: dict | None = None
 
 
 def _mask(val: str) -> str:
@@ -2934,8 +2935,8 @@ def _auto_memory_arrival(payload: str, channel: str, *, driver: str, trace_id: s
 
 def _auto_memory_block_for(msg: dict, trace_id: str) -> tuple[str, list[str]]:
     """Fetch + render this message's own picks (never another message's), record
-    the turn state pending arrival, and trace ids/counts only. Used at the chat
-    assembly site; extracted so the per-turn rule is unit-testable."""
+    the turn state pending arrival, and trace ids/counts only. Shared by chat
+    and wake assembly; wakes supply the latest historical user's id/seq only."""
     entry = _auto_memory_fetch_for_turn(msg or {})
     picked = entry.get("picks") if entry else None
     quoted_ids = [str(c.get("id") or "") for c in ((msg or {}).get("quoted_memories") or []) if isinstance(c, dict)]
@@ -16420,6 +16421,13 @@ def _proactive_chat_context_from_history(history: list[dict] | None, *, limit: i
         last_user_message_age_sec=age_for(last_user) if last_user else None,
         last_visible_proactive_age_sec=age_for(last_proactive) if last_proactive else None,
         visible_proactive_count_24h=proactive_count_24h,
+        # Keep the anchor even when stale-tail truncation omits that user row.
+        # Historical quoted_memories are not explicit references in this wake.
+        memory_anchor=(
+            {"id": last_user.get("id") or last_user.get("message_id"),
+             "seq": last_user.get("seq")}
+            if last_user else None
+        ),
     )
 
 
@@ -19241,13 +19249,17 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         # ── 闸已放行,现在才付昂贵的上下文构建 ────────────────────────
+        _recall_turn_reset()
+        trace_id = str(job.get("trace_id") or job_id)
+        # Introduction deliberately has no recent-chat fetch/user anchor.
+        recent_context = ProactiveChatContext()
         if is_introduction:
             screen_payloads = []
             screen_paths = []
             message = _message_for_introduction_job(job)
         else:
             screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-            recent_context = recent_chat_context_for_proactive()
+            recent_context = _coerce_proactive_chat_context(recent_chat_context_for_proactive())
             # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
             # (its prompt deliberately omits the board).
             perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
@@ -19257,6 +19269,12 @@ def _process_proactive_jobs(jobs: list) -> float:
                 recent_chat_context=recent_context,
                 perception_digest=perception_digest,
             )
+        # T582: select against the latest user in the existing history snapshot,
+        # never the wake text or a newer assistant row. No anchor/fetch failure
+        # stays unknown, and the shared final-driver hook settles actual arrival.
+        auto_text, _auto_ids = _auto_memory_block_for(recent_context.memory_anchor or {}, trace_id)
+        if auto_text:
+            message = f"{auto_text}\n\n{message}"
         update_proactive_job_status(job_id, "realizing")
         # 屏幕像素轮必须armed平台出站围栏 —— 聊天道一直这么做(`screen_pixel_turn`),
         # 主动道**从来没有**:它带着 screen_payloads 调用,却让 outbound_fence 保持
@@ -19275,6 +19293,7 @@ def _process_proactive_jobs(jobs: list) -> float:
                 # 与聊天道不同,两条道永远共享不了 provider 的 prompt cache。
                 # 身份写保护不受影响:io_cli 的闸只放行 chat/未设,proactive 仍被拒。
                 lane="proactive",
+                trace_id=trace_id,
                 **({"outbound_fence": True} if pixel_turn else {}),
             )
         except Exception as e:
@@ -19309,6 +19328,10 @@ def _process_proactive_jobs(jobs: list) -> float:
                 job_id=job_id,
             )
             continue
+        finally:
+            # CLI terminals consume their ledger; also clear state for HTTP or
+            # calls that fail before a CLI terminal so later jobs cannot reuse it.
+            _recall_turn_reset()
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
         # The turn reached the agent — open the across-batch coalescing window so
