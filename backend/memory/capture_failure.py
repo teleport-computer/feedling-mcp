@@ -352,6 +352,23 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
              "last_capture_failed_at": now_ts}, streak, False)
 
 
+#: 落卡**真正成功**（游标推进）时要清掉的整套失败子状态。V1 两个记录函数和 V2 提交共用。
+#:
+#: 以前只清 streak 和失败时间，``capture_account_error_code`` 等留着：
+#:
+#:     余额不足失败 → 成功提交 → 连续 3 次「批次丢失」（服务端问题）
+#:     → 提示读到残留的 quota_insufficient，告诉用户「额度不足」（Codex 第 8 轮复现）
+SUCCESS_RESET_PATCH: dict[str, Any] = {
+    "capture_fail_streak": 0,
+    "last_capture_failed_at": 0.0,
+    "capture_account_error_code": "",
+    "capture_parse_fail_streak": 0,
+    "capture_window_fail_count": 0,
+    "capture_account_fail_since": 0.0,
+    "capture_fail_window_key": "",
+}
+
+
 def window_from_batch_row(batch: Mapping[str, Any]) -> dict[str, Any]:
     """V2 持久批次行（v2_capture_batches）→ 逃生阀认得的窗口。只取游标字段，不碰内容。
 

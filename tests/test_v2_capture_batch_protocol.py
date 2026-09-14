@@ -2258,8 +2258,11 @@ def test_worker_and_commit_agree_on_the_frontier_when_seq_was_zeroed(monkeypatch
     "extraction_failed:auth_invalid",
     "extraction_failed:upstream_unavailable",
 ])
-def test_v2_account_failures_never_skip(reason):
-    """🔴 账号/服务坏了（余额不足、密钥失效、上游不可用）：再多次也不跳，等修好后补上。"""
+def test_v2_account_failures_do_not_skip_by_count(reason):
+    """🔴 账号/服务坏了（余额不足、密钥失效、上游不可用）：不按次数跳（7 天内），等修好后补上。
+
+    7 天上限见 test_account_failures_skip_only_after_persisting_seven_days 和本文件的 V2 7 天边界测试；这里只测「次数再多也不跳」。
+    """
     uid = f"u_capture_account_{reason.split(':')[1]}"
     _seed(uid)
     for attempt in range(1, 13):
@@ -2350,3 +2353,88 @@ def test_v2_notice_is_raised_on_real_failures_and_cleared_by_real_commit():
     assert asyncio.run(worker._run_turn(job, ok_deps)) == "completed"
     assert int(_capture_state(uid).get("capture_fail_streak") or 0) == 0
     assert _notice()["resolved"] is True, "真实提交成功后提示没有清掉"
+
+
+def test_v2_account_failure_skips_after_seven_days_through_the_store(monkeypatch):
+    """V2 持久化路径的 7 天边界：未满 7 天不跳，满 7 天跳过（时间来自 _capture_fail_on_cursor）。"""
+    from memory import capture_failure
+
+    uid = "u_capture_account_seven_days"
+    _seed(uid)
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(jobs_store.time, "time", lambda: clock["now"])
+    limit = capture_failure.CAPTURE_ACCOUNT_SKIP_AFTER_SEC
+
+    def fail(owner):
+        job_id, _job = _running(uid, owner=owner)
+        assert jobs_store.fail_capture_job(
+            job_id=job_id, user_id=uid, claimed_by=owner,
+            error="extraction_failed:quota_insufficient", window=_window(after=0, through=3))
+
+    fail("seven-0")
+    clock["now"] += limit - 60
+    fail("seven-1")
+    assert int(_capture_state(uid).get("capture_skipped_windows") or 0) == 0, "未满 7 天就跳了"
+    clock["now"] += 120
+    fail("seven-2")
+    state = _capture_state(uid)
+    assert int(state["capture_skipped_windows"]) == 1
+    assert int(state["last_captured_until_seq"]) == 3
+
+
+def test_success_clears_stale_account_cause_before_later_serverside_failures():
+    """余额不足失败 → 成功提交 → 3 次服务端「批次丢失」：提示不能说「额度不足」（Codex 第 8 轮）。"""
+    from notices import core as notices_core
+
+    uid = "u_capture_stale_account_cause"
+    _seed(uid)
+    job_id, _job = _running(uid, owner="stale-0")
+    assert jobs_store.fail_capture_job(
+        job_id=job_id, user_id=uid, claimed_by="stale-0",
+        error="extraction_failed:quota_insufficient", window=_window(after=0, through=3))
+    assert _capture_state(uid)["capture_account_error_code"] == "quota_insufficient"
+
+    ok_id, _job = _running(uid, owner="stale-ok")
+    batch = jobs_store.prepare_capture_batch(
+        job_id=ok_id, user_id=uid, claimed_by="stale-ok",
+        window=_window(after=0, through=3), actions=[_add(uid, "mom-stale-ok")])
+    assert jobs_store.commit_capture_batch(
+        job_id=ok_id, user_id=uid, claimed_by="stale-ok", batch_id=batch["id"])["committed"]
+    state = _capture_state(uid)
+    assert state.get("capture_account_error_code", "") == ""
+    assert int(state.get("capture_account_fail_since") or 0) == 0
+
+    last = None
+    for attempt in range(3):
+        fid, _job = _running(uid, owner=f"stale-f{attempt}")
+        assert jobs_store.fail_capture_job(
+            job_id=fid, user_id=uid, claimed_by=f"stale-f{attempt}",
+            error="capture_batch_unavailable")
+        last = fid
+    assert _capture_state(uid).get("capture_account_error_code", "") == ""
+    deps = worker.TurnDeps(
+        read_messages=lambda _u: [], resolve_provider=lambda _u: (object(), {}),
+        mint_enclave_token=lambda _u: "rt", read_capture_state=serve_worker._read_capture_state)
+    asyncio.run(worker._notify_capture_backoff(
+        deps, {"lane": "capture", "user_id": uid, "id": last}, "failed"))
+    rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+    assert "额度" not in rows["memory_backoff:capture"]["user_text"]
+
+
+def test_provider_resolution_failure_uses_the_capture_failure_path():
+    """V2 落卡在解析 provider 之前就失败（未配置/信封缺失）：也要累计退避、记任务 id、发提示；不跳过。"""
+    from notices import core as notices_core
+
+    uid = "u_capture_provider_unresolved"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    deps = _poison_deps(uid, messages=[], capture_enabled=lambda _uid: True,
+                        resolve_provider=lambda _uid: (None, {"error": "model_api_not_configured"}))
+    for attempt in range(3):
+        _job_id, job = _running(uid, owner=f"unresolved-{attempt}", start=False)
+        assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+    state = _capture_state(uid)
+    assert int(state["capture_fail_streak"]) == 3, "provider 前置失败没进落卡失败框架，退避不会生效"
+    assert int(state.get("capture_skipped_windows") or 0) == 0
+    keys = {r["dedupe_key"] for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+    assert "memory_backoff:capture" in keys

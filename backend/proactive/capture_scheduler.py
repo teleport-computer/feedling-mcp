@@ -20,6 +20,7 @@ from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 from memory.capture_failure import capture_failure_patch as _capture_failure_patch
 from memory.capture_failure import frontier_seq as _frontier_seq
+from memory.capture_failure import SUCCESS_RESET_PATCH as _SUCCESS_RESET_PATCH
 
 log = logging.getLogger(__name__)
 
@@ -666,8 +667,7 @@ def record_v2_capture_status(
         # newer capture frontier backwards.
         patch = {
             "pending_capture_key": "",
-            "capture_fail_streak": 0,
-            "last_capture_failed_at": 0.0,
+            **_SUCCESS_RESET_PATCH,
         }
         if until_id and current_id == after_id:
             patch.update(
@@ -832,8 +832,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             cards_added=cards_added,
             completed_at=now_ts,
         ))
-        state["capture_fail_streak"] = 0
-        state["last_capture_failed_at"] = 0.0
+        state.update(_SUCCESS_RESET_PATCH)
     elif status_text == "failed":
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         failed_window = (job.get("capture_window")

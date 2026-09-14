@@ -13,14 +13,16 @@ change must not be interpreted as an API guarantee.
 ## Unreleased
 
 - Memory capture no longer stops permanently when one batch of chat keeps
-  failing. If the same batch fails 3 times in a row with an unreadable model
-  output, or 6 times for any reason, capture skips that batch and continues with
-  newer messages. The skipped batch produces no memories, and the skip is recorded
-  in capture diagnostics. Previously a single bad batch could block all future
-  memories for that account. Failures caused by the account or model provider
-  (invalid key, insufficient balance, expired login, rate limits, provider
-  unavailable) never skip a batch: capture keeps retrying with backoff, and the
-  pending messages are captured once the account works again.
+  failing. Failures are handled in three classes. If the model output for the
+  same batch is unreadable 3 times in a row, capture skips that batch. Failures
+  caused by the account or model provider (invalid key, insufficient balance,
+  expired login, rate limits, provider unavailable) keep retrying with backoff
+  so pending messages can be captured once the account works again; if they
+  persist for 7 days, the oldest pending batch is skipped. Other failures skip
+  the batch after 6 attempts. A skipped batch produces no memories and is
+  recorded in capture diagnostics. While capture is blocked, the app shows a
+  notice naming the cause when it is known. Previously a single bad batch could
+  block all future memories for that account.
 
 - V1 resident proactive wakes now include relevant memory summaries selected
   against the latest user message in their history snapshot. Heartbeat,

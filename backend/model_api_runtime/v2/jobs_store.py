@@ -3368,6 +3368,11 @@ def _capture_fail_on_cursor(
                 ),
             }
         )
+        if increment_backoff:
+            # 没有窗口的失败（批次丢失、游标被推进、provider 前置失败…）也要按**本次**原因
+            # 重写分类，不能沿用上一次失败留下的「额度不足」去提示用户（Codex 第 8 轮）。
+            failed["capture_account_error_code"] = capture_failure.account_error_code(
+                str(error or ""))
     if increment_backoff:
         # 让 worker 的用户提示能确认「这次失败确实是本任务累计的」：取消（关闭落卡/停机）
         # 不累计，失租的旧 worker 也写不到这里 —— 它们都不能拿共享状态里的旧次数去发提示。
@@ -3932,8 +3937,7 @@ def commit_capture_batch(
                                 "capture_seq_initialized": True,
                                 "last_capture_completed_at": now_ts,
                                 "pending_capture_key": "",
-                                "capture_fail_streak": 0,
-                                "last_capture_failed_at": 0.0,
+                                **capture_failure.SUCCESS_RESET_PATCH,
                                 "updated_at": now_iso,
                             }
                         )

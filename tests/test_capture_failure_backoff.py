@@ -268,8 +268,8 @@ def test_v1_skip_keeps_the_seq_cursor_honest(tmp_path, monkeypatch):
     assert capture_scheduler._live_messages_after_capture(store, state) == []
 
 
-def test_v1_account_failures_never_skip_the_window(tmp_path, monkeypatch):
-    """🔴 V1 用户余额不足：连续失败多少次都不跳过这批，充值后还能补上。
+def test_v1_account_failures_do_not_skip_by_count(tmp_path, monkeypatch):
+    """🔴 V1 用户余额不足：7 天内连续失败多少次都不跳过这批，充值后还能补上。
 
     2026-09-13 prod：触发过旧逃生阀的 42 人里 33 人是自己的账号问题（余额不足/密钥失效），
     跳过只是替他们一批批丢记忆。原因文本取自 prod 真实形状。

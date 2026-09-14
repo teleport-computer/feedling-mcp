@@ -17565,9 +17565,21 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                     {"stage": "provider_resolution", "error_code": err},
                     best_effort=True,
                 )
-                owned = await asyncio.to_thread(
-                    jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
-                )
+                if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+                    # 落卡的 provider 前置失败（未配置/未测试/信封缺失/解密失败）也走落卡失败框架：
+                    # 累计退避（否则调度器每轮都重建同一个任务）、记本任务 id（提示才发得出来）。
+                    # 不带窗口 → 不跳过：模型用不了时跳过一批毫无用处，修好后从原处继续（Codex 第 8 轮）。
+                    owned = await asyncio.to_thread(
+                        deps.fail_capture_job,
+                        job_id=job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                        error=err,
+                    )
+                else:
+                    owned = await asyncio.to_thread(
+                        jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+                    )
                 if owned and lane in {"chat", "scheduled"}:
                     if lane == "chat":
                         await _settle_legacy_traced_chat_failure(err)
