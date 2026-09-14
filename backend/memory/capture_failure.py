@@ -9,7 +9,7 @@ V1（``proactive.capture_scheduler``）和 V2（``model_api_runtime.v2.jobs_stor
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -79,6 +79,54 @@ DETERMINISTIC_FAILURE_KINDS = (
 )
 
 _V2_FAILURE_SCOPE = "extraction_failed:"
+
+#: **永远不跳过**的失败：问题出在账号或模型服务上，不在这批消息里。
+#:
+#: 跳过只对「这批消息本身有毒」有用。账号坏了（余额不足、密钥失效、登录过期）
+#: 或服务不可用时跳过这批，下一批照样失败、照样被跳 —— 账号坏多久，那段时间的
+#: 记忆就丢多久；而不跳过的话，用户充值/重新登录后积压的记忆能一次补上。
+#:
+#: 2026-09-13 prod 实测：触发过逃生阀的 42 人里 41 人后续仍失败，**0 人是引号复发**，
+#: 41 人全卡在模型调用：33 人是自己的账号问题（密钥失效/余额不足），其余是渠道/上游不可用。
+#: 也就是说旧逃生阀在 prod 上几乎只干了一件事：替账号坏掉的用户一批批丢记忆。
+#:
+#: V2 用 extraction 的公开 provider 分类（剥掉 ``extraction_failed:`` 后）；
+#: ``content_filtered`` / ``provider_incompatible`` / ``unknown`` 可能真是内容引起的，不在此列。
+ACCOUNT_FAILURE_KINDS = frozenset({
+    "auth_invalid",
+    "quota_insufficient",
+    "provider_config",
+    "model_not_found",
+    "rate_limited",
+    "upstream_unavailable",
+})
+
+#: V1 报的是 CLI/模型原始错误文本（如 ``capture_agent_call_failed:RuntimeError: cli agent
+#: exited 1: Failed to authenticate. API Error: 401 {"error":"Insufficient balance"}``），
+#: 只能按关键词认。只收**明确指向账号/服务**的词，拿不准的仍走 6 次档。
+ACCOUNT_FAILURE_MARKERS = (
+    "insufficient balance",
+    "insufficient_balance",
+    "insufficient quota",
+    "insufficient_quota",
+    "credit balance",
+    "quota exceeded",
+    "failed to authenticate",
+    "authentication failed",
+    "unauthorized",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "oauth session expired",
+    "api error: 401",
+    "api error: 402",
+    "api error: 403",
+    "api error: 429",
+    "rate limit",
+    "rate_limit",
+    "service unavailable",
+    "overloaded",
+)
 
 
 def window_key(window: Mapping | None) -> str:
@@ -150,12 +198,24 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
         # 跳过之后 streak 归零：下一批是干净的，不该带着旧账退避。
         "capture_fail_streak": 0,
         "capture_parse_fail_streak": 0,
+        "capture_window_fail_count": 0,
         "capture_fail_window_key": "",
         "capture_skipped_windows": max(
             0, int(_safe_float(state.get("capture_skipped_windows"), 0.0))
         ) + 1,
         "last_capture_skipped_at": now_ts,
     }
+
+
+def failure_class(reason: str) -> str:
+    """一次失败属于哪类：``parse``（坏 JSON，3 次快跳）/ ``account``（永不跳）/ ``other``（6 次兜底）。"""
+    text = str(reason or "").strip().lower()
+    kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
+    if kind in ACCOUNT_FAILURE_KINDS or any(m in text for m in ACCOUNT_FAILURE_MARKERS):
+        return "account"
+    if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
+        return "parse"
+    return "other"
 
 
 def skip_threshold_for(reason: str) -> int:
@@ -184,9 +244,10 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
 
     ## 两档阈值各数各的
 
-    ``capture_fail_streak`` 是同一窗口的**总失败数**，到 6 次兜底跳过；
+    ``capture_window_fail_count`` 数同一窗口里**非账号类**的失败，到 6 次兜底跳过；
     ``capture_parse_fail_streak`` 只数**连续的**解析类失败，到 3 次快速跳过，
-    中间夹一次别的失败就清零。
+    中间夹一次别的失败就清零。账号类失败（见 ACCOUNT_FAILURE_KINDS）永不跳过、也不计数。
+    ``capture_fail_streak`` 仍是退避和告警用的总连续失败数。
 
     以前两档共用一个 streak、阈值只看本次原因，于是
 
@@ -203,16 +264,21 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
         return ({"capture_fail_streak": streak,
                  "last_capture_failed_at": now_ts}, streak, False)
     same = key == str(state.get("capture_fail_window_key") or "")
-    parse_failure = skip_threshold_for(reason) == CAPTURE_POISON_SKIP_AFTER
+    kind = failure_class(reason)
+    # capture_fail_streak 仍是退避/告警用的总连续失败数，语义不变。
     streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
               if same else 1)
     prev_parse = (int(_safe_float(state.get("capture_parse_fail_streak"), 0.0))
                   if same else 0)
-    parse_streak = prev_parse + 1 if parse_failure else 0
-    if parse_streak >= CAPTURE_POISON_SKIP_AFTER:
-        # 用阈值 1 只是复用「推游标」的补丁；是否该跳已经在这里判断过。
-        skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
-    elif streak >= CAPTURE_TRANSIENT_SKIP_AFTER:
+    prev_count = (int(_safe_float(state.get("capture_window_fail_count"), 0.0))
+                  if same else 0)
+    parse_streak = prev_parse + 1 if kind == "parse" else 0
+    # 账号类失败**不计入**跳过计数：否则余额不足失败 8 次、充值后再偶发一次超时，
+    # 就会因为「已经 9 次了」立刻跳掉。
+    window_count = prev_count if kind == "account" else prev_count + 1
+    if kind != "account" and (parse_streak >= CAPTURE_POISON_SKIP_AFTER
+                              or window_count >= CAPTURE_TRANSIENT_SKIP_AFTER):
+        # 阈值 1 只是复用「推游标」的补丁；该不该跳已经在这里判断过。
         skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
     else:
         skip = None
@@ -220,6 +286,7 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
         return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
     return ({"capture_fail_streak": streak,
              "capture_parse_fail_streak": parse_streak,
+             "capture_window_fail_count": window_count,
              "capture_fail_window_key": key,
              "last_capture_failed_at": now_ts}, streak, False)
 
@@ -243,3 +310,32 @@ def window_after_seq(window: Mapping[str, Any] | None) -> int:
     """窗口起点 seq（缺失/非法按 0）。"""
     w = window if isinstance(window, Mapping) else {}
     return max(0, int(_safe_float(w.get("after_seq"), 0.0)))
+
+
+def frontier_seq(state: Mapping[str, Any] | None,
+                 translate_message_id: Callable[[str], Any]) -> int:
+    """「已经记到第几条了」—— 所有读落卡进度的地方都必须用这一个函数。
+
+    进度有两份记法：数字 ``last_captured_until_seq`` 和消息 id
+    ``last_captured_until_message_id``。两份本该一致，但有几条路只更新了 id：
+    V1 的窗口没有 seq、V1 旧逃生阀跳过时把 seq 写成 0（prod 上 42 人触发过）。
+    以前三处各读各的（worker 读数字、提交读数字、V1 调度器按标志位二选一），
+    数字和 id 对不上时就会：
+
+        worker 按 id 算出从第 N 条开始 → 提交时读到数字 0 → 对不上 → 提交被拒 → 永远重来
+
+    规则：两份都是「已经处理过」的边界，**取靠后的那个**。数字可信（已初始化，
+    或老数据只有数字）才参与比较；id 查不到（被清理）时只看数字。
+    ``translate_message_id`` 由调用方给（查 chat_messages 的 seq），本模块不碰数据库。
+    """
+    st = state if isinstance(state, Mapping) else {}
+    stored_usable = bool(st.get("capture_seq_initialized")) or (
+        "capture_seq_initialized" not in st and "last_captured_until_seq" in st
+    )
+    stored = (max(0, int(_safe_float(st.get("last_captured_until_seq"), 0.0)))
+              if stored_usable else 0)
+    message_id = str(st.get("last_captured_until_message_id") or "")
+    translated = 0
+    if message_id:
+        translated = max(0, int(_safe_float(translate_message_id(message_id), 0.0)))
+    return max(stored, translated)

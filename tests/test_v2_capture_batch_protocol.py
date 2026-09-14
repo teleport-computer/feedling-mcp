@@ -2148,3 +2148,117 @@ def test_commit_rejected_on_the_same_window_is_eventually_skipped():
     assert state["last_captured_until_message_id"] == "m3"
     assert state["capture_seq_initialized"] is True
     assert int(state["capture_skipped_windows"]) == 1
+
+
+# ── 进度两份记法不一致时（prod 上旧逃生阀留下的状态）──────────────────────
+
+
+def _seed_chat_rows(uid: str, ids: list[str]) -> dict[str, int]:
+    for i, mid in enumerate(ids, start=1):
+        db.chat_append_strict(
+            uid, mid, float(i),
+            {"id": mid, "role": "user", "source": "chat", "ts": float(i)}, 5000,
+        )
+    return {mid: int(db.chat_seq_for_msg_id(uid, mid)) for mid in ids}
+
+
+def _write_capture_state(uid: str, doc: dict) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,'capture_state',%s) "
+            "ON CONFLICT (user_id,kind) DO UPDATE SET doc=EXCLUDED.doc",
+            (uid, Jsonb(doc)),
+        )
+
+
+#: prod 上 V1 旧逃生阀跳过后留下的形状：数字被写成 0 且标了已初始化，id 记着真实位置。
+def _corrupted_state(message_id: str) -> dict:
+    return {
+        "last_captured_until_message_id": message_id,
+        "last_captured_until_seq": 0,
+        "capture_seq_initialized": True,
+    }
+
+
+def test_worker_and_commit_agree_on_the_frontier_when_seq_was_zeroed(monkeypatch):
+    """🔴 数字是 0、id 记着第 3 条：worker 从第 3 条之后开始，提交也认第 3 条。
+
+    以前 worker 信数字（从 0 开始 → 把记过的历史重整一遍，记忆重复）；
+    而只改 worker 不改提交的话，提交读到 0、批次起点是 3 → frontier_changed → 永远被拒。
+    两边必须走同一个 frontier_seq。
+    """
+    from model_api_runtime.v2 import extraction
+
+    uid = "u_capture_frontier_zeroed"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    seqs = _seed_chat_rows(uid, ["m1", "m2", "m3", "m4", "m5"])
+    _write_capture_state(uid, _corrupted_state("m3"))
+
+    # ① worker 算出来的起点
+    async def bad_json(**_kwargs):
+        return [], "json_decode_error:JSONDecodeError"
+
+    monkeypatch.setattr(extraction, "extract", bad_json)
+    monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: seqs["m5"])
+    seen_windows: list[dict] = []
+
+    def record_fail(**kwargs):
+        seen_windows.append(dict(kwargs.get("window") or {}))
+        return jobs_store.fail_capture_job(**kwargs)
+
+    messages = [
+        {"id": mid, "seq": seq, "ts": float(i), "role": "user", "raw_role": "user",
+         "source": "chat", "capture_eligible": True, "content": mid}
+        for i, (mid, seq) in enumerate(seqs.items(), start=1)
+    ]
+    _job_id, job = _running(uid, owner="frontier-worker")
+    deps = _poison_deps(uid, messages=messages, fail_capture_job=record_fail)
+    assert _run_capture(uid, job, deps, "frontier-worker") == "failed"
+    assert seen_windows and seen_windows[0]["after_seq"] == seqs["m3"], (
+        "worker 信了被写成 0 的数字，会把已经记过的历史重新整理一遍")
+
+    # ② 同一个起点上提交必须成功，不能被当成「游标被别人推进了」。
+    # 用「数字落后于 id」的形状（V1 完成只更新 id、数字停在旧值）：旧提交路径只要数字
+    # 非 0 就直接信它 → 算出第 1 条，批次起点是第 3 条 → frontier_changed。
+    # （数字恰好是 0 时旧提交路径会回落查 id，反而是旧 worker 信了 0 —— 两边照样对不上。）
+    _write_capture_state(uid, {"last_captured_until_message_id": "m3",
+                               "last_captured_until_seq": seqs["m1"],
+                               "capture_seq_initialized": True})
+    commit_id, _job = _running(uid, owner="frontier-commit")
+    batch = jobs_store.prepare_capture_batch(
+        job_id=commit_id, user_id=uid, claimed_by="frontier-commit",
+        window={"after_seq": seqs["m3"], "through_seq": seqs["m5"],
+                "after_message_id": "m3", "until_message_id": "m5", "until_ts": 5.0},
+        actions=[_add(uid, "mom-frontier")],
+    )
+    assert batch is not None
+    result = jobs_store.commit_capture_batch(
+        job_id=commit_id, user_id=uid, claimed_by="frontier-commit", batch_id=batch["id"],
+    )
+    assert result.get("committed") is True, result
+    state = _capture_state(uid)
+    assert int(state["last_captured_until_seq"]) == seqs["m5"]
+    assert state["capture_seq_initialized"] is True
+
+
+@pytest.mark.parametrize("reason", [
+    "extraction_failed:quota_insufficient",
+    "extraction_failed:auth_invalid",
+    "extraction_failed:upstream_unavailable",
+])
+def test_v2_account_failures_never_skip(reason):
+    """🔴 账号/服务坏了（余额不足、密钥失效、上游不可用）：再多次也不跳，等修好后补上。"""
+    uid = f"u_capture_account_{reason.split(':')[1]}"
+    _seed(uid)
+    for attempt in range(1, 13):
+        owner = f"account-owner-{attempt}"
+        job_id, _job = _running(uid, owner=owner)
+        assert jobs_store.fail_capture_job(
+            job_id=job_id, user_id=uid, claimed_by=owner, error=reason,
+            window=_window(after=0, through=3),
+        )
+    state = _capture_state(uid)
+    assert int(state.get("last_captured_until_seq") or 0) == 0
+    assert int(state.get("capture_skipped_windows") or 0) == 0
+    assert int(state["capture_fail_streak"]) == 12, "退避/告警用的总连续失败数照常累加"

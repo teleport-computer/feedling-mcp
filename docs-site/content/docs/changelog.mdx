@@ -17,7 +17,10 @@ change must not be interpreted as an API guarantee.
   output, or 6 times for any reason, capture skips that batch and continues with
   newer messages. The skipped batch produces no memories, and the skip is recorded
   in capture diagnostics. Previously a single bad batch could block all future
-  memories for that account.
+  memories for that account. Failures caused by the account or model provider
+  (invalid key, insufficient balance, expired login, rate limits, provider
+  unavailable) never skip a batch: capture keeps retrying with backoff, and the
+  pending messages are captured once the account works again.
 
 - V1 resident proactive wakes now include relevant memory summaries selected
   against the latest user message in their history snapshot. Heartbeat,

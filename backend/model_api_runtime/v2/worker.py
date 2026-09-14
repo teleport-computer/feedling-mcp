@@ -12391,23 +12391,14 @@ async def _run_extraction(
             after_id = str(
                 capture_state.get("last_captured_until_message_id") or ""
             )
-            raw_seq = capture_state.get("last_captured_until_seq")
-            if capture_state.get("capture_seq_initialized") or raw_seq is not None and (
-                "capture_seq_initialized" not in capture_state
-                and "last_captured_until_seq" in capture_state
-            ):
-                try:
-                    capture_after_seq = max(0, int(raw_seq))
-                except (TypeError, ValueError):
-                    capture_after_seq = 0
-            elif after_id:
-                # One-time legacy upgrade.  A missing/pruned boundary is not
-                # evidence that any later timestamp was covered: restart from
-                # zero rather than risk skipping out-of-order rows.
-                exact_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, after_id
-                )
-                capture_after_seq = int(exact_seq or 0)
+            # 数字和消息 id 两份进度取靠后的；提交那一步（jobs_store）用同一个函数，
+            # 两边算出来的起点必须一致，否则提交会被当成「游标被别人推进了」反复拒绝。
+            # id 被清理时只看数字；两者都没有才从 0 开始（不会越过没处理的消息）。
+            capture_after_seq = await asyncio.to_thread(
+                capture_failure.frontier_seq,
+                capture_state,
+                lambda message_id: db.chat_seq_for_msg_id(user_id, message_id),
+            )
             capture_snapshot_through_seq = await asyncio.to_thread(
                 db.chat_max_seq, user_id
             )
@@ -17288,23 +17279,12 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             prepared = None
             try:
                 state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
-                raw_seq = state.get("last_captured_until_seq")
-                if state.get("capture_seq_initialized") or (
-                    raw_seq is not None
-                    and "capture_seq_initialized" not in state
-                    and "last_captured_until_seq" in state
-                ):
-                    after_seq = max(0, int(raw_seq or 0))
-                else:
-                    legacy_id = str(
-                        state.get("last_captured_until_message_id") or ""
-                    )
-                    after_seq = int(
-                        await asyncio.to_thread(
-                            db.chat_seq_for_msg_id, user_id, legacy_id
-                        )
-                        or 0
-                    )
+                # 同 _run_extraction：读进度只走 capture_failure.frontier_seq。
+                after_seq = await asyncio.to_thread(
+                    capture_failure.frontier_seq,
+                    state,
+                    lambda message_id: db.chat_seq_for_msg_id(user_id, message_id),
+                )
                 prepared = await asyncio.to_thread(
                     deps.get_prepared_capture_batch,
                     job_id=job_id,

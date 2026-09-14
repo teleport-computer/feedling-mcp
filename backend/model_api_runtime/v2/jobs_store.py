@@ -3647,22 +3647,19 @@ def commit_capture_batch(
                     if halted
                     else _capture_allowed_on_cursor(cur, str(user_id))
                 )
-                raw_seq = state.get("last_captured_until_seq")
-                if str(raw_seq or "").isdigit():
-                    current_seq = int(raw_seq)
-                else:
-                    legacy_id = str(
-                        state.get("last_captured_until_message_id") or ""
-                    )
+                def _seq_for_message_id(message_id: str):
                     cur.execute(
                         "SELECT seq FROM chat_messages WHERE user_id=%s "
                         "AND msg_id=%s",
-                        (str(user_id), legacy_id),
+                        (str(user_id), message_id),
                     )
-                    legacy_row = cur.fetchone()
-                    current_seq = (
-                        int(legacy_row["seq"]) if legacy_row is not None else 0
-                    )
+                    row = cur.fetchone()
+                    return int(row["seq"]) if row is not None else None
+
+                # 必须和 worker 算起点用同一个函数（见 capture_failure.frontier_seq）。
+                # 以前这里只要数字是数字就直接用：数字被写成 0、id 记着真实位置时，
+                # worker 从 id 的位置开始、这里认为是 0 → 永远 frontier_changed → 又卡死。
+                current_seq = capture_failure.frontier_seq(state, _seq_for_message_id)
                 if halted:
                     persisted_state = _cancel_capture_on_cursor(
                         cur,

@@ -266,3 +266,33 @@ def test_v1_skip_keeps_the_seq_cursor_honest(tmp_path, monkeypatch):
     assert state["capture_seq_initialized"] is False, "拿不到 seq 却声明已初始化"
     # 下次读游标按 m2 翻译出真实 seq：m1/m2 不再被当成新消息。
     assert capture_scheduler._live_messages_after_capture(store, state) == []
+
+
+def test_v1_account_failures_never_skip_the_window(tmp_path, monkeypatch):
+    """🔴 V1 用户余额不足：连续失败多少次都不跳过这批，充值后还能补上。
+
+    2026-09-13 prod：触发过旧逃生阀的 42 人里 33 人是自己的账号问题（余额不足/密钥失效），
+    跳过只是替他们一批批丢记忆。原因文本取自 prod 真实形状。
+    """
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "10")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    store = _store(tmp_path, monkeypatch, "usr_capture_account_no_skip")
+    _seed_chat(store, "m1")
+    t = _seed_chat(store, "m2") + 20
+    reason = ('capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to '
+              'authenticate. API Error: 401 {"error":"Insufficient balance"} (api_status=401)')
+    for attempt in range(1, 9):
+        tick = capture_scheduler.tick_quiet_capture(store, now=t)
+        assert tick["enqueued"] is True, (attempt, tick.get("reason"))
+        failed = store.update_proactive_job(tick["job"]["job_id"], {
+            "status": "failed",
+            "capture_result": {"status": "failed", "reason": reason},
+        })
+        t += 5
+        capture_scheduler.record_capture_job_status(store, failed, status="failed", now=t)
+        t += 6 * 3600 + 1
+
+    state = capture_scheduler.load_capture_state(store)
+    assert int(state["capture_skipped_windows"]) == 0
+    assert state["last_captured_until_message_id"] == ""
+    assert int(state["capture_fail_streak"]) == 8

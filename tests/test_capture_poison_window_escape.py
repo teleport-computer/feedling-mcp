@@ -22,6 +22,8 @@ dream 判定 seed card 不够。
 """
 from __future__ import annotations
 
+import pytest
+
 import os
 import sys
 import tempfile
@@ -299,3 +301,68 @@ def test_one_parse_failure_cannot_inherit_earlier_write_failures():
     assert _run_reasons([write, parse, parse, parse]) == 4
     # 总失败数到 6 次兜底，不管混成什么样。
     assert _run_reasons([write, parse, write, parse, write, parse]) == 6
+
+
+@pytest.mark.parametrize("reason,expected", [
+    # V1：CLI 原始错误文本（prod 上真实出现过的形状）
+    ('capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to authenticate. '
+     'API Error: 401 {"error":"Insufficient balance"} (api_status=401)', "account"),
+    ("capture_agent_call_failed:RuntimeError: Failed to authenticate: OAuth session expired "
+     "and could not be refreshed", "account"),
+    # V2：extraction 的公开 provider 分类
+    ("extraction_failed:auth_invalid", "account"),
+    ("extraction_failed:quota_insufficient", "account"),
+    ("extraction_failed:rate_limited", "account"),
+    ("extraction_failed:upstream_unavailable", "account"),
+    # 可能真是内容引起的 —— 不能归到永不跳过
+    ("extraction_failed:content_filtered", "other"),
+    ("extraction_failed:unknown", "other"),
+    ("capture_agent_call_failed:RuntimeError: openai-compatible response carried no assistant text",
+     "other"),
+    ("capture_memory_write_failed", "other"),
+    ("json_decode_error:JSONDecodeError", "parse"),
+    ("extraction_failed:json_decode_error", "parse"),
+])
+def test_failure_class(reason, expected):
+    assert cf.failure_class(reason) == expected
+
+
+def test_account_failures_never_skip_and_do_not_count_toward_skipping():
+    """🔴 余额不足失败再多次也不跳；充值后偶发的别的失败也不能继承这些次数立刻跳。"""
+    balance = "extraction_failed:quota_insufficient"
+    other = "capture_memory_write_failed"
+    assert _run_reasons([balance] * 30) is None
+    # 8 次余额不足 + 5 次别的失败：别的失败只有 5 次，不到 6
+    assert _run_reasons([balance] * 8 + [other] * 5) is None
+    assert _run_reasons([balance] * 8 + [other] * 6) == 14
+    # 账号失败夹在中间会打断「连续解析失败」
+    parse = "extraction_failed:json_decode_error"
+    assert _run_reasons([parse, parse, balance, parse]) is None
+
+
+def test_frontier_seq_takes_the_later_of_seq_and_message_id():
+    """两份进度记法取靠后的；数字不可信（未初始化）时只看 id；id 查不到时只看数字。"""
+    seq_of = {"m3": 120, "m9": 300}.get
+    # prod 上旧逃生阀留下的：数字 0 + 已初始化 + id 记着真实位置
+    assert cf.frontier_seq({"last_captured_until_message_id": "m3",
+                            "last_captured_until_seq": 0,
+                            "capture_seq_initialized": True}, seq_of) == 120
+    # V1 完成只更新 id、数字停在旧值
+    assert cf.frontier_seq({"last_captured_until_message_id": "m9",
+                            "last_captured_until_seq": 120,
+                            "capture_seq_initialized": True}, seq_of) == 300
+    # 正常 V2：两份一致
+    assert cf.frontier_seq({"last_captured_until_message_id": "m3",
+                            "last_captured_until_seq": 120,
+                            "capture_seq_initialized": True}, seq_of) == 120
+    # 数字未初始化：不信数字
+    assert cf.frontier_seq({"last_captured_until_message_id": "m3",
+                            "last_captured_until_seq": 999,
+                            "capture_seq_initialized": False}, seq_of) == 120
+    # id 被清理查不到：只看可信的数字
+    assert cf.frontier_seq({"last_captured_until_message_id": "gone",
+                            "last_captured_until_seq": 150,
+                            "capture_seq_initialized": True}, seq_of) == 150
+    # 老数据只有数字、没有标志位：数字可信
+    assert cf.frontier_seq({"last_captured_until_seq": 77}, seq_of) == 77
+    assert cf.frontier_seq({}, seq_of) == 0

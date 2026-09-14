@@ -19,6 +19,7 @@ from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 from memory.capture_failure import capture_failure_patch as _capture_failure_patch
+from memory.capture_failure import frontier_seq as _frontier_seq
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +133,10 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         #: 同一窗口**连续**解析类失败几次（到 3 快速跳过）；总失败数仍看 capture_fail_streak。
         "capture_parse_fail_streak": max(
             0, int(_safe_float(doc.get("capture_parse_fail_streak"), 0.0))
+        ),
+        #: 同一窗口里**非账号类**失败的次数（到 6 兜底跳过）；账号类失败不计。
+        "capture_window_fail_count": max(
+            0, int(_safe_float(doc.get("capture_window_fail_count"), 0.0))
         ),
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
@@ -320,17 +325,10 @@ def _live_messages_after_capture(store, state: Mapping[str, Any]) -> list[dict[s
     # discovery cursor: an out-of-order later live row can carry an older
     # timestamp and must still trigger Capture. Translate a legacy ID once per
     # read; if it was pruned, restart safely from zero just like V2 extraction.
-    after_seq = max(
-        0, int(_safe_float(state.get("last_captured_until_seq"), 0.0))
+    # 数字和消息 id 两份进度取靠后的 —— 和 V2 worker / 提交路径同一个规则。
+    after_seq = _frontier_seq(
+        state, lambda message_id: db.chat_seq_for_msg_id(store.user_id, message_id)
     )
-    if not bool(state.get("capture_seq_initialized")):
-        after_id = str(state.get("last_captured_until_message_id") or "")
-        translated = (
-            db.chat_seq_for_msg_id(store.user_id, after_id)
-            if after_id
-            else None
-        )
-        after_seq = max(0, int(translated or 0))
     rows = db.chat_capture_messages_after_seq(
         store.user_id,
         after_seq,
