@@ -141,6 +141,17 @@ OUR_SIDE_FAILURE_PREFIXES = (
 )
 
 
+#: V2 provider 解析失败里**用户自己要去设置里修**的那几种（hosted/config_store）。
+#: worker 记成 ``provider_setup:<slug>``。解密失败、runtime token 签发失败是我们的问题，不在此列。
+PROVIDER_SETUP_USER_ERRORS = frozenset({
+    "model_api_not_configured",
+    "model_api_not_tested",
+    "model_api_key_envelope_missing",
+    "model_api_config_invalid",
+})
+PROVIDER_SETUP_ACCOUNT_CODE = "provider_setup"
+
+
 def window_key(window: Mapping | None) -> str:
     """这次失败卡在哪个**游标**上。用来判断"和上次是同一个队头阻塞吗"。
 
@@ -250,6 +261,8 @@ def account_error_code(reason: str) -> str:
         return ""
     if kind in ACCOUNT_FAILURE_KINDS:
         return kind
+    if kind.startswith(PROVIDER_SETUP_ACCOUNT_CODE + ":"):
+        return PROVIDER_SETUP_ACCOUNT_CODE
     # 先认对照表之外的原话：prod 上某中转站回「401 {"error":"Insufficient balance"}」，
     # 对照表按 401 认成「密钥无效」，提示就会让用户去重新填 key，而真实原因是没钱了。
     if "insufficient balance" in text:

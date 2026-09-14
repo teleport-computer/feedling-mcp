@@ -2496,3 +2496,29 @@ def test_outer_turn_failure_on_capture_arms_backoff(monkeypatch):
     state = _capture_state(uid)
     assert int(state["capture_fail_streak"]) == 3
     assert int(state.get("capture_skipped_windows") or 0) == 0
+
+
+@pytest.mark.parametrize("resolver_error,user_fix", [
+    ("model_api_not_tested", True),
+    ("model_api_not_configured", True),
+    ("model_api_key_decrypt_failed", False),
+    ("runtime_token_mint_failed", False),
+])
+def test_provider_setup_failures_tell_the_user_to_fix_settings(resolver_error, user_fix):
+    """用户自己的模型配置问题要提示去设置里修；解密/签发失败是我们的问题，不能甩给用户。"""
+    from notices import core as notices_core
+
+    uid = f"u_capture_provider_setup_{resolver_error}"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    deps = _poison_deps(uid, messages=[], capture_enabled=lambda _uid: True,
+                        resolve_provider=lambda _uid: (None, {"error": resolver_error}))
+    for attempt in range(3):
+        _job_id, job = _running(uid, owner=f"setup-{attempt}", start=False)
+        assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+    rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+    notice = rows["memory_backoff:capture"]
+    if user_fix:
+        assert notice["blame"] == "user_provider" and "设置" in notice["user_text"]
+    else:
+        assert notice["blame"] == "system" and "设置" not in notice["user_text"]

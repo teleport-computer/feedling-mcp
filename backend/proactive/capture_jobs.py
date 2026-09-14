@@ -82,6 +82,15 @@ def notify_backoff(store, *, lane: str, status: str, streak: int,
         # 失败原因是用户自己的账号/服务（余额不足、密钥失效、登录过期…）时，提示里直接说原因：
         # 只写「连续失败 N 次」用户不知道要去充值，记忆就一直停着（2026-09-13 prod：
         # 触发过逃生阀的 42 人里 33 人是账号问题）。文案取统一错误对照表，和聊天报错一致。
+        if account_code == "provider_setup":
+            # 模型服务还没配好（未配置/未测试/配置无效）：对照表里没有这一条，单独写。
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame="user_provider", severity="warning",
+                         user_text=("记忆整理暂停了：模型服务还没有配置好或没通过测试，"
+                                    "请到设置里完成模型配置。配好后会自动继续整理。"),
+                         detail=f"lane={lane} streak={streak} cause={account_code}",
+                         dedupe_key=f"memory_backoff:{lane}")
+            return
         spec = None
         if account_code:
             from notices import error_contract
@@ -143,12 +152,21 @@ def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
         message_count = int(raw.get("message_count") or 0)
     except (TypeError, ValueError):
         message_count = 0
-    return {
+    window = {
         "after_message_id": str(raw.get("after_message_id") or "")[:160],
         "until_message_id": str(raw.get("until_message_id") or "")[:160],
         "until_ts": until_ts,
         "message_count": max(0, message_count),
     }
+    # 🔴 起点 seq 必须跟着任务走，**包括 0**。首次落卡的用户没有 after_message_id，
+    # 丢了 after_seq 的话逃生阀只能按「终点」认窗口 —— 新消息一来终点就变，
+    # 失败次数永远重数、永远到不了阈值（Codex 第 10 轮）。
+    if raw.get("after_seq") is not None and raw.get("after_seq") != "":
+        try:
+            window["after_seq"] = max(0, int(float(raw.get("after_seq"))))
+        except (TypeError, ValueError):
+            pass
+    return window
 
 
 def _active_capture_job(job: Mapping[str, Any]) -> bool:

@@ -1349,3 +1349,36 @@ def test_capture_live_halt_after_context_read_prevents_provider_call(monkeypatch
     assert (status, last_error) == ("failed", "turns_halted")
     state = db.get_blob_strict(uid, "capture_state") or {}
     assert int(state.get("capture_fail_streak") or 0) == 0
+
+
+def test_empty_capture_successor_clears_stale_failure_state_and_notice(monkeypatch):
+    """没有待处理消息的落卡任务完成时，清掉残留的失败子状态和「受阻」提示（Codex 第 10 轮）。"""
+    from notices import core as notices_core
+    from model_api_runtime.v2 import serve_worker
+
+    uid = "u_x_empty_successor_stale"
+    _seed_v2(uid)
+    db.set_blob(uid, "capture_state", {
+        "capture_fail_streak": 4,
+        "last_capture_failed_at": 100.0,
+        "capture_account_error_code": "quota_insufficient",
+        "capture_account_fail_since": 50.0,
+        "capture_window_fail_count": 2,
+        "capture_fail_window_key": "after_seq:0",
+    })
+    from proactive import capture_jobs
+    capture_jobs.notify_backoff(type("S", (), {"user_id": uid})(), lane="capture", status="failed",
+                                streak=4, account_code="quota_insufficient")
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    deps = _deps(read_compaction_tail_after_seq=lambda *_a, **_k: [],
+                 read_capture_state=serve_worker._read_capture_state)
+    assert asyncio.run(worker.process_job(job, deps, provider_config=_BYOK, api_key=None,
+                                          runtime_token="rt")) == "completed"
+    state = db.get_blob_strict(uid, "capture_state")
+    assert int(state["capture_fail_streak"]) == 0
+    assert state["capture_account_error_code"] == ""
+    assert float(state["capture_account_fail_since"]) == 0.0
+    asyncio.run(worker._notify_capture_backoff(deps, job, "completed"))
+    rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+    assert rows["memory_backoff:capture"]["resolved"] is True

@@ -296,3 +296,31 @@ def test_v1_account_failures_do_not_skip_by_count(tmp_path, monkeypatch):
     assert int(state["capture_skipped_windows"]) == 0
     assert state["last_captured_until_message_id"] == ""
     assert int(state["capture_fail_streak"]) == 8
+
+
+def test_v1_first_capture_escape_valve_fires_while_new_messages_keep_arriving(tmp_path, monkeypatch):
+    """🔴 首次落卡（没有 after_message_id）失败期间用户还在聊天：窗口身份必须锚在起点 seq=0。
+
+    以前任务序列化丢了 after_seq，窗口只能按终点认 —— 每来一条新消息终点就变，
+    失败次数永远重数，逃生阀永远不触发（Codex 第 10 轮）。走真实调度器 + 任务序列化。
+    """
+    from memory import capture_failure
+
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "10")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    store = _store(tmp_path, monkeypatch, "usr_capture_first_window_moving_end")
+    t = _seed_chat(store, "m1") + 20
+    for attempt in range(1, capture_failure.CAPTURE_POISON_SKIP_AFTER + 1):
+        tick = capture_scheduler.tick_quiet_capture(store, now=t)
+        assert tick["enqueued"] is True, (attempt, tick.get("reason"))
+        assert (tick["job"].get("window") or {}).get("after_seq") == 0, "任务里丢了起点 seq=0"
+        failed = store.update_proactive_job(tick["job"]["job_id"], {
+            "status": "failed",
+            "status_reason": "json_decode_error:JSONDecodeError",
+        })
+        t += 5
+        capture_scheduler.record_capture_job_status(store, failed, status="failed", now=t)
+        # 失败期间用户又发了一条：下一次调度的窗口终点会变
+        t = max(t, _seed_chat(store, f"new-{attempt}")) + 6 * 3600 + 20
+    state = capture_scheduler.load_capture_state(store)
+    assert int(state["capture_skipped_windows"]) == 1, "终点一直在变，逃生阀没触发"

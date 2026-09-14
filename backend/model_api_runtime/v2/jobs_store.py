@@ -4031,6 +4031,55 @@ def fail_capture_job(
     return True
 
 
+def complete_capture_no_work(*, job_id, user_id: str, claimed_by: str) -> bool:
+    """落卡任务发现游标之后没有消息：完成任务，并清掉残留的失败子状态。
+
+    以前走通用 mark_completed，不碰落卡状态：之前的失败次数、账号原因、7 天计时都留着，
+    旧的退避会压着下一条真消息，「记忆整理受阻」提示也永远不消失（Codex 第 10 轮）。
+    没有待处理消息 = 之前失败的那一批已经不存在，清掉是安全的。
+    任务完成和状态清理在同一个事务里。
+    """
+    persisted = False
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                if _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                ) is None:
+                    return False
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                row = cur.fetchone()
+                state = dict(row["doc"] or {}) if row is not None else None
+                if state is not None and any(
+                    state.get(key) not in (None, "", 0, 0.0)
+                    for key in capture_failure.SUCCESS_RESET_PATCH
+                ):
+                    state.update(capture_failure.SUCCESS_RESET_PATCH)
+                    state["updated_at"] = (
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    )
+                    cur.execute(
+                        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+                        (Jsonb(state), str(user_id), _CAPTURE_STATE_KIND),
+                    )
+                    persisted = True
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed', finished_at=now() "
+                    "WHERE id=%s AND status IN ('claimed','running') "
+                    "AND claimed_by=%s AND lease_expires_at > now()",
+                    (job_id, str(claimed_by)),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("capture ownership lost at no-work completion")
+    if persisted:
+        _mirror_capture_state_current(str(user_id))
+    return True
+
+
 def cancel_capture_job(
     *,
     job_id,

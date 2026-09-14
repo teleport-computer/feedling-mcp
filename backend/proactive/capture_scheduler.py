@@ -839,6 +839,12 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
                          if isinstance(job.get("capture_window"), Mapping)
                          else job.get("window"))
         failed_window = failed_window if isinstance(failed_window, Mapping) else None
+        if (failed_window is not None
+                and not str(failed_window.get("after_message_id") or "")
+                and failed_window.get("after_seq") in (None, "")
+                and not str(state.get("last_captured_until_message_id") or "")):
+            # 老任务（修复前入队）没带 after_seq：起点没有 id 且游标从未推进 = 首次落卡，起点就是 0。
+            failed_window = {**failed_window, "after_seq": 0}
         patch, streak, skipped = _capture_failure_patch(
             state, failed_window, now_ts=now_ts, reason=_failure_reason_of(job))
         if skipped:

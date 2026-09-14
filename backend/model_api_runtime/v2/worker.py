@@ -12588,11 +12588,20 @@ async def _run_extraction(
             # advances the frontier and releases single-flight. The successor
             # owns a valid job but has no raw seq left; settle it as no-work so
             # it cannot arm failure backoff against the next real message.
-            landed = await asyncio.to_thread(
-                jobs_store.mark_completed,
-                job_id,
-                claimed_by=claimed_by,
-            )
+            # 同时清掉残留的失败子状态（旧退避/提示），见 complete_capture_no_work。
+            if claimed_by and deps.read_capture_state is not None:
+                landed = await asyncio.to_thread(
+                    jobs_store.complete_capture_no_work,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+            else:
+                landed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
             if claimed_by and not landed:
                 raise LostJobLease("capture lease lost before no-work completion")
             if tm is not None:
@@ -17543,9 +17552,10 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                 best_effort=True,
             )
             return outcome
+        provider_meta: dict = {}
         try:
             async with enclave_sem:
-                provider_config, _meta = await _resolve_provider_for_current_job(
+                provider_config, provider_meta = await _resolve_provider_for_current_job(
                     deps, user_id, job_id
                 )
         except Exception as provider_exc:
@@ -17569,6 +17579,14 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                     {"stage": "provider_resolution", "error_code": err},
                     best_effort=True,
                 )
+                resolver_error = str(
+                    (provider_meta or {}).get("error") if isinstance(provider_meta, dict) else ""
+                )
+                if lane == "capture" and resolver_error in capture_failure.PROVIDER_SETUP_USER_ERRORS:
+                    # 用户自己的模型配置问题（未配置/未测试/信封缺失/配置无效）：带上具体原因，
+                    # 提示才能告诉他去设置里修，而不是笼统的「系统正在重试」（Codex 第 10 轮）。
+                    # 解密失败、token 签发失败是我们的问题，仍是 provider_unavailable。
+                    err = f"provider_setup:{resolver_error}"
                 if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
                     # 落卡的 provider 前置失败（未配置/未测试/信封缺失/解密失败）也走落卡失败框架：
                     # 累计退避（否则调度器每轮都重建同一个任务）、记本任务 id（提示才发得出来）。
