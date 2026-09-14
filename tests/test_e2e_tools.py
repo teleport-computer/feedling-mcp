@@ -919,7 +919,7 @@ def _teardown_client(monkeypatch, tmp_path, script, oracle):
     import tools.e2e.client as client_mod
 
     monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
-    monkeypatch.setattr(client_mod.time, "sleep", lambda *_a, **_k: None)
+    capture_sleeps(monkeypatch, client_mod)      # module-local, never the global time.sleep
     asked = []
 
     def _oracle(api_url, user_id, **_kw):
