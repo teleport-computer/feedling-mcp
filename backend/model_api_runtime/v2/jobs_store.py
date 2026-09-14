@@ -2464,6 +2464,335 @@ def _mirror_job_recovery_event(event: dict[str, object]) -> None:
     )
 
 
+def _general_watchdog_recover_on_cursor(
+    cur,
+    *,
+    job_id: int,
+    claimed_by: str,
+    reason: str,
+    on_terminal: Callable[[Any], None] | None = None,
+) -> tuple[str, list[tuple[str, str]]] | None:
+    """Budgeted requeue-or-expire for the general lanes (dream/profile/capture/...).
+
+    Caller holds the job row lock.  ``on_terminal`` runs in the same
+    transaction right after the terminal UPDATE and before the review side
+    effects; only the Capture recovery path uses it (to record the failure).
+    Returns ``(recovery, recovered_reviews)`` or ``None`` when the claim moved.
+    """
+    cur.execute(
+        "UPDATE agent_jobs SET status='pending',created_at=now(), "
+        "last_error=%s,attempt_count=attempt_count+1,"
+        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
+        "WHERE id=%s AND claimed_by=%s "
+        "AND status IN ('claimed','running') "
+        "AND (lane=%s OR attempt_count<%s)",
+        (
+            str(reason)[:500],
+            int(job_id),
+            str(claimed_by),
+            _TRAJECTORY_REVIEW_LANE,
+            int(GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS),
+        ),
+    )
+    if cur.rowcount == 1:
+        return "requeued", _recover_review_runner_on_cursor(cur, int(job_id))
+    cur.execute(
+        "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+        "last_error=%s,attempt_count=attempt_count+1,"
+        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+        "lease_expires_at=NULL,deadline_at=NULL "
+        "WHERE id=%s AND claimed_by=%s "
+        "AND status IN ('claimed','running')",
+        (
+            GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
+            int(job_id),
+            str(claimed_by),
+        ),
+    )
+    if cur.rowcount != 1:
+        return None
+    if on_terminal is not None:
+        on_terminal(cur)
+    recovered_reviews = _recover_review_runner_on_cursor(cur, int(job_id))
+    _queue_failure_review_on_cursor(cur, int(job_id))
+    return "terminal", recovered_reviews
+
+
+#: 回收落卡任务时单个事务最多等锁多久。回收器是全局一条循环，不能被某一个用户卡住；
+#: 等不到就跳过这一轮，下一轮（默认 30 秒后）再来。
+_CAPTURE_RECOVERY_LOCK_TIMEOUT = "5s"
+
+
+def _record_capture_crash_failure_on_cursor(
+    cur, *, job: dict, runtime: dict | None, error: str
+) -> dict | None:
+    """把一次「平台回收掉的落卡任务」记成一次**不带窗口**的落卡失败。
+
+    调用方已按落卡的锁顺序锁好 chat fence → runtime 行 → job 行，并且刚在同一个
+    事务里把这个任务转成终态。任务行的终态转移只会发生一次（行锁 + 状态条件），
+    所以这里天然不会重复记账。
+
+    以下情况**不记**（返回 None），因为这次失败已经不代表用户当前的落卡进度：
+
+    - runtime 不是 V2，或任务的 generation 不是当前 generation（Chat Clear / 切换过）
+    - 这个用户已经有**更新的**落卡任务跑过（id 更大、且不是还在排队）：它的结果
+      （成功清零 / 自己的失败）比这次旧回收更新，不能拿旧的覆盖或叠加
+    - 用户已经关掉落卡：和 worker 取消路径一致，不累计、不发提示
+    """
+    user_id = str(job["user_id"])
+    if runtime is None or str(runtime["hosted_runtime_state"]) != "v2":
+        return None
+    if int(job["expected_runtime_generation"] or 0) != int(
+        runtime["runtime_generation"]
+    ):
+        return None
+    cur.execute(
+        "SELECT 1 FROM agent_jobs WHERE user_id=%s AND lane='capture' "
+        "AND id>%s AND status<>'pending' LIMIT 1",
+        (user_id, int(job["id"])),
+    )
+    if cur.fetchone() is not None:
+        return None
+    # 不拿 consent 的 advisory 锁：provider 调用期间 worker 一直握着它，回收器等它
+    # 就会被卡住的那个任务拖住。这里只是决定「记不记账」，读一个非锁定快照足够。
+    if not _capture_allowed_on_cursor(cur, user_id, lock_row=False):
+        return None
+    cur.execute(
+        "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,'{}') "
+        "ON CONFLICT (user_id,kind) DO NOTHING",
+        (user_id, _CAPTURE_STATE_KIND),
+    )
+    cur.execute(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+        (user_id, _CAPTURE_STATE_KIND),
+    )
+    failed, _skipped = _capture_failed_state(
+        dict(cur.fetchone()["doc"] or {}),
+        job_id=job["id"],
+        error=str(error),
+        increment_backoff=True,
+        # 不带窗口 = 只累计退避和提示，永不跳过这一批：崩溃/卡死更可能是我们这边的
+        # 问题，拿它当「这批消息有毒」去跳过会丢掉本来保得住的记忆。
+        window=None,
+    )
+    cur.execute(
+        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+        (Jsonb(failed), user_id, _CAPTURE_STATE_KIND),
+    )
+    return failed
+
+
+def _sync_capture_crash_notice(user_id: str, job_id) -> None:
+    """回收事务提交后，把「记忆整理受阻」提示同步到最新失败次数。纯旁路。
+
+    worker 亲手失败时由 worker._notify_capture_backoff 发提示；崩溃/卡死的任务
+    走不到那里，所以回收路径自己发。重新读一次状态并确认最后一次失败仍是这个
+    任务记的 —— 期间若已有新的落卡成功/失败，就不拿旧次数去覆盖提示。
+    """
+    try:
+        from types import SimpleNamespace
+
+        from proactive import capture_jobs
+
+        state = db.get_blob_strict(str(user_id), _CAPTURE_STATE_KIND) or {}
+        if str(state.get("last_capture_failed_job_id") or "") != str(job_id):
+            return
+        capture_jobs.notify_backoff(
+            SimpleNamespace(user_id=str(user_id)),
+            lane="capture",
+            status="failed",
+            streak=int(state.get("capture_fail_streak") or 0),
+            account_code=str(state.get("capture_account_error_code") or ""),
+            skipped=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — 提示失败绝不影响回收结果
+        log.warning(
+            "[v2.capture] crash recovery notice failed user=%s err=%s",
+            user_id,
+            type(exc).__name__,
+        )
+
+
+def _recover_capture_claim(
+    *,
+    job_id: int,
+    user_id: str,
+    claimed_by: str | None,
+    attempt_count: int,
+    mode: Literal["watchdog", "lease"],
+    reason: str = "slot_watchdog_timeout",
+    now_ts: float | None = None,
+) -> tuple[dict[str, object] | None, dict | None]:
+    """回收一个崩溃/卡死的落卡任务，并在任务**终结**时记一次落卡失败。
+
+    以前 watchdog（``recover_killed_job``）和租约回收器（``reap_stuck_job_rows``）
+    对落卡和其他 lane 一视同仁，只改任务行、不碰 capture_state。于是一批消息只要
+    每次都把 worker 弄崩/卡死：调度器不断重建任务、没有退避、没有提示。
+
+    ## 锁顺序
+
+    和 fail_capture_job 一样：chat fence → runtime 行 → job 行 → capture_state。
+    通用回收是先锁 job 行的，不能在那之后再拿 fence / capture_state（会和落卡提交
+    死锁），所以落卡行从通用路径里摘出来，走这里单独的事务。调用方只做**不加锁**的
+    预读（user_id / attempt_count），加锁后逐项复核：还是同一个 lane、同一个持有者、
+    同一次尝试（attempt_count）、仍是 claimed/running、租约模式下仍已过期 ——
+    任何一项变了就什么都不做。
+
+    runtime 行只拿 ``FOR SHARE``：provider 调用期间 worker 一直握着它的 ``FOR SHARE``，
+    拿 ``FOR UPDATE`` 会让回收器被卡着的那个任务拖住。再加一个短 lock_timeout 兜底。
+
+    ## 什么时候记失败
+
+    只在任务**终结**时记（watchdog 重投预算用完 / 租约过期），重投不记：
+    重投后同一个任务还会再跑、再被回收，每次都记会把一次问题数成好几次，
+    而且 watchdog 和租约回收器可能先后看到同一个卡死任务。
+
+    任务行的转移（requeue / expire、last_error、attempt_count、恢复事件、复核任务）
+    与通用路径逐项一致；返回 ``(和通用路径同形的结果, 记下的失败状态或 None)``。
+    """
+    recovered_reviews: list[tuple[str, str]] = []
+    recovery_event: dict[str, object] | None = None
+    result: dict[str, object] | None = None
+    failed_state: dict | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (_CAPTURE_RECOVERY_LOCK_TIMEOUT,),
+                )
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR SHARE",
+                    (str(user_id),),
+                )
+                runtime = cur.fetchone()
+                cur.execute(
+                    "SELECT id,user_id,lane,status,claimed_by,attempt_count,"
+                    "expected_runtime_generation,"
+                    "(COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    " AND COALESCE(lease_expires_at, deadline_at) "
+                    "     <= COALESCE(to_timestamp(%s), now())) AS overdue "
+                    "FROM agent_jobs WHERE id=%s FOR UPDATE",
+                    (now_ts, int(job_id)),
+                )
+                job = cur.fetchone()
+                if (
+                    job is None
+                    or str(job["lane"]) != "capture"
+                    or str(job["user_id"]) != str(user_id)
+                    or str(job["status"]) not in {"claimed", "running"}
+                    or str(job["claimed_by"] or "") != str(claimed_by or "")
+                    or int(job["attempt_count"] or 0) != int(attempt_count)
+                    or (mode == "lease" and not bool(job["overdue"]))
+                ):
+                    return None, None
+
+                def _record(terminal_error: str):
+                    def _on_terminal(cur_) -> None:
+                        nonlocal failed_state
+                        failed_state = _record_capture_crash_failure_on_cursor(
+                            cur_, job=job, runtime=runtime, error=terminal_error
+                        )
+
+                    return _on_terminal
+
+                if mode == "watchdog":
+                    general = _general_watchdog_recover_on_cursor(
+                        cur,
+                        job_id=int(job_id),
+                        claimed_by=str(claimed_by),
+                        reason=str(reason),
+                        on_terminal=_record(GENERAL_WATCHDOG_REQUEUE_EXHAUSTED),
+                    )
+                    if general is None:
+                        return None, None
+                    recovery, recovered_reviews = general
+                    result = {
+                        "job_id": int(job_id),
+                        "user_id": str(user_id),
+                        "lane": "capture",
+                        "recovery": recovery,
+                    }
+                    recovery_event = _record_job_recovery_event_on_cursor(
+                        cur,
+                        job_id=int(job_id),
+                        lane="capture",
+                        recovery=recovery,
+                        reason=str(reason),
+                    )
+                else:
+                    # 逐项对齐 reap_stuck_job_rows 里 terminal CTE 对 claimed/running 行
+                    # 做的事：同样的列、同样的 last_error 选择、同样把悬空 MCP 尝试记 unknown。
+                    cur.execute(
+                        "UPDATE agent_jobs SET status='expired', finished_at=now(), "
+                        "attempt_count=attempt_count+1, "
+                        "last_error=CASE WHEN EXISTS ("
+                        "    SELECT 1 FROM v2_mcp_mutation_attempts a "
+                        "    WHERE a.job_id=agent_jobs.id "
+                        "      AND (a.outcome IS NULL OR a.outcome='unknown')"
+                        "  ) THEN 'mcp_mutation_outcome_unknown' "
+                        "  ELSE 'lease_timeout' END "
+                        "WHERE id=%s AND status IN ('claimed','running') "
+                        "RETURNING id,user_id,lane,last_error,claimed_by",
+                        (int(job_id),),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None, None
+                    result = dict(row)
+                    cur.execute(
+                        "UPDATE v2_mcp_mutation_attempts "
+                        "SET outcome='unknown',resolved_at=clock_timestamp() "
+                        "WHERE job_id=%s AND outcome IS NULL",
+                        (int(job_id),),
+                    )
+                    _record(str(row["last_error"]))(cur)
+                    recovered_reviews = _recover_review_runner_on_cursor(
+                        cur, int(job_id)
+                    )
+                    _queue_failure_review_on_cursor(cur, int(job_id))
+    if recovery_event is not None:
+        _mirror_job_recovery_event(recovery_event)
+    if recovered_reviews:
+        from tee_shadow import mirror
+
+        for review_user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                review_user_id, "v2_trajectory_reviews", source_job_id, "requeue"
+            )
+    if failed_state is not None:
+        log.warning(
+            "[v2.capture] crashed capture job counted as failure user=%s job=%s "
+            "mode=%s streak=%s",
+            user_id,
+            job_id,
+            mode,
+            failed_state.get("capture_fail_streak"),
+        )
+        _mirror_capture_state_current(str(user_id))
+        _sync_capture_crash_notice(str(user_id), job_id)
+    return result, failed_state
+
+
+def _capture_recovery_target(
+    *, job_id: int, claimed_by: str
+) -> dict | None:
+    """不加锁地看一眼：这个待回收的 claim 是不是落卡任务。是就返回 user_id/attempt_count。"""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT user_id,attempt_count FROM agent_jobs "
+                "WHERE id=%s AND claimed_by=%s AND lane='capture' "
+                "AND status IN ('claimed','running')",
+                (int(job_id), str(claimed_by)),
+            )
+            row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
 def recover_killed_job(
     *,
     job_id: int,
@@ -2471,6 +2800,18 @@ def recover_killed_job(
     reason: str = "slot_watchdog_timeout",
 ) -> dict[str, object] | None:
     """Recover exactly one claim still owned by a killed slot generation."""
+    capture = _capture_recovery_target(job_id=int(job_id), claimed_by=str(claimed_by))
+    if capture is not None:
+        # 落卡要在同一事务里记失败，锁顺序和通用路径相反，见 _recover_capture_claim。
+        result, _failed = _recover_capture_claim(
+            job_id=int(job_id),
+            user_id=str(capture["user_id"]),
+            claimed_by=str(claimed_by),
+            attempt_count=int(capture["attempt_count"] or 0),
+            mode="watchdog",
+            reason=str(reason),
+        )
+        return result
     recovered_reviews: list[tuple[str, str]] = []
     result: dict[str, object] | None = None
     recovery_event: dict[str, object] | None = None
@@ -2629,48 +2970,15 @@ def recover_killed_job(
                     # 持久化进 attempt/effect —— 那是另一件事,不能在这里猜。
                     # 后台复盘由上面那条 failure review 承担。
                 else:
-                    cur.execute(
-                        "UPDATE agent_jobs SET status='pending',created_at=now(), "
-                        "last_error=%s,attempt_count=attempt_count+1,"
-                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
-                        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
-                        "WHERE id=%s AND claimed_by=%s "
-                        "AND status IN ('claimed','running') "
-                        "AND (lane=%s OR attempt_count<%s)",
-                        (
-                            str(reason)[:500],
-                            int(job_id),
-                            str(claimed_by),
-                            _TRAJECTORY_REVIEW_LANE,
-                            int(GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS),
-                        ),
+                    general = _general_watchdog_recover_on_cursor(
+                        cur,
+                        job_id=int(job_id),
+                        claimed_by=str(claimed_by),
+                        reason=str(reason),
                     )
-                    if cur.rowcount == 1:
-                        recovery = "requeued"
-                        recovered_reviews = _recover_review_runner_on_cursor(
-                            cur, int(job_id)
-                        )
-                    else:
-                        recovery = "terminal"
-                        cur.execute(
-                            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
-                            "last_error=%s,attempt_count=attempt_count+1,"
-                            "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
-                            "lease_expires_at=NULL,deadline_at=NULL "
-                            "WHERE id=%s AND claimed_by=%s "
-                            "AND status IN ('claimed','running')",
-                            (
-                                GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
-                                int(job_id),
-                                str(claimed_by),
-                            ),
-                        )
-                        if cur.rowcount != 1:
-                            return None
-                        recovered_reviews = _recover_review_runner_on_cursor(
-                            cur, int(job_id)
-                        )
-                        _queue_failure_review_on_cursor(cur, int(job_id))
+                    if general is None:
+                        return None
+                    recovery, recovered_reviews = general
                 result = {
                     "job_id": int(job_id),
                     "user_id": str(row["user_id"]),
@@ -2767,6 +3075,9 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     "               created_at + make_interval(secs => %s) END) "
                     "             <= COALESCE(to_timestamp(%s), now())) "
                     "     OR (status IN ('claimed','running') "
+                    # 落卡的租约过期另走 _reap_overdue_capture_claims（要在同一事务里
+                    # 记落卡失败，锁顺序和这里相反）。排队超时的落卡仍在这里。
+                    "         AND lane<>'capture' "
                     "         AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
                     "         AND COALESCE(lease_expires_at, deadline_at) "
                     "             <= COALESCE(to_timestamp(%s), now())) "
@@ -2815,7 +3126,48 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
             "[v2.reaper] scheduled lease timeout requeued job_ids=%s",
             requeued_scheduled,
         )
+    rows.extend(_reap_overdue_capture_claims(ts))
     return rows
+
+
+def _reap_overdue_capture_claims(ts: float | None) -> list[dict]:
+    """租约过期的落卡任务：逐个走 _recover_capture_claim（终结 + 记一次落卡失败）。
+
+    先不加锁地挑出候选，再每个任务一个事务按落卡锁顺序处理。单个任务出错
+    （例如等锁超时）只记日志、留到下一轮，不挡住其他任务和其他 lane 的回收。
+    """
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,user_id,claimed_by,attempt_count FROM agent_jobs "
+                "WHERE lane='capture' AND status IN ('claimed','running') "
+                "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                "AND COALESCE(lease_expires_at, deadline_at) "
+                "    <= COALESCE(to_timestamp(%s), now()) "
+                "ORDER BY id",
+                (ts,),
+            )
+            candidates = [dict(row) for row in cur.fetchall()]
+    reaped: list[dict] = []
+    for candidate in candidates:
+        try:
+            row, _failed = _recover_capture_claim(
+                job_id=int(candidate["id"]),
+                user_id=str(candidate["user_id"]),
+                claimed_by=candidate["claimed_by"],
+                attempt_count=int(candidate["attempt_count"] or 0),
+                mode="lease",
+                now_ts=ts,
+            )
+        except Exception:  # noqa: BLE001 — 一个任务失败不能拖住整轮回收
+            log.exception(
+                "[v2.reaper] capture lease recovery failed job=%s; retry next pass",
+                candidate["id"],
+            )
+            continue
+        if row is not None:
+            reaped.append(row)
+    return reaped
 
 
 def ensure_terminal_failure_outbox(
@@ -3348,6 +3700,62 @@ def _capture_fail_on_cursor(
     ``window`` 不给时（其余 6 个调用点：落卡被关、批次丢失、游标已被别人推进、
     校验拒绝…）**行为逐字节不变** —— 那些都不是毒消息场景。
     """
+    failed, skip_applied = _capture_failed_state(
+        state,
+        job_id=job_id,
+        error=error,
+        increment_backoff=increment_backoff,
+        window=window,
+    )
+    if skip_applied:
+        # 跳过的那批如果有 prepared 批次（加密的模型产出），同一事务里删掉。
+        # 不删的话：跳过后用户不再发消息 → 不会有下一个落卡任务 → 也就没有
+        # get_prepared_capture_batch 那次顺带清理 → 已声明丢弃的派生内容永久留库。
+        cur.execute(
+            "DELETE FROM v2_capture_batches WHERE user_id=%s AND status='prepared' "
+            "AND after_seq=%s AND runtime_generation=("
+            "SELECT expected_runtime_generation FROM agent_jobs WHERE id=%s)",
+            (str(user_id),
+             capture_failure.window_after_seq(window),
+             job_id),
+        )
+        # 跳过 = 那一批对话的记忆永久丢了。事务里不发 trace（副作用失败会
+        # 把整个事务带崩），但状态字段是原子写进去的，诊断面看得见。
+        log.warning(
+            "[v2.capture] poison window skipped user=%s job=%s error=%s "
+            "after_seq=%s through_seq=%s",
+            user_id, job_id, error,
+            window.get("after_seq"), window.get("through_seq"))
+    cur.execute(
+        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+        (Jsonb(failed), str(user_id), _CAPTURE_STATE_KIND),
+    )
+    cur.execute(
+        "UPDATE agent_jobs SET status='failed',finished_at=now(),"
+        "last_error=%s,attempt_count=attempt_count+1 "
+        "WHERE id=%s AND status IN ('claimed','running') "
+        "AND claimed_by=%s AND lease_expires_at>now()",
+        (_terminal_error_code(error), job_id, str(claimed_by)),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("capture ownership lost at failure commit")
+    return failed
+
+
+def _capture_failed_state(
+    state: dict,
+    *,
+    job_id,
+    error: str,
+    increment_backoff: bool,
+    window: dict | None,
+) -> tuple[dict, bool]:
+    """落卡失败后 capture_state 该变成什么（纯计算，不读写库）。
+
+    worker 亲手报的失败（``_capture_fail_on_cursor``）和平台回收崩溃/卡死任务
+    （``_recover_capture_claim``）共用这一份，两处记的失败状态不会各写各的。
+    返回 ``(新状态, 是否跳过了这一批)``。
+    """
     failed = dict(state)
     skip_applied = False
     if increment_backoff and isinstance(window, dict) and window:
@@ -3385,39 +3793,7 @@ def _capture_fail_on_cursor(
             .replace("+00:00", "Z"),
         }
     )
-    if skip_applied:
-        # 跳过的那批如果有 prepared 批次（加密的模型产出），同一事务里删掉。
-        # 不删的话：跳过后用户不再发消息 → 不会有下一个落卡任务 → 也就没有
-        # get_prepared_capture_batch 那次顺带清理 → 已声明丢弃的派生内容永久留库。
-        cur.execute(
-            "DELETE FROM v2_capture_batches WHERE user_id=%s AND status='prepared' "
-            "AND after_seq=%s AND runtime_generation=("
-            "SELECT expected_runtime_generation FROM agent_jobs WHERE id=%s)",
-            (str(user_id),
-             capture_failure.window_after_seq(window),
-             job_id),
-        )
-        # 跳过 = 那一批对话的记忆永久丢了。事务里不发 trace（副作用失败会
-        # 把整个事务带崩），但状态字段是原子写进去的，诊断面看得见。
-        log.warning(
-            "[v2.capture] poison window skipped user=%s job=%s error=%s "
-            "after_seq=%s through_seq=%s",
-            user_id, job_id, error,
-            window.get("after_seq"), window.get("through_seq"))
-    cur.execute(
-        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
-        (Jsonb(failed), str(user_id), _CAPTURE_STATE_KIND),
-    )
-    cur.execute(
-        "UPDATE agent_jobs SET status='failed',finished_at=now(),"
-        "last_error=%s,attempt_count=attempt_count+1 "
-        "WHERE id=%s AND status IN ('claimed','running') "
-        "AND claimed_by=%s AND lease_expires_at>now()",
-        (_terminal_error_code(error), job_id, str(claimed_by)),
-    )
-    if cur.rowcount != 1:
-        raise RuntimeError("capture ownership lost at failure commit")
-    return failed
+    return failed, skip_applied
 
 
 def _capture_owned_job_for_disclosure_on_cursor(

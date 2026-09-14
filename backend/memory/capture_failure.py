@@ -138,6 +138,13 @@ OUR_SIDE_FAILURE_PREFIXES = (
     "database_pool_timeout",
     "capture_memory_write_failed",
     "memory_write_rejected",
+    # 平台回收崩溃/卡死任务时记的码（V2 租约回收器和 watchdog，见
+    # jobs_store._recover_capture_claim）。worker 挂了或卡住是我们这边的问题；
+    # 不在这里先认掉的话，错误对照表会因为字面里有 timeout 把它认成「模型服务不可用」，
+    # 提示就会让用户以为是自己的模型服务坏了。
+    "lease_timeout",
+    "slot_watchdog_timeout",
+    "watchdog_requeue_exhausted",
 )
 
 
