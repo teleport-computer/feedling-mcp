@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: docs/superpowers/specs/2026-09-14-user-content-plaintext-migration-design.md
+---
 # User Content Plaintext Migration Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.

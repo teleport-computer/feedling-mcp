@@ -1,6 +1,10 @@
+---
+document_lifecycle: decision
+canonical_owner: self
+---
 # User Content Plaintext Migration Design
 
-**Status:** Proposed
+**Status:** Approved and implemented
 
 **Date:** 2026-09-14
 
