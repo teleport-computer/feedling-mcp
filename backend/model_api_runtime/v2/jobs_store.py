@@ -3368,6 +3368,10 @@ def _capture_fail_on_cursor(
                 ),
             }
         )
+    if increment_backoff:
+        # 让 worker 的用户提示能确认「这次失败确实是本任务累计的」：取消（关闭落卡/停机）
+        # 不累计，失租的旧 worker 也写不到这里 —— 它们都不能拿共享状态里的旧次数去发提示。
+        failed["last_capture_failed_job_id"] = str(job_id)
     failed.update(
         {
             "pending_capture_key": "",

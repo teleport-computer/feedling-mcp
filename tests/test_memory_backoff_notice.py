@@ -106,7 +106,7 @@ def test_v1_non_account_failure_keeps_the_generic_notice():
 def test_v2_capture_failures_now_notify_the_user():
     """🔴 V2 落卡失败以前**完全没有提示**（V2 不经过 V1 的状态记录函数）。
 
-    走 worker 的统一出口 _run_turn → _notify_capture_backoff，状态由 jobs_store 的真实失败路径写入。
+    状态由 jobs_store 的真实失败路径写入；提示只认本任务亲手累计的失败。
     """
     import asyncio
 
@@ -117,15 +117,17 @@ def test_v2_capture_failures_now_notify_the_user():
     conftest.set_v2_runtime_owner(uid, generation=1)
     window = {"after_seq": 0, "through_seq": 3, "after_message_id": "",
               "until_message_id": "m3", "until_ts": 3.0}
+    last_job_id = None
     for attempt in range(3):
         owner = f"notice-owner-{attempt}"
-        job_id, coalesced = jobs_store.enqueue_job(uid, "capture")
+        job_id, _coalesced = jobs_store.enqueue_job(uid, "capture")
         claimed = jobs_store.claim_next_job(owner, lanes={"capture"})
         assert claimed is not None and int(claimed["id"]) == job_id
         assert jobs_store.mark_running(job_id, claimed_by=owner)
         assert jobs_store.fail_capture_job(
             job_id=job_id, user_id=uid, claimed_by=owner,
             error="extraction_failed:quota_insufficient", window=window)
+        last_job_id = job_id
 
     deps = worker.TurnDeps(
         read_messages=lambda _u: [],
@@ -133,15 +135,39 @@ def test_v2_capture_failures_now_notify_the_user():
         mint_enclave_token=lambda _u: "rt",
         read_capture_state=lambda u: db.get_blob_strict(u, "capture_state") or {},
     )
+    # 别的任务（例如关闭落卡被取消的那个）拿着旧次数返回 failed：不能发
     asyncio.run(worker._notify_capture_backoff(
-        deps, {"lane": "capture", "user_id": uid}, "failed"))
-    n = _rows(uid)["memory_backoff:capture"]
-    assert "额度不足" in n["user_text"] and n["blame"] == "user_provider"
+        deps, {"lane": "capture", "user_id": uid, "id": 999999}, "failed"))
+    assert "memory_backoff:capture" not in _rows(uid), "取消/失租的任务借旧状态发了提示"
 
     asyncio.run(worker._notify_capture_backoff(
-        deps, {"lane": "capture", "user_id": uid}, "completed"))
-    assert _rows(uid)["memory_backoff:capture"]["resolved"] is True
+        deps, {"lane": "capture", "user_id": uid, "id": last_job_id}, "failed"))
+    n = _rows(uid)["memory_backoff:capture"]
+    assert "额度不足" in n["user_text"] and n["blame"] == "user_provider"
+    assert "7 天" in n["user_text"], "提示不能只承诺补记，要说清长期不恢复会跳过"
 
     # 其他 lane 不碰
     asyncio.run(worker._notify_capture_backoff(
-        deps, {"lane": "chat", "user_id": uid}, "failed"))
+        deps, {"lane": "chat", "user_id": uid, "id": last_job_id}, "failed"))
+
+
+def test_v1_insufficient_balance_is_reported_as_quota_not_bad_key():
+    """中转站回「401 Insufficient balance」：提示要说额度不足，不能让用户去重填 key。"""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job = {"job_id": "j", "source": capture_jobs.CAPTURE_JOB_SOURCE,
+           "capture_result": {"status": "failed", "reason": _BALANCE_REASON}}
+    for _ in range(3):
+        capture_scheduler.record_capture_job_status(store, job, status="failed")
+    text = _rows(uid)["memory_backoff:capture"]["user_text"]
+    assert "额度不足" in text and "API Key" not in text, text
+
+
+def test_skip_resolves_the_stale_backoff_notice():
+    """跳过一批后，旧的「受阻、修好后补记」提示要清掉 —— 那批已经丢了，后面继续整理。"""
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    capture_jobs.notify_backoff(store, lane="capture", status="failed", streak=3,
+                                account_code="quota_insufficient")
+    assert _rows(uid)["memory_backoff:capture"]["resolved"] is False
+    capture_jobs.notify_backoff(store, lane="capture", status="failed", streak=0,
+                                account_code="", skipped=True)
+    assert _rows(uid)["memory_backoff:capture"]["resolved"] is True

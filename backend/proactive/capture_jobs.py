@@ -65,7 +65,7 @@ _BACKOFF_NOTICE_STREAK = 3   # 前两次退避噪音价值低，第 3 次才打�
 
 
 def notify_backoff(store, *, lane: str, status: str, streak: int,
-                   account_code: str = "") -> None:
+                   account_code: str = "", skipped: bool = False) -> None:
     """三条 maintenance lane（capture/migrate/dream）共用的退避通知钩子。
 
     streak>=3 的失败 emit warning（occurrences 天然吸收后续 +1，不刷屏）；
@@ -74,7 +74,9 @@ def notify_backoff(store, *, lane: str, status: str, streak: int,
     影响原 streak/状态流程（notices.emit/resolve 内部已自吞异常）。"""
     from notices import core as notices
     from notices import catalog
-    if status == "completed":
+    if status == "completed" or skipped:
+        # 跳过一批后游标已经推进、后面继续整理 —— 旧的「受阻/会补记」提示已经不成立，
+        # 留着会一直显示「修好后会补记」，而那批其实已经丢了（Codex 第 6 轮）。
         notices.resolve(store, f"memory_backoff:{lane}")
     elif status == "failed" and int(streak or 0) >= _BACKOFF_NOTICE_STREAK:
         # 失败原因是用户自己的账号/服务（余额不足、密钥失效、登录过期…）时，提示里直接说原因：
@@ -88,7 +90,8 @@ def notify_backoff(store, *, lane: str, status: str, streak: int,
             notices.emit(store, source="memory", error_class="memory_backoff",
                          blame=spec.blame, severity="warning",
                          user_text=(f"记忆整理暂停了：{spec.safe_text_zh}"
-                                    "修好后，这段时间的聊天会自动补记。"),
+                                    "修好后会自动补记这段时间的聊天；"
+                                    "如果超过 7 天仍未恢复，最早那段聊天可能无法补记。"),
                          detail=f"lane={lane} streak={streak} cause={account_code}",
                          dedupe_key=f"memory_backoff:{lane}")
         else:

@@ -651,6 +651,7 @@ def record_v2_capture_status(
     # completed / failed 两个分支都要用 —— 以前只在 completed 里赋值，
     # failed 分支一走到就 UnboundLocalError（tests/test_v2_capture_lifecycle.py 覆盖）。
     processed = window if isinstance(window, Mapping) else {}
+    skipped = False
     if status_text == "completed":
         until_id = str(processed.get("until_message_id") or "")[:160]
         until_ts = _safe_float(processed.get("until_ts"), 0.0)
@@ -706,6 +707,7 @@ def record_v2_capture_status(
         status=status_text,
         account_code=str(state.get("capture_account_error_code") or ""),
         streak=int(state.get("capture_fail_streak") or 0),
+        skipped=skipped,
     )
     return refresh_capture_state_from_chat(store, now=now_ts)
 
@@ -812,6 +814,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         state["pending_capture_key"] = ""
     elif not capture_key:
         state["pending_capture_key"] = ""
+    skipped = False
     if status_text == "completed":
         window = job.get("capture_window") if isinstance(job.get("capture_window"), Mapping) else job.get("window")
         window = window if isinstance(window, Mapping) else {}
@@ -845,7 +848,8 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
     state = save_capture_state(store, state, now=now_ts)
     capture_jobs.notify_backoff(store, lane="capture", status=status_text,
                                 account_code=str(state.get("capture_account_error_code") or ""),
-                                streak=int(state.get("capture_fail_streak") or 0))
+                                streak=int(state.get("capture_fail_streak") or 0),
+                                skipped=skipped)
     result = refresh_capture_state_from_chat(store, now=now_ts)
 
     import debug_trace  # local import avoids load-order cycle

@@ -327,6 +327,11 @@ def test_one_parse_failure_cannot_inherit_earlier_write_failures():
     ("capture_agent_call_failed:RuntimeError: openai-compatible response carried no assistant text",
      "other"),
     ("capture_memory_write_failed", "other"),
+    # 对照表的「服务不可用」对裸三位 5 开头数字也算 —— 逃生阀要求强证据（Codex 第 6 轮）
+    ("capture_agent_call_failed:RuntimeError: invalid max_tokens: must be <= 500", "other"),
+    ("capture_agent_call_failed:RuntimeError: request rejected at byte 512", "other"),
+    ("capture_agent_call_failed:RuntimeError: upstream returned HTTP 502 Bad Gateway", "account"),
+    ("capture_agent_call_failed:RuntimeError: request timed out after 120s", "account"),
     ("json_decode_error:JSONDecodeError", "parse"),
     ("extraction_failed:json_decode_error", "parse"),
 ])

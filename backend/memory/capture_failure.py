@@ -9,6 +9,7 @@ V1（``proactive.capture_scheduler``）和 V2（``model_api_runtime.v2.jobs_stor
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Mapping
 
 
@@ -206,6 +207,17 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
     }
 
 
+#: 「服务不可用」的强证据：明确的 5xx 状态语境、超时、连接失败、过载。见 account_error_code。
+_STRONG_UPSTREAM_EVIDENCE = re.compile(
+    r"provider_http_5\d\d"
+    r"|(?:http|status|status[_ ]code|api error|error code|returned|responded)\W{0,3}5\d\d\b"
+    r"|\b5\d\d\s+(?:internal server error|bad gateway|service unavailable|gateway time-?out)"
+    r"|timed?[ _-]?out|timeout|connection (?:refused|reset|error|aborted)"
+    r"|service unavailable|bad gateway|overloaded|temporarily unavailable",
+    re.IGNORECASE,
+)
+
+
 def account_error_code(reason: str) -> str:
     """账号/服务类失败对应错误对照表里的哪一类（如 ``quota_insufficient``）；不是账号类返回空串。
 
@@ -219,13 +231,20 @@ def account_error_code(reason: str) -> str:
         return ""
     if kind in ACCOUNT_FAILURE_KINDS:
         return kind
+    # 先认对照表之外的原话：prod 上某中转站回「401 {"error":"Insufficient balance"}」，
+    # 对照表按 401 认成「密钥无效」，提示就会让用户去重新填 key，而真实原因是没钱了。
+    if "insufficient balance" in text:
+        return "quota_insufficient"
     from notices import error_contract  # 延迟导入：只在失败路径上用
 
     spec = error_contract.classify_text(raw)
     if spec is not None and spec.code in ACCOUNT_ERROR_CONTRACT_CODES:
+        # 对照表的「服务不可用」是给聊天报错用的，裸三位 5 开头数字就算（``\b5\d{2}\b``）。
+        # 逃生阀要更严：「max_tokens must be <= 500」「rejected at byte 512」是请求/内容问题，
+        # 误判成服务故障会把 6 次兜底拖成 7 天（Codex 第 6 轮复现）。
+        if spec.code == "upstream_unavailable" and not _STRONG_UPSTREAM_EVIDENCE.search(raw):
+            return ""
         return spec.code
-    if "insufficient balance" in text:
-        return "quota_insufficient"
     if "invalid key" in text:
         return "auth_invalid"
     return ""

@@ -17119,13 +17119,28 @@ async def _notify_capture_backoff(deps: TurnDeps, job: dict, outcome: str) -> No
         from proactive import capture_jobs
 
         state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
+        job_id = str(job.get("id") or "")
+        streak = int(state.get("capture_fail_streak") or 0)
+        skipped = False
+        if outcome == "failed":
+            # 只认本任务亲手累计的失败。关闭落卡/停机走取消、不累计，却同样返回 "failed"；
+            # 失租的旧 worker 也返回 "failed"。它们读到的是共享状态里的旧次数，拿去发
+            # 「正在自动重试」会误导（Codex 第 6 轮）。
+            if not job_id or str(state.get("last_capture_failed_job_id") or "") != job_id:
+                return
+            last_skip = float(state.get("last_capture_skipped_at") or 0.0)
+            skipped = last_skip > 0 and last_skip == float(state.get("last_capture_failed_at") or 0.0)
+        elif streak > 0:
+            # completed 却还带着失败次数：不是这次推进的（例如延迟回调），不清提示。
+            return
         await asyncio.to_thread(
             capture_jobs.notify_backoff,
             SimpleNamespace(user_id=user_id),
             lane="capture",
             status=outcome,
-            streak=int(state.get("capture_fail_streak") or 0),
+            streak=streak,
             account_code=str(state.get("capture_account_error_code") or ""),
+            skipped=skipped,
         )
     except Exception as exc:  # noqa: BLE001 — 提示是旁路，绝不影响任务结果
         log.warning(

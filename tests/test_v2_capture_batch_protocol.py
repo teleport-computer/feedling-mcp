@@ -2269,3 +2269,34 @@ def test_v2_account_failures_never_skip(reason):
     assert int(state.get("last_captured_until_seq") or 0) == 0
     assert int(state.get("capture_skipped_windows") or 0) == 0
     assert int(state["capture_fail_streak"]) == 12, "退避/告警用的总连续失败数照常累加"
+
+
+def test_disabling_capture_does_not_refresh_the_retrying_notice():
+    """🔴 用户关掉落卡：任务被取消（不累计失败）却也返回 failed。
+
+    提示钩子不能拿共享状态里的旧失败次数，再发一条「正在自动重试 / 修好后会补记」——
+    落卡都关了，根本不会重试（Codex 第 6 轮）。走生产入口 _run_turn。
+    """
+    from notices import core as notices_core
+
+    uid = "u_capture_disabled_notice"
+    _seed(uid)
+    _write_capture_state(uid, {
+        "capture_fail_streak": 5,
+        "last_capture_failed_at": 100.0,
+        "last_capture_failed_job_id": "some-earlier-job",
+        "capture_account_error_code": "quota_insufficient",
+    })
+    _job_id, job = _running(uid, start=False)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (object(), {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_capture_state=lambda u: db.get_blob_strict(u, "capture_state") or {},
+        cancel_capture_job=jobs_store.cancel_capture_job,
+        fail_capture_job=jobs_store.fail_capture_job,
+        capture_enabled=lambda _uid: False,
+    )
+    assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+    keys = {r["dedupe_key"] for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+    assert "memory_backoff:capture" not in keys
