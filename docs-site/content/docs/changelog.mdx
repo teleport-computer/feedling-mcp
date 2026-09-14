@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- V1 resident proactive wakes now include relevant memory summaries selected
+  against the latest user message in their history snapshot. Heartbeat,
+  scheduled, and screen-watch turns share Chat's rendering and
+  final CLI payload checks. Missing anchors or failed selection remain unknown
+  in diagnostics and do not reuse cards from a previous turn.
+
 - Resident consumers now retry transient startup decrypt-source failures using
   the runtime enclave retry and timeout settings. A failed probe reports
   `unreachable` and continues polling instead of exiting, allowing recovery

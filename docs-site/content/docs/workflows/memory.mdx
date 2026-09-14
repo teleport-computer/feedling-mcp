@@ -7,6 +7,23 @@ canonical_owner: self
 
 Memory separates ciphertext storage from enclave-authorized read projections.
 
+V1 hosted and self-hosted resident consumers include relevant memory summaries
+in proactive wake prompts as well as Chat prompts. Heartbeat, scheduled,
+and screen-watch turns select against the latest user message in
+their fetched conversation history, including when that message is older than
+the short displayed transcript. They use the same bounded summary and match-reason
+block as Chat, before the wake context; full card bodies remain available through
+memory-fetch. Historical explicit card references are not treated as new user
+requests. Introduction turns keep their deliberate no-history behavior and do
+not inject this block; Memory Capture and Dream keep their separate maintenance inputs.
+
+Without a user-message anchor or a successful selection response, the wake
+proceeds without that block. Selection stays unknown in diagnostics; a healthy
+empty selection records zero. For Pi, Claude, and Codex CLI turns,
+`memory.context.applied` verifies complete rendered entries in the final driver
+payload, and `memory.recall.completed` reports the number that arrived. This
+proves prepared payload delivery, not that the model used the memory.
+
 Runtime V2 permits memory-card deletion only during foreground Chat, when the
 user is present in the turn. Background heartbeat, scheduled, and manual-wake
 turns can add or update cards but cannot delete them; the delete operation is
