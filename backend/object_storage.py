@@ -280,8 +280,7 @@ def delete_frame_tee_body(user_id: str, frame_id: str) -> None:
 
 
 def delete_user_frames(user_id: str) -> None:
-    """Delete every object under ``frames/<user_id>/`` AND the TEE storage-layer
-    mirror ``frames-tee/<user_id>/`` (account reset must reap both prefixes)."""
+    """Delete legacy, migrated-plaintext, and TEE frame objects for a user."""
     try:
         client = _client()
         bucket = _bucket()

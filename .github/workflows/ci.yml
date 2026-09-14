@@ -1069,6 +1069,7 @@ jobs:
             tests/test_garden_component_parity.py \
             tests/test_orchestration_is_not_reimplemented.py \
             tests/test_backfill_chat_bodies_to_plaintext.py \
+            tests/test_user_content_plaintext_migration.py \
             tests/test_byok_plaintext_read_routing.py \
             tests/test_content_encryption_preference.py \
             tests/test_encryption_surface_frozen.py \

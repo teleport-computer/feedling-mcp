@@ -274,6 +274,52 @@ Ciphertext in an `off` account can be old history, an old-client upload, or the
 sealed resident lane. Inspect time, producer, and family before rewriting it.
 Mixed reads are supported steady state.
 
+## Single-user historical plaintext migration
+
+Use this only after an account has been explicitly set to
+`content_encryption="off"` and the operator has confirmed that its historical
+shared content should be rewritten. The command is intentionally single-user,
+dry-run by default, count-only, and unavailable without two independent apply
+gates. It leaves `local_only` or missing-`K_enclave` records unchanged because
+the enclave cannot decrypt them.
+
+Run inside the managed CVM from the exact deployed release:
+
+```bash
+cd backend
+python migrate_user_content_to_plaintext.py \
+  --user usr_exact_target \
+  --json
+```
+
+Review the aggregate `migratable_shared`, `already_plaintext`,
+`skipped_local_only`, and `invalid_shape` counts. Do not proceed if the target
+user or expected totals do not match the incident record. Canary at one row per
+second, then resume at no more than two rows per second:
+
+```bash
+export FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1
+python migrate_user_content_to_plaintext.py \
+  --user usr_exact_target \
+  --apply --allow-plaintext-rewrite \
+  --limit 20 --rate 1 --json
+
+python migrate_user_content_to_plaintext.py \
+  --user usr_exact_target \
+  --apply --allow-plaintext-rewrite \
+  --rate 2 --json
+```
+
+Every inline write compares the exact source document and rechecks explicit
+`off` in the write transaction. Chat R2 bodies use the durable upload-guard
+lifecycle. Frame plaintext is uploaded under a separate
+`frames-plaintext/<user>/...` key and the legacy ciphertext object is retired
+only after the row CAS commits. A deletion failure leaves a content-free
+`cleanup_pending` marker which a later apply resumes without decrypting again.
+Rerun the dry-run until neither `migratable_shared` nor `cleanup_pending` rows
+remain; any failure count is a stop condition, not a reason to raise the rate.
+Operator output must remain aggregate-only.
+
 ## Two-account regression
 
 Create explicit `on` and `off` accounts. On every supported surface, write a

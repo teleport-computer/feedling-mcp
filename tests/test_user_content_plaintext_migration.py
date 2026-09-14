@@ -61,6 +61,7 @@ def test_apply_requires_both_independent_write_gates(
 
 
 def test_dry_run_does_not_construct_decryptor(monkeypatch, capsys):
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
     monkeypatch.setattr(
         plaintext_migration,
         "inventory",
@@ -94,6 +95,7 @@ def test_apply_rejects_any_preference_other_than_explicit_off(
     monkeypatch, capsys, preference
 ):
     monkeypatch.setenv(plaintext_migration.APPLY_ENV, "1")
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
     monkeypatch.setattr(
         plaintext_migration, "content_encryption_preference", lambda _uid: preference
     )
@@ -116,6 +118,7 @@ def test_apply_rejects_any_preference_other_than_explicit_off(
 
 def test_apply_gate_accepts_explicit_off_without_exposing_items(monkeypatch, capsys):
     monkeypatch.setenv(plaintext_migration.APPLY_ENV, "1")
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
     monkeypatch.setattr(
         plaintext_migration, "content_encryption_preference", lambda _uid: "off"
     )
@@ -134,6 +137,18 @@ def test_apply_gate_accepts_explicit_off_without_exposing_items(monkeypatch, cap
     report = json.loads(capsys.readouterr().out)
     assert report["counts"] == {}
     assert set(report) == {"apply", "counts", "failures", "user_id"}
+
+
+def test_dry_run_rejects_unknown_user_before_inventory(monkeypatch, capsys):
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: False)
+    monkeypatch.setattr(
+        plaintext_migration,
+        "inventory",
+        lambda _uid: pytest.fail("unknown-user gate must precede inventory"),
+    )
+
+    assert cli.main(["--user", "usr_typo", "--json"]) == 2
+    assert "does not exist" in capsys.readouterr().err
 
 
 def _encrypted(item_id: str, *, visibility: str = "shared") -> dict:
@@ -703,6 +718,7 @@ def test_frame_get_follows_persisted_plaintext_migration_key(monkeypatch):
         "body_object_format": "plaintext_v1",
         "body_sha256": hashlib.sha256(raw).hexdigest(),
         "body_size_bytes": len(raw),
+        db.FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD: True,
     }
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -724,6 +740,123 @@ def test_frame_get_follows_persisted_plaintext_migration_key(monkeypatch):
     loaded = db.frame_get(user_id, "frame-key", unavailable_raises=True)
 
     assert base64.b64decode(loaded["body_b64"]) == raw
+    assert db.FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD not in loaded
+
+
+def test_frame_cleanup_failure_is_durable_and_rerun_needs_no_decrypt(monkeypatch):
+    user_id = "usr_frame_cleanup_resume"
+    seed_user(user_id, content_encryption="off")
+    old_key = f"frames/{user_id}/frame-cleanup"
+    meta = _encrypted("frame-cleanup")
+    meta.pop("body_ct")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'frame-cleanup',1,NULL,%s,%s)",
+            (user_id, Jsonb(meta), old_key),
+        )
+    monkeypatch.setattr(object_storage, "enabled", lambda: True)
+    monkeypatch.setattr(
+        object_storage,
+        "get_frame_body_strict",
+        lambda *_a: base64.b64encode(b"sealed").decode(),
+    )
+    monkeypatch.setattr(
+        object_storage,
+        "put_frame_plaintext_body",
+        lambda uid, fid, raw: f"frames-plaintext/{uid}/{fid}/digest",
+    )
+    delete_outcomes = iter([False, True])
+    monkeypatch.setattr(
+        object_storage,
+        "delete_frame_body_key",
+        lambda *_a: next(delete_outcomes),
+    )
+    monkeypatch.setattr(
+        plaintext_migration,
+        "make_decrypt",
+        lambda _uid: lambda *_a, **_kw: b"plain-frame",
+    )
+
+    first = plaintext_migration.run(user_id, apply=True, rate=1000)
+    assert first.counts == {"failed_frame_cleanup_pending": 1}
+    assert first.failures == 1
+    assert [item.classification for item in plaintext_migration.inventory(user_id)] == [
+        "cleanup_pending"
+    ]
+
+    monkeypatch.setattr(
+        plaintext_migration,
+        "make_decrypt",
+        lambda _uid: pytest.fail("cleanup resume must not decrypt plaintext"),
+    )
+    second = plaintext_migration.run(user_id, apply=True, rate=1000)
+    assert second.counts == {"cleanup_completed": 1}
+    assert second.failures == 0
+    assert [item.classification for item in plaintext_migration.inventory(user_id)] == [
+        "already_plaintext"
+    ]
+
+
+def test_frame_delete_retires_the_persisted_plaintext_object_key(monkeypatch):
+    user_id = "usr_frame_delete_plaintext_key"
+    seed_user(user_id, content_encryption="off")
+    key = f"frames-plaintext/{user_id}/frame-delete/digest"
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'frame-delete',1,NULL,%s,%s)",
+            (
+                user_id,
+                Jsonb({"body_object_format": "plaintext_v1"}),
+                key,
+            ),
+        )
+    monkeypatch.setattr(object_storage, "enabled", lambda: True)
+    deleted_keys = []
+    monkeypatch.setattr(
+        object_storage,
+        "delete_frame_body_key",
+        lambda stored_key, uid: deleted_keys.append((stored_key, uid)) or True,
+    )
+    monkeypatch.setattr(object_storage, "delete_frame_body", lambda *_a: None)
+    monkeypatch.setattr(object_storage, "delete_frame_tee_body", lambda *_a: None)
+
+    db.frame_delete(user_id, "frame-delete")
+
+    assert deleted_keys == [(key, user_id)]
+
+
+def test_frame_prune_retires_evicted_plaintext_object_key(monkeypatch):
+    user_id = "usr_frame_prune_plaintext_key"
+    seed_user(user_id, content_encryption="off")
+    old_key = f"frames-plaintext/{user_id}/old/digest"
+    new_key = f"frames-plaintext/{user_id}/new/digest"
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO frame_envelopes(user_id,frame_id,ts,doc,env_meta,body_key) "
+            "VALUES (%s,'old',1,NULL,%s,%s),(%s,'new',2,NULL,%s,%s)",
+            (
+                user_id,
+                Jsonb({"body_object_format": "plaintext_v1"}),
+                old_key,
+                user_id,
+                Jsonb({"body_object_format": "plaintext_v1"}),
+                new_key,
+            ),
+        )
+    monkeypatch.setattr(object_storage, "enabled", lambda: True)
+    deleted_keys = []
+    monkeypatch.setattr(
+        object_storage,
+        "delete_frame_body_key",
+        lambda stored_key, uid: deleted_keys.append((stored_key, uid)) or True,
+    )
+    monkeypatch.setattr(object_storage, "delete_frame_body", lambda *_a: None)
+    monkeypatch.setattr(object_storage, "delete_frame_tee_body", lambda *_a: None)
+
+    assert db.frame_prune_to(user_id, 1) == ["old"]
+    assert deleted_keys == [(old_key, user_id)]
 
 
 def test_apply_limit_and_rate_only_attempt_bounded_migratable_items(monkeypatch):
@@ -743,6 +876,7 @@ def test_apply_limit_and_rate_only_attempt_bounded_migratable_items(monkeypatch)
     monkeypatch.setattr(
         plaintext_migration, "content_encryption_preference", lambda _uid: "off"
     )
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
     monkeypatch.setattr(plaintext_migration, "inventory", lambda _uid: items)
     monkeypatch.setattr(plaintext_migration, "make_decrypt", lambda _uid: object())
     attempted = []
@@ -784,6 +918,7 @@ def test_cli_failure_report_does_not_expose_exception_or_item_id(monkeypatch, ca
     monkeypatch.setattr(
         plaintext_migration, "content_encryption_preference", lambda _uid: "off"
     )
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
     monkeypatch.setattr(
         plaintext_migration,
         "inventory",

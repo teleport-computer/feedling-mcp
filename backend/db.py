@@ -18042,6 +18042,9 @@ FRAME_SOURCE_PHOTO = "photo"
 # source-filtered list/rebuild paths.
 FRAME_SOURCE_LEGACY_UNATTRIBUTED = "legacy_unattributed"
 _FRAME_SOURCES = frozenset({FRAME_SOURCE_SCREEN, FRAME_SOURCE_PHOTO})
+FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD = (
+    "_plaintext_migration_legacy_frame_cleanup_pending"
+)
 
 
 def _require_frame_source(source: str) -> str:
@@ -18198,6 +18201,10 @@ def migrate_frame_to_plaintext(
         "body_sha256": digest,
         "body_size_bytes": len(plaintext),
     })
+    if old_body_key:
+        if old_body_key != object_storage.frame_key(user_id, frame_id):
+            raise ValueError("frame plaintext migration requires canonical legacy key")
+        common[FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD] = True
     candidate_key = None
     if object_storage.enabled():
         candidate_key = object_storage.put_frame_plaintext_body(
@@ -18254,7 +18261,66 @@ def migrate_frame_to_plaintext(
         user_id, "frame_envelopes", frame_id, "requeue_plaintext_migration"
     )
     if old_body_key and old_body_key != candidate_key:
-        object_storage.delete_frame_body_key(old_body_key, user_id)
+        retry_frame_plaintext_cleanup(user_id, frame_id)
+    return True
+
+
+def frame_plaintext_cleanup_pending(user_id: str, frame_id: str) -> bool:
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND frame_id=%s "
+            "AND env_meta->%s = 'true'::jsonb",
+            (user_id, frame_id, FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD),
+        ).fetchone()
+    return row is not None
+
+
+def retry_frame_plaintext_cleanup(user_id: str, frame_id: str) -> bool:
+    """Retire the deterministic legacy ciphertext and clear its durable marker."""
+    legacy_key = object_storage.frame_key(user_id, frame_id)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT doc->>'content_encryption' FROM users "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                preference = cur.fetchone()
+                if (
+                    preference is None
+                    or str(preference[0] or "").strip().lower() != "off"
+                ):
+                    return False
+                cur.execute(
+                    "SELECT body_key FROM frame_envelopes "
+                    "WHERE user_id=%s AND frame_id=%s "
+                    "AND env_meta->%s = 'true'::jsonb "
+                    "FOR UPDATE",
+                    (user_id, frame_id, FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return True
+                current_key = str(row[0] or "")
+                expected_prefix = f"frames-plaintext/{user_id}/{frame_id}/"
+                if not current_key.startswith(expected_prefix):
+                    return False
+                # Keep the row lock across this one bounded network delete. A
+                # concurrent frame rewrite cannot repoint to the legacy key
+                # between our safety check and deletion.
+                if not object_storage.delete_frame_body_key(legacy_key, user_id):
+                    return False
+                cur.execute(
+                    "UPDATE frame_envelopes SET env_meta=env_meta-%s "
+                    "WHERE user_id=%s AND frame_id=%s AND body_key=%s",
+                    (
+                        FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD,
+                        user_id,
+                        frame_id,
+                        current_key,
+                    ),
+                )
     return True
 
 
@@ -18365,6 +18431,7 @@ def frame_get(
         # Source attribution belongs to storage metadata, not the uploaded
         # cryptographic envelope returned to callers.
         out.pop("source", None)
+        out.pop(FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD, None)
         if out.pop("body_object_format", None) == "plaintext_v1":
             try:
                 raw = base64.b64decode(body, validate=True)
@@ -18388,12 +18455,16 @@ def frame_get(
 
 
 def frame_delete(user_id: str, frame_id: str) -> None:
+    stored_body_key = None
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = %s",
+            deleted = conn.execute(
+                "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = %s "
+                "RETURNING body_key",
                 (user_id, frame_id),
-            )
+            ).fetchone()
+            if deleted is not None:
+                stored_body_key = deleted[0]
     except Exception as e:
         # Row delete failed → the pointer row survives, so leave the R2 body in
         # place; deleting it now would corrupt later reads of the still-present row.
@@ -18411,6 +18482,11 @@ def frame_delete(user_id: str, frame_id: str) -> None:
     ])
     if object_storage.enabled():
         object_storage.delete_frame_body(user_id, frame_id)
+        if (
+            stored_body_key
+            and stored_body_key != object_storage.frame_key(user_id, frame_id)
+        ):
+            object_storage.delete_frame_body_key(stored_body_key, user_id)
         # Also reap the TEE storage-layer re-encrypted body (frames-tee/) so a
         # single-frame delete doesn't orphan it (best-effort, same style).
         object_storage.delete_frame_tee_body(user_id, frame_id)
@@ -18465,17 +18541,22 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
     Returns the evicted frame_ids."""
     if not max_frames or max_frames <= 0:
         return []
+    evicted_body_keys: dict[str, str] = {}
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
                 rows = conn.execute(
-                    "SELECT frame_id FROM frame_envelopes WHERE user_id = %s AND frame_id NOT IN ("
+                    "SELECT frame_id,body_key FROM frame_envelopes "
+                    "WHERE user_id = %s AND frame_id NOT IN ("
                     "  SELECT frame_id FROM frame_envelopes WHERE user_id = %s "
                     "  ORDER BY ts DESC LIMIT %s"
                     ")",
                     (user_id, user_id, max_frames),
                 ).fetchall()
                 evicted = [r[0] for r in rows]
+                evicted_body_keys = {
+                    str(r[0]): str(r[1]) for r in rows if r[1]
+                }
                 if evicted:
                     conn.execute(
                         "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = ANY(%s)",
@@ -18498,6 +18579,12 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
         if evicted and object_storage.enabled():
             for fid in evicted:
                 object_storage.delete_frame_body(user_id, fid)
+                stored_key = evicted_body_keys.get(str(fid))
+                if (
+                    stored_key
+                    and stored_key != object_storage.frame_key(user_id, fid)
+                ):
+                    object_storage.delete_frame_body_key(stored_key, user_id)
                 # Reap the TEE storage-layer re-encrypted body too (frames-tee/).
                 object_storage.delete_frame_tee_body(user_id, fid)
         return evicted

@@ -63,6 +63,15 @@ def content_encryption_preference(user_id: str) -> str | None:
     return value or None
 
 
+def user_exists(user_id: str) -> bool:
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    return row is not None
+
+
 def make_decrypt(user_id: str):
     """Create the existing user-scoped enclave decrypt callback lazily."""
     from tee_replicator.worker import _make_decrypt
@@ -130,6 +139,8 @@ def classify_frame(
     carrier = doc if isinstance(doc, dict) else env_meta
     if not isinstance(carrier, dict):
         return "invalid_shape"
+    if carrier.get(db.FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD) is True:
+        return "cleanup_pending"
     if body_key:
         if carrier.get("body_object_format") == "plaintext_v1":
             return "already_plaintext"
@@ -436,10 +447,20 @@ def _migrate_frame(user_id: str, item: Item, decrypt) -> str:
         plaintext=plaintext,
         semantic_meta=semantic_meta,
     )
-    return "migrated" if won else "cas_conflict"
+    if not won:
+        return "cas_conflict"
+    if db.frame_plaintext_cleanup_pending(user_id, item.item_id):
+        return "failed_frame_cleanup_pending"
+    return "migrated"
 
 
 def migrate_item(user_id: str, item: Item, decrypt) -> str:
+    if item.surface == "frame" and item.classification == "cleanup_pending":
+        return (
+            "cleanup_completed"
+            if db.retry_frame_plaintext_cleanup(user_id, item.item_id)
+            else "failed_frame_cleanup_pending"
+        )
     if item.surface in {"chat_live", "chat_archive"} and item.body_key:
         return _migrate_chat_pointer(user_id, item, decrypt)
     if item.surface == "frame":
@@ -462,14 +483,15 @@ def run(
         raise ValueError("limit must be >= 0")
     if float(rate) <= 0:
         raise ValueError("rate must be > 0")
+    if not user_exists(user_id):
+        raise ValueError("target user does not exist")
     if apply and content_encryption_preference(user_id) != "off":
         raise PermissionError("content_encryption must be explicitly off")
 
     items = list(inventory(user_id))
     counts: Counter[str] = Counter()
-    candidates = [
-        item for item in items if item.classification == "migratable_shared"
-    ]
+    candidate_classes = {"migratable_shared", "cleanup_pending"}
+    candidates = [item for item in items if item.classification in candidate_classes]
     attempted_candidates = candidates[:limit] if apply and limit else candidates
     deferred = len(candidates) - len(attempted_candidates) if apply else 0
     if deferred:
@@ -480,17 +502,17 @@ def run(
     for item in items:
         if (
             not apply
-            or item.classification != "migratable_shared"
+            or item.classification not in candidate_classes
             or id(item) not in attempted_ids
         ):
-            if not apply or item.classification != "migratable_shared":
+            if not apply or item.classification not in candidate_classes:
                 counts[item.classification] += 1
             continue
         if attempt_index:
             time.sleep(1.0 / float(rate))
         attempt_index += 1
         try:
-            if decrypt is None:
+            if item.classification != "cleanup_pending" and decrypt is None:
                 decrypt = make_decrypt(user_id)
             counts[migrate_item(user_id, item, decrypt)] += 1
         except Exception:  # noqa: BLE001 - report only redacted failure class

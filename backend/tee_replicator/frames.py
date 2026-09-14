@@ -43,6 +43,7 @@ _CRYPTO_FIELDS = {"v", "body_ct", "body_b64", "nonce", "K_user", "K_enclave",
                   "enclave_pk_fpr", "content_pk_fpr", "body_object_format",
                   "body_sha256", "body_size_bytes", "body_key"}
 _STORAGE_FIELDS = {"source"}
+_STORAGE_FIELDS.add("_plaintext_migration_legacy_frame_cleanup_pending")
 # Candidate top-level mime hints (screen frames carry the real image_mime inside
 # the ciphertext, so this is best-effort — body_mime is nullable).
 _MIME_FIELDS = ("content_type", "image_mime", "mime")
