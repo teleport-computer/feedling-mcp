@@ -87,7 +87,7 @@ def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_702
+_REAL_TOOL_CATALOG_BYTES = 36_793
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -139,6 +139,9 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     increasing the real catalog by 247 bytes to 36,702. The previous 12-byte
     MCP padding is preserved; the old fixture overflow was 235 bytes, not the
     full description delta. Tool count and parameter schemas are unchanged.
+    T585 updates only the stay_silent description to the approved concrete-reason
+    policy, adding 91 UTF-8 bytes to the catalog (36,793 total). The existing
+    MCP padding, tool count, and parameter schemas remain unchanged.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

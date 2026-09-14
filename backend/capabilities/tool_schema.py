@@ -772,8 +772,10 @@ DESCRIPTIONS: dict[str, str] = {
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
     STAY_SILENT_TOOL: (
-        "Sit this one out. Say briefly why — maybe they are busy, you just talked, "
-        "or the moment is better left quiet. This is good company, not an error."
+        "Skip speaking this time. Use only for a concrete reason — they asked not "
+        "to be disturbed, it is clearly their sleeping hours and they are offline, "
+        "you already spoke within the last hour, or they are visibly busy. "
+        "Say the reason briefly."
     ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "
