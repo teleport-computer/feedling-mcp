@@ -2117,6 +2117,60 @@ def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
     assert len(_memory_dream_jobs(store)) == 1
 
 
+def test_resident_dream_agent_failure_is_stored_as_a_content_free_code(
+    tmp_path, monkeypatch
+):
+    """Bug 20: old and new resident consumers both send raw provider text."""
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    core_store._stores.clear()
+
+    api_key = "test_dream_agent_failure_key"
+    user_id = "usr_dream_agent_failure_code"
+    registry._key_to_user[registry._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_fail")])
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+    secret = "PRIVATE-PROVIDER-ECHO-51c2"
+    raw = (
+        "dream_agent_call_failed:RuntimeError: pi agent produced no reply: "
+        f"HTTP 401: Insufficient balance {secret}"
+    )
+
+    job = client.post("/v1/dream/tick", headers=headers, json={"now": 3000.0}).get_json()["job"]
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "failed",
+            "reason": raw,
+            "dream_result": {"status": "failed", "reason": raw, "job_kind": "memory_dream"},
+            "cards_merged": 0,
+            "cards_superseded": 0,
+            "questions": [],
+            "noop_reason": raw,
+        },
+    )
+
+    assert done.status_code == 200
+    stored = next(
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_id") == job["job_id"]
+    )
+    code = "dream_agent_call_failed:quota_insufficient"
+    assert stored["status"] == "failed"
+    assert stored["status_reason"] == code
+    assert stored["noop_reason"] == code
+    assert stored["dream_result"]["reason"] == code
+    assert secret not in repr(stored)
+    # Still a real failure for backoff purposes.
+    assert proactive_dream_scheduler.load_dream_state(store)["dream_fail_streak"] == 1
+
+
 def test_dream_skip_spaces_retries_without_success_or_failure_bookkeeping(
     tmp_path, monkeypatch
 ):

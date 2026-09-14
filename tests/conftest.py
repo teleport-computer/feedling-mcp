@@ -264,6 +264,8 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_resident_wake_memory.py",
+        # 纯函数：记忆 lane 的 agent 调用失败归类（Bug 20），零 DB / 零网络。
+        "test_agent_call_failure_codes.py",
         "test_resident_decrypt_probe_startup.py",
         "test_memory_bm25.py",
         "test_memory_bm25_readside.py",

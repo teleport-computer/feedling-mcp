@@ -49,6 +49,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
+from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
 
 log = logging.getLogger("feedling.db")
@@ -5102,10 +5103,20 @@ def content_free_failure_code(
 
     Freezers call this after grouping by raw reason, so ``count`` preserves the
     number of affected attempts without logging hundreds of identical lines.
+
+    Resident memory-lane agent-call failures written before the status
+    endpoint started classifying them (``<lane>_agent_call_failed:<raw text>``)
+    keep their prefix plus a registry class instead of ``runtime_failed``; the
+    raw tail is still discarded and logged exactly like any other free text.
     """
     reason = str(raw_reason or "")
     if _LANE_ROLLUP_CODE_RE.match(reason):
         return reason
+    replacement = "runtime_failed"
+    if notices_agent_call_failure.is_agent_call_failed_reason(reason):
+        classified = notices_agent_call_failure.normalize_reason(reason)
+        if _LANE_ROLLUP_CODE_RE.match(classified):
+            replacement = classified
     bounded = reason[:_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS]
     try:
         affected = max(1, int(count))
@@ -5114,7 +5125,7 @@ def content_free_failure_code(
     log.warning(
         "[failure-code] discarded non-allowlisted reason "
         "source=%s user_id=%r lane=%r day=%s count=%d "
-        "reason=%r truncated=%s",
+        "reason=%r truncated=%s replacement=%s",
         str(source or "unknown")[:80],
         str(user_id or "")[:200],
         str(lane or "")[:120],
@@ -5122,8 +5133,9 @@ def content_free_failure_code(
         affected,
         bounded,
         len(reason) > len(bounded),
+        replacement,
     )
-    return "runtime_failed"
+    return replacement
 
 _LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
 

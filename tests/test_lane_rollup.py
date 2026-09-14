@@ -906,6 +906,35 @@ def test_resident_freeze_logs_discarded_reason_without_leaking_cell(
     assert "count=2" in caplog.text
 
 
+def test_resident_dream_agent_failures_keep_their_class_in_frozen_codes(
+        clean_rollup):
+    """Bug 20: legacy raw ``dream_agent_call_failed:<text>`` rows (written
+    before the status endpoint classified them) must not all become
+    ``runtime_failed``; new, already-classified rows pass unchanged."""
+    uid = "usr_rollup_res_dream_agent_codes"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    secret = "PRIVATE-PROVIDER-ECHO-9d1e"
+    for reason in (
+        f"dream_agent_call_failed:RuntimeError: 401 Unauthorized {secret}",
+        f"dream_agent_call_failed:RuntimeError: HTTP 401: Insufficient balance {secret}",
+        "dream_agent_call_failed:model_not_found",
+    ):
+        _log_job(uid, ts=t, status="failed", job_kind="memory_dream",
+                 terminal_at=t, status_reason=reason)
+
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
+
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "dream"]
+    assert cell["failed"] == 3
+    assert cell["failure_codes"] == {
+        "dream_agent_call_failed:auth_invalid": 1,
+        "dream_agent_call_failed:quota_insufficient": 1,
+        "dream_agent_call_failed:model_not_found": 1,
+    }
+    assert secret not in repr(cell)
+
+
 def test_discarded_reason_operational_log_is_bounded(caplog):
     raw_reason = "Provider Error " + ("x" * 600) + "END_SENTINEL"
     assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)

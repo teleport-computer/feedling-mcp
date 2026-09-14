@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident (V1 and self-hosted) memory capture, dream and migrate failures
+  caused by the agent call now keep a content-free cause in job status and
+  lane diagnostics, such as `dream_agent_call_failed:auth_invalid`,
+  `…:quota_insufficient`, `…:model_not_found`, `…:rate_limited`,
+  `…:upstream_unavailable` or `…:unknown`, instead of collapsing to
+  `runtime_failed`. The backend classifies the consumer's error text when the
+  status is reported, so older self-hosted consumers are covered, and no
+  provider error text is stored in these fields for new reports. A provider
+  message reporting an insufficient balance is now classified as
+  `quota_insufficient` even when it arrives with HTTP 401.
+
 - Hosted Runtime V2 Dream no longer reports a run as completed when the
   Memory Garden is below the memory kernel's consolidation minimum. Such a run
   makes no model call and changes no cards; it is now recorded as a completed

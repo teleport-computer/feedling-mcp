@@ -421,6 +421,7 @@ jobs:
             tests/test_capture_window_cursor_diagnostics.py \
             tests/test_window_fingerprint.py \
             tests/test_v2_capture_poison_window_escape.py \
+            tests/test_agent_call_failure_codes.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
             tests/test_card_text_gate.py \
@@ -1022,6 +1023,7 @@ jobs:
             tests/test_capture_window_cursor_diagnostics.py \
             tests/test_window_fingerprint.py \
             tests/test_v2_capture_poison_window_escape.py \
+            tests/test_agent_call_failure_codes.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
             tests/test_contract_rejection_stats.py \
