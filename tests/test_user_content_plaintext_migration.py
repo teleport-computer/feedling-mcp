@@ -15,7 +15,7 @@ from content import plaintext_migration  # noqa: E402
 import migrate_user_content_to_plaintext as cli  # noqa: E402
 import db  # noqa: E402
 import object_storage  # noqa: E402
-from conftest import seed_user  # noqa: E402
+from conftest import capture_sleeps, seed_user  # noqa: E402
 
 
 def test_cli_requires_an_exact_user_before_accessing_data(monkeypatch, capsys):
@@ -885,8 +885,7 @@ def test_apply_limit_and_rate_only_attempt_bounded_migratable_items(monkeypatch)
         "migrate_item",
         lambda _uid, item, _decrypt: attempted.append(item.item_id) or "migrated",
     )
-    sleeps = []
-    monkeypatch.setattr(plaintext_migration.time, "sleep", sleeps.append)
+    sleeps = capture_sleeps(monkeypatch, plaintext_migration)
 
     result = plaintext_migration.run(
         "usr_rate_limit", apply=True, limit=2, rate=2.0
