@@ -2896,3 +2896,21 @@ def test_capture_recovery_serializes_with_capture_lock_holders_without_deadlock(
     state = _capture_state(uid)
     assert int(state["capture_fail_streak"]) == 1
     assert state["last_capture_failed_job_id"] == str(job_id)
+
+
+def test_crash_expiry_keeps_the_known_account_cause():
+    """崩溃/部署重启被回收记失败时，不能把之前认出的「额度不足」冲成空（独立审查 M1）。"""
+    uid = "u_capture_crash_keeps_account_cause"
+    _seed(uid)
+    job_id, _job = _running(uid, owner="cause-0")
+    assert jobs_store.fail_capture_job(
+        job_id=job_id, user_id=uid, claimed_by="cause-0",
+        error="extraction_failed:quota_insufficient", window=_window(after=0, through=3))
+    crash_id, _job = _running(uid, owner="cause-crash")
+    with db.get_pool().connection() as conn:
+        conn.execute("UPDATE agent_jobs SET lease_expires_at=now()-interval '1 hour' WHERE id=%s",
+                     (crash_id,))
+    jobs_store.reap_stuck_job_rows()
+    state = _capture_state(uid)
+    assert int(state["capture_fail_streak"]) == 2
+    assert state["capture_account_error_code"] == "quota_insufficient"

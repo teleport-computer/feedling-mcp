@@ -2567,8 +2567,9 @@ def _record_capture_crash_failure_on_cursor(
         "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
         (user_id, _CAPTURE_STATE_KIND),
     )
+    before = dict(cur.fetchone()["doc"] or {})
     failed, _skipped = _capture_failed_state(
-        dict(cur.fetchone()["doc"] or {}),
+        dict(before),
         job_id=job["id"],
         error=str(error),
         increment_backoff=True,
@@ -2576,6 +2577,10 @@ def _record_capture_crash_failure_on_cursor(
         # 问题，拿它当「这批消息有毒」去跳过会丢掉本来保得住的记忆。
         window=None,
     )
+    if before.get("capture_account_error_code") and not failed.get("capture_account_error_code"):
+        # 崩溃/部署重启不说明账号好了：保留之前认出的「额度不足」等原因，
+        # 别让提示从「充值后恢复」退回笼统的「连续失败 N 次」（独立审查 M1）。
+        failed["capture_account_error_code"] = before["capture_account_error_code"]
     cur.execute(
         "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
         (Jsonb(failed), user_id, _CAPTURE_STATE_KIND),
@@ -3136,18 +3141,22 @@ def _reap_overdue_capture_claims(ts: float | None) -> list[dict]:
     先不加锁地挑出候选，再每个任务一个事务按落卡锁顺序处理。单个任务出错
     （例如等锁超时）只记日志、留到下一轮，不挡住其他任务和其他 lane 的回收。
     """
-    with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT id,user_id,claimed_by,attempt_count FROM agent_jobs "
-                "WHERE lane='capture' AND status IN ('claimed','running') "
-                "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
-                "AND COALESCE(lease_expires_at, deadline_at) "
-                "    <= COALESCE(to_timestamp(%s), now()) "
-                "ORDER BY id",
-                (ts,),
-            )
-            candidates = [dict(row) for row in cur.fetchall()]
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT id,user_id,claimed_by,attempt_count FROM agent_jobs "
+                    "WHERE lane='capture' AND status IN ('claimed','running') "
+                    "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    "AND COALESCE(lease_expires_at, deadline_at) "
+                    "    <= COALESCE(to_timestamp(%s), now()) "
+                    "ORDER BY id",
+                    (ts,),
+                )
+                candidates = [dict(row) for row in cur.fetchall()]
+    except Exception:  # noqa: BLE001 — 通用回收已提交；这里失败不能让本轮 reconcile 跟着跳过
+        log.exception("[v2.reaper] capture lease candidate scan failed; retry next pass")
+        return []
     reaped: list[dict] = []
     for candidate in candidates:
         try:
