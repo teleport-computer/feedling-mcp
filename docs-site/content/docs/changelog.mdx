@@ -73,7 +73,10 @@ change must not be interpreted as an API guarantee.
   stops at that limit is retried once with a more concise prompt and a
   24,000-token budget (both capped at the shared 32,768-token provider ceiling).
   Previously the retry reused the budget that had just truncated, so the same
-  gardens failed with `output_truncated` every night.
+  gardens failed with `output_truncated` every night. If the model rejects the
+  larger retry budget as too large (HTTP 400/422), the concise retry is sent
+  again at the 12,000-token budget the model already accepted instead of
+  failing the run as a provider configuration error.
 
 - Memory capture no longer stops permanently when one batch of chat keeps
   failing. If the same batch fails 3 times in a row with an unreadable model

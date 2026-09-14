@@ -443,3 +443,139 @@ def test_slow_compatibility_fallback_wires_never_starve_the_heavy_pool_stall_clo
             turn_stall_timeout_sec=slot.stall_budget_sec,
             turn_absolute_timeout_sec=slot.absolute_budget_sec,
         ), (slot.slot_id, longest_silence)
+
+
+# --------------------------------------------------------------------------- #
+# Escalated truncation retry rejected as "max_tokens too large"
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "status, message",
+    [
+        (400, "max_tokens is too large: 24000. This model supports at most 16384 completion tokens"),
+        (400, "max_tokens: 24000 > 16000, which is the maximum allowed number of output tokens"),
+        (400, "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]"),
+        (400, "The maximum tokens you requested exceeds the model limit of 8192"),
+        (422, "maxOutputTokens must be less than or equal to 8192"),
+    ],
+)
+def test_output_budget_rejection_shapes_are_recognized(status, message):
+    exc = pc.ProviderError(
+        f"provider_http_{status}: {message}", status_code=status,
+        raw_response_body=json.dumps({"error": {"message": message}}),
+    )
+    assert pc.is_output_budget_rejection(exc) is True
+
+
+@pytest.mark.parametrize(
+    "status, message",
+    [
+        (400, "`temperature` is deprecated for this model."),
+        (400, "messages: at most 100 messages are allowed"),
+        (401, "max_tokens is too large"),  # not a request-shape rejection
+        (429, "output tokens per minute limit exceeded"),
+        (400, "prompt is too long: 250000 tokens > 200000 maximum"),
+        (400, "Unsupported parameter: 'max_tokens' is not supported with this model. "
+              "Use 'max_completion_tokens' instead."),
+    ],
+)
+def test_other_provider_errors_are_not_output_budget_rejections(status, message):
+    exc = pc.ProviderError(
+        f"provider_http_{status}: {message}", status_code=status,
+        raw_response_body=json.dumps({"error": {"message": message}}),
+    )
+    assert pc.is_output_budget_rejection(exc) is False
+
+
+def _serve_by_budget(monkeypatch, *, accepted_max, first, fallback):
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content or b"{}")
+        seen.append(payload)
+        if payload["max_tokens"] > accepted_max:
+            return httpx.Response(400, json={"error": {"message": (
+                f"max_tokens is too large: {payload['max_tokens']}. This model "
+                f"supports at most {accepted_max} completion tokens."
+            )}})
+        return httpx.Response(200, json=first() if len(seen) == 1 else fallback())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(pc, "_shared_async_client", client)
+    monkeypatch.setattr(pc, "_validate_egress_url", lambda _url: None, raising=False)
+    return seen
+
+
+def test_rejected_escalated_budget_falls_back_to_the_accepted_budget(monkeypatch):
+    budget = extraction.max_output_tokens_for_lane("dream")
+    retry_budget = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    seen = _serve_by_budget(
+        monkeypatch, accepted_max=budget,
+        first=lambda: _deepseek_reasoning_spent_budget(budget),
+        fallback=_valid_dream_reply,
+    )
+    events = []
+
+    async def _trajectory(kind, payload):
+        events.append((kind, payload))
+
+    items, reason = asyncio.run(extraction.extract(
+        provider_config=_WIRES["deepseek"][0],
+        prompt="P",
+        parse=_dream_parse,
+        parse_retry=_dream_parse_retry(),
+        max_tokens=budget,
+        truncation_retry_max_tokens=retry_budget,
+        trajectory_out=_trajectory,
+    ))
+
+    assert (items, reason) == ([], None)
+    assert [row["max_tokens"] for row in seen] == [budget, retry_budget, budget]
+    assert seen[1]["messages"] == seen[2]["messages"]
+    assert seen[2]["messages"][-1]["content"].endswith("(be concise)")
+    assert ("extraction_output_budget_fallback",
+            {"rejected_max_tokens": retry_budget, "max_tokens": budget}) in events
+
+
+def test_rejected_escalated_budget_whose_fallback_truncates_is_output_truncated(monkeypatch):
+    budget = extraction.max_output_tokens_for_lane("dream")
+    seen = _serve_by_budget(
+        monkeypatch, accepted_max=budget,
+        first=lambda: _deepseek_reasoning_spent_budget(budget),
+        fallback=lambda: _deepseek_reasoning_spent_budget(budget),
+    )
+
+    items, reason = asyncio.run(extraction.extract(
+        provider_config=_WIRES["deepseek"][0],
+        prompt="P",
+        parse=_dream_parse,
+        parse_retry=_dream_parse_retry(),
+        max_tokens=budget,
+        truncation_retry_max_tokens=extraction.truncation_retry_max_output_tokens_for_lane("dream"),
+    ))
+
+    assert (items, reason) == (None, "output_truncated")
+    assert len(seen) == 3
+
+
+def test_a_first_call_budget_rejection_is_still_a_provider_config_failure(monkeypatch):
+    """The fallback only exists for the escalated retry: rejecting the lane's own
+    budget is a real configuration problem, not something to paper over."""
+    budget = extraction.max_output_tokens_for_lane("dream")
+    seen = _serve_by_budget(
+        monkeypatch, accepted_max=budget - 1,
+        first=_valid_dream_reply, fallback=_valid_dream_reply,
+    )
+
+    items, reason = asyncio.run(extraction.extract(
+        provider_config=_WIRES["deepseek"][0],
+        prompt="P",
+        parse=_dream_parse,
+        parse_retry=_dream_parse_retry(),
+        max_tokens=budget,
+        truncation_retry_max_tokens=extraction.truncation_retry_max_output_tokens_for_lane("dream"),
+    ))
+
+    assert items is None
+    assert reason == "provider_call_failed:provider_config"
+    assert [row["max_tokens"] for row in seen] == [budget]

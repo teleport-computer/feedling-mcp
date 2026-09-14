@@ -945,6 +945,103 @@ def test_dream_thinking_model_spending_the_budget_gets_the_truncation_retry(
         assert _job_row(job_id) == ("completed", None)
 
 
+@pytest.mark.parametrize("fallback_reply_truncated", [False, True])
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        pytest.param((400, {"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": "max_tokens: 24000 > 16000, which is the maximum allowed "
+                       "number of output tokens for claude-sonnet-4-test",
+        }}), id="anthropic-400"),
+        pytest.param((422, {"error": {
+            "message": "max_tokens is too large: 24000. This model supports at most "
+                       "16384 completion tokens, whereas you provided 24000.",
+        }}), id="relay-422"),
+    ],
+)
+def test_dream_escalated_truncation_retry_rejected_as_too_large_falls_back_to_the_accepted_budget(
+    monkeypatch, rejection, fallback_reply_truncated,
+):
+    """A model that accepts Dream's 12k budget but rejects the doubled 24k retry
+    budget must not turn a recoverable concise retry into ``provider_config``.
+    Real transport + parser + retry wrapper + extract + worker (session mode)."""
+    import httpx
+
+    uid = "u_x_dream_budget_rejected"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    budget = extraction.max_output_tokens_for_lane("dream")
+    retry_budget = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    requests = []
+    thinking_only = {
+        "id": "msg_t", "type": "message", "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "...", "signature": "s"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 9000, "output_tokens": budget},
+    }
+    answered = {
+        "id": "msg_a", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": '{"consolidations": []}'}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 9000, "output_tokens": 40},
+    }
+
+    def handler(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload["max_tokens"] > 16000:
+            return httpx.Response(rejection[0], json=rejection[1])
+        first_call = len(requests) == 1
+        return httpx.Response(
+            200,
+            json=thinking_only if first_call or fallback_reply_truncated else answered,
+        )
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_async_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(provider_client.asyncio, "sleep", _no_sleep)
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C", "card_items": cards,
+        }),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    budgets = [row["max_tokens"] for row in requests]
+    # The rejected 24k wire may be re-sent once by a provider compatibility
+    # fallback; what matters is that it is followed by the accepted budget.
+    assert budgets[0] == budget
+    assert budgets[-1] == budget
+    assert set(budgets[1:-1]) == {retry_budget}
+    first_prompt = requests[0]["messages"][-1]["content"]
+    concise_prompts = {json.dumps(row["messages"]) for row in requests[1:]}
+    assert len(concise_prompts) == 1  # the fallback re-asks the same concise prompt
+    assert json.loads(next(iter(concise_prompts)))[-1]["content"] != first_prompt
+    if fallback_reply_truncated:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    else:
+        assert status == "completed"
+        assert _job_row(job_id) == ("completed", None)
+
+
 def _dream_job_outcome(job_id):
     with db.get_pool().connection() as conn:
         return conn.execute(

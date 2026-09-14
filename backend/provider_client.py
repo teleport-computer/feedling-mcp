@@ -138,6 +138,45 @@ def is_output_truncation_error(exc: BaseException) -> bool:
     return isinstance(exc, ProviderError) and getattr(exc, "output_truncated", False) is True
 
 
+# A 400/422 whose provider message says the requested output-token budget is
+# above what this model accepts. Shapes seen across wires: OpenAI "max_tokens is
+# too large: 24000. This model supports at most 16384 completion tokens",
+# Anthropic "max_tokens: 24000 > 16000, which is the maximum allowed number of
+# output tokens", DeepSeek "Invalid max_tokens value, the valid range of
+# max_tokens is [1, 8192]", Bedrock "The maximum tokens you requested exceeds
+# the model limit", Gemini "maxOutputTokens ... must be less than or equal".
+_OUTPUT_BUDGET_FIELD_RE = re.compile(
+    r"max[_ ]?(?:completion[_ ]|output[_ ]|new[_ ])?tokens|maxoutputtokens"
+    r"|maximum (?:number of )?(?:output )?tokens|(?:output|completion) tokens",
+    re.IGNORECASE,
+)
+_OUTPUT_BUDGET_LIMIT_RE = re.compile(
+    r"too (?:large|big|high|many)|exceed|greater than|larger than|at most"
+    r"|maximum allowed|valid range|out of range|must be (?:less|at most|between|<|in)"
+    r"|less than or equal|\d\s*>\s*\d",
+    re.IGNORECASE,
+)
+
+
+def is_output_budget_rejection(exc: BaseException) -> bool:
+    """A 400/422 that rejects the requested output-token budget as too large.
+
+    Only meaningful to a caller that raised its own budget above one the same
+    route already accepted: it can safely fall back to that accepted budget.
+    Content-free: the verdict is derived from the provider's error text, which
+    is not returned.
+    """
+    if not isinstance(exc, ProviderError) or exc.status_code not in {400, 422}:
+        return False
+    text = " ".join(
+        str(part or "")
+        for part in (exc, getattr(exc, "response_detail", ""), exc.raw_response_body)
+    )
+    return bool(
+        _OUTPUT_BUDGET_FIELD_RE.search(text) and _OUTPUT_BUDGET_LIMIT_RE.search(text)
+    )
+
+
 def cap_chat_output_tokens(value: Any) -> int:
     """Clamp to the ceiling; reject invalid/non-positive budgets with ValueError.
 

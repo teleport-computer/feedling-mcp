@@ -173,6 +173,11 @@ def _provider_failure_code(exc: BaseException) -> str:
     return "unknown"
 
 
+# Internal to ``extract``: the escalated truncation-retry budget was rejected as
+# too large. Never returned to callers (``_call_escalated`` falls back first).
+_OUTPUT_BUDGET_REJECTED = "output_budget_rejected"
+
+
 def _response_shape(stop_reason: Any, usage: Any, budget: int) -> dict[str, Any]:
     """Content-free shape of one provider answer, used for truncation handling.
 
@@ -220,8 +225,10 @@ async def extract(
     (value, questions, err)；我们只取首项与末项（末项恒为 err）。
 
     给了 `parse_retry` 时，截断、内容闸或语义闸可带原因重问一次；三条路径共享
-    **最多一次**的 provider 预算。provider 报错 / 空回复不走这条路，它们各有
-    自己的重试与退避。
+    **最多一次**的 provider 预算。provider 报错不走这条路，它有自己的重试与退避。
+    空回复分两种：停在输出上限（``length`` / ``max_tokens`` 等，典型是思考模型把
+    预算花在隐藏推理上）的**算截断**、走截断重问；没有上限标记的空回复仍按
+    provider 故障处理（``upstream_unavailable``）。
 
     ## ``session``：让 GardenComponent 决定问什么
 
@@ -238,9 +245,14 @@ async def extract(
     ## ``truncation_retry_max_tokens``
 
     截断之后的那一次重问用的输出预算。``None`` = 沿用 ``max_tokens``（capture
-    的历史行为）。dream 传一个更大的值：只换「更简洁」的提示词、预算不变，
-    对真的需要更多输出空间的花园等于原样再截断一次（prod 上有用户连续多晚
+    的历史行为）。dream 传一个更大的值：若只换「更简洁」的提示词而预算不变，
+    真的需要更多输出空间的花园会原样再截断一次（prod 上有用户连续多晚
     ``output_truncated``）。只作用于截断之后的调用，首问预算不变。
+
+    没有逐模型的输出上限元数据：若这条路由接受 ``max_tokens`` 却以 400/422
+    拒绝更大的重问预算（"max_tokens too large"），同一个简洁提示词会退回
+    ``max_tokens`` 再问一次（轨迹 ``extraction_output_budget_fallback``），
+    而不是把可恢复的截断变成 ``provider_config`` 失败。
     """
     retry_budget = max(
         int(max_tokens),
@@ -299,7 +311,12 @@ async def extract(
                 return None, "empty_reply", _response_shape(
                     "length", truncated_usage, budget
                 )
-            error_code = _provider_failure_code(e)
+            budget_rejected = budget > max_tokens and (
+                provider_client.is_output_budget_rejection(e)
+            )
+            error_code = (
+                _OUTPUT_BUDGET_REJECTED if budget_rejected else _provider_failure_code(e)
+            )
             if trajectory_out is not None:
                 await trajectory_out(
                     "provider_error",
@@ -312,6 +329,8 @@ async def extract(
                 )
             if usage_out is not None:
                 usage_out(None)
+            if budget_rejected:
+                return None, _OUTPUT_BUDGET_REJECTED, {}
             return None, f"provider_call_failed:{error_code}", {}
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
@@ -324,6 +343,27 @@ async def extract(
         if not reply:
             return None, "empty_reply", response_shape
         return reply, None, response_shape
+
+    async def _call_escalated(
+        attempt_prompt: str,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        """The truncation retry at ``retry_budget``, with a fallback.
+
+        There is no per-model output-cap metadata, so a model that accepted
+        ``max_tokens`` but rejects the doubled budget (400/422 "max_tokens too
+        large") would otherwise turn a recoverable concise retry into a
+        ``provider_config`` failure. Re-ask the same concise prompt once at the
+        budget this route already accepted.
+        """
+        reply, call_error, shape = await _call(attempt_prompt, retry_budget)
+        if call_error != _OUTPUT_BUDGET_REJECTED:
+            return reply, call_error, shape
+        if trajectory_out is not None:
+            await trajectory_out(
+                "extraction_output_budget_fallback",
+                {"rejected_max_tokens": retry_budget, "max_tokens": max_tokens},
+            )
+        return await _call(attempt_prompt, max_tokens)
 
     async def _report_truncated(
         response_shape: dict[str, Any], *, attempt: int
@@ -374,9 +414,10 @@ async def extract(
             attempt_prompt = session.next_prompt()
             if attempt_prompt is None:
                 break
-            reply, call_error, shape = await _call(
-                attempt_prompt,
-                retry_budget if seen_truncation else max_tokens,
+            reply, call_error, shape = (
+                await _call_escalated(attempt_prompt)
+                if seen_truncation
+                else await _call(attempt_prompt, max_tokens)
             )
             truncated = (
                 call_error is None or call_error == "empty_reply"
@@ -427,8 +468,8 @@ async def extract(
                     "max_tokens": retry_budget,
                 },
             )
-        reply, call_error, response_shape = await _call(
-            parse_retry.build_truncation_prompt(prompt), retry_budget
+        reply, call_error, response_shape = await _call_escalated(
+            parse_retry.build_truncation_prompt(prompt)
         )
         retried_once = True
         if await _report_truncated(response_shape, attempt=2):
