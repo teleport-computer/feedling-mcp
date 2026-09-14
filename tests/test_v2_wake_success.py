@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
 from model_api_runtime.v2 import jobs_store
 
+import conftest
 from conftest import seed_user
 
 pytestmark = pytest.mark.skipif(
@@ -204,4 +205,55 @@ def test_memory_lane_health_is_explicit_when_nothing_ran():
     assert stats == {
         "completed": 0, "failed": 0, "expired": 0,
         "success_rate": None, "by_lane": {}, "failed_reasons": {},
+        "skipped": 0, "skipped_by_lane": {}, "attempted_success_rate": None,
     }
+
+
+def _finish_through_the_worker_store(user_id, lane, *, skip_reason=""):
+    """Terminalize a real claimed job the way ``worker._complete_extraction``
+    does: ``mark_completed``, tagged ``skipped`` when Dream had nothing to do."""
+    conftest.set_v2_runtime_owner(user_id)
+    job_id, _ = jobs_store.enqueue_job(user_id, lane)
+    job = jobs_store.claim_next_job("w_health")
+    assert job["id"] == job_id
+    assert jobs_store.mark_completed(
+        job_id,
+        claimed_by="w_health",
+        **({"wake_result": "skipped", "wake_result_reason": skip_reason}
+           if skip_reason else {}),
+    )
+
+
+def test_memory_lane_health_separates_dream_skips_from_attempted_runs():
+    """A too-small-garden Dream completes (no retry, no backoff) without ever
+    asking the model. It stays in ``completed`` / ``success_rate`` but must not
+    dilute the success rate of runs that actually attempted consolidation."""
+    seed_user("u_mem_skip")
+    for _ in range(3):
+        _finish_through_the_worker_store(
+            "u_mem_skip", "dream", skip_reason="not_enough_new_cards"
+        )
+    _finish_through_the_worker_store("u_mem_skip", "dream")
+    _insert_job("u_mem_skip", "dream", "failed",
+                last_error="extraction_failed:upstream_unavailable")
+
+    stats = jobs_store.memory_lane_health()
+
+    assert stats["completed"] == 4
+    assert stats["success_rate"] == pytest.approx(4 / 5)
+    assert stats["by_lane"]["dream"] == {"completed": 4, "failed": 1}
+    assert stats["skipped"] == 3
+    assert stats["skipped_by_lane"] == {"dream": 3}
+    assert stats["attempted_success_rate"] == pytest.approx(1 / 2)
+
+
+def test_memory_lane_health_attempted_rate_is_none_when_every_run_skipped():
+    seed_user("u_mem_all_skip")
+    _finish_through_the_worker_store(
+        "u_mem_all_skip", "dream", skip_reason="not_enough_new_cards"
+    )
+
+    stats = jobs_store.memory_lane_health()
+
+    assert stats["success_rate"] == 1.0
+    assert stats["attempted_success_rate"] is None

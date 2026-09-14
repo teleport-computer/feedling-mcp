@@ -10820,6 +10820,13 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
 
     返回形状与 ``wake_success_stats`` 一致，便于并排读。
 
+    ``skipped`` / ``skipped_by_lane`` / ``attempted_success_rate``（2026-09-15）：
+    dream 判定「花园太小、没活可干」时终态仍是 ``completed``（不重试、不退避），但
+    ``wake_result='skipped'``——**一次模型都没问**。它仍计入 ``completed`` 与
+    ``success_rate``（不改既有口径），但另给一个剔除 skip 的
+    ``attempted_success_rate = 真跑过的完成 / (真跑过的完成 + failed + expired)``：
+    否则一大批小花园的 skip 会把真在跑的整理失败率稀释掉。
+
     ``failed_reasons``（2026-08-05 dream 阀门重构）：失败侧按 ``last_error`` 首段
     细分。dream 的出口闸从「按提案静默丢」改成了「明显不对就让整个 job 失败」
     （``dream_blast_radius_exceeded`` / ``invalid_card_content*``），不细分的话
@@ -10827,7 +10834,9 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT lane, status, count(*) FROM agent_jobs "
+                "SELECT lane, status, "
+                "count(*) FILTER (WHERE status='completed' AND wake_result='skipped'), "
+                "count(*) FROM agent_jobs "
                 "WHERE lane IN ('capture','dream') "
                 "AND finished_at IS NOT NULL "
                 "AND finished_at > now() - make_interval(hours => %s) "
@@ -10848,11 +10857,15 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
                 (int(within_hours),),
             )
             reason_rows = cur.fetchall()
-    completed = failed = expired = 0
+    completed = failed = expired = skipped = 0
     by_lane: dict[str, dict[str, int]] = {}
-    for lane, status, count in rows:
+    skipped_by_lane: dict[str, int] = {}
+    for lane, status, skipped_count, count in rows:
         count = int(count)
         by_lane.setdefault(lane, {})[status] = count
+        if int(skipped_count):
+            skipped_by_lane[lane] = int(skipped_count)
+            skipped += int(skipped_count)
         if status == "completed":
             completed += count
         elif status == "failed":
@@ -10863,6 +10876,8 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     for lane, reason, count in reason_rows:
         failed_reasons.setdefault(lane, {})[str(reason)] = int(count)
     denom = completed + failed + expired
+    attempted = completed - skipped
+    attempted_denom = attempted + failed + expired
     return {
         "completed": completed,
         "failed": failed,
@@ -10870,6 +10885,11 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
         "success_rate": (completed / denom) if denom else None,
         "by_lane": by_lane,
         "failed_reasons": failed_reasons,
+        "skipped": skipped,
+        "skipped_by_lane": skipped_by_lane,
+        "attempted_success_rate": (
+            (attempted / attempted_denom) if attempted_denom else None
+        ),
     }
 
 
