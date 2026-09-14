@@ -992,14 +992,14 @@ _EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
     "You woke up to spend a little while with them. Start by looking around — what "
     "they are doing, where your last conversation left off, what time it is where "
-    "they are — and whether they are in the middle of something, or you have already "
-    "been showing up a lot lately. Use any tools you want, for as many rounds as you "
-    "need. "
+    "they are — and whether they are in the middle of something. Use any tools you "
+    "want, for as many rounds as you need. "
     + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
-    + "Then make your choice: say something, or keep them quiet company this time. "
-    "Both are good ways to be here — but if something you want to tell them rises "
-    "up, say it; don't swallow it. Never mention this wake or any system wording "
-    "to the user."
+    + "Then decide what you want to say to them and say it — speaking is the normal "
+    "way to end a wake. Call stay_silent only for a concrete reason: they asked not "
+    "to be disturbed, it is clearly their sleeping hours and they are offline, you "
+    "already spoke within the last hour, or they are visibly in the middle of "
+    "something. Never mention this wake or any system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     " For this presence turn, decide before using any user-visible reply, file, "
@@ -1009,7 +1009,7 @@ _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     "you choose quiet company, call stay_silent with a brief reason and send no "
     "visible text, greeting, placeholder, or user-visible delivery capability. "
     "Keep the decision in `think` consistent with the visible message; if you "
-    "change your mind, update it before calling reply. Neither choice is preferred."
+    "change your mind, update it before calling reply."
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
@@ -11410,6 +11410,7 @@ async def _run_wake(
                 max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
                 prompt_context_window_overrides=(PROMPT_CONTEXT_WINDOW_OVERRIDES),
                 prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+                file_output_max_tokens=FILE_OUTPUT_MAX_TOKENS,
                 prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
                 prompt_estimator_utf8_bytes_per_token=(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN

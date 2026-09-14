@@ -1878,18 +1878,22 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert _job_status(job_id)[0] == "completed"
 
 
-def test_proactive_policy_does_not_bias_the_model_toward_silence():
-    """The policy must preserve V1's equal speak/sleep product decision."""
-    prompt = worker._WAKE_SYSTEM_PROMPT.lower()
-
-    assert "both are good ways to be here" in prompt
-    assert "don't swallow it" in prompt
+def test_proactive_policy_defaults_to_speaking_with_concrete_silence_reasons():
+    prompt = worker._WAKE_SYSTEM_PROMPT
+    assert "speaking is the normal way to end a wake" in prompt
+    assert "concrete reason" in prompt
+    assert "sleeping hours and they are offline" in prompt
+    assert "within the last hour" in prompt
     assert "in the middle of something" in prompt
-    assert "showing up a lot lately" in prompt
-    assert "never mention this wake or any system wording" in prompt
-    assert "only if" not in prompt
-    assert "genuinely worth saying" not in prompt
-    assert "silence is correct" not in prompt
+    assert "Never mention this wake or any system wording" in prompt
+    assert "showing up a lot lately" not in prompt
+    assert "Both are good ways" not in prompt
+    assert "Neither choice is preferred" not in worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
+    silent = cap_tool_schema.DESCRIPTIONS[cap_tool_schema.STAY_SILENT_TOOL]
+    assert "concrete reason" in silent
+    assert "not an error" not in silent
+    assert "normal way to end a wake" in worker.v2_tool_loop._WAKE_REPLY_TOOL_SPEC.description
+    assert "concrete reason" in worker.v2_tool_loop._WAKE_CHOICE_INSTRUCTION
 
 
 def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
@@ -2524,8 +2528,8 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
 @pytest.mark.parametrize(
     ("trigger", "expected_require_reply", "prompt_fragment"),
     [
-        ("broadcast_opened", False, "Both are good ways to be here"),
-        ("broadcast_closed", False, "Both are good ways to be here"),
+        ("broadcast_opened", False, "speaking is the normal way to end a wake"),
+        ("broadcast_closed", False, "speaking is the normal way to end a wake"),
     ],
 )
 def test_broadcast_edge_wake_reply_policy(
