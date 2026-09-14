@@ -85,6 +85,33 @@ IDENTITY_CARD_RENDER_FIELDS = tuple(dict.fromkeys((
 )))
 
 
+_IDENTITY_CARD_SUBSTANTIVE_FIELDS = tuple(dict.fromkeys((
+    *card_policy.PROFILE_STRING_FIELDS,
+    *card_policy.PROFILE_LIST_FIELDS,
+    "dimensions",
+)))
+
+
+def identity_card_has_substance(card: dict) -> bool:
+    """Ignore empty/default card scaffolding when choosing card over persona."""
+
+    for key in _IDENTITY_CARD_SUBSTANTIVE_FIELDS:
+        value = card.get(key)
+        if key == "agent_name" and str(value or "").strip() == "TA":
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+            continue
+        if isinstance(value, (list, tuple, dict, set)):
+            if value:
+                return True
+            continue
+        if value is not None:
+            return True
+    return False
+
+
 def render_identity_card(card: dict[str, Any]) -> str:
     """Render decrypted card values without inventing prose around them."""
 

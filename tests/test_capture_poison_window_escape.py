@@ -32,6 +32,7 @@ os.environ.setdefault("FEEDLING_DATA_DIR",
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from proactive import capture_scheduler as cs  # noqa: E402
+from memory import capture_failure as cf  # noqa: E402
 
 W1 = {"after_message_id": "msg_a", "until_message_id": "msg_c",
       "through_seq": 120, "until_ts": 1000.0, "message_count": 8}
@@ -39,10 +40,15 @@ W2 = {"after_message_id": "msg_c", "until_message_id": "msg_f",
       "through_seq": 140, "until_ts": 2000.0, "message_count": 5}
 
 
-def _fail_once(state: dict, window: dict | None) -> dict:
-    """走生产用的那个共用函数（V1/V2 两条线都调它）。"""
+def _fail_once(state: dict, window: dict | None,
+               reason: str = "json_decode_error:JSONDecodeError") -> dict:
+    """走生产用的那个共用函数（V1/V2 两条线都调它）。
+
+    默认原因是解析失败 —— 下面这批测试模拟的就是毒消息那个场景
+    （同样的输入必然同样失败）。写入类失败的阈值见文件末尾那组测试。
+    """
     patch, _streak, skipped = cs._capture_failure_patch(
-        state, window, now_ts=9999.0)
+        state, window, now_ts=9999.0, reason=reason)
     return {**state, **patch, "_skipped": skipped}
 
 
@@ -83,10 +89,10 @@ def test_a_window_without_an_end_is_never_skipped():
     """拿不到窗口终点 → 不跳。把游标推到说不清的位置比继续卡着更糟。"""
     blind = {"after_message_id": "msg_a", "through_seq": 120}
     state = {"capture_fail_streak": 5, "capture_fail_window_key":
-             cs._window_key(blind)}
-    assert cs._poison_skip_patch(state, blind, now_ts=1.0) is None
-    assert cs._poison_skip_patch(state, None, now_ts=1.0) is None
-    assert cs._poison_skip_patch(state, {}, now_ts=1.0) is None
+             cf.window_key(blind)}
+    assert cf.poison_skip_patch(state, blind, now_ts=1.0) is None
+    assert cf.poison_skip_patch(state, None, now_ts=1.0) is None
+    assert cf.poison_skip_patch(state, {}, now_ts=1.0) is None
 
 
 def test_a_moving_window_end_does_not_reset_the_streak():
@@ -133,7 +139,7 @@ def test_the_threshold_is_high_enough_to_ride_out_transient_failures():
 
     定成 1 的话，一次网络抖动就会丢掉一批真实记忆。
     """
-    assert cs.CAPTURE_POISON_SKIP_AFTER >= 2
+    assert cf.CAPTURE_POISON_SKIP_AFTER >= 2
 
 
 def test_a_job_without_window_info_still_accumulates_the_backoff_streak():
@@ -163,3 +169,133 @@ def test_an_empty_window_dict_is_treated_as_no_window():
         state = _fail_once(state, {})
         assert state["capture_fail_streak"] == expected
         assert not state["_skipped"]
+
+
+# --------------------------------------------------------------------------- #
+# 两档阈值（2026-09-14）
+# --------------------------------------------------------------------------- #
+
+def _fail_until_skip(reason: str, limit: int = 12) -> int | None:
+    state: dict = {}
+    for attempt in range(1, limit + 1):
+        patch, _s, skipped = cs._capture_failure_patch(
+            state, W1, now_ts=float(attempt), reason=reason)
+        state = {**state, **patch}
+        if skipped:
+            return attempt
+    return None
+
+
+def test_a_write_failure_gets_more_retries_than_a_parse_failure():
+    """🔴 「存不进去」这类会自己好的失败，不能按「读不懂」的 3 次就跳。
+
+    2026-09-14 prod 实测：引号修好后，同一批窗口能解析了，却在写入时栽了
+    （capture_shared_envelope_requires_enclave_key）。而这类失败**重试能好**：
+
+        第一批  失败 失败 成功          ← 第三次过了
+        第二批  失败 失败 失败 → 跳过   ← 按 3 次跳掉，9 条消息的记忆丢了
+
+    用确定性失败的阈值处理会自己好的失败，就是在丢本来保得住的记忆。
+    """
+    write_skip = _fail_until_skip("capture_memory_write_failed:RuntimeError")
+    parse_skip = _fail_until_skip("json_decode_error:JSONDecodeError")
+    assert parse_skip == cf.CAPTURE_POISON_SKIP_AFTER
+    assert write_skip == cf.CAPTURE_TRANSIENT_SKIP_AFTER
+    assert write_skip > parse_skip, "写入失败没比解析失败多给机会"
+
+
+def test_parse_failures_still_skip_fast():
+    """修写入那边，不能把解析失败也拖慢 —— 那一类重试一万次也一样。"""
+    for reason in ("json_decode_error:JSONDecodeError", "no_json_object",
+                   "not_an_object"):
+        assert _fail_until_skip(reason) == cf.CAPTURE_POISON_SKIP_AFTER, reason
+
+
+def test_an_unknown_failure_defaults_to_the_patient_threshold():
+    """🔴 没见过的失败原因走保守的那一档。
+
+    白名单只列确定性失败。反过来用黑名单的话，下一种新冒出来的
+    「会自己好的失败」会被 3 次就跳掉，又开始悄悄丢记忆。
+    """
+    assert _fail_until_skip("some_brand_new_failure") == cf.CAPTURE_TRANSIENT_SKIP_AFTER
+    assert _fail_until_skip("") == cf.CAPTURE_TRANSIENT_SKIP_AFTER
+
+
+def test_even_transient_failures_eventually_skip():
+    """会自己好的失败也**必须有上限** —— 不然某批写入失败其实是确定性的时候，
+    用户又会被永久卡死，也就是这整套逃生阀要修的问题。"""
+    assert _fail_until_skip("capture_memory_write_failed:RuntimeError") is not None
+    assert cf.CAPTURE_TRANSIENT_SKIP_AFTER > cf.CAPTURE_POISON_SKIP_AFTER
+
+
+def test_the_reason_is_read_from_either_place_on_the_job():
+    """原因可能在 capture_result.reason，也可能只在 status_reason。"""
+    assert cs._failure_reason_of({"capture_result": {"reason": "json_decode_error:X"}}) \
+        == "json_decode_error:X"
+    assert cs._failure_reason_of({"status_reason": "no_json_object"}) == "no_json_object"
+    assert cs._failure_reason_of(None) == ""
+
+
+def test_the_real_v1_call_site_passes_the_failure_reason(monkeypatch):
+    """🔴 经过**真实调用点**（record_capture_job_status），不是直接调函数。
+
+    上面那组测试直接调 `_capture_failure_patch`，所以调用点漏传 reason 时
+    它们照样全绿 —— 而漏传的后果是所有失败都默认走 6 次档，
+    解析失败（重试一万次也一样）被白白拖慢一倍，用户多卡一倍的时间。
+
+    变异测试抓到的缺口：把调用点的 `reason=` 删掉，前面 13 条全过。
+
+    数据库那几步换成内存版，只验「调用点有没有把原因送进阈值判断」。
+    """
+    saved: dict = {}
+    monkeypatch.setattr(cs, "load_capture_state", lambda store: dict(saved))
+    monkeypatch.setattr(cs, "save_capture_state",
+                        lambda store, state, now=None: saved.update(state) or dict(saved))
+    monkeypatch.setattr(cs.capture_jobs, "notify_backoff", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "refresh_capture_state_from_chat",
+                        lambda store, now=None: dict(saved))
+    monkeypatch.setattr(cs, "_record_skipped_window", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "_capture_trace_job_id", lambda job: "j")
+
+    job = {"job_id": "j", "source": cs.capture_jobs.CAPTURE_JOB_SOURCE,
+           "capture_window": W1,
+           "capture_result": {"status": "failed",
+                              "reason": "json_decode_error:JSONDecodeError"}}
+    # 解析失败 → 第 3 次就该跳过、游标推过去
+    for _ in range(cf.CAPTURE_POISON_SKIP_AFTER):
+        try:
+            cs.record_capture_job_status(object(), job, status="failed", now=1.0)
+        except Exception:  # noqa: BLE001 —— 下游 trace 之类的副作用不关心
+            pass
+    assert saved.get("last_captured_until_message_id") == W1["until_message_id"], (
+        "解析失败连续 3 次后游标没推过去 —— 调用点大概漏传了失败原因，"
+        "所有失败都掉进了 6 次那一档")
+
+
+def _run_reasons(reasons, window=None):
+    """按顺序喂失败原因，返回第几次跳过（没跳返回 None）。"""
+    w = window or {"after_message_id": "msg_a", "until_message_id": "msg_c",
+                   "until_ts": 1.0, "through_seq": 120}
+    state: dict = {}
+    for i, reason in enumerate(reasons, start=1):
+        patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=float(i), reason=reason)
+        state.update(patch)
+        if skipped:
+            return i
+    return None
+
+
+def test_one_parse_failure_cannot_inherit_earlier_write_failures():
+    """🔴 写入、写入、解析 —— 第三次不能按「解析 3 次」就跳。
+
+    以前两档共用一个计数、阈值只看本次原因，一次解析失败就继承了前面的写入失败，
+    绕过 6 次保护，把本来重试能保住的记忆提前丢掉（Codex 第四轮复现）。
+    """
+    write, parse = "capture_memory_write_failed", "extraction_failed:json_decode_error"
+    assert _run_reasons([write, write, parse]) is None
+    # 解析连续 3 次才快速跳；中间夹一次别的失败，解析计数清零。
+    assert _run_reasons([parse, parse, parse]) == 3
+    assert _run_reasons([parse, parse, write, parse]) is None
+    assert _run_reasons([write, parse, parse, parse]) == 4
+    # 总失败数到 6 次兜底，不管混成什么样。
+    assert _run_reasons([write, parse, write, parse, write, parse]) == 6

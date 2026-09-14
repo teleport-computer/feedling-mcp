@@ -134,6 +134,7 @@ CONSUMER_HEADERS = [
         "X-Feedling-Consumer-Capabilities",
         _schema("string", maxLength=500),
         "Comma-separated capabilities advertised by the current official resident poll. "
+        "agent_body_generate_v1 enables hidden 24x24 body generation. "
         "agent_image_generation_v1 means the configured agent entry exposes a callable "
         "native image-generation tool; it is not inferred from VPS deployment alone.",
         example="vision_observer_v1,agent_image_generation_v1",
@@ -1267,6 +1268,53 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             {"required": ["api_key"], "not": {"required": ["credential_id"]}},
             {"required": ["credential_id"], "not": {"required": ["api_key"]}},
         ],
+        "additionalProperties": False,
+    },
+    "AgentBodyJob": {
+        "type": "object",
+        "required": ["job_id", "expires_at_epoch", "prompt", "palette_count"],
+        "properties": {
+            "job_id": {"type": "string"},
+            "expires_at_epoch": {"type": "number"},
+            "prompt": {"type": "string", "description": "Fixed instructions and palette only; no identity or memory."},
+            "palette_count": {"type": "integer", "minimum": 1, "maximum": 255},
+        },
+        "additionalProperties": False,
+    },
+    "ChatPollResponse": {
+        "type": "object",
+        "properties": {
+            "messages": {"type": "array", "items": {"type": "object"}},
+            "agent_body_job": {"anyOf": [{"$ref": "#/components/schemas/AgentBodyJob"}, {"type": "null"}]},
+        },
+        "additionalProperties": True,
+    },
+    "AgentBodyGenerateRequest": {
+        "type": "object",
+        "required": ["schema_version", "grid_size", "client_request_id", "allowed_palette"],
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [1]},
+            "grid_size": {"type": "integer", "enum": [24]},
+            "client_request_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "\\S"},
+            "allowed_palette": {"type": "array", "minItems": 1, "maxItems": 255,
+                                "items": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"}},
+        },
+        "additionalProperties": True,
+    },
+    "AgentBodyGenerateResponse": {
+        "type": "object",
+        "required": ["schema_version", "grid_size", "rows", "generation_id"],
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [1]},
+            "grid_size": {"type": "integer", "enum": [24]},
+            "generation_id": {"type": "string", "pattern": "^agent_body:[0-9a-f]{32}$"},
+            "rows": {
+                "type": "array", "minItems": 24, "maxItems": 24,
+                "description": "Nonempty 24x24 grid. 0 is transparent; 1..len(allowed_palette) index the request palette. At least one cell must be nonzero.",
+                "items": {"type": "array", "minItems": 24, "maxItems": 24,
+                          "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+            },
+        },
         "additionalProperties": False,
     },
     "ImageGenerationRequest": {
@@ -2440,6 +2488,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
     ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
+    ("post", "/v1/agent-body/generate"): "AgentBodyGenerateRequest",
     ("post", "/v1/image-generation/generate"): "ImageGenerationRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
@@ -2762,6 +2811,74 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/chat/poll"): {
+        "200": {
+            "description": "Chat work and control-plane context. agent_body_job is null unless bound to this capable consumer.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatPollResponse"}}},
+        },
+    },
+    ("post", "/v1/agent-body/generate"): {
+        "200": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/AgentBodyGenerateResponse"
+                    }
+                }
+            },
+            "description": "Validated body generated with the active tested chat route. Generation does not save or apply the body."
+        },
+        "400": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                }
+            },
+            "description": "Invalid request or missing, untested, or unreadable model route."
+        },
+        "409": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                }
+            },
+            "description": "Provider configuration failed, the resident needs an update, or no agent is configured."
+        },
+        "429": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                }
+            },
+            "description": "Provider rate limit; retryable."
+        },
+        "502": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                }
+            },
+            "description": "Provider failed or output remained invalid after one repair attempt. No rows."
+        },
+        "504": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                }
+            },
+            "description": "Generation exceeded its 85-second budget or insufficient budget remains for repair. No rows."
+        }
+    },
     ("get", "/v1/chat/canvases"): {
         "200": {
             "description": "The caller's current Canvas workspace metadata, newest first.",

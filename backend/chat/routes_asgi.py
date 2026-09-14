@@ -112,7 +112,7 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # Either a new chat message OR a new status event (§9 tool-call
         # progress) is enough to return — a status-only update must wake a
         # parked waiter too, not just chat messages.
-        if pending or status_events or context.get("vision_probe"):
+        if pending or status_events or context.get("vision_probe") or context.get("agent_body_job"):
             # Immediate delivery before parking: the pre-park context is still
             # the freshest snapshot, so reuse it (no extra DB read).
             return _response(pending, status_events, timed_out=False, ctx=context)

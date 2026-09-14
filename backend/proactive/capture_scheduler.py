@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
+from memory.capture_failure import capture_failure_patch as _capture_failure_patch
 
 log = logging.getLogger(__name__)
 
@@ -37,28 +38,6 @@ CAPTURE_LIVE_SOURCES = frozenset({
     "voice_call_transcript",
 })
 CAPTURE_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
-
-#: 同一个窗口连续失败几次之后，**跳过它**并把游标推过去。
-#:
-#: ## 为什么必须有这个闸
-#:
-#: 落卡只在成功时推进游标。一条让模型吐出非法 JSON 的消息（比如它引用用户
-#: 原话时把半角引号写进 JSON 字符串却不转义）会造成队头阻塞：
-#:
-#:     解析失败 → 游标不动 → 下次还从同一条消息开始 → 又失败 → 永远
-#:
-#: 结果是那个用户**从此不再有任何新记忆**，而且每一步都"正常失败"、有退避、
-#: 没有告警。2026-09-12 实测：prod 上 152 个有落卡活动的用户里，
-#: 58 个处于这个状态（连续两天 0 成功）。
-#:
-#: 阈值取 3 是为了区分两种失败：provider 超时/5xx 这类是偶发的，重试就好；
-#: 解析失败是确定性的 —— 同样的输入必然同样失败，重试一万次也一样。
-#: 连续 3 次同一窗口失败，基本只可能是后者。
-#:
-#: 🔴 跳过意味着**那一批对话的记忆永久丢了**。这是有意的取舍：丢一批，
-#: 换这个用户后面还能继续记。但必须**大声记下来**（见 _record_skipped_window），
-#: 否则就成了又一处"静默丢数据"。
-CAPTURE_POISON_SKIP_AFTER = 3
 
 
 def _env_float(name: str, default: float, *, lo: float = 0.0, hi: float = 86400.0) -> float:
@@ -150,6 +129,10 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         #: 当前 streak 属于哪个窗口。**不带这个的话 streak 会跨窗口累加** ——
         #: 三次互不相干的偶发失败会被当成"同一条毒消息卡住了"，误跳过一批好数据。
         "capture_fail_window_key": str(doc.get("capture_fail_window_key") or "")[:340],
+        #: 同一窗口**连续**解析类失败几次（到 3 快速跳过）；总失败数仍看 capture_fail_streak。
+        "capture_parse_fail_streak": max(
+            0, int(_safe_float(doc.get("capture_parse_fail_streak"), 0.0))
+        ),
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))
@@ -165,96 +148,13 @@ def _state_doc(raw: Any) -> dict[str, Any]:
     }
 
 
-def _window_key(window: Mapping | None) -> str:
-    """这次失败卡在哪个**游标**上。用来判断"和上次是同一个队头阻塞吗"。
-
-    🔴 只看起点（``after_message_id``），**不能带终点**。
-
-    卡住的是起点：游标停在毒消息前面不动。而终点会随新消息不断前移 ——
-    把终点也算进身份的话：
-
-        第 1 次  msg_a → msg_c  失败   key = "msg_a|msg_c"
-                 新消息进来
-        第 2 次  msg_a → msg_d  失败   key = "msg_a|msg_d"  ← 变了
-                 streak 被重置成 1，永远到不了阈值
-
-    结果是逃生阀永远不触发，用户还是被永久卡死 —— 也就是这个改动本来要修的
-    那个问题。（我第一版就是这么写的，被变异测试抓出来。）
-
-    退化情况：拿不到起点时回落到终点+seq，至少"同一批消息反复失败"仍能被识别。
-    """
-    w = window if isinstance(window, Mapping) else {}
-    after = str(w.get("after_message_id") or "")[:160]
-    if after:
-        return f"after:{after}"
-    until = str(w.get("until_message_id") or "")[:160]
-    seq = int(_safe_float(w.get("through_seq"), 0.0))
-    return f"until:{until}|{seq}" if (until or seq) else ""
-
-
-def _poison_skip_patch(state: Mapping, window: Mapping | None, *,
-                       now_ts: float) -> dict | None:
-    """同一窗口连续失败到阈值 → 返回"把游标推过它"的补丁；否则 None。
-
-    返回 None 时调用方照旧只累加 streak。
-    """
-    w = window if isinstance(window, Mapping) else {}
-    until_id = str(w.get("until_message_id") or "")[:160]
-    if not until_id:
-        # 拿不到窗口终点就没法安全跳过 —— 宁可继续卡着，也不要把游标推到
-        # 一个我们说不清的位置。
-        return None
-    streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-    if streak < CAPTURE_POISON_SKIP_AFTER:
-        return None
-    return {
-        "last_captured_until_message_id": until_id,
-        "last_captured_until_ts": _safe_float(w.get("until_ts"), 0.0),
-        "last_captured_until_seq": max(
-            0, int(_safe_float(w.get("through_seq"), 0.0))
-        ),
-        "capture_seq_initialized": True,
-        # 跳过之后 streak 归零：下一批是干净的，不该带着旧账退避。
-        "capture_fail_streak": 0,
-        "capture_fail_window_key": "",
-        "capture_skipped_windows": max(
-            0, int(_safe_float(state.get("capture_skipped_windows"), 0.0))
-        ) + 1,
-        "last_capture_skipped_at": now_ts,
-    }
-
-
-def _capture_failure_patch(state, window, *, now_ts: float):
-    """一次落卡失败要怎么改状态。返回 ``(补丁, streak, 是否跳过)``。
-
-    三种情形：
-
-        拿不到窗口标识  → 照老行为累加 streak，**绝不跳过**
-        同一个游标      → 累加；到阈值就跳过
-        换了游标        → streak 从 1 重数
-
-    🔴 第一种必须保持老行为。落卡退避告警是按 streak 到 3 才发的
-    （见 tests/test_memory_backoff_notice.py），拿不到窗口时如果把 streak
-    重置成 1，**整个退避机制就哑了** —— 那是我第一版引入的回归，CI 抓到的。
-
-    抽成一个函数是因为 V1 / V2 两条线各写一遍必然漂，而漂了不报错。
-    """
-    key = _window_key(window)
-    if not key:
-        # 说不清是哪个窗口 —— 只累加，不跳过（跳过需要知道推到哪）。
-        streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-        return ({"capture_fail_streak": streak,
-                 "last_capture_failed_at": now_ts}, streak, False)
-    same = key == str(state.get("capture_fail_window_key") or "")
-    streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-              if same else 1)
-    skip = (_poison_skip_patch({**state, "capture_fail_streak": streak - 1},
-                               window, now_ts=now_ts) if same else None)
-    if skip is not None:
-        return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
-    return ({"capture_fail_streak": streak,
-             "capture_fail_window_key": key,
-             "last_capture_failed_at": now_ts}, streak, False)
+def _failure_reason_of(job) -> str:
+    """从任务上取失败原因。两个位置都可能有，优先用更具体的那个。"""
+    src = job if isinstance(job, Mapping) else {}
+    result = src.get("capture_result")
+    if isinstance(result, Mapping) and result.get("reason"):
+        return str(result.get("reason"))
+    return str(src.get("status_reason") or "")
 
 
 def _record_skipped_window(store, *, window: Mapping | None, streak: int,
@@ -746,8 +646,10 @@ def record_v2_capture_status(
         return load_capture_state(store)
     now_ts = time.time() if now is None else float(now)
     state = load_capture_state_strict(store)
+    # completed / failed 两个分支都要用 —— 以前只在 completed 里赋值，
+    # failed 分支一走到就 UnboundLocalError（tests/test_v2_capture_lifecycle.py 覆盖）。
+    processed = window if isinstance(window, Mapping) else {}
     if status_text == "completed":
-        processed = window if isinstance(window, Mapping) else {}
         until_id = str(processed.get("until_message_id") or "")[:160]
         until_ts = _safe_float(processed.get("until_ts"), 0.0)
         until_seq = max(0, int(_safe_float(processed.get("through_seq"), 0.0)))
@@ -778,11 +680,22 @@ def record_v2_capture_status(
             expected_frontier_id=after_id,
         )
     elif status_text == "failed":
+        # ⚠️ 这个函数签名里**没有 job**。之前这里写了 `_failure_reason_of(job)` 和
+        # `_capture_trace_job_id(job)` —— pyflakes 报 undefined name。
+        #
+        # 它没在 prod 上炸，只是因为 V2 的 capture lane 根本不走到这里：
+        # worker 的 `_record_extraction_status` 对 lane == "capture" 直接 return，
+        # V2 落卡的失败状态走 jobs_store 的持久批次协议（_capture_fail_on_cursor）。
+        # 但这里一旦被接上，第一次跳过就会 NameError。
+        #
+        # 失败原因没有就留空 —— 空原因会走保守的 6 次档，不会误把会自己好的
+        # 失败按 3 次跳掉。
+        reason = str(processed.get("failure_reason") or "")
         patch, streak, skipped = _capture_failure_patch(
-            state, processed, now_ts=now_ts)
+            state, processed, now_ts=now_ts, reason=reason)
         if skipped:
             _record_skipped_window(store, window=processed, streak=streak,
-                                   job_id=_capture_trace_job_id(job))
+                                   job_id="")
         state = _patch_capture_state(
             store, {"pending_capture_key": "", **patch}, now=now_ts)
     capture_jobs.notify_backoff(
@@ -919,7 +832,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
                          else job.get("window"))
         failed_window = failed_window if isinstance(failed_window, Mapping) else None
         patch, streak, skipped = _capture_failure_patch(
-            state, failed_window, now_ts=now_ts)
+            state, failed_window, now_ts=now_ts, reason=_failure_reason_of(job))
         if skipped:
             # 🔴 同一批消息连续失败到阈值 —— 推过它。那批记忆就此丢掉，
             # 但这个用户后面还能继续记。见 CAPTURE_POISON_SKIP_AFTER。

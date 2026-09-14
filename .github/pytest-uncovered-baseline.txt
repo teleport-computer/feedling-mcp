@@ -49,7 +49,6 @@ tests/test_capability_html_extract.py
 tests/test_capability_wake.py
 tests/test_capture_daily.py
 tests/test_capture_dream_submit_seam.py
-tests/test_capture_failure_backoff.py
 tests/test_capture_source_whitelists_agree.py
 tests/test_card_guard.py
 tests/test_chat_core_file_ingest.py
@@ -199,7 +198,6 @@ tests/test_users_reload_targeted.py
 tests/test_v2_admission.py
 tests/test_v2_bounded_tail_degrade.py
 tests/test_v2_capacity_health.py
-tests/test_v2_capture_lifecycle.py
 tests/test_v2_chat_clear_fence.py
 tests/test_v2_child_supervisor.py
 tests/test_v2_claim_reservation.py

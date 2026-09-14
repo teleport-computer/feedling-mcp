@@ -82,3 +82,63 @@ Older traces lack the versioned scalar fields. Their nested `blocks` and
 objects/arrays and are not backfilled. Keep those records outside the new-field
 denominator and report coverage separately during rolling upgrades. The shared
 trace limiter and its size bounds are unchanged.
+
+
+## Agent body generation
+
+`POST /v1/agent-body/generate` accepts `schema_version: 1`, `grid_size: 24`,
+a nonblank `client_request_id` of at most 128 characters, and `allowed_palette`
+with 1–255 `#RRGGBB` colors in index order. Successful `rows` contain exactly
+24 rows of 24 integers: 0 is empty, and 1 through the palette length select colors.
+At least one cell is nonzero. The result includes an opaque `generation_id`.
+`client_request_id` is a diagnostic correlation value, not an idempotency key;
+repeating a request can generate a different body and incur another model call.
+
+The endpoint requires an account API key and rejects runtime tokens. Hosted
+accounts use their active tested chat route, including its reasoning setting.
+The backend reads available identity, genesis persona (up to 6,000 characters),
+and up to 12 memory summaries through existing authenticated readers.
+
+Resident accounts run a hidden generation on their own consumer's normal agent.
+A fresh poll must advertise `agent_body_generate_v1`; the additive
+`agent_body_job` field contains a job ID, expiry, fixed instructions with palette
+colors, and palette count. The consumer reads its identity card and at most 12
+memory summaries, then calls its CLI or HTTP agent in an isolated background
+turn. Known CLI drivers use the existing tool-free profile; HTTP uses its
+existing request protocol. The turn does not enter Chat or post a chat reply.
+Unavailable context is labelled as unavailable.
+
+Resident jobs use the existing user-scoped CAS mailbox, bound to the consumer
+and agent entry. Only fixed instructions and temporary grid indices enter that
+mailbox; identity/persona/memory text does not. The waiting request removes grid
+indices after reading them. Expired payloads are removed by the waiting request
+or the next poll; a process crash can leave expired data until the next access.
+Only a content-free completion receipt is retained. No preset is saved or applied;
+saving remains a client action. Concurrent resident generations cannot overwrite
+an active job or unread result; the extra request receives a failure.
+
+The response deadline is 85 seconds after authenticated handler entry, including
+context reads. Direct provider calls receive at most 70 seconds of network
+inactivity timeout. Invalid output can be repaired once only when at least 25
+seconds remain. The resident converts epoch expiry to a monotonic deadline and
+reserves five seconds for delivery. An in-flight synchronous network call can
+finish after the HTTP deadline; its result is discarded and no repair starts
+afterward. Server grid validation applies to both execution paths.
+
+| Status | Slug | Meaning |
+| --- | --- | --- |
+| `400` | `agent_body_invalid_request` | Request fields fail validation. |
+| `400` | `model_api_not_configured`, `model_api_not_tested`, `model_api_key_envelope_missing`, `model_api_key_decrypt_failed`, `model_api_config_invalid` | The hosted chat route cannot be loaded. |
+| `409` | `agent_body_provider_config_failed` | Check provider credentials, access, quota, or configuration. |
+| `409` | `agent_body_resident_update_required` | The resident is offline, outdated, or has not advertised body generation. |
+| `409` | `agent_body_agent_unavailable` | This import-only account is not running an agent. |
+| `429` | `agent_body_generation_failed` | Provider rate limit; `retryable: true`. |
+| `502` | `agent_body_generation_failed` | Provider failure, empty reply, or unavailable/conflicting resident task. |
+| `502` | `agent_body_generation_invalid_output` | Output violates the grid rules after repair. |
+| `504` | `agent_body_generation_timeout` | Deadline reached or insufficient time remains for repair. |
+
+Every failure omits `rows`; there is no random or template fallback. Generation
+diagnostics contain request/generation identifiers, status, duration, attempt
+count, provider/model, error class, and (on success) a nonzero count and short grid
+hash. Ordinary resident prompt/reply trace excerpts, raw parse-failure archives,
+and model-call logs are suppressed for the hidden generation scope.

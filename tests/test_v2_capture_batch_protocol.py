@@ -1943,3 +1943,208 @@ def test_bootstrap_events_are_written_without_a_ts():
         "longer reads this stream, so last_activity_at (and active_1d/3d) will "
         "silently ignore it — revisit db._PAGED_LOG_STREAMS before landing this"
     )
+
+
+# ── 落卡毒窗口逃生阀（V2 真路径）──────────────────────────────────────────
+#
+# 下面两条走真的 worker + 真的 jobs_store + 真的 Postgres，验「逃生阀在 V2
+# 故障现场会不会真的触发」。只调纯函数的测试（test_v2_capture_poison_window_escape）
+# 验不出调用点的问题 —— 这次 Codex review 抓到的三处全是那类：V2 失败原因带
+# ``extraction_failed:`` 前缀、新用户起点只有 seq 0、prepared 重试时窗口是空壳。
+
+
+def _poison_deps(uid: str, *, messages: list[dict], **overrides) -> "worker.TurnDeps":
+    def tail(_uid, after_seq, *_args, **_kwargs):
+        return [m for m in messages if int(m["seq"]) > int(after_seq)]
+
+    kwargs = dict(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (object(), {}),
+        mint_enclave_token=lambda _uid: "rt",
+        read_memory_context=lambda _uid: {},
+        read_capture_state=lambda _uid: db.get_blob_strict(_uid, "capture_state") or {},
+        read_compaction_tail_after_seq=tail,
+        build_memory_envelope=lambda *_args: {},
+        get_prepared_capture_batch=jobs_store.get_prepared_capture_batch,
+        prepare_capture_batch=jobs_store.prepare_capture_batch,
+        authorize_capture_provider_call=jobs_store.authorize_capture_provider_call,
+        commit_capture_batch=jobs_store.commit_capture_batch,
+        fail_capture_job=jobs_store.fail_capture_job,
+        cancel_capture_job=jobs_store.cancel_capture_job,
+    )
+    kwargs.update(overrides)
+    return worker.TurnDeps(**kwargs)
+
+
+def _run_capture(uid: str, job: dict, deps, owner: str) -> str:
+    return asyncio.run(
+        worker._run_extraction(
+            job["id"], uid, "capture", deps, object(), asyncio.Semaphore(1),
+            claimed_by=owner,
+        )
+    )
+
+
+def _capture_state(uid: str) -> dict:
+    return dict(db.get_blob_strict(uid, "capture_state") or {})
+
+
+def test_v2_first_window_parse_failure_is_skipped_after_three_real_runs(monkeypatch):
+    """🔴 新用户第一批就吐坏 JSON：连续 3 次后游标推过去，而不是永久卡死。
+
+    同时覆盖两个只有真路径才暴露的点：
+    - V2 报的是 ``extraction_failed:json_decode_error``（带前缀），要落进 3 次档
+    - 新用户起点没有消息 id、seq 是 0；每次失败之间新消息让终点前移，
+      身份键不能跟着终点变
+    """
+    from memory import capture_failure
+    from model_api_runtime.v2 import extraction
+
+    uid = "u_capture_poison_first_window"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+
+    async def bad_json(**_kwargs):
+        return [], "json_decode_error:JSONDecodeError"
+
+    monkeypatch.setattr(extraction, "extract", bad_json)
+    messages: list[dict] = []
+
+    def add_message(seq: int) -> None:
+        messages.append({
+            "id": f"m{seq}", "seq": seq, "ts": float(seq), "role": "user",
+            "raw_role": "user", "source": "chat", "capture_eligible": True,
+            "content": f"message {seq}",
+        })
+
+    add_message(1)
+    add_message(2)
+    for attempt in range(1, capture_failure.CAPTURE_POISON_SKIP_AFTER + 1):
+        monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: len(messages))
+        owner = f"capture-worker-{attempt}"
+        _job_id, job = _running(uid, owner=owner)
+        assert _run_capture(uid, job, _poison_deps(uid, messages=messages), owner) == "failed"
+        state = _capture_state(uid)
+        if attempt < capture_failure.CAPTURE_POISON_SKIP_AFTER:
+            assert int(state.get("last_captured_until_seq") or 0) == 0, f"第 {attempt} 次就跳了"
+            assert int(state["capture_fail_streak"]) == attempt, "身份键跟着终点变了，streak 被重置"
+            # 字段名和 V1 的状态归一化（capture_scheduler._state_doc）必须是同一个，
+            # 否则 V1 那边读回来就丢了（我拆模块时批量改名误伤过一次）。
+            assert state["capture_fail_window_key"] == "after_seq:0"
+            add_message(len(messages) + 1)  # 故障期间用户还在聊天，终点前移
+
+    assert int(state["last_captured_until_seq"]) == len(messages)
+    assert state["last_captured_until_message_id"] == f"m{len(messages)}"
+    assert int(state["capture_skipped_windows"]) == 1
+    assert int(state["capture_fail_streak"]) == 0
+
+
+@pytest.mark.parametrize("entry", ["run_turn", "run_extraction"])
+def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeypatch, entry):
+    """🔴 prepared 批次每次提交都抛异常（比如写入时拿不到密钥）：到上限后跳过。
+
+    以前 prepared 重试时窗口是个 until_message_id="" 的空壳，逃生阀认为
+    「说不清推到哪」而永远不跳 —— 那个批次就成了新的队头阻塞。
+
+    prepared 批次在 worker 里有两处恢复：
+    - run_turn：生产入口 _run_turn_body 在进 _run_extraction **之前**就恢复（真实流量走这里）
+    - run_extraction：_run_extraction 内部那段兜底
+    两处各漏过一次窗口（第一轮修了后者，第三轮 review 才发现前者），所以两条都测。
+    """
+    from memory import capture_failure
+
+    uid = "u_capture_poison_prepared_retry"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    first_id, _job = _running(uid, owner="first-owner")
+    assert jobs_store.prepare_capture_batch(
+        job_id=first_id, user_id=uid, claimed_by="first-owner",
+        window=_window(after=0, through=4), actions=[_add(uid, "mom-stuck")],
+    ) is not None
+    assert jobs_store.fail_capture_job(
+        job_id=first_id, user_id=uid, claimed_by="first-owner",
+        error="worker_crashed_after_prepare",
+    )
+
+    commit_calls = []
+
+    def commit_raises(**kwargs):
+        commit_calls.append(kwargs["batch_id"])
+        raise RuntimeError("capture_memory_write_failed")
+
+    deps = _poison_deps(uid, messages=[], commit_capture_batch=commit_raises,
+                        capture_enabled=lambda _uid: True)
+    limit = capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
+    for attempt in range(1, limit + 1):
+        owner = f"retry-owner-{attempt}"
+        if entry == "run_turn":
+            _job_id, job = _running(uid, owner=owner, start=False)
+            assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+        else:
+            _job_id, job = _running(uid, owner=owner, start=False)
+            assert jobs_store.mark_running(job["id"], claimed_by=owner)
+            assert _run_capture(uid, job, deps, owner) == "failed"
+        state = _capture_state(uid)
+        if attempt < limit:
+            assert int(state.get("last_captured_until_seq") or 0) == 0, f"第 {attempt} 次就跳了"
+
+    assert len(commit_calls) == limit, "每次都应该先去提交那个 prepared 批次"
+    assert int(state["last_captured_until_seq"]) == 4
+    assert state["last_captured_until_message_id"] == "m4"
+    assert int(state["capture_skipped_windows"]) == 1
+
+    # 🔴 跳过的同一事务里就要删掉那个 prepared 批次 —— 生产上跳过后用户可能
+    # 不再发消息、不会有下一个任务来顺带清理（Codex 第四轮）。
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0, "跳过后加密的批次内容还留在库里"
+
+    # 游标推过去之后，那个旧批次不能再被捡起来重放。
+    next_id, _job = _running(uid, owner="after-skip")
+    assert jobs_store.get_prepared_capture_batch(
+        job_id=next_id, user_id=uid, claimed_by="after-skip", after_seq=4,
+    ) is None
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0
+
+
+def test_commit_rejected_on_the_same_window_is_eventually_skipped():
+    """🔴 同一窗口每次提交都被语义拒绝（例如 supersede 的目标已不存在）：到上限后跳过。
+
+    拒绝分支会删批次、标失败，worker 看到 rejected 直接返回，**不会**再走带窗口的
+    fail_capture_job。以前这里不带窗口 → streak 无限涨、永不跳过。
+    """
+    from memory import capture_failure
+
+    uid = "u_capture_poison_commit_rejected"
+    _seed(uid)
+    limit = capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
+    for attempt in range(1, limit + 1):
+        owner = f"reject-owner-{attempt}"
+        job_id, _job = _running(uid, owner=owner)
+        batch = jobs_store.prepare_capture_batch(
+            job_id=job_id, user_id=uid, claimed_by=owner,
+            window=_window(after=0, through=3),
+            actions=[{
+                "type": "memory.supersede",
+                "supersedes": "deleted-target",
+                "envelope": _envelope(uid, f"mom-reject-{attempt}"),
+            }],
+        )
+        assert batch is not None
+        result = jobs_store.commit_capture_batch(
+            job_id=job_id, user_id=uid, claimed_by=owner, batch_id=batch["id"],
+        )
+        assert result["rejected"] is True
+        state = _capture_state(uid)
+        if attempt < limit:
+            assert int(state.get("last_captured_until_seq") or 0) == 0, f"第 {attempt} 次就跳了"
+            assert int(state["capture_fail_streak"]) == attempt
+
+    assert int(state["last_captured_until_seq"]) == 3
+    assert state["last_captured_until_message_id"] == "m3"
+    assert state["capture_seq_initialized"] is True
+    assert int(state["capture_skipped_windows"]) == 1

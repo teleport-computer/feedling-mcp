@@ -87,7 +87,6 @@ from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import visual_transport
 from hosted import vision_observer
-from identity import card_policy
 from memory import memory_core
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
@@ -195,33 +194,6 @@ def _load_genesis_persona(store, *, runtime_token: str) -> str:
         return ""
 
 
-_IDENTITY_CARD_SUBSTANTIVE_FIELDS = tuple(dict.fromkeys((
-    *card_policy.PROFILE_STRING_FIELDS,
-    *card_policy.PROFILE_LIST_FIELDS,
-    "dimensions",
-)))
-
-
-def _identity_card_has_substance(card: dict) -> bool:
-    """Ignore empty/default card scaffolding when choosing card over persona."""
-
-    for key in _IDENTITY_CARD_SUBSTANTIVE_FIELDS:
-        value = card.get(key)
-        if key == "agent_name" and str(value or "").strip() == "TA":
-            continue
-        if isinstance(value, str):
-            if value.strip():
-                return True
-            continue
-        if isinstance(value, (list, tuple, dict, set)):
-            if value:
-                return True
-            continue
-        if value is not None:
-            return True
-    return False
-
-
 def _load_identity_card_view(store, *, runtime_token: str) -> dict:
     """Read one usable card through the content-shape-aware capability seam."""
     try:
@@ -242,7 +214,7 @@ def _load_identity_card_view(store, *, runtime_token: str) -> dict:
     card = result.data.get("identity")
     if not isinstance(card, dict) or card.get("decrypt_status") != "ok":
         return {}
-    if not _identity_card_has_substance(card):
+    if not v2_context.identity_card_has_substance(card):
         return {}
     return card
 

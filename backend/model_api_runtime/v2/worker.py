@@ -95,6 +95,7 @@ from core import provider_usage
 from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory import capture_failure
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
 from memgarden import contracts as mg_contracts
@@ -991,14 +992,14 @@ _EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
     "You woke up to spend a little while with them. Start by looking around — what "
     "they are doing, where your last conversation left off, what time it is where "
-    "they are — and whether they are in the middle of something, or you have already "
-    "been showing up a lot lately. Use any tools you want, for as many rounds as you "
-    "need. "
+    "they are — and whether they are in the middle of something. Use any tools you "
+    "want, for as many rounds as you need. "
     + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
-    + "Then make your choice: say something, or keep them quiet company this time. "
-    "Both are good ways to be here — but if something you want to tell them rises "
-    "up, say it; don't swallow it. Never mention this wake or any system wording "
-    "to the user."
+    + "Then decide what you want to say to them and say it — speaking is the normal "
+    "way to end a wake. Call stay_silent only for a concrete reason: they asked not "
+    "to be disturbed, it is clearly their sleeping hours and they are offline, you "
+    "already spoke within the last hour, or they are visibly in the middle of "
+    "something. Never mention this wake or any system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     " For this presence turn, decide before using any user-visible reply, file, "
@@ -1008,7 +1009,7 @@ _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     "you choose quiet company, call stay_silent with a brief reason and send no "
     "visible text, greeting, placeholder, or user-visible delivery capability. "
     "Keep the decision in `think` consistent with the visible message; if you "
-    "change your mind, update it before calling reply. Neither choice is preferred."
+    "change your mind, update it before calling reply."
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
@@ -11409,6 +11410,7 @@ async def _run_wake(
                 max_assistant_tool_text_chars=MAX_ASSISTANT_TOOL_TEXT_CHARS,
                 prompt_context_window_overrides=(PROMPT_CONTEXT_WINDOW_OVERRIDES),
                 prompt_output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+                file_output_max_tokens=FILE_OUTPUT_MAX_TOKENS,
                 prompt_safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
                 prompt_estimator_utf8_bytes_per_token=(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
@@ -12435,6 +12437,13 @@ async def _run_extraction(
                 after_seq=capture_after_seq,
             )
             if prepared_retry is not None:
+                # 这批消息上次已经处理过、只是没提交成功。窗口要按**那一批**还原：
+                # 下面的 commit 如果又抛异常，失败处理会拿 capture_window 去判断
+                # 要不要跳过；还停在上面那个 until_message_id="" 的空壳的话，
+                # 逃生阀永远不触发，这个批次就成了新的队头阻塞。
+                capture_window.update(
+                    capture_failure.window_from_batch_row(prepared_retry)
+                )
                 await _ensure_capture_not_halted("prepared_retry_commit")
                 committed_retry = await asyncio.to_thread(
                     deps.commit_capture_batch,
@@ -13440,6 +13449,10 @@ async def _run_extraction(
                 user_id=user_id,
                 claimed_by=claimed_by,
                 error=code,
+                # 带上窗口，逃生阀才认得出「同一批消息在反复失败」并跳过。
+                # 不带的话 V2 用户会被一条毒消息永久卡死（2026-09-14 实测
+                # 还卡着的落卡用户里抽查 12 个全是 V2）。
+                window=dict(capture_window),
             )
         elif lane != "capture":
             await asyncio.to_thread(
@@ -13460,12 +13473,19 @@ async def _terminalize_extraction_gate(
     tm: "TurnMetrics",
     code: str,
     cancel: bool,
+    window: dict[str, Any] | None = None,
 ) -> str:
-    """Settle a background extraction gate without any chat-visible error."""
+    """Settle a background extraction gate without any chat-visible error.
+
+    ``window`` 只在「能证明是哪一批消息失败了」时给（目前只有 prepared 批次恢复），
+    落卡逃生阀靠它识别同一批反复失败。其余门禁（开关关闭、协议不可用、停机）
+    不是毒消息场景，不传 —— 调用参数和以前逐字节一致。
+    """
     landed = False
     if lane == "capture":
         callback = deps.cancel_capture_job if cancel else deps.fail_capture_job
         if callback is not None and claimed_by:
+            extra = {"window": window} if (window and not cancel) else {}
             landed = bool(
                 await asyncio.to_thread(
                     callback,
@@ -13473,6 +13493,7 @@ async def _terminalize_extraction_gate(
                     user_id=user_id,
                     claimed_by=claimed_by,
                     error=code,
+                    **extra,
                 )
             )
     if not landed:
@@ -17265,6 +17286,7 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                     cancel=False,
                 )
             recovery_recorder = None
+            prepared = None
             try:
                 state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
                 raw_seq = state.get("last_captured_until_seq")
@@ -17379,6 +17401,14 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                         "capture_recovery_failed", recovery_exc
                     ),
                     cancel=False,
+                    # 🔴 生产上 prepared 批次的恢复走的是这里（不是 _run_extraction 里
+                    # 那段）。提交反复抛异常时不带窗口，逃生阀永远不触发，这个批次
+                    # 就是新的队头阻塞（Codex 第三轮抓到）。拿到批次之前就挂了则不传。
+                    window=(
+                        capture_failure.window_from_batch_row(prepared)
+                        if isinstance(prepared, dict)
+                        else None
+                    ),
                 )
     recorder = _make_trajectory_recorder(job, deps)
     try:

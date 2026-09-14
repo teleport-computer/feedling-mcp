@@ -357,6 +357,17 @@ def test_chat_pressure_folded_platform_schema_is_searchable_and_protected(
         base_url="",
         context_window_tokens=40_000,
     )
+    # Pressure is an explicit test constraint. Accepted route metadata can be
+    # raised to an audited family bound, so it cannot force this smaller window.
+    monkeypatch.setitem(
+        worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+        "anthropic:claude-sonnet-4-test", 40_000,
+    )
+    limit = worker.v2_prompt_frontier.resolve_model_limit_from_config(
+        pressure_config, deployment_overrides=worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    assert limit.context_window_tokens == 40_000
+    assert limit.source == "deployment_override"
     calls = _script_provider(monkeypatch, [
         {
             "reply": "",
@@ -1166,6 +1177,17 @@ def test_chat_refuses_folded_platform_call_before_dispatch(monkeypatch):
         base_url="",
         context_window_tokens=40_000,
     )
+    # Pressure is an explicit test constraint. Accepted route metadata can be
+    # raised to an audited family bound, so it cannot force this smaller window.
+    monkeypatch.setitem(
+        worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+        "anthropic:claude-sonnet-4-test", 40_000,
+    )
+    limit = worker.v2_prompt_frontier.resolve_model_limit_from_config(
+        pressure_config, deployment_overrides=worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    assert limit.context_window_tokens == 40_000
+    assert limit.source == "deployment_override"
 
     dispatched = []
     real_dispatch = worker.v2_executor.dispatch_tool_calls

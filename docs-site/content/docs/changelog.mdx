@@ -12,12 +12,70 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
+  The block is the user-visible first-person aside shown under the reply, and the
+  instruction now says so; it is no longer described as private inner thoughts.
+  Anthropic's request safeguards on the Opus 5 family classified the previous
+  `<think>` wording as a request for hidden reasoning and rejected every resident
+  turn. The shared thinking-leak gate now recognises `<aside>` on every path
+  that uses it (Runtime V2 chat and wake, resident V1 chat, proactive messages):
+  an `<aside>…</aside>` block is stripped exactly like `<think>`, and a
+  truncated opener such as `<asid` fails closed instead of reaching the user.
+  Prompt text and driver selection for pi, codex, and Runtime V2 are unchanged.
+
+- **Regular V2 wakes now treat speaking as the default.** Silence requires a
+  concrete reason in the model instructions. The existing structured
+  `reply`/`stay_silent` validation remains in place, and free-form text still
+  cannot become a proactive bubble. Regular wakes now use the same output
+  budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768), so
+  reasoning models have more room to produce a terminal choice. Scheduled
+  reminder behavior and file-output budget precedence are unchanged.
+
+- Memory capture no longer stops permanently when one batch of chat keeps
+  failing. If the same batch fails 3 times in a row with an unreadable model
+  output, or 6 times for any reason, capture skips that batch and continues with
+  newer messages. The skipped batch produces no memories, and the skip is recorded
+  in capture diagnostics. Previously a single bad batch could block all future
+  memories for that account.
+
+- V1 resident proactive wakes now include relevant memory summaries selected
+  against the latest user message in their history snapshot. Heartbeat,
+  scheduled, and screen-watch turns share Chat's rendering and
+  final CLI payload checks. Missing anchors or failed selection remain unknown
+  in diagnostics and do not reuse cards from a previous turn.
+
+- Resident consumers now retry transient startup decrypt-source failures using
+  the runtime enclave retry and timeout settings. A failed probe reports
+  `unreachable` and continues polling instead of exiting, allowing recovery
+  without restarting the consumer. Deterministic HTTP failures are not retried
+  within the probe; cycles with failed decrypt-history reads remain skipped.
+
+- `POST /v1/agent-body/generate` generates a validated 24×24 bead body for
+  hosted and resident accounts, including upgraded self-hosted backends.
+  Hosted accounts use their chat model; residents receive a hidden job through
+  `GET /v1/chat/poll` and run their own agent with locally read identity and memory.
+  Generation does not save or apply a preset; failures never return a local
+  substitute. The API-key-only request has an 85-second budget and at most one
+  repair attempt. Residents must upgrade to advertise `agent_body_generate_v1`;
+  test deployment alone does not update consumers following the production
+  release channel. See [the API contract](/docs/api-reference) and
+  [errors](/docs/errors#agent-body-generation).
+
 - `GET /v1/agent/perception` (and the proactive agent's perception tools) again
   return the `steps`, `vitals`, `body`, and `metabolic` fields the client reports.
   Since the perception catalog split health signals into per-metric query
   capabilities, the pull snapshot only consulted the report-level capability and
   silently dropped these 14 fields; it now also honours each field's per-metric
   capability. The cheap `perception.now` snapshot is unchanged.
+
+- **DeepSeek routes no longer remain constrained by an old 64K context value.**
+  Runtime V2 uses a 1,048,576-token audited window for the first-party DeepSeek
+  family, including `deepseek-flash`. At audited destinations, the larger of
+  accepted route metadata and the audited family lower bound now determines
+  the window. Larger metadata and deployment overrides keep their precedence;
+  stored routes are not rewritten. Custom endpoints and OpenRouter's separate
+  DeepSeek window remain unchanged.
+
 - **Resident model-call diagnostics identify their upstream route.** Terminal
   model-call traces from the Pi, Claude, and Codex CLI runtimes now carry the
   configured provider and model identifiers, matching the existing V2 trace

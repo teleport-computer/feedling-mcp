@@ -86,6 +86,21 @@ Applications should make them configurable for self-hosted deployments.
 
 ## Provider health and proactive retries
 
+Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
+choice. Speaking is the default; `stay_silent` needs a concrete reason, such as
+an explicit do-not-disturb request, sleeping hours while the user is offline,
+having spoken within the last hour, or the user being visibly busy. These are
+model instructions, not new scheduler gates. Missing or invalid choices still
+fail without a visible bubble; free-form text cannot bypass the validated reply
+path. Explicitly scheduled reminders retain their must-deliver behavior.
+
+Regular wake provider calls, including choice-correction retries, now use the
+same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
+giving reasoning models room to make the terminal tool call. Operators can tune
+that shared budget with `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS`. It is separate from
+the prompt-frontier output reserve and does not change the input frontier;
+file-capable calls retain their existing budget precedence.
+
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours
 and its latest failures have continuously required user action for at least one
@@ -154,6 +169,14 @@ floor defaults to 32,768 tokens and can be changed with
 `FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS`. A rejected value
 falls through to the next source and emits a content-free warning containing
 only window counts, the resolved source, and a closed provider class.
+For an audited model at its audited provider endpoint, accepted metadata is
+also compared with the audited family lower bound: the larger value wins.
+Equal or larger metadata keeps the `provider_metadata` source; a raised value
+uses `audited_family`. Deployment overrides still take precedence. This lets
+older routes use updated model knowledge without rewriting their stored values.
+DeepSeek's first-party `deepseek-chat`, `deepseek-reasoner`, `deepseek-flash`,
+and `deepseek-v4` family use a 1,048,576-token audited window. Custom endpoints
+and the separately audited OpenRouter DeepSeek family do not inherit that window.
 
 Runtime V2 takes one temporal snapshot for each chat or wake turn.
 The prompt receives the current UTC time, the user's local IANA timezone and

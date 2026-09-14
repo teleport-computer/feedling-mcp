@@ -4019,6 +4019,10 @@ def test_regular_wake_free_text_retries_once_then_fails_without_bubble(
 
     assert replies.calls == []
     assert len(provider.calls) == len(responses)
+    assert all(
+        call["max_tokens"] == provider_client.CHAT_OUTPUT_MAX_TOKENS
+        for call in provider.calls
+    )
     assert "tool_choice" not in provider.calls[0]
     assert {"reply", "stay_silent", "memory_index"} <= {
         spec.name for spec in provider.calls[0]["tools"]
@@ -4035,6 +4039,43 @@ def test_regular_wake_free_text_retries_once_then_fails_without_bubble(
         for kind, payload in events
         if kind == "wake_choice_response"
     ] == ["invalid", "invalid", "invalid"]
+
+
+@pytest.mark.parametrize("file_limit", [None, 16384])
+@pytest.mark.parametrize("file_capable", [False, True])
+def test_regular_wake_output_budget_and_file_priority(monkeypatch, file_limit, file_capable):
+    provider = _ScriptedProvider([{
+        "reply": "", "tool_calls": [{
+            "id": "silence-1", "name": "stay_silent",
+            "args": {"reason": "They asked not to be disturbed."},
+        }], "usage": {},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    async def on_stay_silent(_reason):
+        return None
+
+    file_kwargs = {}
+    if file_capable:
+        file_kwargs["on_file_reply"] = lambda _path, _revision: None
+    if file_limit is not None:
+        file_kwargs["file_output_max_tokens"] = file_limit
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_stay_silent=on_stay_silent,
+        regular_wake_choice_required=True,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        require_reply=False,
+        **file_kwargs,
+    ))
+    assert outcome.stop_reason == "stay_silent"
+    assert len(provider.calls) == 1
+    expected_limit = file_limit or provider_client.CHAT_OUTPUT_MAX_TOKENS
+    assert provider.calls[0]["max_tokens"] == expected_limit
 
 
 def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):

@@ -199,3 +199,26 @@ def test_instrument_stale_is_neither_pass_nor_fail_and_does_not_block():
     assert p0.p0_blocks_release([stale]) is False
     assert hosted.RESULT_INSTRUMENT_STALE not in ("ok", "fail")
     assert p0.p0_blocks_release([stale, {"result": "fail"}]) is True
+
+
+# ── relay cell roster (2026-09-14: hojimi retired → jiushi + zhailian) ─────────
+# Lives here (not in test_self_thinking_prompt_probe.py) because that module is
+# skipped wholesale on machines where the agent-protocol-core distribution is
+# still installed — a roster assertion must run under normal collection.
+
+def test_relay_cells_are_jiushi_and_zhailian_with_own_key_pool_wiring():
+    from tools.e2e.config import HOSTED_CELLS
+    by_name = {c.name: c for c in HOSTED_CELLS}
+    assert "hojimi-relay" not in by_name
+    for name, key_env, base_env in (
+        ("jiushi-relay", "E2E_KEY_JIUSHI", "E2E_JIUSHI_BASE"),
+        ("zhailian-relay", "E2E_KEY_ZHAILIAN", "E2E_ZHAILIAN_BASE"),
+    ):
+        cell = by_name[name]
+        assert cell.provider == "openai_compatible"
+        assert (cell.key_env, cell.base_url_env) == (key_env, base_env)
+        assert cell.models, f"{name} needs at least one model candidate"
+    # every relay cell must read its own pool slots — a copy/paste sharing one
+    # key would make two cells measure the same relay under two names
+    relay_slots = [(c.key_env, c.base_url_env) for c in HOSTED_CELLS if c.base_url_env]
+    assert len(relay_slots) == len(set(relay_slots))

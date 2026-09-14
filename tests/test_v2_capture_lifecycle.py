@@ -1060,5 +1060,7 @@ def test_capture_database_pool_timeout_records_distinct_terminal_code():
             "user_id": "u-v2-capture",
             "claimed_by": "owner",
             "error": "extraction_failed:database_pool_timeout",
+            # 读游标之前就挂了，窗口还是空的 —— 逃生阀对空窗口只累加不跳过。
+            "window": {},
         }
     ]

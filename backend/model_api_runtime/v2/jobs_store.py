@@ -41,6 +41,7 @@ from chat.reply_language import (
 )
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
+from memory import capture_failure
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily
@@ -3325,24 +3326,75 @@ def _capture_fail_on_cursor(
     claimed_by: str,
     error: str,
     increment_backoff: bool = True,
+    window: dict | None = None,
 ) -> dict:
-    """Fail an already-validated owned Capture job in the caller's txn."""
+    """Fail an already-validated owned Capture job in the caller's txn.
+
+    ``window`` 给了、且这次要累计退避时，走**落卡毒窗口逃生阀**：同一个游标
+    连续失败到阈值，就在**同一个事务里**把游标推过这批消息。
+
+    ## 为什么 V2 要单独接
+
+    V1 的逃生阀接在 ``proactive.capture_scheduler`` 里。V2 的落卡**不走那里** ——
+    worker 的 ``_record_extraction_status`` 对 lane == "capture" 直接 return，
+    V2 落卡的失败状态走这个持久批次协议。2026-09-14 prod 实测：还卡着的
+    落卡用户抽查 12 个，12 个全是 V2，就是因为逃生阀一直没接到这条路上。
+
+    ## 为什么放在这个事务里
+
+    游标推进、任务标 failed、状态写回必须同成同败。拆开的话，任务标了 failed
+    但游标没推进 → 下次还卡；游标推进了但任务没标 → 同一批被当成还在跑。
+
+    ``window`` 不给时（其余 6 个调用点：落卡被关、批次丢失、游标已被别人推进、
+    校验拒绝…）**行为逐字节不变** —— 那些都不是毒消息场景。
+    """
     failed = dict(state)
+    skip_applied = False
+    if increment_backoff and isinstance(window, dict) and window:
+        # 和 V1 用**同一个**判断函数（memory.capture_failure）—— 两边各写一遍
+        # 必然漂，而漂了不报错（2026-09-13 就这么漂过一次）。
+        patch, _streak, skip_applied = capture_failure.capture_failure_patch(
+            failed, window, now_ts=time.time(), reason=str(error or ""))
+        failed.update(patch)
+    else:
+        failed.update(
+            {
+                "capture_fail_streak": int(failed.get("capture_fail_streak") or 0)
+                + (1 if increment_backoff else 0),
+                "last_capture_failed_at": (
+                    time.time()
+                    if increment_backoff
+                    else float(failed.get("last_capture_failed_at") or 0.0)
+                ),
+            }
+        )
     failed.update(
         {
             "pending_capture_key": "",
-            "capture_fail_streak": int(failed.get("capture_fail_streak") or 0)
-            + (1 if increment_backoff else 0),
-            "last_capture_failed_at": (
-                time.time()
-                if increment_backoff
-                else float(failed.get("last_capture_failed_at") or 0.0)
-            ),
             "updated_at": datetime.now(timezone.utc)
             .isoformat()
             .replace("+00:00", "Z"),
         }
     )
+    if skip_applied:
+        # 跳过的那批如果有 prepared 批次（加密的模型产出），同一事务里删掉。
+        # 不删的话：跳过后用户不再发消息 → 不会有下一个落卡任务 → 也就没有
+        # get_prepared_capture_batch 那次顺带清理 → 已声明丢弃的派生内容永久留库。
+        cur.execute(
+            "DELETE FROM v2_capture_batches WHERE user_id=%s AND status='prepared' "
+            "AND after_seq=%s AND runtime_generation=("
+            "SELECT expected_runtime_generation FROM agent_jobs WHERE id=%s)",
+            (str(user_id),
+             capture_failure.window_after_seq(window),
+             job_id),
+        )
+        # 跳过 = 那一批对话的记忆永久丢了。事务里不发 trace（副作用失败会
+        # 把整个事务带崩），但状态字段是原子写进去的，诊断面看得见。
+        log.warning(
+            "[v2.capture] poison window skipped user=%s job=%s error=%s "
+            "after_seq=%s through_seq=%s",
+            user_id, job_id, error,
+            window.get("after_seq"), window.get("through_seq"))
     cur.execute(
         "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
         (Jsonb(failed), str(user_id), _CAPTURE_STATE_KIND),
@@ -3749,6 +3801,12 @@ def commit_capture_batch(
                             user_id=str(user_id),
                             claimed_by=str(claimed_by),
                             error=rejection,
+                            # 批次已锁定且 after_seq 就是当前游标（上面校验过），
+                            # 能证明是同一个窗口。不带的话 worker 看到 rejected 直接
+                            # 返回、不会再走带窗口的 fail_capture_job —— 同一窗口
+                            # 每次都被拒，streak 无限涨却永不跳过。
+                            # batch_unavailable / frontier_changed 证明不了是同一窗口，不传。
+                            window=capture_failure.window_from_batch_row(batch),
                         )
                         result = {
                             "committed": False,
@@ -3931,6 +3989,7 @@ def fail_capture_job(
     user_id: str,
     claimed_by: str,
     error: str,
+    window: dict | None = None,
 ) -> bool:
     """Fail + arm backoff only while this worker still owns the Capture job."""
     persisted_state: dict | None = None
@@ -3960,6 +4019,7 @@ def fail_capture_job(
                     user_id=str(user_id),
                     claimed_by=str(claimed_by),
                     error=error,
+                    window=window,
                 )
     if persisted_state is not None:
         _mirror_capture_state_current(str(user_id))

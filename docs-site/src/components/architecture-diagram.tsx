@@ -131,6 +131,9 @@ export function ArchitectureDiagram() {
           <p className="mb-0 mt-3 text-xs leading-5 text-fd-muted-foreground">
             The API also owns authenticated screen WebSocket ingest and wake coordination. The attestation
             endpoint lets audit-aware clients verify the measured deployment and content public key.
+            Hosted body generation sends authorized context from the API to the selected model.
+            Resident jobs carry fixed instructions through the consumer mailbox; the resident reads its
+            own context and returns temporary grid indices, which are cleared after delivery.
           </p>
         </section>
 

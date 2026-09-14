@@ -248,6 +248,18 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("feedling.resident")
+# Hidden body generation must not inherit the ordinary chat prompt/reply
+# excerpts or raw-output archives. Scoped to this call, never a global toggle.
+_AGENT_BODY_PRIVATE: ContextVar[bool] = ContextVar("agent_body_private", default=False)
+
+
+class _AgentBodyLogFilter(logging.Filter):
+    def filter(self, record):
+        return not _AGENT_BODY_PRIVATE.get()
+
+
+log.addFilter(_AgentBodyLogFilter())
+
 
 
 @dataclass
@@ -310,6 +322,7 @@ class ProactiveChatContext:
     last_user_message_age_sec: float | None = None
     last_visible_proactive_age_sec: float | None = None
     visible_proactive_count_24h: int = 0
+    memory_anchor: dict | None = None
 
 
 def _mask(val: str) -> str:
@@ -1638,7 +1651,7 @@ def _consumer_capabilities(hosted: bool = False) -> str:
     keys ``_runtime_supported`` off this header, so omitting the web caps makes
     web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1", "agent_body_generate_v1"]
     if _agent_image_generation_enabled():
         caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
@@ -1805,6 +1818,8 @@ def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
     immediately, so it never blocks or slows a turn — even if the backend is
     slow/unreachable. When the cache is warm and says disabled, this is a
     zero-cost no-op: no thread spawned, no network at all."""
+    if _AGENT_BODY_PRIVATE.get():
+        return
     try:
         known, enabled = _debug_trace_probably_enabled()
         if known and not enabled:
@@ -1893,6 +1908,8 @@ def _preserve_reply_parse_failure(
     the filename and trace still lets an operator correlate the occurrence.
     Failure to preserve diagnostics must never replace the original turn error.
     """
+    if _AGENT_BODY_PRIVATE.get():
+        return None
     if not isinstance(raw, str) or not raw.strip():
         return None
 
@@ -2918,8 +2935,8 @@ def _auto_memory_arrival(payload: str, channel: str, *, driver: str, trace_id: s
 
 def _auto_memory_block_for(msg: dict, trace_id: str) -> tuple[str, list[str]]:
     """Fetch + render this message's own picks (never another message's), record
-    the turn state pending arrival, and trace ids/counts only. Used at the chat
-    assembly site; extracted so the per-turn rule is unit-testable."""
+    the turn state pending arrival, and trace ids/counts only. Shared by chat
+    and wake assembly; wakes supply the latest historical user's id/seq only."""
     entry = _auto_memory_fetch_for_turn(msg or {})
     picked = entry.get("picks") if entry else None
     quoted_ids = [str(c.get("id") or "") for c in ((msg or {}).get("quoted_memories") or []) if isinstance(c, dict)]
@@ -3675,33 +3692,47 @@ def _verify_decrypt_sources() -> bool:
     Returns True if at least one configured source is reachable.
     Each unreachable source is logged at ERROR level so the operator
     can distinguish "configured but broken" from "not configured at all".
+    Uses the runtime enclave timeout and bounded transient-failure retries.
     Also seeds the reported decrypt-health status.
     """
     any_ok = False
 
     if FEEDLING_ENCLAVE_URL:
-        try:
-            client = _client_for(FEEDLING_ENCLAVE_URL)
-            resp = client.get(
-                f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-                params={"limit": 1},
-                headers=_HEADERS,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
-            any_ok = True
-            # Reachability outcomes ALWAYS route through _apply_infra_health so
-            # they can never clobber a standing per-user `degraded` (at startup
-            # status is `unknown`, so this behaves identically to a bare set —
-            # the routing is the invariant, uniform across every call site).
-            _apply_infra_health("ok")
-        except Exception as e:
-            log.error(
-                "decrypt source UNREACHABLE: enclave at %s — %s",
-                FEEDLING_ENCLAVE_URL, e,
-            )
-            _apply_infra_health("unreachable")
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        for attempt in range(ENCLAVE_FETCH_MAX_ATTEMPTS):
+            try:
+                resp = client.get(
+                    f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+                    params={"limit": 1},
+                    headers=_HEADERS,
+                )
+                resp.raise_for_status()
+                log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
+                any_ok = True
+                # Reachability must not clobber a standing per-user degraded
+                # status; only a real successful decrypt may clear that state.
+                _apply_infra_health("ok")
+                break
+            except Exception as e:
+                retryable = isinstance(e, httpx.TransportError) or (
+                    isinstance(e, httpx.HTTPStatusError)
+                    and e.response.status_code in _RETRYABLE_ENCLAVE_STATUS
+                )
+                if retryable and attempt < ENCLAVE_FETCH_MAX_ATTEMPTS - 1:
+                    delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
+                    log.warning(
+                        "decrypt startup probe transient failure (attempt %d/%d) "
+                        "— retrying in %.1fs: %s",
+                        attempt + 1, ENCLAVE_FETCH_MAX_ATTEMPTS, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+                log.error(
+                    "decrypt source UNREACHABLE: enclave at %s after %d attempts — %s",
+                    FEEDLING_ENCLAVE_URL, attempt + 1, e,
+                )
+                _apply_infra_health("unreachable")
+                break
     else:
         _apply_infra_health("unconfigured")
 
@@ -5093,7 +5124,8 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
 
     Structured reasoning fields remain the preferred path. This only handles
     plain terminal text where an upstream wrapper serialized reasoning as
-    `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
+    `<think>...</think>`, `<reasoning>...</reasoning>`, `<thought>...</thought>`,
+    or the Claude-driver `<aside>...</aside>` (T587).
 
     2026-08-08 起委托 ``agent_protocol_core.self_thinking`` 的共享内核：此前 V1/V2 各一套判据、
     各漏各的——这条正则要求开闭成对，一个孤立的 `</think>`（开标签在上游被吃掉）
@@ -12704,13 +12736,32 @@ def _wake_self_thinking_allowed() -> bool:
     return bool(_self_thinking_v1.enabled()) and _supports_mandatory_self_thinking_v1()
 
 
+def _self_thinking_tag() -> str:
+    """协议标签按 driver 选:Claude Code 用 ``aside``,pi / codex 保持 ``think``。
+
+    T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
+    用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
+    隐藏思维链,Opus 5 家族每轮拒答。标签按 driver 不按模型:矩阵里 sonnet-4-6 /
+    opus-4-8 / opus-5 / opus-5[1m] 用 ``aside`` 全部正常,不用维护型号名单。
+    只有 ``AGENT_MODE == "cli"`` 且 ``cmd[0]`` 是 ``claude`` 才算 Claude Code;
+    pi / codex / http 模式(哪怕留着一条 claude 命令)/ 其他 CLI 的指令渲染逐字节
+    不变(见 tests)。"""
+    from agent_protocol_core import self_thinking as _self_thinking_v1
+
+    # Only a turn that really runs the Claude Code CLI gets the aside tag: in
+    # http mode AGENT_CLI_CMD is dead configuration and must not change copy.
+    if AGENT_MODE == "cli" and _is_claude_code_cmd(_cli_cmd_tokens()):
+        return _self_thinking_v1.TAG_ASIDE
+    return _self_thinking_v1.TAG_THINK
+
+
 def _foreground_self_thinking_instruction() -> str:
     """前台强制思考指令；与主动道共享同一开关，只保留强度差异。"""
     if not _wake_self_thinking_allowed():
         return ""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
-    return _self_thinking_v1.INSTRUCTION.strip()
+    return _self_thinking_v1.instruction(_self_thinking_tag()).strip()
 
 
 def _wake_think_permission_line(presence: dict | None = None) -> str:
@@ -12718,6 +12769,24 @@ def _wake_think_permission_line(presence: dict | None = None) -> str:
     if not _wake_self_thinking_allowed():
         return ""
     policy = _resident_reply_language(presence)
+    tag = _self_thinking_tag()
+    if tag == "aside":
+        # Claude Code driver: same permission, truthfully described — the block
+        # is folded under 「参考内容」 in the app, never rendered as message text.
+        if policy.language != "en":
+            return (
+                " 你可以在 JSON 前先写一个平常的 <aside>...</aside> 块；它会折叠在"
+                "「参考内容」里展示，不会显示成消息正文。如果选择写，从第一个字到最后"
+                "一个字都使用用户所用的语言。保持你自己的口气；不要写成对用户的评估，"
+                "也不要写成他们应该做什么的行动方案。"
+            )
+        return (
+            " You may open with your usual <aside>...</aside> block before the JSON; "
+            "it is shown folded under the reply, never as message text. Write the "
+            "whole block in the language the user uses, from first word to last. "
+            "Keep it in your own voice; do not turn it into an assessment of the user "
+            "or an action plan for what they should do."
+        )
     if policy.language != "en":
         return (
             " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
@@ -15123,6 +15192,108 @@ def _vision_probe_error_code(exc: BaseException) -> str:
     }.get(notice.error_class, "vision_model_failed")
 
 
+def _agent_body_rows(reply: str, palette_count: int) -> list[list[int]]:
+    """Standalone distribution copy of the backend grid contract (parity tested)."""
+    text = str(reply or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        text = text[3:-3].strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        body = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError("输出不是合法 JSON 对象") from None
+    rows = body.get("rows") if isinstance(body, dict) else None
+    if not isinstance(rows, list) or len(rows) != 24:
+        raise ValueError("rows 必须恰好有 24 行")
+    nonzero = False
+    for number, row in enumerate(rows, 1):
+        if not isinstance(row, list) or len(row) != 24:
+            raise ValueError(f"第 {number} 行必须恰好有 24 个整数")
+        for value in row:
+            if type(value) is not int:
+                raise ValueError(f"第 {number} 行含非整数值")
+            if not 0 <= value <= palette_count:
+                raise ValueError(f"第 {number} 行含越界索引，允许范围为 0..{palette_count}")
+            nonzero = nonzero or value != 0
+    if not nonzero:
+        raise ValueError("rows 全空，不能全是 0")
+    return rows
+
+
+def _process_agent_body_job(result: dict) -> None:
+    """Run one hidden generation, using local context and no chat output sinks."""
+    job = result.get("agent_body_job")
+    if not isinstance(job, dict):
+        return
+    job_id = job.get("job_id")
+    palette_count = job.get("palette_count")
+    prompt = job.get("prompt")
+    if (not isinstance(job_id, str) or not job_id
+            or type(palette_count) is not int or not 1 <= palette_count <= 255
+            or not isinstance(prompt, str) or not prompt):
+        return
+    payload = {"job_id": job_id, "status": "failed", "attempts": 0,
+               "error_code": "agent_body_generation_failed"}
+    started = time.monotonic()
+    private_token = _AGENT_BODY_PRIVATE.set(True)
+    try:
+        remaining = float(job.get("expires_at_epoch") or 0) - time.time() - 5
+        deadline = time.monotonic() + min(80.0, remaining)
+        if remaining <= 0:
+            raise TimeoutError()
+        identity = _resident_existing_identity()
+        memory = _capture_post_json(
+            "/v1/memory/index", payload={"limit": 12},
+            timeout=_remaining_deadline_timeout(deadline, cap_sec=15),
+        )
+        summaries = [item["summary"][:160] for item in (memory.get("items") or [])[:12]
+                     if isinstance(item, dict) and isinstance(item.get("summary"), str)]
+        prompt += "\n\n身份卡：\n" + (json.dumps(identity, ensure_ascii=False)
+                                               if identity else "当前不可用或尚无内容。")
+        prompt += "\n\n记忆样本：\n" + (json.dumps(summaries, ensure_ascii=False)
+                                               if summaries else "当前不可用或尚无内容。")
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (attempt and remaining < 25):
+                raise TimeoutError()
+            payload["attempts"] = attempt + 1
+            kwargs = {"raw_text": True, "lane": "background", "isolated_session": True,
+                      "absolute_deadline": min(deadline, time.monotonic() + 70)}
+            if AGENT_MODE == "cli":
+                kwargs["tools_disabled"] = True
+            reply = call_agent(prompt, **kwargs)
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
+            try:
+                rows = _agent_body_rows(reply, palette_count)
+            except ValueError as exc:
+                payload["error_code"] = "agent_body_generation_invalid_output"
+                prompt += f"\n\n上次输出违反规则：{exc}。请重新输出完整合法 rows JSON。"
+                continue
+            payload = {"job_id": job_id, "status": "ok", "rows": rows, "attempts": attempt + 1}
+            break
+    except (TimeoutError, subprocess.TimeoutExpired):
+        payload["error_code"] = "agent_body_generation_timeout"
+    except Exception:
+        # Never send an exception's text: it can contain upstream output or keys.
+        payload["error_code"] = "agent_body_generation_failed"
+    finally:
+        _AGENT_BODY_PRIVATE.reset(private_token)
+        log.info("agent_body job_id=%s status=%s error_code=%s attempts=%s dur_ms=%s",
+                 job_id, payload["status"], payload.get("error_code", ""),
+                 payload["attempts"], round((time.monotonic() - started) * 1000))
+    try:
+        _refresh_auth_header()
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/internal/agent-body/generate/result",
+            json=payload, headers=_HEADERS, timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        log.warning("agent_body result delivery failed job_id=%s error_class=%s", job_id, type(exc).__name__)
+
+
 def _process_vision_probe(result: dict) -> None:
     """Run the hidden two-image control probe outside chat/session state."""
     probe = result.get("vision_probe")
@@ -16288,6 +16459,13 @@ def _proactive_chat_context_from_history(history: list[dict] | None, *, limit: i
         last_user_message_age_sec=age_for(last_user) if last_user else None,
         last_visible_proactive_age_sec=age_for(last_proactive) if last_proactive else None,
         visible_proactive_count_24h=proactive_count_24h,
+        # Keep the anchor even when stale-tail truncation omits that user row.
+        # Historical quoted_memories are not explicit references in this wake.
+        memory_anchor=(
+            {"id": last_user.get("id") or last_user.get("message_id"),
+             "seq": last_user.get("seq")}
+            if last_user else None
+        ),
     )
 
 
@@ -19109,13 +19287,17 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         # ── 闸已放行,现在才付昂贵的上下文构建 ────────────────────────
+        _recall_turn_reset()
+        trace_id = str(job.get("trace_id") or job_id)
+        # Introduction deliberately has no recent-chat fetch/user anchor.
+        recent_context = ProactiveChatContext()
         if is_introduction:
             screen_payloads = []
             screen_paths = []
             message = _message_for_introduction_job(job)
         else:
             screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-            recent_context = recent_chat_context_for_proactive()
+            recent_context = _coerce_proactive_chat_context(recent_chat_context_for_proactive())
             # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
             # (its prompt deliberately omits the board).
             perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
@@ -19125,6 +19307,12 @@ def _process_proactive_jobs(jobs: list) -> float:
                 recent_chat_context=recent_context,
                 perception_digest=perception_digest,
             )
+        # T582: select against the latest user in the existing history snapshot,
+        # never the wake text or a newer assistant row. No anchor/fetch failure
+        # stays unknown, and the shared final-driver hook settles actual arrival.
+        auto_text, _auto_ids = _auto_memory_block_for(recent_context.memory_anchor or {}, trace_id)
+        if auto_text:
+            message = f"{auto_text}\n\n{message}"
         update_proactive_job_status(job_id, "realizing")
         # 屏幕像素轮必须armed平台出站围栏 —— 聊天道一直这么做(`screen_pixel_turn`),
         # 主动道**从来没有**:它带着 screen_payloads 调用,却让 outbound_fence 保持
@@ -19143,6 +19331,7 @@ def _process_proactive_jobs(jobs: list) -> float:
                 # 与聊天道不同,两条道永远共享不了 provider 的 prompt cache。
                 # 身份写保护不受影响:io_cli 的闸只放行 chat/未设,proactive 仍被拒。
                 lane="proactive",
+                trace_id=trace_id,
                 **({"outbound_fence": True} if pixel_turn else {}),
             )
         except Exception as e:
@@ -19177,6 +19366,10 @@ def _process_proactive_jobs(jobs: list) -> float:
                 job_id=job_id,
             )
             continue
+        finally:
+            # CLI terminals consume their ledger; also clear state for HTTP or
+            # calls that fail before a CLI terminal so later jobs cannot reuse it.
+            _recall_turn_reset()
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
         # The turn reached the agent — open the across-batch coalescing window so
@@ -22919,12 +23112,13 @@ def run() -> None:
 
     if FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():
-            log.critical(
-                "Decrypt source unreachable (enclave=%s). "
-                "Cannot decrypt user messages — exiting.",
-                FEEDLING_ENCLAVE_URL,
+            # Keep the consumer alive so later poll cycles can recover without
+            # a supervisor restart; failed history reads already skip the cycle.
+            log.error(
+                "decrypt source unreachable at startup after up to %d attempts; "
+                "continuing — poll cycles will be skipped until it recovers",
+                ENCLAVE_FETCH_MAX_ATTEMPTS,
             )
-            sys.exit(1)
     else:
         # No decrypt source at all. Establish the reported health immediately so
         # the FIRST poll already carries `unconfigured` — otherwise the initial
@@ -23159,6 +23353,7 @@ def run() -> None:
 
             # Hidden control-plane capability probe. It never becomes a chat
             # message and uses a fresh isolated model session.
+            _process_agent_body_job(result)
             _process_vision_probe(result)
 
             if result.get("timed_out"):

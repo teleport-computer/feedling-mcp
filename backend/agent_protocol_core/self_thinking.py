@@ -100,7 +100,15 @@ def internal_field_terms_pattern() -> str:
 # io tried to think rather than nothing/garbage. (zh for now; localization TBD.)
 THINKING_FAILED_MARKER = "（思考没写完）"
 
-_TAG_WORDS = ("thinking", "reasoning", "thought", "think")  # longest-first
+# ``aside`` is the tag the resident lane uses when the driver is Claude Code
+# (T587, 2026-09-15): the block is a first-person aside the app shows to the
+# user under 「参考内容」; naming it "think" made Anthropic's request classifier
+# read the protocol as a request for the model's hidden reasoning and reject
+# every turn on the Opus 5 family. The parser accepts both tags for every
+# driver so a block wrapped in either can never reach the user un-stripped.
+_TAG_WORDS = ("thinking", "reasoning", "thought", "think", "aside")  # longest-first
+TAG_THINK = "think"
+TAG_ASIDE = "aside"
 _TAG_ALT = "|".join(_TAG_WORDS)
 # 可选的 XML 命名空间前缀。起始字符必须放宽到 **Unicode 字母**：2026-09-06 线上
 # （usr_1baf…，pi + mimo-v2.5）真实写出的是 `</𝑎𝑛𝑡𝑚𝑙:thinking>` —— 前缀全是
@@ -141,6 +149,52 @@ INSTRUCTION = (
     " 只说日常意图：不出现工具名、参数、字段名、服务器、「身份卡」这类内部或技术说法，\n"
     " 也不要在正文里提到这条规则本身。"
 )
+
+# The ``<think>`` rendering above is what pi / codex drivers keep receiving,
+# byte for byte. The Claude Code driver receives the same protocol under the
+# ``<aside>`` tag with the visibility sentence stated truthfully: the block is
+# shown to the user (folded under 「参考内容」), it is not a private channel.
+_THINK_VISIBILITY_SENTENCE = " 只是这几句他听不见。"
+_ASIDE_VISIBILITY_SENTENCE = " 这几句会折叠在消息上方的「参考内容」里展示给他，他想看就能看到。"
+# The opening line asks for the persona's mood and intent, not the model's
+# private reasoning: measured 2026-09-15 (T587 bisect), this phrase alone kept
+# the Opus 5 family rejecting the aside rendering; reworded (Seven picked this
+# candidate out of three that each measured 0/3 on Opus 5 and Opus 5[1m]), 0/3.
+_THINK_CONTENT_PHRASE = "里面写你此刻心里真实的想法"
+_ASIDE_CONTENT_PHRASE = "里面写你这会儿的感受，和你打算怎么接他这句"
+# Substitutions applied to INSTRUCTION for the aside rendering, in order. Each
+# anchor must occur exactly once so a wording edit upstream cannot silently
+# leave the think phrasing in the aside rendering.
+_ASIDE_SUBSTITUTIONS = (
+    (_THINK_VISIBILITY_SENTENCE, _ASIDE_VISIBILITY_SENTENCE),
+    (_THINK_CONTENT_PHRASE, _ASIDE_CONTENT_PHRASE),
+)
+
+
+def _retag(text: str, tag: str) -> str:
+    return text.replace("<think>", f"<{tag}>").replace("</think>", f"</{tag}>")
+
+
+def instruction(tag: str = TAG_THINK) -> str:
+    """Return the shared instruction rendered for one protocol tag.
+
+    ``think`` returns ``INSTRUCTION`` itself (unchanged for pi / codex).
+    ``aside`` swaps every ``<think>``/``</think>`` for the aside tag, states
+    truthfully that the block is shown to the user, and asks for the persona's
+    mood and intent rather than "genuine inner thoughts" (the block is a visible
+    aside, not the model's reasoning).
+    """
+    if tag == TAG_THINK:
+        return INSTRUCTION
+    if tag != TAG_ASIDE:
+        raise ValueError(f"unsupported self-thinking tag: {tag!r}")
+    text = INSTRUCTION
+    for anchor, replacement in _ASIDE_SUBSTITUTIONS:
+        if text.count(anchor) != 1:
+            raise RuntimeError(f"self-thinking aside anchor drifted: {anchor!r}")
+        text = text.replace(anchor, replacement)
+    return _retag(text, tag)
+
 
 # Foreground chat and every proactive wake lane select one whole rendering from
 # the reply-language policy.  Each rendering intentionally has no blank line:
@@ -330,6 +384,21 @@ def strip_tag_markers(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", _TAG_MARKER.sub("", str(text or ""))).strip()
 
 
+_TRUNCATED_OPENER = re.compile(r"^<\s*/?\s*(?:[^\W\d_][\w.-]*:)?([A-Za-z]{2,})\s*$")
+
+
+def _truncated_protocol_opener(text: str) -> bool:
+    """``<asid`` — the whole (invisible-stripped) text is one opener cut before
+    its ``>``, and the letters are a strict prefix of a protocol tag word.
+    A complete HTML tag (``<a href>x``) never matches: it has a ``>`` and more
+    text; a single letter (``<a``) is deliberately not treated as protocol."""
+    m = _TRUNCATED_OPENER.match(_lstrip_invisible(str(text or "")).rstrip())
+    if not m:
+        return False
+    word = m.group(1).lower()
+    return any(w != word and w.startswith(word) for w in _TAG_WORDS)
+
+
 def strip_all_thinking(text: str, *, sanitize: bool = True) -> tuple[str, str, str]:
     """全文剥离版，返回 ``(status, thinking, reply)``，状态常量与
     :func:`split_thinking` 完全相同，方便调用点按 kill switch 二选一。
@@ -344,6 +413,12 @@ def strip_all_thinking(text: str, *, sanitize: bool = True) -> tuple[str, str, s
     统一剥离**判据**，不该顺带改掉它的展示格式。
     """
     raw = str(text or "")
+    if _truncated_protocol_opener(raw):
+        # 正文只有一个被截断的协议开标签头（``<asid`` / ``<thin``）：这是被
+        # token 上限切断的思考块，不是可见文字。之前它会原样漏成消息
+        # （T587 codex3 审出）。只看开头、只认真前缀、只在没有 ``>`` 时判定，
+        # 所以 ``<a href="…">`` 这类普通 HTML 正文不受影响。
+        return FAILED, "", ""
     if not _RESIDUE.search(raw):
         # 逐字节不变的快路径。没有标签就绝不碰，是 kill switch 之外的第二道保险。
         return ABSENT, "", raw
