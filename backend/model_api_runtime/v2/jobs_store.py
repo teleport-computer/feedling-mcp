@@ -41,6 +41,7 @@ from chat.reply_language import (
 )
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
+from memory import capture_failure
 from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 from proactive import capture_daily
@@ -3334,7 +3335,7 @@ def _capture_fail_on_cursor(
 
     ## 为什么 V2 要单独接
 
-    V1 的逃生阀在 ``proactive.capture_scheduler`` 里。V2 的落卡**不走那里** ——
+    V1 的逃生阀接在 ``proactive.capture_scheduler`` 里。V2 的落卡**不走那里** ——
     worker 的 ``_record_extraction_status`` 对 lane == "capture" 直接 return，
     V2 落卡的失败状态走这个持久批次协议。2026-09-14 prod 实测：还卡着的
     落卡用户抽查 12 个，12 个全是 V2，就是因为逃生阀一直没接到这条路上。
@@ -3350,11 +3351,9 @@ def _capture_fail_on_cursor(
     failed = dict(state)
     skip_applied = False
     if increment_backoff and isinstance(window, dict) and window:
-        # 和 V1 用**同一个**判断函数 —— 两边各写一遍必然漂，而漂了不报错
-        # （2026-09-13 就这么漂过一次：两处各想漏了同一个边界）。
-        from proactive import capture_scheduler
-
-        patch, _streak, skip_applied = capture_scheduler._capture_failure_patch(
+        # 和 V1 用**同一个**判断函数（memory.capture_failure）—— 两边各写一遍
+        # 必然漂，而漂了不报错（2026-09-13 就这么漂过一次）。
+        patch, _streak, skip_applied = capture_failure.capture_failure_patch(
             failed, window, now_ts=time.time(), reason=str(error or ""))
         failed.update(patch)
     else:

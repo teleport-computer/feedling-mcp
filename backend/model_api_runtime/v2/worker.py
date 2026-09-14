@@ -1919,6 +1919,27 @@ PUBLIC_FAILURE_CODES = frozenset(
 )
 
 
+def _capture_window_from_prepared_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    """Prepared 批次行 → 失败处理/逃生阀认得的窗口形状（只取游标字段，不碰内容）。"""
+    def _int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    try:
+        until_ts = float(batch.get("until_ts") or 0.0)
+    except (TypeError, ValueError):
+        until_ts = 0.0
+    return {
+        "after_message_id": str(batch.get("after_message_id") or "")[:160],
+        "after_seq": _int(batch.get("after_seq")),
+        "until_message_id": str(batch.get("until_message_id") or "")[:160],
+        "until_ts": until_ts,
+        "through_seq": _int(batch.get("through_seq")),
+    }
+
+
 def _extraction_failure_code(exc: BaseException) -> str:
     """Preserve expected extraction causes without persisting raw messages."""
     # Historical workers persisted this exception by its bare class name as
@@ -12435,6 +12456,13 @@ async def _run_extraction(
                 after_seq=capture_after_seq,
             )
             if prepared_retry is not None:
+                # 这批消息上次已经处理过、只是没提交成功。窗口要按**那一批**还原：
+                # 下面的 commit 如果又抛异常，失败处理会拿 capture_window 去判断
+                # 要不要跳过；还停在上面那个 until_message_id="" 的空壳的话，
+                # 逃生阀永远不触发，这个批次就成了新的队头阻塞。
+                capture_window.update(
+                    _capture_window_from_prepared_batch(prepared_retry)
+                )
                 await _ensure_capture_not_halted("prepared_retry_commit")
                 committed_retry = await asyncio.to_thread(
                     deps.commit_capture_batch,
