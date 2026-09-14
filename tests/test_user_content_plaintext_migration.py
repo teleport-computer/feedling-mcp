@@ -724,3 +724,112 @@ def test_frame_get_follows_persisted_plaintext_migration_key(monkeypatch):
     loaded = db.frame_get(user_id, "frame-key", unavailable_raises=True)
 
     assert base64.b64decode(loaded["body_b64"]) == raw
+
+
+def test_apply_limit_and_rate_only_attempt_bounded_migratable_items(monkeypatch):
+    items = [
+        plaintext_migration.Item(
+            "memory", f"m-{index}", "migratable_shared",
+            {"id": f"m-{index}", "body_ct": "sealed", "K_enclave": "key"},
+        )
+        for index in range(3)
+    ]
+    items.insert(
+        0,
+        plaintext_migration.Item(
+            "memory", "plain", "already_plaintext", {"id": "plain", "body": "ok"}
+        ),
+    )
+    monkeypatch.setattr(
+        plaintext_migration, "content_encryption_preference", lambda _uid: "off"
+    )
+    monkeypatch.setattr(plaintext_migration, "inventory", lambda _uid: items)
+    monkeypatch.setattr(plaintext_migration, "make_decrypt", lambda _uid: object())
+    attempted = []
+    monkeypatch.setattr(
+        plaintext_migration,
+        "migrate_item",
+        lambda _uid, item, _decrypt: attempted.append(item.item_id) or "migrated",
+    )
+    sleeps = []
+    monkeypatch.setattr(plaintext_migration.time, "sleep", sleeps.append)
+
+    result = plaintext_migration.run(
+        "usr_rate_limit", apply=True, limit=2, rate=2.0
+    )
+
+    assert attempted == ["m-0", "m-1"]
+    assert sleeps == [0.5]
+    assert result.counts == {
+        "already_plaintext": 1,
+        "migrated": 2,
+        "not_attempted_limit": 1,
+    }
+
+
+@pytest.mark.parametrize(("limit", "rate"), [(-1, 1.0), (0, 0), (0, -2.0)])
+def test_run_rejects_invalid_limit_or_rate_before_inventory(monkeypatch, limit, rate):
+    monkeypatch.setattr(
+        plaintext_migration,
+        "inventory",
+        lambda _uid: pytest.fail("validation must precede inventory"),
+    )
+    with pytest.raises(ValueError):
+        plaintext_migration.run("usr_invalid_controls", limit=limit, rate=rate)
+
+
+def test_cli_failure_report_does_not_expose_exception_or_item_id(monkeypatch, capsys):
+    secret = "secret-body-and-item-id"
+    monkeypatch.setenv(plaintext_migration.APPLY_ENV, "1")
+    monkeypatch.setattr(
+        plaintext_migration, "content_encryption_preference", lambda _uid: "off"
+    )
+    monkeypatch.setattr(
+        plaintext_migration,
+        "inventory",
+        lambda _uid: [
+            plaintext_migration.Item(
+                "memory",
+                secret,
+                "migratable_shared",
+                {"id": secret, "body_ct": secret, "K_enclave": "key"},
+            )
+        ],
+    )
+    monkeypatch.setattr(plaintext_migration, "make_decrypt", lambda _uid: object())
+    monkeypatch.setattr(
+        plaintext_migration,
+        "migrate_item",
+        lambda *_a: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+
+    rc = cli.main(
+        [
+            "--user",
+            "usr_redacted",
+            "--apply",
+            "--allow-plaintext-rewrite",
+            "--json",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert rc == 1
+    assert secret not in output.out and secret not in output.err
+    assert json.loads(output.out)["counts"] == {"failed_transform_or_storage": 1}
+
+
+def test_cli_redacts_unexpected_database_or_setup_failure(monkeypatch, capsys):
+    secret_dsn = "postgresql://secret:password@example.invalid/prod"
+    monkeypatch.setattr(
+        plaintext_migration,
+        "run",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError(secret_dsn)),
+    )
+
+    assert cli.main(["--user", "usr_setup_failure", "--json"]) == 1
+
+    output = capsys.readouterr()
+    assert secret_dsn not in output.out and secret_dsn not in output.err
+    assert output.out == ""
+    assert "runtimeerror" in output.err

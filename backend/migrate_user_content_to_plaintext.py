@@ -25,6 +25,14 @@ def _parser() -> argparse.ArgumentParser:
         help="acknowledge the irreversible plaintext rewrite",
     )
     parser.add_argument("--json", action="store_true", help="print JSON counters")
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="maximum migratable rows to attempt (0 means all)",
+    )
+    parser.add_argument(
+        "--rate", type=float, default=2.0,
+        help="maximum migration attempts per second (default: 2)",
+    )
     return parser
 
 
@@ -40,10 +48,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--allow-plaintext-rewrite is only valid with --apply")
 
     try:
-        result = plaintext_migration.run(args.user, apply=args.apply)
+        result = plaintext_migration.run(
+            args.user,
+            apply=args.apply,
+            limit=args.limit,
+            rate=args.rate,
+        )
     except (PermissionError, ValueError) as exc:
         print(f"migration refused: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 - never print data-bearing details
+        print(
+            f"migration failed: {type(exc).__name__.lower()}",
+            file=sys.stderr,
+        )
+        return 1
 
     report = result.public_dict()
     if args.json:

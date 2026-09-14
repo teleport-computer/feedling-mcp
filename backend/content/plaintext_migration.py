@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import time
 from typing import Iterable
 
 import db
@@ -447,23 +448,50 @@ def migrate_item(user_id: str, item: Item, decrypt) -> str:
     return "migrated" if cas_inline_doc(user_id, item, new_doc) else "cas_conflict"
 
 
-def run(user_id: str, *, apply: bool = False) -> Result:
+def run(
+    user_id: str,
+    *,
+    apply: bool = False,
+    limit: int = 0,
+    rate: float = 2.0,
+) -> Result:
     user_id = str(user_id or "").strip()
     if not user_id:
         raise ValueError("exact user_id is required")
+    if int(limit) < 0:
+        raise ValueError("limit must be >= 0")
+    if float(rate) <= 0:
+        raise ValueError("rate must be > 0")
     if apply and content_encryption_preference(user_id) != "off":
         raise PermissionError("content_encryption must be explicitly off")
 
-    items = inventory(user_id)
+    items = list(inventory(user_id))
     counts: Counter[str] = Counter()
+    candidates = [
+        item for item in items if item.classification == "migratable_shared"
+    ]
+    attempted_candidates = candidates[:limit] if apply and limit else candidates
+    deferred = len(candidates) - len(attempted_candidates) if apply else 0
+    if deferred:
+        counts["not_attempted_limit"] = deferred
+    attempted_ids = {id(item) for item in attempted_candidates}
     decrypt = None
+    attempt_index = 0
     for item in items:
-        if not apply or item.classification != "migratable_shared":
-            counts[item.classification] += 1
+        if (
+            not apply
+            or item.classification != "migratable_shared"
+            or id(item) not in attempted_ids
+        ):
+            if not apply or item.classification != "migratable_shared":
+                counts[item.classification] += 1
             continue
-        if decrypt is None:
-            decrypt = make_decrypt(user_id)
+        if attempt_index:
+            time.sleep(1.0 / float(rate))
+        attempt_index += 1
         try:
+            if decrypt is None:
+                decrypt = make_decrypt(user_id)
             counts[migrate_item(user_id, item, decrypt)] += 1
         except Exception:  # noqa: BLE001 - report only redacted failure class
             counts["failed_transform_or_storage"] += 1
