@@ -32,6 +32,13 @@ change must not be interpreted as an API guarantee.
   reports from older self-hosted consumers: a "no cards" completion is
   recorded as `dream_context_unavailable` when the garden has active cards.
 
+- Hosted Runtime V2 background memory jobs (Capture, Dream, profile) are no
+  longer mistaken for stuck when a single provider call needs a compatibility
+  retry (for example a model that rejects `temperature`). Each HTTP request
+  inside a provider attempt now counts as progress for the worker's stall
+  watchdog, so a slow but healthy request is not killed and re-run (which also
+  billed the provider twice). Stall budgets are unchanged.
+
 - Hosted Runtime V2 Capture and Dream now treat a model reply that stops at the
   output-token limit without any visible text (typically a thinking model that
   spent the whole budget on reasoning) as an output truncation instead of an

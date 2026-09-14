@@ -360,3 +360,86 @@ def test_extract_treats_anthropic_max_tokens_on_a_partial_reply_as_truncation(mo
     ))
     assert (items, reason) == ([], None)
     assert [row["max_tokens"] for row in seen] == [4000, 8000]
+
+
+# --------------------------------------------------------------------------- #
+# Heavy-pool watchdog: slow wires and compatibility fallbacks inside one attempt
+# --------------------------------------------------------------------------- #
+
+def test_slow_compatibility_fallback_wires_never_starve_the_heavy_pool_stall_clock(
+    monkeypatch,
+):
+    """Dream runs in a Heavy-pool slot whose stall budget (120s) is shorter than
+    two extraction wires (2 x 90s). One reliable attempt can hold several wires
+    (a compatibility fallback re-sends without ``temperature``), and the retry
+    wrapper used to report progress only around the whole attempt, so a slow but
+    healthy request was killed and requeued (duplicate spend).
+
+    Fault injection: every wire takes just under the 90s wire timeout on a fake
+    clock; the first wire of each attempt is a compatibility 400. The real
+    transport, parser, retry wrapper and ``extract`` run; the stall ages the
+    watchdog would observe are computed from the reported progress timestamps
+    and fed to the real ``should_kill`` with the real Heavy-pool budgets.
+    """
+    from model_api_runtime.v2 import pool_config, watchdog
+
+    clock = {"now": 0.0}
+    progress: list[tuple[float, str]] = []
+    wires: list[dict] = []
+    budget = extraction.max_output_tokens_for_lane("dream")
+    retry_budget = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    answers = [
+        (400, {"error": {"message": "`temperature` is deprecated for this model."}}),
+        (200, _deepseek_reasoning_spent_budget(budget)),
+        (400, {"error": {"message": "`temperature` is deprecated for this model."}}),
+        (200, _valid_dream_reply()),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        wires.append(json.loads(request.content or b"{}"))
+        clock["now"] += extraction._TIMEOUT_SEC - 1.0  # slow, but inside the wire timeout
+        status, body = answers[len(wires) - 1]
+        return httpx.Response(status, json=body)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(pc, "_shared_async_client", client)
+    monkeypatch.setattr(pc, "_validate_egress_url", lambda _url: None, raising=False)
+
+    items, reason = asyncio.run(extraction.extract(
+        provider_config=_WIRES["deepseek"][0],
+        prompt="P",
+        parse=_dream_parse,
+        parse_retry=_dream_parse_retry(),
+        max_tokens=budget,
+        truncation_retry_max_tokens=retry_budget,
+        progress_cb=lambda stage, attempt: progress.append((clock["now"], stage)),
+    ))
+    finished_at = clock["now"]
+
+    assert (items, reason) == ([], None)
+    assert len(wires) == 4
+    assert "temperature" in wires[0] and "temperature" not in wires[1]
+    assert [stage for _at, stage in progress].count("wire_start") == 4
+
+    heavy_dream_slots = [
+        slot for slot in pool_config.RuntimePoolConfig.from_env().slots
+        if "dream" in slot.lanes
+    ]
+    assert heavy_dream_slots and {slot.pool for slot in heavy_dream_slots} == {"heavy"}
+    boundaries = [0.0, *(at for at, _stage in progress), finished_at]
+    longest_silence = max(b - a for a, b in zip(boundaries, boundaries[1:]))
+    for slot in heavy_dream_slots:
+        assert not watchdog.should_kill(
+            {
+                "alive": True,
+                "event_loop_heartbeat_age_sec": 1.0,
+                "last_slot_progress_age_sec": 1.0,
+                "active_turn_count": 1,
+                "current_turn_age_sec": finished_at,
+                "current_turn_stall_age_sec": longest_silence,
+            },
+            child_liveness_timeout_sec=45.0,
+            jobs_claimable=True,
+            turn_stall_timeout_sec=slot.stall_budget_sec,
+            turn_absolute_timeout_sec=slot.absolute_budget_sec,
+        ), (slot.slot_id, longest_silence)

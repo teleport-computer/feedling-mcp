@@ -3449,6 +3449,26 @@ def _extend_attempt_trace(
     return ordinals
 
 
+# Set only by ``reliable_chat_completion_async`` while a caller-supplied
+# ``progress_cb`` is active. One outer attempt can contain several bounded HTTP
+# wires (compatibility fallbacks); without a boundary between them a hosted
+# watchdog sees one long silent await and may kill a healthy slot. Task-local,
+# so concurrent turns never see each other's callback.
+_WIRE_START_CB: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "feedling_provider_wire_start_cb", default=None
+)
+
+
+def _notify_wire_start(inner_attempt: int) -> None:
+    callback = _WIRE_START_CB.get()
+    if callback is None:
+        return
+    try:
+        callback(int(inner_attempt))
+    except Exception:  # noqa: BLE001 — observation must never change a request
+        pass
+
+
 async def _traced_async_json_post(
     *,
     trace: list[dict[str, Any]] | None,
@@ -3465,6 +3485,7 @@ async def _traced_async_json_post(
     therefore preserves the exact JSON body without an extra deep-copy of a large
     prompt on the latency-sensitive path.
     """
+    _notify_wire_start(inner_attempt)
     if trace is None:
         return await post(request_payload), None
 
@@ -5981,6 +6002,19 @@ async def reliable_chat_completion_async(
         except Exception:  # noqa: BLE001
             pass
 
+    async def _with_wire_progress(awaitable: Any, attempt: int) -> Any:
+        # Every HTTP wire inside one attempt (compatibility fallbacks included)
+        # is a real progress boundary; report it through the same callback.
+        # Set and reset inside the awaiting task, so ``wait_for``'s child task
+        # and concurrent turns never see a stale callback.
+        if progress_cb is None:
+            return await awaitable
+        token = _WIRE_START_CB.set(lambda _inner: _progress("wire_start", attempt))
+        try:
+            return await awaitable
+        finally:
+            _WIRE_START_CB.reset(token)
+
     for attempt in range(1, attempts + 1):
         started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
@@ -6002,7 +6036,9 @@ async def reliable_chat_completion_async(
                 # detached zombie.
                 try:
                     result = await asyncio.wait_for(
-                        chat_completion_async(*args, **attempt_kwargs),
+                        _with_wire_progress(
+                            chat_completion_async(*args, **attempt_kwargs), attempt
+                        ),
                         timeout=remaining,
                     )
                 except asyncio.TimeoutError as timeout_exc:
@@ -6014,7 +6050,9 @@ async def reliable_chat_completion_async(
                         "provider absolute deadline exceeded"
                     ) from timeout_exc
             else:
-                result = await chat_completion_async(*args, **attempt_kwargs)
+                result = await _with_wire_progress(
+                    chat_completion_async(*args, **attempt_kwargs), attempt
+                )
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(

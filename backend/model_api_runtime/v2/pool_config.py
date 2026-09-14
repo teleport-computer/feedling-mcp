@@ -62,6 +62,11 @@ class RuntimePoolConfig:
             SlotSpec("wake", index, _WAKE_POOL_LANES, 240.0, 900.0)
             for index in range(wake_slots)
         )
+        # Heavy's 120s stall is shorter than serve_worker's default clock (which
+        # must cover two 90s extraction wires). It holds for Capture/Dream only
+        # because the provider retry wrapper reports a boundary before every
+        # HTTP wire, so the longest silence is one wire; see
+        # tests/test_v2_pool_config.py::test_heavy_extraction_slots_outlast_one_provider_wire.
         for index in range(heavy_slots):
             lanes = _HEAVY_LANES | ({"profile"} if index == 0 else set())
             slots.append(SlotSpec("heavy", index, frozenset(lanes), 120.0, 1200.0))
