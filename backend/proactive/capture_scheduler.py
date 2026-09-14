@@ -142,6 +142,9 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "capture_account_fail_since": _safe_float(doc.get("capture_account_fail_since"), 0.0),
         #: 最近一次失败若是账号/服务问题，对照表里的类别（如 quota_insufficient），给用户提示说清原因。
         "capture_account_error_code": str(doc.get("capture_account_error_code") or "")[:80],
+        #: 最近一次亲手累计失败的 V2 任务 id —— 提示只认它（见 worker._notify_capture_backoff）。
+        #: 🔴 必须在这个白名单里：生产读状态走本函数归一化，漏了字段提示就永远不发（Codex 第 7 轮）。
+        "last_capture_failed_job_id": str(doc.get("last_capture_failed_job_id") or "")[:80],
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))

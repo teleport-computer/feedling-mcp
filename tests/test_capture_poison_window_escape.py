@@ -332,6 +332,12 @@ def test_one_parse_failure_cannot_inherit_earlier_write_failures():
     ("capture_agent_call_failed:RuntimeError: request rejected at byte 512", "other"),
     ("capture_agent_call_failed:RuntimeError: upstream returned HTTP 502 Bad Gateway", "account"),
     ("capture_agent_call_failed:RuntimeError: request timed out after 120s", "account"),
+    # 对照表已认定的其他上游瞬时故障形状（Codex 第 7 轮：漏了会在第 6 次被跳过）
+    ("capture_agent_call_failed:RuntimeError: stream disconnected before completion", "account"),
+    ("capture_agent_call_failed:RuntimeError: response ended without finish_reason", "account"),
+    ("capture_agent_call_failed:RuntimeError: provider unreachable", "account"),
+    ("capture_agent_call_failed:RuntimeError: provider_http_403: Request failed. Please try again later.",
+     "account"),
     ("json_decode_error:JSONDecodeError", "parse"),
     ("extraction_failed:json_decode_error", "parse"),
 ])

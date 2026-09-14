@@ -17,7 +17,7 @@ import db
 from core import envelope as core_envelope
 from core import store as core_store
 from memory import service as memory_service
-from model_api_runtime.v2 import jobs_store, trajectory, worker
+from model_api_runtime.v2 import jobs_store, serve_worker, trajectory, worker
 from proactive import proactive_core
 
 
@@ -1962,7 +1962,9 @@ def _poison_deps(uid: str, *, messages: list[dict], **overrides) -> "worker.Turn
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
         read_memory_context=lambda _uid: {},
-        read_capture_state=lambda _uid: db.get_blob_strict(_uid, "capture_state") or {},
+        # 生产装配（serve_worker._read_capture_state）：读状态要经过 _state_doc 归一化。
+        # 用原始 blob 当替身会漏掉「写了字段、归一化白名单却没有」这类 bug（Codex 第 7 轮）。
+        read_capture_state=serve_worker._read_capture_state,
         read_compaction_tail_after_seq=tail,
         build_memory_envelope=lambda *_args: {},
         get_prepared_capture_batch=jobs_store.get_prepared_capture_batch,
@@ -2094,8 +2096,10 @@ def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeyp
         # 以前 V2 完全没有这条提示。
         from notices import core as notices_core
 
-        keys = {r["dedupe_key"] for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
-        assert "memory_backoff:capture" in keys, "V2 落卡连续失败，用户侧没有任何提示"
+        rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+        assert "memory_backoff:capture" in rows, "V2 落卡连续失败，用户侧没有任何提示"
+        # 第 limit 次触发了跳过：旧的「受阻、修好后补记」提示要被清掉（V2 按两个时间字段推断跳过）
+        assert rows["memory_backoff:capture"]["resolved"] is True, "跳过后旧提示还挂着"
     assert int(state["last_captured_until_seq"]) == 4
     assert state["last_captured_until_message_id"] == "m4"
     assert int(state["capture_skipped_windows"]) == 1
@@ -2292,7 +2296,7 @@ def test_disabling_capture_does_not_refresh_the_retrying_notice():
         read_messages=lambda _uid: [],
         resolve_provider=lambda _uid: (object(), {}),
         mint_enclave_token=lambda _uid: "rt",
-        read_capture_state=lambda u: db.get_blob_strict(u, "capture_state") or {},
+        read_capture_state=serve_worker._read_capture_state,
         cancel_capture_job=jobs_store.cancel_capture_job,
         fail_capture_job=jobs_store.fail_capture_job,
         capture_enabled=lambda _uid: False,
@@ -2300,3 +2304,49 @@ def test_disabling_capture_does_not_refresh_the_retrying_notice():
     assert asyncio.run(worker._run_turn(job, deps)) == "failed"
     keys = {r["dedupe_key"] for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
     assert "memory_backoff:capture" not in keys
+
+
+
+def test_v2_notice_is_raised_on_real_failures_and_cleared_by_real_commit():
+    """V2 落卡：经生产入口 _run_turn 连续失败 3 次 → 提示出现；之后真实提交成功 → 提示清掉。
+
+    读状态用生产装配（经 _state_doc 归一化），失败走真实 fail_capture_job，成功走真实
+    commit_capture_batch（它负责把失败次数清零）。
+    """
+    from notices import core as notices_core
+
+    uid = "u_capture_v2_notice_lifecycle"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    first_id, _job = _running(uid, owner="lifecycle-first")
+    assert jobs_store.prepare_capture_batch(
+        job_id=first_id, user_id=uid, claimed_by="lifecycle-first",
+        window=_window(after=0, through=4), actions=[_add(uid, "mom-lifecycle")],
+    ) is not None
+    assert jobs_store.fail_capture_job(
+        job_id=first_id, user_id=uid, claimed_by="lifecycle-first",
+        error="worker_crashed_after_prepare",
+    )
+
+    def commit_raises(**_kwargs):
+        raise RuntimeError("provider_http_503: upstream unavailable")
+
+    deps = _poison_deps(uid, messages=[], commit_capture_batch=commit_raises,
+                        capture_enabled=lambda _uid: True)
+    for attempt in range(3):
+        _job_id, job = _running(uid, owner=f"lifecycle-{attempt}", start=False)
+        assert asyncio.run(worker._run_turn(job, deps)) == "failed"
+
+    def _notice():
+        rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+        return rows.get("memory_backoff:capture")
+
+    raised = _notice()
+    assert raised is not None and raised["resolved"] is False
+
+    ok_deps = _poison_deps(uid, messages=[], commit_capture_batch=jobs_store.commit_capture_batch,
+                           capture_enabled=lambda _uid: True)
+    _job_id, job = _running(uid, owner="lifecycle-ok", start=False)
+    assert asyncio.run(worker._run_turn(job, ok_deps)) == "completed"
+    assert int(_capture_state(uid).get("capture_fail_streak") or 0) == 0
+    assert _notice()["resolved"] is True, "真实提交成功后提示没有清掉"

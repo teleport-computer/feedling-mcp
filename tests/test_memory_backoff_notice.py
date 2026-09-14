@@ -110,7 +110,7 @@ def test_v2_capture_failures_now_notify_the_user():
     """
     import asyncio
 
-    from model_api_runtime.v2 import jobs_store, worker
+    from model_api_runtime.v2 import jobs_store, serve_worker, worker
 
     uid = _uid(); seed_user(uid)
     import conftest
@@ -133,7 +133,8 @@ def test_v2_capture_failures_now_notify_the_user():
         read_messages=lambda _u: [],
         resolve_provider=lambda _u: (object(), {}),
         mint_enclave_token=lambda _u: "rt",
-        read_capture_state=lambda u: db.get_blob_strict(u, "capture_state") or {},
+        # 生产装配：经 _state_doc 归一化（用原始 blob 会漏掉白名单缺字段的 bug）
+        read_capture_state=serve_worker._read_capture_state,
     )
     # 别的任务（例如关闭落卡被取消的那个）拿着旧次数返回 failed：不能发
     asyncio.run(worker._notify_capture_backoff(

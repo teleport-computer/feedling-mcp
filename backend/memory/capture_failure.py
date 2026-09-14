@@ -213,7 +213,9 @@ _STRONG_UPSTREAM_EVIDENCE = re.compile(
     r"|(?:http|status|status[_ ]code|api error|error code|returned|responded)\W{0,3}5\d\d\b"
     r"|\b5\d\d\s+(?:internal server error|bad gateway|service unavailable|gateway time-?out)"
     r"|timed?[ _-]?out|timeout|connection (?:refused|reset|error|aborted)"
-    r"|service unavailable|bad gateway|overloaded|temporarily unavailable",
+    r"|service unavailable|bad gateway|overloaded|temporarily unavailable"
+    # 对照表里已认定的其他上游瞬时故障形状（Codex 第 7 轮：漏了会在第 6 次被跳过）
+    r"|unreachable|stream disconnected|ended without finish_reason",
     re.IGNORECASE,
 )
 
@@ -242,7 +244,12 @@ def account_error_code(reason: str) -> str:
         # 对照表的「服务不可用」是给聊天报错用的，裸三位 5 开头数字就算（``\b5\d{2}\b``）。
         # 逃生阀要更严：「max_tokens must be <= 500」「rejected at byte 512」是请求/内容问题，
         # 误判成服务故障会把 6 次兜底拖成 7 天（Codex 第 6 轮复现）。
-        if spec.code == "upstream_unavailable" and not _STRONG_UPSTREAM_EVIDENCE.search(raw):
+        if spec.code == "upstream_unavailable" and not (
+            _STRONG_UPSTREAM_EVIDENCE.search(raw)
+            # 中转站通用 403「Request failed. Please try again later.」—— 对照表按形状锚定在
+            # 开头，这里原因可能带着 capture_agent_call_failed: 等前缀，所以不锚定再认一次。
+            or re.search(error_contract._GENERIC_UPSTREAM_403_SHAPE, raw)
+        ):
             return ""
         return spec.code
     if "invalid key" in text:
