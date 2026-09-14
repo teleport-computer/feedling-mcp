@@ -20,6 +20,7 @@ import time
 import types
 import copy
 import os
+import re
 import sys
 import threading
 import uuid
@@ -263,6 +264,8 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_no_global_mirror_patching.py",
+        "test_mirror_group_capture.py",
         "test_resident_wake_memory.py",
         "test_resident_decrypt_probe_startup.py",
         "test_memory_bm25.py",
@@ -569,6 +572,42 @@ def capture_sleeps(monkeypatch, module, sink=None, *, on_sleep=None):
         f"{module.__name__}'s reference"
     )
     return sink
+
+def capture_mirror_groups(monkeypatch, sink=None):
+    """Capture mirror batches without unrelated background statistics writes.
+
+    ``tee_shadow.mirror`` is process-global: replacing ``execute_many`` with
+    list.append also captures debug_trace's daemon flushes. That made the
+    lane-rollup deletion test fail its exact one-group assertion in main CI
+    (T593), even though deletion itself emitted the correct batch.
+
+    Match the SQL target tables used by db.upsert_trace_write_stats and
+    db.upsert_contract_rejection_stats, never parameter text or the thread name.
+    If ANY statement targets one of those statistics tables, discard the whole
+    group; otherwise preserve its order and parameters. No real mirror writes
+    run unless the caller supplies a sink whose append explicitly forwards them.
+    Returns the supplied append-capable sink, or a new list.
+    """
+    from tee_shadow import mirror
+
+    if sink is None:
+        sink = []
+    stats_target = re.compile(
+        r"^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"
+        r"(?:trace_write_stats|trace_write_stats_health|contract_rejection_stats)"
+        r"(?=\s|\(|$)",
+        re.IGNORECASE,
+    )
+
+    def capture(statements):
+        group = list(statements)
+        if any(stats_target.match(sql) for sql, _params in group):
+            return
+        return sink.append(group)
+
+    monkeypatch.setattr(mirror, "execute_many", capture)
+    return sink
+
 
 def seed_user(user_id: str, **doc) -> None:
     """Test-only: insert a minimal row into the ``users`` table so per-user

@@ -14,6 +14,7 @@ import uuid
 from types import SimpleNamespace
 
 import db
+from conftest import capture_mirror_groups
 import pytest
 from voice import routes_asgi
 from voice import cleanup as summary
@@ -357,10 +358,7 @@ def test_uncovered_batch_mirrors_deletes_and_repairs_absent_primary_row(
             (uid, absent_id),
         )
 
-    mirrored = []
-    monkeypatch.setattr(
-        mirror, "execute_many", lambda statements: mirrored.append(statements)
-    )
+    mirrored = capture_mirror_groups(monkeypatch)
     # The process-wide trace stats writer shares this mirror entrypoint and
     # may flush while this test owns the monkeypatch. Reproduce that unrelated
     # traffic deterministically so the assertion cannot rely on global mirror
