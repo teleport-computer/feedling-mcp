@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
 import distillation_ledger  # noqa: E402
-from conftest import configure_model_api_route, seed_user  # noqa: E402
+from conftest import capture_mirror_groups, configure_model_api_route, seed_user  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import data_track  # noqa: E402
 from admin import lane_rollup_scheduler as sched  # noqa: E402
@@ -528,10 +528,7 @@ def test_freeze_mirrors_each_day_as_one_atomic_group(clean_rollup, monkeypatch):
     execute_many group of the verbatim main-path statements, watermark last.
     A torn/omitted group would make the TEE watermark claim days whose cells
     never arrived — after RDS shutdown that reads as "genuinely zero"."""
-    from tee_shadow import mirror as tee_mirror
-    groups: list[list] = []
-    monkeypatch.setattr(tee_mirror, "execute_many",
-                        lambda stmts: groups.append(list(stmts)))
+    groups = capture_mirror_groups(monkeypatch)
     uid = "usr_rollup_mirror"
     seed_user(uid)
     _insert_job(uid, "heartbeat", "completed",
@@ -689,10 +686,7 @@ def test_freeze_after_deletion_inserts_nothing(clean_rollup):
 def test_account_deletion_mirrors_the_anonymize_statements(clean_rollup, monkeypatch):
     """The TEE mirror group must be sourced from the SAME authoritative
     operation (delete_user), not from the belt."""
-    from tee_shadow import mirror as tee_mirror
-    groups: list[list] = []
-    monkeypatch.setattr(tee_mirror, "execute_many",
-                        lambda stmts: groups.append(list(stmts)))
+    groups = capture_mirror_groups(monkeypatch)
     uid = "usr_rollup_anonm"
     seed_user(uid)
     _insert_job(uid, "dream", "failed",

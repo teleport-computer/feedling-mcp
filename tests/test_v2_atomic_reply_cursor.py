@@ -772,8 +772,7 @@ def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
 
     from tee_shadow import mirror
 
-    mirrored: list[list[tuple[str, tuple]]] = []
-    monkeypatch.setattr(mirror, "execute_many", lambda statements: mirrored.append(statements))
+    mirrored = conftest.capture_mirror_groups(monkeypatch)
 
     # The process-wide debug trace stats writer shares this mirror entrypoint
     # and may flush while this test owns the monkeypatch.  Keep an unrelated
