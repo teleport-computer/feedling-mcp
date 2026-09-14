@@ -60,6 +60,36 @@ CAPTURE_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
 #: 否则就成了又一处"静默丢数据"。
 CAPTURE_POISON_SKIP_AFTER = 3
 
+#: 其它失败（存不进去、provider 抖动、拿不到密钥…）要连续失败这么多次才跳过。
+#:
+#: ## 为什么要分两档（2026-09-14 prod 实测）
+#:
+#: 上面那个 3 次的阈值，是按「解析失败是确定性的」设计的 —— 同样的输入必然
+#: 同样的输出，重试一万次也一样，早跳早好。
+#:
+#: 但上线后发现：引号修好之后，同一批窗口能解析了，却在**写入**那步栽了
+#: （``capture_shared_envelope_requires_enclave_key``）。而这类失败**重试是能好的**：
+#:
+#:     第一批  失败 失败 成功          ← 第三次过了，记忆保住
+#:     第二批  失败 失败 失败 → 跳过   ← 被 3 次阈值跳掉，这 9 条消息的记忆丢了
+#:
+#: 用确定性失败的阈值去处理会自己好的失败，就是在丢本来保得住的记忆。
+#: 所以非确定性失败多给几次机会；但仍然**有上限** —— 万一某批的写入失败其实是
+#: 确定性的，用户也不能被永久卡死（那正是这整套逃生阀要修的问题）。
+CAPTURE_TRANSIENT_SKIP_AFTER = 6
+
+#: 走 3 次快速跳过的失败原因前缀。**只列确定性的**：同样的窗口必然同样失败。
+#:
+#: 🔴 用白名单不用黑名单：遇到一个没见过的失败原因时，默认走保守的 6 次档。
+#: 反过来的话，新冒出来的一类会自己好的失败会被 3 次就跳掉，又开始悄悄丢记忆。
+_DETERMINISTIC_FAILURE_PREFIXES = (
+    "json_decode_error",
+    "no_json_object",
+    "not_an_object",
+    "invalid_card",
+    "format_error",
+)
+
 
 def _env_float(name: str, default: float, *, lo: float = 0.0, hi: float = 86400.0) -> float:
     try:
@@ -193,7 +223,8 @@ def _window_key(window: Mapping | None) -> str:
 
 
 def _poison_skip_patch(state: Mapping, window: Mapping | None, *,
-                       now_ts: float) -> dict | None:
+                       now_ts: float,
+                       threshold: int = CAPTURE_POISON_SKIP_AFTER) -> dict | None:
     """同一窗口连续失败到阈值 → 返回"把游标推过它"的补丁；否则 None。
 
     返回 None 时调用方照旧只累加 streak。
@@ -205,7 +236,7 @@ def _poison_skip_patch(state: Mapping, window: Mapping | None, *,
         # 一个我们说不清的位置。
         return None
     streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-    if streak < CAPTURE_POISON_SKIP_AFTER:
+    if streak < threshold:
         return None
     return {
         "last_captured_until_message_id": until_id,
@@ -224,7 +255,24 @@ def _poison_skip_patch(state: Mapping, window: Mapping | None, *,
     }
 
 
-def _capture_failure_patch(state, window, *, now_ts: float):
+def _skip_threshold_for(reason: str) -> int:
+    """这次失败要连续失败几次才跳过。见 CAPTURE_TRANSIENT_SKIP_AFTER 的说明。"""
+    text = str(reason or "").strip().lower()
+    if any(text.startswith(p) for p in _DETERMINISTIC_FAILURE_PREFIXES):
+        return CAPTURE_POISON_SKIP_AFTER
+    return CAPTURE_TRANSIENT_SKIP_AFTER
+
+
+def _failure_reason_of(job) -> str:
+    """从任务上取失败原因。两个位置都可能有，优先用更具体的那个。"""
+    src = job if isinstance(job, Mapping) else {}
+    result = src.get("capture_result")
+    if isinstance(result, Mapping) and result.get("reason"):
+        return str(result.get("reason"))
+    return str(src.get("status_reason") or "")
+
+
+def _capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     """一次落卡失败要怎么改状态。返回 ``(补丁, streak, 是否跳过)``。
 
     三种情形：
@@ -248,8 +296,12 @@ def _capture_failure_patch(state, window, *, now_ts: float):
     same = key == str(state.get("capture_fail_window_key") or "")
     streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
               if same else 1)
+    # 阈值看**这一次**的失败原因：解析失败是确定性的，3 次就跳；
+    # 存不进去这类会自己好的，给 6 次机会。见 CAPTURE_TRANSIENT_SKIP_AFTER。
     skip = (_poison_skip_patch({**state, "capture_fail_streak": streak - 1},
-                               window, now_ts=now_ts) if same else None)
+                               window, now_ts=now_ts,
+                               threshold=_skip_threshold_for(reason))
+            if same else None)
     if skip is not None:
         return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
     return ({"capture_fail_streak": streak,
@@ -778,11 +830,23 @@ def record_v2_capture_status(
             expected_frontier_id=after_id,
         )
     elif status_text == "failed":
+        # ⚠️ 这个函数签名里**没有 job**。之前这里写了 `_failure_reason_of(job)` 和
+        # `_capture_trace_job_id(job)` —— pyflakes 报 undefined name。
+        #
+        # 它没在 prod 上炸，只是因为 V2 的 capture lane 根本不走到这里：
+        # worker 的 `_record_extraction_status` 对 lane == "capture" 直接 return，
+        # V2 落卡的失败状态走 jobs_store 的持久批次协议（_capture_fail_on_cursor）。
+        # 但这里一旦被接上，第一次跳过就会 NameError。
+        #
+        # 失败原因没有就留空 —— 空原因会走保守的 6 次档，不会误把会自己好的
+        # 失败按 3 次跳掉。
+        reason = str((window or {}).get("failure_reason") or "") \
+            if isinstance(window, Mapping) else ""
         patch, streak, skipped = _capture_failure_patch(
-            state, processed, now_ts=now_ts)
+            state, processed, now_ts=now_ts, reason=reason)
         if skipped:
             _record_skipped_window(store, window=processed, streak=streak,
-                                   job_id=_capture_trace_job_id(job))
+                                   job_id="")
         state = _patch_capture_state(
             store, {"pending_capture_key": "", **patch}, now=now_ts)
     capture_jobs.notify_backoff(
@@ -919,7 +983,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
                          else job.get("window"))
         failed_window = failed_window if isinstance(failed_window, Mapping) else None
         patch, streak, skipped = _capture_failure_patch(
-            state, failed_window, now_ts=now_ts)
+            state, failed_window, now_ts=now_ts, reason=_failure_reason_of(job))
         if skipped:
             # 🔴 同一批消息连续失败到阈值 —— 推过它。那批记忆就此丢掉，
             # 但这个用户后面还能继续记。见 CAPTURE_POISON_SKIP_AFTER。

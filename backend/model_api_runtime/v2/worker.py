@@ -13440,6 +13440,10 @@ async def _run_extraction(
                 user_id=user_id,
                 claimed_by=claimed_by,
                 error=code,
+                # 带上窗口，逃生阀才认得出「同一批消息在反复失败」并跳过。
+                # 不带的话 V2 用户会被一条毒消息永久卡死（2026-09-14 实测
+                # 还卡着的落卡用户里抽查 12 个全是 V2）。
+                window=dict(capture_window),
             )
         elif lane != "capture":
             await asyncio.to_thread(
