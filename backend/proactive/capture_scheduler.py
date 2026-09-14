@@ -140,6 +140,8 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         ),
         #: 同一窗口第一次账号/服务类失败的时间；持续 7 天仍失败才跳过。
         "capture_account_fail_since": _safe_float(doc.get("capture_account_fail_since"), 0.0),
+        #: 最近一次失败若是账号/服务问题，对照表里的类别（如 quota_insufficient），给用户提示说清原因。
+        "capture_account_error_code": str(doc.get("capture_account_error_code") or "")[:80],
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))
@@ -702,6 +704,7 @@ def record_v2_capture_status(
         store,
         lane="capture",
         status=status_text,
+        account_code=str(state.get("capture_account_error_code") or ""),
         streak=int(state.get("capture_fail_streak") or 0),
     )
     return refresh_capture_state_from_chat(store, now=now_ts)
@@ -841,6 +844,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         state.update(patch)
     state = save_capture_state(store, state, now=now_ts)
     capture_jobs.notify_backoff(store, lane="capture", status=status_text,
+                                account_code=str(state.get("capture_account_error_code") or ""),
                                 streak=int(state.get("capture_fail_streak") or 0))
     result = refresh_capture_state_from_chat(store, now=now_ts)
 

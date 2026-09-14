@@ -114,12 +114,9 @@ ACCOUNT_ERROR_CONTRACT_CODES = frozenset({
     "cli_config_invalid",
 })
 
-#: 对照表之外、V1 consumer 自己也按账号问题处理的原始文本（见 chat_resident_consumer 的
-#: 失败分类：``"invalid key" in lowered`` → provider_auth）。
-ACCOUNT_FAILURE_MARKERS = (
-    "invalid key",
-    "insufficient balance",
-)
+#: 对照表之外、prod 上出现过或 V1 consumer 自己也按账号问题处理的原始文本
+#: （``"invalid key" in lowered`` → provider_auth；「Insufficient balance」是某中转站的原话），
+#: 见 account_error_code。
 
 #: 账号/服务类失败**同一批**持续这么久仍没好，才跳过。
 #:
@@ -209,22 +206,39 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
     }
 
 
-def failure_class(reason: str) -> str:
-    """一次失败属于哪类：``parse``（坏 JSON，连续 3 次快跳）/ ``account``（账号或服务，
-    持续 7 天才跳）/ ``other``（6 次兜底）。"""
+def account_error_code(reason: str) -> str:
+    """账号/服务类失败对应错误对照表里的哪一类（如 ``quota_insufficient``）；不是账号类返回空串。
+
+    用于：① 判断不按次数跳过 ② 给用户的提示里说清原因（「额度不足，充值后即可恢复」）。
+    两处用同一个判断，不会出现「按账号问题处理了、提示却只说连续失败」。
+    """
     raw = str(reason or "").strip()
     text = raw.lower()
     kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
     if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
-        return "parse"
-    if kind in ACCOUNT_FAILURE_KINDS or any(m in text for m in ACCOUNT_FAILURE_MARKERS):
-        return "account"
+        return ""
+    if kind in ACCOUNT_FAILURE_KINDS:
+        return kind
     from notices import error_contract  # 延迟导入：只在失败路径上用
 
     spec = error_contract.classify_text(raw)
     if spec is not None and spec.code in ACCOUNT_ERROR_CONTRACT_CODES:
-        return "account"
-    return "other"
+        return spec.code
+    if "insufficient balance" in text:
+        return "quota_insufficient"
+    if "invalid key" in text:
+        return "auth_invalid"
+    return ""
+
+
+def failure_class(reason: str) -> str:
+    """一次失败属于哪类：``parse``（坏 JSON，连续 3 次快跳）/ ``account``（账号或服务，
+    持续 7 天才跳）/ ``other``（6 次兜底）。"""
+    text = str(reason or "").strip().lower()
+    kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
+    if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
+        return "parse"
+    return "account" if account_error_code(reason) else "other"
 
 
 def skip_threshold_for(reason: str) -> int:
@@ -272,6 +286,7 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
         # 说不清是哪个窗口 —— 只累加，不跳过（跳过需要知道推到哪）。
         streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
         return ({"capture_fail_streak": streak,
+                 "capture_account_error_code": account_error_code(reason),
                  "last_capture_failed_at": now_ts}, streak, False)
     same = key == str(state.get("capture_fail_window_key") or "")
     kind = failure_class(reason)
@@ -298,9 +313,12 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
         skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
     else:
         skip = None
+    account_code = account_error_code(reason) if kind == "account" else ""
     if skip is not None:
-        return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
+        return ({**skip, "capture_account_error_code": account_code,
+                 "last_capture_failed_at": now_ts}, streak, True)
     return ({"capture_fail_streak": streak,
+             "capture_account_error_code": account_code,
              "capture_parse_fail_streak": parse_streak,
              "capture_window_fail_count": window_count,
              "capture_account_fail_since": account_since,

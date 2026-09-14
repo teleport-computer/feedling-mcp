@@ -69,3 +69,79 @@ def test_dream_backoff_emits_only_at_streak_3_and_resolves():
     assert "dream" in n["user_text"] and "3" in n["user_text"]
     dream_scheduler.record_dream_job_status(store, job, status="completed")
     assert _rows(uid)["memory_backoff:dream"]["resolved"] is True
+
+
+_BALANCE_REASON = ('capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to '
+                   'authenticate. API Error: 401 {"error":"Insufficient balance"} (api_status=401)')
+
+
+def test_v1_capture_notice_names_the_account_cause():
+    """🔴 余额不足时提示要说清原因，否则用户不知道要去充值，记忆一直停着。
+
+    2026-09-13 prod：触发过逃生阀的 42 人里 33 人是自己账号的问题。
+    """
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job = {"job_id": "j", "source": capture_jobs.CAPTURE_JOB_SOURCE,
+           "capture_result": {"status": "failed", "reason": _BALANCE_REASON}}
+    for _ in range(3):
+        capture_scheduler.record_capture_job_status(store, job, status="failed")
+    n = _rows(uid)["memory_backoff:capture"]
+    assert "API Key 无效" in n["user_text"] or "额度不足" in n["user_text"], n["user_text"]
+    assert n["blame"] == "user_provider"
+    assert "自动补记" in n["user_text"]
+    capture_scheduler.record_capture_job_status(store, job, status="completed")
+    assert _rows(uid)["memory_backoff:capture"]["resolved"] is True
+
+
+def test_v1_non_account_failure_keeps_the_generic_notice():
+    uid = _uid(); seed_user(uid); store = get_store(uid)
+    job = {"job_id": "j", "source": capture_jobs.CAPTURE_JOB_SOURCE,
+           "capture_result": {"status": "failed", "reason": "json_decode_error:JSONDecodeError"}}
+    for _ in range(3):
+        capture_scheduler.record_capture_job_status(store, job, status="failed")
+    n = _rows(uid)["memory_backoff:capture"]
+    assert "连续失败 3 次" in n["user_text"]
+
+
+def test_v2_capture_failures_now_notify_the_user():
+    """🔴 V2 落卡失败以前**完全没有提示**（V2 不经过 V1 的状态记录函数）。
+
+    走 worker 的统一出口 _run_turn → _notify_capture_backoff，状态由 jobs_store 的真实失败路径写入。
+    """
+    import asyncio
+
+    from model_api_runtime.v2 import jobs_store, worker
+
+    uid = _uid(); seed_user(uid)
+    import conftest
+    conftest.set_v2_runtime_owner(uid, generation=1)
+    window = {"after_seq": 0, "through_seq": 3, "after_message_id": "",
+              "until_message_id": "m3", "until_ts": 3.0}
+    for attempt in range(3):
+        owner = f"notice-owner-{attempt}"
+        job_id, coalesced = jobs_store.enqueue_job(uid, "capture")
+        claimed = jobs_store.claim_next_job(owner, lanes={"capture"})
+        assert claimed is not None and int(claimed["id"]) == job_id
+        assert jobs_store.mark_running(job_id, claimed_by=owner)
+        assert jobs_store.fail_capture_job(
+            job_id=job_id, user_id=uid, claimed_by=owner,
+            error="extraction_failed:quota_insufficient", window=window)
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _u: [],
+        resolve_provider=lambda _u: (object(), {}),
+        mint_enclave_token=lambda _u: "rt",
+        read_capture_state=lambda u: db.get_blob_strict(u, "capture_state") or {},
+    )
+    asyncio.run(worker._notify_capture_backoff(
+        deps, {"lane": "capture", "user_id": uid}, "failed"))
+    n = _rows(uid)["memory_backoff:capture"]
+    assert "额度不足" in n["user_text"] and n["blame"] == "user_provider"
+
+    asyncio.run(worker._notify_capture_backoff(
+        deps, {"lane": "capture", "user_id": uid}, "completed"))
+    assert _rows(uid)["memory_backoff:capture"]["resolved"] is True
+
+    # 其他 lane 不碰
+    asyncio.run(worker._notify_capture_backoff(
+        deps, {"lane": "chat", "user_id": uid}, "failed"))

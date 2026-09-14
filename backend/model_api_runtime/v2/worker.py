@@ -17092,7 +17092,46 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     # the honest signal that a terminal state was reached.
     dur_ms = max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000)
     await _emit_job_terminal_trace(deps, job, outcome, dur_ms=dur_ms)
+    await _notify_capture_backoff(deps, job, outcome)
     return outcome
+
+
+async def _notify_capture_backoff(deps: TurnDeps, job: dict, outcome: str) -> None:
+    """V2 落卡结束后给用户发/清「记忆整理受阻」提示，和 V1 用同一个函数、同一套文案。
+
+    以前 V2 落卡失败**完全没有提示**：提示只在 V1 的两个状态记录函数里发，
+    V2 的失败走 jobs_store 的持久批次协议、从不经过那里。用户账号余额不足，
+    记忆一直停着，App 里什么都看不到。
+
+    挂在 _run_turn 这个统一出口，而不是散落在各个 return 前（prepared 恢复、门禁、
+    主流程各有几处出口，漏一处就是一个无声的洞）。纯旁路：读失败/发失败都吞掉。
+    """
+    if str(job.get("lane") or "") != "capture" or deps.read_capture_state is None:
+        return
+    if outcome not in ("completed", "failed"):
+        return
+    user_id = str(job.get("user_id") or "")
+    if not user_id:
+        return
+    try:
+        from types import SimpleNamespace
+
+        from proactive import capture_jobs
+
+        state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
+        await asyncio.to_thread(
+            capture_jobs.notify_backoff,
+            SimpleNamespace(user_id=user_id),
+            lane="capture",
+            status=outcome,
+            streak=int(state.get("capture_fail_streak") or 0),
+            account_code=str(state.get("capture_account_error_code") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 — 提示是旁路，绝不影响任务结果
+        log.warning(
+            "[v2.worker] capture backoff notice failed user=%s err=%s",
+            user_id, type(exc).__name__,
+        )
 
 
 async def _emit_job_terminal_trace(

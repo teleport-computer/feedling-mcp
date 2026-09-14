@@ -2089,6 +2089,13 @@ def test_prepared_batch_whose_commit_keeps_raising_is_eventually_skipped(monkeyp
             assert int(state.get("last_captured_until_seq") or 0) == 0, f"第 {attempt} 次就跳了"
 
     assert len(commit_calls) == limit, "每次都应该先去提交那个 prepared 批次"
+    if entry == "run_turn":
+        # 生产出口 _run_turn 挂着 V2 落卡提示：连续失败 ≥3 次后用户能看到「记忆整理受阻」。
+        # 以前 V2 完全没有这条提示。
+        from notices import core as notices_core
+
+        keys = {r["dedupe_key"] for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+        assert "memory_backoff:capture" in keys, "V2 落卡连续失败，用户侧没有任何提示"
     assert int(state["last_captured_until_seq"]) == 4
     assert state["last_captured_until_message_id"] == "m4"
     assert int(state["capture_skipped_windows"]) == 1
