@@ -4788,12 +4788,21 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
     monkeypatch.setattr(crc, "_capture_post_json", _post_json)
-    # Dream's card read goes through the strict helper (a failed read must not
-    # look like an empty garden); the harness answers it from the same fixtures.
+    # Dream's card read goes through the real strict helper (a failed read must
+    # not look like an empty garden); only the pooled HTTP client is replaced,
+    # and it answers with the backend's real envelopes built from the fixtures.
     monkeypatch.setattr(
         crc,
-        "_dream_post_items",
-        lambda path, *, payload, timeout: _post_json(path, payload=payload)["items"],
+        "_client_for",
+        lambda _root: _DreamReadsideClient({
+            "/v1/memory/index": _json_response(200, {
+                "items": index_items,
+                "limit": 1000,
+                "truncated": False,
+                "user_card_count": len(index_items),
+            }),
+            "/v1/memory/fetch": _fetch_response(fetch_items),
+        }),
     )
     monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(
@@ -5720,8 +5729,12 @@ class _DreamReadsideClient:
     def post(self, url, *, json=None, headers=None, timeout=None):
         import httpx
 
-        path = next(p for p in self.answers if url.endswith(p))
-        self.paths.append(path)
+        path = next((p for p in self.answers if url.endswith(p)), None)
+        self.paths.append(path or url)
+        if path is None:
+            # Recorded so a test can assert on it: production swallows the
+            # exception into "context unavailable", which would hide the miss.
+            raise AssertionError(f"unexpected readside path {url}")
         answer = self.answers[path]
         if isinstance(answer, BaseException):
             raise answer
@@ -5737,6 +5750,36 @@ def _json_response(status, body):
     return _make
 
 
+def _fetch_response(cards, *, drop=(), unavailable=(), missing=(), keep_flagged=False):
+    """A ``/v1/memory/fetch`` answer in the backend's real envelope.
+
+    Requested ids listed in ``drop`` are silently omitted from ``items``; ids in
+    ``unavailable`` / ``missing`` are reported the way ``memory_fetch_core``
+    reports undecryptable and unknown cards (and omitted from ``items`` unless
+    ``keep_flagged`` builds a self-contradicting answer).
+    """
+    import httpx
+
+    by_id = {card["id"]: card for card in cards}
+
+    def _make(request, payload):
+        ids = list((payload or {}).get("ids") or [])
+        skipped = set(drop) | (
+            set() if keep_flagged else set(unavailable) | set(missing)
+        )
+        return httpx.Response(200, request=request, json={
+            "items": [by_id[mid] for mid in ids if mid in by_id and mid not in skipped],
+            "related_items": [],
+            "related_status": "not_needed",
+            "missing_ids": [mid for mid in ids if mid in set(missing)],
+            "unavailable_ids": [mid for mid in ids if mid in set(unavailable)],
+            "truncation": {"truncated": False, "requested_count": len(ids),
+                           "processed_count": len(ids), "omitted_count": 0},
+        })
+
+    return _make
+
+
 def _raw_response(status, content):
     import httpx
 
@@ -5747,9 +5790,8 @@ def _raw_response(status, content):
 
 
 def _install_real_dream_read(monkeypatch, client):
-    """Undo the harness shortcut: the job reads cards through the real strict
-    helper and the real ``_client_for`` seam, answered by ``client``."""
-    monkeypatch.setattr(crc, "_dream_post_items", _REAL_DREAM_POST_ITEMS)
+    """Answer the job's real strict card read with ``client`` (through the real
+    ``_client_for`` seam) and forbid the lenient best-effort helper."""
     monkeypatch.setattr(crc, "_client_for", lambda _root: client)
 
     def _no_lenient_read(path, **_kwargs):
@@ -5758,11 +5800,14 @@ def _install_real_dream_read(monkeypatch, client):
     monkeypatch.setattr(crc, "_capture_post_json", _no_lenient_read)
 
 
-_REAL_DREAM_POST_ITEMS = crc._dream_post_items
 _DREAM_INDEX_OK = {"items": [
     {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life"},
     {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life"},
-]}
+], "limit": 1000, "truncated": False, "user_card_count": 2}
+_DREAM_FULL_CARDS = [
+    {"id": "mem_a", "content": "Full card A body."},
+    {"id": "mem_b", "content": "Full card B body."},
+]
 
 
 @pytest.mark.parametrize(
@@ -5775,6 +5820,63 @@ _DREAM_INDEX_OK = {"items": [
         pytest.param(
             {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK), "/v1/memory/fetch": "timeout"},
             id="fetch-timeout",
+        ),
+        # HTTP 200 is not a readable garden: the backend drops every card it
+        # cannot decrypt and still answers with an empty ``items`` list.
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {
+                "items": [], "limit": 1000, "truncated": False, "user_card_count": 12,
+            })},
+            id="index-200-empty-but-garden-has-cards",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {"items": [], "limit": 1000})},
+            id="index-200-without-card-count",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {
+                **_DREAM_INDEX_OK,
+                "items": [_DREAM_INDEX_OK["items"][0], {"summary": "no id"}, "junk"],
+             }),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS)},
+            id="index-200-partially-malformed",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {
+                **_DREAM_INDEX_OK, "items": [{"summary": "no id"}, None],
+            })},
+            id="index-200-all-malformed",
+        ),
+        # A partial fetch must not fall back to index summaries: the model
+        # could supersede a real card knowing only its one-line summary.
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS, drop=("mem_b",))},
+            id="fetch-200-omits-a-card",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS, unavailable=("mem_b",))},
+            id="fetch-200-unavailable-ids",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS, missing=("mem_a",))},
+            id="fetch-200-missing-ids",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(
+                 _DREAM_FULL_CARDS, unavailable=("mem_b",), keep_flagged=True)},
+            id="fetch-200-body-but-flagged-unavailable",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _json_response(200, {
+                 "items": [*_DREAM_FULL_CARDS, {"id": "mem_other", "content": "x"}],
+                 "missing_ids": [], "unavailable_ids": [],
+             })},
+            id="fetch-200-unrequested-card",
         ),
     ],
 )
@@ -5794,7 +5896,9 @@ def test_dream_job_failed_card_read_fails_instead_of_completing_as_no_cards(monk
 
     assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
 
-    assert client.paths == list(answers)
+    # Every read the job made was an expected one, in order (a stopped read
+    # need not reach the later paths).
+    assert client.paths == list(answers)[: len(client.paths)]
     assert captured["prompts"] == []  # no model call on an unreadable garden
     assert captured["actions"] == []
     job_id, status, reason, kwargs = _dream_final_status(captured)
@@ -5816,9 +5920,9 @@ def test_dream_job_failed_card_read_fails_instead_of_completing_as_no_cards(monk
 
 def test_dream_job_genuinely_empty_garden_still_completes_as_verified_no_cards(monkeypatch):
     captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
-    client = _DreamReadsideClient(
-        {"/v1/memory/index": _json_response(200, {"items": [], "unavailable_ids": []})}
-    )
+    client = _DreamReadsideClient({"/v1/memory/index": _json_response(200, {
+        "items": [], "limit": 1000, "truncated": False, "user_card_count": 0,
+    })})
     _install_real_dream_read(monkeypatch, client)
 
     crc._process_resident_jobs([job])
@@ -5834,10 +5938,7 @@ def test_dream_job_reads_full_cards_through_the_strict_read(monkeypatch):
     captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
     client = _DreamReadsideClient({
         "/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
-        "/v1/memory/fetch": _json_response(200, {"items": [
-            {"id": "mem_a", "content": "Full card A body."},
-            {"id": "mem_b", "content": "Full card B body."},
-        ]}),
+        "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS),
     })
     _install_real_dream_read(monkeypatch, client)
 

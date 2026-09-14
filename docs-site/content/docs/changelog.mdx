@@ -20,10 +20,17 @@ change must not be interpreted as an API guarantee.
   untouched, so Dream runs again once reading recovers. Previously such a run
   completed as a no-op (`dream_no_cards_available` on resident V1 and
   self-hosted consumers) and Dream then stayed silent as `already_dreamed`
-  until enough new cards arrived. A read that succeeds and returns no cards
-  still completes as before. The backend also applies this to status reports
-  from older self-hosted consumers: a "no cards" completion is recorded as
-  `dream_context_unavailable` when the garden has active cards.
+  until enough new cards arrived. A successful HTTP response is not enough:
+  the read also fails when the card index comes back empty while its
+  `user_card_count` reports active cards (for example every card failed to
+  decrypt), when an index item is malformed, or when fetching full cards
+  omits a requested card or reports it in `missing_ids` / `unavailable_ids`.
+  Resident V1 and self-hosted consumers no longer fall back to a card's index
+  summary when its full body is missing, so Dream can no longer rewrite a card
+  it has only seen as a summary. Only a read that reports zero active cards
+  still completes as "no cards". The backend also applies this to status
+  reports from older self-hosted consumers: a "no cards" completion is
+  recorded as `dream_context_unavailable` when the garden has active cards.
 
 - Hosted Runtime V2 Capture and Dream now treat a model reply that stops at the
   output-token limit without any visible text (typically a thinking model that

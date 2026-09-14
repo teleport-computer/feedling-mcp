@@ -639,14 +639,181 @@ def test_dream_failed_card_read_fails_with_backoff_instead_of_advancing_ledger(
     assert tick["reason"] == "failure_backoff"
 
 
-def test_dream_empty_successful_card_read_keeps_the_noop_completion(monkeypatch):
-    uid = "u_x_dream_empty_read"
+def _stub_dream_enclave(monkeypatch, *, index_drop=(), fetch_drop=(), fetch_flag=()):
+    """Drive the real Dream reader AND the real ``memory_core`` index/fetch
+    (lifecycle filter, owner scoping, ``user_card_count``, fetch envelope) over
+    the user's real DB cards; only the enclave decrypt round-trip is faked.
+
+    ``index_drop`` / ``fetch_drop`` are card ids the fake enclave cannot
+    decrypt (reported in ``unavailable_ids`` exactly like the enclave route);
+    ``fetch_flag`` are ids it returns a body for AND reports unavailable.
+    """
+    import memory_readside_core
+    from model_api_runtime.v2 import serve_worker
+
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker, "_load_identity_card_view", lambda _store, *, runtime_token: {}
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    calls = []
+
+    def _enclave(_api_key, candidates, *, operation, payload=None, runtime_token=None):
+        calls.append(operation)
+        drop = set(index_drop if operation == "index" else fetch_drop)
+        items, unavailable = [], []
+        for card in candidates:
+            mid = card["id"]
+            if mid in drop:
+                unavailable.append(mid)
+                continue
+            items.append({
+                "id": mid, "bucket": "life", "summary": f"summary {mid}",
+                "content": f"body {mid}", "occurred_at": card.get("occurred_at"),
+            })
+            if operation == "fetch" and mid in fetch_flag:
+                unavailable.append(mid)
+        return {"user_id": card.get("owner_user_id") if candidates else "",
+                "items": items, "unavailable_ids": unavailable}
+
+    monkeypatch.setattr(memory_readside_core, "post_enclave_readside", _enclave)
+    return serve_worker, calls
+
+
+@pytest.mark.parametrize(
+    "stub",
+    [
+        # Prod shape: every card fails to decrypt, the readside still answers
+        # HTTP 200 with ``items=[]`` — but ``user_card_count`` is 12.
+        pytest.param({"index_drop": [f"mem_{i}" for i in range(12)]}, id="index-200-all-undecryptable"),
+        pytest.param({"fetch_drop": ["mem_3"]}, id="fetch-200-card-unavailable"),
+        pytest.param({"fetch_flag": ["mem_3"]}, id="fetch-200-body-but-flagged-unavailable"),
+    ],
+)
+def test_dream_200_read_that_is_not_the_whole_garden_fails_instead_of_noop(
+    monkeypatch, stub,
+):
+    """A 200 answer is not proof of a readable garden. An enclave that cannot
+    decrypt any card answers ``items=[]``; treating that as an empty garden
+    completed Dream as a no-op and advanced the ledger."""
+    uid = "u_x_dream_200_incomplete"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(12)])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    serve_worker, enclave_calls = _stub_dream_enclave(monkeypatch, **stub)
+    provider_calls = _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=serve_worker._read_dream_memory_context,
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert enclave_calls[0] == "index"
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_context_unavailable")
+    assert traces[-1]["type"] == "memory.dream.error"
+    assert traces[-1]["detail"]["outcome"] == "context_unavailable"
+
+
+def test_dream_fully_readable_garden_reaches_the_provider_through_the_same_fakes(
+    monkeypatch,
+):
+    """Control for the failure cases above: same real reader, same fake enclave,
+    nothing dropped -> every card reaches the provider."""
+    uid = "u_x_dream_200_complete"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(12)])
+    jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    serve_worker, enclave_calls = _stub_dream_enclave(monkeypatch)
+    prompts = []
+
+    async def _provider(_cfg, messages, **_kwargs):
+        prompts.append(messages[0]["content"])
+        return {"reply": '{"consolidations": []}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=serve_worker._read_dream_memory_context),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert enclave_calls[:2] == ["index", "fetch"]
+    assert len(prompts) == 1 and "[mem_3] summary mem_3" in prompts[0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"items": [], "limit": 60, "truncated": False}, id="no-user-card-count"),
+        pytest.param(
+            {"items": [{"id": "mem_0", "summary": "S"}, {"summary": "no id"}],
+             "limit": 60, "truncated": False, "user_card_count": 2},
+            id="partially-malformed",
+        ),
+        pytest.param(
+            {"items": ["junk"], "limit": 60, "truncated": False, "user_card_count": 1},
+            id="all-malformed",
+        ),
+    ],
+)
+def test_dream_malformed_index_envelope_fails_instead_of_noop(monkeypatch, body):
+    uid = "u_x_dream_index_malformed"
     _seed_v2(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "dream")
     job = jobs_store.claim_next_job("w")
+    fetches = []
     serve_worker = _stub_dream_readside(
-        monkeypatch, index=lambda *a, **k: ({"items": [], "unavailable_ids": []}, 200)
+        monkeypatch,
+        index=lambda *a, **k: (body, 200),
+        fetch=lambda _store, _key, payload, **k: (
+            fetches.append(payload) or ({
+                "items": [{"id": mid, "summary": "S", "content": "C"} for mid in payload["ids"]],
+                "missing_ids": [], "unavailable_ids": [],
+            }, 200)
+        ),
     )
+    provider_calls = _no_provider_call(monkeypatch)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=serve_worker._read_dream_memory_context),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert fetches == []
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_context_unavailable")
+
+
+def test_dream_empty_successful_card_read_keeps_the_noop_completion(monkeypatch):
+    uid = "u_x_dream_empty_read"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    # Real memory_core over a garden with no live cards: ``user_card_count`` 0.
+    serve_worker, enclave_calls = _stub_dream_enclave(monkeypatch)
+    assert enclave_calls == []
     _no_provider_call(monkeypatch)
     traces, emit_trace = _trace_collector()
     status = asyncio.run(worker.process_job(
