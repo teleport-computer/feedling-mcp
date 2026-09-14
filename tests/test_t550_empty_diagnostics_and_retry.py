@@ -501,3 +501,69 @@ def test_t568_raw_stop_reason_is_gemini_scoped_mirror():
     non_gemini = tl._empty_response_shape(_PR({"stop_reason": marker}))
     assert non_gemini["stop_reason"] == "other"
     assert "raw_stop_reason" not in non_gemini
+
+
+def test_t590_malformed_response_is_recognized_at_provider_seam():
+    # Anchor the observed wire value so removing it from the source constant
+    # cannot also remove every derived downstream test case during collection.
+    reason = "MALFORMED_RESPONSE"
+    assert reason in pc._GEMINI_FINISH_REASONS
+    assert pc._normalize_gemini_finish_reason(reason) == reason
+
+
+@pytest.mark.parametrize("reason", sorted(
+    reason for reason in pc._GEMINI_FINISH_REASONS
+    if reason.startswith("MALFORMED_")
+))
+def test_t590_provider_malformed_reasons_survive_tool_loop_shape(reason):
+    from provider_types import ProviderResponse
+
+    expected = reason.lower()
+    assert expected in tl._CONTENT_FREE_STOP_REASONS
+    shape = tl._empty_response_shape(ProviderResponse.from_result({
+        "reply": "", "stop_reason": reason, "usage": {},
+    }))
+    assert shape["stop_reason"] == expected
+
+
+@pytest.mark.parametrize("reason", sorted(tl._CONTENT_FREE_STOP_REASONS))
+def test_t590_tool_loop_stop_reasons_survive_admin_projection(reason):
+    from admin import data_track
+
+    # Derive the reader contract from the producer's whole vocabulary, rather
+    # than copying a list that could drift along with the public allowlist.
+    assert reason in data_track._EMPTY_RESPONSE_PUBLIC_ENUMS["stop_reason"]
+    public = data_track._debug_event_public_json({
+        "type": "provider.empty_response",
+        "detail": {"stop_reason": reason, "lane": "chat"},
+    }, trace_public_fields={})
+    assert public["detail"]["stop_reason"] == reason
+
+
+def test_t590_malformed_response_full_chain_has_no_raw_stop_reason():
+    from admin import data_track
+    from provider_types import ProviderResponse
+
+    body = {
+        "candidates": [{"content": {}, "finishReason": "MALFORMED_RESPONSE"}],
+        "usageMetadata": {"thoughtsTokenCount": 50},
+    }
+    reason = body["candidates"][0]["finishReason"]
+    normalized = pc._parse_gemini_body(
+        body, model="gemini-3.6-flash", require_reply=False,
+    )
+    response = ProviderResponse.from_result(normalized)
+    assert response.text == ""
+    assert response.tool_calls == []
+    shape = tl._empty_response_shape(response)
+    assert shape["stop_reason"] == reason.lower()
+    assert shape["provider_diagnostics"]["finish_reason"] == reason
+    assert shape["provider_diagnostics"]["thoughts_token_count"] == 50
+    assert "raw_stop_reason" not in shape
+    detail = _safe_detail(worker._empty_response_trace_detail(shape, "chat"))
+    assert detail["provider_finish_reason"] == reason
+    assert "raw_stop_reason" not in detail
+    public = data_track._debug_event_public_json({
+        "type": "provider.empty_response", "detail": detail,
+    }, trace_public_fields={})
+    assert public["detail"]["stop_reason"] == reason.lower()

@@ -9,6 +9,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import threading
 
@@ -18,7 +19,7 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
-from conftest import seed_user, set_v2_runtime_owner
+from conftest import capture_mirror_groups, seed_user, set_v2_runtime_owner
 from model_api_runtime.v2 import effect_id, effect_outbox, jobs_store
 from proactive import capture_scheduler
 
@@ -208,7 +209,7 @@ def test_clear_atomically_removes_live_chat_context_but_retains_independent_stat
         mirrored_deletes.extend(statements)
         return original_execute_many(statements)
 
-    monkeypatch.setattr(mirror, "execute_many", _capture_mirror)
+    capture_mirror_groups(monkeypatch, SimpleNamespace(append=_capture_mirror))
     uid = "u_v2_clear_atomic_context"
     seed_user(uid)
     set_v2_runtime_owner(uid, generation=7)

@@ -890,3 +890,117 @@ def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
     assert p0._cleanup_expired_failures() == 0
     assert not (orphans / "usr_expired.json").exists()
     assert not site.exists()
+
+
+# ── T589/T592: reset is not idempotent — a retry after a lost 200 must not crash,
+# and only a key-independent admin 404 may declare the account gone ────────────
+
+def _http_with_script(script):
+    """script: list of (status, body) or an Exception, consumed in order by .request()."""
+    class ScriptedHTTP:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+
+        def request(self, method, url, **_kw):
+            self.calls.append((method, url))
+            item = script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            status, body = item
+            return FakeResponse(status, body)
+
+        def close(self):
+            self.closed = True
+    return ScriptedHTTP()
+
+
+def _teardown_client(monkeypatch, tmp_path, script, oracle):
+    import tools.e2e.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
+    capture_sleeps(monkeypatch, client_mod)      # module-local, never the global time.sleep
+    asked = []
+
+    def _oracle(api_url, user_id, **_kw):
+        asked.append(user_id)
+        return oracle
+    monkeypatch.setattr(client_mod, "admin_confirms_absent", _oracle)
+    client = _client()
+    client._http.close()
+    manifest = client_mod._write_orphan_manifest(TEST_API, client.user_id, client.api_key)
+    http = _http_with_script(script)
+    client._http = http  # type: ignore[assignment]
+    client._orphan_file = manifest
+    return client, http, manifest, asked
+
+
+def test_teardown_lost_response_then_401_with_admin_404_is_clean(monkeypatch, tmp_path) -> None:
+    import httpx
+    # first reset reaches the server (account deleted) but the response is lost
+    # (TransportError) → _request retries → the retry sees 401 on the dead key →
+    # the admin oracle (bound to user_id, not the key) says 404 → clean.
+    client, http, manifest, asked = _teardown_client(
+        monkeypatch, tmp_path,
+        [httpx.ReadTimeout("lost response"), (401, {"error": "unauthorized"})],
+        (True, "admin confirmed 404"),
+    )
+    client.teardown()                                                # must NOT raise
+    assert client._deleted is True and not manifest.exists()
+    assert [m for m, _ in http.calls] == ["POST", "POST"]           # retry, no whoami
+    assert asked == [client.user_id]
+
+
+@pytest.mark.parametrize("oracle", [
+    (False, "admin verification returned 200: {\"user_id\": \"usr_t592\"}"),  # alive, key revoked
+    (None, "admin token unavailable"),                                             # cannot measure
+    (False, "admin verification transport error: boom"),                           # cannot measure
+])
+def test_teardown_401_without_admin_404_keeps_failure_and_manifest(monkeypatch, tmp_path, oracle) -> None:
+    client, http, manifest, asked = _teardown_client(
+        monkeypatch, tmp_path, [(401, {"error": "unauthorized"})], oracle)
+    with pytest.raises(Exception):
+        client.teardown()
+    assert client._deleted is False
+    assert manifest.exists()                                         # leak guard stays
+    assert asked == [client.user_id]
+
+
+def test_teardown_401_never_trusts_whoami_on_the_same_key(monkeypatch, tmp_path) -> None:
+    # codex4 counterexample (T592): a revoked key answers 401 to reset AND whoami
+    # while the account still exists. The oracle says alive → hard failure, and
+    # the client must not have consulted whoami at all.
+    client, http, manifest, asked = _teardown_client(
+        monkeypatch, tmp_path,
+        [(401, {"error": "unauthorized"}), (401, {"error": "unauthorized"})],
+        (False, "admin verification returned 200: alive"))
+    with pytest.raises(Exception):
+        client.teardown()
+    assert manifest.exists()
+    assert all(not url.endswith("/v1/users/whoami") for _, url in http.calls)
+
+
+def test_admin_confirms_absent_only_404_is_true(monkeypatch, tmp_path) -> None:
+    import tools.e2e.client as client_mod
+    token = tmp_path / "tok"; token.write_text("t")
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["url"] = url; seen["headers"] = kw.get("headers"); seen["kwargs"] = dict(kw)
+        return FakeResponse(seen.pop("status"), {})
+    monkeypatch.setattr(client_mod.httpx, "get", fake_get)
+    for status, expect in ((404, True), (200, False), (500, False)):
+        seen["status"] = status
+        got, _detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=token)
+        assert got is expect, status
+    assert seen["url"].endswith("/v1/admin/data-track/users/usr_x")
+    assert seen["headers"] == {"X-Admin-Token": "t"}
+    assert "verify" not in seen["kwargs"]                            # TLS verification stays on
+
+    def tls_error(url, **kw):
+        raise client_mod.httpx.ConnectError("certificate verify failed")
+    monkeypatch.setattr(client_mod.httpx, "get", tls_error)
+    got, detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=token)
+    assert got is False and "ConnectError" in detail                 # TLS failure ⇒ not confirmed
+    got, detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=tmp_path / "missing")
+    assert got is None and "unavailable" in detail

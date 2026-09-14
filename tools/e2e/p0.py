@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from tools.e2e.config import HOSTED_CELLS, VPS_CELLS, KEYS_FILE, load_keys  # noqa: E402
+from tools.e2e import client as client_mod  # noqa: E402
 from tools.e2e.client import FAILURE_RETENTION_DAYS, VERDICT_FALLBACK  # noqa: E402
 from tools.e2e.hosted import run_hosted_cell  # noqa: E402
 from tools.e2e.vps import run_vps_cell  # noqa: E402
@@ -132,25 +133,12 @@ def p0_blocks_release(results: list[dict]) -> bool:
 
 
 def _admin_confirms_absent(api_url: str, user_id: str) -> tuple[bool | None, str]:
-    """Return True only for admin 404; None when no local admin token exists."""
-    import httpx as _httpx
+    """Return True only for admin 404; None when no local admin token exists.
 
-    try:
-        token = _ADMIN_TOKEN_FILE.read_text().strip()
-    except FileNotFoundError:
-        return None, "admin token unavailable"
-    if not token:
-        return None, "admin token empty"
-    try:
-        r = _httpx.get(
-            f"{api_url}/v1/admin/data-track/users/{user_id}",
-            headers={"X-Admin-Token": token}, timeout=30, verify=False,
-        )
-    except _httpx.TransportError as e:
-        return False, f"admin verification transport error: {e}"
-    if r.status_code == 404:
-        return True, "admin confirmed 404"
-    return False, f"admin verification returned {r.status_code}: {r.text[:80]}"
+    Single definition lives in client.admin_confirms_absent (teardown uses the
+    same oracle after a 401 on reset); this name stays for existing callers.
+    """
+    return client_mod.admin_confirms_absent(api_url, user_id, token_file=_ADMIN_TOKEN_FILE)
 
 
 def _remove_failure_evidence(user_id: str) -> None:

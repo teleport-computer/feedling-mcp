@@ -178,6 +178,36 @@ def _refuse_prod(api_url: str) -> None:
         raise RuntimeError(f"E2E only permits the test API host: {api_url}")
 
 
+def admin_confirms_absent(api_url: str, user_id: str, *,
+                          token_file: Path | None = None) -> tuple[bool | None, str]:
+    """Key-independent account-existence oracle: True only for admin 404.
+
+    None when no local admin token exists (cannot measure); False for every
+    other outcome (alive, transport error, unexpected status). Callers must
+    treat None/False identically — "not confirmed absent" is not "absent".
+    """
+    try:
+        token = (token_file or _ADMIN_TOKEN_FILE).read_text().strip()
+    except FileNotFoundError:
+        return None, "admin token unavailable"
+    if not token:
+        return None, "admin token empty"
+    try:
+        # Certificate verification stays ON here: this answer deletes the leak
+        # manifest, and it carries the admin token — a spoofed endpoint must
+        # not be able to say "404". Any TLS/transport failure is "not
+        # confirmed" (False), never "absent".
+        r = httpx.get(
+            f"{api_url}/v1/admin/data-track/users/{user_id}",
+            headers={"X-Admin-Token": token}, timeout=30,
+        )
+    except httpx.TransportError as e:
+        return False, f"admin verification transport error: {type(e).__name__}: {e}"
+    if r.status_code == 404:
+        return True, "admin confirmed 404"
+    return False, f"admin verification returned {r.status_code}: {r.text[:80]}"
+
+
 class E2EClient:
     """One throwaway account. Use as a context manager so teardown is never skipped:
 
@@ -283,10 +313,33 @@ class E2EClient:
     def teardown(self) -> None:
         """Hard-delete the account (test-account-hygiene: create → use → delete).
         Rides the transport-retry wrapper, so a flapping connection gets three
-        chances before we surface a leak."""
+        chances before we surface a leak. reset itself is not idempotent (see the
+        401 branch), so the wrapper's "reset is idempotent" shortcut is closed here."""
         if self._deleted:
             return
         r = self.post("/v1/account/reset", json={"confirm": "delete-all-data"})
+        if r.status_code == 401:
+            # reset is NOT idempotent: once the account is gone the same key is
+            # 401 everywhere. A transport retry (or a lost response) after a
+            # server-side delete therefore lands here — T589 deepseek cell:
+            # users row gone, orphan manifest left, cell marked "crash".
+            # Two 401s on the same key prove nothing about the ACCOUNT (a
+            # revoked key on a live account looks identical — codex4's T592
+            # counterexample), so only the key-independent admin read bound to
+            # user_id may declare it gone: admin 404 ⇒ clean teardown; anything
+            # else (alive, no token, transport error) keeps the failure and the
+            # orphan manifest — the leak guard never yields to an assumption.
+            absent, detail = admin_confirms_absent(self.api_url, self.user_id)
+            if absent is True:
+                print(f"[e2e] teardown: reset returned 401 and {detail} for "
+                      f"{self.user_id} — account absent; treating as clean "
+                      f"teardown", file=sys.stderr)
+                self._deleted = True
+                if self._orphan_file is not None:
+                    self._orphan_file.unlink(missing_ok=True)
+                return
+            print(f"[e2e] teardown: reset returned 401 and account absence is NOT "
+                  f"confirmed ({detail}) — keeping manifest", file=sys.stderr)
         r.raise_for_status()
         self._deleted = True
         if self._orphan_file is not None:
@@ -593,7 +646,8 @@ class E2EClient:
         Retrying POSTs is safe for every path this client uses: both send paths
         carry a client_msg_id minted ONCE per logical send and reused across
         retries (/v1/chat/message and /v1/model_api/chat/send dedup on it);
-        setup and reset are idempotent; verify_loop is a repeatable probe (each
+        setup is idempotent; reset is NOT (a retry after a lost 200 gets 401 —
+        teardown resolves that via the key-independent admin oracle); verify_loop is a repeatable probe (each
         call may post a fresh hidden ping — harmless, GC'd server-side).
         (register does NOT ride this wrapper — provision uses its own client.)"""
         last: Exception | None = None
