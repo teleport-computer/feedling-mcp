@@ -23,6 +23,9 @@ change must not be interpreted as an API guarantee.
   truncated opener such as `<asid` fails closed instead of reaching the user.
   Prompt text and driver selection for pi, codex, and Runtime V2 are unchanged.
 
+- Empty-response diagnostics now retain Gemini's `malformed_response` as a
+  recognized `stop_reason`, making it distinguishable from `other` in admin views.
+
 - **Regular V2 wakes now treat speaking as the default.** Silence requires a
   concrete reason in the model instructions. The existing structured
   `reply`/`stay_silent` validation remains in place, and free-form text still

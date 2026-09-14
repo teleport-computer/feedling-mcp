@@ -210,6 +210,7 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "length",
         "max_output_tokens",
         "malformed_function_call",
+        "malformed_response",
         "max_tokens",
         "other",
         "pause_turn",
@@ -1204,7 +1205,9 @@ def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
     policy), while every other provider's unknown stop marker stays closed to
     "other" — a relay/OpenAI-compatible stop string can embed a raw upstream
     error body and must not open a new plaintext surface. ``stop_reason`` keeps
-    the closed-set value for enum consumers. (T568.)
+    the closed-set value for enum consumers. (T568.) Once a reason such as
+    ``malformed_response`` is recognized instead of folded to "other", it is
+    visible in ``stop_reason`` and no longer gets a ``raw_stop_reason`` field.
     """
     raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
     normalized_stop = (

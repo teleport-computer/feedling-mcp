@@ -3501,6 +3501,7 @@ _EMPTY_RESPONSE_PUBLIC_ENUMS = {
     "stop_reason": frozenset({
         "", "blocklist", "content_filter", "end_turn", "function_call",
         "image_safety", "language", "length", "malformed_function_call",
+        "malformed_response",
         "max_output_tokens", "max_tokens", "other", "pause_turn", "prohibited_content",
         "recitation", "refusal", "safety", "spii", "stop",
         "stop_sequence", "tool_calls", "tool_use",

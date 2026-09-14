@@ -2564,6 +2564,9 @@ _GEMINI_FINISH_REASONS = frozenset({
     "FINISH_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "RECITATION",
     "LANGUAGE", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
     "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",
+    # Observed on Gemini 3.x (T586/T588; also pi-mono#2028), despite its
+    # absence from Google's published finishReason enum.
+    "MALFORMED_RESPONSE",
 })
 
 
