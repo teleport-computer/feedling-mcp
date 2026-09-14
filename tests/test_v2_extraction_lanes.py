@@ -133,7 +133,10 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     async def _fake_extract(**kwargs):
         retry_prompt = kwargs["parse_retry"].build_truncation_prompt("P")
         seen.append((kwargs["max_tokens"], retry_prompt))
+        retry_budgets.append(kwargs.get("truncation_retry_max_tokens"))
         return [], None
+
+    retry_budgets = []
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     status = asyncio.run(
@@ -152,6 +155,9 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     assert budget == extraction.max_output_tokens_for_lane(lane)
     assert "截断" in retry_prompt
     assert retry_prompt != "P"
+    assert retry_budgets == [
+        extraction.truncation_retry_max_output_tokens_for_lane(lane)
+    ]
 
 
 def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):

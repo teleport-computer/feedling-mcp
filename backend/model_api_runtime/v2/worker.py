@@ -13040,6 +13040,9 @@ async def _run_extraction(
                 session=_capture_session,
                 step_sink=_step_sink,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                truncation_retry_max_tokens=(
+                    v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
+                ),
                 failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"

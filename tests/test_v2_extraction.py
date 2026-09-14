@@ -307,6 +307,107 @@ def test_extract_retries_truncated_output_once_with_same_budget_and_recovers(
     ]
 
 
+def test_dream_output_budget_leaves_room_and_retry_escalates_under_wire_ceiling():
+    """prod 09-07..09-13: 5 users failed every night with output_truncated at 4000."""
+    ceiling = extraction.provider_client.CHAT_OUTPUT_MAX_TOKENS
+    first = extraction.max_output_tokens_for_lane("dream")
+    retry = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    assert first >= 12000
+    assert retry == min(first * 2, ceiling)
+    assert first < retry <= ceiling
+    # Capture keeps its historical same-budget retry.
+    assert extraction.truncation_retry_max_output_tokens_for_lane("capture") is None
+
+
+def test_dream_retry_budget_is_clamped_to_the_shared_wire_ceiling(monkeypatch):
+    ceiling = extraction.provider_client.CHAT_OUTPUT_MAX_TOKENS
+    monkeypatch.setattr(extraction, "DREAM_MAX_OUTPUT_TOKENS", ceiling * 3)
+    assert extraction.max_output_tokens_for_lane("dream") == ceiling
+    assert extraction.truncation_retry_max_output_tokens_for_lane("dream") == ceiling
+
+
+def test_extract_truncation_retry_uses_the_larger_budget_without_session(monkeypatch):
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append((messages[0]["content"], kwargs["max_tokens"]))
+        if len(calls) == 1:
+            return {"reply": '{"consolidations":[{"result', "stop_reason": "length",
+                    "usage": {"completion_tokens": 100}}
+        return {"reply": '{"consolidations":[]}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _responses
+    )
+    events = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncation_retry":
+            events.append(payload)
+
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(),
+        prompt="P",
+        parse=lambda _raw: (["ok"], None),
+        max_tokens=100,
+        truncation_retry_max_tokens=250,
+        trajectory_out=_record,
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda _err: False,
+            build_prompt=lambda prompt, _err: prompt,
+            parse=lambda _raw: (["ok"], None),
+            build_truncation_prompt=lambda prompt: prompt + "|concise",
+        ),
+    ))
+
+    assert parsed == ["ok"] and err is None
+    assert calls == [("P", 100), ("P|concise", 250)]
+    assert events == [{"attempt": 2, "strategy": "concise_prompt", "max_tokens": 250}]
+
+
+def test_extract_session_truncation_retry_uses_the_larger_budget(monkeypatch):
+    """The production Dream path is session-driven; the escalation must reach it."""
+    from memgarden import contracts as mg_contracts
+    from memory import garden_component
+
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            return {"reply": '{"consolidations":[{"op":"merge","card_ids":["c',
+                    "stop_reason": "length", "usage": {"completion_tokens": 100}}
+        return {"reply": '{"consolidations":[]}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _responses
+    )
+    cards = [{"id": f"card-{i}", "summary": f"S{i}"} for i in range(12)]
+    sink = garden_component.BounceTracker()
+    session = garden_component.build_garden(
+        garden_component.CallableModel(lambda _p: ""), on_step=sink,
+    ).maintenance_session(mg_contracts.MaintenanceRequest(
+        cards=cards, all_cards=cards, locale="zh-Hans",
+        known_ids=tuple(c["id"] for c in cards),
+    ))
+    details = []
+
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(),
+        prompt="unused",
+        parse=lambda _raw: (None, "unused"),
+        max_tokens=100,
+        truncation_retry_max_tokens=250,
+        failure_detail_out=details.append,
+        session=session,
+        step_sink=sink,
+    ))
+
+    assert (parsed, err) == ([], None)
+    assert calls == [100, 250]
+    assert details == []
+
+
 def test_extract_stops_after_second_truncation(monkeypatch):
     limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
     calls = 0

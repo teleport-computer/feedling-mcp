@@ -19,9 +19,15 @@ from typing import Any, Awaitable, Callable, NamedTuple
 import provider_client
 from notices import error_contract
 
+# Dream renders up to 60 full cards / 60k chars (serve_worker
+# ``_MEMORY_CARDS_LIMIT`` / ``_DREAM_CARDS_MAX_CHARS``) and
+# answers with complete rewritten card bodies, so its reply scales with the
+# garden; thinking models also bill hidden reasoning against this same cap.
+# 4,000 made the largest gardens truncate deterministically every night. The
+# cap is a ceiling, not a spend: a reply that fits costs the same as before.
 _MAX_OUTPUT_TOKEN_SETTINGS = {
     "capture": ("FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS", 1500),
-    "dream": ("FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS", 4000),
+    "dream": ("FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS", 12000),
 }
 
 
@@ -50,7 +56,28 @@ def max_output_tokens_for_lane(lane: str) -> int:
     if lane == "capture":
         return CAPTURE_MAX_OUTPUT_TOKENS
     if lane == "dream":
-        return DREAM_MAX_OUTPUT_TOKENS
+        # Every provider payload builder clamps to this shared wire ceiling
+        # anyway; clamping here keeps the recorded ``max_tokens`` truthful.
+        return min(DREAM_MAX_OUTPUT_TOKENS, provider_client.CHAT_OUTPUT_MAX_TOKENS)
+    raise ValueError(f"unsupported extraction lane: {lane}")
+
+
+def truncation_retry_max_output_tokens_for_lane(lane: str) -> int | None:
+    """Budget for the one retry that follows a length-stopped reply.
+
+    Dream doubles its budget (the same escalation genesis' JSON repair uses),
+    clamped to ``provider_client.CHAT_OUTPUT_MAX_TOKENS`` — the one audited
+    ceiling every provider wire already accepts from foreground file-capable
+    Chat. Retrying at the budget that just truncated only asks for a shorter
+    answer; a garden whose consolidation genuinely needs more room fails the
+    same way every night. Capture keeps its historical same-budget retry
+    (``None``).
+    """
+    if lane == "capture":
+        return None
+    if lane == "dream":
+        base = max_output_tokens_for_lane("dream")
+        return min(base * 2, provider_client.CHAT_OUTPUT_MAX_TOKENS)
     raise ValueError(f"unsupported extraction lane: {lane}")
 
 
@@ -159,6 +186,7 @@ async def extract(
     parse_retry: ParseRetry | None = None,
     session: Any = None,
     step_sink: Any = None,
+    truncation_retry_max_tokens: int | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -180,10 +208,24 @@ async def extract(
     会把 provider 调用抢过去，等于放弃这些能力，那是净退步。
 
     两种模式共用一个 ``_call``，所以 provider 那一侧的行为不可能分家。
+
+    ## ``truncation_retry_max_tokens``
+
+    截断之后的那一次重问用的输出预算。``None`` = 沿用 ``max_tokens``（capture
+    的历史行为）。dream 传一个更大的值：只换「更简洁」的提示词、预算不变，
+    对真的需要更多输出空间的花园等于原样再截断一次（prod 上有用户连续多晚
+    ``output_truncated``）。只作用于截断之后的调用，首问预算不变。
     """
+    retry_budget = max(
+        int(max_tokens),
+        int(truncation_retry_max_tokens)
+        if truncation_retry_max_tokens is not None
+        else int(max_tokens),
+    )
 
     async def _call(
         attempt_prompt: str,
+        budget: int = max_tokens,
     ) -> tuple[str | None, str | None, dict[str, Any]]:
         """跑一次 provider，返回 reply、error 与 content-free 响应形状。"""
         messages = [{"role": "user", "content": attempt_prompt}]
@@ -195,7 +237,7 @@ async def extract(
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
-                max_tokens=max_tokens,
+                max_tokens=budget,
                 temperature=_TEMPERATURE,
                 timeout=_TIMEOUT_SEC,
                 progress_cb=progress_cb,
@@ -236,7 +278,7 @@ async def extract(
                 and not isinstance(raw_completion_tokens, bool)
                 else None
             ),
-            "max_tokens": max_tokens,
+            "max_tokens": budget,
         }
         reply = str((result or {}).get("reply") or "").strip()
         if not reply:
@@ -291,7 +333,10 @@ async def extract(
             attempt_prompt = session.next_prompt()
             if attempt_prompt is None:
                 break
-            reply, call_error, shape = await _call(attempt_prompt)
+            reply, call_error, shape = await _call(
+                attempt_prompt,
+                retry_budget if seen_truncation else max_tokens,
+            )
             if call_error is not None:
                 return None, call_error
             truncated = await _report_truncated(shape, attempt=2 if seen_truncation else 1)
@@ -326,11 +371,11 @@ async def extract(
                 {
                     "attempt": 2,
                     "strategy": "concise_prompt",
-                    "max_tokens": max_tokens,
+                    "max_tokens": retry_budget,
                 },
             )
         reply, call_error, response_shape = await _call(
-            parse_retry.build_truncation_prompt(prompt)
+            parse_retry.build_truncation_prompt(prompt), retry_budget
         )
         retried_once = True
         if await _report_truncated(response_shape, attempt=2):
