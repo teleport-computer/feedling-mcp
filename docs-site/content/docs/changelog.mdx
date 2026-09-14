@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Runtime V2 Dream no longer reports a run as completed when the
+  Memory Garden is below the memory kernel's consolidation minimum. Such a run
+  makes no model call and changes no cards; it is now recorded as a completed
+  job with outcome `skipped` / `not_enough_new_cards`, leaves the "last dreamed"
+  record untouched, adds no failure backoff, and is not attempted again until the
+  minimum Dream interval has passed. The consolidation threshold itself is
+  unchanged.
+
 - Hosted Runtime V2 Dream now has room to finish consolidating larger Memory
   Gardens. Its output budget rises from 4,000 to 12,000 tokens, and a reply that
   stops at that limit is retried once with a more concise prompt and a

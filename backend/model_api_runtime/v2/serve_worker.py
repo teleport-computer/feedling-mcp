@@ -4881,6 +4881,7 @@ def _record_extraction_status(
                     "organized_count": item_count,
                     "merged_count": item_count,
                 },
+                "dream_skip_reason": str((detail or {}).get("skip_reason") or ""),
             },
             status=status,
         )

@@ -575,6 +575,155 @@ def test_dream_context_degradation_is_not_indistinguishable_from_model_noop(
     assert terminal["status"] == "warning"
     assert terminal["detail"]["outcome"] == "noop"
     assert terminal["detail"]["degraded_context"] is True
+    # An unreadable card set is not "too few cards": it must never be
+    # recorded as a small-garden skip (which would space the next attempt).
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT wake_result FROM agent_jobs WHERE lane='dream' AND user_id=%s",
+            (uid,),
+        ).fetchone() == (None,)
+
+
+def _dream_job_outcome(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, last_error, wake_result, wake_result_reason "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+
+def _dream_db_card(user_id: str, memory_id: str) -> dict:
+    ts = "2026-06-20T00:00:00Z"
+    return {
+        "v": 1, "id": memory_id, "type": "fact", "owner_user_id": user_id,
+        "visibility": "shared", "body_ct": f"ct_{memory_id}",
+        "nonce": f"n_{memory_id}", "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}", "occurred_at": ts, "created_at": ts,
+        "updated_at": ts, "status": "active",
+    }
+
+
+def _no_provider_call(monkeypatch):
+    calls = []
+
+    async def _provider(*_args, **_kwargs):
+        calls.append(1)
+        raise AssertionError("a too-small garden must not reach the provider")
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _provider
+    )
+    return calls
+
+
+def test_dream_on_too_small_garden_is_recorded_as_skipped_not_consolidated(
+    monkeypatch,
+):
+    """Bug 17: memgarden declines to consolidate < its minimum; io used to call it
+    ``completed`` and advance the Dream ledger as if a real dream had run."""
+    from model_api_runtime.v2 import serve_worker
+    from proactive import dream_scheduler
+
+    uid = "u_x_dream_small_garden"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(2)])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    provider_calls = _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+    recorded = []
+
+    def _record(user_id, lane, status, detail):
+        recorded.append((lane, status, dict(detail)))
+        serve_worker._record_extraction_status(user_id, lane, status, detail)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(emit_debug_trace=emit_trace, record_extraction_status=_record),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert provider_calls == []
+    assert _dream_job_outcome(job_id) == (
+        "completed", None, "skipped", "not_enough_new_cards",
+    )
+    assert [row[:2] for row in recorded] == [("dream", "skipped")]
+    assert recorded[0][2]["skip_reason"] == "not_enough_new_cards"
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "ok"
+    assert terminal["detail"]["outcome"] == "skipped"
+    assert terminal["detail"]["counts"]["model_attempts"] == 0
+    assert "memory.dream.model.done" not in [row["type"] for row in traces]
+
+    store = core_store.get_store_per_load_mode(uid, reason="test dream ledger")
+    state = dream_scheduler.load_dream_state(store)
+    # Not a success: the consolidation ledger does not move ...
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["last_dreamed_seed_card_count"] == 0
+    # ... and not a failure: no backoff streak.
+    assert state["dream_fail_streak"] == 0
+    assert state["last_dream_skip_reason"] == "not_enough_new_cards"
+    assert state["last_dream_skipped_at"] > 0.0
+
+    # The next scheduler tick does not re-enqueue the same no-op right away.
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    submitted = []
+    tick = dream_scheduler.tick_memory_dream(
+        store,
+        submit=lambda *_a, **_k: submitted.append(1) or {"enqueued": True},
+    )
+    assert tick["enqueued"] is False
+    assert tick["reason"] == "not_enough_new_cards"
+    assert submitted == []
+
+
+def test_dream_with_enough_cards_still_reaches_the_model_and_is_not_skipped(
+    monkeypatch,
+):
+    uid = "u_x_dream_big_enough_garden"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    calls = []
+
+    async def _provider(_cfg, _messages, **_kwargs):
+        calls.append(1)
+        return {"reply": '{"consolidations": []}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _provider
+    )
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_memory_context=lambda _uid: {
+                "ai_name": "小克", "user_name": "Z", "cards": "C",
+                "card_items": cards,
+            },
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert calls == [1]
+    assert _dream_job_outcome(job_id) == ("completed", None, None, None)
+    assert traces[-1]["detail"]["outcome"] == "noop"
 
 
 def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):

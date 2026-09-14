@@ -21,6 +21,11 @@ from proactive import capture_jobs
 
 DREAM_STATE_KIND = "dream_state"
 DREAM_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
+# Worker-side "nothing to consolidate" verdicts that may arm the skip ledger.
+# Same content-free vocabulary as the tick reasons below (the kernel's
+# ``needs_dream``); anything else a status patch calls "skipped" leaves the
+# ledger untouched so it can never silence Dream for a day by accident.
+DREAM_SKIP_REASONS = frozenset({"not_enough_new_cards"})
 # One hour keeps a stalled scheduler visible within a bounded diagnostic window
 # while collapsing a stable 45-second client poll to at most 24 traces/user/day.
 DREAM_TRACE_HEARTBEAT_SEC = 3600.0
@@ -114,6 +119,15 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "pending_dream_key": str(doc.get("pending_dream_key") or "")[:240],
         "dream_fail_streak": max(0, _safe_int(doc.get("dream_fail_streak"), 0)),
         "last_dream_failed_at": _safe_float(doc.get("last_dream_failed_at"), 0.0),
+        # A Dream job that ran but had nothing to consolidate (garden below the
+        # kernel minimum). Neither a success (the consolidation ledger above is
+        # untouched) nor a failure (no backoff streak); it only spaces retries.
+        "last_dream_skipped_at": _safe_float(doc.get("last_dream_skipped_at"), 0.0),
+        "last_dream_skip_reason": (
+            str(doc.get("last_dream_skip_reason") or "")
+            if str(doc.get("last_dream_skip_reason") or "") in DREAM_SKIP_REASONS
+            else ""
+        ),
         "last_dream_trace_reason": str(doc.get("last_dream_trace_reason") or "")[:120],
         "last_dream_trace_at": _safe_float(doc.get("last_dream_trace_at"), 0.0),
         "updated_at": str(doc.get("updated_at") or "")[:80],
@@ -333,6 +347,19 @@ def _tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
+    # A recent worker skip ("garden too small to consolidate") spaces the next
+    # attempt like a completion would, without pretending a dream happened:
+    # the consolidation ledger stays untouched, so once the garden grows the
+    # next night's run is a real one. force bypasses.
+    skip_reason = str(state.get("last_dream_skip_reason") or "")
+    last_skipped = _safe_float(state.get("last_dream_skipped_at"), 0.0)
+    if (
+        not force
+        and skip_reason
+        and last_skipped
+        and now_ts - last_skipped < min_interval_sec()
+    ):
+        return {"enqueued": False, "reason": skip_reason, "state": state, "job": None, "snapshot": snapshot}
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
 
     # 「值不值得整理」的判据在内核 —— 只数种子卡、比指纹，不看时间不看内容。
@@ -483,6 +510,13 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         state["last_dreamed_until"] = str(until.get("last_until") or "")[:240]
         state["dream_fail_streak"] = 0
         state["last_dream_failed_at"] = 0.0
+        state["last_dream_skipped_at"] = 0.0
+        state["last_dream_skip_reason"] = ""
+    elif status_text == "skipped":
+        skip_reason = str(job.get("dream_skip_reason") or "").strip()
+        if skip_reason in DREAM_SKIP_REASONS:
+            state["last_dream_skipped_at"] = now_ts
+            state["last_dream_skip_reason"] = skip_reason
     elif status_text == "failed":
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         state["dream_fail_streak"] = int(state.get("dream_fail_streak") or 0) + 1

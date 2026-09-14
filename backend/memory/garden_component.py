@@ -108,6 +108,33 @@ def build_garden(
     )
 
 
+#: 内核「这次不整理」的判据里，只有这一种代表「花园还太小，整理没活可干」。
+#: 它来自 ``memgarden.dreaming.needs_dream``，阈值归内核（此处不复制数字）。
+#:
+#: ``no_memory_cards`` 刻意不在里面：调度器只在有卡时才排 Dream，worker 看到
+#: 0 张卡几乎一定是**卡片读取失败/降级**，把它记成「卡太少、跳过」就是把读失败
+#: 伪装成正常。它仍走原来的 noop 路径（带 degraded_context 告警）。
+MAINTENANCE_SKIP_REASONS = frozenset({"not_enough_new_cards"})
+
+
+def maintenance_skip_reason(session: Any) -> str:
+    """整理会话若被内核判为「花园太小、不必整理」，返回那个 content-free 理由；否则 ""。
+
+    只用会话的公开契约：被判不需要的会话 ``result()`` 返回 ``needed=False``
+    和 ``trace["reason"]``，且没有副作用。调用方应当只在「一次模型都没问、
+    也没有结果」时才来问 —— 那正是被判掉的会话的样子。
+    """
+    try:
+        outcome = session.result()
+    except Exception:  # noqa: BLE001 — 判不出来就按原路径走，不改变终态
+        return ""
+    if getattr(outcome, "needed", True) or getattr(outcome, "error", None):
+        return ""
+    trace = getattr(outcome, "trace", None)
+    reason = str(trace.get("reason") or "") if isinstance(trace, dict) else ""
+    return reason if reason in MAINTENANCE_SKIP_REASONS else ""
+
+
 # --------------------------------------------------------------------------- #
 # 观测：把组件汇报的步骤翻译成 io 原有的口径
 # --------------------------------------------------------------------------- #

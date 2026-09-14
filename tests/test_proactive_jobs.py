@@ -2117,6 +2117,93 @@ def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
     assert len(_memory_dream_jobs(store)) == 1
 
 
+def test_dream_skip_spaces_retries_without_success_or_failure_bookkeeping(
+    tmp_path, monkeypatch
+):
+    """Bug 17: a worker-side "garden too small" skip is its own outcome."""
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "3600")
+    core_store._stores.clear()
+
+    user_id = "usr_dream_skip_ledger"
+    seed_user(user_id)
+    store = core_store.UserStore(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_small")])
+
+    first = proactive_dream_scheduler.tick_memory_dream(store, now=1000.0)
+    assert first["enqueued"] is True
+    store.update_proactive_job(first["job"]["job_id"], {"status": "skipped"})
+    job = dict(first["job"], dream_skip_reason="not_enough_new_cards")
+    state = proactive_dream_scheduler.record_dream_job_status(
+        store, job, status="skipped", now=1001.0
+    )
+    assert state["pending_dream_key"] == ""
+    assert state["last_dream_skipped_at"] == 1001.0
+    assert state["last_dream_skip_reason"] == "not_enough_new_cards"
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["dream_fail_streak"] == 0
+    assert state["last_dream_failed_at"] == 0.0
+
+    within = proactive_dream_scheduler.tick_memory_dream(store, now=2000.0)
+    assert (within["enqueued"], within["reason"]) == (False, "not_enough_new_cards")
+    forced = proactive_dream_scheduler.tick_memory_dream(store, now=2001.0, force=True)
+    assert forced["reason"] != "not_enough_new_cards"
+    assert forced["job"] is not None
+
+    # A later real completion clears the skip marker.
+    proactive_dream_scheduler.record_dream_job_status(
+        store, forced["job"], status="completed", now=2002.0
+    )
+    cleared = proactive_dream_scheduler.load_dream_state(store)
+    assert cleared["last_dream_skipped_at"] == 0.0
+    assert cleared["last_dream_skip_reason"] == ""
+
+
+def test_dream_skip_marker_expires_after_min_interval_and_ignores_unknown_reasons(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "3600")
+    core_store._stores.clear()
+
+    user_id = "usr_dream_skip_expiry"
+    seed_user(user_id)
+    store = core_store.UserStore(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_small")])
+
+    first = proactive_dream_scheduler.tick_memory_dream(store, now=1000.0)
+    store.update_proactive_job(first["job"]["job_id"], {"status": "skipped"})
+    # A control-plane "skipped" (no worker verdict, or free text) must not
+    # silence Dream for a whole interval.
+    unknown = proactive_dream_scheduler.record_dream_job_status(
+        store,
+        dict(first["job"], dream_skip_reason="provider said: PRIVATE TEXT"),
+        status="skipped",
+        now=1001.0,
+    )
+    assert unknown["last_dream_skipped_at"] == 0.0
+    assert unknown["last_dream_skip_reason"] == ""
+    retry = proactive_dream_scheduler.tick_memory_dream(store, now=1002.0)
+    assert retry["enqueued"] is True
+    store.update_proactive_job(retry["job"]["job_id"], {"status": "skipped"})
+
+    proactive_dream_scheduler.record_dream_job_status(
+        store,
+        dict(retry["job"], dream_skip_reason="not_enough_new_cards"),
+        status="skipped",
+        now=1003.0,
+    )
+    after_interval = proactive_dream_scheduler.tick_memory_dream(
+        store, now=1003.0 + 3601.0
+    )
+    assert after_interval["enqueued"] is True
+
+
 def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "1")
