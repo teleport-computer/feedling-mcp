@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **`memory_fetch` returns superseded history again.** Every card retired by
+  `memory.supersede` (and by Runtime V2 Capture) also carries archive markers, and
+  those markers made it unavailable even when the request asked for
+  `include_superseded`. Before: fetching a replaced card with
+  `include_superseded: true` put it in `unavailable_ids`, and a successor's
+  `related_items` never listed the card it replaced. After: the replaced card is
+  returned with `status: "superseded"`, and the successor's related items include
+  it along the explicit `supersedes` link, as documented. Plain archived cards
+  still need `include_archived`; default index, search, fetch and automatic recall
+  are unchanged.
+
 - **Memory search stops returning loosely related cards, and automatic recall uses
   the same ranker.** `memory_search` / `memory-index --query` now rank with
   memgarden's BM25 (`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"`, same jieba
