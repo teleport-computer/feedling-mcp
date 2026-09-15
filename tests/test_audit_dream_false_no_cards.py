@@ -24,13 +24,14 @@ from asgi_test_client import make_client  # noqa: E402
 from conftest import seed_user  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from proactive import dream_ledger_audit as audit  # noqa: E402
 from proactive import dream_scheduler  # noqa: E402
 
 MODULE_PATH = Path(__file__).parent.parent / "tools" / "audit_dream_false_no_cards.py"
 SPEC = importlib.util.spec_from_file_location("audit_dream_false_no_cards", MODULE_PATH)
-audit = importlib.util.module_from_spec(SPEC)
+cli = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
-SPEC.loader.exec_module(audit)
+SPEC.loader.exec_module(cli)
 
 WINDOW = audit.parse_window("2026-09-10T18:00:00Z/2026-09-10T20:00:00Z")
 
@@ -155,9 +156,67 @@ def test_report_counts_verdicts_and_carries_no_card_content():
     assert [row["user_id"] for row in report["candidates"]] == ["usr_a"]
     assert set(report["candidates"][0]) == {
         "user_id", "job_id", "completed_at", "enqueue_card_count",
-        "incident_completions_in_window", "expected_ledger",
-        "restore_from_job_id", "restore_ledger",
+        "incident_completions_in_window", "expected_ledger", "ledger_fingerprint",
+        "restore_from_job_id", "restore_ledger", "rewound_job_ids",
+        "unreclassified_job_ids",
     }
+    assert report["already_repaired"] == []
+
+
+def test_a_ledger_already_rewound_to_the_restore_target_is_already_repaired():
+    verdict, row = _select([PREVIOUS, INCIDENT], _ledger_for(PREVIOUS))
+
+    assert verdict == "already_repaired"
+    assert row["job_id"] == "dream_incident"
+    assert row["ledger_fingerprint"] == audit.ledger_fingerprint(row["restore_ledger"])
+    report = audit.build_report(
+        {"usr_x": [PREVIOUS, INCIDENT]}, {"usr_x": _ledger_for(PREVIOUS)}, windows=[WINDOW],
+    )
+    assert report["already_repaired"] == [{
+        "user_id": "usr_x", "job_id": "dream_incident",
+        "unreclassified_job_ids": ["dream_incident"],
+    }]
+    assert report["candidates"] == []
+
+
+def test_a_job_the_repair_reclassified_still_reads_as_the_false_completion():
+    repaired = {
+        **INCIDENT,
+        "status": "failed",
+        "status_reason": "dream_context_unavailable",
+        "noop_reason": "dream_context_unavailable",
+        "dream_result": {**INCIDENT["dream_result"], "status": "failed",
+                         "reason": "dream_context_unavailable"},
+        audit.REPAIR_MARKER_KEY: {"original_status": "completed",
+                                  "original_completed_at": INCIDENT["completed_at"]},
+    }
+    assert _select([PREVIOUS, INCIDENT], _ledger_for(INCIDENT))[0] == "candidate"
+    verdict, row = _select([PREVIOUS, repaired], _ledger_for(PREVIOUS))
+    assert verdict == "already_repaired"
+    assert row["rewound_job_ids"] == ["dream_incident"]
+    assert row["unreclassified_job_ids"] == []
+    verdict, row = _select([PREVIOUS, INCIDENT], _ledger_for(PREVIOUS))
+    assert row["unreclassified_job_ids"] == ["dream_incident"]
+    # A job the fixed backend failed on its own (no marker) is not an incident.
+    unmarked = {key: value for key, value in repaired.items() if key != audit.REPAIR_MARKER_KEY}
+    assert _select([PREVIOUS, unmarked], _ledger_for(PREVIOUS)) == ("no_incident_completion", None)
+
+
+def test_ledger_fingerprint_covers_only_ledger_fields_and_tells_missing_from_zero():
+    ledger = _ledger_for(INCIDENT)
+    fingerprint = audit.ledger_fingerprint(ledger)
+    # Non-ledger siblings (pending/backoff/trace) do not move the fingerprint.
+    assert audit.ledger_fingerprint({**ledger, "pending_dream_key": "k",
+                                     "last_dream_trace_at": 9.0}) == fingerprint
+    for key in audit.LEDGER_FIELDS:
+        changed = {**ledger, key: ledger[key] + 1 if isinstance(ledger[key], (int, float))
+                   else ledger[key] + "x"}
+        assert audit.ledger_fingerprint(changed) != fingerprint, key
+    zero = audit.ledger_after(None)
+    assert audit.ledger_fingerprint({}) != audit.ledger_fingerprint(zero)
+    # jsonb may hand an integral float back for an int; that is the same ledger.
+    assert audit.ledger_fingerprint({**zero, "last_dreamed_card_count": 0.0}) == \
+        audit.ledger_fingerprint(zero)
 
 
 def test_window_dates_cover_every_utc_day_a_window_touches():
@@ -174,10 +233,15 @@ def test_window_dates_cover_every_utc_day_a_window_touches():
 def test_window_argument_must_be_an_ordered_pair():
     import argparse
 
-    with pytest.raises(argparse.ArgumentTypeError):
+    with pytest.raises(audit.InvalidWindow):
         audit.parse_window("2026-09-10T20:00:00Z/2026-09-10T18:00:00Z")
     with pytest.raises(argparse.ArgumentTypeError):
-        audit.parse_window("2026-09-10T18:00:00Z")
+        cli.parse_window("2026-09-10T20:00:00Z/2026-09-10T18:00:00Z")
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli.parse_window("2026-09-10T18:00:00Z")
+    with pytest.raises(SystemExit):
+        cli.main(["--env", "test", "--window", "2026-09-10T18:00:00Z"],
+                 connect=lambda: pytest.fail("must not connect"))
 
 
 def _memory(user_id, memory_id):
@@ -251,6 +315,22 @@ def _run_tool_read(user_ids, *, window=None, **kwargs):
     return report
 
 
+def _run_cli(user_ids):
+    import contextlib
+    import io
+    import json
+
+    now = datetime.now(timezone.utc)
+    window = f"{(now - timedelta(hours=1)).isoformat()}/{(now + timedelta(hours=1)).isoformat()}"
+    argv = ["--env", "test", "--window", window]
+    for user_id in user_ids:
+        argv += ["--user-id", user_id]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli.main(argv, connect=lambda: psycopg.connect(os.environ["DATABASE_URL"])) == 0
+    return json.loads(out.getvalue())
+
+
 @pytest.fixture
 def utc_server_clock():
     """``completed_at`` is written with the naive server clock; CVMs run in UTC."""
@@ -278,6 +358,9 @@ def test_tool_finds_a_user_stuck_by_the_real_pre_fix_flow(
     )
 
     report = _run_tool_read([stuck_user, verified_user])
+    cli_report = _run_cli([stuck_user, verified_user])
+    assert cli_report["candidates"] == report["candidates"]
+    assert cli_report["environment"] == "test"
 
     assert report["verdicts"] == {"candidate": 1, "no_incident_completion": 1}
     [candidate] = report["candidates"]

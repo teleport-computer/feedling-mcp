@@ -497,6 +497,73 @@ failure rate ≥ 50% or +15 pp day over day on ≥ 20 attempts, active users hal
   frozen before Dream skips were written to `silent_declared` show those skips
   as completions. The schedule only fires from the default branch.
 
+## Operator repairs (admin API)
+
+### False no-cards Dream ledger repair
+
+For users stuck after the 2026-09-10 / 09-13 incident (a timed-out card read
+was recorded as a completed "no cards" Dream, so the scheduler answers
+`already_dreamed`). Needs only the admin token; selection rules and limits live
+in `backend/proactive/dream_ledger_audit.py`, the write in
+`backend/admin/dream_ledger_repair.py`. All output is content-free (ids,
+timestamps, counts, hashes).
+
+What a repair does per listed user: (1) compare-and-set the `dream_state`
+ledger fields back to the last verified Dream (or never-dreamed zeros), only if
+the ledger fingerprint still equals the one from the audit; (2) reclassify the
+rewound false completions to `failed` / `dream_context_unavailable` with a
+`dream_ledger_repair` marker (otherwise an unchanged garden recomputes the same
+`dream_key` and the enqueue says `duplicate_dream_key`). It does not enqueue a
+Dream itself: the next scheduler tick decides with its normal rules.
+
+```bash
+API=https://<env-api-host>          # the backend of the environment to repair
+TOKEN=<FEEDLING_ADMIN_TOKEN>        # never paste into shared logs
+W1=2026-09-10T18:00:00Z/2026-09-10T20:00:00Z
+W2=2026-09-13T18:00:00Z/2026-09-13T20:00:00Z
+
+# 1. Read-only audit (repeat user_id=... to narrow). Review candidates[].
+curl -sG "$API/v1/admin/memory/dream-false-no-cards" \
+  -H "X-Admin-Token: $TOKEN" \
+  --data-urlencode "window=$W1" --data-urlencode "window=$W2" > audit.json
+jq '{verdicts, candidate_count, prefilter}' audit.json
+
+# 2. Build the request from reviewed rows only (no "all users" mode exists).
+jq --arg w1 "$W1" --arg w2 "$W2" '{windows: [$w1, $w2],
+  users: [.candidates[] | {user_id, ledger_fingerprint}]}' audit.json > repair.json
+
+# 3. Dry run (default): per user action=would_rewind, changes{field:{from,to}},
+#    would_reclassify_job_ids. Nothing is written.
+curl -s "$API/v1/admin/memory/dream-false-no-cards/repair" \
+  -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d @repair.json | jq '.counts, .results[] | {user_id, action, reason}'
+
+# 4. Apply — start with one user, then the rest (max 100 per request).
+jq '.dry_run = false | .users = .users[:1]' repair.json |
+  curl -s "$API/v1/admin/memory/dream-false-no-cards/repair" \
+    -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' -d @- |
+  jq '.counts, .results'
+
+# 5. Verify: re-run step 1 — repaired users move to already_repaired with
+#    unreclassified_job_ids == []; after their next night, later_verified_dream.
+```
+
+Result `action` values: `rewound`; `already_repaired` (no-op; apply mode only
+finishes leftover `unreclassified_job_ids`); `skipped` with `reason` =
+`ledger_changed_since_audit` (a Dream or another write moved the ledger — re-audit
+before retrying), `ledger_missing`, or the selector verdict
+(`no_incident_completion`, `later_verified_dream`, `ledger_moved`);
+`not_attempted` (35 s request budget spent — re-run, it is idempotent). A 503
+`dream_ledger_query_timeout` is safe to retry; narrow with `user_id` for the
+audit. Every applied decision logs `[admin:dream-ledger-repair]` and a rewind
+also writes a `memory.dream.ledger_rewound` trace event (when that user's debug
+trace is enabled).
+
+Known limits: a concurrent scheduler full write of `dream_state` that read the
+ledger before the rewind can put the old ledger back (step 5 then shows the user
+as a candidate again; re-run the repair for that user); jobs trimmed past the
+newest 500 per user and Runtime V2 empty reads are not found.
+
 ## Enclave configuration
 
 ### Screen frame VLM captioning

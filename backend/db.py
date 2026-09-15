@@ -10192,6 +10192,59 @@ def patch_blob_strict(
     return persisted_doc
 
 
+def patch_blob_if_match_strict(
+    user_id: str,
+    kind: str,
+    patch: dict,
+    *,
+    precondition,
+    statement_timeout_ms: int | None = None,
+) -> tuple[bool, dict | None]:
+    """Compare-and-merge one existing blob: the operator-repair write path.
+
+    Locks the row, evaluates ``precondition(current_doc)`` on the locked
+    document, and only then merges ``patch``'s top-level keys — all in one
+    transaction, so a writer that commits after this read cannot be overwritten
+    by a merge computed from a stale view. A missing row is never created
+    (``(False, None)``); a failed precondition returns ``(False, current_doc)``;
+    a merge returns ``(True, persisted_doc)`` after mirroring the committed
+    document to the TEE shadow exactly as :func:`patch_blob_strict` does.
+
+    The lock only fences writers that also lock or merge atomically. A
+    read/modify/full-write writer (``set_blob``) that read before this commit
+    can still overwrite the merge afterwards; callers re-read to confirm.
+    Revisioned kinds are refused: their mirror ordering needs the revision bump
+    this merge does not perform. DB failures propagate.
+    """
+    if kind in _REVISIONED_BLOB_KINDS:
+        raise ValueError("compare-and-merge does not support revisioned blob kinds")
+    clean_patch = dict(patch or {})
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            if statement_timeout_ms is not None:
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{int(statement_timeout_ms)}ms",),
+                )
+            current = conn.execute(
+                "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                (user_id, kind),
+            ).fetchone()
+            if current is None:
+                return False, None
+            current_doc = dict(current[0]) if isinstance(current[0], dict) else {}
+            if not precondition(dict(current_doc)):
+                return False, current_doc
+            row = conn.execute(
+                "UPDATE user_blobs SET doc = doc || %s "
+                "WHERE user_id=%s AND kind=%s RETURNING doc",
+                (Jsonb(clean_patch), user_id, kind),
+            ).fetchone()
+    persisted_doc = row[0]
+    _mirror_persisted_blob(user_id, kind, persisted_doc)
+    return True, persisted_doc
+
+
 def advance_blob_int_strict(user_id: str, kind: str, key: str, new_value: int):
     """Atomically advance one non-negative integer field without regression.
 
