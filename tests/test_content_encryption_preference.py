@@ -1,8 +1,4 @@
-"""一等偏好 content_encryption（Phase 2 Task 2.1）。
-
-只验证「偏好被正确存取」，不涉及任何加解密格式路由——那是 Task 2.2/2.3。
-偏好交付后暂时没有消费者，这是有意的：让路由改造能独立评审。
-"""
+"""Legacy encryption preference storage and the plaintext-new-content contract."""
 from __future__ import annotations
 
 import os
@@ -96,9 +92,16 @@ def test_whoami_reports_off_by_default(uid):
     assert _whoami(uid)["content_encryption"] == "off"
 
 
-def test_whoami_reports_on_when_enabled(uid):
-    registry._set_user_content_encryption(uid, "on")
-    assert _whoami(uid)["content_encryption"] == "on"
+@pytest.mark.parametrize("stored", [None, "off", "on"])
+def test_whoami_reports_off_without_rewriting_legacy_preference(uid, monkeypatch, stored):
+    from core import envelope as core_envelope
+
+    registry._set_user_content_encryption(uid, stored)
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    body = _whoami(uid)
+    assert body["content_encryption"] == "off"
+    assert body["content_encryption_effective"] == "off"
+    assert registry._get_user_content_encryption(uid) == (stored or "off")
 
 
 def test_whoami_still_emits_enclave_public_key_for_plaintext_users(uid):
@@ -123,10 +126,11 @@ def _prefs(uid, payload):
 
 
 def test_prefs_sets_and_returns_preference(uid):
-    body, status = _prefs(uid, {"content_encryption": "on"})
+    registry._set_user_content_encryption(uid, "on")
+    body, status = _prefs(uid, {"content_encryption": "off"})
     assert status == 200, body
-    assert body["content_encryption"] == "on"
-    assert registry._get_user_content_encryption(uid) == "on"
+    assert body["content_encryption"] == "off"
+    assert registry._get_user_content_encryption(uid) == "off"
 
 
 def test_prefs_alone_is_accepted(uid):
@@ -140,7 +144,7 @@ def test_prefs_alone_is_accepted(uid):
 
 
 def test_prefs_rejects_invalid_value(uid):
-    _prefs(uid, {"content_encryption": "on"})
+    registry._set_user_content_encryption(uid, "on")
     body, status = _prefs(uid, {"content_encryption": "maybe"})
     assert status == 400
     assert registry._get_user_content_encryption(uid) == "on", "非法请求不得改动原值"
@@ -173,16 +177,7 @@ def test_unchanged_value_is_a_noop(uid, monkeypatch):
 # ---------------------------------------------------------------------------
 # 生效值（effective）——供客户端**写侧**使用的那一个
 #
-# 偏好本身是「用户意图」，可以随时被设成 off；但服务端在 Task 2.2 完成前
-# **仍然拒收明文写入**（客户端写闸硬校验 K_enclave，见 worldbook_core.
-# _validate_envelope:51）。若 iOS 直接按意图走明文，全量写入会 400。
-#
-# 故 whoami 同时下发两个字段：
-#   content_encryption            = 用户意图（设置页开关绑这个）
-#   content_encryption_effective  = 客户端写侧必须遵守的形状
-#
-# 这样 iOS 与后端的发版顺序互不依赖：iOS 先发版也不会写坏，等后端把
-# PLAINTEXT_WRITES_ACCEPTED 翻成 True 才真正开始产生明文行。
+# 已知用户统一 off；部署闸关闭和未知用户仍 on，存量偏好不改写。
 
 
 def test_effective_is_on_while_plaintext_writes_are_rejected(uid, monkeypatch):
@@ -317,14 +312,15 @@ def test_effective_follows_intent_once_plaintext_writes_are_accepted(uid, monkey
     assert registry.effective_content_encryption(uid) == "off"
 
 
-def test_effective_stays_on_for_opted_in_user_even_after_gate_opens(uid, monkeypatch):
-    """开闸不影响显式选择加密的用户。"""
+def test_effective_is_off_for_legacy_on_user_after_gate_opens(uid, monkeypatch):
+    """旧 on 记录保留，但不能再让新客户端的明文写入遭到拒绝。"""
     from core import envelope as core_envelope
 
     monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
     registry._set_user_content_encryption(uid, "on")
 
-    assert registry.effective_content_encryption(uid) == "on"
+    assert registry.effective_content_encryption(uid) == "off"
+    assert registry._get_user_content_encryption(uid) == "on"
 
 
 def test_effective_is_on_for_unknown_user(backend_env, monkeypatch):
@@ -334,3 +330,72 @@ def test_effective_is_on_for_unknown_user(backend_env, monkeypatch):
     monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
 
     assert registry.effective_content_encryption("usr_definitely_not_here") == "on"
+
+
+@pytest.mark.parametrize("requested", ["on", " ON "])
+def test_prefs_rejects_on_before_writing_any_preferences(uid, requested):
+    registry._set_user_content_encryption(uid, "on")
+    before_language = registry._get_user_archive_language(uid)
+    before_timezone = registry._get_user_timezone(uid)
+    body, status = _prefs(uid, {
+        "content_encryption": requested,
+        "archive_language": "fr", "timezone": "Europe/Paris",
+    })
+    assert (status, body) == (400, {"error": "content_encryption_on_not_supported"})
+    assert registry._get_user_content_encryption(uid) == "on"
+    assert registry._get_user_archive_language(uid) == before_language
+    assert registry._get_user_timezone(uid) == before_timezone
+
+
+@pytest.mark.parametrize("requested", [None, "", "  "])
+def test_prefs_clear_remains_compatible(uid, requested):
+    registry._set_user_content_encryption(uid, "on")
+    body, status = _prefs(uid, {"content_encryption": requested})
+    assert status == 200, body
+    assert body["content_encryption"] == "off"
+    assert registry._get_user_content_encryption(uid) == "off"
+
+
+def test_unrelated_preferences_report_off_without_rewriting_legacy_on(uid):
+    registry._set_user_content_encryption(uid, "on")
+    body, status = _prefs(uid, {"archive_language": "en"})
+    assert status == 200, body
+    assert body["content_encryption"] == "off"
+    assert registry._get_user_content_encryption(uid) == "on"
+
+
+@pytest.mark.parametrize("binary", [False, True])
+@pytest.mark.parametrize("known,gate,expected", [
+    (True, True, None),
+    (False, True, "plaintext_envelope_not_enabled_for_this_account"),
+    (True, False, "plaintext_envelope_not_enabled_for_this_account"),
+])
+def test_plaintext_upload_uses_effective_policy_for_legacy_on(
+    uid, monkeypatch, binary, known, gate, expected,
+):
+    from core import envelope as core_envelope
+
+    registry._set_user_content_encryption(uid, "on")
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", gate)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption",
+                        registry.effective_content_encryption)
+    user_id = uid if known else "usr_definitely_not_here"
+    envelope = {"owner_user_id": user_id, "visibility": "shared"}
+    if binary:
+        envelope["body_b64"] = "AP8="
+        result = core_envelope.validate_uploaded_chat_envelope(
+            envelope, user_id=user_id, content_type="file")
+    else:
+        envelope["body"] = "new plaintext"
+        result = core_envelope.validate_uploaded_envelope(envelope, user_id=user_id)
+    assert result == ({"error": expected} if expected else None)
+    assert registry._get_user_content_encryption(uid) == "on"
+
+
+def test_whoami_retains_closed_gate_effective_on(uid, monkeypatch):
+    from core import envelope as core_envelope
+
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", False)
+    body = _whoami(uid)
+    assert body["content_encryption"] == "off"
+    assert body["content_encryption_effective"] == "on"

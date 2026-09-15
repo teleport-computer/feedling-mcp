@@ -8085,7 +8085,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes."
+        "description": "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"off\", or null/empty to clear). Requesting \"on\" returns HTTP 400 content_encryption_on_not_supported before any preferences are written; other invalid values also return 400. The response content_encryption is always \"off\". Legacy stored \"on\" does not control new writes and is not rewritten by reads or unrelated preference updates. Existing ciphertext is not converted. Use content_encryption_effective from /v1/users/whoami for the deployment-gated write shape; local_only still requires encryption."
       }
     },
     "/v1/users/public-key": {
@@ -8204,7 +8204,7 @@
           "Accounts"
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference."
+        "description": "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and preferences. content_encryption is a compatibility field reporting \"off\" for known users, including accounts with a legacy stored \"on\" preference. content_encryption_effective is the write shape: \"off\" for every known user when plaintext writes are enabled, otherwise \"on\". Unknown users remain fail-safe \"on\". Treat an absent, empty, or unrecognized effective value as \"on\". Legacy preferences and existing ciphertext are not rewritten; local_only still requires encryption."
       }
     },
     "/v1/vision/config": {

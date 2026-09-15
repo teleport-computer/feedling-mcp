@@ -393,8 +393,16 @@ def users_set_preferences(store: UserStore, payload: dict):
 
     ce_raw = payload.get("content_encryption")
     has_ce = "content_encryption" in payload
-    if has_ce and ce_raw is not None and not isinstance(ce_raw, str):
-        return {"error": "content_encryption must be a string or null"}, 400
+    # Validate before any preference is persisted; null/empty still clear the
+    # legacy preference, while enabling encryption must never look successful.
+    if has_ce:
+        if ce_raw is not None and not isinstance(ce_raw, str):
+            return {"error": "content_encryption must be a string or null"}, 400
+        ce_value = (ce_raw or "").strip().lower()
+        if ce_value == "on":
+            return {"error": "content_encryption_on_not_supported"}, 400
+        if ce_value not in ("", "off"):
+            return {"error": 'content_encryption must be "on", "off", or null'}, 400
 
     if not has_lang and not has_tz and not has_ce:
         return {
@@ -429,9 +437,8 @@ def users_set_preferences(store: UserStore, payload: dict):
             return {"error": "timezone must be a valid IANA zone or null"}, 400
 
     if has_ce:
-        # v6 加密开关：只认 "on"/"off"（空=清除）。非法值整条请求 400，不半应用。
         if not registry._set_user_content_encryption(store.user_id, ce_raw):
-            return {"error": 'content_encryption must be "on", "off", or null'}, 400
+            return {"error": "user not found"}, 404
 
     tz_now = registry._get_user_timezone(store.user_id)
     ce_now = registry._get_user_content_encryption(store.user_id)
@@ -441,8 +448,8 @@ def users_set_preferences(store: UserStore, payload: dict):
         "status": "updated",
         "archive_language": registry._get_user_archive_language(store.user_id),
         "timezone": tz_now or None,
-        # 未设置时回显 "off"：v6 默认明文，别让客户端自己猜缺字段的含义。
-        "content_encryption": ce_now or "off",
+        # Compatibility field: stored legacy "on" no longer controls new writes.
+        "content_encryption": "off",
     }, 200
 
 

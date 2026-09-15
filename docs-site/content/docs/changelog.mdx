@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **New shared content uses plaintext for all known accounts when the deployment
+  gate is enabled.** A legacy stored `content_encryption: "on"` no longer changes
+  the new-write shape. `whoami` reports compatibility `content_encryption: "off"`
+  and effective `off`; the effective value remains `on` for unknown users or a
+  closed deployment gate. `POST /v1/users/preferences` rejects `on` with HTTP 400
+  `content_encryption_on_not_supported` before writing any preference; `off` and
+  null/empty clearing remain supported. Existing preferences and ciphertext are
+  not migrated, and `local_only` still requires encryption.
+
 - **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
   The block is the user-visible first-person aside shown under the reply, and the
   instruction now says so; it is no longer described as private inner thoughts.

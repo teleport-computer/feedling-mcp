@@ -1076,6 +1076,7 @@ jobs:
             tests/test_user_content_plaintext_migration.py \
             tests/test_byok_plaintext_read_routing.py \
             tests/test_content_encryption_preference.py \
+            tests/test_asgi_accounts_remaining.py \
             tests/test_encryption_surface_frozen.py \
             tests/test_envelope_storage_fields.py \
             tests/test_no_fake_envelope_shapes.py \
