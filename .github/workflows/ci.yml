@@ -835,7 +835,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (77 files)
+      - name: Run CI security tier 3 (78 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -883,6 +883,7 @@ jobs:
             tests/test_tee_replicate_conn_retry.py \
             tests/test_tee_replicator_frames.py \
             tests/test_tee_replicator_main.py \
+            tests/test_tee_replicator_policy.py \
             tests/test_tee_replicator_transforms.py \
             tests/test_tee_replicator_worker.py \
             tests/test_tee_reflow.py \
@@ -1074,6 +1075,7 @@ jobs:
             tests/test_garden_component_parity.py \
             tests/test_orchestration_is_not_reimplemented.py \
             tests/test_backfill_chat_bodies_to_plaintext.py \
+            tests/test_effective_off_content_repair.py \
             tests/test_user_content_plaintext_migration.py \
             tests/test_byok_plaintext_read_routing.py \
             tests/test_content_encryption_preference.py \
