@@ -921,7 +921,7 @@ def test_v1_block_renders_the_unified_enclave_selection(monkeypatch):
     assert [c["id"] for c in picked] == ["lamp"] and picked[0]["score"] > 0
     text, ids = resident._auto_memory_context(picked, [])
     assert ids == ["lamp"] and "匹配「" in text and "露营灯" in text
-    assert log["mode"].startswith("relevant:unified:memgarden-bm25-v1+tok:jieba-0.42.1")
+    assert log["mode"].startswith("relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1")
 
 
 def test_auto_memory_context_orders_by_score_skips_quoted_and_keeps_ids_only():

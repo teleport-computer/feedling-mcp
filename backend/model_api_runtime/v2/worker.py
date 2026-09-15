@@ -13099,7 +13099,13 @@ async def _run_extraction(
             dream_counts["model_attempts"] = (
                 0 if dream_skip_reason else max(1, dream_model_attempts)
             )
-            dream_counts["proposals"] = len(items or [])
+            # Proposals = what the model returned, including the ones the
+            # component dropped at its exit (TRUNCATED / unrendered targets).
+            dream_counts["proposals"] = (
+                len(items or [])
+                + _step_sink.dropped_truncated_target
+                + _step_sink.dropped_unrendered_target
+            )
         if lane == "dream" and dream_skip_reason:
             await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
             await _emit_v2_dream_lifecycle(
@@ -13142,28 +13148,38 @@ async def _run_extraction(
                 job_id=str(job_id),
                 trace_id=trace_id,
                 status="ok",
-                outcome=("accepted" if items else "no_proposals"),
+                outcome=("accepted" if dream_counts.get("proposals") else "no_proposals"),
                 started_at=dream_started,
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
-        if lane == "dream" and items and dream_disclosure.truncated_ids:
+        kernel_truncated_dropped = (
+            _step_sink.dropped_truncated_target if lane == "dream" else 0
+        )
+        if lane == "dream" and (
+            (items and dream_disclosure.truncated_ids) or kernel_truncated_dropped
+        ):
             # Host-side hard block: the prompt forbids rewriting a card the
             # model only saw part of, but a prompt is not a guarantee. Drop
             # every consolidation that touches one before mapping; if that
             # leaves nothing, fail (ledger stays put) rather than report a
-            # no-op for a run whose every proposal was forbidden.
-            items, truncated_rejected = (
+            # no-op for a run whose every proposal was forbidden. A memgarden
+            # that already drops these at the component exit leaves nothing
+            # for this check; its drops count as the same guard.
+            items, host_truncated_rejected = (
                 garden_component.reject_truncated_consolidations(
-                    items, dream_disclosure.truncated_ids
+                    items or [], dream_disclosure.truncated_ids
                 )
             )
+            truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
             if truncated_rejected:
                 await _record_trajectory(
                     trajectory_recorder,
                     "dream_truncated_card_guard",
                     {
                         "rejected": truncated_rejected,
+                        "component_rejected": kernel_truncated_dropped,
+                        "host_rejected": host_truncated_rejected,
                         "kept": len(items),
                         "truncated_cards": len(dream_disclosure.truncated_ids),
                     },

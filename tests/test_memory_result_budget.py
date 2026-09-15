@@ -264,7 +264,7 @@ def test_94_cards_survive_real_pipeline_with_seven_siblings(garden, name, args):
     assert status == 200 and len(http["items"]) == 94
     assert "score" in http["items"][0] and "threads" in http["items"][0]
     if name == "memory_search":
-        assert payload["ranking"] == memory_search_contract.VERSION == "memgarden-bm25-v1+tok:jieba-0.42.1"
+        assert payload["ranking"] == memory_search_contract.VERSION == "memgarden-bm25-v2+tok:jieba-0.42.1"
         assert payload["unavailable_count"] == 0
         search_event = next(e for e in events if e["type"] == "memory.search.called")
         assert len(search_event["detail"]["ids"]) == 20

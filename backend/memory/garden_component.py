@@ -505,6 +505,14 @@ class BounceTracker:
         #: 重问之后 target_id 仍不是现有卡、被组件丢掉的卡数。和上面分开：
         #: 「没说覆盖哪张」和「说了一张不存在的」是两种模型失败。
         self.dropped_unknown_target = 0
+        #: Dream：组件在出口丢掉的整理建议条数（``why="unsafe_target"``）——
+        #: 动了 TRUNCATED 卡的、动了没渲染进提示词的卡的，分开数。
+        #:
+        #: 新内核自己先拦了，宿主 :func:`reject_truncated_consolidations` 就拦不到；
+        #: 不把这两个数接住，「全部建议都动了截断卡」会从 guard_rejected 失败
+        #: 变成「这晚没什么要整理」的 noop，提案数也会少算。
+        self.dropped_truncated_target = 0
+        self.dropped_unrendered_target = 0
         #: 组件建提示词时报的索引计数（``prompt_built`` 步骤里带的）。
         self.index: dict = {}
 
@@ -516,6 +524,9 @@ class BounceTracker:
             self.dropped_semantic += int(step.detail.get("cards") or 0)
         elif step.kind == "dropped" and step.detail.get("why") == "unknown_target":
             self.dropped_unknown_target += int(step.detail.get("cards") or 0)
+        elif step.kind == "dropped" and step.detail.get("why") == "unsafe_target":
+            self.dropped_truncated_target += int(step.detail.get("truncated") or 0)
+            self.dropped_unrendered_target += int(step.detail.get("unrendered") or 0)
         elif step.kind == "prompt_built" and step.purpose == "capture":
             for key in ("index_candidates", "index_cards", "index_chars"):
                 if isinstance(step.detail.get(key), int):
@@ -533,8 +544,8 @@ class BounceTracker:
             return ""
         if error:
             return "bounced_failed"
-        if not cards:
-            # 模型接受了「宁可留空」这条出路。
+        if not cards and not (self.dropped_truncated_target or self.dropped_unrendered_target):
+            # 模型接受了「宁可留空」这条出路。（给了建议、被组件出口拦掉的不算留空。）
             return "bounced_empty"
         return "bounced_ok"
 

@@ -138,7 +138,8 @@ def test_memory_search_bm25_contract_and_explicit_resource_failure(public_schema
     result = schemas["MemoryIndexResponse"]["properties"]
     import memory_search_contract
     assert result["ranking"]["enum"] == list(memory_search_contract.ACCEPTED) == [
-        "memgarden-bm25-v1+tok:jieba-0.42.1", "bm25-jieba-0.42.1-v1", "substring-legacy"]
+        "memgarden-bm25-v2+tok:jieba-0.42.1", "memgarden-bm25-v1+tok:jieba-0.42.1",
+        "bm25-jieba-0.42.1-v1", "substring-legacy"]
     assert "unavailable_count" in result
     op = public_schema["paths"]["/v1/memory/index"]["post"]
     assert "413" in op["responses"]

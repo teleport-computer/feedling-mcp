@@ -200,3 +200,16 @@ def test_truncated_guard_drops_only_proposals_touching_a_truncated_card():
     assert rejected == 2
     assert kept == [rows[2], rows[3]]
     assert gc.reject_truncated_consolidations(rows, ()) == (rows, 0)
+
+
+def test_bounce_tracker_counts_component_exit_drops_apart_from_model_empties():
+    from memgarden import Step
+
+    tracker = gc.BounceTracker()
+    tracker(Step(kind="retrying", purpose="dream", attempt=1, detail={"why": "x"}))
+    assert tracker.bounce(cards=[], error=None) == "bounced_empty"
+    tracker(Step(kind="dropped", purpose="dream", attempt=2,
+                 detail={"why": "unsafe_target", "truncated": 2, "unrendered": 1}))
+    assert (tracker.dropped_truncated_target, tracker.dropped_unrendered_target) == (2, 1)
+    # The model did propose; the component refused them. Not "chose to stay empty".
+    assert tracker.bounce(cards=[], error=None) == "bounced_ok"

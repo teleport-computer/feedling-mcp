@@ -132,7 +132,7 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 同一个 jieba 分词器（`backend/memory/jieba_tokenizer.py`），每张卡先过相关性门槛，
 再按软配额留转折卡 ≤3 / 最近 ≤2，≤8 张。自动想起的强证据门槛比搜索松
 （`memory_search_contract.RECALL_RANK_OPTIONS`，理由和评测数字在那里的注释与
-docs-site changelog），mode 形如 `relevant:unified:memgarden-bm25-v1+tok:jieba-0.42.1+cfg:…`。
+docs-site changelog），mode 形如 `relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`。
 回滚闸 `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0`（enclave 环境变量，默认开）
 退回旧的 `scoring.relevance.select_relevant_context_memories_with_trace`（mode `relevant:unified`）。选卡 query 是**最近四条对话**（含上一条 AI 回复）拼接，
 不再只看最后一句。转折角色只认卡片显式 `roles`（`backend/memory/card_shape.py::roles_of`），

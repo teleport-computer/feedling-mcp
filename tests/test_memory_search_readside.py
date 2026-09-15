@@ -190,6 +190,13 @@ def test_previous_protocol_is_served_for_a_backend_mid_rolling_restart(client):
     new = search(client, garden, query="我叫什么名字", limit=5).get_json()
     assert new["ranking"] == contract.VERSION
     assert new["items"] == []
+    tiny = [moment("coffee", "喜欢喝美式咖啡，不加糖")]
+    v1 = search(client, tiny, query="我平时早上一般喝什么咖啡", limit=5,
+                search_protocol=contract.PREVIOUS_MEMGARDEN).get_json()
+    assert v1["ranking"] == contract.PREVIOUS_MEMGARDEN and v1["items"] == []
+    v2 = search(client, tiny, query="我平时早上一般喝什么咖啡", limit=5).get_json()
+    assert v2["ranking"] == contract.VERSION
+    assert [i["id"] for i in v2["items"]] == ["coffee"]
 
 
 def test_new_backend_retries_old_protocol_only_on_explicit_unsupported(monkeypatch):
@@ -198,18 +205,34 @@ def test_new_backend_retries_old_protocol_only_on_explicit_unsupported(monkeypat
     monkeypatch.setattr(memory_readside_core.memory_service, "_load_moments", lambda _: rows)
     calls = []
 
-    def old_enclave(api_key, candidates, *, operation, payload):
-        calls.append(payload["search_protocol"])
-        if payload["search_protocol"] != contract.PREVIOUS:
-            raise RuntimeError('enclave_http_400:{"error":"memory_search_protocol_unsupported"}')
-        return {"user_id": "owner", "items": [{"id": "a", "summary": "coffee"}],
-                "unavailable_ids": [], "ranking": contract.PREVIOUS}
+    def enclave_serving(*served):
+        def post(api_key, candidates, *, operation, payload):
+            calls.append(payload["search_protocol"])
+            if payload["search_protocol"] not in served:
+                raise RuntimeError('enclave_http_400:{"error":"memory_search_protocol_unsupported"}')
+            return {"user_id": "owner", "items": [{"id": "a", "summary": "coffee"}],
+                    "unavailable_ids": [], "ranking": payload["search_protocol"]}
+        return post
 
-    out = memory_readside_core.memory_index_core(
-        SimpleNamespace(user_id="owner"), "k", {"query": "coffee", "limit": 1},
-        post_enclave=old_enclave)
-    assert calls == [contract.VERSION, contract.PREVIOUS]
-    assert out["ranking"] == contract.PREVIOUS and [i["id"] for i in out["items"]] == ["a"]
+    # One release behind (memgarden v1 enclave), then pre-memgarden enclave.
+    for served, expected in (
+            ((contract.PREVIOUS_MEMGARDEN, contract.PREVIOUS),
+             [contract.VERSION, contract.PREVIOUS_MEMGARDEN]),
+            ((contract.PREVIOUS,),
+             [contract.VERSION, contract.PREVIOUS_MEMGARDEN, contract.PREVIOUS])):
+        calls.clear()
+        out = memory_readside_core.memory_index_core(
+            SimpleNamespace(user_id="owner"), "k", {"query": "coffee", "limit": 1},
+            post_enclave=enclave_serving(*served))
+        assert calls == expected
+        assert out["ranking"] == expected[-1] and [i["id"] for i in out["items"]] == ["a"]
+
+    calls.clear()
+    with pytest.raises(RuntimeError, match="memory_search_protocol_unsupported"):
+        memory_readside_core.memory_index_core(
+            SimpleNamespace(user_id="owner"), "k", {"query": "coffee", "limit": 1},
+            post_enclave=enclave_serving())
+    assert calls == [contract.VERSION, *contract.FALLBACKS]
 
     for error in ("enclave_http_400:{\"error\":\"moments must be a list\"}",
                   "enclave_http_503:memory_search_protocol_unsupported", "enclave_error:ReadTimeout"):

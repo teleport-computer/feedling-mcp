@@ -998,7 +998,10 @@ def test_dream_host_blocks_consolidations_touching_a_truncated_card(monkeypatch)
     assert [action["supersedes"] for action in applied] == [["card-5", "card-6"]]
     guard = [payload for kind, payload in recorder.events
              if kind == "dream_truncated_card_guard"]
-    assert guard == [{"rejected": 1, "kept": 1, "truncated_cards": 1}]
+    # memgarden drops it at the component exit first; the host check then sees
+    # nothing, and the guard still reports it (not as a smaller proposal count).
+    assert guard == [{"rejected": 1, "component_rejected": 1, "host_rejected": 0,
+                      "kept": 1, "truncated_cards": 1}]
     assert "card-3" not in json.dumps(guard)
 
 
@@ -1043,6 +1046,7 @@ def test_dream_fails_when_every_consolidation_touches_a_truncated_card(monkeypat
     )
     assert traces[-1]["type"] == "memory.dream.error"
     assert traces[-1]["detail"]["outcome"] == "guard_rejected"
+    assert traces[-1]["detail"]["counts"]["proposals"] == 1
 
 
 def test_dream_fails_closed_on_a_memgarden_without_card_body_rendering(monkeypatch):

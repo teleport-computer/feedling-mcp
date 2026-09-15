@@ -106,7 +106,7 @@ def test_kill_switch_off_restores_the_previous_selector_exactly(monkeypatch):
     assert len(calls) == 4 and calls[0] == "\n".join(m["content"] for m in WINDOW)
     for value in ("1", "true", "", "anything"):
         monkeypatch.setenv(chat.RECALL_RANKER_ENV, value)
-        assert _run(monkeypatch, _cards())[2]["mode"].startswith("relevant:unified:memgarden-bm25-v1")
+        assert _run(monkeypatch, _cards())[2]["mode"].startswith("relevant:unified:memgarden-bm25-v2")
     assert len(calls) == 4
 
 

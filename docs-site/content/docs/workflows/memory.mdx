@@ -204,7 +204,7 @@ points and recent cards; every selected card must pass the relevance gate. Its
 gate is looser than search's: the four-message query is mostly everyday chat the
 Garden never recorded, so one strongly matching anchor is enough to recall a
 card. Selection records carry the ranking version in `mode` (for example
-`relevant:unified:memgarden-bm25-v1+tok:jieba-0.42.1+cfg:…`). Operators can
+`relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`). Operators can
 restore the previous selector with `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0` on
 the enclave (default on); search keeps the new ranker either way. A missing or
 failed selection remains unknown, not a measured empty Garden.
@@ -459,11 +459,15 @@ ID ascending. The existing per-item `score` remains importance/recency, **not**
 BM25. Full content, tokens, postings and BM25 scores are not added to the response.
 Final evidence selection still belongs to your client or agent.
 
-Query responses additionally carry `ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"`
+Query responses additionally carry `ranking: "memgarden-bm25-v2+tok:jieba-0.42.1"`
 and `unavailable_count` (candidate cards that could not be read, excluded from
-statistics). During a rolling upgrade a response may instead report
-`ranking: "bm25-jieba-0.42.1-v1"` (the previous enclave BM25 without stopwords or
-relevance gate) or `ranking: "substring-legacy"` (the old case-insensitive
+statistics). The relevance gate's coverage check counts term rarity over at least
+20 cards, so a Garden with only a few cards still finds its answer. During a
+rolling upgrade a response may instead report
+`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"` (the same ranker with the coverage
+check over the real card count, which could return nothing in Gardens under ~20
+cards), `ranking: "bm25-jieba-0.42.1-v1"` (the previous enclave BM25 without
+stopwords or relevance gate) or `ranking: "substring-legacy"` (the old case-insensitive
 whole-query substring match and importance order). Authentication
 errors, timeouts, and unknown protocols do not silently fall back. Blank or
 omitted `query` retains the existing index browsing path; fetch is unchanged.

@@ -11398,11 +11398,12 @@
           "ranking": {
             "type": "string",
             "enum": [
+              "memgarden-bm25-v2+tok:jieba-0.42.1",
               "memgarden-bm25-v1+tok:jieba-0.42.1",
               "bm25-jieba-0.42.1-v1",
               "substring-legacy"
             ],
-            "description": "Present for nonblank query. memgarden-bm25-v1+tok:jieba-0.42.1 is the current ranker (shared with automatic recall). bm25-jieba-0.42.1-v1 and substring-legacy explicitly mark older rankers answered during rolling upgrades."
+            "description": "Present for nonblank query. memgarden-bm25-v2+tok:jieba-0.42.1 is the current ranker (shared with automatic recall). memgarden-bm25-v1+tok:jieba-0.42.1, bm25-jieba-0.42.1-v1 and substring-legacy explicitly mark older rankers answered during rolling upgrades."
           },
           "unavailable_count": {
             "type": "integer",

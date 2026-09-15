@@ -12,6 +12,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Users with fewer than about 20 memories now get search and automatic-recall
+  hits that were previously filtered out.** The relevance gate's coverage check
+  weighed query words the Garden never recorded by the real card count, so in a
+  tiny Garden they outweighed the words that did match. Before: a new user whose
+  only card is "likes Americano, no sugar" asks "what coffee do I usually drink in
+  the morning" → `memory_search` returns nothing and automatic recall injects no
+  card. After: the card is returned and recalled. memgarden now counts that
+  check over at least 20 cards; Gardens of 20 or more cards rank exactly as
+  before. `memory_search` responses report
+  `ranking: "memgarden-bm25-v2+tok:jieba-0.42.1"` and recall modes
+  `relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`. During a rolling
+  upgrade an older enclave may still answer `memgarden-bm25-v1+tok:jieba-0.42.1`
+  (accepted, old gate), and a new enclave still serves that protocol to an older
+  backend.
+
 - **History import no longer fails when the account's archive language carries
   a region tag.** The iOS app stores the device's preferred language (for
   example `en-US`, `zh-Hans-CN` or `zh-Hant-TW`) as the archive language, and the
