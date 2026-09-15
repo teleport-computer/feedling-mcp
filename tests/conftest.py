@@ -269,6 +269,8 @@ if not _provisioned:
         "test_resident_wake_memory.py",
         # 纯函数：记忆 lane 的 agent 调用失败归类（Bug 20），零 DB / 零网络。
         "test_agent_call_failure_codes.py",
+        # 记忆管线日报：fixture + 假 opener，零 DB / 零网络 / 不发飞书。
+        "test_memory_pipeline_daily_report.py",
         # 纯函数：provider 解析层给「思考吃光输出预算」打标 + 抽取截断重问，MockTransport、零 DB。
         "test_extraction_output_truncation.py",
         "test_resident_decrypt_probe_startup.py",
