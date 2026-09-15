@@ -43,6 +43,7 @@ import object_storage
 from plaintext_shadow import config as plaintext_shadow_config
 from plaintext_shadow.config import TargetPolicy
 from tee_replicator import policy, terminal_preservation, transforms
+from tee_replicator import worker as _worker
 from tee_shadow import mirror, reconciler
 from tee_shadow import table_registry as reg
 

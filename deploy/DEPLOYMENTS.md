@@ -811,7 +811,8 @@ read-only and refuses to boot if the prepare was skipped or only partially
 completed. The marker remains audit metadata and is not a startup dependency.
 
 The complete encrypted/plaintext two-account release order, inventory queries,
-and test/prod promotion checklist are in
+test/prod promotion checklist, and the dry-run-first effective-off historical
+repair command are in
 `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`.
 
 ### TEE-primary to plaintext-shadow release gates
