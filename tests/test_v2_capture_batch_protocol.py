@@ -3376,3 +3376,301 @@ def test_chat_preempt_of_a_dead_workers_non_capture_job_is_unchanged(
 
     assert _job_row(job_id)[:3] == ("superseded", 0, "foreground_chat_preempted")
     assert int(_capture_state(uid).get("capture_fail_streak") or 0) == 0
+
+
+# --- Codex 第 13 轮 ---------------------------------------------------------- #
+
+
+def _race(first_name: str, first_fn, second_fn, holding: threading.Event,
+          release: threading.Event) -> tuple[dict, list]:
+    """先动手的一方拿齐锁后停住，第二方必须真的在等锁；放行后两边都跑完。"""
+    results: dict = {}
+    errors: list[BaseException] = []
+
+    def run(name, fn):
+        try:
+            results[name] = fn()
+        except BaseException as exc:  # noqa: BLE001 — 线程里的失败要带回主线程断言
+            errors.append(exc)
+
+    t1 = threading.Thread(target=run, args=("first", first_fn), name=first_name)
+    t1.start()
+    assert holding.wait(10)
+    t2 = threading.Thread(target=run, args=("second", second_fn), name="race-second")
+    t2.start()
+    t2.join(1.0)
+    assert t2.is_alive(), "第二方没有等锁 —— 两边并没有真正争同一组锁"
+    release.set()
+    t1.join(15)
+    t2.join(15)
+    assert not t1.is_alive() and not t2.is_alive()
+    return results, errors
+
+
+@pytest.mark.parametrize("first", ["enqueue", "reaper"])
+def test_capture_enqueue_waiting_behind_a_crash_expiry_honours_the_backoff_it_armed(
+    monkeypatch, first
+):
+    """A 锁住过期的落卡任务、终结 + 记账；B 在等同一行锁。B 醒来后看到「没有活跃任务」，
+    不能立刻建新任务绕过 A 刚记下的退避（第 13 轮 I1）。A 是另一次入队或回收器都一样。
+
+    两次入队的调度器都是在 A 记账**之前**判的退避（同一个 admitted_at）。
+    """
+    uid = f"u_capture_enqueue_backoff_race_{first}"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    _write_capture_state(uid, {
+        "last_captured_until_message_id": "m2",
+        "last_captured_until_seq": 2,
+        "capture_seq_initialized": True,
+    })
+    job_id, _job = _running(uid, owner="race-crashed")
+    _expire_lease(job_id)
+    holding = threading.Event()
+    release = threading.Event()
+    original = jobs_store._record_capture_crash_failure_on_cursor
+
+    def hold_after_accounting(cur, **kwargs):
+        failed = original(cur, **kwargs)
+        if threading.current_thread().name == "race-first":
+            holding.set()
+            assert release.wait(10)
+        return failed
+
+    monkeypatch.setattr(
+        jobs_store, "_record_capture_crash_failure_on_cursor", hold_after_accounting)
+    admitted_at = _time.time()
+
+    def enqueue():
+        return jobs_store.enqueue_capture(
+            uid, reason="quiet_timeout", backoff_now=admitted_at)
+
+    results, errors = _race(
+        "race-first", enqueue if first == "enqueue" else _reap_future, enqueue,
+        holding, release)
+
+    assert errors == []
+    if first == "enqueue":
+        assert results["first"] == jobs_store.CaptureEnqueueResult(job_id, "expired_deferred")
+    else:
+        assert [r["id"] for r in results["first"]] == [job_id]
+    assert results["second"] == jobs_store.CaptureEnqueueResult(None, "backoff_deferred")
+    assert _active_capture_jobs(uid) == [], "等锁的那次入队绕过刚记下的退避建了新任务"
+    assert _job_row(job_id)[:3] == ("expired", 1, "lease_timeout")
+    assert int(_capture_state(uid)["capture_fail_streak"]) == 1
+
+
+def test_capture_enqueue_backoff_recheck_matches_the_scheduler_when_nothing_changed():
+    """重判用调度器的同一个 now：退避已过 / 从没失败时照常建任务；已知仍在退避里也不建。"""
+    uid = "u_capture_enqueue_backoff_recheck"
+    _seed(uid)
+    now = _time.time()
+    assert jobs_store.enqueue_capture(uid, backoff_now=now).disposition == "created"
+    with db.get_pool().connection() as conn:
+        conn.execute("UPDATE agent_jobs SET status='completed',finished_at=now() "
+                     "WHERE user_id=%s", (uid,))
+    _write_capture_state(uid, {"capture_fail_streak": 1, "last_capture_failed_at": now - 601})
+    assert jobs_store.enqueue_capture(uid, backoff_now=now).disposition == "created"
+    with db.get_pool().connection() as conn:
+        conn.execute("UPDATE agent_jobs SET status='completed',finished_at=now() "
+                     "WHERE user_id=%s", (uid,))
+    _write_capture_state(uid, {"capture_fail_streak": 1, "last_capture_failed_at": now - 10})
+    assert jobs_store.enqueue_capture(uid, backoff_now=now) == jobs_store.CaptureEnqueueResult(
+        None, "backoff_deferred")
+    # 不传 backoff_now（手动 force / 通用 enqueue_job）不重判。
+    assert jobs_store.enqueue_capture(uid).disposition == "created"
+    assert jobs_store.enqueue_capture(uid, backoff_now=now).disposition == "coalesced_active"
+
+
+def test_v2_capture_submit_reports_deferred_rounds_without_a_fake_pending_job(monkeypatch):
+    """旧任务过期被终结 / 被刚记的失败压在退避里：submit 不能回一个假的 pending 任务、
+    也不能报成 v2_coalesced（第 13 轮 M1）。手动 force 不受退避限制。"""
+    uid = "u_capture_submit_deferred"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    monkeypatch.setenv("FEEDLING_V2_CAPTURE_ENABLED", "1")
+    notified: list = []
+    monkeypatch.setattr(proactive_core.core_wake_bus, "notify",
+                        lambda *args: notified.append(args))
+
+    class Store:
+        user_id = uid
+
+    def submit(trigger):
+        return proactive_core._submit_v2_capture(
+            Store(), trigger=trigger, now=_time.time(),
+            window=_window(), capture_key="capture:k")
+
+    crashed_id, _job = _running(uid, owner="submit-crashed")
+    _expire_lease(crashed_id)
+
+    assert submit("quiet_timeout") == {
+        "enqueued": False, "reason": "v2_expired_deferred", "job": None}
+    assert _job_row(crashed_id)[0] == "expired"
+    assert submit("quiet_timeout") == {
+        "enqueued": False, "reason": "failure_backoff", "job": None}
+    assert _active_capture_jobs(uid) == [] and notified == []
+
+    forced = submit("manual_force")
+    assert forced["enqueued"] is True and forced["reason"] == "v2"
+    assert [r[0] for r in _active_capture_jobs(uid)] == [forced["job"]["id"]]
+    coalesced = submit("quiet_timeout")
+    assert coalesced["enqueued"] is False and coalesced["reason"] == "v2_coalesced"
+    assert coalesced["job"]["id"] == forced["job"]["id"]
+    assert len(notified) == 1
+
+
+def test_first_time_opt_out_racing_crash_accounting_leaves_no_retrying_notice(monkeypatch):
+    """设置行还不存在、首次关闭落卡正握着 consent 锁没提交：回收器照记账（卡死 worker 也常握着
+    这把锁，不记会让默认用户的卡死永远进不了退避），但开关说不准 → 不发「正在重试」提示；
+    关闭提交后也不能留下提示（第 13 轮 I2）。"""
+    uid = "u_capture_first_opt_out_race"
+    _seed(uid)
+    assert db.get_blob_strict(uid, "proactive_settings") is None
+    _write_capture_state(uid, {"capture_fail_streak": 2, "last_capture_failed_at": 1.0})
+    job_id, _job = _running(uid, owner="first-opt-out-crash")
+    holding = threading.Event()
+    release = threading.Event()
+    original = db._lock_capture_consent_on_cursor
+
+    def hold_consent(cur, user_id):
+        original(cur, user_id)
+        if threading.current_thread().name == "first-opt-out":
+            holding.set()
+            assert release.wait(15)
+
+    monkeypatch.setattr(db, "_lock_capture_consent_on_cursor", hold_consent)
+    results: dict = {}
+    errors: list[BaseException] = []
+
+    def run(name, fn):
+        try:
+            results[name] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    optout = threading.Thread(target=run, args=(
+        "optout", lambda: core_store.UserStore(uid).save_proactive_settings(
+            {"capture_enabled": False})), name="first-opt-out")
+    optout.start()
+    assert holding.wait(10)
+    try:
+        reaper = threading.Thread(target=run, args=("reaped", _reap_future), name="reaper")
+        reaper.start()
+        reaper.join(10)
+        assert not reaper.is_alive(), "回收器被正在提交的首次关闭卡住了"
+        assert [r["id"] for r in results["reaped"]] == [job_id]
+        assert int(_capture_state(uid)["capture_fail_streak"]) == 3
+        assert _backoff_notice(uid) is None, "开关说不准时发了「正在重试」提示"
+    finally:
+        release.set()
+        optout.join(15)
+    assert not optout.is_alive() and errors == []
+    assert db.get_blob_strict(uid, "proactive_settings")["capture_enabled"] is False
+    assert _backoff_notice(uid) is None
+
+
+def test_opt_out_waits_for_an_in_flight_crash_notice_and_then_clears_it(monkeypatch):
+    """回收器拿到 consent 锁、读到开着、正在发提示：关闭必须排在它后面，并在提交后清掉这条提示（第 13 轮 I2）。"""
+    from proactive import capture_jobs
+
+    uid = "u_capture_notice_then_opt_out"
+    _seed(uid)
+    _write_capture_state(uid, {"capture_fail_streak": 2, "last_capture_failed_at": 1.0})
+    job_id, _job = _running(uid, owner="notice-crash")
+    holding = threading.Event()
+    release = threading.Event()
+    original = capture_jobs.notify_backoff
+
+    first_seen: dict = {}
+
+    def hold_after_notice(*args, **kwargs):
+        original(*args, **kwargs)
+        if threading.current_thread().name == "race-first":
+            first_seen["notice"] = _backoff_notice(uid)
+            holding.set()
+            assert release.wait(10)
+
+    monkeypatch.setattr(capture_jobs, "notify_backoff", hold_after_notice)
+
+    def opt_out():
+        return core_store.UserStore(uid).save_proactive_settings({"capture_enabled": False})
+
+    results, errors = _race("race-first", _reap_future, opt_out, holding, release)
+
+    assert errors == []
+    assert [r["id"] for r in results["first"]] == [job_id]
+    assert first_seen["notice"] is not None and first_seen["notice"]["resolved"] is False
+    assert results["second"]["capture_enabled"] is False
+    notice = _backoff_notice(uid)
+    assert notice is not None and notice["resolved"] is True, "关闭提交后没有清掉「正在重试」提示"
+
+
+def test_opt_out_clears_an_existing_retrying_notice():
+    uid = "u_capture_opt_out_clears_notice"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    for attempt in range(3):
+        job_id, _job = _running(uid, owner=f"clear-{attempt}")
+        assert [r["id"] for r in _reap_future()] == [job_id]
+    assert _backoff_notice(uid)["resolved"] is False
+    core_store.UserStore(uid).save_proactive_settings({"dnd": True})
+    assert _backoff_notice(uid)["resolved"] is False, "无关的设置写入不该清提示"
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": False})
+    assert _backoff_notice(uid)["resolved"] is True
+
+
+def test_chat_send_does_not_wait_for_crash_accounting_postcommit(monkeypatch):
+    """聊天抢占终结了崩溃的落卡任务：镜像 + 提示放到后台做，发送不等它（第 13 轮 M2）。"""
+    uid = "u_capture_chat_postcommit_async"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    crashed_id, _job = _running(uid, owner="postcommit-crashed")
+    _expire_lease(crashed_id)
+    started = threading.Event()
+    release = threading.Event()
+    ran: list = []
+
+    def slow_postcommit(user_id, job_id, *, source, failed_state):
+        started.set()
+        assert release.wait(10)
+        ran.append((user_id, job_id, source, int(failed_state["capture_fail_streak"])))
+
+    monkeypatch.setattr(jobs_store, "after_capture_crash_recorded", slow_postcommit)
+    try:
+        t0 = _time.monotonic()
+        _seq, chat_id = _chat_send(uid, "chat-slow-postcommit")
+        elapsed = _time.monotonic() - t0
+        assert chat_id is not None
+        assert started.wait(10), "收尾根本没跑"
+        assert ran == [] and elapsed < 5, "聊天发送等了崩溃记账的收尾"
+    finally:
+        release.set()
+    assert jobs_store.wait_capture_postcommit_idle(10)
+    assert ran == [(uid, crashed_id, "chat_preempt", 1)]
+
+
+def test_chat_send_crash_postcommit_still_notices_and_survives_a_failing_hook(monkeypatch):
+    uid = "u_capture_chat_postcommit_real"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    calls: list = []
+    real = jobs_store.after_capture_crash_recorded
+
+    def flaky(user_id, job_id, **kwargs):
+        calls.append(job_id)
+        if len(calls) == 1:
+            raise RuntimeError("mirror down")
+        return real(user_id, job_id, **kwargs)
+
+    monkeypatch.setattr(jobs_store, "after_capture_crash_recorded", flaky)
+    assert jobs_store.after_capture_crash_recorded_in_background(
+        uid, 0, source="test", failed_state={"capture_fail_streak": 0})
+    _write_capture_state(uid, {"capture_fail_streak": 2, "last_capture_failed_at": 1.0})
+    crashed_id, _job = _running(uid, owner="postcommit-real")
+    _expire_lease(crashed_id)
+    _chat_send(uid, "chat-real-postcommit")
+    assert jobs_store.wait_capture_postcommit_idle(10)
+    assert calls == [0, crashed_id], "一次收尾失败把后台线程带死了"
+    notice = _backoff_notice(uid)
+    assert notice is not None and notice["resolved"] is False and notice["blame"] == "system"

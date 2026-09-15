@@ -176,6 +176,34 @@ class PreemptedJob:
     # 抢占时撞见的是租约已过期的落卡任务：已在同一事务里终结并记了一次落卡失败。
     # 调用方提交后要调 ``after_capture_crash_recorded``（镜像 capture_state + 同步提示）。
     capture_failure_state: dict | None = None
+
+
+#: 落卡入队这一次到底发生了什么（Codex 第 13 轮 M1）。通用 ``enqueue_job`` 的
+#: ``(job_id, coalesced)`` 表达不了「旧任务已被终结、这一轮没有任务」，调用方会误报成
+#: 「已合并进一个排队中的任务」。
+#:
+#: - ``created``：新建了一个待跑的落卡任务。
+#: - ``coalesced_active``：合并进一个仍活着的落卡任务（排队中 / 租约内在跑）。
+#: - ``expired_deferred``：撞见租约已过期的旧任务，同一事务里终结 + 记账，这一轮不建新任务；
+#:   ``job_id`` 是那个**已终结**的旧任务。
+#: - ``backoff_deferred``：没有活跃任务，但加锁后重读的 capture_state 显示正处在失败退避里
+#:   （典型：并发的另一次入队 / 回收器刚终结了崩溃任务并记了账），这一轮不建新任务；
+#:   ``job_id`` 为 None。只有调用方传了 ``backoff_now`` 才会出现。
+CaptureEnqueueDisposition = Literal[
+    "created", "coalesced_active", "expired_deferred", "backoff_deferred"
+]
+
+
+@dataclass(frozen=True)
+class CaptureEnqueueResult:
+    job_id: int | None
+    disposition: CaptureEnqueueDisposition
+
+    @property
+    def created(self) -> bool:
+        return self.disposition == "created"
+
+
 # Chat admission and execution use separate columns and clocks. Pending rows
 # have a short queue deadline so an admitted turn cannot wait forever when the
 # fleet dies. Claim starts a distinct owner-fenced execution lease. Workers
@@ -1326,7 +1354,8 @@ def _enqueue_capture_job(
     priority,
     deadline_at,
     expected_generation: int | None,
-) -> tuple[int, bool]:
+    backoff_now: float | None = None,
+) -> CaptureEnqueueResult:
     """落卡 lane 的入队边界（Codex 第 12 轮 C1）。
 
     通用的 ``coalesce_or_insert_on_cursor`` 撞见租约已过期的 claimed/running 旧任务时，
@@ -1340,10 +1369,21 @@ def _enqueue_capture_job(
     - 锁顺序和落卡其他边界一致：chat fence → runtime 行（``FOR SHARE``）→ job 行 →
       （设置行 ``FOR SHARE``）→ capture_state。不能先让通用函数锁了 job 行再补拿 fence。
     - 撞见**同代**、租约已过期的 claimed/running 落卡任务：同一事务里按回收器的方式终结 +
-      记一次不带窗口的失败，**这一轮不建新任务**，返回 ``(旧任务 id, True)``（True = 没有新建）。
+      记一次不带窗口的失败，**这一轮不建新任务**，返回 ``expired_deferred``。
       下一轮调度器再决定建不建 —— 那时它能看到刚记下的退避。
     - 仍在租约内的 claimed/running：直接合并（``input_generation+1``），不再二次读时钟。
-    - 其余情况（没有活跃任务 / 排队中 / 代已过期）原样交给通用函数，行为不变。
+    - **没有活跃任务**且调用方给了 ``backoff_now``（调度器的准入时刻）：建新任务之前，在同一事务、
+      按同一锁顺序（job 行之后）重读 capture_state，用同一个退避判断再过一次闸；处在退避里
+      就返回 ``backoff_deferred``，不建（Codex 第 13 轮 I1）。堵的是这条缝：
+
+          A 锁住过期任务 → 终结 + 记账 → 提交
+          B 在等同一行锁 → 醒来后行已不是 claimed/running → 看到「没有活跃任务」→ 直接建新任务
+
+      B 的调度器是在 A 记账**之前**判的退避，所以绕过了。回收器在调度器判完退避之后提交也是同一条缝。
+      状态没变时这次重判和调度器的结论一样（同一个 now、同一份状态），正常路径不受影响。
+    - 其余情况（排队中 / 代已过期）原样交给通用函数，行为不变。
+
+    ``backoff_now=None``（手动 force、通用 ``enqueue_job`` 调用方）不做这道重判。
 
     ``expected_generation`` 由调用方给出时（effect outbox），调用方已在外层事务里握着
     runtime 行锁和 chat fence（``_chat_user_fence_held_by_outer_transaction``），这里只读
@@ -1358,6 +1398,7 @@ def _enqueue_capture_job(
                 priority=priority,
                 deadline_at=deadline_at,
                 expected_generation=expected_generation,
+                backoff_now=backoff_now,
             )
             break
         except psycopg.errors.UniqueViolation:
@@ -1375,12 +1416,70 @@ def _enqueue_capture_job(
                 )
         if failed_state is not None:
             after_capture_crash_recorded(
-                str(user_id), int(result[0]), source="enqueue", failed_state=failed_state
+                str(user_id), int(result.job_id), source="enqueue",
+                failed_state=failed_state,
             )
-    _notify_job_enqueued(
-        user_id, "capture", reason=reason, trace_id=trace_id, result=result
-    )
+    if result.job_id is not None:
+        # 只有真正新建才会触发 enqueue 钩子（通用 _notify_job_enqueued 的约定）。
+        _notify_job_enqueued(
+            user_id, "capture", reason=reason, trace_id=trace_id,
+            result=(int(result.job_id), not result.created),
+        )
     return result
+
+
+def enqueue_capture(
+    user_id,
+    *,
+    reason=None,
+    trace_id=None,
+    priority=None,
+    deadline_at=None,
+    expected_generation: int | None = None,
+    backoff_now: float | None = None,
+) -> CaptureEnqueueResult:
+    """落卡调度器的入队入口：返回结构化的 ``CaptureEnqueueResult``（见 CaptureEnqueueDisposition）。
+
+    ``backoff_now`` 传调度器做准入判断时用的那个时刻（手动 force 不传）：没有活跃任务时，
+    建新任务前会拿加锁后重读的 capture_state 按同一个时刻再判一次失败退避。
+    """
+    trace_id = _trace_id_for_enqueue("capture", trace_id)
+    if priority is None:
+        priority = LANE_PRIORITY.get("capture", 0)
+    return _enqueue_capture_job(
+        user_id,
+        reason=reason,
+        trace_id=trace_id,
+        priority=priority,
+        deadline_at=deadline_at,
+        expected_generation=expected_generation,
+        backoff_now=backoff_now,
+    )
+
+
+def _capture_backoff_armed_on_cursor(cur, user_id: str, now_ts: float) -> bool:
+    """建新落卡任务之前，重读 capture_state（``FOR SHARE``）并按调度器同一个退避判断过闸。
+
+    调用方已持 chat fence → runtime 行，且刚确认没有活跃的落卡任务（等过的 job 行锁已释放）。
+    ``FOR SHARE`` 让本事务排在任何还没提交的 capture_state 写入之后（worker 失败 / 回收记账都是
+    job 行 → capture_state 的顺序，不会反过来等本事务持有的锁）。状态行不在 = 没失败过。
+    """
+    from proactive import capture_jobs
+
+    cur.execute(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR SHARE",
+        (str(user_id), _CAPTURE_STATE_KIND),
+    )
+    row = cur.fetchone()
+    doc = row["doc"] if row is not None else None
+    if not isinstance(doc, dict):
+        return False
+    try:
+        streak = int(float(doc.get("capture_fail_streak") or 0))
+        last_failed_at = float(doc.get("last_capture_failed_at") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return capture_jobs.in_failure_backoff(streak, last_failed_at, float(now_ts))
 
 
 def _enqueue_capture_once(
@@ -1391,7 +1490,8 @@ def _enqueue_capture_once(
     priority,
     deadline_at,
     expected_generation: int | None,
-) -> tuple[tuple[int, bool], tuple | None]:
+    backoff_now: float | None = None,
+) -> tuple[CaptureEnqueueResult, tuple | None]:
     expired: tuple | None = None
     with _pool().connection() as conn:
         with conn.transaction():
@@ -1442,14 +1542,25 @@ def _enqueue_capture_once(
                             expired = _expire_overdue_capture_on_cursor(
                                 cur, job=dict(existing), runtime=runtime
                             )
-                            return (int(existing["id"]), True), expired
+                            return CaptureEnqueueResult(
+                                int(existing["id"]), "expired_deferred"
+                            ), expired
                         cur.execute(
                             "UPDATE agent_jobs SET input_generation=input_generation+1 "
                             "WHERE id=%s RETURNING id",
                             (existing["id"],),
                         )
-                        return (int(cur.fetchone()["id"]), True), None
-                result = coalesce_or_insert_on_cursor(
+                        return CaptureEnqueueResult(
+                            int(cur.fetchone()["id"]), "coalesced_active"
+                        ), None
+                if (
+                    existing is None
+                    and backoff_now is not None
+                    and _capture_backoff_armed_on_cursor(cur, str(user_id), backoff_now)
+                ):
+                    # 调度器判退避之后，另一次入队 / 回收器刚终结崩溃任务并记了账（第 13 轮 I1）。
+                    return CaptureEnqueueResult(None, "backoff_deferred"), None
+                job_id, coalesced = coalesce_or_insert_on_cursor(
                     cur,
                     user_id,
                     "capture",
@@ -1459,7 +1570,9 @@ def _enqueue_capture_once(
                     deadline_at=deadline_at,
                     expected_generation=effective_generation,
                 )
-    return result, expired
+    return CaptureEnqueueResult(
+        int(job_id), "coalesced_active" if coalesced else "created"
+    ), expired
 
 
 def enqueue_job(
@@ -1496,7 +1609,10 @@ def enqueue_job(
     if lane == "capture":
         # 落卡入队可能撞见一个租约已过期的旧任务，终结它要在同一事务里记落卡失败，
         # 锁顺序和下面的通用路径不同，见 _enqueue_capture_job。其他 lane 不经过这里。
-        return _enqueue_capture_job(
+        # 这里保持通用返回约定 (job_id, 没有新建)；要区分「合并进活任务」和「旧任务已终结、
+        # 这一轮没任务」的调用方（调度器）用 enqueue_capture。不传 backoff_now，不会出现
+        # backoff_deferred，job_id 一定有值。
+        capture = _enqueue_capture_job(
             user_id,
             reason=reason,
             trace_id=trace_id,
@@ -1504,6 +1620,9 @@ def enqueue_job(
             deadline_at=deadline_at,
             expected_generation=expected_generation,
         )
+        if capture.job_id is None:  # pragma: no cover - 不传 backoff_now 时不可达
+            raise RuntimeError("capture enqueue deferred without a job id")
+        return int(capture.job_id), not capture.created
 
     # The result is captured and returned *after* the transaction closes so the
     # enqueue hook below cannot observe a write that later rolls back: a trace
@@ -2821,7 +2940,14 @@ def _capture_allowed_for_crash_accounting_on_cursor(cur, user_id: str) -> bool:
 
     设置行还不存在（默认开着）时没有行可锁：只**尝试**拿一下 consent 锁（不等待）。
     拿到 = 此刻没有并发的设置写入，之后的写入会排在本事务后面；拿不到 = 有人正握着它
-    （设置写入或还活着的 provider 调用），照旧按默认开着记账，提交后的提示前会再查一次开关。
+    （正在首次写设置行的关闭，或卡住的 worker 还在 provider 调用里握着它），此时开关**说不准**。
+
+    说不准时仍然**记账**（Codex 第 13 轮 I2 的取舍）：租约过期的卡死 worker 恰恰常常还握着
+    consent 锁（卡在 provider 调用里），这时不记账会让「没有设置行的默认用户」（大多数人）的
+    卡死永远进不了退避 —— 第 12 轮要修的问题原样回来。反过来，真碰上一次并发的首次关闭，
+    多记的这一次只影响退避次数：落卡已经关了，调度器不会再建任务；以后重新打开时这次崩溃也
+    确实发生在打开期间。**提示**则不在这里决定：提交后 ``_sync_capture_crash_notice`` 会在
+    consent 锁下重新判断，说不准就不发；关闭提交后自己也会清掉这条提示。
     """
     settings_sql = (
         "SELECT doc FROM user_blobs WHERE user_id=%s "
@@ -2914,31 +3040,62 @@ def _sync_capture_crash_notice(user_id: str, job_id) -> None:
     worker 亲手失败时由 worker._notify_capture_backoff 发提示；崩溃/卡死的任务
     走不到那里，所以回收路径自己发。重新读一次状态并确认最后一次失败仍是这个
     任务记的 —— 期间若已有新的落卡成功/失败，就不拿旧次数去覆盖提示。
+
+    和关闭落卡的线性化（Codex 第 12 轮 I2 / 第 13 轮 I2）：
+
+    - **尝试**拿 consent 锁（不等待）。拿不到 = 有人正握着它（最典型的是正在提交的关闭，
+      设置行还不存在时它是唯一的串行点），开关说不准 → 不发。卡死 worker 还握着锁时同样不发，
+      下一次记账会再同步。
+    - 拿到之后读设置（关掉了就不发），并且**握着锁发提示**：关闭要拿同一把锁，只能排在
+      这次发提示之后提交；它提交后会清掉 ``memory_backoff:capture``（``UserStore.save_proactive_settings``），
+      所以不会留下一条「正在自动重试」给已经关掉落卡的人。
+    - 只尝试、从不等待，且不拿 chat fence：发提示本身不碰 consent 锁，也不会被账号删除卡住。
     """
     try:
         from types import SimpleNamespace
 
         from proactive import capture_jobs
 
-        state = db.get_blob_strict(str(user_id), _CAPTURE_STATE_KIND) or {}
-        if str(state.get("last_capture_failed_job_id") or "") != str(job_id):
-            return
-        # 记账事务提交之后、发提示之前，用户可能刚关掉落卡：关掉的人不该再收到
-        # 「记忆整理受阻、正在重试」（Codex 第 12 轮 I2）。设置读不出来时不发。
-        settings = db.get_blob_strict(str(user_id), "proactive_settings")
-        if settings is not None and (
-            not isinstance(settings, dict)
-            or not bool(settings.get("capture_enabled", True))
-        ):
-            return
-        capture_jobs.notify_backoff(
-            SimpleNamespace(user_id=str(user_id)),
-            lane="capture",
-            status="failed",
-            streak=int(state.get("capture_fail_streak") or 0),
-            account_code=str(state.get("capture_account_error_code") or ""),
-            skipped=False,
-        )
+        with _pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        "SELECT pg_try_advisory_xact_lock("
+                        "hashtextextended('capture-consent:' || %s, 0)) AS got",
+                        (str(user_id),),
+                    )
+                    if not bool(cur.fetchone()["got"]):
+                        log.info(
+                            "[v2.capture] crash notice skipped: capture consent busy user=%s job=%s",
+                            user_id,
+                            job_id,
+                        )
+                        return
+                    cur.execute(
+                        "SELECT kind,doc FROM user_blobs WHERE user_id=%s "
+                        "AND kind IN (%s,'proactive_settings')",
+                        (str(user_id), _CAPTURE_STATE_KIND),
+                    )
+                    docs = {str(r["kind"]): r["doc"] for r in cur.fetchall()}
+                    state = docs.get(_CAPTURE_STATE_KIND)
+                    state = state if isinstance(state, dict) else {}
+                    if str(state.get("last_capture_failed_job_id") or "") != str(job_id):
+                        return
+                    # 关掉的人不该再收到「记忆整理受阻、正在重试」。设置行形状不对时不发。
+                    if "proactive_settings" in docs:
+                        settings = docs["proactive_settings"]
+                        if not isinstance(settings, dict) or not bool(
+                            settings.get("capture_enabled", True)
+                        ):
+                            return
+                    capture_jobs.notify_backoff(
+                        SimpleNamespace(user_id=str(user_id)),
+                        lane="capture",
+                        status="failed",
+                        streak=int(state.get("capture_fail_streak") or 0),
+                        account_code=str(state.get("capture_account_error_code") or ""),
+                        skipped=False,
+                    )
     except Exception as exc:  # noqa: BLE001 — 提示失败绝不影响回收结果
         log.warning(
             "[v2.capture] crash recovery notice failed user=%s err=%s",
@@ -3139,6 +3296,82 @@ def after_capture_crash_recorded(
     )
     _mirror_capture_state_current(str(user_id))
     _sync_capture_crash_notice(str(user_id), job_id)
+
+
+#: 聊天发送路径上待做的崩溃记账收尾最多排多少条。超出就丢弃并打日志：capture_state 的
+#: TEE 镜像有定期对账补齐，提示会在这个用户下一次记账时重新同步。
+_CAPTURE_POSTCOMMIT_QUEUE_MAX = 256
+_capture_postcommit_queue: Any = None
+_capture_postcommit_start_lock = threading.Lock()
+
+
+def after_capture_crash_recorded_in_background(
+    user_id: str, job_id, *, source: str, failed_state: dict
+) -> bool:
+    """把 ``after_capture_crash_recorded`` 放到后台线程做，不占聊天发送的返回路径（Codex 第 13 轮 M2）。
+
+    前台聊天抢占时终结了崩溃的落卡任务，提交后要镜像 capture_state（TEE 网络 I/O）+ 同步提示
+    （几次 DB 读写）。这些都是纯旁路、结果不影响这次发送，却曾在发送请求里同步做完。
+
+    没有复用 effect outbox / wake bus：它们都是持久化的 V2 effect 或跨进程唤醒，这里两件事都
+    有自己的补偿（镜像有对账，提示下次记账再同步），不值得为它们加一张持久化表。
+    每个进程一个守护线程 + 有界队列；队列满 / 单条失败只打日志。返回是否入队成功。
+    """
+    global _capture_postcommit_queue
+    import queue as _queue
+
+    if _capture_postcommit_queue is None:
+        with _capture_postcommit_start_lock:
+            if _capture_postcommit_queue is None:
+                q: _queue.Queue = _queue.Queue(maxsize=_CAPTURE_POSTCOMMIT_QUEUE_MAX)
+                threading.Thread(
+                    target=_capture_postcommit_loop,
+                    args=(q,),
+                    name="v2-capture-crash-postcommit",
+                    daemon=True,
+                ).start()
+                _capture_postcommit_queue = q
+    try:
+        _capture_postcommit_queue.put_nowait(
+            (str(user_id), job_id, str(source), dict(failed_state))
+        )
+    except _queue.Full:
+        log.warning(
+            "[v2.capture] crash post-commit dropped (queue full) user=%s job=%s mode=%s",
+            user_id,
+            job_id,
+            source,
+        )
+        return False
+    return True
+
+
+def _capture_postcommit_loop(q) -> None:
+    while True:
+        user_id, job_id, source, failed_state = q.get()
+        try:
+            after_capture_crash_recorded(
+                user_id, job_id, source=source, failed_state=failed_state
+            )
+        except Exception as exc:  # noqa: BLE001 — 旁路收尾，绝不让线程退出
+            log.warning(
+                "[v2.capture] crash post-commit failed user=%s job=%s mode=%s err=%s",
+                user_id,
+                job_id,
+                source,
+                type(exc).__name__,
+            )
+        finally:
+            q.task_done()
+
+
+def wait_capture_postcommit_idle(timeout: float = 10.0) -> bool:
+    """测试 / 运维用：等后台崩溃记账收尾队列清空。没启动过视为空闲。"""
+    q = _capture_postcommit_queue
+    if q is None:
+        return True
+    with q.all_tasks_done:
+        return q.all_tasks_done.wait_for(lambda: q.unfinished_tasks == 0, timeout)
 
 
 def _capture_recovery_target(

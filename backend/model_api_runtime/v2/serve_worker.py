@@ -3287,14 +3287,20 @@ def _tick_capture_for_user(user_id: str) -> int:
     )
 
     def _submit(store, *, trigger, now, window, capture_key):
-        job_id, coalesced = jobs_store.enqueue_job(
-            user_id, "capture", reason=trigger, trace_id=None
+        result = jobs_store.enqueue_capture(
+            user_id, reason=trigger, trace_id=None,
+            # 调度器准入用的时刻：入队事务里没有活跃任务时，按它重判一次退避（第 13 轮 I1）。
+            backoff_now=None if trigger == "manual_force" else now,
         )
-        if not coalesced:
+        deferred = capture_scheduler.v2_deferred_submission(result.disposition)
+        if deferred is not None:
+            return deferred
+        job_id = result.job_id
+        if result.created:
             core_wake_bus.notify("v2_jobs", user_id)
         return {
-            "enqueued": not coalesced,
-            "reason": "v2_coalesced" if coalesced else "v2",
+            "enqueued": result.created,
+            "reason": "v2" if result.created else "v2_coalesced",
             "job": {
                 "id": job_id,
                 "job_id": str(job_id),

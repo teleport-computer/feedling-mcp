@@ -15952,8 +15952,8 @@ def chat_append_and_enqueue(
         for preempted in _preempted_jobs:
             if preempted.capture_failure_state is not None:
                 # 抢占时终结了一个租约已过期的落卡任务并记了失败：提交后镜像状态 + 同步提示。
-                # 纯旁路，内部自吞异常。
-                jobs_store.after_capture_crash_recorded(
+                # 纯旁路，放到后台线程做，不拖慢这次发送的返回（Codex 第 13 轮 M2）。
+                jobs_store.after_capture_crash_recorded_in_background(
                     user_id,
                     preempted.job_id,
                     source="chat_preempt",

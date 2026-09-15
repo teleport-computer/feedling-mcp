@@ -2021,6 +2021,14 @@ class UserStore:
                 update,
                 seed_doc=cur,
             )
+        if update.get("capture_enabled") is False:
+            # 关闭落卡提交之后是「记忆整理受阻、正在重试」提示的最后清理边界（Codex 第 13 轮 I2）：
+            # 关闭之前已经发出去的、以及和关闭并发的崩溃记账发的提示，都在这里清掉 ——
+            # 回收器发提示时握着 consent 锁，关闭提交只能排在它后面，所以这次清理一定在它之后。
+            # V1 / V2 的设置写入都经过这里。清理失败不影响关闭本身（notices 内部自吞异常）。
+            from notices import core as notices_core
+
+            notices_core.resolve(self, "memory_backoff:capture")
         if "wake_interval_sec" in update:
             persisted[HEARTBEAT_NEXT_TICK_AT_KEY] = shrink_proactive_heartbeat_tick(
                 self.user_id,

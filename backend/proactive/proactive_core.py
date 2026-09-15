@@ -282,17 +282,22 @@ def _submit_v2_capture(store, *, trigger, now, window, capture_key) -> dict:
     """Submit every V2 Capture trigger through the shared agent_jobs lane."""
     if not _v2_capture_feature_enabled():
         return {"enqueued": False, "reason": "capture_disabled", "job": None}
-    job_id, coalesced = jobs_store.enqueue_job(
+    result = jobs_store.enqueue_capture(
         store.user_id,
-        "capture",
         reason=str(trigger or "capture")[:200],
         trace_id=None,
+        # 手动 force 本来就不受退避限制（capture_scheduler._enqueue_window 同一条规则）。
+        backoff_now=None if trigger == "manual_force" else now,
     )
-    if not coalesced:
+    deferred = capture_scheduler.v2_deferred_submission(result.disposition)
+    if deferred is not None:
+        return deferred
+    job_id = result.job_id
+    if result.created:
         core_wake_bus.notify("v2_jobs", store.user_id)
     return {
-        "enqueued": not coalesced,
-        "reason": "v2_coalesced" if coalesced else "v2",
+        "enqueued": result.created,
+        "reason": "v2" if result.created else "v2_coalesced",
         "job": {
             "id": job_id,
             "job_id": str(job_id),
