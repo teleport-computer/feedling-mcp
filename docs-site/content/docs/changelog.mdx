@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 memory capture now counts a crash even when the whole worker died
+  while its job lease was still valid. Previously a user who kept chatting could
+  hand that job back to the queue on every message, so repeated worker crashes on
+  the same capture were never counted and the capture failure notice never
+  appeared. When every heartbeat of the job's owning worker (all pools and its
+  Genesis thread) has been silent for more than two minutes
+  (`FEEDLING_V2_CAPTURE_OWNER_DEAD_SEC`, default 120, minimum 60) and the claim is
+  older than that, sending a chat message ends the job and records one capture
+  failure, exactly as an expired lease does. Jobs whose owner is still beating, or
+  whose owner cannot be identified, are still handed back to the queue.
+
 - Admin Dream success rates no longer count a skipped Dream as a success. A
   Runtime V2 Dream that finds the Memory Garden too small completes without
   asking the model; the frozen daily lane cells now record it under the
