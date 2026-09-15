@@ -898,17 +898,15 @@ def _set_user_content_encryption(user_id: str, value: str | None) -> bool:
 def effective_content_encryption(user_id: str) -> str:
     """客户端**写侧**必须遵守的内容形状："on" | "off"。
 
-    与 ``_get_user_content_encryption``（用户意图）的区别：意图可以随时是
-    "off"，但服务端在 Task 2.2 前仍拒收明文写入，此时生效值恒为 "on"。
-    两者分开下发，iOS 与后端的发版顺序才互不依赖。
-
-    fail-safe：查不到用户 / 服务端未开闸 → "on"（加密）。
+    已知用户的新内容统一明文，不再让存量 "on" 偏好控制新写入；旧偏好
+    保留供存量密文读取/复制使用，不在读取策略时改写用户记录。
+    fail-safe：查不到用户（包括新用户注册竞态）/ 服务端未开闸 → "on"。
     """
     from core import envelope as core_envelope  # 延迟导入：避免装配期循环
 
     if not core_envelope.PLAINTEXT_WRITES_ACCEPTED:
         return "on"
-    return "off" if _get_user_content_encryption(user_id) == "off" else "on"
+    return "off" if _get_user_content_encryption(user_id) is not None else "on"
 
 
 def _find_user_entry_locked(user_id: str) -> dict | None:

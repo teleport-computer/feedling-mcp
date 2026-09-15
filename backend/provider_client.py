@@ -1846,6 +1846,33 @@ def _mark_anthropic_cache_breakpoint(
     return system, updated
 
 
+def _strip_local_schema_markers(schema):
+    """Copy a wire schema without execution-only array-bound markers.
+
+    Property/definition names and literal values are data, not schema keywords.
+    Keep the source intact: local argument validation still needs the marker.
+    This is not Gemini's schema relaxation; standard constraints stay on wire.
+    """
+    if isinstance(schema, list):
+        return [_strip_local_schema_markers(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key == "enforceItemBounds":
+            continue
+        if key in _OPAQUE_SCHEMA_VALUE_KEYS or key == "enum":
+            out[key] = copy.deepcopy(value)
+        elif (key in _SCHEMA_MAP_KEYS or key in {"dependencies", "dependentRequired"}) and isinstance(value, dict):
+            out[key] = {
+                name: _strip_local_schema_markers(child)
+                for name, child in value.items()
+            }
+        else:
+            out[key] = _strip_local_schema_markers(value)
+    return out
+
+
 def _encode_tools_openai_chat(tools) -> list[dict]:
     return [
         {
@@ -1853,7 +1880,7 @@ def _encode_tools_openai_chat(tools) -> list[dict]:
             "function": {
                 "name": t.name,
                 "description": t.description,
-                "parameters": t.parameters,
+                "parameters": _strip_local_schema_markers(t.parameters),
             },
         }
         for t in tools
@@ -1911,7 +1938,7 @@ def _encode_tools_openai_responses(tools) -> list[dict]:
             "type": "function",
             "name": t.name,
             "description": t.description,
-            "parameters": t.parameters,
+            "parameters": _strip_local_schema_markers(t.parameters),
         }
         for t in tools
     ]
@@ -1961,7 +1988,8 @@ def _encode_tool_results_openai_responses(results) -> list[dict]:
 
 def _encode_tools_anthropic(tools) -> list[dict]:
     return [
-        {"name": t.name, "description": t.description, "input_schema": t.parameters}
+        {"name": t.name, "description": t.description,
+         "input_schema": _strip_local_schema_markers(t.parameters)}
         for t in tools
     ]
 
@@ -2013,7 +2041,7 @@ def _encode_tools_bedrock(tools) -> list[dict[str, Any]]:
             "toolSpec": {
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": {"json": tool.parameters},
+                "inputSchema": {"json": _strip_local_schema_markers(tool.parameters)},
             },
         }
         for tool in tools

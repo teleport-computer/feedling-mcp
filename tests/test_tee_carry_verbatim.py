@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from accounts import registry  # noqa: E402
 from conftest import seed_user  # noqa: E402
+from tee_replicator import policy  # noqa: E402
 from tee_replicator import transforms  # noqa: E402
 from tee_replicator import worker as tee_worker  # noqa: E402
 
@@ -217,11 +218,11 @@ def test_carry_verbatim_scrubs_nul_bytes(uid, monkeypatch):
 
 
 def test_preference_is_cached_but_bounded(uid, monkeypatch):
-    """按行查 registry 会 O(用户数) 扫全表，必须缓存；但不能永久缓存，
+    """按行查权威库成本高，必须缓存；但不能永久缓存，
     否则用户切档后复制层要到进程重启才跟上。"""
     calls = []
-    real = registry._get_user_content_encryption
-    monkeypatch.setattr(registry, "_get_user_content_encryption",
+    real = policy.resolve_content_encryption
+    monkeypatch.setattr(policy, "resolve_content_encryption",
                         lambda u: calls.append(u) or real(u))
     tee_worker._carry_verbatim_cache.clear()
     monkeypatch.setattr(tee_worker, "_get_decrypt",

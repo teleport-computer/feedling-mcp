@@ -14359,7 +14359,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     return False
                 cur.execute(
                     "SELECT 1 FROM users WHERE user_id=%s "
-                    "AND doc->>'content_encryption'='off'",
+                    "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                    "<> 'on'",
                     (user_id,),
                 )
                 if cur.fetchone() is None:
@@ -14411,7 +14412,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     guard_exists = cur.fetchone() is not None
                     cur.execute(
                         "SELECT 1 FROM users WHERE user_id=%s "
-                        "AND doc->>'content_encryption'='off'",
+                        "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                        "<> 'on'",
                         (user_id,),
                     )
                     tier_allows = cur.fetchone() is not None
@@ -14448,7 +14450,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     guard_exists = cur.fetchone() is not None
                     cur.execute(
                         "SELECT 1 FROM users WHERE user_id=%s "
-                        "AND doc->>'content_encryption'='off'",
+                        "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                        "<> 'on'",
                         (user_id,),
                     )
                     tier_allows = cur.fetchone() is not None
@@ -18446,7 +18449,10 @@ def migrate_frame_to_plaintext(
             (user_id,),
         )
         preference = cur.fetchone()
-        if preference is None or str(preference[0] or "").strip().lower() != "off":
+        if (
+            preference is None
+            or str(preference[0] or "").strip().lower() == "on"
+        ):
             return False
         cur.execute(
             "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND frame_id=%s "
@@ -18563,7 +18569,7 @@ def retry_frame_plaintext_cleanup(user_id: str, frame_id: str) -> bool:
                 preference = cur.fetchone()
                 if (
                     preference is None
-                    or str(preference[0] or "").strip().lower() != "off"
+                    or str(preference[0] or "").strip().lower() == "on"
                 ):
                     return False
                 cur.execute(

@@ -90,14 +90,11 @@ def test_dry_run_does_not_construct_decryptor(monkeypatch, capsys):
     }
 
 
-@pytest.mark.parametrize("preference", [None, "on", ""])
-def test_apply_rejects_any_preference_other_than_explicit_off(
-    monkeypatch, capsys, preference
-):
+def test_apply_rejects_explicit_on(monkeypatch, capsys):
     monkeypatch.setenv(plaintext_migration.APPLY_ENV, "1")
     monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
     monkeypatch.setattr(
-        plaintext_migration, "content_encryption_preference", lambda _uid: preference
+        plaintext_migration, "content_encryption_preference", lambda _uid: "on"
     )
     monkeypatch.setattr(
         plaintext_migration,
@@ -113,7 +110,7 @@ def test_apply_rejects_any_preference_other_than_explicit_off(
             "--allow-plaintext-rewrite",
         ]
     ) == 2
-    assert "explicitly off" in capsys.readouterr().err
+    assert "effective off" in capsys.readouterr().err
 
 
 def test_apply_gate_accepts_explicit_off_without_exposing_items(monkeypatch, capsys):
@@ -137,6 +134,21 @@ def test_apply_gate_accepts_explicit_off_without_exposing_items(monkeypatch, cap
     report = json.loads(capsys.readouterr().out)
     assert report["counts"] == {}
     assert set(report) == {"apply", "counts", "failures", "user_id"}
+
+
+def test_apply_gate_accepts_existing_unset_as_default_off(monkeypatch, capsys):
+    monkeypatch.setenv(plaintext_migration.APPLY_ENV, "1")
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
+    monkeypatch.setattr(
+        plaintext_migration, "content_encryption_preference", lambda _uid: None
+    )
+    monkeypatch.setattr(plaintext_migration, "inventory", lambda _uid: [])
+
+    assert cli.main(
+        ["--user", "usr_default_off", "--apply", "--allow-plaintext-rewrite"]
+    ) == 0
+
+    assert "failures=0" in capsys.readouterr().out
 
 
 def test_dry_run_rejects_unknown_user_before_inventory(monkeypatch, capsys):
@@ -414,6 +426,26 @@ def test_inline_cas_rechecks_explicit_off_in_the_write_transaction():
     ) is False
 
 
+def test_inline_cas_allows_existing_unset_user():
+    user_id = "usr_inline_default_off"
+    seed_user(user_id)
+    original = _encrypted("memory-default-off")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO memory_moments(user_id,moment_id,occurred_at,doc) "
+            "VALUES (%s,'memory-default-off','2026-01-01',%s)",
+            (user_id, Jsonb(original)),
+        )
+    item = next(
+        item for item in plaintext_migration.inventory(user_id)
+        if item.surface == "memory"
+    )
+
+    assert plaintext_migration.cas_inline_doc(
+        user_id, item, {"id": "memory-default-off", "body": "plain"}
+    ) is True
+
+
 def test_chat_r2_body_uses_existing_crash_safe_pointer_migration(monkeypatch):
     key = "chatfiles/usr_chat_r2/g0/msg-r2/old"
     item = plaintext_migration.Item(
@@ -463,7 +495,7 @@ def test_chat_r2_body_uses_existing_crash_safe_pointer_migration(monkeypatch):
 
 def test_chat_r2_promotion_then_cas_migrates_encrypted_subcontent(monkeypatch):
     user_id = "usr_chat_r2_sub"
-    seed_user(user_id, content_encryption="off")
+    seed_user(user_id)
     key = f"chatimages/{user_id}/g0/msg-r2-sub/old"
     old_doc = {
         **_encrypted("msg-r2-sub"),
@@ -526,7 +558,7 @@ def test_chat_r2_promotion_then_cas_migrates_encrypted_subcontent(monkeypatch):
 
 def test_inline_frame_migrates_to_plaintext_without_r2(monkeypatch):
     user_id = "usr_frame_inline_migrate"
-    seed_user(user_id, content_encryption="off")
+    seed_user(user_id)
     frame_doc = _encrypted("frame-inline")
     frame_doc["source"] = "screen"
     with db.get_pool().connection() as conn:
@@ -556,7 +588,7 @@ def test_inline_frame_migrates_to_plaintext_without_r2(monkeypatch):
 
 def test_r2_frame_uses_fresh_plaintext_key_then_cas_and_retires_old(monkeypatch):
     user_id = "usr_frame_r2_migrate"
-    seed_user(user_id, content_encryption="off")
+    seed_user(user_id)
     old_key = f"frames/{user_id}/frame-r2"
     meta = _encrypted("frame-r2")
     meta.pop("body_ct")

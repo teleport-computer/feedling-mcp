@@ -33,7 +33,7 @@ from plaintext_shadow.config import TargetPolicy
 from psycopg.types.json import Jsonb
 from tee_shadow import mirror
 
-from tee_replicator import transforms
+from tee_replicator import policy, transforms
 
 log = logging.getLogger("feedling.tee_replicator")
 
@@ -391,8 +391,8 @@ def _carries_verbatim(
     fail-safe 方向与写侧一致：**查不到用户就不解密**。搬运的失败方向是「多留了
     密文」，事后重放可修；解密的失败方向是「明文泄漏」，不可逆。
 
-    带 TTL 缓存：``_get_user_content_encryption`` 是 O(用户数) 的全表扫描，按行
-    调用会拖垮长跑 pass；但不能永久缓存，否则用户切档后要等进程重启才生效。
+    带 TTL 缓存：权威库读取不能按每一行重复执行；但不能永久缓存，否则用户切档后
+    要等进程重启才生效。离线复制不依赖 ASGI 进程内 registry 是否初始化。
     """
     if target_policy is not None and target_policy.mode == "plaintext_all":
         return False
@@ -402,11 +402,9 @@ def _carries_verbatim(
     if hit is not None and now - hit[0] <= _CARRY_VERBATIM_TTL_SEC:
         return hit[1]
 
-    from accounts import registry  # 延迟导入：复制层不该在模块期拉起 accounts
-
-    # 三态：`"on"` 加密档 → 搬运；`"off"` 明文档 → 解密；`None` 查不到用户 →
-    # fail-safe 搬运。所以「不等于 off」正是判据。
-    verbatim = registry._get_user_content_encryption(user_id) != "off"
+    # 三态：`"on"` 加密档 → 搬运；`"off"` 明文档（含未设置）→ 解密；
+    # `None` 查不到用户 → fail-safe 搬运。所以「不等于 off」正是判据。
+    verbatim = policy.resolve_content_encryption(user_id) != "off"
     _carry_verbatim_cache[user_id] = (now, verbatim)
     return verbatim
 

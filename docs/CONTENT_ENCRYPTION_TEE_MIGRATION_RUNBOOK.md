@@ -276,9 +276,9 @@ Mixed reads are supported steady state.
 
 ## Single-user historical plaintext migration
 
-Use this only after an account has been explicitly set to
-`content_encryption="off"` and the operator has confirmed that its historical
-shared content should be rewritten. The command is intentionally single-user,
+Use this only for an existing account whose effective preference is off
+(explicit `off` or unset/default-off) and after the operator has confirmed that
+its historical shared content should be rewritten. The command is intentionally single-user,
 dry-run by default, count-only, and unavailable without two independent apply
 gates. It leaves `local_only` or missing-`K_enclave` records unchanged because
 the enclave cannot decrypt them.
@@ -310,8 +310,8 @@ python migrate_user_content_to_plaintext.py \
   --rate 2 --json
 ```
 
-Every inline write compares the exact source document and rechecks explicit
-`off` in the write transaction. Chat R2 bodies use the durable upload-guard
+Every inline write compares the exact source document and rechecks effective
+off in the write transaction. Chat R2 bodies use the durable upload-guard
 lifecycle. Frame plaintext is uploaded under a separate
 `frames-plaintext/<user>/...` key and the legacy ciphertext object is retired
 only after the row CAS commits. A deletion failure leaves a content-free
@@ -319,6 +319,49 @@ only after the row CAS commits. A deletion failure leaves a content-free
 Rerun the dry-run until neither `migratable_shared` nor `cleanup_pending` rows
 remain; any failure count is a stop condition, not a reason to raise the rate.
 Operator output must remain aggregate-only.
+
+## Fleet historical plaintext repair
+
+Use the fleet coordinator only after the code release containing the
+database-backed replication policy resolver is deployed and its exact commit is
+visible in `/healthz`. It selects existing explicit-off and unset/default-off
+users in deterministic `user_id` order, excludes explicit-on users, runs one
+user at a time, and stops on the first migration or health-gate failure.
+
+Inventory is read-only and does not require the enclave to be healthy:
+
+```bash
+cd backend
+python migrate_effective_off_content_to_plaintext.py \
+  --user-limit 10 --json
+```
+
+Apply first in TEST at one decrypt operation per second. All three write gates
+are mandatory; the health gate checks `FEEDLING_ENCLAVE_URL/healthz` before
+admitting each user and requires two consecutive timely responses:
+
+```bash
+export FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1
+python migrate_effective_off_content_to_plaintext.py \
+  --apply --allow-plaintext-rewrite \
+  --confirm-all-effective-off ALL-EFFECTIVE-OFF \
+  --user-limit 10 --row-limit 20 --rate 1 --json
+```
+
+Record `last_completed_user_id` only after a zero-failure user. Resume strictly
+after that value:
+
+```bash
+python migrate_effective_off_content_to_plaintext.py \
+  --apply --allow-plaintext-rewrite \
+  --confirm-all-effective-off ALL-EFFECTIVE-OFF \
+  --start-after usr_last_completed --rate 1 --json
+```
+
+Before and after every batch, record content-shape counts split into explicit-on
+and effective-off users. Abort rather than raising QPS if the enclave health
+gate, decrypts, CAS, or storage cleanup reports a failure. A PROD apply is a
+separate operator action and is never performed by deployment automation.
 
 ## Two-account regression
 
