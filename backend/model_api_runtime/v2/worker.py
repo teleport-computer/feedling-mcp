@@ -98,7 +98,6 @@ from core import wake_bus as core_wake_bus
 from memory import capture_failure
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
-from memgarden import contracts as mg_contracts
 from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
@@ -142,7 +141,6 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
 from identity.user_naming import transcript_speaker_label
 from memgarden.text.card_text import (
     card_text_rejection,
@@ -12861,15 +12859,21 @@ async def _run_extraction(
                 _capture_session = garden_component.build_garden(
                     garden_component.CallableModel(lambda _p: ""),
                     on_step=_step_sink,
-                ).capture_session(mg_contracts.CaptureRequest(
+                ).capture_session(garden_component.capture_request(
                     window=window,
                     locale=capture_locale,
                     buckets=str(ctx.get("buckets") or ""),
                     threads=str(ctx.get("threads") or ""),
                     identity=str(ctx.get("identity") or ""),
-                    ai_name=ctx.get("ai_name", ""),
-                    user_name=ctx.get("user_name", ""),
-                    policy=IO_CONVERSATION_CAPTURE_POLICY,
+                    ai_name=str(ctx.get("ai_name") or ""),
+                    user_name=str(ctx.get("user_name") or ""),
+                    # 现有卡 → 组件挑索引、校验 target_id。读不全时 serve_worker
+                    # 不放这个键（None），绝不当成空花园。V1 与这里共用同一个构造点。
+                    existing_cards=(
+                        ctx.get("capture_cards")
+                        if isinstance(ctx.get("capture_cards"), list)
+                        else None
+                    ),
                 ))
                 # 引号压力：失败窗口 >0 而成功窗口 =0 就坐实了引号假说。
                 # 只出个数和每千字符密度，不出位置、不出上下文。

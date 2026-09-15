@@ -402,7 +402,18 @@ async def extract(
         if trajectory_out is None or step_sink is None:
             return
         for step in step_sink.drain():
-            if step.kind == "parsed" and step.detail.get("error"):
+            if step.kind == "prompt_built" and "index_candidates" in step.detail:
+                # 已有记忆索引的规模（内容无关）。「这轮为什么没并进旧卡」先看这里：
+                # index_cards=0 就是模型根本没看到可并的卡。
+                await trajectory_out("capture_index", {
+                    key: int(step.detail[key])
+                    for key in ("index_candidates", "index_cards", "index_chars")
+                    if isinstance(step.detail.get(key), int)
+                })
+            elif step.kind == "dropped" and step.detail.get("why") == "unknown_target":
+                await trajectory_out("unknown_target_dropped",
+                                     {"cards": int(step.detail.get("cards") or 0)})
+            elif step.kind == "parsed" and step.detail.get("error"):
                 await trajectory_out("parse_bounced",
                                      {"reason": str(step.detail.get("error"))})
             elif step.kind == "retrying":
@@ -449,6 +460,8 @@ async def extract(
             session.feed(reply or "", truncated=truncated)
             await _emit_component_steps()
         outcome = session.result()
+        # 收尾那一步（丢掉仍不合格的卡）发生在 result() 里，要再翻一次才看得见。
+        await _emit_component_steps()
         if outcome.error and last_truncated_shape is not None:
             # The component had no retry left for that empty, cut-off reply, so
             # it parsed "" — report the real cause, not a bogus format error.

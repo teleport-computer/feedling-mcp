@@ -190,7 +190,6 @@ from notices import rejection_stats as _rejection_stats
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
 
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
 from identity.user_naming import sanitize_user_name, transcript_speaker_label
 from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
@@ -17571,6 +17570,27 @@ def _capture_memory_terms_context() -> tuple[str, str]:
     )
 
 
+def _capture_existing_cards() -> list[dict] | None:
+    """Capture 的「现有卡」：交给组件挑索引、校验 merge/supersede 的 target_id。
+
+    V1 以前从来没有这份索引（提示词里是 ``(none)``），模型只能 add，
+    同一件事说两次就是两张卡。V2 用的是同一个构造点和同一个判据。
+
+    读不全返回 ``None``（组件退回无索引、不校验 target，服务端所有权闸照旧兜底），
+    **绝不拿空列表冒充**：空列表 = 确认一张卡都没有，任何 supersede 都会被判成编造。
+    200 + 空 items 只有 ``user_card_count == 0`` 才算真空花园（与 Dream 同一判据）。
+    """
+    body = _capture_post_json("/v1/memory/index", payload={"limit": 0}, timeout=30)
+    items = body.get("items")
+    if not isinstance(items, list):
+        return None
+    if not items and not (
+        type(body.get("user_card_count")) is int and body.get("user_card_count") == 0
+    ):
+        return None
+    return garden_component.capture_existing_cards(items)
+
+
 def _capture_message_text(msg: dict) -> str:
     text = (
         msg.get("content")
@@ -18141,6 +18161,7 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         buckets_text, threads_text = _capture_memory_terms_context()
+        existing_cards = _capture_existing_cards()
         # 花园的分类语言 —— **看这个人用什么语言，不看桶名**。
         #
         # 桶名曾经是这里的首要判据，2026-08-24 因此出过线上事故（旧 bug 留下的英文
@@ -18189,17 +18210,21 @@ def _process_capture_jobs(jobs: list) -> float:
             garden_component.CallableModel(_capture_model_call),
             on_step=_bounce_tracker,
         )
+        # 请求只在 garden_component.capture_request 里拼（V2 同一个）：现有卡索引、
+        # io 的称呼规则、洗过的名字、档位。服务端打回后的重问复用同一个请求，
+        # 模型看到的索引和校验的 target 集合前后一致。
+        _capture_req = garden_component.capture_request(
+            window=window_text,
+            locale=capture_locale,
+            buckets=buckets_text,
+            threads=threads_text,
+            identity=identity_text,
+            ai_name=ai_name,
+            user_name=user_name,
+            existing_cards=existing_cards,
+        )
         try:
-            _captured = _garden.capture(mg_contracts.CaptureRequest(
-                window=window_text,
-                locale=capture_locale,
-                buckets=buckets_text,
-                threads=threads_text,
-                identity=identity_text,
-                ai_name=ai_name,
-                user_name=user_name,
-                policy=IO_CONVERSATION_CAPTURE_POLICY,
-            ))
+            _captured = _garden.capture(_capture_req)
             _emit_agent_turn_success(
                 foreground=False,
                 lane="capture",
@@ -18211,6 +18236,30 @@ def _process_capture_jobs(jobs: list) -> float:
             bounce = _bounce_tracker.bounce(cards=cards, error=err)
             if bounce:
                 log.warning("capture content gate bounced id=%s outcome=%s", job_id, bounce)
+            # 已有记忆索引的规模，内容无关。「这轮为什么没并进旧卡」先看这条：
+            # unavailable = 现有卡没读到，模型这轮看不到可并的卡。
+            _index_detail = _bounce_tracker.index_detail()
+            _index_outcome = (
+                "kernel_outdated"
+                if not garden_component.capture_kernel_selects_index()
+                else "unavailable"
+                if existing_cards is None
+                else "ready"
+            )
+            _emit_debug_trace(
+                "memory", "memory.capture.index",
+                status="ok" if _index_outcome == "ready" else "degraded",
+                summary=(
+                    f"落卡索引 {_index_detail.get('index_cards', 0)}"
+                    f"/{_index_detail.get('index_candidates', 0)} 张"
+                    if _index_outcome == "ready"
+                    else f"落卡索引不可用（{_index_outcome}）"
+                ),
+                explain="落卡时模型看到的已有记忆索引有多大；只有计数，没有卡片内容。",
+                detail={"outcome": _index_outcome, **_index_detail},
+                trace_id=job_id,
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
@@ -18243,6 +18292,7 @@ def _process_capture_jobs(jobs: list) -> float:
             # 别的好卡活了下来。只看 bounce 的话它会显示成 recovered。
             "failed"
             if _bounce_tracker.dropped_semantic
+            or _bounce_tracker.dropped_unknown_target
             else "recovered"
             if bounce == "bounced_ok"
             else "failed"
@@ -18295,11 +18345,15 @@ def _process_capture_jobs(jobs: list) -> float:
             # 两者在 admin 上长得一模一样,混在一起等于这类失败永远查不出来。
             # 同一条道理见下面 content_gate 那句注释。
             _dropped = _bounce_tracker.dropped_semantic
+            # 「说了要覆盖一张不存在的卡」同理是模型失败，单独一类（见 BounceTracker）。
+            _unknown = _bounce_tracker.dropped_unknown_target
             _noop_reason = (
                 "empty_after_reask"
                 if reask_count > 0 and reask_outcome == "empty"
                 else "supersede_without_target"
                 if _dropped
+                else "supersede_target_unknown"
+                if _unknown
                 else "nothing_worth_keeping"
             )
             _capture_result = {
@@ -18309,9 +18363,17 @@ def _process_capture_jobs(jobs: list) -> float:
                 "reask_trigger": reask_trigger or None,
                 "reask_outcome": reask_outcome,
             }
-            if _dropped:
-                _capture_result["skipped"] = {"supersede_without_target": _dropped}
-                _capture_result["skipped_count"] = _dropped
+            _skipped = {
+                key: count
+                for key, count in (
+                    ("supersede_without_target", _dropped),
+                    ("supersede_target_unknown", _unknown),
+                )
+                if count
+            }
+            if _skipped:
+                _capture_result["skipped"] = _skipped
+                _capture_result["skipped_count"] = sum(_skipped.values())
             update_proactive_job_status(
                 job_id,
                 "completed",
@@ -18370,16 +18432,7 @@ def _process_capture_jobs(jobs: list) -> float:
                     # 在两边各写一份,然后慢慢漂开(这个文件里刚删掉一段就是
                     # 这么来的)。
                     _retried = _garden.recapture_with_feedback(
-                        mg_contracts.CaptureRequest(
-                            window=window_text,
-                            locale=capture_locale,
-                            buckets=buckets_text,
-                            threads=threads_text,
-                            identity=identity_text,
-                            ai_name=ai_name,
-                            user_name=user_name,
-                            policy=IO_CONVERSATION_CAPTURE_POLICY,
-                        ),
+                        _capture_req,
                         server_semantic_reasons,
                     )
                     _note_agent_turn_success()
@@ -18458,6 +18511,12 @@ def _process_capture_jobs(jobs: list) -> float:
                 + rejected_without_target
             )
             observation["skipped_count"] += rejected_without_target
+        if _bounce_tracker.dropped_unknown_target:
+            observation["skipped"]["supersede_target_unknown"] = (
+                observation["skipped"].get("supersede_target_unknown", 0)
+                + _bounce_tracker.dropped_unknown_target
+            )
+            observation["skipped_count"] += _bounce_tracker.dropped_unknown_target
         applied_added = observation["applied"].get("added", 0)
         applied_superseded = observation["applied"].get("superseded", 0)
         capture_status = observation["status"] if actions else "noop"

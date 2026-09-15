@@ -307,13 +307,13 @@ def test_extraction_lane_ignores_content_block_metadata_for_language(monkeypatch
         return [], None
 
     if lane == "capture":
-        real_request = worker.mg_contracts.CaptureRequest
+        real_request = worker.garden_component.capture_request
 
         def _spy_request(**kwargs):
             _fake_prompt(**kwargs)
             return real_request(**kwargs)
 
-        monkeypatch.setattr(worker.mg_contracts, "CaptureRequest", _spy_request)
+        monkeypatch.setattr(worker.garden_component, "capture_request", _spy_request)
     else:
         real_open = worker.garden_component.open_dream_session
 
@@ -1821,16 +1821,11 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
     assert "(none)" in seen["prompt"]           # prompt builder's own fallback kicked in
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known gap since fd963bf9 (V2 capture on the component session): "
-        "CaptureRequest.cards is never set, so the model sees no existing-card "
-        "index and cannot copy a target_id for merge/supersede. This test used "
-        "to pass only because it inspected the unused legacy prompt."
-    ),
-)
 def test_capture_prompt_includes_existing_card_ids(monkeypatch):
+    """fd963bf9 (08-30) 起组件请求不带索引，模型抄不到 target_id —— 这条曾是 strict xfail。
+
+    同时守名字：身份卡里存成「用户」的名字不许原样进提示词，称呼规则是 io 那版。
+    """
     uid = "u_x_cards_context"
     _seed_v2(uid)
     jobs_store.enqueue_job(uid, "capture")
@@ -1844,7 +1839,10 @@ def test_capture_prompt_includes_existing_card_ids(monkeypatch):
     monkeypatch.setattr(extraction, "extract", _capture)
     deps = _deps(
         read_memory_context=lambda _uid: {
-            "cards": "- [mom_existing] （桶：工作）之前的工作记忆"
+            "ai_name": " 小克 ", "user_name": "用户", "buckets": "工作",
+            "capture_cards": [
+                {"id": "mom_existing", "summary": "之前的工作记忆", "bucket": "工作"}
+            ],
         }
     )
     status = asyncio.run(
@@ -1857,8 +1855,156 @@ def test_capture_prompt_includes_existing_card_ids(monkeypatch):
         )
     )
     assert status == "completed"
-    assert "[mom_existing]" in seen["prompt"]
+    assert "- mom_existing: [工作] 之前的工作记忆" in seen["prompt"]
     assert "target_id" in seen["prompt"]
+    assert "用户's companion" not in seen["prompt"]
+    from identity.user_naming import _naming_rule
+
+    assert _naming_rule("用户", locale="zh-Hans") in seen["prompt"]
+
+
+def _capture_db_card(user_id: str, memory_id: str) -> dict:
+    ts = "2026-06-20T00:00:00Z"
+    return {
+        "v": 1, "id": memory_id, "type": "fact", "owner_user_id": user_id,
+        "visibility": "shared", "body_ct": f"ct_{memory_id}",
+        "nonce": f"n_{memory_id}", "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}", "occurred_at": ts, "created_at": ts,
+        "updated_at": ts, "status": "active", "source": "memory_capture",
+        "importance": 0.5,
+    }
+
+
+_CAPTURE_SUMMARIES = {
+    "mom_job": ("工作", "Z 在字节跳动做产品经理，负责电商"),
+    **{f"mom_fill_{i}": ("日常", f"第{i}次闲聊提到的天气和午饭") for i in range(80)},
+}
+
+
+def _stub_capture_readside(monkeypatch):
+    """真 serve_worker 读侧 + 真 memory_core.index（生命周期过滤、owner、user_card_count），
+    只把 enclave 解密那一跳换成按 id 给摘要。"""
+    import memory_readside_core
+    from model_api_runtime.v2 import serve_worker
+
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker, "_load_identity_card_view",
+        lambda _store, *, runtime_token: {"agent_name": "小克", "user_preferred_name": "Z"},
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": ["工作"]}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    calls = []
+
+    def _enclave(_api_key, candidates, *, operation, payload=None, runtime_token=None):
+        calls.append((operation, dict(payload or {})))
+        items = []
+        for card in candidates:
+            bucket, summary = _CAPTURE_SUMMARIES[card["id"]]
+            items.append({"id": card["id"], "bucket": bucket, "summary": summary,
+                          "importance": 0.5, "status": "active"})
+        return {"items": items, "unavailable_ids": []}
+
+    monkeypatch.setattr(memory_readside_core, "post_enclave_readside", _enclave)
+    return serve_worker, calls
+
+
+def _supersede_reply(target: str) -> str:
+    return json.dumps({"cards": [{
+        "action": "supersede", "type": "fact", "target_id": target, "bucket": "工作",
+        "threads": ["换工作"], "summary": "Z 下个月去腾讯做产品经理",
+        "content": "Z 上周从字节跳动离职，下个月去腾讯继续做产品经理。",
+        "importance": 0.7, "pulse": 0.4,
+    }]}, ensure_ascii=False)
+
+
+def _run_capture_e2e(monkeypatch, uid, replies):
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [
+        _capture_db_card(uid, mid) for mid in _CAPTURE_SUMMARIES
+    ])
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    serve_worker, enclave_calls = _stub_capture_readside(monkeypatch)
+    prompts = []
+
+    async def _provider(_cfg, messages, **_kwargs):
+        prompts.append(messages[0]["content"])
+        return {"reply": replies[min(len(prompts) - 1, len(replies) - 1)],
+                "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    row = {
+        "id": "m1", "seq": 1, "ts": 1.0, "role": "user", "raw_role": "user",
+        "source": "chat", "capture_eligible": True,
+        "content": "我上周从字节跳动离职了，下个月去腾讯做产品经理",
+    }
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_memory_context=serve_worker._read_memory_context,
+            read_compaction_tail_after_seq=lambda *_a, **_k: [row],
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+    with db.get_pool().connection() as conn:
+        docs = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT moment_id, doc FROM memory_moments WHERE user_id=%s", (uid,)
+            ).fetchall()
+        }
+    return status, job_id, prompts, docs, enclave_calls
+
+
+def test_capture_supersedes_an_indexed_card_end_to_end(monkeypatch):
+    """模型照抄索引里的 id → 过 jobs_store 的所有权/存在校验 → 旧卡被取代，而不是多一张。"""
+    status, job_id, prompts, docs, enclave_calls = _run_capture_e2e(
+        monkeypatch, "u_x_capture_index_e2e", [_supersede_reply("mom_job")]
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    # 读侧一次全量 index（limit=0 → 硬上限），不是只读 60 张。
+    assert ("index", {"ambient": False, "bucket": "", "thread": "", "limit": 1000, "query": ""}) in enclave_calls
+    assert len(prompts) == 1
+    index = prompts[0].split("target_id from here)]", 1)[1].split("\n[", 1)[0]
+    index_rows = index.splitlines()
+    assert index_rows[0] == "- mom_job: [工作] Z 在字节跳动做产品经理，负责电商"
+    assert len(index_rows) == 60
+    new_ids = set(docs) - set(_CAPTURE_SUMMARIES)
+    assert len(new_ids) == 1
+    new_id = new_ids.pop()
+    assert docs["mom_job"]["status"] == "superseded"
+    assert docs["mom_job"]["superseded_by"] == new_id
+
+
+def test_capture_made_up_target_is_reasked_instead_of_rejecting_the_batch(monkeypatch):
+    """编造的 id 以前会让 jobs_store 整批拒掉（capture_supersede_target_missing），
+    同窗口的好卡一起丢、job 进失败退避。现在组件先重问，改对了照常落库。"""
+    status, job_id, prompts, docs, _ = _run_capture_e2e(
+        monkeypatch, "u_x_capture_index_reask",
+        [_supersede_reply("mom_made_up"), _supersede_reply("mom_job")],
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    assert len(prompts) == 2
+    assert "你给的 target_id 不是现有的卡" in prompts[1]
+    assert docs["mom_job"]["status"] == "superseded"
+
+
+def test_capture_made_up_target_twice_drops_only_that_card(monkeypatch):
+    status, job_id, prompts, docs, _ = _run_capture_e2e(
+        monkeypatch, "u_x_capture_index_drop",
+        [_supersede_reply("mom_made_up")],
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    assert len(prompts) == 2
+    assert set(docs) == set(_CAPTURE_SUMMARIES)
+    assert docs["mom_job"]["status"] == "active"
 
 
 def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):

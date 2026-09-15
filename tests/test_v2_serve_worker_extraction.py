@@ -130,25 +130,62 @@ def test_dream_context_does_not_pre_budget_cards(monkeypatch):
     assert ctx["_diagnostic_cards_outcome"] == "ready"
 
 
-def test_capture_context_skips_the_card_read(monkeypatch):
-    """Capture's component request carries no card index, so its context must
-    not pay an enclave round trip for one."""
+def _capture_ctx(monkeypatch, index):
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
     monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
     monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    calls = []
 
-    def _no_index(*_a, **_k):
-        raise AssertionError("capture context must not read the card index")
+    def _index(_store, _api_key, payload, **_k):
+        calls.append(dict(payload))
+        return index() if callable(index) else index
 
-    monkeypatch.setattr("memory.memory_core.index", _no_index)
-    monkeypatch.setattr("memory.memory_core.fetch", _no_index)
+    def _no_fetch(*_a, **_k):
+        raise AssertionError("capture needs summaries only, never full card bodies")
 
-    ctx = serve_worker._read_memory_context("u_ctx_capture")
+    monkeypatch.setattr("memory.memory_core.index", _index)
+    monkeypatch.setattr("memory.memory_core.fetch", _no_fetch)
+    return serve_worker._read_memory_context("u_ctx_capture"), calls
 
+
+def test_capture_context_reads_all_existing_cards_for_the_index(monkeypatch):
+    """08-30 起 Capture 不读卡，提示词索引是 (none)、模型只能 add。现在读一次全量
+    index（limit=0 → 读侧硬上限；校验 target 要全部现有卡），只取 id/摘要/桶/重要度。"""
+    ctx, calls = _capture_ctx(monkeypatch, ({
+        "items": [
+            {"id": "m1", "summary": "在字节做产品", "bucket": "工作", "importance": 0.5,
+             "score": 1.0, "created_at": "2026-08-01"},
+            {"id": "m0", "summary": "旧的", "status": "superseded"},
+        ],
+        "user_card_count": 2,
+    }, 200))
+    assert calls == [{"limit": 0}]
+    assert ctx["capture_cards"] == [
+        {"id": "m1", "summary": "在字节做产品", "bucket": "工作", "importance": 0.5}
+    ]
     assert ctx["card_items"] == []
-    assert "cards" not in ctx
     assert "_diagnostic_cards_outcome" not in ctx
+
+
+def test_capture_context_verified_empty_garden_is_an_empty_list(monkeypatch):
+    ctx, _ = _capture_ctx(monkeypatch, ({"items": [], "user_card_count": 0}, 200))
+    assert ctx["capture_cards"] == []
+
+
+def test_capture_context_unreadable_index_is_absent_not_empty(monkeypatch):
+    """读不全就不交：空列表会让任何 supersede 被当成编造，那是把读失败伪装成空花园。"""
+    def _boom():
+        raise RuntimeError("enclave down")
+
+    for index in (
+        ({"items": []}, 200),                        # 200 但没证明是空花园
+        ({"items": [], "user_card_count": 5}, 200),  # 读侧解不开全部卡
+        ({"error": "readside_unavailable"}, 503),
+        _boom,
+    ):
+        ctx, _ = _capture_ctx(monkeypatch, index)
+        assert "capture_cards" not in ctx, index
 
 
 def test_dream_context_distinguishes_empty_index_from_failed_full_card_read(

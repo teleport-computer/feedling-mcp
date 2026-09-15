@@ -32,10 +32,11 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Callable, Iterable, Mapping
 
-from memgarden import GardenComponent, MaintenanceRequest
+from memgarden import CaptureRequest, GardenComponent, MaintenanceRequest
 from memgarden.contracts import Step
 
-from identity.user_naming import sanitize_user_name
+from identity.user_naming import _naming_rule, sanitize_user_name
+from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 # io 的落卡档位（``IO_CONVERSATION_CAPTURE_POLICY``，max_cards=50）由调用点经
@@ -93,6 +94,120 @@ def build_garden(
         signals=IO_LEAK_SIGNALS,
         max_capture_retries=MAX_CAPTURE_RETRIES,
         on_step=on_step,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Capture：两条 runtime 共用的落卡请求
+# --------------------------------------------------------------------------- #
+#
+# 2026-08-30（fd963bf9）两条 runtime 换成组件之后，这里的请求是 V1 / V2 各拼一份，
+# 两份都漏了同样的三样东西，线上跑了半个月：
+#
+#   1. **已有记忆索引** —— 提示词里是 ``(none)``，模型抄不到任何 target_id，
+#      只能 add，同一件事说两次就是两张卡。（V2 08-03 起有过这份索引；
+#      V1 从来没有。）
+#   2. **io 的称呼规则** —— 没传 ``naming_rule``，用的是内核默认那版
+#      （英文花园里不禁「TA」占位符，和 io 的转写标签、Dream 的规则对不上）。
+#   3. **洗过的名字** —— V2 把身份卡里的原始 ``user_preferred_name`` 直接交出去，
+#      存成「用户」的人会在提示词里被叫做「用户」，正是称呼规则禁止的词。
+#
+# 各拼一份就是漏的原因，所以请求只在这里拼。
+
+#: 索引预算。**显式传**，理由同 Dream：组件默认值换了，这里不跟着悄悄变。
+#: 60 张是 V2 08-03 那版索引的张数；字数上限防一张异常长的摘要把提示词撑爆。
+CAPTURE_INDEX_CARDS_LIMIT = 60
+CAPTURE_INDEX_BUDGET_CHARS = 16_000
+CAPTURE_INDEX_SUMMARY_CHARS = 400
+
+
+_CAPTURE_INDEX_FIELDS = (
+    "existing_cards", "index_cards_limit", "index_budget_chars", "index_summary_chars",
+)
+
+
+def capture_kernel_selects_index() -> bool:
+    """装的 memgarden 认不认 ``CaptureRequest.existing_cards``（组件挑索引 + 校验 target）。
+
+    自建 VPS 的 consumer 自更新时先切代码、再 pip 装依赖（见 Dream 的同名判据）。
+    和 Dream 不同，落卡在旧组件上**降级跑**而不是失败：旧组件就是这次修复之前的
+    行为（无索引、只能 add），比整窗口不落卡好；观测上报 ``kernel_outdated``。
+    """
+    names = {field.name for field in dataclasses.fields(CaptureRequest)}
+    return all(name in names for name in _CAPTURE_INDEX_FIELDS)
+
+
+def capture_existing_cards(items: Iterable[Any]) -> list[dict]:
+    """把读侧 memory index 的条目翻成组件认识的「现有卡」。
+
+    只留组件用得到的字段（id / summary / bucket / importance）—— 索引里还有时间、
+    分数这些，交出去没用。非 active 的卡不算现有卡：模型不该去覆盖一张已经
+    被取代或归档的卡，组件会把指向它的 target_id 当成不存在的打回。
+
+    没有摘要的卡仍然保留：它不会被渲染进索引，但它是真卡，模型从对话里拿到它的
+    id 去覆盖时不该被判成编造。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items or ():
+        if not isinstance(item, Mapping):
+            continue
+        mid = _one_line(item.get("id"))
+        status = _one_line(item.get("status")).lower() or "active"
+        if not mid or mid in seen or status != "active":
+            continue
+        seen.add(mid)
+        card: dict = {"id": mid, "summary": _one_line(_first_text(item, _SUMMARY_KEYS, one_line=True))}
+        bucket = _one_line(item.get("bucket") or item.get("category"))
+        if bucket:
+            card["bucket"] = bucket
+        if item.get("importance") is not None:
+            card["importance"] = item.get("importance")
+        out.append(card)
+    return out
+
+
+def capture_request(
+    *,
+    window: str,
+    locale: str,
+    buckets: str,
+    threads: str,
+    identity: str,
+    ai_name: str,
+    user_name: str,
+    existing_cards: list[dict] | None,
+) -> CaptureRequest:
+    """V1 / V2 落卡（含 V1 的服务端打回重问）唯一的请求构造点。
+
+    ``existing_cards``：``capture_existing_cards`` 的结果。``None`` = 这次没读到
+    （读侧失败 / 读不全），组件退回「无索引、不校验 target」—— 不能拿空列表冒充，
+    空列表的意思是「确认这个人一张卡都没有」，会让任何 supersede 都被判成编造。
+
+    ``user_name`` 可以是原始值：这里洗名字、按**同一个原始值**生成称呼规则
+    （``_naming_rule`` 内部也洗，两者一致）。
+    """
+    index_fields = (
+        dict(
+            existing_cards=existing_cards,
+            index_cards_limit=CAPTURE_INDEX_CARDS_LIMIT,
+            index_budget_chars=CAPTURE_INDEX_BUDGET_CHARS,
+            index_summary_chars=CAPTURE_INDEX_SUMMARY_CHARS,
+        )
+        if capture_kernel_selects_index()
+        else {}
+    )
+    return CaptureRequest(
+        window=window,
+        locale=locale,
+        buckets=buckets,
+        threads=threads,
+        identity=identity,
+        ai_name=_one_line(ai_name),
+        user_name=sanitize_user_name(user_name),
+        naming_rule=_naming_rule(user_name, locale=locale),
+        policy=IO_CONVERSATION_CAPTURE_POLICY,
+        **index_fields,
     )
 
 
@@ -367,6 +482,11 @@ class BounceTracker:
         #: supersede），代价就是宿主原来靠数 cards 得到的这个计数没了，
         #: 只能由组件显式告诉宿主。
         self.dropped_semantic = 0
+        #: 重问之后 target_id 仍不是现有卡、被组件丢掉的卡数。和上面分开：
+        #: 「没说覆盖哪张」和「说了一张不存在的」是两种模型失败。
+        self.dropped_unknown_target = 0
+        #: 组件建提示词时报的索引计数（``prompt_built`` 步骤里带的）。
+        self.index: dict = {}
 
     def __call__(self, step: Step) -> None:
         self.steps.append(step)
@@ -374,6 +494,19 @@ class BounceTracker:
             self.retried = True
         elif step.kind == "dropped" and step.detail.get("why") == "semantic":
             self.dropped_semantic += int(step.detail.get("cards") or 0)
+        elif step.kind == "dropped" and step.detail.get("why") == "unknown_target":
+            self.dropped_unknown_target += int(step.detail.get("cards") or 0)
+        elif step.kind == "prompt_built" and step.purpose == "capture":
+            for key in ("index_candidates", "index_cards", "index_chars"):
+                if isinstance(step.detail.get(key), int):
+                    self.index[key] = step.detail[key]
+
+    def index_detail(self) -> dict:
+        """这次落卡的索引观测量，内容无关：现有卡几张、渲染进索引几张、多少字、
+        丢了几张指向不存在的卡。没交现有卡时为空。"""
+        if not self.index:
+            return {}
+        return {**self.index, "dropped_unknown_target": self.dropped_unknown_target}
 
     def bounce(self, *, cards: list, error: str | None) -> str:
         if not self.retried:

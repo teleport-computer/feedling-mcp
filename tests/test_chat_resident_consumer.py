@@ -4588,7 +4588,10 @@ def test_proactive_http_text_chain_without_af_unix(monkeypatch, response_status)
         assert "failed" in statuses
 
 
-def _install_capture_job_harness(monkeypatch, agent_reply):
+def _install_capture_job_harness(monkeypatch, agent_reply, *, index_body=None):
+    """``index_body``：``/v1/memory/index`` 的回包（现有卡）。不给 = 读不到现有卡
+    （``_capture_existing_cards`` 返回 None：无索引、不校验 target），
+    这样既有用例不碰网络、行为确定。"""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     captured = {
@@ -4683,6 +4686,15 @@ def _install_capture_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
     monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
     monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    if index_body is None:
+        monkeypatch.setattr(crc, "_capture_existing_cards", lambda: None)
+    else:
+        def _post_json(path, *, payload=None, **_kwargs):
+            captured.setdefault("post_json", []).append((path, payload))
+            assert path == "/v1/memory/index"
+            return index_body
+
+        monkeypatch.setattr(crc, "_capture_post_json", _post_json)
     return captured, job
 
 
@@ -5139,6 +5151,122 @@ def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
     extra = _capture_final_status(captured)[3]["extra"]
     assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 1
+
+
+_CAPTURE_INDEX_BODY = {
+    "items": [
+        {"id": "mem_meeting", "summary": "Seven's weekly meeting always stresses him out.",
+         "bucket": "work", "importance": 0.6, "status": "active"},
+        {"id": "mem_oat", "summary": "Seven only drinks oat milk.", "bucket": "food",
+         "importance": 0.4, "status": "active"},
+        {"id": "mem_retired", "summary": "An old retired card.", "bucket": "work",
+         "status": "superseded"},
+    ],
+    "user_card_count": 3,
+}
+
+
+def _capture_supersede_reply(target):
+    return json.dumps({"cards": [{
+        "action": "supersede",
+        "target_id": target,
+        "type": "event",
+        "bucket": "work",
+        "threads": ["meeting"],
+        "summary": "The weekly meeting stress is really about boundaries.",
+        "content": "Seven clarified the weekly meeting stress is mostly about a boundary issue.",
+        "importance": 0.8,
+        "pulse": 0.6,
+    }]}, ensure_ascii=False)
+
+
+def test_capture_prompt_carries_existing_card_index_and_io_naming(monkeypatch):
+    """V1 从来没有这份索引（提示词里是 (none)），模型只能 add。现在经同一个构造点
+    带上现有卡索引、io 的称呼规则，照抄索引里的 id 就落成 supersede。"""
+    captured, job = _install_capture_job_harness(
+        monkeypatch, _capture_supersede_reply("mem_meeting"),
+        index_body=_CAPTURE_INDEX_BODY,
+    )
+    # 英文花园：io 和内核的英文称呼规则不同，才分得出用的是哪一版。
+    monkeypatch.setattr(
+        crc, "garden_language_decision",
+        lambda *_a, **_k: {"locale": "en", "basis": "test"},
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["post_json"] == [("/v1/memory/index", {"limit": 0})]
+    prompt = captured["prompts"][0]
+    index = prompt.split("target_id from here)]", 1)[1].split("\n[", 1)[0]
+    assert "- mem_meeting: [work] Seven's weekly meeting always stresses him out." in index
+    assert "- mem_oat: [food] Seven only drinks oat milk." in index
+    assert "mem_retired" not in index
+    from identity.user_naming import _naming_rule
+
+    assert _naming_rule("Seven", locale="en") in prompt
+    assert len(captured["prompts"]) == 1
+    action = captured["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == "mem_meeting"
+
+
+def test_capture_made_up_target_is_reasked_then_dropped(monkeypatch):
+    captured, job = _install_capture_job_harness(
+        monkeypatch,
+        [_capture_supersede_reply("mem_made_up"), _capture_supersede_reply("mem_made_up")],
+        index_body=_CAPTURE_INDEX_BODY,
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert "你给的 target_id 不是现有的卡" in captured["prompts"][1]
+    assert captured["actions"] == []
+    status = _capture_final_status(captured)
+    assert status[:3] == ("cap_dispatch", "completed", "supersede_target_unknown")
+    result = status[3]["extra"]["capture_result"]
+    assert result["reask_outcome"] == "failed"
+    assert result["skipped"] == {"supersede_target_unknown": 1}
+
+
+def test_capture_made_up_target_reask_recovers(monkeypatch):
+    captured, job = _install_capture_job_harness(
+        monkeypatch,
+        [_capture_supersede_reply("mem_made_up"), _capture_supersede_reply("mem_meeting")],
+        index_body=_CAPTURE_INDEX_BODY,
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert [a["supersedes"] for a in captured["actions"]] == ["mem_meeting"]
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_outcome"] == "recovered"
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"items": [], "user_card_count": 0}, []),
+        ({"items": []}, None),
+        ({"items": [], "user_card_count": 4}, None),
+        ({}, None),
+        ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
+          "user_card_count": 1},
+         [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}]),
+    ],
+)
+def test_capture_existing_cards_unreadable_is_none_not_empty(monkeypatch, body, expected):
+    monkeypatch.setattr(crc, "_capture_post_json", lambda path, **_k: body)
+    assert crc._capture_existing_cards() == expected
+
+
+def test_capture_unreadable_index_leaves_target_to_the_server(monkeypatch):
+    """读不到现有卡（None）时不校验 target —— 交给服务端所有权闸，别把好卡丢了。"""
+    captured, job = _install_capture_job_harness(
+        monkeypatch, _capture_supersede_reply("mem_meeting"),
+        index_body={"items": []},
+    )
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert "target_id from here)](none)" in captured["prompts"][0]
+    assert [a["supersedes"] for a in captured["actions"]] == ["mem_meeting"]
 
 
 def test_capture_job_supersede_without_target_is_noop(monkeypatch):
@@ -6970,6 +7098,7 @@ def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatc
     )
     monkeypatch.setattr(crc, "_capture_window_text", lambda *_a, **_kw: "窗口")
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(crc, "_capture_existing_cards", lambda: None)
     monkeypatch.setattr(crc, "_emit_debug_trace", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         crc.garden_component, "build_garden", lambda *_a, **_kw: _Recorder()
