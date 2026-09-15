@@ -36,6 +36,12 @@ canonical_owner: self
 | `agent_body_generation_failed` | 429/502；内部 409/410/503 | provider_transient/system | provider 限流、失败/空回复或任务冲突；内部 reason=consumer_mismatch/expired/state_unavailable 标识绑定、过期、CAS 失败；不返回 rows | ✅ |
 | `agent_body_generation_invalid_output` | 502 | system | 一次修复重试后仍不符合网格硬规则；不返回 rows | ✅ |
 
+## 用户偏好
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `content_encryption_on_not_supported` | 400 | — | 新内容统一明文，设置口不再接受 on；off 或 null/空值清除仍支持，请求拒绝前不写入任何偏好 | |
+
 ## 通用
 
 ### 本地 resident CLI（不是 HTTP API）

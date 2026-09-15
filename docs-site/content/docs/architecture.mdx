@@ -50,7 +50,7 @@ worker, while still waking parked pollers. This changes query timing and worker
 cache shape only: PostgreSQL authority, API behavior, encryption, isolation,
 trust boundaries, and deployment topology are unchanged.
 
-Feedling separates ciphertext persistence from authorized decryption and agent
+Feedling separates content persistence from authorized decryption and agent
 execution. Managed production uses a main confidential VM for the public API and
 trusted-decrypt service, separate confidential-VM capacity for hosted agents,
 and external persistence and delivery services.
@@ -81,9 +81,9 @@ deployment topology.
 | TLS ingress | Terminate the public API certificate and route configured traffic | Transport plaintext inside the managed confidential-VM boundary |
 | ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext |
 | Attested decrypt service | Own the content private key and authorize envelope decryption or read-side projection | Plaintext while servicing an authorized operation |
-| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in whichever shape the owning user's tier selects, plus plaintext IDs, timestamps, types, status, and other operational metadata |
-| Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
-| Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
+| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in the deployment-gated write shape, plus legacy ciphertext, and plaintext IDs, timestamps, types, status, and other operational metadata |
+| Object storage | Offload enabled large-object flows | Screen and Chat objects use the effective write shape; plaintext media are raw bytes, while legacy ciphertext remains encrypted |
+| Hosted runner | Poll work, assemble authorized context, invoke an agent, and return a result in the effective write shape | Plaintext selected for an agent turn, the provider credential, and authenticated API traffic |
 | Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
 | ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
@@ -93,7 +93,7 @@ The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
 that every identifier, status field, compatibility payload, normalized signal,
 or diagnostic upload is encrypted — nor that every protected body is encrypted,
-since [content encryption is a per-user preference](#content-encryption-is-a-per-user-preference).
+since [new shared content uses plaintext when the deployment gate is open](#new-shared-content-uses-plaintext).
 
 ## Core data flows
 
@@ -102,18 +102,20 @@ since [content encryption is a per-user preference](#content-encryption-is-a-per
 1. The client sends a message or attachment over HTTPS to
    `POST /v1/model_api/chat/send`.
 2. Inside the managed main VM, the API validates the request, creates a shared
-   encrypted envelope, appends the user turn, and wakes the hosted queue.
+   envelope in the effective write shape, appends the user turn, and wakes the
+   hosted queue.
 3. A Runtime V2 parent assigns the durable job to one of four foreground
    single-slot child processes and mints a scoped runtime token for that turn.
    PostgreSQL remains authoritative for the claim, and a cancellation bus can
    target the exact child owner.
-4. The decrypt service opens the required shared envelopes. The runner sends the
+4. The decrypt service opens required shared ciphertext; plaintext records are
+   read under the same tenant boundary. The runner sends the
    plaintext prompt and selected context to the configured model provider.
-5. The runner encrypts the assistant result into a new user-owned envelope before
+5. The runner wraps the assistant result in the effective write shape before
    it is persisted. The original send remains asynchronous and returns `202`.
 
-The model provider is an external plaintext recipient. Envelope encryption
-protects persisted content and the storage path; it does not hide the prompt
+The model provider is an external plaintext recipient. For encrypted records,
+envelope encryption protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
@@ -230,8 +232,9 @@ the worker image rather than changing a runtime flag.
 The bounded Memory/Style profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
 The two field bodies are separate content records that follow the owner's
-effective content shape: encrypted users store shared ciphertext envelopes,
-while plaintext users store `body` values in the same document. The PostgreSQL
+effective content shape: `on` stores shared ciphertext envelopes, while `off`
+stores `body` values in the same document. With the deployment gate enabled,
+all known users use `off` for new writes. The PostgreSQL
 primary and TEE mirror preserve that selected shape verbatim. Field character
 counts, state, disabled status, source-card counts, and generation/retry
 timestamps remain plaintext routing and observability metadata. A stale CAS
@@ -442,13 +445,12 @@ account's chat route, provider URL, or credential.
    concurrent cancel cannot downgrade or partially delete a successful call.
 7. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
    `GET /v1/voice/transcripts/{call_id}` returns the shape-aware content envelope
-   (ciphertext for encrypted-tier accounts, plaintext for plaintext-tier
-   accounts). The agent reaches the same archive through the
+   (legacy ciphertext or new plaintext when the deployment gate is enabled). The agent reaches the same archive through the
    `voice_transcript_list` / `voice_transcript_read` tools, and memory cards
    distilled from a call carry that call's id so it can go back to the source.
-   For encrypted-tier accounts the server stores and serves ciphertext; for
-   plaintext-tier accounts the promoted TEE database stores the plaintext
-   envelope under the same tenant-bound schema. Transcript trust
+   Existing encrypted transcripts remain ciphertext; new effective-plaintext
+   transcripts are stored in the promoted TEE database under the same
+   tenant-bound schema. Transcript trust
    boundary: the transcript is client-supplied plaintext (chat rows are
    ciphertext the server cannot read); an authenticated user can therefore
    only shape their own summary and delete their own call rows. Known
@@ -607,32 +609,40 @@ component ever sees plaintext. Hosted Chat, enclave-backed read projections,
 normalized Perception processing, user-approved diagnostics, and external
 inference each have an explicit plaintext boundary.
 
-### Content encryption is a per-user preference
+### New shared content uses plaintext
 
-Protected-body encryption is moving from an always-on property to a per-user
-choice with two storage tiers:
+With the plaintext-write deployment gate enabled, every known account writes new
+shared content as plaintext, including accounts with a legacy stored `on`
+preference. Existing ciphertext remains readable; this policy change does not
+rewrite stored preferences or convert old records. Both stored shapes remain
+supported:
 
-| Tier | Stored shape | Who can read the body |
+| Shape | Stored body | Who can read the body |
 | --- | --- | --- |
 | Encrypted | Dual-recipient envelope (`body_ct`, `K_user`, `K_enclave`) | The user's device, and the measured decrypt service for `shared` records |
 | Plaintext | UTF-8 `body`, or strict-base64 `body_b64` for binary media, alongside `id`, `owner_user_id`, and `visibility` | The service, within the same tenant-isolation boundary as every other row |
 
-Two `whoami` fields describe this. `content_encryption` is the user's stated
-preference. `content_encryption_effective` is the shape a client must actually
-write, and it is the only one a write path may act on — a deployment that has
-not enabled plaintext storage reports `on` regardless of the preference, so a
-client that ships support for plaintext ahead of the server still writes
-envelopes. Treat an absent, empty, or unrecognized value as `on`.
+`whoami.content_encryption` is a compatibility field reporting `off` for known
+users. `content_encryption_effective` is the write shape: it reports `off` for
+known users when the deployment gate is open, and `on` when the gate is closed.
+Unknown users remain fail-safe encrypted, including registry misses during
+registration. Treat an absent, empty, or unrecognized effective value as `on`.
 
-The deployment gate is closed by default and opens only when
-`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. The test and pre-production
-environments enable it. Production exposes a separate fail-closed release
-variable, forwards one value to the API and every worker/runner, and rejects an
-open gate unless the database schema selector is `tee`. Even in an enabled
-deployment, an explicit encrypted-tier account or an unknown user remains
-fail-safe encrypted; existing ciphertext is not rewritten by the gate.
+`POST /v1/users/preferences` accepts `content_encryption: "off"`, or null/empty
+to clear the legacy preference. Requesting `on` returns HTTP 400
+`content_encryption_on_not_supported` before any preference is written. Updating
+another preference does not rewrite a stored `on`; the response still reports
+`content_encryption: "off"`.
 
-Two boundaries hold in both tiers:
+The deployment gate remains closed by default and opens only when
+`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. Test and pre-production enable it.
+Production forwards one fail-closed release value to the API and every
+worker/runner, and rejects an open gate unless the database schema selector is
+`tee`. This change does not alter that gate or initiate a ciphertext backfill.
+Legacy replication and explicit migration policies remain separate from the
+new-write policy.
+
+Two boundaries continue to hold:
 
 - A record is never silently downgraded. If a user's effective shape is `on` and
   the decrypt service is unreachable, the write fails rather than falling back to

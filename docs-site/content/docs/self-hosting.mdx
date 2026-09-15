@@ -92,7 +92,7 @@ HTTP/custom drivers, and background/proactive work retain the existing visible
 timeout fallback.
 
 For direct `POST /v1/chat/response`, authenticate with the account's API key and
-send a valid envelope for that account's encryption tier. A whoami public key
+send a valid envelope matching `whoami.content_encryption_effective`. A whoami public key
 is an encryption recipient, not an API credential. Plain-text-only chat messages
 (carried inside an envelope) may omit `reply_to_message_id`; file/image
 **followups** require it. Authentication, bootstrap, and envelope validation
@@ -127,14 +127,17 @@ per-tenant secrets and storage, or keep the deployment single-tenant.
 
 On a generic VPS, the local enclave service is software/process separation. It
 does not provide Intel TDX attestation or protection from the machine operator.
-For accounts on the encrypted tier, envelope encryption still protects backups and
-accidental storage exposure, but the host operator controls the processes that can
-request decryption. Accounts on the plaintext tier get no such protection: inline
-bodies are readable in the database, and heavy Chat image/file objects are stored
-as raw bytes in object storage. Database backups, object-storage backups, and
-operators with either form of storage access are plaintext recipients. Decide the
-tier deliberately for the deployment, not per user, when the host operator is not
-the data subject.
+Existing encrypted envelopes still protect backups and accidental storage
+exposure, but the host operator controls the processes that can request
+decryption. With `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`, all known accounts use
+plaintext for new shared content, even if they have a legacy stored `on`
+preference. They cannot opt new content into encryption through the settings API.
+Inline bodies are readable in the database, and heavy Chat image/file objects
+are stored as raw bytes in object storage. Database backups, object-storage
+backups, and operators with either form of storage access are plaintext
+recipients. Decide whether to enable the deployment gate with that trust boundary
+in mind. The gate remains fail-closed by default; this policy does not convert
+existing ciphertext, and `local_only` still requires device-only encryption.
 
 A managed migration may preserve a historical ciphertext envelope verbatim
 when its enclave recipient can no longer decrypt it. That is a data-retention

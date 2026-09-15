@@ -89,7 +89,7 @@ export function ArchitectureDiagram() {
               Hold the user API key and content keypair; call HTTPS and WebSocket APIs.
             </Node>
             <Node eyebrow="User-operated option" title="Independent resident consumer">
-              Polls encrypted Chat work and posts encrypted replies from infrastructure the user controls.
+              Polls Chat work and posts replies in the effective content shape from infrastructure the user controls.
             </Node>
           </div>
         </section>
@@ -153,7 +153,7 @@ export function ArchitectureDiagram() {
             </h3>
             <div className="grid gap-2">
               <Node title="PostgreSQL">
-                Stores accounts, workflow state, encrypted bodies, and operational metadata.
+                Stores accounts, workflow state, plaintext and legacy encrypted bodies, and operational metadata.
               </Node>
               <Node title="Object storage">
                 Stores enabled large-object flows; encryption depends on the specific workflow.

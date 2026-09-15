@@ -11,7 +11,6 @@ tests/test_agent_runtime_resolve_cache.py
 tests/test_agent_runtime_supervisor.py
 tests/test_ai_msg_live_activity_gate.py
 tests/test_api_errors_doc.py
-tests/test_asgi_accounts_remaining.py
 tests/test_asgi_agent.py
 tests/test_asgi_bootstrap_post.py
 tests/test_asgi_client_disconnect.py
