@@ -234,8 +234,8 @@ print(json.dumps({{
      "memory.capture_prompt_v1", "memory.garden_component"],
     ["memory.garden_component", "memory.capture_prompt_v1",
      "memgarden.component"],
-    ["model_api_runtime.v2.extraction", "memory.dream_prompt_v1",
-     "memory.capture_prompt_v1", "memory.garden_component"],
+    ["model_api_runtime.v2.extraction", "memory.capture_prompt_v1",
+     "memory.garden_component"],
 ])
 def test_import_order_does_not_change_policy_behaviour(order) -> None:
     code = _ORDER_PROBE.format(backend=str(BACKEND), order=order,
@@ -271,7 +271,6 @@ def test_kernel_component_functions_are_not_monkeypatched_by_io(attr, source) ->
     悄悄失效或反向生效。
     """
     import memory.capture_prompt_v1  # noqa: F401
-    import memory.dream_prompt_v1  # noqa: F401
     import memory.garden_component  # noqa: F401
 
     assert getattr(kernel_component, attr) is getattr(source, attr)

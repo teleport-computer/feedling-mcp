@@ -107,12 +107,13 @@ resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
 
 | prompt | 唯一实现 | 谁在用 |
 |---|---|---|
-| capture | `memgarden/prompts/capture.py`（外部包） | V2 + resident(都经 `memory/capture_prompt_v1.py` 适配壳) |
-| dream | `memgarden/prompts/dream.py`（外部包） | V2 + resident(都经 `memory/dream_prompt_v1.py` 适配壳) |
+| capture | `memgarden/prompts/capture.py`（外部包） | V2 + resident(都经 `GardenComponent` 的 capture / capture_session;io 档位在 `memory/capture_prompt_v1.py`) |
+| dream | `memgarden/prompts/dream.py`（外部包） | V2 + resident(都经 `memory/garden_component.open_dream_session` → `maintenance_session`,整张卡带正文渲染) |
 | migrate | `memgarden/prompts/migrate.py`（外部包） | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
 
-`memory/*_prompt_v1.py` 现在**不是纯 re-export**:它们是适配层,补齐称呼规则后转调内核
-(所以壳与内核签名不同,别用 `is` 判定两者等同)。
+2026-09-15 起 `memory/dream_prompt_v1.py` 已删、`memory/capture_prompt_v1.py` 只剩 io 的落卡档位:
+两条 runtime 不再直接调内核的提示词/解析函数,只 import memgarden 公开 API
+(守卫:`tests/test_orchestration_is_not_reimplemented.py`)。
 
 **改动影响面**:动 capture / dream 的模板 = **同时改变托管用户与自建服务器用户的行为**。
 逐字节 golden 见 `tests/test_memgarden_capture_golden.py` 与

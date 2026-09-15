@@ -63,7 +63,7 @@ def test_kernel_does_not_reach_into_the_host_identity_system():
         assert not leaked, f"{mod.__name__} 导出了 identity 相关符号：{leaked}"
         assert "identity" not in getattr(mod, "__dict__", {}), mod.__name__
 
-    from memory.capture_prompt_v1 import build_capture_prompt
+    from _memgarden_prompt_bindings import build_capture_prompt
 
     text = build_capture_prompt(
         ai_name="io", user_name="老王", buckets="", threads="",
@@ -82,7 +82,7 @@ def test_compat_shell_preserves_original_naming_semantics():
     sanitized = sanitize_user_name(raw)
     expected_rule = _naming_rule(raw)
 
-    from memory.capture_prompt_v1 import build_capture_prompt
+    from _memgarden_prompt_bindings import build_capture_prompt
 
     text = build_capture_prompt(
         ai_name="io",

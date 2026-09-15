@@ -190,15 +190,8 @@ from notices import rejection_stats as _rejection_stats
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
 
-from memory.capture_prompt_v1 import (
-    IO_CONVERSATION_CAPTURE_POLICY,
-    build_capture_prompt,
-    build_capture_retry_prompt,
-    build_capture_semantic_retry_prompt,
-    parse_capture_cards,
-    sanitize_user_name,
-)
-from identity.user_naming import transcript_speaker_label
+from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
+from identity.user_naming import sanitize_user_name, transcript_speaker_label
 from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates

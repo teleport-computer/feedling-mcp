@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from memory.dream_prompt_v1 import (  # noqa: E402
+from _memgarden_prompt_bindings import (  # noqa: E402
     DREAM_OPS,
     build_dream_prompt as _kernel_build_dream_prompt,
     parse_dream_consolidations,

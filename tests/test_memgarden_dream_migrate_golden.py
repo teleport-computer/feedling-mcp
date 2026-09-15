@@ -15,11 +15,20 @@
 影响面是全量记忆,而在此之前没有任何检查会红。
 
 比对的入口刻意选**运行时真正调用的那个**:
-- dream → ``memory.dream_prompt_v1.build_dream_prompt``(适配层壳,内部装配称呼规则;
-  Runtime V2 与 resident consumer 都调它)
+- dream → ``memory.garden_component.open_dream_session(...)`` 开出的组件会话的
+  第一问(Runtime V2 与 resident consumer 都经它;卡片以**整张卡**的形式传入,
+  由组件带正文渲染、按预算截断、标 TRUNCATED)。旧入口
+  ``memory.dream_prompt_v1.build_dream_prompt`` 已随 import * 壳删除(2026-09-15)
 - migrate → ``memgarden.prompts.migrate.build_migrate_prompt``
   (**只有 resident consumer 在用**,V2 侧无调用方;老壳
   ``memory/migrate_prompt_v1.py`` 已在 ``5e50e79e`` 删除)
+
+基线变更记录:
+- 2026-09-15 dream 基线整体重生成:memgarden 的 Dream 带正文渲染(Step 1 措辞加
+  "and its body"、新增 TRUNCATED 规则、卡片区改成 ``- id=… | bucket=…`` +
+  summary/content 块);入口换成组件会话,所以 params 里的 ``cards`` 从渲染好的串
+  变成卡片列表,且至少 10 张(组件的整理门槛)。英文花园的称呼规则改用内核默认
+  那份(不再夹中文「用户」「TA」)。
 
 基线更新方式:改动是有意的 → 重跑本文件顶部的生成参数、覆盖 fixture、
 在提交说明里写明为什么。没有自动重写机制,这是故意的。
@@ -31,8 +40,19 @@ import pathlib
 
 import pytest
 
-from memory.dream_prompt_v1 import build_dream_prompt as build_dream_via_shell
 from memgarden.prompts.migrate import build_migrate_prompt
+from memory import garden_component
+
+
+def build_dream_via_runtime(**params) -> str:
+    """The first prompt a Dream run sends, through the entry both runtimes use."""
+    session, _disclosure = garden_component.open_dream_session(
+        garden_component.build_garden(garden_component.CallableModel(lambda _p: "")),
+        **params,
+    )
+    prompt = session.next_prompt()
+    assert prompt, "a golden Dream case must be large enough for the component to run"
+    return prompt
 
 _FIXTURE = (
     pathlib.Path(__file__).resolve().parent
@@ -54,7 +74,7 @@ def _case_names(kind: str) -> list[str]:
 def test_dream_prompt_is_byte_identical_to_baseline(case_name: str) -> None:
     """dream prompt 逐字节不变 —— V2 与 resident 共用这一份。"""
     case = _baseline()["dream"][case_name]
-    actual = build_dream_via_shell(**case["params"])
+    actual = build_dream_via_runtime(**case["params"])
     assert actual == case["text"], (
         f"dream prompt 的 {case_name} 用例变了。若是有意改动:重新生成 fixture "
         f"并在提交说明里写明原因;若不是,说明有改动无意中动了模板。"
@@ -90,8 +110,10 @@ def test_fixture_covers_the_shapes_that_break_templates() -> None:
         empty_params = cases["all_empty"]["params"]
         # locale 是必填参数（没有默认值），不算「填了内容」——
         # 这个用例守的是「其余参数全空时模板的默认措辞」。
+        # dream 的 cards 也不算:组件对不到 10 张卡的花园不出提示词,
+        # 全空用例只能用最小的卡(只有 id + 一行摘要)压默认措辞。
         non_empty = {k: v for k, v in empty_params.items()
-                     if str(v).strip() and k != "locale"}
+                     if str(v).strip() and k not in {"locale", "cards"}}
         assert not non_empty, (
             f"{kind}.all_empty 已经不是全空了:{sorted(non_empty)} —— "
             "这个用例的意义就是压默认档措辞,填了值就守不住了"
@@ -113,45 +135,21 @@ def test_fixture_covers_the_shapes_that_break_templates() -> None:
         )
 
 
-def test_dream_shell_is_an_adapter_not_a_second_template() -> None:
-    """壳只许装配参数后转调内核,不许自己复制一份模板。
+def test_dream_fixture_covers_bodies_legacy_fields_and_truncation() -> None:
+    """dream 基线必须真的压住这次改动的形状:正文进提示词、老字段名被翻译、
+    超长卡被截断并标 TRUNCATED —— 断言取值本身,不看 case 名字。"""
+    cases = _baseline()["dream"]
+    typical = cases["typical"]["text"]
+    assert "  content:\n    老婆是重庆人，每次回重庆都要吃火锅。" in typical
 
-    判据是**完全相等**,不做任何 strip:用壳内部同样的两个助手
-    (``sanitize_user_name`` / ``_naming_rule``)构造出内核入参,
-    两边产出必须一字不差。
+    legacy = cases["legacy_fields_and_truncated_card"]
+    kinds = {k for card in legacy["params"]["cards"] for k in card}
+    assert {"title", "body", "category", "thread", "description", "plaintext"} <= kinds
+    assert "- id=mem_1 | bucket=家庭 | threads=家人" in legacy["text"]
+    assert "summary: 每周三跑步" in legacy["text"]
+    assert "- id=mem_3 | TRUNCATED" in legacy["text"]
+    assert any(len(card.get("content", "")) > garden_component.DREAM_CARD_BODY_CHARS
+               for card in legacy["params"]["cards"])
 
-    早先这条用「删掉所有含『称呼』的行再比对」,那会把模板主体里静态的
-    称呼说明一起删掉 —— 改动那行时测试照样绿,声明不成立。
-
-    顺带钉住壳里那个刻意的不对称(见壳的 docstring):
-    ``naming_rule`` 取**未 sanitize** 的原始 user_name,
-    模板里的 ``user_name`` 取 **sanitize 后**的值。两者不同源。
-    """
-    from identity.user_naming import _naming_rule, sanitize_user_name
-    from memgarden.prompts import dream as kernel
-
-    # 刻意用带前后空格的名字:sanitize 与否会产生不同结果,
-    # 抄错一边就会被这条抓住。
-    raw_user_name = "  老王 "
-    params = dict(
-        ai_name="io",
-        user_name=raw_user_name,
-        cards="卡1: 老婆是重庆人",
-        recent_conversations="用户:今天开了一天会",
-        locale="zh-Hans",
-    )
-
-    via_shell = build_dream_via_shell(**params)
-    via_kernel = kernel.build_dream_prompt(
-        ai_name=params["ai_name"],
-        user_name=sanitize_user_name(raw_user_name),
-        naming_rule=_naming_rule(raw_user_name, locale=params["locale"]),
-        cards=params["cards"],
-        recent_conversations=params["recent_conversations"],
-        locale=params["locale"],
-    )
-
-    assert via_shell == via_kernel, (
-        "壳的产出与内核不一致 —— 壳里可能复制了一份模板,"
-        "或者 naming_rule / user_name 的 sanitize 取值被改成了同源。"
-    )
+    assert cases["english_garden"]["params"]["locale"] == "en"
+    assert "用户" not in cases["english_garden"]["text"]

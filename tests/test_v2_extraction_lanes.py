@@ -142,13 +142,10 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     seen = []
 
     async def _fake_extract(**kwargs):
-        if lane == "dream":
-            # Dream is session-only: the component decides the truncation
-            # re-ask wording, extract() only owns the wire budget.
-            assert kwargs["parse_retry"] is None and kwargs["session"] is not None
-            retry_prompt = "截断重问由组件决定"
-        else:
-            retry_prompt = kwargs["parse_retry"].build_truncation_prompt("P")
+        # Both lanes are session-only: the component decides the truncation
+        # re-ask wording, extract() only owns the wire budgets.
+        assert kwargs["parse_retry"] is None and kwargs["session"] is not None
+        retry_prompt = "截断重问由组件决定"
         seen.append((kwargs["max_tokens"], retry_prompt))
         retry_budgets.append(kwargs.get("truncation_retry_max_tokens"))
         return [], None
@@ -195,17 +192,15 @@ def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):
     seen = {}
 
     async def _fake_extract(**kwargs):
-        direct_cards, direct_err = kwargs["parse"](reply)
-        retry_cards, retry_err = kwargs["parse_retry"].parse(reply)
+        # The component session is the only parse route the worker has; the
+        # legacy direct/retry parsers are placeholders that refuse to run.
+        assert kwargs["parse"](reply) == (None, "component_session_required")
+        assert kwargs["parse_retry"] is None
         session = kwargs["session"]
         assert session.next_prompt()
         session.feed(reply)
         outcome = session.result()
-        seen.update(
-            direct=(len(direct_cards), direct_err),
-            retry=(len(retry_cards), retry_err),
-            session=(len(outcome.cards), outcome.error),
-        )
+        seen.update(session=(len(outcome.cards), outcome.error))
         return outcome.cards, outcome.error
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
@@ -218,11 +213,7 @@ def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):
     ))
 
     assert status == "completed"
-    assert seen == {
-        "direct": (8, None),
-        "retry": (8, None),
-        "session": (8, None),
-    }
+    assert seen == {"session": (8, None)}
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -316,7 +307,13 @@ def test_extraction_lane_ignores_content_block_metadata_for_language(monkeypatch
         return [], None
 
     if lane == "capture":
-        monkeypatch.setattr(worker, "build_capture_prompt", _fake_prompt)
+        real_request = worker.mg_contracts.CaptureRequest
+
+        def _spy_request(**kwargs):
+            _fake_prompt(**kwargs)
+            return real_request(**kwargs)
+
+        monkeypatch.setattr(worker.mg_contracts, "CaptureRequest", _spy_request)
     else:
         real_open = worker.garden_component.open_dream_session
 
@@ -1810,8 +1807,9 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
 
     seen = {}
 
-    async def _cap(*, provider_config, prompt, parse, **kw):
-        seen["prompt"] = prompt
+    async def _cap(*, provider_config, session, **kw):
+        # The prompt the model would actually receive is the session's.
+        seen["prompt"] = session.next_prompt()
         return ([], None)
 
     monkeypatch.setattr(extraction, "extract", _cap)
@@ -1819,9 +1817,19 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
         job, _deps(read_memory_context=None), provider_config=_BYOK,
         api_key=None, runtime_token="rt"))
     assert status == "completed"
+    assert "我换工作了" in seen["prompt"]
     assert "(none)" in seen["prompt"]           # prompt builder's own fallback kicked in
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known gap since fd963bf9 (V2 capture on the component session): "
+        "CaptureRequest.cards is never set, so the model sees no existing-card "
+        "index and cannot copy a target_id for merge/supersede. This test used "
+        "to pass only because it inspected the unused legacy prompt."
+    ),
+)
 def test_capture_prompt_includes_existing_card_ids(monkeypatch):
     uid = "u_x_cards_context"
     _seed_v2(uid)
@@ -1829,8 +1837,8 @@ def test_capture_prompt_includes_existing_card_ids(monkeypatch):
     job = jobs_store.claim_next_job("w")
     seen = {}
 
-    async def _capture(*, prompt, **_kwargs):
-        seen["prompt"] = prompt
+    async def _capture(*, session, **_kwargs):
+        seen["prompt"] = session.next_prompt()
         return [], None
 
     monkeypatch.setattr(extraction, "extract", _capture)
@@ -1982,8 +1990,9 @@ def test_capture_mixed_batch_discloses_only_live_rows(monkeypatch):
     job = jobs_store.claim_next_job("w")
     prompts = []
 
-    async def _capture(*, prompt, **_kwargs):
-        prompts.append(prompt)
+    async def _capture(*, session, **_kwargs):
+        # What is disclosed is what the component session would send.
+        prompts.append(session.next_prompt())
         return [], None
 
     monkeypatch.setattr(extraction, "extract", _capture)

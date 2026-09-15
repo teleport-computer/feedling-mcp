@@ -142,29 +142,15 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
-from memory.capture_prompt_v1 import (
-    IO_CONVERSATION_CAPTURE_POLICY,
-    build_capture_prompt,
-    build_capture_retry_prompt,
-    build_capture_semantic_retry_prompt,
-    capture_semantic_retry_reasons,
-    parse_capture_cards,
-)
+from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
 from identity.user_naming import transcript_speaker_label
 from memgarden.text.card_text import (
-    build_truncation_retry_prompt,
     card_text_rejection,
     count_user_token_residuals,
-    is_retryable_parse_error,
     sanitize_card_labels,
 )
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
-from memory.dream_prompt_v1 import (
-    build_dream_prompt,
-    build_dream_retry_prompt,
-    parse_dream_consolidations,
-)
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 log = logging.getLogger("feedling.runtime_v2.worker")
@@ -12708,28 +12694,17 @@ async def _run_extraction(
             _sole_call_id = ""
             if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
                 _sole_call_id = next(iter(voice_transcripts))
-            parse = lambda reply: parse_capture_cards(
-                reply, policy=IO_CONVERSATION_CAPTURE_POLICY
-            )
+            # 提示词、解析、内容闸/语义闸的重问（第二问放宽成「只丢脏卡、干净的
+            # 照收」）都由组件的会话决定，见下面建 _capture_session 那段；
+            # extract() 在会话模式下不看 prompt/parse/parse_retry。
+            prompt = ""
+            parse = _session_only_parse
+            parse_retry = None
 
             def to_actions(*args, _call_id=_sole_call_id, **kwargs):
                 return v2_extraction.cards_to_actions(
                     *args, voice_call_id=_call_id, **kwargs
                 )
-            # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
-            # 不让一张脏卡把整个窗口的落卡清零。
-            parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_retryable_parse_error,
-                build_prompt=build_capture_retry_prompt,
-                parse=lambda reply: parse_capture_cards(
-                    reply,
-                    strict=False,
-                    policy=IO_CONVERSATION_CAPTURE_POLICY,
-                ),
-                semantic_reasons=capture_semantic_retry_reasons,
-                build_semantic_prompt=build_capture_semantic_retry_prompt,
-                build_truncation_prompt=build_truncation_retry_prompt,
-            )
         else:
             # 整理走组件的会话：提示词、带正文的卡片区、预算截断、解析与重问都在组件里；
             # provider 那步仍归 extract()（截断检测、用量、失败分类、退避、轨迹）。
@@ -12896,16 +12871,6 @@ async def _run_extraction(
                     user_name=ctx.get("user_name", ""),
                     policy=IO_CONVERSATION_CAPTURE_POLICY,
                 ))
-                prompt = build_capture_prompt(
-                    ai_name=ctx.get("ai_name", ""),
-                    user_name=ctx.get("user_name", ""),
-                    buckets=ctx.get("buckets", ""),
-                    threads=ctx.get("threads", ""),
-                    identity=ctx.get("identity", ""),
-                    window=window,
-                    cards=ctx.get("cards", ""),
-                    locale=capture_locale,
-                )
                 # 引号压力：失败窗口 >0 而成功窗口 =0 就坐实了引号假说。
                 # 只出个数和每千字符密度，不出位置、不出上下文。
                 try:
@@ -12935,9 +12900,6 @@ async def _run_extraction(
                 #
                 # 不直接调 garden.acapture() 的原因：那个自带循环，会把 provider
                 # 调用抢过去 —— 等于放弃上面那些能力，是净退步。
-                #
-                # dream lane 仍走原路径（它的 session API 还没做），所以下面两个
-                # 分支的 prompt/parse/parse_retry 仍然保留。
                 result = await _extract_with_provider_health(
                     user_id,
                     provider_config=provider_config,
@@ -13079,9 +13041,8 @@ async def _run_extraction(
                 counts=dream_counts,
             )
             _report_turn_progress("extraction_provider_start")
-            # dream 也走组件的会话（见上面建 _capture_session 那段）。
-            # prompt/parse/parse_retry 仍传着 —— 会话模式下 extract() 忽略它们，
-            # 但保留意味着「去掉 session 就退回原路径」随时可做。
+            # dream 也走组件的会话（见上面 open_dream_session 那段）；
+            # prompt/parse/parse_retry 只是占位，会话模式下 extract() 不看它们。
             items, reason = await _extract_with_provider_health(
                 user_id,
                 provider_config=provider_config,

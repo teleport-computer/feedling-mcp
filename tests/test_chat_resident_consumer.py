@@ -4193,7 +4193,7 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     fragment -> no_json_object / json_decode_error, and every claimed dream job
     failed. call_agent(..., raw_text=True) must bypass the chat sanitizer.
     """
-    from memory.dream_prompt_v1 import parse_dream_consolidations
+    from _memgarden_prompt_bindings import parse_dream_consolidations
 
     dream_json = (
         "Here is the consolidation result:\n"

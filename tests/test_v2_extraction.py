@@ -10,12 +10,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import pytest
 from psycopg_pool import PoolTimeout as PsycopgPoolTimeout
 
-from memory.capture_prompt_v1 import (
+from _memgarden_prompt_bindings import (
     build_capture_retry_prompt,
     parse_capture_cards,
 )
 from memgarden.text.card_text import is_retryable_parse_error
-from memory.dream_prompt_v1 import build_dream_prompt
+from _memgarden_prompt_bindings import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 
 
@@ -593,8 +593,15 @@ def test_extract_reasks_once_after_json_decode_error(monkeypatch):
     assert len(prompts) == 2
 
 
-def test_v2_worker_uses_the_shared_retryable_parse_predicate():
-    assert worker.is_retryable_parse_error is is_retryable_parse_error
+def test_v2_worker_leaves_parsing_and_re_asks_to_the_component():
+    """The retry predicate, parsers and prompt builders live in the Garden
+    component; the worker only hands extract() a placeholder that refuses to
+    parse, so a call that forgot its session fails loudly."""
+    assert worker._session_only_parse("{}") == (None, "component_session_required")
+    for name in ("is_retryable_parse_error", "parse_capture_cards",
+                 "parse_dream_consolidations", "build_capture_prompt",
+                 "build_dream_prompt"):
+        assert not hasattr(worker, name), name
 
 
 def test_extract_bounces_at_most_once(monkeypatch):

@@ -45,10 +45,6 @@ ORCHESTRATION = {
 EXEMPT = {
     # 挂载点本身，import 组件是它的职责
     "backend/memory/garden_component.py",
-    # 兼容外壳：为了不动一大批老调用点而保留的 re-export，
-    # 它们不做编排，只把名字转出去
-    "backend/memory/capture_prompt_v1.py",
-    "backend/memory/dream_prompt_v1.py",
     # e2e 探针要复用线上同一把尺子来断言，不是产品路径
     "tools/e2e/",
 }
@@ -86,3 +82,56 @@ def test_the_exemptions_are_still_real() -> None:
     「什么都豁免」而没人发现。"""
     missing = [x for x in EXEMPT if not (REPO / x).exists()]
     assert not missing, f"豁免名单里有不存在的路径：{missing}"
+
+
+#: 记忆 runtime 的入口文件：两条 lane 的落卡 / 整理都经过这里。
+#: 2026-09-15 起它们只许 import memgarden 的公开 API（顶层 ``__all__``，或
+#: ``memgarden.STABLE_MODULES`` 里模块的 ``__all__``）—— ``prompts.capture`` /
+#: ``prompts.dream`` 这类内部零件随时会改名，那正是 ``import *`` 兼容壳被删的原因。
+PUBLIC_API_ONLY = (
+    "backend/memory/garden_component.py",
+    "backend/memory/capture_prompt_v1.py",
+    "backend/model_api_runtime/v2/worker.py",
+    "backend/model_api_runtime/v2/serve_worker.py",
+    "tools/chat_resident_consumer.py",
+)
+
+
+def _is_public(module: str, name: str | None) -> bool:
+    import importlib
+
+    import memgarden
+
+    stable = set(memgarden.STABLE_MODULES)
+    if name is None:                       # ``import memgarden.x``
+        return module == "memgarden" or module in stable
+    if module == "memgarden":
+        return name in memgarden.__all__ or f"memgarden.{name}" in stable
+    if f"{module}.{name}" in stable:       # ``from memgarden.text import card_guard``
+        return True
+    return module in stable and name in getattr(importlib.import_module(module), "__all__", ())
+
+
+def test_memory_runtime_entry_files_import_only_public_memgarden_api() -> None:
+    offenders = []
+    for rel in PUBLIC_API_ONLY:
+        tree = ast.parse((REPO / rel).read_text("utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("memgarden"):
+                if any(alias.name == "*" for alias in node.names):
+                    offenders.append(f"{rel}:{node.lineno} from {node.module} import *")
+                    continue
+                offenders.extend(
+                    f"{rel}:{node.lineno} {node.module}.{alias.name}"
+                    for alias in node.names if not _is_public(node.module, alias.name)
+                )
+            elif isinstance(node, ast.Import):
+                offenders.extend(
+                    f"{rel}:{node.lineno} import {alias.name}"
+                    for alias in node.names
+                    if alias.name.startswith("memgarden") and not _is_public(alias.name, None)
+                )
+    assert not offenders, (
+        "这些 import 用了 memgarden 的内部零件（不在 __all__ / STABLE_MODULES 里）：\n  "
+        + "\n  ".join(offenders)
+    )

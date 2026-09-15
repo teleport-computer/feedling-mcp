@@ -10,7 +10,10 @@
 发一套、语言被显式指定、称呼规则跟着花园语言走），而不是只比对一个不透明的
 字符串。fixture 负责挡后续的意外漂移，断言负责挡「基线本身就是错的」。
 
-比对的是 io 侧兼容壳 ``memory.capture_prompt_v1.build_capture_prompt``。
+比对的是旧 io 兼容壳的装配方式（sanitize 名字 + io 称呼规则），现在住在
+``tests/_memgarden_prompt_bindings.py``；那个壳已随 ``import *`` 一起从生产代码删除
+（2026-09-15）。⚠️ 生产落卡走组件（``CaptureRequest``，原始名字 + 内核默认称呼
+规则、不带卡片索引），与这里的入参不完全相同 —— 这份基线守的是内核模板文本。
 
 覆盖的边界：典型输入 / 全空 / 中英混合但花园是中文 / 真英文花园 /
 名字带前后空格（走 sanitize）/ 正文里含花括号（会撞 ``str.format``）。
@@ -22,7 +25,7 @@ import pathlib
 
 import pytest
 
-from memory.capture_prompt_v1 import build_capture_prompt as build_via_shell
+from _memgarden_prompt_bindings import build_capture_prompt as build_via_shell
 from memgarden.policies import CONVERSATION_CAPTURE, CURATED_ARCHIVE, HISTORY_IMPORT
 from memgarden.prompts.capture import build_capture_prompt as build_via_kernel
 
