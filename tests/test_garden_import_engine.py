@@ -393,3 +393,162 @@ def test_old_memgarden_without_host_note_field_builds_the_request_without_it(mon
     monkeypatch.setattr(memgarden, "ImportRequest", real)
     assert garden_import.import_request_accepts_host_note() is True
     assert garden_import._request(_sources("窗一\n")[0], params, job_key="j").host_note == _NOTE
+
+
+# --------------------------------------------------------------- 第 4 节审查意见（import6）
+
+def _two_pass_model(*, write_reply) -> Model:
+    """两段式替身：抽候选按窗口回；写卡阶段交给 ``write_reply(prompt)``。"""
+
+    class _M(Model):
+        def __call__(self, prompt: str, _purpose: str) -> tuple[str, bool]:
+            self.prompts.append(prompt)
+            if "Candidate facts" in _material(prompt):
+                return write_reply(prompt), False
+            return _candidates(("likes oolong tea", "w1 tea")), False
+
+    return _M([])
+
+
+def test_region_tagged_locale_is_normalized_and_drives_the_naming_rule():
+    """C1 之前：``en-US`` 原样进 ImportRequest → UnknownBucketLocaleError；而且称呼规则按
+    ``locale == "en"`` 判，``en-US`` 拿到中文规则。之后：存进状态的就是归一值。"""
+    for raw, expected in (("en-US", "en"), ("zh-Hans-CN", "zh-Hans"), ("zh-Hant-TW", "zh-Hans")):
+        assert garden_import.new_state(locale=raw)["params"]["locale"] == expected
+    state = garden_import.new_state(locale="en-US", user_name="Sam", strategy="single_pass")
+    model = Model([("tea", _reply(_card("Sam likes oolong tea")))])
+    result = _run(state, _sources("w1 I like oolong tea\n"), model, Store())
+    assert result.done
+    assert 'Refer to Sam by the name "Sam"' in model.prompts[0]
+    assert "提到 Sam 就用" not in model.prompts[0]
+
+
+def test_old_checkpoint_holding_a_raw_locale_resumes_instead_of_crashing_again(monkeypatch):
+    """归一之前开始的 job：两段式候选阶段已经存进 checkpoint（带原样 locale 的续传指纹），
+    写卡阶段炸了。之后重试：读的时候归一，旧进度对不上就清掉重来，跑完。"""
+    sources = _sources("w1 I like oolong tea\n")
+    state = garden_import.new_state(locale="en", strategy="two_pass")
+    state["params"]["locale"] = "en-US"  # 老 checkpoint 里存的原样标签
+    saves: list[dict] = []
+    monkeypatch.setattr(garden_import, "garden_locale", lambda raw: str(raw or ""))  # 修复前
+    with pytest.raises(Exception, match="en-US"):
+        _run(state, sources, _two_pass_model(write_reply=lambda _p: _reply(_card("x"))),
+             Store(), saves=saves)
+    stuck = saves[-1]
+    assert stuck["sessions"]["1:history"]["progress"]["candidates"], "候选阶段的进度已经存下"
+    monkeypatch.undo()
+
+    store = Store()
+    model = _two_pass_model(write_reply=lambda _p: _reply(_card("Likes oolong tea")))
+    result = _run(stuck, sources, model, store)
+    assert result.done and [c["summary"] for c in store.cards.values()] == ["Likes oolong tea"]
+    assert stuck["params"]["locale"] == "en"
+
+
+def test_old_memgarden_fails_with_a_named_code_before_asking_the_model(monkeypatch):
+    """C1' 之前：旧 memgarden（0.20.1 没有 ImportBatchResult）→ 裸 ImportError。"""
+    import memgarden
+
+    monkeypatch.delattr(memgarden, "ImportBatchResult")
+    assert garden_import.import_kernel_drives_batches() is False
+    model, saves = Model([]), []
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    with pytest.raises(garden_import.GardenImportKernelOutdated) as err:
+        _run(state, _sources("窗口\n"), model, Store(), saves=saves)
+    assert str(err.value) == err.value.code == "garden_import_kernel_outdated"
+    assert model.prompts == [] and saves == []
+    monkeypatch.undo()
+    assert garden_import.import_kernel_drives_batches() is True
+
+
+def test_two_pass_write_stage_all_failing_raises_instead_of_done_with_zero_cards():
+    """I1 之前：候选批次的成功把写卡阶段全失败盖住 → 「完成、0 张卡」。"""
+    saves: list[dict] = []
+    state = garden_import.new_state(locale="en", strategy="two_pass")
+    with pytest.raises(garden_import.GardenImportFailed, match="write"):
+        _run(state, _sources("w1 I like oolong tea\n"),
+             _two_pass_model(write_reply=lambda _p: "garbage"), Store(), saves=saves)
+    entry = saves[-1]["sessions"]["1:history"]
+    assert entry["progress"] is None and not entry.get("done")
+    assert saves[-1]["totals"]["dropped"] == 0, "失败的这组撤回丢弃数，重试时重新算"
+
+
+def test_skipped_write_group_counts_its_candidates_as_dropped():
+    """I1 之前：跳过的写卡组不计丢弃 → genesis_partial 通知发不出来。"""
+    many = [(f"fact number {i} about tea", f"w1 fact {i}") for i in range(45)]
+
+    class _M(Model):
+        def __call__(self, prompt: str, _purpose: str) -> tuple[str, bool]:
+            self.prompts.append(prompt)
+            material = _material(prompt)
+            if "Candidate facts" not in material:
+                return _candidates(*many), False
+            if "fact number 0 " in material:
+                return "garbage", False  # 第一组（40 条）写卡一直失败
+            return _reply(_card("Drinks tea daily")), False
+
+    store = Store()
+    result = _run(garden_import.new_state(locale="en", strategy="two_pass"),
+                  _sources("w1 I like tea\n"), _M([]), store)
+    assert result.done and result.batches_skipped == 1
+    assert (result.cards_written, result.dropped) == (1, 40)
+
+
+def test_unresumable_progress_restarts_that_source_instead_of_failing_forever(caplog):
+    """I2 之前：续传指纹对不上（跨发版改了批次规则等）→ ValueError，每次重试同处炸。"""
+    sources = _sources("窗口一：我不吃辣\n", "窗口二：我养了一只橘猫叫蛋子\n")
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    saves: list[dict] = []
+    calls = {"n": 0}
+    model = Model([("不吃辣", _reply(_card("不吃辣"))), ("蛋子", _reply(_card("橘猫蛋子")))])
+    store = Store()
+    _run(state, sources, model, store, saves=saves,
+         should_yield=lambda: calls.__setitem__("n", calls["n"] + 1) or calls["n"] > 1)
+    stale = saves[-1]
+    stale["sessions"]["1:history"]["progress"]["import_fingerprint"] = "f" * 64
+    stale["pending"] = {"session": "1:history", "stage": "cards", "offset": 0, "end": 1,
+                        "idempotency_key": "old", "mutations": [], "cards": [], "ids": []}
+
+    model2 = Model(model.rules)
+    existing = [{"id": rid, "summary": c["summary"]} for rid, c in store.cards.items()]
+    with caplog.at_level("WARNING", logger="memory.garden_import"):
+        result = _run(stale, sources, model2, store, existing=existing)
+    assert result.done
+    assert len(model2.prompts) == 2, "这组从头来（已写的卡在已有记忆索引里）"
+    assert stale["pending"] is None
+    assert stale["sessions"]["1:history"]["resume_resets"] == 1
+    assert "not resumable" in caplog.text and "蛋子" not in caplog.text
+
+
+def test_later_batch_index_sees_the_rewritten_name_not_the_placeholder():
+    """M1 之前：commit 给会话的是改写前的指令，后面批次的已有记忆索引里还是「用户…」。"""
+    sources = _sources("窗口一：骑车\n", "窗口二：咖啡\n")
+    state = garden_import.new_state(locale="zh-Hans", user_name="小雨", strategy="single_pass")
+    model = Model([("骑车", _reply(_card("用户喜欢周末去西湖边骑车"))),
+                   ("咖啡", _reply(_card("每天早上一杯冰美式")))])
+    _run(state, sources, model, Store())
+    second = model.prompts[1]
+    assert "小雨喜欢周末去西湖边骑车" in second
+    assert "用户喜欢周末去西湖边骑车" not in second
+
+
+def test_pending_write_replay_gives_up_after_the_batch_attempt_budget(caplog):
+    """M2 之前：持久写库错误每次重试都把同一段 pending 原样重放，job 永远失败。"""
+    sources = _sources("窗口：两件事\n")
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    saves: list[dict] = []
+    model = Model([("两件事", _reply(_card("周末常去西湖边骑车"), _card("每天早上一杯冰美式")))])
+    broken = Store()
+    broken.fail_after = 0
+    with pytest.raises(RuntimeError, match="store down"):
+        _run(state, sources, model, broken, saves=saves)
+    doc = saves[-1]
+    with pytest.raises(RuntimeError, match="store down"):  # 第一次重放：还在试
+        _run(doc, sources, Model([], default="NO"), broken, saves=saves)
+    doc = saves[-1]
+    assert doc["pending"]["replays"] == 1
+    with caplog.at_level("WARNING", logger="memory.garden_import"):
+        result = _run(doc, sources, Model([], default="NO"), broken)
+    assert result.done and (result.cards_written, result.dropped) == (0, 2)
+    assert len(broken.calls) == 2, "第二次重放不再写"
+    assert "gave up" in caplog.text and "西湖" not in caplog.text

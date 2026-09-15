@@ -23111,7 +23111,14 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
         def complete(prompt: str, _purpose: str) -> tuple[str, bool]:
             reply = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
             genesis_resident_heartbeat(job_id)  # each batch is one agent call — keep the lease alive
-            return reply, False
+            # The CLI/HTTP agent path returns only text (no provider stop_reason), so the
+            # truncation signal comes from the reply itself: a JSON reply whose brackets or
+            # string never close was cut off. memgarden then re-asks once with its
+            # "be more compact" prompt instead of a generic format retry.
+            # Previously this was always False, so that re-ask never fired on the VPS.
+            shape = _capture_reply_shape(reply)
+            truncated = bool(shape["reply_looks_truncated"]) and shape["reply_head"] in {"{", "[", "```"}
+            return reply, truncated
 
         def write(mutations: list[dict], _key: str) -> list[str]:
             now_iso = datetime.now(_tzmod.utc).isoformat()

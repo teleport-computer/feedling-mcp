@@ -11,6 +11,7 @@ import os
 from typing import Callable
 
 import debug_trace
+import distillation_ledger
 import provider_client
 from genesis.llm_client import GenesisLLMClient
 from memory import actions as memory_actions
@@ -108,6 +109,67 @@ def store_writer(
     return write
 
 
+def run_with_memory_ledger(store, job_id: str, state: dict,
+                           run: Callable[[garden_import.Write], garden_import.ImportRunResult],
+                           write: garden_import.Write, *, record_empty: bool = True,
+                           ) -> garden_import.ImportRunResult:
+    """跑一次导入，按 Seven b0ef0c24 的口径给记忆台账记**一行**。
+
+    b0ef0c24 的台账包的是「写库」这一步（切换前模型早就跑完了，``apply_memory_outputs``
+    才开台账），口径是：
+
+        没有卡要写        → not_provided
+        写进去的比要写的少 → partial
+        全写进去          → written
+        写库本身抛了       → write_failed
+
+    换引擎之后模型调用和写库交替进行，台账如果包住整个 ``run`` 就会走样：provider 超时 /
+    429 也记成 write_failed；outcome 拿整个 job 的累计数，重试时把上一次写的卡算进这次。
+    所以这里：
+
+    * 台账在**第一次写库时**才开（模型失败、一张没写到库这一步 → 不开行，和切换前
+      「模型挂了 apply 根本没跑」一致）；
+    * 只有从 ``write`` 里抛出来、并且就是让这次 run 失败的那个异常，才算 write_failed；
+    * outcome 用这次 run 前后 ``totals`` 的差值；
+    * 正常跑完一张都不用写时记一行 not_provided（切换前 apply 空列表也记这一行）。
+      ``record_empty=False`` 的调用方（前台 0 张转一次做完）不记 —— 接下来那一趟会记。
+    """
+    totals = state.setdefault("totals", {})
+    before = (int(totals.get("cards_written") or 0), int(totals.get("dropped") or 0))
+    box: dict = {"attempt": None, "write_exc": None}
+
+    def _open():
+        if box["attempt"] is None:
+            box["attempt"] = distillation_ledger.ArtifactAttempt(store, job_id, "memory").__enter__()
+        return box["attempt"]
+
+    def ledgered_write(mutations: list[dict], key: str) -> list[str]:
+        _open()
+        box["write_exc"] = None
+        try:
+            return write(mutations, key)
+        except Exception as exc:  # noqa: BLE001 — 只记下来，照原样抛给引擎
+            box["write_exc"] = exc
+            raise
+
+    def _delta_outcome() -> str:
+        written = max(0, int(totals.get("cards_written") or 0) - before[0])
+        dropped = max(0, int(totals.get("dropped") or 0) - before[1])
+        if written + dropped == 0:
+            return "not_provided"
+        return "partial" if dropped else "written"
+
+    try:
+        result = run(ledgered_write)
+    except BaseException as exc:
+        if box["attempt"] is not None:
+            box["attempt"].finish("write_failed" if exc is box["write_exc"] else _delta_outcome())
+        raise
+    if box["attempt"] is not None or record_empty:
+        _open().finish(_delta_outcome())
+    return result
+
+
 def existing_cards(store, api_key: str | None, *, runtime_token: str = "",
                    job_id: str = "") -> list[dict]:
     """这个人现在可见的卡（id + 摘要 + 桶），给导入会话做跨批去重的「已有记忆索引」。
@@ -138,4 +200,5 @@ def existing_cards(store, api_key: str | None, *, runtime_token: str = "",
         return []
 
 
-__all__ = ["IMPORT_MAX_TOKENS", "existing_cards", "llm_complete", "memory_action", "store_writer"]
+__all__ = ["IMPORT_MAX_TOKENS", "existing_cards", "llm_complete", "memory_action",
+           "run_with_memory_ledger", "store_writer"]

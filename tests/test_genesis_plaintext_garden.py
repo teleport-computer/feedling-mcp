@@ -437,3 +437,129 @@ def test_archive_only_onboarding_still_brings_the_ai_name_from_the_archive(env, 
     assert merged["identity"]["dimensions"] == [], "档案不推性格维度（同切换前）"
     assert merged["days_with_user"] == 321
     assert merged["relationship_anchor_evidence"] == "2024-08 开始"
+
+
+@pytest.mark.parametrize("archive_language, expected", [
+    ("en-US", "en"), ("zh-Hans-CN", "zh-Hans"), ("zh-Hant-TW", "zh-Hans")])
+@pytest.mark.parametrize("strategy", ["single_pass", "two_pass"])
+def test_region_tagged_archive_language_imports_instead_of_crashing(
+        env, monkeypatch, archive_language, expected, strategy):
+    """iOS 把 ``Locale.preferredLanguages.first``（``en-US`` / ``zh-Hans-CN``）存成档案语言。
+    之前原样进 ``ImportRequest.locale`` → memgarden 桶清单只认 ``en`` / ``zh-Hans`` → 整个导入
+    抛 UnknownBucketLocaleError。现在导入引擎入口统一归一。"""
+    from accounts import registry
+
+    monkeypatch.setenv("FEEDLING_GARDEN_IMPORT_STRATEGY", strategy)
+    monkeypatch.setattr(registry, "_get_user_archive_language", lambda _uid: archive_language)
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    card = _card("Runs the Chicago marathon in October")
+
+    class TwoPassModel(FakeModel):
+        def __call__(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if "W1" in _material(prompt) and "Candidate facts" not in prompt and strategy == "two_pass":
+                self.prompts.append(prompt)
+                return types.SimpleNamespace(text=json.dumps({"candidates": [
+                    {"about": "person", "summary": card["summary"], "evidence": "W1 signed up",
+                     "occurred_at": None}]}), stop_reason="stop")
+            if "Candidate facts" in prompt:
+                self.prompts.append(prompt)
+                return types.SimpleNamespace(text=json.dumps({"cards": [card]}), stop_reason="stop")
+            return super().__call__(**kwargs)
+
+    model = TwoPassModel({"W1": [card]})
+    _use_model(monkeypatch, model)
+    groups = [{"source_kind": "history_import", "source_family": "history",
+               "chunk_texts": ["2025-06-01T20:30:00 The person: W1 signed up for the Chicago marathon\n"]}]
+    msgs = [{"role": "user", "content": "signed up for the Chicago marathon in October, first one ever"}]
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=groups, analysis_messages=msgs)
+    job = db.genesis_get_job(env.user_id, job_id)
+    assert job["status"] == "done", (job.get("error"), job.get("error_code"))
+    assert env.checkpoints[job_id]["garden_import"]["params"]["locale"] == expected
+    assert _live_cards(env.user_id) == ["Runs the Chicago marathon in October"]
+
+
+# --------------------------------------------------------------------------- #
+# 记忆台账（Seven b0ef0c24 的口径）：台账只包写库、每次一行、outcome 用这次的差值
+# --------------------------------------------------------------------------- #
+
+def _memory_ledger(user_id: str, job_id: str) -> list[tuple[str, str]]:
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT outcome, terminal_result FROM distillation_artifact_attempts "
+            "WHERE user_id = %s AND job_id = %s AND artifact = 'memory' "
+            "ORDER BY started_at, attempt_id", (user_id, job_id)).fetchall()
+    return [(r[0] if not isinstance(r, dict) else r["outcome"],
+             r[1] if not isinstance(r, dict) else r["terminal_result"]) for r in rows]
+
+
+def test_ledger_provider_failure_is_not_write_failed_and_retry_counts_only_its_own_cards(env, monkeypatch):
+    """之前：台账包住了模型调用 → provider 超时记成 write_failed；重试时 outcome 用整个 job 的
+    累计数 → 重试一张没写也记 written。台账行：
+
+        之前  [("write_failed","failed"), ("written","succeeded")]
+        之后  [("written","succeeded"),   ("not_provided","no_write")]
+    """
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    model = FakeModel({"〔窗A〕": [_card("周末常去西湖边骑车")], "〔窗B〕": []}, fail_on={"〔窗B〕"})
+    _use_model(monkeypatch, model)
+    groups = _history_groups("〔窗A〕", "〔窗B〕")
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=groups)
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "failed"
+    assert _memory_ledger(env.user_id, job_id) == [("written", "succeeded")]
+
+    db.genesis_set_job_status(env.user_id, job_id, status="processing")
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=groups)
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert _memory_ledger(env.user_id, job_id) == [
+        ("written", "succeeded"), ("not_provided", "no_write")]
+
+
+def test_ledger_model_failure_before_any_write_opens_no_row(env, monkeypatch):
+    """切换前模型挂了 apply 根本不跑、不开行；之前换引擎后记一行 write_failed。"""
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("周末常去西湖边骑车")]}, fail_on={"〔窗A〕"}))
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=_history_groups("〔窗A〕"))
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "failed"
+    assert _memory_ledger(env.user_id, job_id) == []
+
+
+def test_ledger_storage_failure_is_still_write_failed(env, monkeypatch):
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("周末常去西湖边骑车")]}))
+    monkeypatch.setattr(memory_actions, "_build_memory_envelope_for_store",
+                        lambda *_a, **_k: (None, "enclave_unavailable"))
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=_history_groups("〔窗A〕"))
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "failed"
+    assert _memory_ledger(env.user_id, job_id) == [("write_failed", "failed")]
+
+
+def test_ledger_empty_foreground_falling_back_to_full_path_records_one_row(env, monkeypatch):
+    """之前：前台 0 张先记一行 not_provided，转一次做完再记一行（多一行）。
+
+        之前  [("not_provided","no_write"), ("not_provided","no_write")]
+        之后  [("not_provided","no_write")]
+    """
+    monkeypatch.setattr(worker, "genesis_v2_enabled", lambda: True)
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="onboarding")
+    _use_model(monkeypatch, FakeModel({}))
+    monkeypatch.setattr(worker, "build_reducer_output_from_texts",
+                        lambda **kw: {"source_family": "history", "memories": []})
+    monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_a, **_k: "hi")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **_k: ({"agent_name": "", "dimensions": []}, []))
+    plaintext._run_plaintext_genesis_job(
+        env.store, "api_key", job_id, mode="onboarding", source_groups=_history_groups("〔窗1〕"),
+        analysis_messages=[{"role": "user", "content": "嗯", "source": "history_import"}])
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert _memory_ledger(env.user_id, job_id) == [("not_provided", "no_write")]

@@ -1511,3 +1511,30 @@ def test_runtime_for_user_raises_without_active_route(backend_env):
     with pytest.raises(worker.GenesisWorkerError) as exc:
         worker._runtime_for_user(uid, "sk-plain-key")
     assert str(exc.value) == "model_api_not_configured"
+
+
+def test_chunked_import_with_region_tagged_archive_language_writes_cards(monkeypatch):
+    """C1 之前：档案语言 ``zh-Hans-CN`` 原样进导入 → memgarden UnknownBucketLocaleError，
+    分块导入整单失败。之后：导入引擎入口归一成 ``zh-Hans``。"""
+    from hosted import history_import
+
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch, source_kind="user_profile", chunk_texts=["喜欢直接反馈。"])
+    writes = _patch_garden_writes(monkeypatch)
+    monkeypatch.setattr(history_import.registry, "_get_user_archive_language",
+                        lambda _uid: "zh-Hans-CN")
+    prompts: list[str] = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            prompts.append(prompt)
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["喜欢直接反馈"]), usage={},
+                                         cached=False, output_ref="x", stop_reason="stop")
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+    result = worker.tick(api_url="http://backend:5001", enclave_url="https://enclave:5003",
+                         mint_runtime_token=mint)
+    assert result["processed"] == 1
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["喜欢直接反馈"]
+    assert apply_payloads[0]["reducer_output"]["garden_import"]["cards_written"] == 1
