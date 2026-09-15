@@ -199,7 +199,7 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
-        if response.get("ranking") in (search_contract.VERSION, search_contract.LEGACY):
+        if response.get("ranking") in search_contract.ACCEPTED:
             detail["ranking"] = response["ranking"]
             detail["counts"]["unavailable"] = response.get("unavailable_count", 0)
         detail["query_fingerprint"] = query_fingerprint

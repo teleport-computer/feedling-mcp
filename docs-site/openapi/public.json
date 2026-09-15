@@ -11315,7 +11315,7 @@
           "query": {
             "type": "string",
             "maxLength": 500,
-            "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."
+            "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Very common words (stopwords) are ignored, and a card is returned only when it covers enough of the query (or has strong evidence such as a rare identifier); a query nothing matches returns no items, never filler. Blank/omitted: existing index browsing."
           },
           "limit": {
             "type": "integer",
@@ -11378,10 +11378,11 @@
           "ranking": {
             "type": "string",
             "enum": [
+              "memgarden-bm25-v1+tok:jieba-0.42.1",
               "bm25-jieba-0.42.1-v1",
               "substring-legacy"
             ],
-            "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."
+            "description": "Present for nonblank query. memgarden-bm25-v1+tok:jieba-0.42.1 is the current ranker (shared with automatic recall). bm25-jieba-0.42.1-v1 and substring-legacy explicitly mark older rankers answered during rolling upgrades."
           },
           "unavailable_count": {
             "type": "integer",

@@ -13,7 +13,9 @@ import memory_search_contract as search_contract
 from core import envelope as core_envelope
 from enclave import readside as enclave_readside
 from memory import service as memory_service
+from memory import card_shape
 from memory import recall_metadata
+from memgarden import related as mg_related
 from memgarden import timestamps as memory_timestamps
 
 
@@ -427,7 +429,17 @@ def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict
               if str(row.get("id") or "") in by_id]
     request = {**payload, "search_protocol": search_contract.VERSION}
     search_contract.check_request({**request, "moments": corpus})
-    response = post(api_key, corpus, operation="index", payload=request)
+    try:
+        response = post(api_key, corpus, operation="index", payload=request)
+    except RuntimeError as exc:
+        # Rolling restart: an enclave that predates the memgarden ranker rejects
+        # the new protocol with this exact 400. Ask once for the old protocol it
+        # does serve; every other failure (auth, timeout, 5xx) still propagates.
+        if not (str(exc).startswith("enclave_http_400:")
+                and "memory_search_protocol_unsupported" in str(exc)):
+            raise
+        request = {**payload, "search_protocol": search_contract.PREVIOUS}
+        response = post(api_key, corpus, operation="index", payload=request)
     # A successful previous-protocol response has this exact envelope. Missing
     # ranking on that known shape is rolling compatibility, not permission to
     # swallow HTTP/auth/timeouts or unknown/malformed future protocols.
@@ -436,7 +448,7 @@ def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict
             or not isinstance(response.get("unavailable_ids"), list)):
         raise RuntimeError("enclave_invalid_readside_response")
     ranking = response.get("ranking", search_contract.LEGACY)
-    if ranking not in (search_contract.VERSION, search_contract.LEGACY):
+    if ranking not in search_contract.ACCEPTED:
         raise RuntimeError("enclave_invalid_readside_response")
     items = []
     for item in response["items"]:
@@ -550,7 +562,11 @@ def memory_fetch_core(
             neighbor_items = _memory_index_partition(
                 api_key, neighbors[:bound], store.user_id, {"limit": bound},
                 post=post_enclave or post_enclave_readside)
-            related_items = recall_metadata.one_hop(source_items, neighbor_items, cap=7)
+            # memgarden reads canonical lifecycle/summary only; translate io's
+            # legacy archive markers and title-style summaries first.
+            related_items = mg_related.one_hop(
+                [card_shape.to_related_card(item) for item in source_items],
+                [card_shape.to_related_card(item) for item in neighbor_items], cap=7)
             complete_window = {m.get("id") for m in neighbors[:bound]} <= {i.get("id") for i in neighbor_items}
             related_status = "bounded" if (len(neighbors) > bound or len(related_items) > 6
                                              or not complete_window) else "ok"

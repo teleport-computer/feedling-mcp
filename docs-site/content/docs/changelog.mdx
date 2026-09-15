@@ -12,6 +12,27 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory search stops returning loosely related cards, and automatic recall uses
+  the same ranker.** `memory_search` / `memory-index --query` now rank with
+  memgarden's BM25 (`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"`, same jieba
+  0.42.1 tokenizer and formula as before) plus two gates: common function words
+  are ignored, and a card must cover enough of the query or carry strong evidence.
+  Before: asking for something never recorded ("我姐姐叫什么名字") returned every
+  card sharing 我/什么/名字. After: it returns no items. On the synthetic
+  retrieval evaluation (210 cards, 53 queries) recall@5 stays 0.896, MRR 0.806 →
+  0.849, precision@3 0.545 → 0.830, no-hit queries answered empty 1/5 → 4/5; three
+  paraphrase queries that previously ranked answers outside the top five now
+  return nothing. Automatic recall (`context_memories` for V1 resident and V2
+  chat/wake) switched from memgarden's legacy relevance scorer to the same ranker
+  with a looser gate for four-message chat windows: single queries recall@5
+  0.668 → 0.866 and empty-despite-an-answer 9 → 1; chat windows recall@5 0.962 →
+  1.000, MRR 0.515 → 0.923, cards per turn 6.25 → 7.94, and unrelated chit-chat
+  windows answered empty 1/3 → 0/3 (single no-hit queries 4/5 → 3/5); selection
+  is about 3–10× faster. `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0` on the enclave restores the
+  previous selector. `memory_fetch` related items now come from memgarden's
+  one-hop read with unchanged results. A backend and enclave on different
+  versions during a restart still agree on `bm25-jieba-0.42.1-v1`.
+
 - **Automatic Memory Dream runs no longer all start when the night window opens.**
   Each account now has a per-user offset inside the 02:00–05:00 window (in the
   user's timezone) that stays fixed within a night and rotates between nights,
