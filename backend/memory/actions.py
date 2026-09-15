@@ -1166,7 +1166,6 @@ def _execute_memory_action(
                 store, subsystem="memory", type="memory.content.rejected",
                 actor="backend", status="warning", summary="", explain="",
                 detail={"route": "memory_actions", "counts": {
-                    "actual_chars": exc.actual,
                     "max_chars": content_policy.MAX_CONTENT_CHARS,
                 }},
             )

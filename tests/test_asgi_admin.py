@@ -418,7 +418,6 @@ def test_memory_length_rejection_is_queryable_through_admin_data_track(
     assert event["detail"] == {
         "route": "memory_actions",
         "counts": {
-            "actual_chars": len(raw_content),
             "max_chars": 5000,
         },
         db.TRACE_OUTCOME_PROVENANCE_FIELD: "missing",
