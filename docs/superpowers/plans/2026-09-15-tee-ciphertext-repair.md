@@ -1,3 +1,8 @@
+---
+document_lifecycle: current
+canonical_owner: docs/superpowers/specs/2026-09-15-tee-ciphertext-repair-design.md
+---
+
 # TEE Ciphertext Repair Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
