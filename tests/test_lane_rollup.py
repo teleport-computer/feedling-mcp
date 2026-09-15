@@ -929,6 +929,62 @@ def test_resident_dream_agent_failures_keep_their_class_in_frozen_codes(
     assert secret not in repr(cell)
 
 
+def test_daily_report_fixture_matches_real_rollup_and_dream_job_projections(
+        clean_rollup):
+    """tools/memory_pipeline_daily_report.py is tested from a saved fixture.
+    Lock that fixture to what the producers really return, so a renamed or
+    dropped column fails here instead of silently zeroing the daily report."""
+    import json as _json
+    from pathlib import Path as _P
+
+    from admin import memory_metadata
+
+    sys.path.insert(0, str(_P(__file__).parent.parent))
+    from tools import memory_pipeline_daily_report as report_tool
+
+    fixture = _json.loads(
+        (_P(__file__).parent / "fixtures" / "memory_pipeline_daily_report"
+         / "sources_2026-09-14.json").read_text(encoding="utf-8"))
+
+    v2_uid, v1_uid = "usr_rollup_report_v2", "usr_rollup_report_v1"
+    seed_user(v2_uid)
+    fin = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    _insert_job(v2_uid, "capture", "failed", finished=fin,
+                last_error="extraction_failed:auth_invalid")
+    _insert_job(v2_uid, "capture", "expired", finished=fin)
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    _seed_resident(v1_uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _log_job(v1_uid, ts=t, status="completed", job_kind="memory_capture",
+             terminal_at=t)
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+
+    payload = db.admin_lane_rollup(lane="capture", since_day="2030-05-31",
+                                   until_day="2030-06-01")
+    fixture_payload = fixture["lane_rollup"]["capture"]
+    assert set(payload) == set(fixture_payload)
+    assert set(payload["stuck"]) == set(fixture_payload["stuck"])
+    real_rows = payload["rows"]
+    assert {r["route"] for r in real_rows} == {"model_api", "resident"}
+    fixture_keys = {frozenset(r) for r in fixture_payload["rows"]}
+    assert fixture_keys == {frozenset(r) for r in real_rows}
+    for route in ("model_api", "resident"):
+        assert set(payload["coverage"][route]) >= set(
+            fixture_payload["coverage"][route])
+
+    v2 = report_tool.aggregate_day(real_rows, lane="capture", route="model_api",
+                                   day="2030-06-01")
+    assert (v2.failed, v2.stuck_users) == (2, 1)
+    assert v2.causes["user_account"].codes == {"extraction_failed:auth_invalid": 1}
+    assert v2.causes["unknown"].codes == {"no_code": 1}
+    v1 = report_tool.aggregate_day(real_rows, lane="capture", route="resident",
+                                   day="2030-06-01")
+    assert (v1.completed, v1.failed) == (1, 0)
+
+    for job in fixture["dream_jobs"]["jobs"]:
+        assert set(job) == memory_metadata.DREAM_JOB_FIELDS
+
+
 def test_discarded_reason_operational_log_is_bounded(caplog):
     raw_reason = "Provider Error " + ("x" * 600) + "END_SENTINEL"
     assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)

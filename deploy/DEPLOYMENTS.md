@@ -448,6 +448,38 @@ procedure have been removed from this runbook. Git history preserves the
 incident record; it must not be copied into current manifests. Recover hosted
 incidents only through [`HOSTED_RUNTIME_V2_ROLLOUT.md`](HOSTED_RUNTIME_V2_ROLLOUT.md).
 
+## Scheduled read-only monitors
+
+### Memory pipeline daily Lark report (`memory-pipeline-daily.yml`)
+
+Once a day (01:30 UTC = 09:30 Beijing) GitHub Actions runs
+`tools/memory_pipeline_daily_report.py` against **prod** and posts one Chinese
+message to the deploy-notice Lark group: capture and dream, split by V1
+`resident` / V2 `model_api`, with active users, successes, failures, users with
+failures and zero successes, V2 skipped dreams, and failures grouped as 用户自己的账号/配置 /
+模型服务 / 我们这边 / 未知 (grouping reuses `notices.error_contract` blame and
+`memory.capture_failure`). The first line is `[需要关注]` when any threshold in
+the tool fires (stuck users ≥ 10, our-side failures ≥ 5 users, failure rate
+≥ 50% or +15 pp day over day on ≥ 20 attempts, active users halved, ≥ 20 live
+stuck jobs, or unfrozen/missing data).
+
+- **Runs outside the CVM on purpose**: the CVM never holds the webhook secret,
+  and a dead backend still yields a "没生成出来" message instead of silence.
+- **Reads only** `GET /v1/admin/lane-rollup` and `GET /v1/admin/memory-dream-jobs`
+  (both content-free). The message carries counts and sanitized failure codes
+  only — no user ids.
+- **Day** is the previous **Beijing** day, because lane-rollup cells are frozen
+  per Beijing day.
+- **Secrets / vars** (all pre-existing): `FEEDLING_ADMIN_TOKEN`,
+  `LARK_BOT_WEBHOOK`, `LARK_BOT_SECRET` (signed exactly like the ci.yml deploy
+  notices), optional `vars.PROD_MAIN_API_URL`.
+- **Verify locally without sending**: `python tools/memory_pipeline_daily_report.py --fixture tests/fixtures/memory_pipeline_daily_report/sources_2026-09-14.json --day 2026-09-14 --dry-run`;
+  or `workflow_dispatch` with `dry_run=true`.
+- **Known gaps**: capture escape-valve skips (`memory.capture.window_skipped`)
+  have no aggregate admin read yet, so they are not in the message; V1 skipped
+  dreams are not distinguishable from V1 failures in the rollup. The schedule
+  only fires from the default branch.
+
 ## Enclave configuration
 
 ### Screen frame VLM captioning
