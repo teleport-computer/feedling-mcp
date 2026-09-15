@@ -1,0 +1,301 @@
+"""Nightly Dream burst protection: per-user stagger + fleet admission ceiling.
+
+Prod 09-10 / 09-13: every user's Dream became due at the same second (window
+start) and the burst of whole-garden card reads coincided with enclave decrypt
+timeouts. These tests pin the two guards in the shared Dream gate, which both
+the resident V1 path (``/v1/capture/tick`` → legacy ``proactive_jobs``) and the
+Runtime V2 scheduler (``serve_worker._tick_dream_for_user`` → ``agent_jobs``)
+go through.
+"""
+import sys
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+import pytest
+
+import db  # noqa: E402
+from conftest import seed_user  # noqa: E402
+from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, serve_worker  # noqa: E402
+from proactive import capture_jobs  # noqa: E402
+from proactive import dream_scheduler  # noqa: E402
+
+# 2026-09-10 02:00:00 UTC — the window start of one of the incident nights.
+WINDOW_START = datetime(2026, 9, 10, 2, 0, 0, tzinfo=timezone.utc).timestamp()
+
+
+def _memory(user_id: str, memory_id: str) -> dict:
+    at = "2026-06-20T00:00:00Z"
+    return {
+        "v": 1,
+        "id": memory_id,
+        "type": "fact",
+        "owner_user_id": user_id,
+        "visibility": "shared",
+        "body_ct": f"ct_{memory_id}",
+        "nonce": f"nonce_{memory_id}",
+        "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}",
+        "occurred_at": at,
+        "created_at": at,
+        "updated_at": at,
+        "status": "active",
+        "importance": 0.6,
+        "pulse": 0.3,
+    }
+
+
+def _dream_jobs(store) -> list[dict]:
+    return [
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_kind") == "memory_dream"
+    ]
+
+
+@pytest.fixture()
+def dream_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_TIMEZONE", "UTC")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    for name in (
+        "FEEDLING_DREAM_NIGHT_ONLY",
+        "FEEDLING_DREAM_NIGHT_START_HOUR",
+        "FEEDLING_DREAM_NIGHT_END_HOUR",
+        "FEEDLING_DREAM_STAGGER",
+        "FEEDLING_DREAM_MAX_CONCURRENT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    core_store._stores.clear()
+    yield
+
+
+def _user_with_cards(user_id: str):
+    seed_user(user_id)
+    db.memory_replace_all(user_id, [_memory(user_id, f"mem_{user_id}_{i}") for i in range(3)])
+    store = core_store.UserStore(user_id)
+    # The product default zone is not UTC; pin it so WINDOW_START is 02:00 local.
+    store.save_proactive_settings({"timezone": "UTC"})
+    return store
+
+
+# ---------------------------------------------------------------------------
+# Stagger: pure, deterministic, well spread, margin kept
+# ---------------------------------------------------------------------------
+
+
+def test_stagger_offset_is_a_stable_function_of_the_user_id(monkeypatch, dream_env):
+    first = dream_scheduler.dream_stagger_offset_sec("usr_stable")
+    # The clock must not matter (not a per-tick draw)...
+    monkeypatch.setattr(dream_scheduler.time, "time", lambda: 9_999_999_999.0)
+    assert dream_scheduler.dream_stagger_offset_sec("usr_stable") == first
+    # ...and the value is pinned, so a restart / another process agrees.
+    assert first == 319
+    assert dream_scheduler.dream_stagger_offset_sec("usr_other") != first
+
+
+def test_stagger_spreads_users_over_the_window_and_keeps_the_retry_tail(dream_env):
+    # Default window 02:00-05:00: first attempts spread over the first 90 min,
+    # the last 90 min stay free for failure-backoff retries (10+20+40 min).
+    span = dream_scheduler.dream_stagger_span_sec()
+    assert span == 3 * 3600 - 5400
+
+    offsets = [dream_scheduler.dream_stagger_offset_sec(f"usr_{i:05d}") for i in range(3000)]
+    assert all(0 <= offset < span for offset in offsets)
+    buckets = Counter(offset * 6 // span for offset in offsets)  # six 15-min buckets
+    assert sorted(buckets) == list(range(6))
+    expected = len(offsets) / 6
+    assert all(abs(count - expected) < expected * 0.15 for count in buckets.values()), buckets
+
+
+def test_stagger_span_follows_custom_and_wrapping_windows(monkeypatch, dream_env):
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_START_HOUR", "2")
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_END_HOUR", "3")
+    assert dream_scheduler.dream_stagger_span_sec() == 1800  # margin capped at half
+
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_START_HOUR", "23")
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_END_HOUR", "2")
+    assert dream_scheduler.dream_stagger_span_sec() == 3 * 3600 - 5400
+
+    store = type("S", (), {"user_id": "usr_wrap", "load_proactive_settings": lambda self: {}})()
+    after_midnight = datetime(2026, 9, 10, 0, 30, 0, tzinfo=timezone.utc).timestamp()
+    assert dream_scheduler._seconds_into_night_window(store, now=after_midnight) == 5400
+
+
+# ---------------------------------------------------------------------------
+# Stagger gate on the real resident V1 path (Postgres, legacy proactive_jobs)
+# ---------------------------------------------------------------------------
+
+
+def test_user_whose_offset_has_not_arrived_is_not_enqueued(dream_env):
+    user_id = "usr_dream_stagger_gate"
+    store = _user_with_cards(user_id)
+    offset = dream_scheduler.dream_stagger_offset_sec(user_id)
+    assert offset > 120, "pick a user id whose offset leaves room before it"
+
+    early = dream_scheduler.tick_memory_dream(store, now=WINDOW_START + offset - 60)
+    assert early["enqueued"] is False
+    assert early["reason"] == "dream_stagger_not_due"
+    assert _dream_jobs(store) == []
+
+    due = dream_scheduler.tick_memory_dream(store, now=WINDOW_START + offset + 1)
+    assert due["enqueued"] is True, due["reason"]
+    assert len(_dream_jobs(store)) == 1
+
+
+def test_stagger_kill_switch_restores_window_start_behaviour(monkeypatch, dream_env):
+    monkeypatch.setenv("FEEDLING_DREAM_STAGGER", "0")
+    store = _user_with_cards("usr_dream_stagger_off")
+    out = dream_scheduler.tick_memory_dream(store, now=WINDOW_START)
+    assert out["enqueued"] is True, out["reason"]
+
+
+def test_force_bypasses_stagger(dream_env):
+    store = _user_with_cards("usr_dream_stagger_force")
+    assert dream_scheduler.dream_stagger_offset_sec("usr_dream_stagger_force") > 0
+    out = dream_scheduler.tick_memory_dream(store, now=WINDOW_START, force=True)
+    assert out["enqueued"] is True, out["reason"]
+
+
+def test_outside_the_window_the_reason_is_still_night_not_due(dream_env):
+    store = _user_with_cards("usr_dream_stagger_day")
+    out = dream_scheduler.tick_memory_dream(store, now=WINDOW_START + 12 * 3600)
+    assert out["reason"] == "night_not_due"
+
+
+# ---------------------------------------------------------------------------
+# Admission ceiling with real jobs in Postgres (V1 legacy rows + V2 agent_jobs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def no_v2_jobs():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+    yield
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
+
+
+def _active_count() -> int:
+    return dream_scheduler.active_dream_job_count()
+
+
+def test_active_count_sees_v1_and_v2_dreams_but_not_orphans_or_terminal(dream_env, no_v2_jobs):
+    baseline = _active_count()
+    now = time.time()
+
+    live_v1 = _user_with_cards("usr_dream_cap_live_v1")
+    capture_jobs.enqueue_memory_dream_job(live_v1, trigger="nightly_dream", dream_key="k1", now=now)
+    assert _active_count() == baseline + 1
+
+    orphan = _user_with_cards("usr_dream_cap_orphan_v1")
+    capture_jobs.enqueue_memory_dream_job(
+        orphan, trigger="nightly_dream", dream_key="k2",
+        now=now - dream_scheduler.DREAM_ADMISSION_LEGACY_HORIZON_SEC - 60,
+    )
+    assert _active_count() == baseline + 1, "an hour-old active V1 row is an orphan"
+
+    done = _user_with_cards("usr_dream_cap_done_v1")
+    job, _, _ = capture_jobs.enqueue_memory_dream_job(done, trigger="nightly_dream", dream_key="k3", now=now)
+    done.update_proactive_job(job["job_id"], {"status": "completed"})
+    assert _active_count() == baseline + 1
+
+    seed_user("usr_dream_cap_v2")
+    jobs_store.enqueue_job("usr_dream_cap_v2", "dream", reason="nightly_dream")
+    seed_user("usr_dream_cap_v2_capture")
+    jobs_store.enqueue_job("usr_dream_cap_v2_capture", "capture", reason="quiet_timeout")
+    assert _active_count() == baseline + 2
+    # V2 half uses the V2 store's own in-flight predicate (drift guard).
+    assert jobs_store.inflight_job_count(lanes={"dream"}) == 1
+
+
+def test_ceiling_blocks_v1_enqueue_until_a_slot_frees(monkeypatch, dream_env, no_v2_jobs):
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    baseline = _active_count()
+    now = time.time()
+    holders = []
+    for i in range(2):
+        holder = _user_with_cards(f"usr_dream_cap_holder_{i}")
+        job, enqueued, _ = capture_jobs.enqueue_memory_dream_job(
+            holder, trigger="nightly_dream", dream_key=f"hold{i}", now=now,
+        )
+        assert enqueued
+        holders.append((holder, job))
+    monkeypatch.setenv("FEEDLING_DREAM_MAX_CONCURRENT", str(baseline + 2))
+
+    waiting = _user_with_cards("usr_dream_cap_waiting")
+    capped = dream_scheduler.tick_memory_dream(waiting, now=now)
+    assert capped["enqueued"] is False
+    assert capped["reason"] == "dream_concurrency_cap"
+    assert _dream_jobs(waiting) == []
+    assert dream_scheduler.load_dream_state(waiting)["pending_dream_key"] == ""
+
+    holder, job = holders[0]
+    holder.update_proactive_job(job["job_id"], {"status": "failed"})
+    admitted = dream_scheduler.tick_memory_dream(waiting, now=now + 1)
+    assert admitted["enqueued"] is True, admitted["reason"]
+    assert len(_dream_jobs(waiting)) == 1
+
+
+def test_ceiling_zero_is_a_kill_switch_and_force_bypasses(monkeypatch, dream_env, no_v2_jobs):
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    seed_user("usr_dream_cap_ks_v2")
+    jobs_store.enqueue_job("usr_dream_cap_ks_v2", "dream", reason="nightly_dream")
+    monkeypatch.setenv("FEEDLING_DREAM_MAX_CONCURRENT", "1")
+
+    forced = _user_with_cards("usr_dream_cap_forced")
+    assert dream_scheduler.tick_memory_dream(forced, now=time.time())["reason"] == "dream_concurrency_cap"
+    assert dream_scheduler.tick_memory_dream(forced, now=time.time(), force=True)["enqueued"] is True
+
+    monkeypatch.setenv("FEEDLING_DREAM_MAX_CONCURRENT", "0")
+    unlimited = _user_with_cards("usr_dream_cap_unlimited")
+    assert dream_scheduler.tick_memory_dream(unlimited, now=time.time())["enqueued"] is True
+
+
+def test_ceiling_count_failure_admits(monkeypatch, dream_env):
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+
+    def _boom(**_kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(dream_scheduler.db, "memory_dream_active_job_count", _boom)
+    store = _user_with_cards("usr_dream_cap_count_fails")
+    assert dream_scheduler.tick_memory_dream(store, now=time.time())["enqueued"] is True
+
+
+def test_ceiling_blocks_the_v2_scheduler_producer(monkeypatch, dream_env, no_v2_jobs):
+    """Runtime V2: the serve_worker Dream producer goes through the same gate,
+    and V2 dream jobs already queued/running count toward the ceiling."""
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    serve_worker.wire_assembly()
+    for i in range(2):
+        seed_user(f"usr_dream_v2_busy_{i}")
+        jobs_store.enqueue_job(f"usr_dream_v2_busy_{i}", "dream", reason="nightly_dream")
+    baseline_v1 = _active_count() - 2
+    monkeypatch.setenv("FEEDLING_DREAM_MAX_CONCURRENT", str(baseline_v1 + 2))
+
+    user_id = "usr_dream_v2_waiting"
+    _user_with_cards(user_id)
+
+    def _v2_dream_rows():
+        with db.get_pool().connection() as conn:
+            return conn.execute(
+                "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='dream'", (user_id,),
+            ).fetchone()[0]
+
+    assert serve_worker._tick_dream_for_user(user_id) == 0
+    assert _v2_dream_rows() == 0
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET status='completed', finished_at=now() "
+            "WHERE user_id='usr_dream_v2_busy_0'"
+        )
+    assert serve_worker._tick_dream_for_user(user_id) == 1
+    assert _v2_dream_rows() == 1

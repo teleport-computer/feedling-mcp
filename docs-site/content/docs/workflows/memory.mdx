@@ -254,10 +254,23 @@ run as using degraded context, so it cannot be mistaken for a model choosing to
 make no changes from a complete input. Card ids, prompts, replies, summaries,
 raw errors, and other memory text are never part of this diagnostic shape.
 
+Automatic Dream runs are spread across the night window (02:00–05:00 in the
+user's timezone by default) instead of all becoming due when it opens. Each
+account has a fixed offset derived from its user id, within the first part of
+the window; the last 90 minutes (at most half the window) are kept free so a
+failed first attempt still has room for its retry backoff. Until the offset
+arrives, `POST /v1/dream/tick` answers `enqueued: false` with reason
+`dream_stagger_not_due`. Separately, no automatic Dream is enqueued while the
+deployment already has its concurrency ceiling of Dream jobs queued or running
+(resident V1 and Runtime V2 counted together, because both read cards through
+the same enclave); the tick answers `dream_concurrency_cap` and the next tick
+re-evaluates. Both are scheduling delays, not failures: they do not start
+backoff or advance the Dream ledger.
+
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their
-memories. It bypasses the automatic scheduler's night window, minimum interval,
-and new-material gates, but not Dream's deterministic exit gates and
+memories. It bypasses the automatic scheduler's night window, stagger offset,
+concurrency ceiling, minimum interval, and new-material gates, but not Dream's deterministic exit gates and
 soft-deletion safeguards.
 Repeated requests coalesce with an active Dream job. If the deployment-wide or
 user-level Dream switch is off, the tool returns an explainable disabled result.

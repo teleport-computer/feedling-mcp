@@ -6958,6 +6958,52 @@ def admin_data_track_proactive_kinds(*, since_epoch: float = 0.0, days: int = 30
         return {}
 
 
+def memory_dream_active_job_count(
+    *,
+    legacy_since_epoch: float,
+    legacy_active_statuses: list[str],
+    v2_active_statuses: list[str],
+) -> int:
+    """Fleet-wide count of Dream jobs that are queued or running, both runtimes.
+
+    Dream admission uses this as its concurrency ceiling (``dream_scheduler``).
+    Both runtimes read cards through the same enclave, so one ceiling covers:
+
+    - resident V1 (hosted runner and self-hosted consumers): ``memory_dream``
+      rows in the per-user ``proactive_jobs`` log whose status is still active.
+      Only rows created since ``legacy_since_epoch`` count — a consumer that went
+      away leaves its job ``pending``/``claimed`` forever (hosted claims are never
+      reclaimed), and such an orphan must not hold a slot night after night.
+      Served by ``ix_user_logs_proactive_jobs_ts`` (partial index on ts).
+    - Runtime V2: ``agent_jobs`` rows in the ``dream`` lane with an active
+      status — the same predicate as ``jobs_store.inflight_job_count``; stale V2
+      leases are already retired by the V2 reaper.
+
+    Status vocabularies are passed in by the caller so they cannot drift from
+    the job modules that own them. Raises on DB failure; the caller decides.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM user_logs
+                WHERE stream = 'proactive_jobs'
+                  AND ts >= %s
+                  AND (doc->>'job_kind' = 'memory_dream' OR doc->>'source' = 'memory_dream')
+                  AND lower(COALESCE(NULLIF(btrim(doc->>'status'), ''), 'pending')) = ANY(%s))
+              +
+              (SELECT count(*) FROM agent_jobs
+                WHERE lane = 'dream' AND status = ANY(%s))
+            """,
+            (
+                float(legacy_since_epoch),
+                list(legacy_active_statuses),
+                list(v2_active_statuses),
+            ),
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int = 7,
                                         tz: str = "Asia/Shanghai") -> dict[str, list[dict]]:
     """超速哨兵：每天心跳 job 数超过其 wake_interval 物理上限的用户。

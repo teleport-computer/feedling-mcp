@@ -12,6 +12,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Automatic Memory Dream runs no longer all start when the night window opens.**
+  Each account now has a fixed per-user offset inside the 02:00–05:00 window
+  (in the user's timezone), and a fleet-wide ceiling (default 4) limits how many
+  automatic Dream jobs may be queued or running at once, across resident V1 and
+  Runtime V2. Previously every eligible account became due at 02:00 and the
+  simultaneous whole-garden card reads coincided with enclave decrypt timeouts.
+  `POST /v1/dream/tick` can now answer `enqueued: false` with the reasons
+  `dream_stagger_not_due` or `dream_concurrency_cap`; both are scheduling
+  delays, not failures. User-requested organize (`force`) bypasses both. New
+  operator settings: `FEEDLING_DREAM_STAGGER` (default on) and
+  `FEEDLING_DREAM_MAX_CONCURRENT` (default `4`, `0` disables).
+
 - **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
   The block is the user-visible first-person aside shown under the reply, and the
   instruction now says so; it is no longer described as private inner thoughts.

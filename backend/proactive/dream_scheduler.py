@@ -6,6 +6,8 @@ agent, write chat, or consult proactive reach-out gates.
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -18,6 +20,8 @@ import memory_readside_core
 from memgarden import dreaming as mg_dreaming
 from memory import service as memory_service
 from proactive import capture_jobs
+
+log = logging.getLogger(__name__)
 
 DREAM_STATE_KIND = "dream_state"
 DREAM_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
@@ -72,6 +76,116 @@ def night_start_hour() -> int:
 
 def night_end_hour() -> int:
     return _env_int("FEEDLING_DREAM_NIGHT_END_HOUR", 5, lo=0, hi=23)
+
+
+# ---------------------------------------------------------------------------
+# Night-burst protection (prod 09-10 / 09-13): every user's Dream used to become
+# due at the same second (window start), and the burst of whole-garden card
+# reads coincided with fleet-wide enclave decrypt timeouts. Two independent
+# guards, both kill switches rather than feature gates:
+#
+# 1. Stagger — each user gets a stable offset into the night window, derived
+#    from the user id only (same value every tick, every process, every restart).
+# 2. Admission ceiling — no new Dream is enqueued while the fleet already has
+#    ``dream_max_concurrent()`` Dream jobs queued or running (V1 + V2 together,
+#    because both read cards through the same enclave).
+#
+# ``force`` (a user-requested organize) bypasses both, like every other gate.
+# ---------------------------------------------------------------------------
+
+#: The tail of the window kept free of first attempts, so a first run that
+#: fails still has room for the failure-backoff retries (600s base, doubling:
+#: 10 + 20 + 40 min = 70 min) plus a run, before the window closes. Never more
+#: than half the window, so short custom windows still stagger.
+DREAM_STAGGER_TAIL_MARGIN_SEC = 5400
+#: A V1 Dream job created longer ago than this no longer counts toward the
+#: admission ceiling. A resident Dream is at most a couple of 300s agent turns;
+#: an hour-old active row is an orphan (consumer gone), not load.
+DREAM_ADMISSION_LEGACY_HORIZON_SEC = 3600.0
+#: Default ceiling. The enclave serves decrypts from 4 GIL-bound worker
+#: processes (FEEDLING_ENCLAVE_WORKERS=4 in the prod compose), and a Dream's
+#: card read decrypts the whole garden in one burst; Runtime V2 likewise bounds
+#: one worker instance's enclave requests at 4. More than 4 simultaneous Dreams
+#: can therefore occupy every decrypt worker at once and starve foreground reads.
+DREAM_MAX_CONCURRENT_DEFAULT = 4
+_V2_ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
+
+
+def stagger_enabled() -> bool:
+    return _env_bool("FEEDLING_DREAM_STAGGER", True)
+
+
+def dream_max_concurrent() -> int:
+    """0 disables the admission ceiling (kill switch)."""
+    return _env_int("FEEDLING_DREAM_MAX_CONCURRENT", DREAM_MAX_CONCURRENT_DEFAULT, lo=0, hi=10000)
+
+
+def _night_window_len_sec() -> int:
+    start = night_start_hour()
+    end = night_end_hour()
+    if start == end:
+        return 0
+    return ((end - start) % 24) * 3600
+
+
+def dream_stagger_span_sec() -> int:
+    """Seconds from window start over which first attempts are spread."""
+    window = _night_window_len_sec()
+    return max(0, window - min(DREAM_STAGGER_TAIL_MARGIN_SEC, window // 2))
+
+
+def dream_stagger_offset_sec(user_id: str) -> int:
+    """Stable per-user offset into the night window, in ``[0, span)``.
+
+    A hash of the user id only — never the clock or a random draw — so the
+    answer is identical across ticks, processes and restarts, and a user keeps
+    the same nightly slot (the 23h min interval then holds naturally).
+    """
+    span = dream_stagger_span_sec()
+    if span <= 0:
+        return 0
+    digest = hashlib.sha256(f"feedling-dream-stagger:{user_id}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % span
+
+
+def _seconds_into_night_window(store, *, now: float) -> int:
+    """Local wall-clock seconds since tonight's window opened (caller has
+    already established that ``now`` is inside the window)."""
+    local_dt = datetime.fromtimestamp(now, timezone.utc).astimezone(_timezone_for_store(store))
+    since_midnight = local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+    return (since_midnight - night_start_hour() * 3600) % 86400
+
+
+def _stagger_not_due(store, *, now: float) -> bool:
+    if not stagger_enabled():
+        return False
+    offset = dream_stagger_offset_sec(str(store.user_id))
+    return _seconds_into_night_window(store, now=now) < offset
+
+
+def active_dream_job_count() -> int:
+    """Fleet Dream jobs queued or running (V1 + V2) that hold an admission slot.
+
+    The orphan horizon is measured on server time: the decision ``now`` of a
+    tick may come from a client and must not be able to hide load.
+    """
+    return db.memory_dream_active_job_count(
+        legacy_since_epoch=time.time() - DREAM_ADMISSION_LEGACY_HORIZON_SEC,
+        legacy_active_statuses=sorted(capture_jobs.CAPTURE_ACTIVE_STATUSES),
+        v2_active_statuses=list(_V2_ACTIVE_JOB_STATUSES),
+    )
+
+
+def _admission_ceiling_reached() -> bool:
+    cap = dream_max_concurrent()
+    if cap <= 0:
+        return False
+    try:
+        active = active_dream_job_count()
+    except Exception as exc:  # noqa: BLE001 — a failed count must not stop Dream
+        log.warning("dream admission count failed; admitting: %s", type(exc).__name__)
+        return False
+    return active >= cap
 
 
 def _now_iso(now: float | None = None) -> str:
@@ -314,6 +428,7 @@ def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
 _EXPECTED_SKIP_REASONS = frozenset({
     "dream_disabled", "no_memory_cards", "dream_already_pending",
     "night_not_due", "min_interval", "not_enough_new_cards", "already_dreamed",
+    "dream_stagger_not_due", "dream_concurrency_cap",
 })
 
 
@@ -339,6 +454,10 @@ def _tick_memory_dream(
         state = save_dream_state(store, state, now=now_ts)
     if not force and night_only() and not _within_night_window(store, now=now_ts):
         return {"enqueued": False, "reason": "night_not_due", "state": state, "job": None, "snapshot": snapshot}
+    # Stagger refines the night window (it has no meaning without one): inside the
+    # window, this user's first attempt waits for its stable per-user offset.
+    if not force and night_only() and _stagger_not_due(store, now=now_ts):
+        return {"enqueued": False, "reason": "dream_stagger_not_due", "state": state, "job": None, "snapshot": snapshot}
     # 失败退避（同 capture）：min_interval 只看上次成功，对永远失败的 dream
     # （坏 BYOK key）不生效，会退化成每 tick 重试。force 绕过。
     if not force and capture_jobs.in_failure_backoff(
@@ -397,6 +516,19 @@ def _tick_memory_dream(
         return {
             "enqueued": False,
             "reason": verdict.reason,
+            "state": state,
+            "job": None,
+            "snapshot": snapshot,
+            "new_cards": new_cards,
+            "new_turns": 0,
+        }
+
+    # Fleet admission ceiling — last, so only genuine enqueue candidates pay for
+    # the count, and a capped user simply re-evaluates on the next tick.
+    if not force and _admission_ceiling_reached():
+        return {
+            "enqueued": False,
+            "reason": "dream_concurrency_cap",
             "state": state,
             "job": None,
             "snapshot": snapshot,

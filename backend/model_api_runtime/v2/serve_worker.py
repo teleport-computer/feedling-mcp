@@ -3313,8 +3313,9 @@ def _tick_capture_for_user(user_id: str) -> int:
 def _tick_dream_for_user(user_id: str) -> int:
     """跑一遍 dream 触发闸（`dream_scheduler.tick_memory_dream`），注入把 job 塞进 agent_jobs
     的 submitter —— gate 的全部早退（dream_disabled/no_memory_cards/dream_already_pending/
-    night_not_due/failure_backoff/already_dreamed/min_interval/not_enough_new_cards）原样复用，
-    零漂移。enqueue 了返回 1，否则 0。"""
+    night_not_due/dream_stagger_not_due/failure_backoff/already_dreamed/min_interval/
+    not_enough_new_cards/dream_concurrency_cap）原样复用，零漂移——每用户夜间错峰偏移和
+    全舰队 Dream 准入上限（V1+V2 合计）都在那个共享闸里，这里不另做。enqueue 了返回 1，否则 0。"""
     store = core_store.get_store_per_load_mode(
         user_id, reason="dream scheduler state is DB/blob backed"
     )
