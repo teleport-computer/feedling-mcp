@@ -76,8 +76,17 @@ HOSTED_CELLS: list[HostedCell] = [
     # 本机直打 opus-5/deepseek/GLM 各 1 次 60s ReadTimeout、kimi-k3 1 次 45s 通过后
     # 下一次 429;test 后端 setup 对 opus-5、deepseek 各 1 次 ReadTimeout。kimi-k3
     # 作为 setup 候选尚未在 p0 里跑过。该格 setup 红时先看中转连通性再看产品。
+    # 2026-09-15(T596,Seven 拍板 A:gpt-5.5 → gemini → [AG4]claude):[AG4]claude-sonnet-4-6
+    # 通道后端按 Gemini 格式转发,对我们工具 schema 里漏出的本地标记 enforceItemBounds
+    # 返 400 → 运行时裁掉全部工具、记忆链不可用(T589 定界;根修在 T595 剥离标记)。
+    # 同一中转直打(reports/T589-run-20260915/T596-jiushi-schema-probe.txt):
+    # gemini-3-flash-preview / gpt-5.5 带全部 36 个工具 200,[AG4]claude 剥掉标记后 200。
+    # p0 实跑(同目录 p0_jiushi_*.log + T596-jiushi-gemini-trace-timeline.txt):
+    # gemini-3-flash-preview 2/2 round1 tool_calls 正常、round2 finish_reason=timeout
+    # → 兜底;gpt-5.5 1/1 harness 六步 ✅ 但 memory 步 WARN(300s 内 index 0 卡,
+    # 库 trace 无 capture 事件)。故候选顺序 gpt > gemini > [AG4]claude。
     HostedCell("jiushi-relay", "openai_compatible", "E2E_KEY_JIUSHI",
-               ["[AG4]claude-sonnet-4-6", "gemini-3-flash-preview"],
+               ["gpt-5.5", "gemini-3-flash-preview", "[AG4]claude-sonnet-4-6"],
                base_url_env="E2E_JIUSHI_BASE"),
     HostedCell("zhailian-relay", "openai_compatible", "E2E_KEY_ZHAILIAN",
                ["[0.01]限时/claude-opus-5", "[0.01]限时/kimi-k3"],
