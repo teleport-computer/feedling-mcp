@@ -63,7 +63,7 @@ historical_reason: point-in-time
 - 默认 `two_pass` 的依据（合成材料、同一模型、每种 3 次）：两种策略质量打平且都好于旧流水线（英文材料不再写成中文卡、再导入不复制花园）；多窗材料上 single_pass 每窗改写已写的卡，输出 token 反而多 51%。放弃：只换 fact_write 保留 fact_map（半拟合）、single_pass 默认。回滚闸 `FEEDLING_GARDEN_IMPORT_STRATEGY=single_pass`。
 - 兼容：checkpoint 带引擎标记；已有旧流水线进度的在途 job 在旧流水线上跑完。导入进度（含两段式候选）存进既有加密 genesis checkpoint，信封/AAD 未改。
 - 身份卡改为独立推导（`foreground_identity`），不再从写卡那一步顺带产出。VPS 的收口复查保留；floor note 随 fact_write 退役。未定问题见 `docs/HISTORY_IMPORT_GARDEN_SESSION.md`。
-- 需要 memgarden 0.20.1 之后的下一个发布（宿主驱动导入）。
+- 需要 memgarden 0.21.0（宿主驱动导入）。
 
 ## 2026-09-15 — 显式 off 用户的历史内容单用户明文化迁移
 
