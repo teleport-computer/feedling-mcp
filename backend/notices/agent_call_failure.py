@@ -229,6 +229,12 @@ _CHINESE_AUTH_IN_ERROR_FIELD = re.compile(
 
 
 _INSUFFICIENT_BALANCE = re.compile(r"insufficient[ _-]?balance", re.IGNORECASE)
+_STATUS_403 = re.compile(_status_position("403"), re.IGNORECASE)
+_TRUSTED_CN_BALANCE = re.compile(
+    r"(?:cli agent exited \d+|pi agent produced no reply|agent call failed)\s*:\s*"
+    r"(?:\d{3}\s*)?(?:余额不足|额度不足|余额已用尽|额度已用尽)",
+    re.IGNORECASE,
+)
 
 
 def _has_strong_evidence(code: str, text: str) -> bool:
@@ -252,7 +258,18 @@ def classify_failure_text(text: object) -> str:
     # is out of money, not a bad key. The shared chat registry (Seven's) is left
     # untouched; memory lanes recognise this shape here, with the same JSON-error /
     # status evidence every other class needs.
-    if _STRONG_EVIDENCE["quota_insufficient"].search(candidate) and _INSUFFICIENT_BALANCE.search(candidate):
+    # Not for 403: a 403 keeps the registry order, so memory lanes
+    # and chat agree (Seven's T497/T504 403 rule).
+    if (
+        _INSUFFICIENT_BALANCE.search(candidate)
+        and _STRONG_EVIDENCE["quota_insufficient"].search(candidate)
+        and not _STATUS_403.search(candidate)
+    ):
+        return "quota_insufficient"
+    # A Chinese balance message right after a trusted CLI/relay error prefix
+    # ("cli agent exited 1: 余额不足") is the provider's own error, not echoed prompt
+    # text; the registry already classifies it as quota for chat.
+    if _TRUSTED_CN_BALANCE.search(candidate):
         return "quota_insufficient"
     for spec in error_contract.matcher_specs():
         if spec.code not in AGENT_CALL_FAILURE_CLASSES:

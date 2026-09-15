@@ -232,3 +232,24 @@ def test_rollup_code_keeps_class_for_legacy_rows_and_still_logs_raw(caplog):
         f"Provider Error {SECRET}", source="lane_rollup_v1", user_id="usr_x",
         lane="heartbeat", day="2030-06-01",
     ) == "runtime_failed"
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    # 401 + Insufficient balance：记忆侧特例，算额度不足
+    ('RuntimeError: cli agent exited 1: Failed to authenticate. API Error: 401 {"error":"Insufficient balance"} (api_status=401)',
+     "quota_insufficient"),
+    # 403 + Insufficient balance：跟聊天侧一致（Seven 的 403 规则）
+    ("RuntimeError: HTTP 403 Insufficient balance", None),
+    # 可信错误前缀后的中文余额：额度不足
+    ("RuntimeError: cli agent exited 1: 余额不足", "quota_insufficient"),
+    ("RuntimeError: cli agent exited 1: 402 余额不足", "quota_insufficient"),
+    # 用户原话回显里的「余额不足」：仍是 unknown
+    ("RuntimeError: 用户说他余额不足，还说额度不够", "unknown"),
+])
+def test_balance_shapes_follow_chat_except_the_401_special_case(text, expected):
+    got = agent_call_failure.classify_failure_text(text)
+    if expected is None:
+        chat = error_contract.classify_text(text)
+        assert got == (chat.code if chat else "unknown")
+    else:
+        assert got == expected
