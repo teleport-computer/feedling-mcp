@@ -279,6 +279,7 @@ if not _provisioned:
         # memgarden 公开 API 收口（2026-09-15）：纯函数对拍 / 假解密 / AST 扫描，零 DB。
         "test_memory_related_read.py",
         "test_enclave_recall_unified.py",
+        "test_memgarden_public_api_only.py",
         "test_memory_result_budget.py",
         # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
         # 零 DB / 零网络 / 不调用 claude。**它最需要能跑的时刻正是本地无 PG 时**——
