@@ -2796,3 +2796,133 @@ def test_the_resident_anchor_has_an_index_to_stand_on():
         # CONCURRENTLY cannot run inside the migration's transaction.
         assert "autocommit_block()" in (_P(__file__).parent.parent
                                         / source).read_text()
+
+
+# --- 2026-09-15: memory-lane user-account failures leave the numerator ------ #
+#
+# hx-approved additions to the notices catalog's user-unavailable sets (pending
+# Seven's review). Real rows through both freezers and the event×path master
+# payload: a proven account problem is user_unavailable, a provider outage or a
+# legacy raw tail stays an operational failure.
+
+def test_v1_memory_lane_account_failures_freeze_as_user_unavailable(clean_rollup):
+    from proactive import proactive_core
+
+    uid = "usr_rollup_mem_v1_account"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+
+    def stored(raw: str) -> str:
+        # The value the status endpoint actually persists.
+        return proactive_core._job_status_patch(
+            {"status": "failed", "reason": raw}
+        )["status_reason"]
+
+    capture_auth = stored(
+        "capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to "
+        'authenticate. API Error: 401 {"error":"Insufficient balance"} (api_status=401)'
+    )
+    assert capture_auth == "capture_agent_call_failed:quota_insufficient"
+    capture_outage = stored(
+        "capture_agent_call_failed:RuntimeError: status 503 Service Unavailable"
+    )
+    assert capture_outage == "capture_agent_call_failed:upstream_unavailable"
+    dream_logged_out = stored(
+        "dream_agent_call_failed:RuntimeError: Not logged in · Please run /login"
+    )
+    migrate_model = stored(
+        "migrate_agent_call_failed:RuntimeError: Error code: 404 - model_not_found: gpt-9"
+    )
+    for job_kind, reason in (
+        ("memory_capture", capture_auth),
+        ("memory_capture", capture_outage),
+        ("memory_capture", None),
+        ("memory_dream", dream_logged_out),
+        # Written before status-endpoint normalization: raw tail, stays operational.
+        ("memory_dream", "dream_agent_call_failed:RuntimeError: HTTP 401 invalid api key"),
+        ("memory_migrate", migrate_model),
+    ):
+        _log_job(uid, ts=t, status="failed" if reason else "completed",
+                 job_kind=job_kind, terminal_at=t, status_reason=reason)
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    cells = {r["lane"]: r for r in _cells(user_id=uid)}
+    capture, dream, migrate = cells["capture"], cells["dream"], cells["migrate"]
+    assert (capture["failed"], capture["user_unavailable"],
+            capture["operational_failures"]) == (2, 1, 1)
+    assert (dream["failed"], dream["user_unavailable"],
+            dream["operational_failures"]) == (2, 1, 1)
+    assert (migrate["failed"], migrate["user_unavailable"],
+            migrate["operational_failures"]) == (1, 1, 0)
+    for cell in (capture, dream, migrate):
+        assert (cell["operational_failures"] + cell["control_outcomes"]
+                + cell["user_unavailable"]) == cell["failed"]
+
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-01")
+    master = data_track._event_path_master_payload(frozen)
+    runtime_24h = next(w for w in master["runtime_windows"] if w["key"] == "24h")
+    capture_cell = next(
+        row for row in runtime_24h["rows"] if row["key"] == "capture"
+    )["cells"]["runtime_v1"]
+    assert capture_cell["state"] == "metric", capture_cell
+    assert capture_cell["user_unavailable"] == 1
+    assert capture_cell["failure"] == 1
+    assert capture_cell["denominator"] == 2  # 1 completed + 1 operational
+
+
+def test_v2_memory_lane_account_failures_are_user_unavailable_after_freeze(
+        clean_rollup):
+    uid = "usr_rollup_mem_v2_account"
+    seed_user(uid)
+    fin = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _insert_job(uid, "capture", "completed", finished=fin)
+    _insert_job(uid, "capture", "failed", finished=fin,
+                last_error="provider_setup:model_api_not_configured")
+    _insert_job(uid, "capture", "failed", finished=fin,
+                last_error="extraction_failed:upstream_unavailable")
+    _insert_job(uid, "capture", "failed", finished=fin,
+                last_error="extraction_failed:database_pool_timeout")
+    _insert_job(uid, "dream", "failed", finished=fin,
+                last_error="extraction_failed:auth_invalid")
+    _insert_job(uid, "dream", "failed", finished=fin,
+                last_error="extraction_failed:model_not_found")
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-01")
+    master = data_track._event_path_master_payload(frozen)
+    runtime_24h = next(w for w in master["runtime_windows"] if w["key"] == "24h")
+    cells = {
+        row["key"]: row["cells"].get("runtime_v2")
+        for row in runtime_24h["rows"] if row["key"] in {"capture", "dream"}
+    }
+    assert cells["capture"]["state"] == "metric", cells["capture"]
+    assert cells["capture"]["user_unavailable"] == 1
+    assert cells["capture"]["failure"] == 2
+    assert cells["capture"]["denominator"] == 3
+    assert cells["dream"]["user_unavailable"] == 2
+    assert cells["dream"]["failure"] == 0
+
+
+def test_v2_runtime_health_excludes_memory_lane_account_failures():
+    from model_api_runtime.v2 import jobs_store
+
+    uid = "usr_health_mem_v2_account"
+    seed_user(uid)
+    lane = "capture"
+
+    def lane_row():
+        report = jobs_store.recent_runtime_health(within_hours=1)
+        return next((r for r in report["lanes"] if r["lane"] == lane),
+                    {"user_unavailable": 0, "operational_failures": 0})
+
+    before = lane_row()
+    now = datetime.now(timezone.utc)
+    _insert_job(uid, lane, "failed", finished=now,
+                last_error="provider_setup:model_api_key_envelope_missing")
+    _insert_job(uid, lane, "failed", finished=now,
+                last_error="extraction_failed:auth_invalid")
+    _insert_job(uid, lane, "failed", finished=now,
+                last_error="extraction_failed:rate_limited")
+    after = lane_row()
+    assert after["user_unavailable"] - before["user_unavailable"] == 2
+    assert after["operational_failures"] - before["operational_failures"] == 1

@@ -48,6 +48,66 @@ USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
     "turn_failed:image_generation_model_not_found",
 })
 
+# --------------------------------------------------------------------------- #
+# 2026-09-15 hx-approved memory-lane additions — PENDING SEVEN'S REVIEW
+# --------------------------------------------------------------------------- #
+# Product decision (hx, 2026-09-15): a memory-lane (capture/dream/migrate)
+# failure *proven* to be the user's own account or model configuration leaves
+# Feedling's operational failure numerator, exactly like Seven's chat-lane
+# entries above. "Proven" means the memory-lane classifier
+# (``notices.agent_call_failure``, strong-evidence gated; V2 extraction's
+# provider classification; V2 ``provider_setup`` resolver errors) produced one
+# of the account classes below.
+#
+# Additions only: Seven's two sets above are left exactly as approved and are
+# extended by union right after this block, so reverting this block restores
+# them byte-for-byte. Deliberately NOT here (they stay operational failures):
+# upstream_unavailable, rate_limited, timeouts, content_filtered,
+# context_overflow, provider_incompatible, provider_config, cli_config_invalid,
+# unknown, and every Feedling-side code (database_pool_timeout, lease_timeout,
+# watchdog codes, write failures).
+#
+# V1 keyspace: the backend stores ``<lane>_agent_call_failed:<class>``
+# (``proactive_core._job_status_patch`` via ``agent_call_failure.normalize_reason``).
+# Rows written before that normalization keep a raw tail and stay operational.
+MEMORY_LANE_USER_UNAVAILABLE_V1_REASONS = frozenset({
+    "capture_agent_call_failed:auth_invalid",
+    "capture_agent_call_failed:quota_insufficient",
+    "capture_agent_call_failed:model_not_found",
+    "capture_agent_call_failed:provider_account_expired",
+    "capture_agent_call_failed:resident_agent_cli_logged_out",
+    "dream_agent_call_failed:auth_invalid",
+    "dream_agent_call_failed:quota_insufficient",
+    "dream_agent_call_failed:model_not_found",
+    "dream_agent_call_failed:provider_account_expired",
+    "dream_agent_call_failed:resident_agent_cli_logged_out",
+    "migrate_agent_call_failed:auth_invalid",
+    "migrate_agent_call_failed:quota_insufficient",
+    "migrate_agent_call_failed:model_not_found",
+    "migrate_agent_call_failed:provider_account_expired",
+    "migrate_agent_call_failed:resident_agent_cli_logged_out",
+})
+# V2 keyspace (``agent_jobs.last_error``). ``extraction_failed:quota_insufficient``
+# is already in Seven's set. ``extraction_failed:provider_account_expired`` is
+# not added: V2 extraction never produces it (its provider classification maps
+# 401/403 to auth_invalid) and it is not a registered producer code.
+MEMORY_LANE_USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
+    "extraction_failed:auth_invalid",
+    "extraction_failed:model_not_found",
+    "provider_setup:model_api_not_configured",
+    "provider_setup:model_api_not_tested",
+    "provider_setup:model_api_key_envelope_missing",
+    "provider_setup:model_api_config_invalid",
+})
+USER_UNAVAILABLE_V1_REASONS = (
+    USER_UNAVAILABLE_V1_REASONS | MEMORY_LANE_USER_UNAVAILABLE_V1_REASONS
+)
+USER_UNAVAILABLE_V2_OUTCOME_CODES = (
+    USER_UNAVAILABLE_V2_OUTCOME_CODES
+    | MEMORY_LANE_USER_UNAVAILABLE_V2_OUTCOME_CODES
+)
+# ------------------------ end of 2026-09-15 additions ----------------------- #
+
 
 def v1_proactive_outcome_class(status: object, reason: object) -> str:
     """Classify the resident/V1 proactive status-reason keyspace.
