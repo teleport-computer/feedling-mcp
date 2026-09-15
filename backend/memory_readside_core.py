@@ -112,7 +112,14 @@ def memory_available(
         return False
     if status in _INACTIVE_STATUSES and status not in {"archived", "superseded"}:
         return False
-    if memory_service._memory_is_archived(moment) and not include_archived:
+    # Every io supersede writer (memory/actions.py, V2 commit_capture_batch)
+    # also stamps is_archived/archived_at/archive_reason="superseded_by:<id>" on
+    # the retired card. Those markers are part of the supersede, not a separate
+    # archive: once include_superseded admitted the card, the legacy archive
+    # check must not take it away again, or fetch(include_superseded) and the
+    # related read's explicit supersedes link never return any history.
+    if (memory_service._memory_is_archived(moment) and not include_archived
+            and status != "superseded"):
         return False
     return True
 

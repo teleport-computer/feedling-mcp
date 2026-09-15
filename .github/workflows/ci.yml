@@ -428,6 +428,7 @@ jobs:
             tests/test_extraction_output_truncation.py \
             tests/test_audit_dream_false_no_cards.py \
             tests/test_admin_dream_false_no_cards.py \
+            tests/test_memory_store_conformance.py \
             tests/test_dream_stagger_admission.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
@@ -1048,6 +1049,7 @@ jobs:
             tests/test_extraction_output_truncation.py \
             tests/test_audit_dream_false_no_cards.py \
             tests/test_admin_dream_false_no_cards.py \
+            tests/test_memory_store_conformance.py \
             tests/test_dream_stagger_admission.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
