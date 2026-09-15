@@ -28,6 +28,9 @@ import provider_client as pc  # noqa: E402
 from model_api_runtime.v2 import extraction  # noqa: E402
 
 _MESSAGES = [{"role": "user", "content": "consolidate these cards"}]
+# ``_no_backoff_sleep`` below replaces the global ``asyncio.sleep``; tests that
+# need real async blocking (a slow relay) keep the real one.
+_REAL_ASYNC_SLEEP = asyncio.sleep
 
 
 def _deepseek_reasoning_spent_budget(max_tokens: int) -> dict:
@@ -443,6 +446,179 @@ def test_slow_compatibility_fallback_wires_never_starve_the_heavy_pool_stall_clo
             turn_stall_timeout_sec=slot.stall_budget_sec,
             turn_absolute_timeout_sec=slot.absolute_budget_sec,
         ), (slot.slot_id, longest_silence)
+
+
+async def _trickle_server(trickle_sec: float, body: bytes):
+    """A real HTTP/1.1 server that keeps a response alive with keep-alive bytes.
+
+    It sends headers at once, then one leading space every 20ms for
+    ``trickle_sec`` (JSON allows leading whitespace), then ``body``. No gap is
+    anywhere near httpx's per-phase read timeout, so only a wall-clock
+    ceiling can end the wire before the body arrives.
+    """
+    gap = 0.02
+    spaces = max(1, int(trickle_sec / gap))
+    wires: list[float] = []
+
+    async def handle(reader, writer):
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1])
+            await reader.readexactly(length)
+            wires.append(asyncio.get_running_loop().time())
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {spaces + len(body)}\r\n\r\n".encode()
+            )
+            await writer.drain()
+            for _ in range(spaces):
+                writer.write(b" ")
+                await writer.drain()
+                await _REAL_ASYNC_SLEEP(gap)
+            writer.write(body)
+            await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return server, port, wires
+
+
+def test_trickling_wire_is_cut_at_the_wall_clock_deadline_before_the_heavy_stall_budget(
+    monkeypatch,
+):
+    """A trickling relay must not outlive one wire's budget (Codex r2 I1).
+
+    httpx's ``timeout=`` is per phase (read = gap between two bytes), so a relay
+    that drips keep-alive bytes can hold one extraction wire far past the Heavy
+    pool's 120s stall budget; the watchdog then kills a healthy slot and the job
+    is re-run (duplicate model spend). Scaled down: the phase timeout and the
+    wall-clock ceiling are 0.5s, the relay trickles for 1.5s.
+
+    Control: the real transport with only the phase timeout lets the trickle
+    run to completion (the premise). Then real ``extract``: every wire is cut
+    at the ceiling, classified exactly like a read timeout (transient → three
+    attempts → ``upstream_unavailable``), and the longest silence the watchdog
+    could observe stays under a stall budget that one uncut wire would blow.
+    """
+    from model_api_runtime.v2 import watchdog
+
+    deadline, trickle = 0.5, 1.5
+    monkeypatch.setattr(extraction, "_TIMEOUT_SEC", deadline)
+    monkeypatch.setattr(extraction, "WIRE_DEADLINE_SEC", deadline)
+    monkeypatch.setattr(pc, "_reliable_retry_delay_sec", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(pc, "_validate_egress_url", lambda _url: None, raising=False)
+    body = json.dumps(_valid_dream_reply()).encode()
+
+    async def scenario():
+        server, port, wires = await _trickle_server(trickle, body)
+        client = httpx.AsyncClient()
+        monkeypatch.setattr(pc, "_shared_async_client", client)
+        config = pc.ProviderConfig(
+            provider="openai_compatible", model="m", api_key="k",
+            base_url=f"http://127.0.0.1:{port}/v1",
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            started = loop.time()
+            control = await pc.reliable_chat_completion_async(
+                config, _MESSAGES, max_tokens=10, timeout=deadline, max_attempts=1,
+            )
+            control_elapsed = loop.time() - started
+            wires.clear()
+
+            progress: list[tuple[float, str]] = []
+            started = loop.time()
+            outcome = await extraction.extract(
+                provider_config=config, prompt="P", parse=_dream_parse,
+                parse_retry=_dream_parse_retry(), max_tokens=100,
+                progress_cb=lambda stage, _attempt: progress.append((loop.time(), stage)),
+            )
+            return control, control_elapsed, outcome, progress, started, loop.time(), list(wires)
+        finally:
+            await client.aclose()
+            server.close()
+            await server.wait_closed()
+
+    control, control_elapsed, outcome, progress, started, finished, wires = asyncio.run(scenario())
+
+    assert control["reply"] == '{"consolidations": []}'
+    assert control_elapsed >= trickle  # the per-phase timeout never fired
+
+    assert outcome == (None, "provider_call_failed:upstream_unavailable")
+    assert len(wires) == 3  # transient: retried like a read timeout
+    stages = [stage for _at, stage in progress]
+    assert stages.count("wire_start") == 3 and stages.count("attempt_failed") == 3
+    boundaries = [started, *(at for at, _stage in progress), finished]
+    longest_silence = max(b - a for a, b in zip(boundaries, boundaries[1:]))
+    assert longest_silence < deadline + 0.4 < trickle
+    stall_budget = deadline + 0.5  # below one uncut wire (trickle)
+    assert not watchdog.should_kill(
+        {
+            "alive": True,
+            "event_loop_heartbeat_age_sec": 0.0,
+            "last_slot_progress_age_sec": 0.0,
+            "active_turn_count": 1,
+            "current_turn_age_sec": finished - started,
+            "current_turn_stall_age_sec": longest_silence,
+        },
+        child_liveness_timeout_sec=45.0,
+        jobs_claimable=True,
+        turn_stall_timeout_sec=stall_budget,
+        turn_absolute_timeout_sec=60.0,
+    )
+
+
+def test_wire_deadline_expiry_is_classified_like_a_wrapped_read_timeout(monkeypatch):
+    """Same retry class, timeout recognition and extraction code as ReadTimeout."""
+
+    async def hang(_request: httpx.Request) -> httpx.Response:
+        await _REAL_ASYNC_SLEEP(5)
+        return httpx.Response(200, json=_valid_dream_reply())
+
+    def read_timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    monkeypatch.setattr(pc, "_reliable_retry_delay_sec", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(pc, "_validate_egress_url", lambda _url: None, raising=False)
+    config = _WIRES["deepseek"][0]
+
+    def failure(handler, **kwargs):
+        async def run():
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            monkeypatch.setattr(pc, "_shared_async_client", client)
+            try:
+                await pc.reliable_chat_completion_async(
+                    config, _MESSAGES, max_tokens=10, timeout=30.0, max_attempts=2, **kwargs,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Same task, after the call: the ceiling must not stick to the
+                # caller's context (a later provider call in this turn).
+                return exc, pc._WIRE_DEADLINE_SEC.get()
+            finally:
+                await client.aclose()
+            raise AssertionError("expected a provider failure")
+
+        return asyncio.run(run())
+
+    cut, leaked = failure(hang, wire_deadline_sec=0.05)
+    timed_out, _ = failure(read_timeout)
+    assert leaked is None
+    assert str(cut) == "provider network error: WireDeadlineExceeded"
+    for exc in (cut, timed_out):
+        assert isinstance(exc, pc.ProviderError) and exc.status_code is None
+        assert pc.classify_provider_error(exc) == "transient"
+        assert pc.is_timeout_error(exc) is True
+        assert exc.feedling_error_class == "transient_exhausted"
+        assert extraction._provider_failure_code(exc) == "upstream_unavailable"
+    with pytest.raises(ValueError):
+        asyncio.run(pc.reliable_chat_completion_async(config, _MESSAGES, wire_deadline_sec=0))
 
 
 # --------------------------------------------------------------------------- #

@@ -63,9 +63,11 @@ class RuntimePoolConfig:
             for index in range(wake_slots)
         )
         # Heavy's 120s stall is shorter than serve_worker's default clock (which
-        # must cover two 90s extraction wires). It holds for Capture/Dream only
-        # because the provider retry wrapper reports a boundary before every
-        # HTTP wire, so the longest silence is one wire; see
+        # must cover two 90s extraction wires). It holds for Capture/Dream/Profile
+        # only because the provider retry wrapper reports a boundary before every
+        # HTTP wire AND those lanes cap each wire's wall-clock
+        # (``extraction.WIRE_DEADLINE_SEC``; httpx's own timeout is per phase), so
+        # the longest silence is one bounded wire; see
         # tests/test_v2_pool_config.py::test_heavy_extraction_slots_outlast_one_provider_wire.
         for index in range(heavy_slots):
             lanes = _HEAVY_LANES | ({"profile"} if index == 0 else set())

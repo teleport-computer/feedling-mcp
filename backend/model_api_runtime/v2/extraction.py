@@ -83,6 +83,14 @@ def truncation_retry_max_output_tokens_for_lane(lane: str) -> int | None:
 
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
+# Wall-clock ceiling of ONE provider wire. ``_TIMEOUT_SEC`` is handed to httpx,
+# which applies it per phase (a read timeout is the gap between two bytes), so a
+# relay trickling keep-alive bytes could hold one wire past the Heavy pool's
+# 120s stall budget and get a healthy Capture/Dream slot killed and requeued
+# (duplicate model calls). The retry wrapper reports progress before every wire,
+# so the longest silence is this value; tests/test_v2_pool_config.py keeps it
+# 30s below every extraction slot's stall budget.
+WIRE_DEADLINE_SEC = 90.0
 
 class ParseRetry(NamedTuple):
     """「截断/解析/语义结果不合格 → 原样打回去重问一次」的注入点。
@@ -278,6 +286,7 @@ async def extract(
                 max_tokens=budget,
                 temperature=_TEMPERATURE,
                 timeout=_TIMEOUT_SEC,
+                wire_deadline_sec=WIRE_DEADLINE_SEC,
                 progress_cb=progress_cb,
                 # An empty reply that stopped at the token cap is this lane's
                 # truncation (handled below), not a transport blip to re-send

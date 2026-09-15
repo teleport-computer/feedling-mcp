@@ -37,7 +37,12 @@ change must not be interpreted as an API guarantee.
   retry (for example a model that rejects `temperature`). Each HTTP request
   inside a provider attempt now counts as progress for the worker's stall
   watchdog, so a slow but healthy request is not killed and re-run (which also
-  billed the provider twice). Stall budgets are unchanged.
+  billed the provider twice). Each of those HTTP requests also has a 90-second
+  wall-clock limit: the provider timeout used to bound only the gap between
+  received bytes, so a relay that kept a request alive by trickling bytes
+  could outlast the stall watchdog. A request cut at that limit is handled
+  like a provider timeout (retried, then `upstream_unavailable`). Stall
+  budgets are unchanged.
 
 - Hosted Runtime V2 Capture and Dream now treat a model reply that stops at the
   output-token limit without any visible text (typically a thinking model that

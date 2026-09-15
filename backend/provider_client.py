@@ -3508,6 +3508,35 @@ def _notify_wire_start(inner_attempt: int) -> None:
         pass
 
 
+# Set only by ``reliable_chat_completion_async(wire_deadline_sec=...)``: a true
+# wall-clock ceiling for ONE HTTP wire (connect + send + the whole buffered
+# response). httpx's ``timeout=`` bounds each phase separately (read = the gap
+# between two received bytes), so a relay that trickles keep-alive bytes can
+# hold one wire far past it. A hosted watchdog whose stall budget is only a
+# little longer than one wire needs this ceiling to be real. Task-local, like
+# ``_WIRE_START_CB``; unset for every other caller (behaviour unchanged).
+_WIRE_DEADLINE_SEC: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "feedling_provider_wire_deadline_sec", default=None
+)
+
+
+async def _post_within_wire_deadline(post: Any, request_payload: dict[str, Any]) -> Any:
+    deadline = _WIRE_DEADLINE_SEC.get()
+    if deadline is None:
+        return await post(request_payload)
+    try:
+        # ``wait_for`` cancels and joins the in-flight request on expiry, so no
+        # paid socket survives as a detached zombie (same as absolute_deadline).
+        return await asyncio.wait_for(post(request_payload), timeout=deadline)
+    except asyncio.TimeoutError as exc:
+        # Same shape as an httpx read timeout wrapped by the wire adapters
+        # (``ProviderError("provider network error: <Name>")``, no status):
+        # ``classify_provider_error`` → transient, ``is_timeout_error`` → True.
+        raise ProviderError(
+            "provider network error: WireDeadlineExceeded"
+        ) from exc
+
+
 async def _traced_async_json_post(
     *,
     trace: list[dict[str, Any]] | None,
@@ -3526,7 +3555,7 @@ async def _traced_async_json_post(
     """
     _notify_wire_start(inner_attempt)
     if trace is None:
-        return await post(request_payload), None
+        return await _post_within_wire_deadline(post, request_payload), None
 
     started_ns = time.monotonic_ns()
     entry: dict[str, Any] = {
@@ -3545,7 +3574,7 @@ async def _traced_async_json_post(
         },
     }
     try:
-        response = await post(request_payload)
+        response = await _post_within_wire_deadline(post, request_payload)
     except Exception as exc:  # noqa: BLE001 -- retain evidence, preserve exception
         status = getattr(exc, "status_code", None)
         entry["status"] = int(status) if isinstance(status, int) else None
@@ -5994,6 +6023,7 @@ async def reliable_chat_completion_async(
     progress_cb: Any = None,
     absolute_deadline: float | None = None,
     retry_output_truncation: bool = True,
+    wire_deadline_sec: float | None = None,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
@@ -6011,7 +6041,17 @@ async def reliable_chat_completion_async(
     of being retried as a transient shape error. Re-sending the same prompt at
     the same budget to a thinking model reliably burns the budget again. The
     default keeps every other caller's retry, classification and labels.
+
+    ``wire_deadline_sec`` caps the wall-clock of every single HTTP wire
+    (compatibility fallbacks included), unlike ``timeout`` which httpx applies
+    per phase. Expiry raises the same no-status ``ProviderError`` a wrapped
+    read timeout does, so retry and classification are unchanged. For callers
+    whose hosted watchdog stall budget must outlast one wire (Heavy pool).
     """
+    if wire_deadline_sec is not None:
+        wire_deadline_sec = float(wire_deadline_sec)
+        if not math.isfinite(wire_deadline_sec) or wire_deadline_sec <= 0:
+            raise ValueError("wire_deadline_sec must be finite and positive")
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
     config = args[0] if args and isinstance(args[0], ProviderConfig) else None
@@ -6045,14 +6085,26 @@ async def reliable_chat_completion_async(
         # Every HTTP wire inside one attempt (compatibility fallbacks included)
         # is a real progress boundary; report it through the same callback.
         # Set and reset inside the awaiting task, so ``wait_for``'s child task
-        # and concurrent turns never see a stale callback.
-        if progress_cb is None:
+        # and concurrent turns never see a stale callback or wire deadline.
+        if progress_cb is None and wire_deadline_sec is None:
             return await awaitable
-        token = _WIRE_START_CB.set(lambda _inner: _progress("wire_start", attempt))
+        cb_token = (
+            _WIRE_START_CB.set(lambda _inner: _progress("wire_start", attempt))
+            if progress_cb is not None
+            else None
+        )
+        deadline_token = (
+            _WIRE_DEADLINE_SEC.set(wire_deadline_sec)
+            if wire_deadline_sec is not None
+            else None
+        )
         try:
             return await awaitable
         finally:
-            _WIRE_START_CB.reset(token)
+            if deadline_token is not None:
+                _WIRE_DEADLINE_SEC.reset(deadline_token)
+            if cb_token is not None:
+                _WIRE_START_CB.reset(cb_token)
 
     for attempt in range(1, attempts + 1):
         started_ns = time.monotonic_ns()
