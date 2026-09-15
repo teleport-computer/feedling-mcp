@@ -353,17 +353,27 @@ def _supports_mandatory_self_thinking(provider_config: Any) -> bool:
     return model.rsplit("/", 1)[-1] != "claude-fable-5"
 
 
+# Provider → protocol tag lives in agent_protocol_core.self_thinking (shared
+# with the resident V1 consumer and the V2 tool loop) so all three cannot drift.
+_ASIDE_TAG_PROVIDERS = self_thinking.ASIDE_TAG_PROVIDERS
+
+
+def self_thinking_tag(provider_config: Any = None) -> str:
+    """Protocol tag for the self-authored aside block of one V2 provider config."""
+    return self_thinking.tag_for_provider(getattr(provider_config, "provider", ""))
+
+
 def chat_system_prompt(provider_config: Any = None) -> str:
     """Return the topic-grouped foreground policy for the selected V2 model.
 
-    The shared self-thinking instruction remains byte-identical and atomic. It
-    sits beside the reply rules it governs rather than after unrelated memory,
-    screen, file, reminder, and identity policies.
+    The shared self-thinking instruction remains atomic (one rendering, chosen
+    by ``self_thinking_tag``). It sits beside the reply rules it governs rather
+    than after unrelated memory, screen, file, reminder, and identity policies.
     """
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return _join_policy_blocks(
             _CHAT_REPLY_POLICY,
-            self_thinking.INSTRUCTION,
+            self_thinking.instruction(self_thinking_tag(provider_config)),
             _CHAT_POLICY_AFTER_THINKING,
         )
     return CHAT_SYSTEM_PROMPT

@@ -12743,7 +12743,8 @@ def _wake_self_thinking_allowed() -> bool:
 
 
 def _self_thinking_tag() -> str:
-    """协议标签按 driver 选:Claude Code 用 ``aside``,pi / codex 保持 ``think``。
+    """协议标签按 driver / provider 选:Claude Code 用 ``aside``,gemini(任何 driver)
+    用 ``aside``(T591),其余 pi / codex 保持 ``think``。
 
     T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
     用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
@@ -12758,7 +12759,13 @@ def _self_thinking_tag() -> str:
     # http mode AGENT_CLI_CMD is dead configuration and must not change copy.
     if AGENT_MODE == "cli" and _is_claude_code_cmd(_cli_cmd_tokens()):
         return _self_thinking_v1.TAG_ASIDE
-    return _self_thinking_v1.TAG_THINK
+    # T591 (2026-09-15): gemini gets ``aside`` on any driver — measured on
+    # gemini-3.6-flash via the pi wire with a tag-only swap in one captured
+    # request body: 6/10 replays came back HTTP 503 with ``<think>``, 0/10 with
+    # ``<aside>`` in the same window (replay only; no delivery path exercised).
+    # The provider set is shared with Runtime V2 (self_thinking.ASIDE_TAG_PROVIDERS);
+    # every other provider and driver keeps ``think`` byte for byte.
+    return _self_thinking_v1.tag_for_provider(AGENT_RUNTIME_METADATA.get("provider"))
 
 
 def _foreground_self_thinking_instruction() -> str:
