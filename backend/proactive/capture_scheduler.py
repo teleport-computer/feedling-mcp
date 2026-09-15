@@ -505,6 +505,21 @@ def capture_key_for_window(window: Mapping[str, Any]) -> str:
     return "capture:" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
+def v2_deferred_submission(disposition: str) -> dict[str, Any] | None:
+    """V2 落卡入队这一轮**没有**任务时，submit 回调该返回什么（Codex 第 13 轮 M1）。
+
+    ``disposition`` 取 ``jobs_store.CaptureEnqueueResult.disposition``。旧任务租约过期被终结
+    （``expired_deferred``），或刚记下的失败让本轮落在退避里（``backoff_deferred``）：
+    都不是「合并进了一个排队中的任务」，不能回一个假的 pending 任务 —— 下面
+    ``_enqueue_window`` 会拿它标 pending，接口也会报成 v2_coalesced。有任务时返回 None。
+    """
+    if disposition == "expired_deferred":
+        return {"enqueued": False, "reason": "v2_expired_deferred", "job": None}
+    if disposition == "backoff_deferred":
+        return {"enqueued": False, "reason": "failure_backoff", "job": None}
+    return None
+
+
 def _enqueue_window(
     store,
     *,

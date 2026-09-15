@@ -240,7 +240,8 @@ change must not be interpreted as an API guarantee.
   hangs the runtime worker and is recovered by the platform now also counts as a
   failure (backoff and notice apply), but never causes a batch to be skipped;
   its notice attributes the problem to the service rather than the account, and
-  it interrupts the count of consecutive unreadable outputs.
+  it interrupts the count of consecutive unreadable outputs. Turning capture
+  off clears the "capture blocked, retrying" notice.
   Previously a single bad batch could block all future memories for that account.
 
 - V1 resident proactive wakes now include relevant memory summaries selected

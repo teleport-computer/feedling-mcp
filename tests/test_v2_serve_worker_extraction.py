@@ -198,8 +198,9 @@ def test_capture_submit_enqueues_a_capture_agent_job(monkeypatch):
     from model_api_runtime.v2 import jobs_store
     serve_worker.wire_assembly()
     calls = []
-    monkeypatch.setattr(jobs_store, "enqueue_job",
-                        lambda u, lane, **kw: calls.append((u, lane)) or ("j1", False))
+    monkeypatch.setattr(jobs_store, "enqueue_capture",
+                        lambda u, **kw: calls.append((u, "capture")) or
+                        jobs_store.CaptureEnqueueResult(1, "created"))
     monkeypatch.setattr("proactive.capture_scheduler.tick_quiet_capture",
                         lambda store, *, now=None, submit=None:
                             submit(
