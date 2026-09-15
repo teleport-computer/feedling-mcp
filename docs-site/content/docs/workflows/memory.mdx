@@ -256,16 +256,22 @@ raw errors, and other memory text are never part of this diagnostic shape.
 
 Automatic Dream runs are spread across the night window (02:00–05:00 in the
 user's timezone by default) instead of all becoming due when it opens. Each
-account has a fixed offset derived from its user id, within the first part of
-the window; the last 90 minutes (at most half the window) are kept free so a
-failed first attempt still has room for its retry backoff. Until the offset
-arrives, `POST /v1/dream/tick` answers `enqueued: false` with reason
+account gets an offset derived from its user id and the night's local date,
+within the first part of the window: it is the same for every tick of one night
+and changes from night to night, so when the ceiling below is saturated the
+accounts left waiting in late slots rotate rather than being the same ones every
+night. The last 90 minutes (at most half the window) are kept free so a failed
+first attempt still has room for its retry backoff. Until the offset arrives,
+`POST /v1/dream/tick` answers `enqueued: false` with reason
 `dream_stagger_not_due`. Separately, no automatic Dream is enqueued while the
-deployment already has its concurrency ceiling of Dream jobs queued or running
-(resident V1 and Runtime V2 counted together, because both read cards through
-the same enclave); the tick answers `dream_concurrency_cap` and the next tick
-re-evaluates. Both are scheduling delays, not failures: they do not start
-backoff or advance the Dream ledger.
+deployment already has its concurrency ceiling of Dream jobs holding enclave
+work (resident V1 jobs queued or running, Runtime V2 jobs claimed or running,
+counted together because both read cards through the same enclave; a V2 job
+still waiting in the queue does not hold a slot); the tick answers
+`dream_concurrency_cap` and the next tick re-evaluates. Both are scheduling
+delays, not failures: they do not start backoff or advance the Dream ledger. An
+account that is still capped when the window closes records a content-free
+`memory.dream.window_missed` diagnostic event.
 
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their

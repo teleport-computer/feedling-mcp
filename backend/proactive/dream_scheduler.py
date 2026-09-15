@@ -10,7 +10,7 @@ import hashlib
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -84,11 +84,13 @@ def night_end_hour() -> int:
 # reads coincided with fleet-wide enclave decrypt timeouts. Two independent
 # guards, both kill switches rather than feature gates:
 #
-# 1. Stagger — each user gets a stable offset into the night window, derived
-#    from the user id only (same value every tick, every process, every restart).
+# 1. Stagger — each user gets an offset into the night window, derived from the
+#    user id and tonight's local date (same value every tick, process and restart
+#    within one night; a different slot next night, so under saturation the users
+#    stuck in late slots rotate instead of the same ones losing every night).
 # 2. Admission ceiling — no new Dream is enqueued while the fleet already has
-#    ``dream_max_concurrent()`` Dream jobs queued or running (V1 + V2 together,
-#    because both read cards through the same enclave).
+#    ``dream_max_concurrent()`` Dream jobs holding enclave work (V1 queued or
+#    running + V2 claimed or running; see ``active_dream_job_count``).
 #
 # ``force`` (a user-requested organize) bypasses both, like every other gate.
 # ---------------------------------------------------------------------------
@@ -108,7 +110,11 @@ DREAM_ADMISSION_LEGACY_HORIZON_SEC = 3600.0
 #: one worker instance's enclave requests at 4. More than 4 simultaneous Dreams
 #: can therefore occupy every decrypt worker at once and starve foreground reads.
 DREAM_MAX_CONCURRENT_DEFAULT = 4
-_V2_ACTIVE_JOB_STATUSES = ("pending", "claimed", "running")
+#: V2 Dream jobs hold a slot only once a worker has them. A ``pending`` V2 Dream
+#: has no queue deadline, so a stalled or drained V2 queue would otherwise keep
+#: pending rows forever and block Dream fleet-wide (V1 included); a pending row
+#: reads nothing from the enclave.
+_V2_ADMISSION_JOB_STATUSES = ("claimed", "running")
 
 
 def stagger_enabled() -> bool:
@@ -134,17 +140,19 @@ def dream_stagger_span_sec() -> int:
     return max(0, window - min(DREAM_STAGGER_TAIL_MARGIN_SEC, window // 2))
 
 
-def dream_stagger_offset_sec(user_id: str) -> int:
-    """Stable per-user offset into the night window, in ``[0, span)``.
+def dream_stagger_offset_sec(user_id: str, night: str = "") -> int:
+    """Per-user offset into the night window, in ``[0, span)``.
 
-    A hash of the user id only — never the clock or a random draw — so the
-    answer is identical across ticks, processes and restarts, and a user keeps
-    the same nightly slot (the 23h min interval then holds naturally).
+    A hash of the user id and the night's local date (``night``, ``YYYY-MM-DD``
+    of the evening the window opened) — never the clock within a night or a
+    random draw — so every tick, process and restart agrees on tonight's slot,
+    while the slot rotates from night to night. A fixed per-user slot would let
+    the same late-slot users lose to the admission ceiling every night.
     """
     span = dream_stagger_span_sec()
     if span <= 0:
         return 0
-    digest = hashlib.sha256(f"feedling-dream-stagger:{user_id}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"feedling-dream-stagger:{user_id}:{night}".encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") % span
 
 
@@ -156,23 +164,40 @@ def _seconds_into_night_window(store, *, now: float) -> int:
     return (since_midnight - night_start_hour() * 3600) % 86400
 
 
+def _night_key(store, *, now: float) -> str:
+    """Local date on which tonight's window opened (``now`` inside the window).
+
+    A 23:00–02:00 window keeps one key across midnight.
+    """
+    local_dt = datetime.fromtimestamp(now, timezone.utc).astimezone(_timezone_for_store(store))
+    opened = local_dt - timedelta(seconds=_seconds_into_night_window(store, now=now))
+    return opened.date().isoformat()
+
+
 def _stagger_not_due(store, *, now: float) -> bool:
     if not stagger_enabled():
         return False
-    offset = dream_stagger_offset_sec(str(store.user_id))
+    offset = dream_stagger_offset_sec(str(store.user_id), _night_key(store, now=now))
     return _seconds_into_night_window(store, now=now) < offset
 
 
 def active_dream_job_count() -> int:
-    """Fleet Dream jobs queued or running (V1 + V2) that hold an admission slot.
+    """Fleet Dream jobs that hold an admission slot.
 
-    The orphan horizon is measured on server time: the decision ``now`` of a
-    tick may come from a client and must not be able to hide load.
+    - V1: active ``memory_dream`` rows created within the orphan horizon. A V1
+      job is only ever claimed by a live consumer shortly after it is queued, so
+      pending and claimed both count; the horizon retires orphans.
+    - V2: ``claimed``/``running`` dream-lane jobs only — see
+      ``_V2_ADMISSION_JOB_STATUSES``.
+
+    The orphan horizon is measured on server time, and scheduler-enqueued V1
+    rows carry server time too (``_tick_memory_dream``): the decision ``now`` of
+    a tick may come from a client and must not be able to hide or pin load.
     """
     return db.memory_dream_active_job_count(
         legacy_since_epoch=time.time() - DREAM_ADMISSION_LEGACY_HORIZON_SEC,
         legacy_active_statuses=sorted(capture_jobs.CAPTURE_ACTIVE_STATUSES),
-        v2_active_statuses=list(_V2_ACTIVE_JOB_STATUSES),
+        v2_active_statuses=list(_V2_ADMISSION_JOB_STATUSES),
     )
 
 
@@ -360,11 +385,39 @@ def tick_memory_dream(
     outcome = _tick_memory_dream(store, now=now_ts, force=force, submit=submit)
     trace_now = _trace_now()
     try:
+        _emit_window_missed_at_cap(store, outcome)
+    except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
+        pass
+    try:
         _emit_dream_trace(store, outcome, duration_ms=(time.monotonic() - started) * 1000.0,
                           forced=bool(force), now=trace_now)
     except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
         pass
     return outcome
+
+
+def _emit_window_missed_at_cap(store, outcome: Mapping[str, Any]) -> None:
+    """A due user was still held by the admission ceiling when the window closed.
+
+    The trace cursor always holds the previous tick's reason (a reason change is
+    always traced), so ``dream_concurrency_cap`` → ``night_not_due`` means the
+    user was due and capped until the window ended. Fires once per such
+    transition; content-free (reason codes only).
+    """
+    if str(outcome.get("reason") or "") != "night_not_due":
+        return
+    state = _state_doc(outcome.get("state"))
+    if state.get("last_dream_trace_reason") != "dream_concurrency_cap":
+        return
+    log.warning("dream window closed while user was still capped: user=%s", store.user_id)
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.dream.window_missed", actor="backend",
+        status="warning",
+        summary="夜间窗口结束时仍被做梦并发上限挡住，今晚未做梦",
+        explain="上一次判定是 dream_concurrency_cap、这一次窗口已关。只记理由码，不含卡片内容。",
+        detail={"reason": "dream_concurrency_cap_at_window_end",
+                "max_concurrent": dream_max_concurrent()},
+    )
 
 
 def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
@@ -579,7 +632,9 @@ def _tick_memory_dream(
                 "last_until": snapshot.get("last_until") or "",
             },
             dream_stats=stats,
-            now=now_ts,
+            # Server time, not the (possibly client-supplied) decision ``now``:
+            # the row's ts is what the admission ceiling's orphan horizon reads.
+            now=_trace_now(),
         )
     # Only arm pending for a genuinely in-flight job (mirror capture fix): arming on
     # a terminal duplicate is what caused the permanent dream_already_pending lock.

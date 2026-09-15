@@ -13,10 +13,12 @@ change must not be interpreted as an API guarantee.
 ## Unreleased
 
 - **Automatic Memory Dream runs no longer all start when the night window opens.**
-  Each account now has a fixed per-user offset inside the 02:00–05:00 window
-  (in the user's timezone), and a fleet-wide ceiling (default 4) limits how many
-  automatic Dream jobs may be queued or running at once, across resident V1 and
-  Runtime V2. Previously every eligible account became due at 02:00 and the
+  Each account now has a per-user offset inside the 02:00–05:00 window (in the
+  user's timezone) that stays fixed within a night and rotates between nights,
+  and a fleet-wide ceiling (default 4) limits how many automatic Dream jobs may
+  hold enclave work at once (resident V1 queued or running, Runtime V2 claimed
+  or running). An account still capped when the window closes records a
+  `memory.dream.window_missed` diagnostic event. Previously every eligible account became due at 02:00 and the
   simultaneous whole-garden card reads coincided with enclave decrypt timeouts.
   `POST /v1/dream/tick` can now answer `enqueued: false` with the reasons
   `dream_stagger_not_due` or `dream_concurrency_cap`; both are scheduling

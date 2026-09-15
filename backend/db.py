@@ -7018,9 +7018,10 @@ def memory_dream_active_job_count(
       away leaves its job ``pending``/``claimed`` forever (hosted claims are never
       reclaimed), and such an orphan must not hold a slot night after night.
       Served by ``ix_user_logs_proactive_jobs_ts`` (partial index on ts).
-    - Runtime V2: ``agent_jobs`` rows in the ``dream`` lane with an active
-      status — the same predicate as ``jobs_store.inflight_job_count``; stale V2
-      leases are already retired by the V2 reaper.
+    - Runtime V2: ``agent_jobs`` rows in the ``dream`` lane whose status is in
+      ``v2_active_statuses``. The scheduler passes only claimed/running: a V2
+      Dream has no queue deadline, so pending rows in a stalled queue would hold
+      slots forever; stale V2 leases are already retired by the V2 reaper.
 
     Status vocabularies are passed in by the caller so they cannot drift from
     the job modules that own them. Raises on DB failure; the caller decides.
