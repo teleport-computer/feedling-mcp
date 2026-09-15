@@ -163,11 +163,14 @@ def test_every_class_is_a_registered_displayable_error_class():
     } <= agent_call_failure.AGENT_CALL_FAILURE_CLASSES
 
 
-def test_registry_reads_insufficient_balance_as_quota_for_every_lane():
-    """The shared matcher change also fixes Chat's notice for 401+balance."""
-    assert notices_catalog.classify_upstream("401 Insufficient Balance") == (
-        "quota_insufficient"
-    )
+def test_memory_lane_reads_insufficient_balance_without_touching_the_chat_registry():
+    """记忆整理自己认「401 + Insufficient balance」= 额度不足；聊天侧对照表（Seven 的）不动。"""
+    raw = ('RuntimeError: cli agent exited 1: Failed to authenticate. API Error: 401 '
+           '{"error":"Insufficient balance"} (api_status=401)')
+    assert agent_call_failure.classify_failure_text(raw) == "quota_insufficient"
+    assert agent_call_failure.classify_failure_text(
+        "RuntimeError: prompt text says insufficient balance between goals") == "unknown"
+    # 聊天侧保持原判断（本分支不改共享对照表）
     assert notices_catalog.classify_upstream("401 Unauthorized") == "auth_invalid"
 
 

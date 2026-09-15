@@ -206,6 +206,9 @@ _CHINESE_AUTH_IN_ERROR_FIELD = re.compile(
 )
 
 
+_INSUFFICIENT_BALANCE = re.compile(r"insufficient[ _-]?balance", re.IGNORECASE)
+
+
 def _has_strong_evidence(code: str, text: str) -> bool:
     if code in _SELF_EVIDENT:
         return True
@@ -223,6 +226,12 @@ def classify_failure_text(text: object) -> str:
     evidence in ``text`` (see ``_STRONG_EVIDENCE``).
     """
     candidate = str(text or "")
+    # Before the registry: a relay answering "401 {"error":"Insufficient balance"}"
+    # is out of money, not a bad key. The shared chat registry (Seven's) is left
+    # untouched; memory lanes recognise this shape here, with the same JSON-error /
+    # status evidence every other class needs.
+    if _STRONG_EVIDENCE["quota_insufficient"].search(candidate) and _INSUFFICIENT_BALANCE.search(candidate):
+        return "quota_insufficient"
     for spec in error_contract.matcher_specs():
         if spec.code not in AGENT_CALL_FAILURE_CLASSES:
             continue

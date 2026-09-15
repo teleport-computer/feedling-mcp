@@ -61,9 +61,9 @@ change must not be interpreted as an API guarantee.
   `…:upstream_unavailable` or `…:unknown`, instead of collapsing to
   `runtime_failed`. The backend classifies the consumer's error text when the
   status is reported, so older self-hosted consumers are covered, and no
-  provider error text is stored in these fields for new reports. A provider
-  message reporting an insufficient balance is now classified as
-  `quota_insufficient` even when it arrives with HTTP 401. An account or
+  provider error text is stored in these fields for new reports. For these
+  memory lanes, a provider error reporting an insufficient balance is classified
+  as `quota_insufficient` even when it arrives with HTTP 401. An account or
   request class is only assigned with provider error evidence (an HTTP status,
   a provider error code, or the phrase inside an error field); a keyword that
   merely appears in echoed request text, such as "quota" or "authentication",
