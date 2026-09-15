@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from collections import OrderedDict
 
 from enclave import envelope
 from memory import recall_metadata
@@ -310,3 +312,49 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             "linked_dimension": inner.get("linked_dimension"),
         })
     return out
+
+
+# Per-user cache of the DECRYPTED context-memory pool. /v1/chat/history rebuilt this on
+# every load — decrypting up to MEMORY_READSIDE_MODEL_API_LIMIT envelopes (an X25519
+# unwrap each) on the enclave's single busy path, ignoring the chat `limit`. The pool
+# barely changes between loads; the per-turn part is only the selector, which runs on the
+# returned cards. Cache the decrypt keyed on a CLEARTEXT fingerprint of the moment set, so
+# any add/edit/archive/delete misses and re-decrypts (never serves stale) while a repeated
+# open is a hash over metadata instead of N scalar-mults. content_sk is process-lifetime
+# (keys.get_or_derive_content_sk), so it is not part of the key; the cache lives only in
+# enclave RAM, exactly where the plaintext already lives during a request.
+_CARD_CACHE: "OrderedDict[str, tuple[str, list[dict]]]" = OrderedDict()
+_CARD_CACHE_MAX_USERS = int(os.environ.get("FEEDLING_CTX_CARD_CACHE_USERS", "512"))
+
+
+def _corpus_fingerprint(moments: list, authorized_user_id: str) -> str:
+    """Hash the full cleartext moment set (id + ciphertext blobs + lifecycle metadata).
+
+    moments_to_cards' output is a pure function of (envelope set, content_sk); with
+    content_sk fixed per process, hashing the envelopes is a sound cache key. Hashing the
+    ciphertext (not decrypting it) guarantees any body edit invalidates even if a caller's
+    updated_at is unreliable. No plaintext is touched.
+    """
+    h = hashlib.sha256()
+    h.update(authorized_user_id.encode("utf-8"))
+    for m in sorted(moments or [], key=lambda m: str(m.get("id") or "")):
+        h.update(b"\x1e")
+        h.update(json.dumps(m, sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()
+
+
+def moments_to_cards_cached(
+    moments: list, authorized_user_id: str, content_sk
+) -> list[dict]:
+    """Cached moments_to_cards. Hit ⇒ skip all decryption; miss ⇒ decrypt once and store."""
+    fp = _corpus_fingerprint(moments, authorized_user_id)
+    hit = _CARD_CACHE.get(authorized_user_id)
+    if hit is not None and hit[0] == fp:
+        _CARD_CACHE.move_to_end(authorized_user_id)
+        return hit[1]
+    cards = moments_to_cards(moments, authorized_user_id, content_sk)
+    _CARD_CACHE[authorized_user_id] = (fp, cards)
+    _CARD_CACHE.move_to_end(authorized_user_id)
+    while len(_CARD_CACHE) > _CARD_CACHE_MAX_USERS:
+        _CARD_CACHE.popitem(last=False)
+    return cards

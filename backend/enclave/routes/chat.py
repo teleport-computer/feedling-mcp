@@ -307,7 +307,7 @@ def _build_context_memories(moments, decrypted, query_args):
     context_memories: list[dict] = []
     context_memory_trace: dict | None = None
 
-    cards = readside.moments_to_cards(
+    cards = readside.moments_to_cards_cached(
         moments, query_args["authorized_user_id"], query_args["content_sk"])
     # 生命周期过滤归宿主 —— **必须在翻译之前**。
     # 翻译产物里没有 io 的 archive 字段，放到翻译之后就漏了，已归档的卡
