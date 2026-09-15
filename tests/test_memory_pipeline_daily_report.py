@@ -497,6 +497,58 @@ def test_post_requires_lark_success_code():
         report_tool.post_to_lark("https://lark.invalid/hook", {"x": 1}, opener=bad_sign)
 
 
+def test_post_accepts_both_documented_success_shapes():
+    for body in (b'{"code":0,"msg":"success","data":{}}',
+                 b'{"StatusCode":0,"StatusMessage":"success"}',
+                 b'{"Extra":null,"StatusCode":0,"StatusMessage":"success","code":0,"msg":"success"}'):
+        report_tool.post_to_lark("https://lark.invalid/hook", {"x": 1},
+                                 opener=lambda request, timeout, b=body: _Resp(b))
+
+
+@pytest.mark.parametrize("body, error", [
+    (b"{}", "lark_invalid_response"),
+    (b"[]", "lark_invalid_response"),
+    (b'{"msg":"success"}', "lark_invalid_response"),
+    (b'{"code":"0","msg":"success"}', "lark_invalid_response"),
+    (b'{"code":null}', "lark_invalid_response"),
+    (b'{"code":false}', "lark_invalid_response"),
+    (b'{"code":0,"StatusCode":"0"}', "lark_invalid_response"),
+    (b"", "lark_response_not_json"),
+    (b'{"code":19021,"msg":"sign match fail"}', "lark_rejected:code=19021"),
+    (b'{"code":0,"StatusCode":9499}', "lark_rejected:code=9499"),
+])
+def test_post_rejects_anything_but_an_explicit_zero_code(body, error):
+    """Codex review 2026-09-15 (I2). Before: HTTP 200 ``{}`` counted as posted
+    and ``[]`` crashed with AttributeError. After: both are post failures."""
+    with pytest.raises(RuntimeError) as exc_info:
+        report_tool.post_to_lark("https://lark.invalid/hook", {"x": 1},
+                                 opener=lambda request, timeout: _Resp(body))
+    assert str(exc_info.value) == error
+
+
+@pytest.mark.parametrize("body", [b"{}", b"[]", b'{"code":"0"}'])
+def test_malformed_lark_success_fails_the_run_instead_of_reporting_posted(body):
+    posts = []
+
+    def opener(request, timeout):
+        posts.append(request.full_url)
+        return _Resp(body)
+
+    out, err = io.StringIO(), io.StringIO()
+    old_err = sys.stderr
+    sys.stderr = err
+    try:
+        code = report_tool.main(
+            ["--fixture", str(FIXTURE), "--day", DAY], opener=opener,
+            environ={"LARK_BOT_WEBHOOK": "https://lark.invalid/hook"}, out=out)
+    finally:
+        sys.stderr = old_err
+    assert posts == ["https://lark.invalid/hook"]
+    assert code == 3
+    assert "posted memory pipeline daily report" not in out.getvalue()
+    assert "lark post failed: lark_invalid_response" in err.getvalue()
+
+
 # --------------------------------------------------------------------------- #
 # CLI: dry-run, live read with fakes, fetch failure
 # --------------------------------------------------------------------------- #
@@ -751,3 +803,38 @@ def test_workflow_runs_daily_against_prod_with_existing_secrets():
     assert "api.feedling.app" in env["FEEDLING_API_URL"]
     # Secrets must reach the tool via env only, never argv.
     assert "secrets." not in run_step["run"]
+    # Attention thresholds are overridable from repository variables.
+    for name in report_tool.THRESHOLD_ENV_VARS:
+        assert env[name] == f"${{{{ vars.{name} }}}}"
+
+
+def test_thresholds_keep_defaults_and_follow_env_overrides(monkeypatch):
+    """Codex review 2026-09-15 (M1): the thresholds are unbaselined initial
+    values, so they must be tunable without a code change."""
+    import importlib
+
+    for name in report_tool.THRESHOLD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    try:
+        importlib.reload(report_tool)
+        assert (report_tool.STUCK_USERS_ATTENTION, report_tool.OUR_SIDE_USERS_ATTENTION,
+                report_tool.MIN_ATTEMPTS_FOR_RATE, report_tool.FAILURE_RATE_ATTENTION,
+                report_tool.FAILURE_RATE_JUMP_PP, report_tool.ACTIVE_DROP_RATIO,
+                report_tool.ACTIVE_DROP_MIN_PREVIOUS,
+                report_tool.LIVE_STUCK_JOBS_ATTENTION) == (10, 5, 20, 0.5, 15.0, 0.5, 10, 20)
+
+        monkeypatch.setenv("MEMORY_REPORT_STUCK_USERS", "3")
+        monkeypatch.setenv("MEMORY_REPORT_FAILURE_RATE", "0.8")
+        monkeypatch.setenv("MEMORY_REPORT_LIVE_STUCK_JOBS", "")       # unset var in Actions
+        monkeypatch.setenv("MEMORY_REPORT_OUR_SIDE_USERS", "many")    # typo keeps default
+        importlib.reload(report_tool)
+        assert report_tool.STUCK_USERS_ATTENTION == 3
+        assert report_tool.FAILURE_RATE_ATTENTION == 0.8
+        assert report_tool.LIVE_STUCK_JOBS_ATTENTION == 20
+        assert report_tool.OUR_SIDE_USERS_ATTENTION == 5
+        # The override reaches the rule, not just the constant.
+        assert any("完全卡死 3 人" in r for r in _report(_stuck_rows(3)).attention)
+    finally:
+        for name in report_tool.THRESHOLD_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+        importlib.reload(report_tool)

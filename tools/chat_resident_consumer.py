@@ -17664,7 +17664,6 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
 
 
 CAPTURE_BATCH_PAGE_LIMIT = 200  # backend /v1/chat/history 单页上限
-CAPTURE_BATCH_MAX_PAGES = 10
 
 
 def _capture_seq_or_none(value: Any) -> int | None:
@@ -17684,12 +17683,25 @@ def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dic
     一条不多、一条不少；不按 message_count 截尾（区间里夹着的非落卡来源行不能挤掉
     这批最早的消息）。
 
-    取不全（解密源失败 / 行没有 seq / 翻页没有进展 / 页数用完）返回 []，
+    🔴 **不设页数上限。** 后端切批只数会触发落卡的行（user/openclaw + 实时来源），
+    而这里翻的是全部行；两者之间没有稳定比例 —— 一段感知/维护/导入之类的行可以
+    在两条聊天之间堆上几千行。以前限 10 页（2000 行），堆得更多时每次都「页数用完」
+    → 任务失败 → 同一批反复失败到逃生阀阈值 → 这 60 条从没取到过的消息被当成毒窗口
+    **跳过、永久丢掉**（Codex review 2026-09-15）。
+
+    循环一定会结束：每页都要求 seq 严格前进（否则按「没有进展」失败），遇到超过
+    ``through_seq`` 的行或翻到末尾就返回，而 ``(after_seq, through_seq]`` 里的行数有限
+    （新消息的 seq 都大于终点，不会让它变长）。代价只是这种罕见批次多翻几页。
+
+    内存：每页先过 ``_capture_live_history``（原来是攒完再过，同一个逐行过滤器，
+    结果一样），被角色过滤掉的行不会整段攒在内存里。
+
+    取不全（解密源失败 / 行没有 seq / 翻页没有进展）返回 []，
     由调用方把任务标失败、游标不动 —— 绝不拿半批冒充整批。
     """
     out: list[dict] = []
     cursor = int(after_seq)
-    for _page in range(CAPTURE_BATCH_MAX_PAGES):
+    while True:
         page = get_decrypted_history(
             since=0,
             limit=CAPTURE_BATCH_PAGE_LIMIT,
@@ -17700,8 +17712,10 @@ def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dic
             return []
         if not page:
             # 翻到对话末尾：终点那条可能被删了（Chat Clear 之类），区间里现存的就是全部。
-            return _capture_live_history(out)
+            return out
         page_max = cursor
+        in_range: list[dict] = []
+        reached_end = False
         for msg in page:
             seq = _capture_seq_or_none(msg.get("seq") if isinstance(msg, dict) else None)
             if seq is None:
@@ -17711,19 +17725,19 @@ def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dic
             if seq <= after_seq:
                 continue
             if seq > through_seq:
-                return _capture_live_history(out)
-            out.append(msg)
+                reached_end = True
+                break
+            in_range.append(msg)
             if seq == through_seq:
-                return _capture_live_history(out)
+                reached_end = True
+                break
+        out.extend(_capture_live_history(in_range))
+        if reached_end:
+            return out
         if page_max <= cursor:
             log.warning("capture batch window: history paging made no progress at seq=%s", cursor)
             return []
         cursor = page_max
-    log.warning(
-        "capture batch window: (%s, %s] not reached within %d pages",
-        after_seq, through_seq, CAPTURE_BATCH_MAX_PAGES,
-    )
-    return []
 
 
 def _capture_window_messages(job: dict) -> list[dict]:

@@ -7017,6 +7017,7 @@ def memory_dream_active_job_count(
     legacy_since_epoch: float,
     legacy_active_statuses: list[str],
     v2_active_statuses: list[str],
+    v2_pending_horizon_sec: float | None = None,
 ) -> int:
     """Fleet-wide count of Dream jobs that are queued or running, both runtimes.
 
@@ -7030,9 +7031,13 @@ def memory_dream_active_job_count(
       reclaimed), and such an orphan must not hold a slot night after night.
       Served by ``ix_user_logs_proactive_jobs_ts`` (partial index on ts).
     - Runtime V2: ``agent_jobs`` rows in the ``dream`` lane whose status is in
-      ``v2_active_statuses``. The scheduler passes only claimed/running: a V2
-      Dream has no queue deadline, so pending rows in a stalled queue would hold
-      slots forever; stale V2 leases are already retired by the V2 reaper.
+      ``v2_active_statuses`` (claimed/running; stale leases are retired by the
+      V2 reaper), plus — when ``v2_pending_horizon_sec`` is given — ``pending``
+      dream rows created within that many seconds of database time. Pending
+      rows must count: the pool claims every pending row the moment it has
+      capacity, so admitting while they are invisible lets the claimed total
+      exceed the ceiling. A V2 Dream has no queue deadline, so without the
+      horizon a stalled queue's pending rows would hold slots forever.
 
     Status vocabularies are passed in by the caller so they cannot drift from
     the job modules that own them. Raises on DB failure; the caller decides.
@@ -7048,15 +7053,48 @@ def memory_dream_active_job_count(
                   AND lower(COALESCE(NULLIF(btrim(doc->>'status'), ''), 'pending')) = ANY(%s))
               +
               (SELECT count(*) FROM agent_jobs
-                WHERE lane = 'dream' AND status = ANY(%s))
+                WHERE lane = 'dream'
+                  AND (status = ANY(%s)
+                       OR (%s::double precision IS NOT NULL
+                           AND status = 'pending'
+                           AND created_at >= now() - make_interval(secs => %s::double precision))))
             """,
             (
                 float(legacy_since_epoch),
                 list(legacy_active_statuses),
                 list(v2_active_statuses),
+                None if v2_pending_horizon_sec is None else float(v2_pending_horizon_sec),
+                0.0 if v2_pending_horizon_sec is None else float(v2_pending_horizon_sec),
             ),
         ).fetchone()
     return int(row[0] or 0) if row else 0
+
+
+@contextmanager
+def memory_dream_admission_lock():
+    """Serialize fleet Dream admission (count + enqueue) across every process.
+
+    Yields ``True`` while this caller holds the admission lock, ``False`` when
+    another admission holds it right now. The lock is a transaction-scoped
+    advisory lock on a dedicated connection, held until the ``with`` body
+    returns — the caller counts and enqueues inside the body (on their own
+    connections; the enqueue commits before this transaction ends, so the next
+    holder's count sees it). Commit or rollback releases it, including when the
+    body raises or the process dies.
+
+    ``pg_try_advisory_xact_lock`` (never the blocking form) on purpose: a
+    waiter would sit on a pool connection while the holder needs a second one
+    to enqueue, so a burst of waiters could exhaust the pool under the holder.
+    A caller that does not get the lock just re-evaluates on its next tick.
+    Raises on DB failure; the caller decides.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("feedling.memory_dream_admission",),
+            ).fetchone()
+            yield bool(row and row[0])
 
 
 def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int = 7,

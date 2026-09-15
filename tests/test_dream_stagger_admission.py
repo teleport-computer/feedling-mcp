@@ -242,7 +242,12 @@ def test_active_count_sees_v1_and_v2_dreams_but_not_orphans_or_terminal(dream_en
     jobs_store.enqueue_job("usr_dream_cap_v2", "dream", reason="nightly_dream")
     seed_user("usr_dream_cap_v2_capture")
     jobs_store.enqueue_job("usr_dream_cap_v2_capture", "capture", reason="quiet_timeout")
-    assert _active_count() == baseline + 1, "a pending V2 dream reads nothing from the enclave"
+    # A fresh pending V2 dream is claimed as soon as the pool has room: it is
+    # load already on its way (Codex review 2026-09-15). Other lanes never count.
+    assert _active_count() == baseline + 2
+    _set_v2_status("usr_dream_cap_v2", "pending",
+                   age_sec=dream_scheduler.DREAM_ADMISSION_LEGACY_HORIZON_SEC + 60)
+    assert _active_count() == baseline + 1, "a pending row past the horizon is a stalled queue"
     _set_v2_status("usr_dream_cap_v2", "running")
     _set_v2_status("usr_dream_cap_v2_capture", "running")
     assert _active_count() == baseline + 2
@@ -345,6 +350,24 @@ def test_ceiling_count_failure_admits(monkeypatch, dream_env):
     assert dream_scheduler.tick_memory_dream(store, now=time.time())["enqueued"] is True
 
 
+def test_admission_held_elsewhere_answers_busy_and_lock_failure_admits(monkeypatch, dream_env, no_v2_jobs):
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    store = _user_with_cards("usr_dream_admission_busy")
+    with db.memory_dream_admission_lock() as held:
+        assert held is True
+        busy = dream_scheduler.tick_memory_dream(store, now=time.time())
+    assert busy["enqueued"] is False and busy["reason"] == "dream_admission_busy"
+    assert _dream_jobs(store) == []
+    assert dream_scheduler.tick_memory_dream(store, now=time.time())["enqueued"] is True
+
+    def _boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(dream_scheduler.db, "memory_dream_admission_lock", _boom)
+    other = _user_with_cards("usr_dream_admission_lock_fails")
+    assert dream_scheduler.tick_memory_dream(other, now=time.time())["enqueued"] is True
+
+
 def test_ceiling_blocks_the_v2_scheduler_producer(monkeypatch, dream_env, no_v2_jobs):
     """Runtime V2: the serve_worker Dream producer goes through the same gate,
     and V2 dream jobs a worker holds (claimed/running) count toward the ceiling."""
@@ -376,6 +399,107 @@ def test_ceiling_blocks_the_v2_scheduler_producer(monkeypatch, dream_env, no_v2_
         )
     assert serve_worker._tick_dream_for_user(user_id) == 1
     assert _v2_dream_rows() == 1
+
+
+def test_pending_v2_flood_cannot_be_claimed_past_the_ceiling(monkeypatch, dream_env, no_v2_jobs):
+    """Codex review 2026-09-15 (I1).
+
+    Before: only claimed/running V2 Dreams held a slot, so while nothing was
+    claimed yet every due user was admitted as ``pending``; the heavy pool then
+    claimed all of them at once, far past FEEDLING_DREAM_MAX_CONCURRENT.
+    After: fresh pending rows hold a slot, so admission stops at the ceiling and
+    claiming everything that was admitted stays within it.
+    """
+    from conftest import set_v2_runtime_owner
+
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    serve_worker.wire_assembly()
+    baseline = _active_count()
+    slots = 2
+    monkeypatch.setenv("FEEDLING_DREAM_MAX_CONCURRENT", str(baseline + slots))
+
+    users = [f"usr_dream_flood_v2_{i}" for i in range(6)]
+    admitted = 0
+    for user_id in users:
+        _user_with_cards(user_id)
+        set_v2_runtime_owner(user_id)
+        admitted += serve_worker._tick_dream_for_user(user_id)
+    assert admitted == slots
+
+    claimed = []
+    while True:
+        job = jobs_store.claim_next_job("dream-flood-worker", lanes={"dream"})
+        if job is None:
+            break
+        claimed.append(job)
+    assert len(claimed) == slots
+    assert _active_count() == baseline + slots
+
+
+def test_concurrent_producers_cannot_share_one_free_slot(monkeypatch, dream_env, no_v2_jobs):
+    """Codex review 2026-09-15 (I1): V1 ticks (every backend worker) and the V2
+    scheduler run at the same time. Before: each read ``active < cap`` and then
+    enqueued separately, so producers that counted together all got in.
+    After: count + enqueue is one decision under a fleet-wide lock.
+
+    The barrier holds every producer that reaches the count until all of them
+    have (or a short timeout passes), which is exactly the interleaving that
+    used to overshoot.
+    """
+    import threading
+
+    from conftest import set_v2_runtime_owner
+
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    serve_worker.wire_assembly()
+    baseline = _active_count()
+    monkeypatch.setenv("FEEDLING_DREAM_MAX_CONCURRENT", str(baseline + 1))
+
+    v1_users = [_user_with_cards(f"usr_dream_race_v1_{i}") for i in range(3)]
+    v2_users = []
+    for i in range(3):
+        user_id = f"usr_dream_race_v2_{i}"
+        _user_with_cards(user_id)
+        set_v2_runtime_owner(user_id)
+        v2_users.append(user_id)
+
+    producers = len(v1_users) + len(v2_users)
+    barrier = threading.Barrier(producers, timeout=2.0)
+    real_count = dream_scheduler.active_dream_job_count
+
+    def _count_then_wait():
+        active = real_count()
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return active
+
+    monkeypatch.setattr(dream_scheduler, "active_dream_job_count", _count_then_wait)
+    results: list = []
+    lock = threading.Lock()
+
+    def _run(fn):
+        out = fn()
+        with lock:
+            results.append(out)
+
+    threads = [
+        threading.Thread(target=_run, args=(lambda s=s: dream_scheduler.tick_memory_dream(
+            s, now=time.time())["enqueued"],))
+        for s in v1_users
+    ] + [
+        threading.Thread(target=_run, args=(lambda u=u: bool(serve_worker._tick_dream_for_user(u)),))
+        for u in v2_users
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert len(results) == producers
+    monkeypatch.setattr(dream_scheduler, "active_dream_job_count", real_count)
+    assert sum(bool(r) for r in results) <= 1
+    assert _active_count() <= baseline + 1
 
 
 # ---------------------------------------------------------------------------
