@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Nightly memory consolidation (Dream) follows the same naming rule as
+  capture.** Dream prompts in Runtime V2 and resident V1 (hosted runner and
+  self-hosted consumers) used the memory kernel's default naming rule instead of
+  io's. The Chinese wording of the two rules is identical; the English one did
+  not name 「用户」/"user" or the placeholder 「TA」. Before: in an English memory
+  garden, capture was told never to write "the user" or 「TA」 for the person, but
+  the nightly rewrite of the same cards was not. After: Dream receives io's rule
+  too, so a rewritten card keeps calling the person by name. A self-hosted
+  consumer whose installed memory kernel predates this field keeps running
+  Dream with the default rule instead of failing.
+
 - **Memory capture can update an existing card again instead of adding a
   duplicate.** Since 2026-08-30 the capture prompt in Runtime V2 showed the
   model an empty existing-memory index, so it could only add cards; resident V1

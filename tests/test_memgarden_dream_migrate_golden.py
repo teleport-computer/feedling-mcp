@@ -29,6 +29,11 @@
   summary/content 块);入口换成组件会话,所以 params 里的 ``cards`` 从渲染好的串
   变成卡片列表,且至少 10 张(组件的整理门槛)。英文花园的称呼规则改用内核默认
   那份(不再夹中文「用户」「TA」)。
+- 2026-09-15 english_garden 称呼规则一行改回 io 的 ``_naming_rule``:Dream 请求现在
+  和 Capture 一样传 io 的规则(memgarden ``MaintenanceRequest.naming_rule``)。上一条
+  「改用内核默认」时 ``MaintenanceRequest`` 还没有这个字段;留着的话同一个人白天落卡
+  按 io 规则、夜里整理按内核规则,两份提示词对称呼的禁令不一致。中文用例不变
+  (两份中文规则逐字相同)。
 
 基线更新方式:改动是有意的 → 重跑本文件顶部的生成参数、覆盖 fixture、
 在提交说明里写明为什么。没有自动重写机制,这是故意的。
@@ -151,5 +156,12 @@ def test_dream_fixture_covers_bodies_legacy_fields_and_truncation() -> None:
     assert any(len(card.get("content", "")) > garden_component.DREAM_CARD_BODY_CHARS
                for card in legacy["params"]["cards"])
 
-    assert cases["english_garden"]["params"]["locale"] == "en"
-    assert "用户" not in cases["english_garden"]["text"]
+    english = cases["english_garden"]
+    assert english["params"]["locale"] == "en"
+    # 称呼规则和 Capture 同一份(io 的 _naming_rule,英文版点名禁「用户」/「TA」),
+    # 不是内核默认那版。见顶部基线变更记录 2026-09-15 第二条。
+    from identity.user_naming import _naming_rule
+    from memgarden.naming import naming_rule as kernel_naming_rule
+    user_name = english["params"]["user_name"]
+    assert _naming_rule(user_name, locale="en") in english["text"]
+    assert kernel_naming_rule(user_name, locale="en") not in english["text"]
