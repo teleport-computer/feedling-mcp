@@ -197,18 +197,28 @@ to requested/returned card-ID bindings, joined by turn/job/attempt. The terminal
 `memory.recall.completed` event contains aggregate counts. These are content-free operational fields,
 not proof of semantic relevance or provider-token usage. The full provider-request
 messages remain in the encrypted trajectory under its existing access controls.
-On the pinned memgarden 0.19.0 release, selection still uses its historical buckets;
-the opt-in relevance-gated soft-quota policy is used only when a reviewed, released
-dependency upgrade supplies it. A missing or failed selection remains unknown,
-not a measured empty Garden.
+Automatic selection (V1 resident and V2 chat/wake alike) ranks candidates with the
+same BM25 ranker and tokenizer as `memory_search` (memgarden
+`retrieval.select_context`, jieba 0.42.1), then applies soft quotas for turning
+points and recent cards; every selected card must pass the relevance gate. Its
+gate is looser than search's: the four-message query is mostly everyday chat the
+Garden never recorded, so one strongly matching anchor is enough to recall a
+card. Selection records carry the ranking version in `mode` (for example
+`relevant:unified:memgarden-bm25-v1+tok:jieba-0.42.1+cfg:…`). Operators can
+restore the previous selector with `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0` on
+the enclave (default on); search keeps the new ranker either way. A missing or
+failed selection remains unknown, not a measured empty Garden.
 
 `memory_search` uses request-local BM25 token ranking over the complete authorized
 readable Garden. Chinese segmentation uses pinned jieba 0.42.1 (precise mode,
 HMM disabled); ASCII words and whole identifiers such as `NP-4286` and `CR2450`
 are case-insensitive tokens, not substring prefixes. Query terms need not be
-adjacent; any matching term can contribute. No synonyms, translation, stemming,
-time interpretation, embedding or model is involved. A nonblank query with no
-searchable tokens returns no matches. Empty results do not prove memory absence;
+adjacent. Very common function words (我, 什么, the, what …) are dropped from the
+query, and a card is returned only when its matched terms cover at least a quarter
+of the query's weight or it carries strong evidence such as a rare identifier; a
+query nothing matches returns no items rather than loosely related filler. No
+synonyms, translation, stemming, time interpretation, embedding or model is
+involved. A nonblank query with no searchable tokens returns no matches. Empty results do not prove memory absence;
 try different wording or browse a bucket/thread. Only identical repeated
 arguments are refused within a turn. The V2 compact result preserves `ranking`
 and `unavailable_count`, including the explicit `substring-legacy` mode during
@@ -426,11 +436,12 @@ ID ascending. The existing per-item `score` remains importance/recency, **not**
 BM25. Full content, tokens, postings and BM25 scores are not added to the response.
 Final evidence selection still belongs to your client or agent.
 
-Query responses additionally carry `ranking: "bm25-jieba-0.42.1-v1"` and
-`unavailable_count` (candidate cards that could not be read, excluded from
-statistics). A recognized older enclave response instead reports
-`ranking: "substring-legacy"`: this temporary rolling-upgrade mode uses the old
-case-insensitive whole-query substring match and importance order. Authentication
+Query responses additionally carry `ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"`
+and `unavailable_count` (candidate cards that could not be read, excluded from
+statistics). During a rolling upgrade a response may instead report
+`ranking: "bm25-jieba-0.42.1-v1"` (the previous enclave BM25 without stopwords or
+relevance gate) or `ranking: "substring-legacy"` (the old case-insensitive
+whole-query substring match and importance order). Authentication
 errors, timeouts, and unknown protocols do not silently fall back. Blank or
 omitted `query` retains the existing index browsing path; fetch is unchanged.
 
