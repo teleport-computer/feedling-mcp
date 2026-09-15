@@ -12,6 +12,27 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory Dream now reads each card's body, not just its title.** When Dream
+  tidies the Memory Garden (merge, thicken or supersede), the model now sees
+  every card's summary and full body — in Runtime V2 and in resident V1 (hosted
+  runner and self-hosted consumers alike). Previously Runtime V2 showed only a
+  one-line summary per card and resident V1 cut summaries to 500 and bodies to
+  900 characters inside a 20,000-character list that could stop mid-card, so a
+  rewrite could drop details the model never saw. One Dream run shows at most
+  60 cards and 60,000 characters; cards that do not fit wait for a later run
+  and cannot be retired by this one. A card whose body exceeds 5,000 characters
+  (or summary 2,000) is shown truncated, marked `TRUNCATED`, and may not be
+  changed: such proposals are dropped, and a run where all proposals were
+  dropped fails as `dream_truncated_card_rejected` without advancing the Dream
+  ledger. Resident V1 now also records a too-small garden as a skipped Dream
+  (`status: skipped` with `dream_skip_reason: not_enough_new_cards` on
+  `POST /v1/proactive/jobs/{job_id}/status`) instead of running it, matching
+  Runtime V2. A worker or consumer whose installed `memgarden` cannot render
+  card bodies fails its Dream run with `dream_kernel_outdated` instead of
+  falling back to titles only. The blast-radius fuse now measures against the
+  cards shown to the model. Resident Dream jobs no longer store the model's
+  `questions`. The `FEEDLING_V2_DREAM_CARDS_MAX_CHARS` setting is retired.
+
 - **Memory search stops returning loosely related cards, and automatic recall uses
   the same ranker.** `memory_search` / `memory-index --query` now rank with
   memgarden's BM25 (`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"`, same jieba
