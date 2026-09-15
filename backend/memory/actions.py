@@ -7,7 +7,6 @@ import uuid
 
 
 import db
-import debug_trace
 from core.store import UserStore
 
 from bootstrap import gates as boot_gates
@@ -16,6 +15,8 @@ from identity import service as identity_service
 from memgarden.text import card_guard
 from memgarden.text import card_text
 from memory import service as memory_service
+from memory import content_policy
+from memory import action_receipts
 from memgarden import timestamps as memory_timestamps
 from memgarden.prompts.buckets import normalize_bucket_language
 from memgarden.prompts import recall_fields
@@ -151,54 +152,8 @@ def _memory_default_bucket(value) -> str:
     return "未分类"
 
 
-MEMORY_CONTENT_MAX_CHARS = 5000
-MEMORY_CONTENT_TRUNCATION_EVENT = "memory.content.truncation"
-
-
-def trace_memory_content_truncation(
-    store: UserStore,
-    value,
-    *,
-    route: str,
-) -> None:
-    """Record a content-free counter when the existing 5k slice will clip.
-
-    ``route`` is a closed caller-supplied label stored under an admin-redactor
-    allowlisted key. The body itself never enters the event, including through
-    summary/explain/content_excerpt.
-    """
-    original = str(value or "").strip()
-    original_chars = len(original)
-    truncated_chars = max(0, original_chars - MEMORY_CONTENT_MAX_CHARS)
-    if not truncated_chars:
-        return
-    try:
-        debug_trace.trace_event(
-            store,
-            subsystem="memory",
-            type=MEMORY_CONTENT_TRUNCATION_EVENT,
-            actor="backend",
-            status="warning",
-            summary="",
-            explain="",
-            detail={
-                "route": route,
-                "counts": {
-                    "original_chars": original_chars,
-                    "truncated_chars": truncated_chars,
-                },
-            },
-        )
-    except Exception as e:  # noqa: BLE001 — observability must never block a memory write
-        log.warning(
-            "[memory.actions] truncation trace failed route=%s error=%s",
-            route,
-            type(e).__name__,
-        )
-
-
 def _memory_content_from_action(data: dict, summary: str) -> str:
-    content = str(data.get("content") or "").strip()[:MEMORY_CONTENT_MAX_CHARS]
+    content = content_policy.validated_content(data.get("content"))
     if content:
         return content
     description = str(data.get("description") or summary or "").strip()[:2000]
@@ -255,22 +210,12 @@ def _memory_plain_from_envelope(
         return None, f"memory_decrypt_failed:{type(e).__name__}:{str(e)[:180]}"
 
 
-def _memory_inner_from_action(
-    data: dict,
-    *,
-    trace_store: UserStore | None = None,
-) -> dict:
+def _memory_inner_from_action(data: dict) -> dict:
     summary = str(data.get("summary") or data.get("description") or data.get("title") or "").strip()[:2000]
     threads = _memory_action_list(data.get("threads"), max_items=8, max_chars=80)
     if not threads:
         linked = _memory_action_list(data.get("linked_dimension"), max_items=1, max_chars=80)
         threads.extend(linked)
-    if trace_store is not None and data.get("content"):
-        trace_memory_content_truncation(
-            trace_store,
-            data.get("content"),
-            route="memory_actions",
-        )
     content = _memory_content_from_action(data, summary)
     bucket = _memory_action_text(data.get("bucket") or _memory_default_bucket(data.get("type")), 80)
     if card_guard.guard_enabled():
@@ -542,7 +487,6 @@ def _memory_add_action(
 
     inner = _memory_inner_from_action(
         {**raw, "type": mem_type, "title": title, "description": description},
-        trace_store=store,
     )
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
     if envelope is None:
@@ -713,7 +657,7 @@ def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) 
     if not memory_id:
         return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
     v1 = action.get("v1") if isinstance(action.get("v1"), dict) else action
-    inner = _memory_inner_from_action(v1, trace_store=store)
+    inner = _memory_inner_from_action(v1)
     if not inner.get("summary"):
         return {"status": "error", "error": "summary_required", "action": "memory.upgrade"}, [], 400
     if card_guard.guard_enabled() and (
@@ -919,7 +863,7 @@ def _memory_supersede_action(
     if "pulse" not in raw_for_inner and old_cards[0].get("pulse") is not None:
         raw_for_inner["pulse"] = old_cards[0].get("pulse")
 
-    inner = _memory_inner_from_action(raw_for_inner, trace_store=store)
+    inner = _memory_inner_from_action(raw_for_inner)
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.supersede"}, [], 409
@@ -1143,7 +1087,7 @@ def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[di
     return {"status": "ok", "action": "memory.delete", "memory": {"id": memory_id}, "change": change}, [effect], 200
 
 
-def _execute_memory_action(
+def _dispatch_memory_action(
     store: UserStore,
     api_key: str | None,
     action: dict,
@@ -1204,6 +1148,21 @@ def _execute_memory_action(
         "action": action_type,
         "supported": ["memory.add", "memory.supersede", "memory.upgrade", "memory.delete", "memory.retype"],
     }, [], 400
+
+
+def _execute_memory_action(
+    store: UserStore, api_key: str | None, action: dict, *, runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
+    try:
+        dispatch = lambda: _dispatch_memory_action(
+            store, api_key, action, runtime_token=runtime_token)
+        if not isinstance(action, dict):
+            return dispatch()
+        return action_receipts.execute(store, action, dispatch)
+    except content_policy.ContentTooLong as exc:
+        return {"status": "error", "error": exc.code, "detail": {
+            "actual_chars": exc.actual, "max_chars": content_policy.MAX_CONTENT_CHARS,
+        }}, [], 400
 
 
 def _execute_memory_actions(

@@ -106,7 +106,7 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
     if all(key in inner for key in ("summary", "content", "bucket", "threads")):
         return {
             "summary": memory_readside_text(inner.get("summary"), 500),
-            "content": memory_readside_text(inner.get("content"), 5000),
+            "content": str(inner.get("content") or "").strip(),
             "bucket": memory_readside_text(inner.get("bucket"), 80) or "未分类",
             "threads": memory_readside_list(inner.get("threads"))[:8],
             # 通话溯源:agent 拿到它就能调 voice_transcript_read

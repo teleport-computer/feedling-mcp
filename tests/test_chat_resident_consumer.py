@@ -5952,8 +5952,7 @@ def test_dream_job_fails_when_every_consolidation_touches_a_truncated_card(monke
 
     assert captured["actions"] == []
     job_id, status, reason, kwargs = _dream_final_status(captured)
-    assert (status, reason) == ("failed", "dream_truncated_card_rejected")
-    assert kwargs["extra"]["dream_result"]["truncated_rejected"] == 1
+    assert (status, reason) == ("failed", "maintenance_targets_rejected")
     assert captured["traces"][-1]["type"] == "memory.dream.error"
     assert captured["traces"][-1]["detail"]["outcome"] == "guard_rejected"
     assert captured["traces"][-1]["detail"]["counts"]["proposals"] == 1

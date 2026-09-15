@@ -265,8 +265,6 @@ _DREAM_BUDGET_FIELDS = (
 #: 老版本会把整理提示词退化成「只有 id 和摘要」—— 模型看不到正文就重写整张卡，
 #: 旧正文随旧卡退休。宁可这一晚整理失败退避，也不能静默走那条路。
 DREAM_KERNEL_OUTDATED = "dream_kernel_outdated"
-#: 模型的整理方案**全部**碰了被截断的卡时的失败码（content-free）。
-DREAM_TRUNCATED_CARD_REJECTED = "dream_truncated_card_rejected"
 
 # 老卡的字段名。组件只认 summary / content / bucket / threads。
 _SUMMARY_KEYS = ("summary", "title", "description")
@@ -449,31 +447,6 @@ def open_dream_session(
     return session, disclosure
 
 
-def reject_truncated_consolidations(
-    consolidations: Iterable[Any],
-    truncated_ids: Iterable[str],
-) -> tuple[list[dict], int]:
-    """宿主侧硬闸：丢掉动了被截断卡的整理方案，返回 ``(留下的, 丢掉的条数)``。
-
-    提示词已经禁止模型把 TRUNCATED 卡放进 ``card_ids``，但提示词不是保证：
-    模型只看过前 5000 字就去重写整张卡，后半段正文会随旧卡一起退休，
-    而用户看不出发生了什么。这道闸是确定性的，不看内容。
-    """
-    blocked = {_one_line(mid) for mid in truncated_ids if _one_line(mid)}
-    kept: list[dict] = []
-    rejected = 0
-    for row in consolidations or []:
-        if not isinstance(row, dict):
-            continue
-        raw_ids = row.get("card_ids")
-        ids = {_one_line(mid) for mid in (raw_ids if isinstance(raw_ids, list) else [])}
-        if blocked and ids & blocked:
-            rejected += 1
-            continue
-        kept.append(row)
-    return kept, rejected
-
-
 # --------------------------------------------------------------------------- #
 # 观测：把组件汇报的步骤翻译成 io 原有的口径
 # --------------------------------------------------------------------------- #
@@ -508,9 +481,7 @@ class BounceTracker:
         #: Dream：组件在出口丢掉的整理建议条数（``why="unsafe_target"``）——
         #: 动了 TRUNCATED 卡的、动了没渲染进提示词的卡的，分开数。
         #:
-        #: 新内核自己先拦了，宿主 :func:`reject_truncated_consolidations` 就拦不到；
-        #: 不把这两个数接住，「全部建议都动了截断卡」会从 guard_rejected 失败
-        #: 变成「这晚没什么要整理」的 noop，提案数也会少算。
+        #: 内核负责过滤与失败语义，IO 只接住计数，保证原始提案数不被低估。
         self.dropped_truncated_target = 0
         self.dropped_unrendered_target = 0
         #: 组件建提示词时报的索引计数（``prompt_built`` 步骤里带的）。

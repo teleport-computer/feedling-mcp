@@ -187,21 +187,6 @@ def test_old_kernel_without_naming_rule_still_opens_the_session(monkeypatch):
     assert kernel_naming_rule("Alex", locale="en") in session.next_prompt()
 
 
-def test_truncated_guard_drops_only_proposals_touching_a_truncated_card():
-    rows = [
-        {"op": "thicken", "card_ids": ["m2"], "result": {}},
-        {"op": "merge", "card_ids": ["m5", " m2 "], "result": {}},
-        {"op": "merge", "card_ids": ["m5", "m6"], "result": {}},
-        {"op": "supersede", "card_ids": "m2", "result": {}},   # 非列表：交给 mapper 判
-    ]
-
-    kept, rejected = gc.reject_truncated_consolidations(rows, frozenset({"m2"}))
-
-    assert rejected == 2
-    assert kept == [rows[2], rows[3]]
-    assert gc.reject_truncated_consolidations(rows, ()) == (rows, 0)
-
-
 def test_bounce_tracker_counts_component_exit_drops_apart_from_model_empties():
     from memgarden import Step
 

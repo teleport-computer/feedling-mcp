@@ -275,7 +275,7 @@ def coerce_runtime_action(
     if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
         raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
         summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
-        content = str(raw.get("content") or raw.get("description") or summary).strip()[:5000]
+        content = str(raw.get("content") or raw.get("description") or summary).strip()
         if not summary or not content:
             return None
         source = "model_api_correction" if action_type == "memory.add_correction" else "hosted_runtime_state"
@@ -311,7 +311,7 @@ def coerce_runtime_action(
         summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
         if not summary:
             return None
-        content = str(raw.get("content") or raw.get("description") or summary).strip()[:5000]
+        content = str(raw.get("content") or raw.get("description") or summary).strip()
         memory_payload = {
             "summary": summary,
             "content": content,
@@ -364,7 +364,7 @@ def coerce_runtime_action(
 
         raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
         summary = str(raw_patch.get("summary") or raw_patch.get("description") or raw_patch.get("content") or "").strip()[:2000]
-        content = str(raw_patch.get("content") or raw_patch.get("description") or summary).strip()[:5000]
+        content = str(raw_patch.get("content") or raw_patch.get("description") or summary).strip()
         if not summary or not content:
             return None
         runtime_action["executor_action"] = {

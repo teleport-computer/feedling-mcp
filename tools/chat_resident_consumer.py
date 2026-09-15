@@ -172,7 +172,6 @@ except ImportError:
 from perceptkit import prompts as perception_prompts
 
 import generated_image
-import provider_client as _provider_client
 import vision_policy as _vision_policy
 from hosted import visual_transport as _visual_transport
 from chat import file_display
@@ -6780,7 +6779,6 @@ def _visible_stream_text(text: str) -> str:
     """Project cumulative model text to speech-safe visible text."""
     raw = str(text or "")
     head = raw.lstrip()
-    from agent_protocol_core import self_thinking as _st_tags
 
     if head.startswith("<"):
         # 流式快照不可撤回：一旦把 `<n` / `<ns` 发出去，后面再干净的正文也接不回
@@ -13318,7 +13316,6 @@ def _prepend_io_cli_capability_catalog(
     catalog for the rest of that session."""
     global _io_cli_catalog_cache, _io_cli_voice_catalog_cache
     global _io_cli_catalog_pending_session_id
-    global _web_advertised_session_id, _web_off_notice_session_id
     if not _agent_can_use_local_io_cli():
         return content
 
@@ -19446,52 +19443,9 @@ def _process_dream_jobs(jobs: list) -> float:
             counts=dream_counts,
         )
 
-        # Host-side hard block: the prompt forbids rewriting a card the model
-        # only saw part of (TRUNCATED), but a prompt is not a guarantee. Drop
-        # those proposals; if every proposal was one, fail (ledger untouched)
-        # rather than complete as "nothing to consolidate".
-        # A memgarden that already drops these at the component exit leaves
-        # nothing for the host check; count its drops as the same guard so an
-        # all-forbidden run still fails instead of completing as a noop.
-        consolidations, host_truncated_rejected = garden_component.reject_truncated_consolidations(
-            consolidations, dream_disclosure.truncated_ids
-        )
-        truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
-        if truncated_rejected:
-            log.warning(
-                "dream truncated-card guard id=%s rejected=%d (component=%d host=%d) kept=%d",
-                job_id, truncated_rejected, kernel_truncated_dropped,
-                host_truncated_rejected, len(consolidations),
-            )
-        if truncated_rejected and not consolidations:
-            reason = garden_component.DREAM_TRUNCATED_CARD_REJECTED
-            update_proactive_job_status(
-                job_id,
-                "failed",
-                reason,
-                extra={
-                    "dream_result": {
-                        "status": "failed",
-                        "reason": reason,
-                        "job_kind": "memory_dream",
-                        "truncated_rejected": truncated_rejected,
-                    },
-                    "cards_merged": 0,
-                    "cards_superseded": 0,
-                    "questions": questions,
-                    "noop_reason": reason,
-                },
-            )
-            _emit_resident_dream_lifecycle(
-                "memory.dream.error",
-                job_id=job_id,
-                status="error",
-                outcome="guard_rejected",
-                started_at=dream_started,
-                degraded_context=dream_degraded_context,
-                counts=dream_counts,
-            )
-            continue
+        # Target safety is owned by memgarden >=0.21.1. Keep its observation,
+        # not a second host implementation of the same filtering algorithm.
+        truncated_rejected = kernel_truncated_dropped
 
         user_token_residual = sum(
             count_user_token_residuals(row.get("result") or {})
@@ -23278,13 +23232,15 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             truncated = bool(shape["reply_looks_truncated"]) and shape["reply_head"] in {"{", "[", "```"}
             return reply, truncated
 
-        def write(mutations: list[dict], _key: str) -> list[str]:
+        def prepare_write(mutations: list[dict]) -> list[dict]:
             now_iso = datetime.now(_tzmod.utc).isoformat()
+            return [_resident_import_action(
+                garden_import.mutation_item(m), now_iso=now_iso,
+                supersedes=garden_import.supersede_target(m)) for m in mutations]
+
+        def write(prepared: list[dict], key: str) -> list[str]:
             return garden_import.write_with_executor(
-                mutations,
-                build_action=lambda m: _resident_import_action(
-                    garden_import.mutation_item(m), now_iso=now_iso,
-                    supersedes=garden_import.supersede_target(m)),
+                prepared, build_action=dict, idempotency_key=key,
                 execute=_resident_import_rows,
             )
 
@@ -23292,6 +23248,7 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             sources=sources, state=state["garden"], job_key=job_id, owner_key=uid,
             existing_cards=state["known"], complete=complete, write=write,
             save=lambda _s: None,  # in memory only, by design
+            prepare_write=prepare_write,
             should_yield=lambda: _distill_user_waiting(chat_since),
         )
         state["known"] = result.known

@@ -162,71 +162,20 @@ def test_memory_add_route_normalizes_supplied_timestamp(monkeypatch):
     assert body["error"].startswith("occurred_at required")
 
 
-def test_memory_add_truncation_emits_content_free_counts_without_behavior_change(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_v1_truncation")
+def test_memory_add_oversize_returns_content_free_error(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_oversize")
     saved = _install_memory_action_fakes(monkeypatch, [])
-    events = []
-    monkeypatch.setattr(
-        memory_actions.debug_trace,
-        "trace_event",
-        lambda _store, **event: events.append(event),
-    )
-    secret = "T074_SECRET_MUST_NOT_REACH_TRACE"
+    secret = "SECRET_MUST_NOT_REACH_RECEIPT"
     raw_content = ("x" * 5001) + secret
-
     body, status = memory_actions._execute_memory_actions(store, "api_key", [{
         "type": "memory.add",
-        "memory": {
-            "summary": "Long card",
-            "content": raw_content,
-            "source": "chat",
-        },
+        "memory": {"summary": "Long card", "content": raw_content, "source": "chat"},
     }])
-
-    assert status == 200
-    assert body["status"] == "ok"
-    stored = json.loads(saved[0]["body_ct"])["content"]
-    assert stored == raw_content[:5000]
-    assert events == [{
-        "subsystem": "memory",
-        "type": "memory.content.truncation",
-        "actor": "backend",
-        "status": "warning",
-        "summary": "",
-        "explain": "",
-        "detail": {
-            "route": "memory_actions",
-            "counts": {
-                "original_chars": len(raw_content),
-                "truncated_chars": len(raw_content) - 5000,
-            },
-        },
-    }]
-    assert secret not in json.dumps(events, ensure_ascii=False)
-
-
-def test_memory_add_truncation_trace_failure_does_not_block_write(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_v1_trace_failure")
-    saved = _install_memory_action_fakes(monkeypatch, [])
-
-    def fail_trace(*_args, **_kwargs):
-        raise RuntimeError("trace backend unavailable")
-
-    monkeypatch.setattr(memory_actions.debug_trace, "trace_event", fail_trace)
-    raw_content = "x" * 5017
-
-    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
-        "type": "memory.add",
-        "memory": {
-            "summary": "Long card",
-            "content": raw_content,
-            "source": "chat",
-        },
-    }])
-
-    assert status == 200
-    assert body["status"] == "ok"
-    assert json.loads(saved[0]["body_ct"])["content"] == raw_content[:5000]
+    assert status == 400
+    assert body["error"] == "memory_content_too_long"
+    assert body["detail"] == {"actual_chars": len(raw_content), "max_chars": 5000}
+    assert saved == []
+    assert secret not in json.dumps(body)
 
 
 def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
