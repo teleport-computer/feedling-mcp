@@ -530,6 +530,12 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
                 patch[key] = max(0, int(payload.get(key) or 0))
             except (TypeError, ValueError):
                 patch[key] = 0
+    # A resident Dream skipped by the Garden component ("garden too small")
+    # names why, so the Dream ledger spaces the next attempt without counting
+    # a consolidation. Only the scheduler's own skip vocabulary is stored.
+    dream_skip_reason = str(payload.get("dream_skip_reason") or "").strip()
+    if dream_skip_reason in dream_scheduler.DREAM_SKIP_REASONS:
+        patch["dream_skip_reason"] = dream_skip_reason
     if payload.get("noop_reason"):
         patch["noop_reason"] = _content_free_agent_call_reason(
             str(payload.get("noop_reason"))

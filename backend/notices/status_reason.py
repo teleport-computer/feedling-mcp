@@ -72,6 +72,12 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "dream_agent_call_failed",
     "dream_context_unavailable",
     "dream_invalid_memory_action",
+    # Dream through the Garden component (open_dream_session): an installed
+    # memgarden that cannot render card bodies, every proposal touching a
+    # TRUNCATED card, and the component's small-garden skip verdict.
+    "dream_kernel_outdated",
+    "dream_truncated_card_rejected",
+    "not_enough_new_cards",
     "dream_memory_actions_applied",
     "dream_memory_actions_failed",
     "dream_memory_actions_partial",

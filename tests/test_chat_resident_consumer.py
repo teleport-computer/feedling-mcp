@@ -4293,14 +4293,34 @@ def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
     ) % (card_id, json.dumps(summary, ensure_ascii=False), json.dumps(content, ensure_ascii=False))
 
 
+def _dream_gate_session():
+    """A real Dream component session (the resident only drives the model)."""
+    from memory import garden_component
+
+    tracker = garden_component.BounceTracker()
+    cards = [{"id": "m_1", "summary": "他在加班", "content": "他说最近总加班。", "bucket": "工作"}] + [
+        {"id": f"m_{i}", "summary": f"别的记忆 {i}", "content": f"别的正文 {i}。"}
+        for i in range(2, 11)
+    ]
+    session, _disclosure = garden_component.open_dream_session(
+        garden_component.build_garden(
+            garden_component.CallableModel(lambda _prompt: ""), on_step=tracker
+        ),
+        cards=cards,
+        locale="zh-Hans",
+        ai_name="小柒",
+        user_name="小雨",
+        recent_conversations="",
+    )
+    return session, tracker
+
+
 def test_memory_content_gate_bounces_placeholder_reply_once(monkeypatch):
     """弱模型抄回占位符 → 带着「哪个字段没填」重问一次,而不是静默落库。
 
     现场(usr_ed21…,minimax-M3):花园里出现 `[thickened summary]` / 正文只有 `...`
     的卡。JSON 合法、字段非空,老路径直接封信封写进去,用户能亲眼看到空白卡。
     """
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
     replies = [
         _dream_reply("[thickened summary]", "[thickened content combining work + incident]"),
@@ -4314,24 +4334,17 @@ def test_memory_content_gate_bounces_placeholder_reply_once(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, questions, err), bounce = crc._memory_agent_parse_with_bounce(
-        "原始 dream prompt",
-        parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt,
-        lane="dream",
-        job_id="job_1",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, calls = crc._run_dream_session(session, tracker, job_id="job_1")
     assert err is None and bounce == "bounced_ok"
     assert len(cons) == 1 and cons[0]["result"]["summary"] == "他最近一直在加班"
     # 只问两次(第一问 + 一次打回),且第二问带着原 prompt 的上下文和具体问题
-    assert len(prompts) == 2
-    assert prompts[1].startswith("原始 dream prompt")
+    assert len(prompts) == 2 and calls == 2
+    assert prompts[1].startswith(prompts[0])
     assert "content 还是方括号占位" in prompts[1] or "summary 还是方括号占位" in prompts[1]
 
 
 def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
 
     def _fake_call_agent(prompt, **kw):
@@ -4341,10 +4354,8 @@ def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_2",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_2")
     assert err is None and bounce == "" and len(cons) == 1
     assert len(prompts) == 1  # 正常回复不额外烧一次调用
 
@@ -4355,8 +4366,6 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
     报成 noop 会让这轮以「没什么要整理」完成 —— V2 那侧还会推进 capture frontier,
     窗口就永久丢了,而且 data-track 上完全看不见(codex review P1-3)。
     """
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
 
     def _fake_call_agent(prompt, **kw):
@@ -4366,10 +4375,8 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_3",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_3")
     assert cons == [] and bounce == "bounced_failed"
     assert err.startswith("invalid_card_content_after_retry:")
     assert len(prompts) == 2
@@ -4377,8 +4384,6 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
 
 def test_memory_content_gate_accepts_the_clean_empty_answer(monkeypatch):
     """第二问选择「宁可留空」→ 这是 prompt 想要的结果,算干净 noop 不算失败。"""
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     replies = [
         _dream_reply("[thickened summary]", "..."),
         '{"consolidations": [], "questions_to_ask": []}',
@@ -4392,17 +4397,13 @@ def test_memory_content_gate_accepts_the_clean_empty_answer(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_5",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_5")
     assert cons == [] and err is None and bounce == "bounced_empty"
 
 
 def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):
     """JSON 根本没出来是另一条路(provider/流被截),重问同一段 prompt 没意义。"""
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
 
     def _fake_call_agent(prompt, **kw):
@@ -4412,10 +4413,8 @@ def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_4",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_4")
     assert cons == [] and err == "no_json_object" and bounce == ""
     assert len(prompts) == 1
 
@@ -4691,7 +4690,13 @@ def _capture_final_status(captured):
     return captured["statuses"][-1]
 
 
-def _install_dream_job_harness(monkeypatch, agent_reply):
+_DREAM_FILLER_INDEX = [
+    {"id": f"mem_fill_{i}", "summary": f"Seven's other memory {i}.", "bucket": "life"}
+    for i in range(7)
+]
+
+
+def _install_dream_job_harness(monkeypatch, agent_reply, *, cards=None):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     captured = {
@@ -4713,11 +4718,18 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
         {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life", "threads": ["coffee"]},
         {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life", "threads": ["coffee"]},
         {"id": "mem_c", "summary": "Seven drinks coffee in the morning.", "bucket": "routine", "threads": ["coffee"]},
+        # The Dream component only consolidates a garden of at least 10 cards.
+        *_DREAM_FILLER_INDEX,
     ]
     fetch_items = [
         {**item, "content": item["summary"] + " Full card."}
         for item in index_items
     ]
+    if cards is not None:
+        # Full cards as the backend returns them: index carries the summary,
+        # fetch carries the whole card.
+        index_items = [{"id": card["id"], "summary": card.get("summary", "")} for card in cards]
+        fetch_items = [dict(card) for card in cards]
     job = {
         "job_id": "dream_dispatch",
         "job_kind": "memory_dream",
@@ -5556,7 +5568,8 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["merged_count"] == 1
     assert extra["dream_result"]["organized_count"] == 2
     assert extra["dream_result"]["merged_count"] == 1
-    assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+    # The component does not surface questions_to_ask (V2 never did either).
+    assert extra["questions"] == []
     assert [row["type"] for row in captured["traces"]] == [
         "memory.dream.start",
         "memory.dream.model.start",
@@ -5578,7 +5591,7 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
         "degraded_context": False,
         "counts": {
             "actions": 1,
-            "active_cards": 3,
+            "active_cards": 10,
             "applied": 1,
             "failed": 0,
             "merged": 1,
@@ -5693,7 +5706,7 @@ def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_c
     )
     extra = _dream_final_status(captured)[3]["extra"]
     assert extra["dream_result"]["status"] == "noop"
-    assert extra["questions"] == ["下次问 TA 是否还喝拿铁"]
+    assert extra["questions"] == []
     assert extra["noop_reason"] == "dream_nothing_to_consolidate"
     assert extra.get("organized_count", 0) == 0
     assert extra.get("merged_count", 0) == 0
@@ -5712,6 +5725,138 @@ def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
         "memory.dream.error",
     ]
     assert captured["traces"][-1]["detail"]["outcome"] == "parse_rejected"
+
+
+def _dream_cards(n, *, body="正文。"):
+    return [{"id": f"mem_{i}", "summary": f"记忆 {i}", "content": f"{body}{i}",
+             "bucket": "life"} for i in range(n)]
+
+
+def test_dream_job_small_garden_is_a_skip_not_a_consolidation(monkeypatch):
+    """Below the component's minimum there is nothing to consolidate: no model
+    call, and the job says so (skipped + reason) instead of completing and
+    advancing the Dream ledger as if a consolidation ran."""
+    captured, job = _install_dream_job_harness(
+        monkeypatch, '{"consolidations": []}', cards=_dream_cards(3)
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert captured["prompts"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (job_id, status, reason) == ("dream_dispatch", "skipped", "not_enough_new_cards")
+    extra = kwargs["extra"]
+    assert extra["dream_skip_reason"] == "not_enough_new_cards"
+    assert extra["wake_result"] == "skipped"
+    assert all(row[1] != "completed" for row in captured["statuses"])
+    terminal = captured["traces"][-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["detail"]["outcome"] == "skipped"
+    assert "memory.dream.model.start" not in [row["type"] for row in captured["traces"]]
+
+
+def test_dream_job_cards_beyond_the_budget_are_partial_context_and_never_targets(monkeypatch):
+    # 20 cards of ~4,000 chars: the component renders the first 14.
+    reply = json.dumps({"consolidations": [{
+        "op": "supersede", "card_ids": ["mem_19"], "rationale": "更新",
+        "result": {"summary": "新摘要", "content": "新正文。"},
+    }]}, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(
+        monkeypatch, reply, cards=_dream_cards(20, body="正文" * 2000)
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    prompt = captured["prompts"][0]
+    assert "- id=mem_13 | bucket=life" in prompt and "- id=mem_14 |" not in prompt
+    assert captured["actions"] == []
+    types = [row["type"] for row in captured["traces"]]
+    context = next(row for row in captured["traces"]
+                   if row["type"] == "memory.extraction.context.error")
+    assert context["detail"]["component"] == "cards"
+    assert context["detail"]["outcome"] == "truncated"
+    assert types.index("memory.extraction.context.error") < types.index("memory.dream.model.start")
+    assert captured["traces"][-1]["detail"]["degraded_context"] is True
+    assert captured["traces"][-1]["detail"]["counts"]["active_cards"] == 14
+
+
+def _truncated_garden():
+    cards = _dream_cards(12)
+    cards[3]["content"] = "长" * 6000   # over the 5,000-char body cap -> TRUNCATED
+    return cards
+
+
+def test_dream_job_host_blocks_consolidations_touching_a_truncated_card(monkeypatch):
+    reply = json.dumps({"consolidations": [
+        {"op": "thicken", "card_ids": ["mem_3"], "rationale": "补充",
+         "result": {"summary": "只看了一半", "content": "重写的正文。"}},
+        {"op": "merge", "card_ids": ["mem_5", "mem_6"], "rationale": "同一件事",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+    ]}, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply, cards=_truncated_garden())
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    head = next(line for line in captured["prompts"][0].splitlines()
+                if line.startswith("- id=mem_3 |"))
+    assert head.endswith("| TRUNCATED")
+    assert [action["supersedes"] for action in captured["actions"]] == [["mem_5", "mem_6"]]
+    job_id, status, _reason, kwargs = _dream_final_status(captured)
+    assert status == "completed"
+    assert kwargs["extra"]["dream_result"]["truncated_rejected"] == 1
+
+
+def test_dream_job_fails_when_every_consolidation_touches_a_truncated_card(monkeypatch):
+    reply = json.dumps({"consolidations": [
+        {"op": "merge", "card_ids": ["mem_3", "mem_4"], "rationale": "同一件事",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+    ]}, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply, cards=_truncated_garden())
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert captured["actions"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (status, reason) == ("failed", "dream_truncated_card_rejected")
+    assert kwargs["extra"]["dream_result"]["truncated_rejected"] == 1
+    assert captured["traces"][-1]["type"] == "memory.dream.error"
+    assert captured["traces"][-1]["detail"]["outcome"] == "guard_rejected"
+
+
+def test_dream_job_fails_closed_on_a_memgarden_without_card_body_rendering(monkeypatch):
+    """Self-update switched code but the dependency install did not land: the
+    old component would give the model titles only. Fail before any model call."""
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    monkeypatch.setattr(crc.garden_component, "dream_kernel_renders_card_bodies", lambda: False)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert captured["prompts"] == []
+    job_id, status, reason, _kwargs = _dream_final_status(captured)
+    assert (status, reason) == ("failed", "dream_kernel_outdated")
+    assert captured["traces"][-1]["detail"]["outcome"] == "failed"
+
+
+def test_v1_dream_fuse_denominator_is_the_cards_the_model_saw(monkeypatch):
+    """Retiring 10 of the 12 cards the model saw trips the fuse even though the
+    garden read had more cards (they were never shown, so never at risk)."""
+    _patch_dream_envelope(monkeypatch)
+    card_map = {f"m{i}": {"id": f"m{i}", "content": f"卡{i}"} for i in range(12)}
+    rows = [
+        {"op": "merge", "card_ids": [f"m{i}", f"m{i + 1}"], "rationale": "同一线索",
+         "result": {"summary": "合并", "content": "合并正文。"}}
+        for i in range(0, 10, 2)
+    ]
+    with pytest.raises(ValueError, match="dream_blast_radius_exceeded"):
+        crc._dream_actions_from_consolidations(
+            rows, card_map=card_map, occurred_at="2026-09-15T00:00:00Z",
+            disclosed_count=12,
+        )
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        rows, card_map=card_map, occurred_at="2026-09-15T00:00:00Z",
+        disclosed_count=60,
+    )
+    assert len(actions) == 5
 
 
 class _DreamReadsideClient:
@@ -5803,10 +5948,14 @@ def _install_real_dream_read(monkeypatch, client):
 _DREAM_INDEX_OK = {"items": [
     {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life"},
     {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life"},
-], "limit": 1000, "truncated": False, "user_card_count": 2}
+    *_DREAM_FILLER_INDEX,
+    {"id": "mem_z", "title": "Legacy title only.", "category": "old"},
+], "limit": 1000, "truncated": False, "user_card_count": 10}
 _DREAM_FULL_CARDS = [
     {"id": "mem_a", "content": "Full card A body."},
     {"id": "mem_b", "content": "Full card B body."},
+    *({"id": item["id"], "content": f"Body of {item['id']}."} for item in _DREAM_FILLER_INDEX),
+    {"id": "mem_z", "body": "Legacy body field."},
 ]
 
 
@@ -5945,7 +6094,11 @@ def test_dream_job_reads_full_cards_through_the_strict_read(monkeypatch):
     crc._process_resident_jobs([job])
 
     assert client.paths == ["/v1/memory/index", "/v1/memory/fetch"]
+    # Bodies reach the model, legacy field names included (title/body/category).
     assert "Full card A body." in captured["prompts"][0]
+    assert "- id=mem_z | bucket=old" in captured["prompts"][0]
+    assert "summary: Legacy title only." in captured["prompts"][0]
+    assert "Legacy body field." in captured["prompts"][0]
     assert _dream_final_status(captured)[:3] == (
         "dream_dispatch", "completed", "dream_nothing_to_consolidate",
     )
@@ -6833,6 +6986,16 @@ def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatc
     assert seen == {"locale": "zh-Hans"}
 
 
+class _EmptyDreamSession:
+    def next_prompt(self):
+        return None
+
+    def result(self):
+        from memgarden import MaintenanceResult
+
+        return MaintenanceResult(needed=True)
+
+
 def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch):
     """The resident Dream call site must make the same language decision."""
     crc._seen_ids.clear()
@@ -6852,14 +7015,14 @@ def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch)
     }]
     seen = {}
 
-    def _fake_dream_prompt(**kwargs):
+    def _fake_open_dream_session(_garden, **kwargs):
         seen["locale"] = kwargs["locale"]
-        return "prompt"
+        return _EmptyDreamSession(), crc.garden_component.DreamDisclosure(needed=True)
 
     monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
     monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
     monkeypatch.setattr(crc, "_emit_resident_dream_lifecycle", lambda *_a, **_kw: None)
-    monkeypatch.setattr(crc, "_dream_cards_context", lambda: ("cards", {"c1": {}}))
+    monkeypatch.setattr(crc, "_dream_read_cards", lambda: [{"id": "c1", "summary": "s"}])
     monkeypatch.setattr(
         crc,
         "_capture_identity_context",
@@ -6868,14 +7031,7 @@ def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch)
     monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
     monkeypatch.setattr(
-        crc,
-        "build_dream_prompt",
-        _fake_dream_prompt,
-    )
-    monkeypatch.setattr(
-        crc,
-        "_memory_agent_parse_with_bounce",
-        lambda *_a, **_kw: (([], [], None), ""),
+        crc.garden_component, "open_dream_session", _fake_open_dream_session
     )
     job = {
         "schema_version": 2,

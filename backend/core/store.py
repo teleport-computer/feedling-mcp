@@ -2278,6 +2278,7 @@ class UserStore:
             "cards_superseded",
             "questions",
             "noop_reason",
+            "dream_skip_reason",
         }
         patch = {k: v for k, v in (fields or {}).items() if k in allowed}
         if not patch:

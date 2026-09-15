@@ -207,12 +207,6 @@ from memgarden import contracts as mg_contracts
 from memory import garden_component
 from memgarden.text.card_text import (
     count_user_token_residuals,
-    is_retryable_parse_error,
-)
-from memory.dream_prompt_v1 import (
-    build_dream_prompt,
-    build_dream_retry_prompt,
-    parse_dream_consolidations,
 )
 from chat.reply_language import (
     format_time_anchor,
@@ -17888,58 +17882,6 @@ def _capture_reply_shape(reply_text: str) -> dict[str, Any]:
     }
 
 
-def _memory_agent_parse_with_bounce(
-    prompt: str,
-    *,
-    parse,
-    build_retry_prompt,
-    lane: str,
-    job_id: str,
-) -> tuple[tuple, str]:
-    """跑一次记忆抽取,内容不合格就原样打回去重问一次。
-
-    弱模型(实测 minimax-M3)会把输出示例的骨架抄回来:JSON 合法、字段非空,
-    但 summary/content 是 ``...`` 或 ``[thickened summary]``。这类回复以前
-    静默落库,用户在花园里就看到空白卡。现在第一次严格判、不合格就带着
-    「哪个字段没填」重问一次;第二次放宽为「只丢脏卡、保留干净的」。
-
-    返回 ``(parsed, bounce)``:``parsed`` 是 parse 的原始元组,``bounce`` 是
-    ``""``/``bounced_ok``/``bounced_empty``/``bounced_failed``,只用于观测。
-    调用方仍然只看 parse 元组末位的 err 决定成败 —— 打回是内部实现,不改判成败的口径。
-    注意第二问全脏时 parse 会给 ``invalid_card_content_after_retry:*``,
-    调用方据此把 job 判失败:报成 noop 会推进 frontier 把这段窗口永久丢掉。
-    """
-    reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
-    _note_agent_turn_success()
-    parsed = parse(reply_text, strict=True)
-    err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memgarden.text.card_text)。两条 lane
-    # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
-    # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
-    # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
-    if not is_retryable_parse_error(err):
-        return parsed, ""
-    log.warning(
-        "%s content gate bounced id=%s reason=%s — re-asking once", lane, job_id, err
-    )
-    retry_text = _capture_agent_reply_text(
-        call_agent(build_retry_prompt(prompt, err), raw_text=True)
-    )
-    _note_agent_turn_success()
-    # 第二次放宽:脏行丢掉、干净的照收,不让一行占位符把整晚整理清零;
-    # 但一张干净的都没剩下时 parse 会报 *_after_retry,不伪装成成功。
-    retried = parse(retry_text, strict=False)
-    if retried[-1]:
-        log.warning("%s content gate retry still bad id=%s reason=%s", lane, job_id, retried[-1])
-        return retried, "bounced_failed"
-    if not retried[0]:
-        # 模型接受了「宁可留空」这条出路 —— 这是 prompt 想要的结果,不是失败。
-        log.info("%s content gate retry returned a clean empty result id=%s", lane, job_id)
-        return retried, "bounced_empty"
-    log.info("%s content gate retry recovered id=%s cards=%d", lane, job_id, len(retried[0]))
-    return retried, "bounced_ok"
-
-
 RETRIEVAL_CUES_MAX = 5
 RETRIEVAL_CUE_CHARS = 120
 
@@ -18761,58 +18703,51 @@ def _dream_fetch_items(ids: list[str]) -> dict[str, dict]:
     return by_id
 
 
-def _dream_card_field(card: dict, *names: str) -> str:
-    for name in names:
-        value = card.get(name)
-        if isinstance(value, str) and value.strip():
-            return re.sub(r"\s+", " ", value.strip())
-    return ""
+def _dream_read_cards() -> list[dict]:
+    """The Dream card window with full bodies, or ``DreamContextUnavailable``.
 
-
-def _dream_card_threads(card: dict) -> list[str]:
-    raw = card.get("threads") or card.get("thread") or []
-    values = raw if isinstance(raw, list) else [raw]
-    out: list[str] = []
-    for item in values:
-        text = str(item or "").strip()
-        if text and text not in out:
-            out.append(text[:80])
-    return out[:8]
-
-
-def _dream_cards_context() -> tuple[str, dict[str, dict]]:
+    Index order is kept; each card is its index item overlaid with the fetched
+    body. Nothing is rendered or trimmed here: the Garden component renders the
+    cards with their bodies and applies the prompt budget (see
+    ``memory.garden_component.open_dream_session``), and maps legacy field
+    names (title/body/category …) on the way in.
+    """
     index_items = _dream_index_items()
     ids = [str(item.get("id") or "").strip() for item in index_items if str(item.get("id") or "").strip()]
     fetched = _dream_fetch_items(ids)
-    merged: list[dict] = []
-    by_id: dict[str, dict] = {}
+    cards: list[dict] = []
     for item in index_items:
         memory_id = str(item.get("id") or "").strip()
         if not memory_id:
             continue
         # ``_dream_fetch_items`` guarantees every indexed id has its full body.
-        card = {**item, **fetched[memory_id]}
-        merged.append(card)
-        by_id[memory_id] = card
-    lines: list[str] = []
-    for card in merged:
-        memory_id = str(card.get("id") or "").strip()
-        bucket = _dream_card_field(card, "bucket", "category")
-        threads = _dream_card_threads(card)
-        summary = _dream_card_field(card, "summary", "title", "description")
-        content = _dream_card_field(card, "content", "body", "text", "plaintext")
-        parts = [f"- id={memory_id}"]
-        if bucket:
-            parts.append(f"bucket={bucket}")
-        if threads:
-            parts.append("threads=" + ",".join(threads))
-        if summary:
-            parts.append(f"summary={summary[:500]}")
-        if content and content != summary:
-            parts.append(f"content={content[:900]}")
-        lines.append(" | ".join(parts))
-    text = "\n".join(lines).strip()
-    return (text or "（暂无卡）")[:20000], by_id
+        cards.append({**item, **fetched[memory_id]})
+    return cards
+
+
+def _run_dream_session(session, tracker, *, job_id: str) -> tuple[list[dict], str | None, str, int]:
+    """Drive a Dream component session through the resident agent.
+
+    The component decides what to ask and whether to re-ask (content gate,
+    format re-ask once); the resident only calls the model — ``raw_text`` so
+    the chat-bubble sanitizer never touches the JSON. Returns
+    ``(consolidations, err, bounce, model_calls)``; ``bounce`` keeps the
+    established ``""``/``bounced_ok``/``bounced_empty``/``bounced_failed``
+    observation vocabulary.
+    """
+    calls = 0
+    while (prompt := session.next_prompt()) is not None:
+        reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+        _note_agent_turn_success()
+        calls += 1
+        session.feed(reply_text)
+    outcome = session.result()
+    consolidations = list(outcome.consolidations or [])
+    err = str(outcome.error) if outcome.error else None
+    bounce = tracker.bounce(cards=consolidations, error=err)
+    if bounce:
+        log.warning("dream content gate bounced id=%s outcome=%s", job_id, bounce)
+    return consolidations, err, bounce, calls
 
 
 def _dream_recent_conversations_context(
@@ -18856,6 +18791,7 @@ def _dream_actions_from_consolidations(
     *,
     card_map: dict[str, dict],
     occurred_at: str,
+    disclosed_count: int | None = None,
 ) -> tuple[list[dict], int, int, int, int, int]:
     # 2026-08-05 复盘只保留结构性判据(rationale 非空、目标卡真实存在、不重复退休)。
     # 语义审查员与 15% 增量栅栏(内容质量判断)已拆除;出口硬闸移到 parse 层
@@ -18917,7 +18853,9 @@ def _dream_actions_from_consolidations(
         cards_superseded += len(card_ids)
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
-    if memory_dream_gates.blast_radius_exceeded(cards_superseded, len(card_map)):
+    if memory_dream_gates.blast_radius_exceeded(
+        cards_superseded, len(card_map) if disclosed_count is None else disclosed_count
+    ):
         # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显不对
         # (834→1 事故的最后防线)。整个 job 失败等人查,不部分执行。
         raise ValueError("dream_blast_radius_exceeded")
@@ -18953,7 +18891,9 @@ def _emit_resident_dream_lifecycle(
     )
 
 
-def _emit_resident_dream_context_error(job_id: str) -> None:
+def _emit_resident_dream_context_error(
+    job_id: str, *, component: str = "memory_context", outcome: str = "unavailable"
+) -> None:
     _emit_debug_trace(
         "memory",
         memory_dream_trace.CONTEXT_TRACE_TYPE,
@@ -18962,8 +18902,8 @@ def _emit_resident_dream_context_error(job_id: str) -> None:
         explain="",
         detail=memory_dream_trace.context_detail(
             runtime="resident_v1",
-            component="memory_context",
-            outcome="unavailable",
+            component=component,
+            outcome=outcome,
         ),
         trace_id=job_id,
         job_id=job_id,
@@ -19006,7 +18946,7 @@ def _process_dream_jobs(jobs: list) -> float:
         )
         update_proactive_job_status(job_id, "realizing")
         try:
-            cards_text, card_map = _dream_cards_context()
+            dream_cards = _dream_read_cards()
         except DreamContextUnavailable:
             # A failed read is not an empty garden: fail the job so the backend
             # applies the Dream failure backoff and leaves the ledger alone.
@@ -19049,8 +18989,8 @@ def _process_dream_jobs(jobs: list) -> float:
                 counts=dream_counts,
             )
             raise
-        dream_counts["active_cards"] = len(card_map)
-        if not card_map:
+        dream_counts["active_cards"] = len(dream_cards)
+        if not dream_cards:
             update_proactive_job_status(
                 job_id,
                 "completed",
@@ -19087,40 +19027,111 @@ def _process_dream_jobs(jobs: list) -> float:
             user_label=user_name, agent_label=ai_name
         )
         _dream_buckets, _dream_threads = _capture_memory_terms_context()
-        prompt = build_dream_prompt(
-            ai_name=ai_name,
-            user_name=user_name,
-            cards=cards_text,
-            recent_conversations=recent_text,
-            # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
-            # 证据也要同一套 —— 光同源不同证据，一样会判出两个结果。
-            locale=infer_garden_language(
-                _identity,
-                written=_dream_written,
-                existing_buckets=_dream_buckets,
-                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
-            ),
-        )
-        # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
-        # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
-        dream_known_ids = frozenset(card_map)
+        # 整理走 GardenComponent 的会话：提示词（带正文的卡片区、预算截断、TRUNCATED
+        # 标记）、解析、内容闸与重问都在组件里；resident 只负责调模型。
+        # known_ids（墓碑卡守卫）覆盖读到的全部卡，由组件的解析同路打回重问。
+        _dream_tracker = garden_component.BounceTracker()
+        try:
+            dream_session, dream_disclosure = garden_component.open_dream_session(
+                garden_component.build_garden(
+                    garden_component.CallableModel(lambda _prompt: ""),
+                    on_step=_dream_tracker,
+                ),
+                cards=dream_cards,
+                # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
+                # 证据也要同一套 —— 光同源不同证据，一样会判出两个结果。
+                locale=infer_garden_language(
+                    _identity,
+                    written=_dream_written,
+                    existing_buckets=_dream_buckets,
+                    archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+                ),
+                ai_name=ai_name,
+                user_name=user_name,
+                recent_conversations=recent_text,
+            )
+        except garden_component.DreamKernelOutdated:
+            # The installed memgarden cannot render card bodies (a self-update
+            # that switched code but did not finish installing dependencies).
+            # Its titles-only prompt would let the model rewrite bodies it never
+            # saw: fail this run (backoff, ledger untouched) instead.
+            reason = garden_component.DREAM_KERNEL_OUTDATED
+            log.error("dream job id=%s: installed memgarden cannot render card bodies", job_id)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": reason,
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="failed",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
+            continue
+        if dream_disclosure.skip_reason:
+            # The component judged the garden too small to consolidate (same
+            # verdict V2 records as a skip). Not a completion — the Dream ledger
+            # must not advance as if a consolidation ran — and not a failure.
+            update_proactive_job_status(
+                job_id,
+                "skipped",
+                dream_disclosure.skip_reason,
+                extra={
+                    "wake_result": "skipped",
+                    "dream_skip_reason": dream_disclosure.skip_reason,
+                    "dream_result": {
+                        "status": "skipped",
+                        "reason": dream_disclosure.skip_reason,
+                        "job_kind": "memory_dream",
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": dream_disclosure.skip_reason,
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.done",
+                job_id=job_id,
+                status="ok",
+                outcome="skipped",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
+            continue
+        dream_degraded_context = dream_disclosure.partial
+        if dream_degraded_context:
+            # Cards beyond the component's prompt budget wait for a later night:
+            # an intentional partial context, visible as ``truncated``.
+            _emit_resident_dream_context_error(
+                job_id, component="cards", outcome="truncated"
+            )
+        dream_counts["active_cards"] = len(dream_disclosure.rendered_ids)
         _emit_resident_dream_lifecycle(
             "memory.dream.model.start",
             job_id=job_id,
             status="ok",
             outcome="started",
             started_at=dream_started,
+            degraded_context=dream_degraded_context,
             counts=dream_counts,
         )
+        # The component does not return the model's "questions_to_ask"; Dream
+        # questions were only ever stored on the job, never asked (V2 drops them).
+        questions: list = []
         try:
-            (consolidations, questions, err), bounce = _memory_agent_parse_with_bounce(
-                prompt,
-                parse=lambda raw, strict=True: parse_dream_consolidations(
-                    raw, strict=strict, known_ids=dream_known_ids
-                ),
-                build_retry_prompt=build_dream_retry_prompt,
-                lane="dream",
-                job_id=job_id,
+            consolidations, err, bounce, dream_calls = _run_dream_session(
+                dream_session, _dream_tracker, job_id=job_id
             )
             _emit_agent_turn_success(
                 foreground=False,
@@ -19157,6 +19168,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome="provider_failed",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             _emit_resident_dream_lifecycle(
@@ -19165,10 +19177,11 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome="provider_failed",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
-        dream_counts["model_attempts"] = 2 if bounce else 1
+        dream_counts["model_attempts"] = max(1, dream_calls)
         dream_counts["proposals"] = len(consolidations or [])
         if err:
             update_proactive_job_status(
@@ -19190,6 +19203,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome=model_outcome,
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             _emit_resident_dream_lifecycle(
@@ -19198,6 +19212,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome=model_outcome,
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19208,8 +19223,51 @@ def _process_dream_jobs(jobs: list) -> float:
             status="ok",
             outcome=("accepted" if consolidations else "no_proposals"),
             started_at=dream_started,
+            degraded_context=dream_degraded_context,
             counts=dream_counts,
         )
+
+        # Host-side hard block: the prompt forbids rewriting a card the model
+        # only saw part of (TRUNCATED), but a prompt is not a guarantee. Drop
+        # those proposals; if every proposal was one, fail (ledger untouched)
+        # rather than complete as "nothing to consolidate".
+        consolidations, truncated_rejected = garden_component.reject_truncated_consolidations(
+            consolidations, dream_disclosure.truncated_ids
+        )
+        if truncated_rejected:
+            log.warning(
+                "dream truncated-card guard id=%s rejected=%d kept=%d",
+                job_id, truncated_rejected, len(consolidations),
+            )
+        if truncated_rejected and not consolidations:
+            reason = garden_component.DREAM_TRUNCATED_CARD_REJECTED
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {
+                        "status": "failed",
+                        "reason": reason,
+                        "job_kind": "memory_dream",
+                        "truncated_rejected": truncated_rejected,
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": reason,
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="guard_rejected",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            continue
 
         user_token_residual = sum(
             count_user_token_residuals(row.get("result") or {})
@@ -19241,9 +19299,10 @@ def _process_dream_jobs(jobs: list) -> float:
             _emit_resident_dream_lifecycle(
                 "memory.dream.done",
                 job_id=job_id,
-                status="ok",
+                status="warning" if dream_degraded_context else "ok",
                 outcome="noop",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19262,8 +19321,15 @@ def _process_dream_jobs(jobs: list) -> float:
                 merged_count,
             ) = _dream_actions_from_consolidations(
                 consolidations,
-                card_map=card_map,
+                # Retirable = cards the model saw in full this run; the fuse
+                # denominator = every card it saw (same meaning as before the
+                # component took over the prompt budget).
+                card_map={
+                    str(card.get("id") or "").strip(): card
+                    for card in dream_disclosure.editable_cards()
+                },
                 occurred_at=occurred_at,
+                disclosed_count=len(dream_disclosure.rendered_ids),
             )
             dream_counts.update({
                 "actions": len(actions),
@@ -19300,6 +19366,7 @@ def _process_dream_jobs(jobs: list) -> float:
                     else "mapping_rejected"
                 ),
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19325,6 +19392,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome=("write_failed" if dream_stage == "write" else "failed"),
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19366,6 +19434,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome="write_rejected",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19386,7 +19455,8 @@ def _process_dream_jobs(jobs: list) -> float:
                     "job_kind": "memory_dream",
                     "consolidations": len(consolidations),
                     "actions": len(actions),
-                    "active_cards": len(card_map),
+                    "active_cards": len(dream_disclosure.rendered_ids),
+                    "truncated_rejected": truncated_rejected,
                     "questions": len(questions),
                     "cards_thickened": cards_thickened,
                     "organized_count": organized_count,
@@ -19426,6 +19496,7 @@ def _process_dream_jobs(jobs: list) -> float:
             status=("warning" if observation["failed_count"] else "ok"),
             outcome=("partial" if observation["failed_count"] else "applied"),
             started_at=dream_started,
+            degraded_context=dream_degraded_context,
             counts=dream_counts,
         )
     return latest

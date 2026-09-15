@@ -2141,6 +2141,60 @@ def test_verified_empty_no_cards_completion_is_trusted(tmp_path, monkeypatch):
     assert state["dream_fail_streak"] == 0
 
 
+def test_resident_dream_small_garden_skip_spaces_the_next_attempt(tmp_path, monkeypatch):
+    """A resident Dream the Garden component skipped ("garden too small") is
+    neither a consolidation (ledger stays) nor a failure (no backoff), and the
+    next tick waits min_interval instead of re-enqueueing the same no-op."""
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_resident_skip", cards=2
+    )
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "3600")
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "skipped",
+            "reason": "not_enough_new_cards",
+            "wake_result": "skipped",
+            "dream_skip_reason": "not_enough_new_cards",
+            "dream_result": {"status": "skipped", "reason": "not_enough_new_cards",
+                             "job_kind": "memory_dream"},
+            "noop_reason": "not_enough_new_cards",
+        },
+    )
+    after = client.post("/v1/dream/tick", headers=headers, json={"now": 2100.0})
+
+    patched = done.get_json()["job"]
+    assert patched["status"] == "skipped"
+    assert patched["dream_skip_reason"] == "not_enough_new_cards"
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["dream_fail_streak"] == 0
+    assert state["last_dream_skip_reason"] == "not_enough_new_cards"
+    assert after.get_json()["enqueued"] is False
+    assert after.get_json()["reason"] == "not_enough_new_cards"
+
+
+def test_resident_dream_skip_reason_outside_the_scheduler_vocabulary_is_dropped(
+    tmp_path, monkeypatch,
+):
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_resident_skip_junk", cards=2
+    )
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={"status": "skipped", "reason": "x", "dream_skip_reason": "mem_secret_id"},
+    )
+
+    assert "dream_skip_reason" not in done.get_json()["job"]
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["last_dream_skip_reason"] == ""
+
+
 def test_legacy_no_cards_completion_with_no_live_cards_stays_completed(tmp_path, monkeypatch):
     store, client, headers, job = _dream_no_cards_setup(
         monkeypatch, tmp_path, "usr_dream_cards_gone", cards=1
