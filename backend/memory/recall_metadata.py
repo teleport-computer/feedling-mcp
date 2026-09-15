@@ -1,23 +1,17 @@
-"""Bounded memory recall projections; no persistence, IO or model calls."""
+"""Bounded memory recall projections; no persistence, IO or model calls.
+
+Cue normalization is memgarden's ``prompts.recall_fields.retrieval_cues`` and
+the one-hop related read is ``memgarden.related.one_hop`` (fed through
+``card_shape.to_related_card``); what stays here is io's own projection of
+envelope link fields and the "new in the last 7 days" product policy.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from memgarden.prompts.recall_fields import retrieval_cues
+
 from memory import card_shape
-
-
-def cues(value: object) -> list[str]:
-    """Optional hints are data, not evidence; never stringify nested objects."""
-    result: list[str] = []
-    for item in value if isinstance(value, list) else []:
-        if not isinstance(item, str):
-            continue
-        text = " ".join(item.split())[:120]
-        if text and text not in result:
-            result.append(text)
-        if len(result) == 5:
-            break
-    return result
 
 
 def links(value: object) -> list[str]:
@@ -28,7 +22,7 @@ def links(value: object) -> list[str]:
 
 def fields(inner: dict, envelope: dict) -> dict:
     result = {}
-    hints = cues(inner.get("retrieval_cues"))
+    hints = retrieval_cues(inner.get("retrieval_cues"))
     if hints:
         result["retrieval_cues"] = hints
     for key in ("anchor_memory_ids", "supersedes"):
@@ -36,39 +30,6 @@ def fields(inner: dict, envelope: dict) -> dict:
         if values:
             result[key] = values
     return result
-
-
-def one_hop(sources: list[dict], candidates: list[dict], *, cap: int = 6) -> list[dict]:
-    """Callers supply only same-user readable cards. No recursive expansion."""
-    excluded = {c.get("id") for c in sources}
-    found = {}
-    for source in sources:
-        anchors = links(source.get("anchor_memory_ids"))
-        supersedes = links(source.get("supersedes"))
-        threads = links(source.get("threads"))
-        for card in candidates:
-            mid = card.get("id")
-            if not isinstance(mid, str) or mid in excluded:
-                continue
-            reason = ("anchor" if mid in anchors else "supersedes" if mid in supersedes
-                      else "thread" if set(threads).intersection(links(card.get("threads")))
-                      else "")
-            if card_shape.is_retired(card) and not (
-                reason in {"anchor", "supersedes"} and card.get("status") == "superseded"
-            ):
-                continue
-            summary = " ".join(card_shape.summary_of(card).split())
-            if reason and summary:
-                rank = (0 if reason != "thread" else 1, str(source.get("id") or ""), reason)
-                if mid in found and found[mid][0] <= rank:
-                    continue
-                found[mid] = (rank, {
-                    "id": mid, "summary": summary[:120],
-                    "source_id": source.get("id"), "relation": reason,
-                    "status": str(card.get("status") or "active"),
-                })
-    ordered = sorted(found.values(), key=lambda item: (item[0][0], str(item[1]["id"])))
-    return [item for _, item in ordered[:cap]]
 
 
 def recent_cards(cards: list[dict], *, now: datetime | None = None, cap: int = 3) -> list[dict]:

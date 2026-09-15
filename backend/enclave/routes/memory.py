@@ -40,9 +40,11 @@ async def v1_memory_index(request: Request):
     query = str(payload.get("query") or "").strip()
 
     protocol = payload.get("search_protocol")
-    if query and protocol not in (None, search_contract.VERSION):
+    # PREVIOUS keeps a not-yet-restarted backend on the exact old ranking during
+    # a rolling restart; anything else unknown fails explicitly.
+    if query and protocol not in (None, search_contract.VERSION, search_contract.PREVIOUS):
         return JSONResponse({"error": "memory_search_protocol_unsupported"}, status_code=400)
-    if query and protocol == search_contract.VERSION:
+    if query and protocol in (search_contract.VERSION, search_contract.PREVIOUS):
         try:
             result = await anyio.to_thread.run_sync(
                 memory_search.search, moments, user_id or "", content_sk, payload)

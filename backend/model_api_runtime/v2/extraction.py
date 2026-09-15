@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 import os
 from typing import Any, Awaitable, Callable, NamedTuple
 
+from memgarden.prompts.recall_fields import retrieval_cues
+
 import provider_client
 from notices import error_contract
 
@@ -550,12 +552,9 @@ def _inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
-    # Optional future-package field: keep it inside the encrypted body. Old
-    # parsers omit it; no dependency on an unpublished memgarden API.
-    raw_cues = card.get("retrieval_cues")
-    cues = list(dict.fromkeys(" ".join(c.split())[:120] for c in
-                             (raw_cues if isinstance(raw_cues, list) else [])
-                             if isinstance(c, str) and c.strip()))[:5]
+    # Optional field: keep it inside the encrypted body. Normalized by the
+    # same memgarden rule every reader uses.
+    cues = retrieval_cues(card.get("retrieval_cues"))
     if cues:
         inner["retrieval_cues"] = cues
     # 溯源提示:这张卡来自一个含该通电话的 capture 窗口,agent 可据此调

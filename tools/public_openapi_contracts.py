@@ -1735,7 +1735,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "MemoryIndexRequest": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "maxLength": 500, "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."},
+            "query": {"type": "string", "maxLength": 500, "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Very common words (stopwords) are ignored, and a card is returned only when it covers enough of the query (or has strong evidence such as a rare identifier); a query nothing matches returns no items, never filler. Blank/omitted: existing index browsing."},
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
@@ -1754,8 +1754,8 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "limit": {"type": "integer", "minimum": 1},
             "truncated": {"type": "boolean", "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."},
             "user_card_count": {"type": "integer", "minimum": 0},
-            "ranking": {"type": "string", "enum": ["bm25-jieba-0.42.1-v1", "substring-legacy"],
-                        "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."},
+            "ranking": {"type": "string", "enum": ["memgarden-bm25-v1+tok:jieba-0.42.1", "bm25-jieba-0.42.1-v1", "substring-legacy"],
+                        "description": "Present for nonblank query. memgarden-bm25-v1+tok:jieba-0.42.1 is the current ranker (shared with automatic recall). bm25-jieba-0.42.1-v1 and substring-legacy explicitly mark older rankers answered during rolling upgrades."},
             "unavailable_count": {"type": "integer", "minimum": 0,
                                   "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."},
         },

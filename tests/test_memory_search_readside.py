@@ -6,13 +6,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import memory_bm25
 import memory_readside_core
 import content_encryption
 import nacl.public
 import memory_search_contract as contract
 from asgi_test_client import _AsgiTestClient
-from enclave import auth, backend_client, keys, readside, state
+from enclave import auth, backend_client, keys, memory_search, readside, state
 from enclave import routes
 
 
@@ -73,14 +72,14 @@ def test_global_stats_include_other_buckets_and_ignore_unreadable(client, monkey
             *[moment(f"other{i}", "coffee", bucket="other") for i in range(20)],
             moment("foreign", "repair repair", owner="someone_else")]
     seen = []
-    original = memory_bm25.corpus_stats
+    original = memory_search.retrieval.rank
 
-    def observe(documents):
-        stats = original(documents)
-        seen.append(stats.documents)
-        return stats
+    def observe(query, candidates, **kw):
+        result = original(query, candidates, **kw)
+        seen.append(result.trace["candidates"])
+        return result
 
-    monkeypatch.setattr(memory_bm25, "corpus_stats", observe)
+    monkeypatch.setattr(memory_search.retrieval, "rank", observe)
     response = search(client, rows, bucket="topic")
     assert response.status_code == 200
     assert [i["id"] for i in response.get_json()["items"]] == ["b"]
@@ -167,9 +166,75 @@ def test_resource_failure_http_contract_and_v2_legacy_visibility(monkeypatch):
     assert compact["unavailable_count"] == 2
 
 
-@pytest.mark.asyncio
-async def test_lifespan_prewarms_before_serving(monkeypatch):
+def test_lifespan_prewarms_before_serving(monkeypatch):
+    import asyncio
+    from memory import jieba_tokenizer
     called = []
-    monkeypatch.setattr(memory_bm25, "prewarm", lambda: called.append("warm"))
-    async with routes.lifespan(None):
-        assert called == ["warm"]
+    monkeypatch.setattr(jieba_tokenizer, "prewarm", lambda: called.append("warm"))
+
+    async def run():
+        async with routes.lifespan(None):
+            assert called == ["warm"]
+
+    asyncio.run(run())
+    assert called == ["warm"]
+
+
+def test_previous_protocol_is_served_for_a_backend_mid_rolling_restart(client):
+    garden = [moment("drama", "我的解放日志"), moment("cat", "猫咪体检指标偏高"),
+              *[moment(f"f{i}", f"第{i}次整理工作笔记") for i in range(8)]]
+    old = search(client, garden, query="我叫什么名字", limit=5,
+                 search_protocol=contract.PREVIOUS).get_json()
+    assert old["ranking"] == contract.PREVIOUS
+    assert old["items"]  # the old ranker returns stopword-only matches
+    new = search(client, garden, query="我叫什么名字", limit=5).get_json()
+    assert new["ranking"] == contract.VERSION
+    assert new["items"] == []
+
+
+def test_new_backend_retries_old_protocol_only_on_explicit_unsupported(monkeypatch):
+    from types import SimpleNamespace
+    rows = [moment("a", "coffee")]
+    monkeypatch.setattr(memory_readside_core.memory_service, "_load_moments", lambda _: rows)
+    calls = []
+
+    def old_enclave(api_key, candidates, *, operation, payload):
+        calls.append(payload["search_protocol"])
+        if payload["search_protocol"] != contract.PREVIOUS:
+            raise RuntimeError('enclave_http_400:{"error":"memory_search_protocol_unsupported"}')
+        return {"user_id": "owner", "items": [{"id": "a", "summary": "coffee"}],
+                "unavailable_ids": [], "ranking": contract.PREVIOUS}
+
+    out = memory_readside_core.memory_index_core(
+        SimpleNamespace(user_id="owner"), "k", {"query": "coffee", "limit": 1},
+        post_enclave=old_enclave)
+    assert calls == [contract.VERSION, contract.PREVIOUS]
+    assert out["ranking"] == contract.PREVIOUS and [i["id"] for i in out["items"]] == ["a"]
+
+    for error in ("enclave_http_400:{\"error\":\"moments must be a list\"}",
+                  "enclave_http_503:memory_search_protocol_unsupported", "enclave_error:ReadTimeout"):
+        calls.clear()
+
+        def failing(api_key, candidates, *, operation, payload, error=error):
+            calls.append(payload["search_protocol"])
+            raise RuntimeError(error)
+
+        with pytest.raises(RuntimeError):
+            memory_readside_core.memory_index_core(
+                SimpleNamespace(user_id="owner"), "k", {"query": "coffee", "limit": 1},
+                post_enclave=failing)
+        assert calls == [contract.VERSION]
+
+
+def test_unknown_ranking_label_is_still_rejected(monkeypatch):
+    from types import SimpleNamespace
+    rows = [moment("a", "coffee")]
+    monkeypatch.setattr(memory_readside_core.memory_service, "_load_moments", lambda _: rows)
+
+    def future(api_key, candidates, *, operation, payload):
+        return {"user_id": "owner", "items": [], "unavailable_ids": [], "ranking": "future-v9"}
+
+    with pytest.raises(RuntimeError, match="enclave_invalid_readside_response"):
+        memory_readside_core.memory_index_core(
+            SimpleNamespace(user_id="owner"), "k", {"query": "coffee", "limit": 1},
+            post_enclave=future)

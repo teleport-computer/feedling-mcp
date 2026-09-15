@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 
+from memgarden.prompts.recall_fields import retrieval_cues
+
 from enclave import envelope
 from memory import recall_metadata
 
@@ -180,7 +182,7 @@ def build_memory_search_item(envelope: dict, inner: dict) -> dict:
     adapted = memory_inner_to_v1(inner, envelope)
     item = build_memory_index_item(envelope, inner)
     item["_search_content"] = "\n".join([adapted.get("content", ""),
-                                           *recall_metadata.cues(inner.get("retrieval_cues"))])
+                                           *retrieval_cues(inner.get("retrieval_cues"))])
     return item
 
 

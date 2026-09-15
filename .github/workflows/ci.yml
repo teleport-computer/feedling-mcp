@@ -965,8 +965,10 @@ jobs:
             tests/test_capability_web.py \
             tests/test_web_fetch_result_budget.py \
             tests/test_memory_result_budget.py \
-            tests/test_memory_bm25.py \
-            tests/test_memory_bm25_readside.py \
+            tests/test_memory_search_rank.py \
+            tests/test_memory_search_readside.py \
+            tests/test_memory_related_read.py \
+            tests/test_enclave_recall_unified.py \
             tests/test_web_search_duckduckgo.py \
             tests/test_image_generation_model.py \
             tests/test_t534_caption_hop_trace.py \

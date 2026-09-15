@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from memgarden.prompts.recall_fields import retrieval_cues
+
 
 @dataclass(frozen=True)
 class FieldMap:
@@ -103,16 +105,43 @@ def text_for_match(card: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> str:
         if text
     ]
     # Optional producer-authored hints are matching data, never card body.
-    hints = card.get("retrieval_cues")
-    canonical_parts.extend(" ".join(c.split())[:120] for c in
-                           (hints[:5] if isinstance(hints, list) else [])
-                           if isinstance(c, str) and c.strip())
+    # memgarden's normalization: strings only, whitespace-collapsed, <=120
+    # chars, deduplicated, the first five *valid* cues (non-strings and repeats
+    # no longer take a seat, as they did when this sliced before filtering).
+    canonical_parts.extend(retrieval_cues(card.get("retrieval_cues")))
 
     if not canonical_parts:
         return legacy_text
     if not legacy_text.strip():
         return " ".join(canonical_parts)
     return legacy_text + " " + " ".join(canonical_parts)
+
+
+_RETIRED_STATUSES = frozenset({"archived", "superseded", "deleted"})
+
+
+def to_related_card(raw: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> dict:
+    """Translate an io card for ``memgarden.related.one_hop``.
+
+    memgarden only reads canonical lifecycle (``status`` / ``superseded_by`` /
+    ``archived``) and ``summary``. io's legacy archive markers become
+    ``status="archived"``, except a card already ``superseded`` (or otherwise
+    retired) keeps its status: a historical version reachable along an explicit
+    link must not turn into an archived card that never appears. Title-style
+    cards get their summary from :func:`summary_of`. Everything else is copied.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    out["summary"] = summary_of(raw, field_map)
+    legacy_archived = (
+        raw.get("is_archived") is True
+        or str(raw.get("archived_at") or "").strip()
+        or str(raw.get("archive_reason") or "").strip()
+    )
+    if legacy_archived and str(raw.get("status") or "").lower() not in _RETIRED_STATUSES:
+        out["status"] = "archived"
+    return out
 
 
 def has_matchable_text(card: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> bool:
