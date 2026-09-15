@@ -54,6 +54,23 @@ change must not be interpreted as an API guarantee.
   one-hop read with unchanged results. A backend and enclave on different
   versions during a restart still agree on `bm25-jieba-0.42.1-v1`.
 
+- **History imports now write memory cards through Memory Garden's import session.**
+  This covers `POST /v1/genesis/imports/plaintext` (onboarding and `add_memory`),
+  encrypted chunked imports (`POST /v1/genesis/imports`), the resident distill jobs
+  run by self-hosted consumers, and the legacy `POST /v1/history_import/upload`.
+  Cards are judged and written batch by batch, so a retried import continues from
+  the next unfinished batch instead of starting over. Cards are written in the
+  language of the uploaded material (English material no longer yields Chinese cards).
+  Cards already in the garden are shown to the model, so importing the same material
+  again merges into them rather than duplicating them. Card dates come from timestamps
+  in the material. Long-term memory archives still fall back to the relationship
+  start date. The Identity Card is derived in a separate step. Response shapes are
+  unchanged. On the legacy upload job, `candidate_count` and
+  `candidate_cluster_count` now report cards judged and written, because there is no
+  separate candidate stage anymore. Imports already in progress with the previous
+  pipeline finish on it. Operator setting `FEEDLING_GARDEN_IMPORT_STRATEGY` can be
+  `two_pass` (the default) or `single_pass`.
+
 - **Automatic Memory Dream runs no longer all start when the night window opens.**
   Each account now has a per-user offset inside the 02:00–05:00 window (in the
   user's timezone) that stays fixed within a night and rotates between nights,

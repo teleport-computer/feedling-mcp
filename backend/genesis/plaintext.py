@@ -30,6 +30,7 @@ from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
 from identity.user_naming import sanitize_user_name
+from memory import garden_import
 from notices import catalog
 from notices import core as notices_core
 
@@ -644,18 +645,42 @@ def _plaintext_voice_task_id(source_pass: int, source_family: str) -> str:
 class _PlaintextCheckpointProgress:
     """Encrypted fact/voice map checkpoint plus the non-content progress projection."""
 
-    def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict]):
+    def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict],
+                 *, use_garden: bool = False):
         self.store = store
         self.api_key = api_key
         self.job_id = job_id
         self.source_groups = source_groups
         loaded = service.load_genesis_checkpoint(store, api_key, job_id)
         self.doc = checkpoint.resume(loaded) if loaded else checkpoint.new_checkpoint()
+        # 升级前开始的 job（checkpoint 里已经有 fact_map 进度、没有引擎标记）在旧流水线上
+        # 跑完；其余一律走 memgarden 导入会话，并把标记写进 checkpoint，重试时不会换回来。
+        # ``use_garden`` 只对写记忆卡的模式（onboarding / add_memory）为 True；
+        # update_identity 不写卡，进度照旧按窗口任务算。
+        self.legacy = (not use_garden) or _checkpoint_is_legacy(self.doc)
+        if not self.legacy:
+            self.doc["import_engine"] = garden_import.ENGINE
         self.doc.setdefault("map_outputs", {})
         if _voice_checkpoint_enabled():
             self.doc.setdefault("voice_outputs", {})
         service.write_genesis_checkpoint(store, job_id, self.doc)
         self.publish(stage="plaintext_reducer")
+
+    # -- memgarden 导入会话的进度（加密 checkpoint 里的 ``garden_import``） ------ #
+
+    def garden_state(self, *, locale: str, user_name: str) -> dict:
+        """这个 job 的导入进度。第一次调用定下 locale/称呼/策略，续跑沿用存下的值。"""
+        state = self.doc.get("garden_import")
+        if not garden_import.is_state(state):
+            state = garden_import.new_state(locale=locale, user_name=user_name)
+            self.save_garden(state)
+        return state
+
+    def save_garden(self, state: dict) -> None:
+        # 两段式候选、写到一半的卡都在里面（用户内容）—— 走同一个加密 checkpoint，
+        # 不单独落明文。可见进度由调用方每批 publish 一次。
+        self.doc["garden_import"] = state
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
 
     def _task_id(self, source_pass: int, source_family: str) -> str:
         return _plaintext_map_task_id(source_pass, source_family)
@@ -799,7 +824,39 @@ class _PlaintextCheckpointProgress:
             source_pass=source_pass,
         )
 
+    def _garden_materials(self, *, active_pass: int = 0) -> list[dict]:
+        state = self.doc.get("garden_import") if isinstance(self.doc.get("garden_import"), dict) else {}
+        sessions = state.get("sessions") if isinstance(state.get("sessions"), dict) else {}
+        materials: list[dict] = []
+        for source_pass, group in enumerate(self.source_groups, start=1):
+            family = str(group.get("source_family") or "history")
+            total = len(group.get("chunk_texts") or [])
+            suffix = f":{source_pass}:{family}"
+            done = cards = 0
+            for key, entry in sessions.items():
+                if not str(key).endswith(suffix) or not isinstance(entry, dict):
+                    continue
+                done += garden_import.entry_windows_done(entry)[0]
+                cards += int(entry.get("cards_written") or 0)
+            done = min(done, total)
+            if total and done >= total:
+                status = "done"
+            elif source_pass == active_pass or done:
+                status = "processing"
+            else:
+                status = "queued"
+            materials.append({
+                "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
+                "status": status,
+                "windows_done": done,
+                "windows_total": total,
+                "cards": cards,
+            })
+        return materials
+
     def materials(self, *, active_pass: int = 0) -> list[dict]:
+        if not self.legacy:
+            return self._garden_materials(active_pass=active_pass)
         materials: list[dict] = []
         outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
         material_cards = self.doc.get("material_cards") if isinstance(self.doc.get("material_cards"), dict) else {}
@@ -871,6 +928,19 @@ class _PlaintextCheckpointProgress:
             output=output,
             processed_chunks=self.processed_chunks(),
         )
+
+
+def _checkpoint_is_legacy(doc: dict | None) -> bool:
+    """旧流水线开始过、还没跑完的 job：没有引擎标记，但已经有 fact_map/voice 进度。
+
+    只看「有没有进度」而不是「有没有 checkpoint」—— checkpoint 在 job 一开始就会写一个
+    空的，那种还什么都没做的 job 直接走新引擎，不需要为它保留旧路径。"""
+    if not isinstance(doc, dict):
+        return False
+    if str(doc.get("import_engine") or "") == garden_import.ENGINE:
+        return False
+    return bool(doc.get("map_outputs") or doc.get("tasks") or doc.get("voice_outputs")
+                or doc.get("material_cards"))
 
 
 def _find_reusable_plaintext_job(
@@ -2378,12 +2448,38 @@ def _run_plaintext_genesis_job(
         )
         llm = GenesisLLMClient(canary=True)
         progress = _PlaintextCheckpointProgress(
-            store, api_key, job_id, source_groups
+            store, api_key, job_id, source_groups,
+            use_garden=mode in {"onboarding", "add_memory"},
         )
         user_name = _resolve_plaintext_user_name(
             store, api_key, runtime, source_groups
         )
 
+        if mode == "add_memory" and not progress.legacy:
+            from genesis import plaintext_garden
+
+            _trace_genesis(store, "genesis.plaintext.add_memory.started", job_id=job_id,
+                           summary="add memory job started", detail={"engine": garden_import.ENGINE})
+            plaintext_garden.run_add_memory(
+                store, api_key, job_id, runtime=runtime, source_groups=source_groups,
+                relationship_anchor=relationship_anchor, analysis_messages=analysis_messages,
+                user_name=user_name, llm=llm, progress=progress)
+            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
+                           detail={"mode": mode, "engine": garden_import.ENGINE},
+                           dur_ms=(time.time() - started_at) * 1000)
+            return
+        if mode == "onboarding" and not progress.legacy:
+            from genesis import plaintext_garden
+
+            path = plaintext_garden.run_onboarding(
+                store, api_key, job_id, runtime=runtime, source_groups=source_groups,
+                relationship_anchor=relationship_anchor, analysis_messages=analysis_messages,
+                user_name=user_name, llm=llm, progress=progress)
+            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="plaintext genesis job done",
+                           detail={"mode": mode, "engine": garden_import.ENGINE,
+                                   "genesis_v2": path == "genesis_v2"},
+                           dur_ms=(time.time() - started_at) * 1000)
+            return
         if mode == "add_memory":
             _trace_genesis(store, "genesis.plaintext.add_memory.started", job_id=job_id, summary="add memory job started")
             _run_plaintext_add_memory_job(

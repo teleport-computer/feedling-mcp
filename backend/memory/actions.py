@@ -19,6 +19,7 @@ from memgarden.text import card_text
 from memory import service as memory_service
 from memgarden import timestamps as memory_timestamps
 from memgarden.prompts.buckets import normalize_bucket_language
+from memgarden.prompts import recall_fields
 from memory.source_policy import (
     MAX_MEMORY_SUPERSEDE_TARGETS,
     MEMORY_CAPTURE_MODE_VALUES,
@@ -290,12 +291,19 @@ def _memory_inner_from_action(
     # ⚠️ 注意:这并非「所有写入路径的唯一关口」—— capture/dream/migrate/history-import 等
     # 后台路径提前封信封、绕过本函数(见 card_text/各 pre-seal 点的同源 guard)。
     bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
-    return {
+    inner = {
         "summary": summary,
         "content": content,
         "bucket": bucket,
         "threads": threads,
     }
+    # 检索线索（memgarden 写卡时给的 3-5 个搜索提示）。只在调用方给了时才进加密正文 ——
+    # 历史导入走这条明文 action 路径，不带过来的话导入卡永远比日常落卡少一截可检索文本。
+    # 没给这个字段时 inner 与之前逐字节一致。清洗口径与 V2 envelope 路径同源。
+    cues = recall_fields.retrieval_cues(data.get("retrieval_cues"))
+    if cues:
+        inner["retrieval_cues"] = cues
+    return inner
 
 
 def _memory_validate_write(

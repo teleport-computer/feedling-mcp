@@ -11768,18 +11768,40 @@ def test_maintenance_runs_after_lull_and_on_fresh_process(monkeypatch):
     assert ran == [("dream", "d1"), ("capture", "c1")]
 
 
-# --- resident distill: chat preemption + resumable in-memory progress --------
+# --- resident distill: memgarden import session, chat preemption, in-memory progress ---
+#
+# VPS 记忆导入跑的是和托管同一个 memgarden 导入引擎（backend/memory/garden_import.py）。
+# 这里用真引擎 + 假 agent/假写库，守 consumer 这一层：让路/续跑、写库形状、日期、收口复查。
 
-def _patch_memory_distill(monkeypatch, *, windows=3):
-    """Memory-mode distill harness: fake genesis worker/LLM modules injected into
-    sys.modules (so the lazy imports never pull real backend code), fake transport
-    helpers, REAL state machine under test. Returns the call ledger."""
+def _import_card(summary: str, *, occurred_at=None, action="add", target=None) -> dict:
+    card = {"action": action, "type": "fact", "target_id": target, "bucket": "爱好",
+            "threads": [], "summary": summary,
+            "content": f"{summary}。这是一段足够长、有实质内容的正文。",
+            "importance": 0.5, "pulse": 0.2}
+    if occurred_at is not None:
+        card["occurred_at"] = occurred_at
+    return card
+
+
+def _import_material(prompt: str) -> str:
+    end = prompt.find("[Output]")
+    start = max(prompt.rfind("[The material", 0, end), prompt.rfind("[The entries", 0, end))
+    return prompt[start:end] if start >= 0 else ""
+
+
+def _patch_memory_distill(monkeypatch, *, windows=3, cards_by_window=None, material_kind=""):
+    """Memory-mode distill harness: REAL import engine + consumer state machine; fake
+    agent, fake memory writer, fake recheck module (sys.modules, so the lazy genesis
+    imports never pull the real worker). Returns the call ledger."""
     import types as _types
 
-    calls = {"pending": 0, "map": [], "write": [], "recheck": 0,
-             "actions": [], "complete": [], "heartbeat": [], "lease": []}
-    job = {"job_id": "jobm", "mode": "add_memory", "material_kind": "",
+    monkeypatch.setenv("FEEDLING_GARDEN_IMPORT_STRATEGY", "single_pass")
+    calls = {"pending": 0, "agent": [], "recheck": 0, "actions": [], "complete": [],
+             "heartbeat": [], "lease": [], "envelopes": []}
+    job = {"job_id": "jobm", "mode": "add_memory", "material_kind": material_kind,
            "sealed": {"envelope": {"body_ct": "x"}}}
+    cards_by_window = cards_by_window or {
+        i: [_import_card(f"第{i}段里提到的一件具体的事情")] for i in range(1, windows + 1)}
 
     def fake_pending():
         calls["pending"] += 1
@@ -11790,10 +11812,11 @@ def _patch_memory_distill(monkeypatch, *, windows=3):
     monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"doc")
     monkeypatch.setattr(
         crc, "_window_document",
-        lambda text, **kw: [f"w{i}" for i in range(1, windows + 1)],
+        lambda text, **kw: [f"〔窗{i}〕这一段材料\n" for i in range(1, windows + 1)],
     )
-    monkeypatch.setattr(crc, "_resident_memory_snapshot", lambda: ("terms", ["known"]))
-    monkeypatch.setattr(crc, "_resident_floor_note", lambda: "")
+    monkeypatch.setattr(crc, "_resident_memory_index_items", lambda: [])
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {})
+    monkeypatch.setattr(crc, "_resident_import_locale", lambda document: "zh-Hans")
     monkeypatch.setattr(
         crc, "genesis_resident_heartbeat", lambda jid: calls["heartbeat"].append(jid)
     )
@@ -11801,37 +11824,45 @@ def _patch_memory_distill(monkeypatch, *, windows=3):
         crc, "_genesis_resident_lease_alive",
         lambda jid: calls["lease"].append(jid) or True,
     )
-    monkeypatch.setattr(
-        crc, "_capture_build_envelope",
-        lambda card, *, occurred_at, source: {"card": card},
-    )
-    monkeypatch.setattr(
-        crc, "execute_memory_actions", lambda actions: calls["actions"].append(len(actions))
-    )
+
+    def fake_envelope(card, *, occurred_at, source):
+        calls["envelopes"].append((card["summary"], occurred_at, source))
+        return {"card": card, "occurred_at": occurred_at}
+
+    monkeypatch.setattr(crc, "_capture_build_envelope", fake_envelope)
+
+    def fake_execute(actions):
+        calls["actions"].append([a["type"] for a in actions])
+        base = sum(len(x) for x in calls["actions"][:-1])
+        return {"status": "ok", "results": [
+            {"status": "ok", "http_status": 201, "memory": {"id": f"mom_{base + i + 1}"}}
+            for i in range(len(actions))]}
+
+    monkeypatch.setattr(crc, "execute_memory_actions", fake_execute)
     monkeypatch.setattr(
         crc, "genesis_resident_complete",
         lambda jid, *, memory_action_count, identity_status:
             calls["complete"].append((jid, memory_action_count, identity_status)),
     )
 
-    def fake_map(**kw):
-        calls["map"].append(kw["key_prefix"])
-        return {"all_fact_candidates": [{"summary": kw["key_prefix"]}]}
+    def fake_call_agent(prompt, raw_text=True, **kw):
+        calls["agent"].append(prompt)
+        material = _import_material(prompt)
+        for i, cards in cards_by_window.items():
+            if f"〔窗{i}〕" in material:
+                return json.dumps({"cards": cards}, ensure_ascii=False)
+        return '{"cards": []}'
 
-    def fake_write(**kw):
-        calls["write"].append(len(kw["fact_candidates"]))
-        return {"memories": [{"summary": "m1"}, {"summary": "m2"}]}
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    monkeypatch.setattr(crc, "_capture_agent_reply_text", lambda x: x)
 
     def fake_recheck(**kw):
         calls["recheck"] += 1
+        calls["recheck_written"] = [c["summary"] for c in kw["written_memories"]]
         return {"memories": []}
 
     fake_genesis = _types.ModuleType("genesis")
-    fake_genesis.worker = _types.SimpleNamespace(
-        build_foreground_output_from_texts=fake_map,
-        build_memory_output_from_fact_candidates=fake_write,
-        build_memory_recheck_from_material=fake_recheck,
-    )
+    fake_genesis.worker = _types.SimpleNamespace(build_memory_recheck_from_material=fake_recheck)
     fake_llm_mod = _types.ModuleType("genesis.llm_client")
 
     class _FakeLLM:
@@ -11852,37 +11883,42 @@ def _patch_memory_distill(monkeypatch, *, windows=3):
     return calls
 
 
-def test_distill_yields_to_user_between_chunks_and_resumes_without_rerun(monkeypatch):
+def _agent_windows(calls) -> list[int]:
+    out = []
+    for prompt in calls["agent"]:
+        material = _import_material(prompt)
+        out.extend(i for i in range(1, 10) if f"〔窗{i}〕" in material)
+    return out
+
+
+def test_distill_yields_to_user_between_batches_and_resumes_without_rerun(monkeypatch):
     calls = _patch_memory_distill(monkeypatch, windows=3)
     pending = {"flag": False}
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
-    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+    real_agent = crc.call_agent
 
-    def map_then_user_arrives(**kw):
-        out = real_map(**kw)
-        pending["flag"] = True          # user message lands DURING chunk 1's turn
+    def agent_then_user_arrives(prompt, **kw):
+        out = real_agent(prompt, **kw)
+        pending["flag"] = True          # user message lands DURING batch 1's turn
         return out
 
-    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
-
+    monkeypatch.setattr(crc, "call_agent", agent_then_user_arrives)
     crc._process_resident_distill_once(chat_since=1.0)
-    # yielded after chunk 1: progress held, nothing written, job NOT completed
-    assert calls["map"] == ["jobm:resident:map:1"]
-    assert calls["write"] == [] and calls["actions"] == [] and calls["complete"] == []
+    # yielded after batch 1 was judged AND written (a batch never splits across a yield)
+    assert _agent_windows(calls) == [1]
+    assert calls["actions"] == [["memory.add"]] and calls["complete"] == []
     held = crc._distill_in_progress
-    assert held is not None and held["active"]["next_window_idx"] == 2
-    assert held["active"]["phase"] == "map"
+    assert held is not None and held["active"]["phase"] == "import"
+    assert held["active"]["known"][0]["id"] == "mom_1"   # written card enters the index
 
-    # user handled → resume: chunk 1 NOT re-run, pipeline finishes end-to-end
     pending["flag"] = False
-    sys.modules["genesis"].worker.build_foreground_output_from_texts = real_map
+    monkeypatch.setattr(crc, "call_agent", real_agent)
     crc._process_resident_distill_once(chat_since=1.0)
     assert calls["lease"] == ["jobm"]              # held lease re-checked on resume
-    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2, 3)]
-    assert calls["write"] == [3]                   # all 3 windows' candidates, once
+    assert _agent_windows(calls) == [1, 2, 3]      # batch 1 NOT re-judged
+    assert calls["actions"] == [["memory.add"]] * 3
     assert calls["recheck"] == 1
-    assert calls["actions"] == [2]                 # one batched memory.add
-    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert calls["complete"] == [("jobm", 3, "skipped")]
     assert crc._distill_in_progress is None
     assert calls["pending"] == 1                   # resume never re-claims
 
@@ -11891,38 +11927,39 @@ def test_distill_drops_progress_when_lease_lost_while_yielded(monkeypatch):
     calls = _patch_memory_distill(monkeypatch, windows=2)
     pending = {"flag": False}
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
-    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+    real_agent = crc.call_agent
 
-    def map_then_user_arrives(**kw):
-        out = real_map(**kw)
+    def agent_then_user_arrives(prompt, **kw):
+        out = real_agent(prompt, **kw)
         pending["flag"] = True
         return out
 
-    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
+    monkeypatch.setattr(crc, "call_agent", agent_then_user_arrives)
     crc._process_resident_distill_once(chat_since=1.0)
     assert crc._distill_in_progress is not None
 
-    # while the user kept chatting, the backend reaper re-queued the job
     monkeypatch.setattr(crc, "_genesis_resident_lease_alive", lambda jid: False)
     pending["flag"] = False
     crc._process_resident_distill_once(chat_since=1.0)
     assert crc._distill_in_progress is None        # local progress dropped
     assert calls["complete"] == []                 # never completes a lost job
-    assert calls["map"] == ["jobm:resident:map:1"]  # and never touched chunk 2
+    assert _agent_windows(calls) == [1]            # and never touched batch 2
 
 
-def test_distill_yields_before_write_phase_and_resumes(monkeypatch):
+def test_distill_yields_before_recheck_and_resumes(monkeypatch):
     calls = _patch_memory_distill(monkeypatch, windows=1)
-    seq = iter([False, True])                       # map peek ok → write peek yields
+    seq = iter([False, False, True])      # batch 1 peek, end-of-batches peek, recheck peek yields
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(seq, False))
     crc._process_resident_distill_once(chat_since=1.0)
     held = crc._distill_in_progress
-    assert calls["map"] == ["jobm:resident:map:1"] and calls["write"] == []
-    assert held is not None and held["active"]["phase"] == "write"
+    assert _agent_windows(calls) == [1] and calls["recheck"] == 0
+    assert held is not None and held["active"]["phase"] == "recheck"
 
-    crc._process_resident_distill_once(chat_since=1.0)  # peek now False
-    assert calls["write"] == [1] and calls["recheck"] == 1
-    assert calls["complete"] == [("jobm", 2, "skipped")]
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert calls["recheck"] == 1
+    assert calls["recheck_written"] == ["第1段里提到的一件具体的事情"]
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+    assert _agent_windows(calls) == [1]
     assert crc._distill_in_progress is None
 
 
@@ -11979,78 +12016,53 @@ def test_distill_lease_alive_only_4xx_means_lost(monkeypatch):
 
 
 def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypatch):
-    # legacy call shape (no gate): must run the whole pipeline in one call and
-    # never touch the chat-peek path at all.
     calls = _patch_memory_distill(monkeypatch, windows=2)
     monkeypatch.setattr(
         crc, "_user_chat_pending",
         lambda since: (_ for _ in ()).throw(AssertionError("peeked without chat_since")),
     )
     crc._process_resident_distill_once()
-    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2)]
+    assert _agent_windows(calls) == [1, 2]
     assert calls["complete"] == [("jobm", 2, "skipped")]
     assert crc._distill_in_progress is None
 
 
-def test_distill_preserves_dates_for_long_term_memory_material(monkeypatch):
-    # LTM archive (material_kind == "memory_summary" → keep_all) carries each card's
-    # original date into the envelope, so decades of uploaded memories keep their dates
-    # instead of collapsing onto today. A card the model couldn't date falls back to a
-    # real now() stamp — never empty (resident has no server-side relationship anchor).
-    _patch_memory_distill(monkeypatch, windows=1)
+def test_distill_card_dates_come_from_the_material_undated_cards_get_now(monkeypatch):
+    # memgarden's import rubrics keep the date the material states (never guessed);
+    # the envelope carries it so imported history keeps its timeline. A card the
+    # material gave no date to gets a real now() stamp — never empty.
+    calls = _patch_memory_distill(monkeypatch, windows=1, cards_by_window={1: [
+        _import_card("生日那天去看了一场演唱会", occurred_at="2019-06-01"),
+        _import_card("每周六早上去爬山的习惯"),
+    ]})
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
-
-    once = {"n": 0}
-
-    def ltm_pending():
-        once["n"] += 1
-        return [{"job_id": "jobm", "mode": "add_memory",
-                 "material_kind": "memory_summary",
-                 "sealed": {"envelope": {"body_ct": "x"}}}] if once["n"] == 1 else []
-
-    monkeypatch.setattr(crc, "genesis_resident_pending", ltm_pending)
-    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
-        "memories": [
-            {"summary": "birthday", "occurred_at": "2019-06-01"},
-            {"summary": "graduation", "date": "2020-02-02"},   # alternate key also honored
-            {"summary": "no_date"},
-        ],
-    }
-    seen = {}
-    monkeypatch.setattr(
-        crc, "_capture_build_envelope",
-        lambda card, *, occurred_at, source:
-            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
-    )
-
     crc._process_resident_distill_once()
+    dates = {summary: when for summary, when, _src in calls["envelopes"]}
+    assert dates["生日那天去看了一场演唱会"] == "2019-06-01"
+    assert dates["每周六早上去爬山的习惯"] and "T" in dates["每周六早上去爬山的习惯"]
+    assert {src for *_x, src in calls["envelopes"]} == {"genesis_resident_distill"}
 
-    assert seen["birthday"] == "2019-06-01"
-    assert seen["graduation"] == "2020-02-02"
-    assert seen["no_date"] and "T" in seen["no_date"]   # undated → real now() ISO, not empty
 
-
-def test_distill_ignores_dates_for_chat_history_material(monkeypatch):
-    # Chat-history distill (material_kind != memory_summary → keep_all False) is the
-    # normal path: even if a card happens to carry a date, the write stamps now(). Date
-    # preservation is scoped strictly to long-term-memory uploads.
-    _patch_memory_distill(monkeypatch, windows=1)   # base job material_kind is ""
+def test_distill_long_term_memory_uses_curated_archive_rubric(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=1, material_kind="memory_summary")
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
-
-    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
-        "memories": [{"summary": "chatty", "occurred_at": "2019-06-01"}],
-    }
-    seen = {}
-    monkeypatch.setattr(
-        crc, "_capture_build_envelope",
-        lambda card, *, occurred_at, source:
-            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
-    )
-
     crc._process_resident_distill_once()
+    assert "[The entries they wrote]" in calls["agent"][0]       # curated_archive
+    calls2 = _patch_memory_distill(monkeypatch, windows=1)
+    crc._process_resident_distill_once()
+    assert "[The material they handed you]" in calls2["agent"][0]  # history_import
 
-    assert seen["chatty"] != "2019-06-01"   # date ignored off the LTM path
-    assert "T" in seen["chatty"]            # now() stamp
+
+def test_distill_supersede_goes_out_as_supersede_action(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=2, cards_by_window={
+        1: [_import_card("养了一只叫年糕的三花猫")],
+        2: [_import_card("三花猫年糕今年五岁了", action="merge", target="mom_1")],
+    })
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["actions"] == [["memory.add"], ["memory.supersede"]]
+    batch2 = [p for p in calls["agent"] if "〔窗2〕" in _import_material(p)][0]
+    assert "mom_1" in batch2       # batch 1's real id is in batch 2's existing-memory index
 
 
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):

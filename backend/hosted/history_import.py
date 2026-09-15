@@ -26,15 +26,11 @@ from core import util as core_util
 from identity import service as identity_service
 from identity import card_policy
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
-from memgarden.text import card_guard
-from memgarden.prompts.buckets import normalize_bucket_language
 from memory import service as memory_service
-from memgarden import timestamps as memory_timestamps
 import provider_client
 from hosted import config_store as hosted_config_store
 from notices import core as notices
 from notices import catalog
-from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 
 def _history_job_kind(job_id: str) -> str:
@@ -812,16 +808,6 @@ def _persona_support_messages(payload: dict) -> list[dict]:
     return messages
 
 
-def _message_iso_date(msg: dict, fallback: date | None = None) -> str:
-    try:
-        ts = msg.get("ts")
-        if ts:
-            return datetime.fromtimestamp(float(ts)).date().isoformat()
-    except Exception:
-        pass
-    return fallback.isoformat() if fallback else ""
-
-
 _IMPORT_ARTIFACT_KEYS = (
     "async_status",
     "atlas_mode_enabled",
@@ -913,8 +899,17 @@ def _detect_import_language(messages: list[dict]) -> str:
 
 
 def _import_language_for_store(store: UserStore, messages: list[dict]) -> str:
-    detected = _detect_import_language(messages)
     archive_language = str(registry._get_user_archive_language(store.user_id) or "").strip()
+    return import_language_with_archive(messages, archive_language)
+
+
+def import_language_with_archive(messages: list[dict], archive_language: str) -> str:
+    """导入材料写卡用的语言：档案语言是中文就用中文，否则跟材料走。
+
+    托管（``_import_language_for_store`` 从账号取档案语言）和 VPS（从 whoami 取）
+    共用这一份判定，两边不各写一套。"""
+    detected = _detect_import_language(messages)
+    archive_language = str(archive_language or "").strip()
     if archive_language.lower().startswith("zh"):
         return archive_language
     if detected.startswith("zh"):
@@ -2217,137 +2212,6 @@ def _dedupe_memory_cards(cards: list[dict]) -> list[dict]:
     return out
 
 
-def _natural_import_title(content: str, mem_type: str, language: str) -> str:
-    clean = re.sub(r"\s+", " ", str(content or "")).strip()
-    clean = re.sub(r"^(User|Assistant|用户|助手|AI|TA)[:：]\s*", "", clean)
-    if not clean:
-        return "新的记忆" if str(language).startswith("zh") else "New memory"
-    if str(language).startswith("zh"):
-        compact = re.sub(r"[。！？].*$", "", clean)
-        return compact[:24] or "导入的真实片段"
-    words = clean.split()
-    return " ".join(words[:8])[:72] or "Imported memory"
-
-
-def _fallback_chunks_from_message(msg: dict, max_chunks: int = 18) -> list[str]:
-    content = _clean_import_memory_text(str(msg.get("content") or ""), max_chars=30000)
-    if not content:
-        return []
-    if ":" in content[:240]:
-        _, body = content.split(":", 1)
-        content = body.strip() or content
-    parts = [
-        part.strip(" \t\r\n-•*0123456789.、)）")
-        for part in re.split(r"(?:\n{2,}|\n\s*(?:[-*•]|\d+[.)、）])\s+)", content)
-    ]
-    chunks: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        clean = _clean_import_memory_text(part, max_chars=900)
-        if len(clean) < 8:
-            continue
-        norm = _normalize_card_similarity_text(clean)
-        if not norm or norm in seen:
-            continue
-        seen.add(norm)
-        chunks.append(clean)
-        if len(chunks) >= max_chunks:
-            break
-    if not chunks and content:
-        chunks = [content[:900]]
-    return chunks
-
-
-def _fallback_memory_cards(
-    messages: list[dict],
-    relationship_start: date,
-    *,
-    story_needed: int,
-    about_needed: int,
-    language: str = "en",
-    user_name: str = "",
-) -> list[dict]:
-    cards: list[dict] = []
-    story_pool: list[dict] = []
-    about_pool: list[dict] = []
-    for msg in messages:
-        content = _clean_import_memory_text(str(msg.get("content") or ""))
-        if not content:
-            continue
-        clean_msg = dict(msg)
-        clean_msg["content"] = content
-        family = _import_source_family(str(clean_msg.get("source") or clean_msg.get("source_family") or ""))
-        if family in {_HISTORY_SOURCE, _MEMORY_SUMMARY_SOURCE, _FRESH_START_SOURCE}:
-            story_pool.append(clean_msg)
-        if family in {_HISTORY_SOURCE, _MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE, _FRESH_START_SOURCE}:
-            about_pool.append(clean_msg)
-    if not story_pool and not about_pool and any(
-        _import_source_family(str(m.get("source") or m.get("source_family") or "")) == _FRESH_START_SOURCE
-        for m in messages
-    ):
-        fallback_text = "从空白状态开始。" if str(language).startswith("zh") else "Fresh start with IO."
-        fresh = {"role": "user", "content": fallback_text, "ts": None, "source": _FRESH_START_SOURCE}
-        story_pool = [fresh]
-        about_pool = [fresh]
-
-    def expand(pool: list[dict], limit: int) -> list[tuple[dict, str]]:
-        expanded: list[tuple[dict, str]] = []
-        for msg in pool:
-            family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
-            chunk_limit = max(1, limit - len(expanded))
-            chunks = _fallback_chunks_from_message(
-                msg,
-                max_chunks=max(chunk_limit, 4 if family == _MEMORY_SUMMARY_SOURCE else 1),
-            )
-            for chunk in chunks:
-                expanded.append((msg, chunk))
-                if len(expanded) >= limit:
-                    return expanded
-        return expanded
-
-    idx = 0
-    story_types = ["moment", "quote"]
-    story_items = expand(story_pool, story_needed)
-    while story_needed > 0 and idx < len(story_items):
-        msg, content = story_items[idx]
-        family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
-        if family in {_MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE}:
-            content = rewrite_user_reference(content, user_name, subject="user")
-        mem_type = story_types[idx % len(story_types)]
-        title = _natural_import_title(content, mem_type, language)
-        cards.append({
-            "type": mem_type,
-            "title": title,
-            "description": content[:900],
-            "her_quote": content[:360] if mem_type == "quote" and msg.get("role") == "user" else "",
-            "occurred_at": _message_iso_date(msg),
-            "context": f"fallback source={_import_source_family(str(msg.get('source') or msg.get('source_family') or ''))}",
-        })
-        idx += 1
-        story_needed -= 1
-
-    idx = 0
-    about_types = ["fact", "event"]
-    about_items = expand(about_pool, about_needed)
-    while about_needed > 0 and idx < len(about_items):
-        msg, content = about_items[idx]
-        family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
-        if family in {_MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE}:
-            content = rewrite_user_reference(content, user_name, subject="user")
-        mem_type = about_types[idx % len(about_types)]
-        title = _natural_import_title(content, mem_type, language)
-        cards.append({
-            "type": mem_type,
-            "title": title,
-            "description": content[:900],
-            "occurred_at": _message_iso_date(msg),
-            "context": f"fallback source={_import_source_family(str(msg.get('source') or msg.get('source_family') or ''))}",
-        })
-        idx += 1
-        about_needed -= 1
-    return cards
-
-
 def _import_memory_targets(
     history_messages: list[dict],
     support_messages: list[dict],
@@ -2397,40 +2261,6 @@ def _import_memory_targets(
     }
 
 
-def _memory_counts_for_cards(cards: list[dict]) -> dict:
-    counts = {"story": 0, "about_me": 0, "ta_thinking": 0, "total": 0}
-    for card in cards:
-        counts["total"] += 1
-        counts["story"] += 1
-        counts["about_me"] += 1
-    return counts
-
-
-def _ensure_import_minimum_cards(
-    cards: list[dict],
-    messages: list[dict],
-    relationship_start: date,
-    *,
-    min_story: int = 1,
-    min_about: int = 1,
-    language: str = "en",
-    user_name: str = "",
-) -> list[dict]:
-    counts = _memory_counts_for_cards(cards)
-    story_needed = max(0, min_story - counts["story"])
-    about_needed = max(0, min_about - counts["about_me"])
-    if story_needed or about_needed:
-        cards = cards + _fallback_memory_cards(
-            messages,
-            relationship_start,
-            story_needed=story_needed,
-            about_needed=about_needed,
-            language=language,
-            user_name=user_name,
-        )
-    return _dedupe_memory_cards(cards)
-
-
 def _card_dedupe_key(card: dict) -> str:
     return "|".join([
         str(card.get("bucket") or ""),
@@ -2449,82 +2279,6 @@ def _new_cards_only(existing_cards: list[dict], candidate_cards: list[dict]) -> 
         existing.add(key)
         out.append(card)
     return out
-
-
-def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> dict:
-    now = memory_timestamps.now_iso()
-    occurred_at = memory_timestamps.normalize(card.get("occurred_at"))
-    moment = {
-        "v": 1,
-        "id": envelope.get("id") or f"mom_{uuid.uuid4().hex[:12]}",
-        "occurred_at": occurred_at,
-        "created_at": now,
-        "updated_at": now,
-        "source": "history_import",
-        "enclave_pk_fpr": "",
-        **core_envelope.envelope_storage_fields(envelope),
-        "status": "active",
-        "importance": max(0.0, min(1.0, float(card.get("importance") or 0.55))),
-        "pulse": max(0.0, min(1.0, float(card.get("pulse") or 0.3))),
-        "last_referenced_at": occurred_at or now,
-    }
-    if envelope.get("K_enclave"):
-        moment["K_enclave"] = envelope["K_enclave"]
-    return moment
-
-
-def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dict]:
-    created: list[dict] = []
-    _guard_on = card_guard.guard_enabled()
-    for card in _sort_memory_cards_newest_first(cards):
-        summary = str(card.get("summary") or "").strip()[:500]
-        content = _memory_card_content(card)[:5000]
-        if not summary or not content:
-            continue
-        # 模型原始输出/协议残片防护(与 capture/dream/actions 同一套判据)。硬字段脏 → 跳过
-        # 整卡;桶脏 → 降级到按语言的默认桶;threads 逐项丢脏留净。history-import 是绕过
-        # actions 层的直写路径(codex plan_review 抓到的第 14 条 producer lane)。
-        if _guard_on and (
-            card_guard.field_pollution_reason(summary, IO_LEAK_SIGNALS) or card_guard.field_pollution_reason(content, IO_LEAK_SIGNALS)
-        ):
-            continue
-        bucket = str(card.get("bucket") or "").strip()[:80]
-        if _guard_on and bucket and card_guard.bucket_pollution_reason(bucket, IO_LEAK_SIGNALS):
-            # 污染桶 → 按语言的本地化默认桶。
-            bucket = card_guard.default_bucket_for_text(f"{summary}\n{content}")
-        elif not bucket:
-            # 干净但缺桶 → 保留旧行为「未分类」(不改动正常路径,kill switch 也能完整回滚)。
-            bucket = "未分类"
-        else:
-            # Q3:干净桶按卡片语言归一(COMMON 桶换语言;自定义桶不动)。
-            bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
-        threads_in = [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()]
-        if _guard_on:
-            threads_in = [t for t in threads_in if not card_guard.field_pollution_reason(t, IO_LEAK_SIGNALS)]
-        body = {
-            "summary": summary,
-            "content": content,
-            "bucket": bucket,
-            "threads": threads_in[:8],
-        }
-        envelope, err = core_envelope._build_shared_envelope_for_store(
-            store,
-            json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        )
-        if envelope is None:
-            raise RuntimeError(f"memory_envelope_failed:{err}")
-        envelope["occurred_at"] = memory_timestamps.normalize(card.get("occurred_at"))
-        envelope["source"] = "history_import"
-        created.append(_moment_from_memory_card(store, card, envelope))
-    # Re-read + extend + save under one memory_lock hold so a concurrent
-    # same-user write can't lost-update this bulk import (and vice-versa).
-    with memory_service.mutation_lock(store):
-        fresh = memory_service._load_moments(store)
-        fresh.extend(created)
-        memory_service._save_moments(store, fresh)
-    if created:
-        boot_gates._log_bootstrap_event(store, "history_import_memory_written", success=True)
-    return created
 
 
 def _fallback_identity_payload(memories: list[dict], days: int, language: str = "en") -> dict:
@@ -3085,6 +2839,89 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
         return winner
 
 
+class _GardenMemoryImport:
+    """旧上传入口的记忆卡那一步，接到 genesis 同一个导入引擎上（没有持久进度：本入口
+    失败后整单重跑，和切换前一样）。窗口划分沿用本入口：历史窗口在大档位时先采样
+    ``initial_windows`` 个跑前台，剩下的后台补；张数上限是本入口的分层配额。"""
+
+    def __init__(self, store: UserStore, api_key: str | None, job: dict, runtime, *,
+                 analysis_messages: list[dict], fresh_start: bool, window_limit: int,
+                 initial_windows: int, background: bool, relationship_start: date,
+                 language: str, user_name: str, max_cards: int) -> None:
+        from genesis import import_engine
+        from genesis import plaintext as genesis_plaintext
+        from genesis.llm_client import GenesisLLMClient
+        from memory import garden_import
+
+        self._garden_import = garden_import
+        self.store = store
+        self.job = job
+        self.max_cards = max(0, int(max_cards))
+        groups = [] if fresh_start else genesis_plaintext._plaintext_source_groups(
+            analysis_messages, window_limit=max(1, int(window_limit)))
+        self.groups = groups
+        self.initial_idx: dict[int, list[int]] = {}
+        self.background_idx: dict[int, list[int]] = {}
+        for idx, group in enumerate(groups, start=1):
+            every = list(range(len(group.get("chunk_texts") or [])))
+            picked = every
+            if background and str(group.get("source_family")) == "history" and len(every) > initial_windows:
+                picked = _select_evenly(every, max(1, int(initial_windows)))
+            self.initial_idx[idx] = picked
+            self.background_idx[idx] = [i for i in every if i not in set(picked)]
+        self.initial_windows_total = sum(len(v) for v in self.initial_idx.values())
+        self.background_windows_total = sum(len(v) for v in self.background_idx.values())
+        self.windows_total = self.initial_windows_total + self.background_windows_total
+        self.state = garden_import.new_state(locale=language, user_name=user_name)
+        job_id = str(job.get("job_id") or "")
+        self.job_id = job_id
+        self._fallback = relationship_start.isoformat()
+        self._complete = import_engine.llm_complete(
+            GenesisLLMClient(persist_output=False), user_id=store.user_id, job_id=job_id,
+            runtime=runtime)
+        self._write = import_engine.store_writer(store, api_key, source="history_import")
+        self._known = import_engine.existing_cards(store, api_key, job_id=job_id) if groups else []
+
+    def run(self, stage: str) -> dict:
+        gi = self._garden_import
+        indices = self.initial_idx if stage == "initial" else self.background_idx
+        totals = self.state["totals"]
+        before_written = int(totals.get("cards_written") or 0)
+        before_dropped = int(totals.get("dropped") or 0)
+        sources = gi.sources_from_groups(
+            self.groups, prefix=f"{stage}:", fallback_occurred_at=self._fallback,
+            fallback_families={"memory_summary"}, window_indices=indices)
+        done_windows = 0
+        for source in sources:
+            remaining = self.max_cards - int(totals.get("cards_written") or 0)
+            if remaining <= 0:
+                break
+            source.max_total_cards = remaining
+
+            def on_batch(current, _done=done_windows) -> None:
+                _update_history_job_phase(
+                    self.store, self.job,
+                    "candidate_extracting" if stage == "initial" else "background_importing",
+                    status="processing",
+                    candidate_windows_done=_done + gi.session_windows_done(self.state, current),
+                    memories_created=int(totals.get("cards_written") or 0),
+                )
+
+            result = gi.run_import(
+                sources=[source], state=self.state, job_key=self.job_id,
+                owner_key=str(self.store.user_id), existing_cards=self._known,
+                complete=self._complete, write=self._write, save=lambda _s: None,
+                on_batch=on_batch)
+            self._known = result.known
+            done_windows += len(source.windows)
+        return {"written": int(totals.get("cards_written") or 0) - before_written,
+                "dropped": int(totals.get("dropped") or 0) - before_dropped}
+
+    def cards(self) -> list[dict]:
+        return [{k: v for k, v in c.items() if k not in {"id", "_source_family"}}
+                for c in (self.state.get("written") or [])]
+
+
 def _process_history_import_sync(
     store: UserStore,
     api_key: str | None,
@@ -3137,17 +2974,22 @@ def _process_history_import_sync(
         support_messages,
     )
     warnings.extend(name_warnings)
-    windows = _build_transcript_windows(
-        analysis_messages,
-        max_chars=18000,
-        max_windows=int(import_targets.get("total_windows") or 8),
+    # 记忆卡：和 genesis 同一个 memgarden 导入引擎（memory.garden_import）。之前这里是一套
+    # 自己的候选抽取 → 打分 → 渲染 → 兜底卡（和 genesis、日常落卡各写各的判断标准）。
+    # 张数上限沿用本入口的分层配额（import_targets["total"]），前台/后台窗口划分不变。
+    memory_import = _GardenMemoryImport(
+        store, api_key, job, runtime,
+        analysis_messages=analysis_messages,
+        fresh_start=not history_messages and all(
+            str(m.get("source") or "") == _FRESH_START_SOURCE for m in support_messages),
+        window_limit=int(import_targets.get("total_windows") or 8),
+        initial_windows=int(import_targets.get("initial_windows") or 8),
+        background=bool(import_targets.get("background")),
+        relationship_start=relationship_start,
+        language=language,
+        user_name=user_name,
+        max_cards=int(import_targets.get("total") or 12),
     )
-    initial_windows = _select_evenly(windows, int(import_targets.get("initial_windows") or len(windows)))
-    initial_window_ids = {str(w.get("id") or "") for w in initial_windows}
-    background_windows = [
-        w for w in windows
-        if bool(import_targets.get("background")) and str(w.get("id") or "") not in initial_window_ids
-    ]
 
     _update_history_job_phase(store, job, "chat_history_importing", **{
         "format": fmt or "plaintext",
@@ -3191,85 +3033,45 @@ def _process_history_import_sync(
         "history_profile": profile,
         "history_tier": profile["tier"],
         "timeline_span_days": profile["span_days"],
-        "candidate_windows_total": len(windows),
-        "candidate_windows_initial": len(initial_windows),
-        "background_windows_total": len(background_windows),
+        "candidate_windows_total": memory_import.windows_total,
+        "candidate_windows_initial": memory_import.initial_windows_total,
+        "background_windows_total": memory_import.background_windows_total,
     })
-
-    def initial_progress(done: int, total: int, candidate_count: int) -> None:
-        progress = 24 + int(24 * done / max(total, 1))
-        _update_history_job_phase(
-            store,
-            job,
-            "candidate_extracting",
-            progress=progress,
-            candidate_windows_done=done,
-            candidate_windows_total=total,
-            candidates_extracted=candidate_count,
-        )
 
     _update_history_job_phase(
         store,
         job,
         "candidate_extracting",
         candidate_windows_done=0,
-        candidate_windows_total=len(initial_windows),
+        candidate_windows_total=memory_import.initial_windows_total,
         candidates_extracted=0,
     )
-    per_window_target = max(4, min(10, (int(import_targets.get("total", 12)) + max(len(initial_windows), 1) - 1) // max(len(initial_windows), 1) + 2))
-    initial_candidates, provider_warnings = _extract_memory_candidates_with_provider(
-        runtime,
-        initial_windows,
-        relationship_start,
-        per_window_target=per_window_target,
-        language=language,
-        user_name=user_name,
-        on_progress=initial_progress,
-    )
-    warnings.extend(provider_warnings)
-    merged_candidates = _merge_import_candidates(initial_candidates)
-    cards = _render_candidates_to_memory_cards(
-        merged_candidates,
-        relationship_start,
-        import_targets,
-        language=language,
-        max_cards=int(import_targets.get("total") or 12),
-        user_name=user_name,
-    )
-    cards = _ensure_import_minimum_cards(
-        cards,
-        fallback_messages,
-        relationship_start,
-        min_story=min(1, int(import_targets.get("story") or 0)),
-        min_about=min(1, int(import_targets.get("about_me") or 0)),
-        language=language,
-        user_name=user_name,
-    )
-    cards = _sort_memory_cards_newest_first(cards)
-
+    with distillation_ledger.history_attempt(
+        store, str(job["job_id"]), "memory"
+    ) as attempt:
+        initial = memory_import.run("initial")
+        attempt.finish(
+            "not_provided" if not (initial["written"] + initial["dropped"])
+            else "partial" if initial["dropped"]
+            else "written"
+        )
+    cards = memory_import.cards()
+    memory_rows = list(range(initial["written"]))
+    background_windows = memory_import.background_windows_total
     _update_history_job_phase(
         store,
         job,
         "candidate_merging",
-        candidates_extracted=len(initial_candidates),
-        candidates_merged=len(merged_candidates),
-        memories_planned=len(cards),
+        candidates_extracted=initial["written"] + initial["dropped"],
+        candidates_merged=initial["written"],
+        memories_planned=initial["written"] + initial["dropped"],
     )
     _update_history_job_phase(
         store,
         job,
         "memory_writing",
-        memories_planned=len(cards),
+        memories_planned=initial["written"] + initial["dropped"],
     )
-    with distillation_ledger.history_attempt(
-        store, str(job["job_id"]), "memory"
-    ) as attempt:
-        memory_rows = _append_import_memory_cards(store, cards)
-        attempt.finish(
-            "not_provided" if not cards
-            else "partial" if len(memory_rows) < len(cards)
-            else "written"
-        )
     _update_history_job_phase(
         store,
         job,
@@ -3332,8 +3134,8 @@ def _process_history_import_sync(
         "chat_ready_at": core_util._now_iso() if chat_ready else "",
         "chat_ready_cards_required": chat_ready_cards,
         "initial_memories_created": len(memory_rows),
-        "candidate_count": len(initial_candidates),
-        "candidate_cluster_count": len(merged_candidates),
+        "candidate_count": initial["written"] + initial["dropped"],
+        "candidate_cluster_count": initial["written"],
         "background_status": "pending" if background_windows else "not_needed",
         "warnings": warnings,
     })
@@ -3347,63 +3149,27 @@ def _process_history_import_sync(
             identity_written=bool(identity),
             onboarding_greeting_written=bool(greeting_row),
             background_windows_done=0,
-            background_windows_total=len(background_windows),
+            background_windows_total=background_windows,
         )
 
-        def background_progress(done: int, total: int, candidate_count: int) -> None:
-            progress = 96 + int(3 * done / max(total, 1))
-            _update_history_job_phase(
-                store,
-                job,
-                "background_importing",
-                status="processing",
-                progress=progress,
-                background_windows_done=done,
-                background_windows_total=total,
-                background_candidates_extracted=candidate_count,
-                memories_created=len(memory_rows),
-            )
-
         try:
-            background_candidates, bg_warnings = _extract_memory_candidates_with_provider(
-                runtime,
-                background_windows,
-                relationship_start,
-                per_window_target=max(3, min(7, per_window_target - 1)),
-                language=language,
-                user_name=user_name,
-                on_progress=background_progress,
-            )
-            warnings.extend(bg_warnings)
-            all_candidates = initial_candidates + background_candidates
-            all_cards = _render_candidates_to_memory_cards(
-                all_candidates,
-                relationship_start,
-                import_targets,
-                language=language,
-                max_cards=int(import_targets.get("total") or 120),
-                user_name=user_name,
-            )
-            additional_cards = _new_cards_only(cards, all_cards)
-            additional_cards = _sort_memory_cards_newest_first(additional_cards)
             with distillation_ledger.history_attempt(
                 store, str(job["job_id"]), "memory"
             ) as attempt:
-                additional_rows = _append_import_memory_cards(store, additional_cards)
+                extra = memory_import.run("background")
                 attempt.finish(
-                    "not_provided" if not additional_cards
-                    else "partial" if len(additional_rows) < len(additional_cards)
+                    "not_provided" if not (extra["written"] + extra["dropped"])
+                    else "partial" if extra["dropped"]
                     else "written"
                 )
-            memory_rows.extend(additional_rows)
-            cards = _sort_memory_cards_newest_first(_dedupe_memory_cards(cards + additional_cards))
-            merged_all = _merge_import_candidates(all_candidates)
+            memory_rows.extend(range(extra["written"]))
+            cards = memory_import.cards()
             job.update({
                 "background_status": "completed",
-                "background_candidates_extracted": len(background_candidates),
-                "background_memories_created": len(additional_rows),
-                "candidate_count": len(all_candidates),
-                "candidate_cluster_count": len(merged_all),
+                "background_candidates_extracted": extra["written"] + extra["dropped"],
+                "background_memories_created": extra["written"],
+                "candidate_count": initial["written"] + initial["dropped"] + extra["written"] + extra["dropped"],
+                "candidate_cluster_count": initial["written"] + extra["written"],
             })
         except Exception as e:
             warnings.append(f"background_import_failed:{type(e).__name__}:{str(e)[:180]}")
