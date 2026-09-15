@@ -331,7 +331,17 @@ def test_one_parse_failure_cannot_inherit_earlier_write_failures():
     ("capture_agent_call_failed:RuntimeError: invalid max_tokens: must be <= 500", "other"),
     ("capture_agent_call_failed:RuntimeError: request rejected at byte 512", "other"),
     ("capture_agent_call_failed:RuntimeError: upstream returned HTTP 502 Bad Gateway", "account"),
-    ("capture_agent_call_failed:RuntimeError: request timed out after 120s", "account"),
+    # 🔴 本机 agent 调用自己超时（CLI 子进程 / agent call / pi 请求超时）不是「用户的模型服务
+    # 不可用」：以前按账号类等 7 天、还提示「你的模型服务暂时不可用」（09-15 审查）。按 6 次兜底。
+    ("capture_agent_call_failed:RuntimeError: request timed out after 120s", "other"),
+    ("capture_agent_call_failed:TimeoutExpired: Command '['claude', '-p']' timed out after 300 seconds",
+     "other"),
+    ("capture_agent_call_failed:TimeoutError: agent call timed out", "other"),
+    ("capture_agent_call_failed:RuntimeError: pi agent produced no reply: request timed out", "other"),
+    ("capture_agent_call_failed:turn_timeout", "other"),
+    # 有上游证据的超时仍是服务不可用
+    ("capture_agent_call_failed:RuntimeError: HTTP 504 Gateway Timeout", "account"),
+    ("capture_agent_call_failed:RuntimeError: provider_http_503: upstream request timed out", "account"),
     # 对照表已认定的其他上游瞬时故障形状（Codex 第 7 轮：漏了会在第 6 次被跳过）
     ("capture_agent_call_failed:RuntimeError: stream disconnected before completion", "account"),
     ("capture_agent_call_failed:RuntimeError: response ended without finish_reason", "account"),
@@ -473,6 +483,8 @@ _V1_RAW_TAILS = (
     "RuntimeError: cli agent exited 1: invalid key",
     "RuntimeError: stream disconnected before completion",
     "RuntimeError: response ended without finish_reason",
+    "TimeoutExpired: Command '['claude', '-p']' timed out after 300 seconds",
+    "TimeoutError: agent call timed out",
     "RuntimeError: invalid max_tokens: must be <= 500",
     "RuntimeError: 错误码 401：API 密钥无效",
     "RuntimeError: 状态码 429：额度不足，请充值",

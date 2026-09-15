@@ -47,6 +47,7 @@ AGENT_CALL_FAILURE_CLASSES = frozenset({
     "quota_insufficient",
     "rate_limited",
     "resident_agent_cli_logged_out",
+    "turn_timeout",
     "unknown",
     "upstream_unavailable",
 })
@@ -65,11 +66,24 @@ _STRONG_UPSTREAM_EVIDENCE = re.compile(
     r"|\b5\d{2}\b\W{0,3}(?:internal server error|bad gateway"
     r"|service (?:temporarily )?unavailable|gateway time-?out)"
     r"|internal server error|bad gateway|service (?:temporarily )?unavailable"
-    r"|gateway time-?out|overloaded|timed? ?out|\btimeout\b"
+    r"|gateway time-?out|overloaded"
     r"|connection (?:refused|reset|error|aborted|closed)|unreachable"
     r"|stream disconnected|ended without finish_reason",
     re.IGNORECASE,
 )
+# A timeout with no upstream evidence above is the resident's own agent call
+# running out of time: ``subprocess.TimeoutExpired`` from the CLI runner,
+# ``TimeoutError: agent call timed out``, the pi CLI's "request timed out". The
+# model may simply be slow, but nothing proves the user's provider is down, so
+# it is neither the user's account problem (7-day wait, "你的模型服务暂时不可用")
+# nor ``upstream_unavailable``. It is stored as ``turn_timeout`` — the class the
+# resident chat lane already gives ``subprocess.TimeoutExpired`` — a registered,
+# system-blamed, content-free code that stays an operational failure.
+_LOCAL_AGENT_TIMEOUT = re.compile(
+    r"\A\s*(?:subprocess\.)?Timeout(?:Expired|Error)\b|timed? ?out|\btimeout\b",
+    re.IGNORECASE,
+)
+LOCAL_AGENT_TIMEOUT_CLASS = "turn_timeout"
 # The relay's generic "Request failed. Please try again later." 403 shell (the
 # registry's exact, whole-candidate shape, Seven's T497) is real upstream evidence.
 _RELAY_403 = re.compile(error_contract._GENERIC_UPSTREAM_403, re.IGNORECASE)
@@ -248,6 +262,10 @@ def classify_failure_text(text: object) -> str:
             continue
         if _has_strong_evidence(spec.code, candidate):
             return spec.code
+    # Outside the registry's evidence: a timeout with no upstream evidence is the
+    # resident agent call's own timeout (see ``_LOCAL_AGENT_TIMEOUT``).
+    if _LOCAL_AGENT_TIMEOUT.search(candidate):
+        return LOCAL_AGENT_TIMEOUT_CLASS
     # Outside the registry: the pi relay's bare "invalid key" message, which the
     # resident consumer itself already treats as an auth failure.
     if _BARE_INVALID_KEY_MESSAGE.search(candidate):

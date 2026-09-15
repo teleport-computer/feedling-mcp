@@ -42,7 +42,20 @@ SECRET = "PRIVATE-PROMPT-ECHO-7f3a"
         (f"RuntimeError: 429 Too Many Requests {SECRET}", "rate_limited"),
         (f"RuntimeError: status 503 Service Unavailable {SECRET}", "upstream_unavailable"),
         (f"RuntimeError: provider_http_502 {SECRET}", "upstream_unavailable"),
-        (f"TimeoutExpired: Command timed out after 600 seconds {SECRET}", "upstream_unavailable"),
+        # The resident agent call's own timeout is not proof the provider is down
+        # (review 09-15): it keeps the chat lane's class for TimeoutExpired.
+        (f"TimeoutExpired: Command timed out after 600 seconds {SECRET}", "turn_timeout"),
+        (f"TimeoutExpired: Command '['claude', '-p']' timed out after 300 seconds {SECRET}",
+         "turn_timeout"),
+        ("TimeoutError: agent call timed out", "turn_timeout"),
+        ("TimeoutError", "turn_timeout"),
+        (f"RuntimeError: pi agent produced no reply: request timed out {SECRET}", "turn_timeout"),
+        # With real upstream evidence a timeout stays a provider outage.
+        (f"RuntimeError: HTTP 504 Gateway Timeout {SECRET}", "upstream_unavailable"),
+        (f"RuntimeError: provider_http_503: upstream request timed out {SECRET}",
+         "upstream_unavailable"),
+        (f"TimeoutError: timed out; stream disconnected before completion {SECRET}",
+         "upstream_unavailable"),
         (f"RuntimeError: Connection refused {SECRET}", "upstream_unavailable"),
         (f"RuntimeError: Not logged in · Please run /login {SECRET}", "resident_agent_cli_logged_out"),
         # A bare 5xx-looking number is not upstream evidence.

@@ -2883,9 +2883,12 @@ def test_v1_memory_lane_account_failures_freeze_as_user_unavailable(clean_rollup
         "capture_agent_call_failed:RuntimeError: status 503 Service Unavailable"
     )
     assert capture_outage == "capture_agent_call_failed:upstream_unavailable"
+    # CLI logged out stays operational: on hosted V1 it can be a platform
+    # key-injection bug (review 09-15; Seven's chat set excludes it too).
     dream_logged_out = stored(
         "dream_agent_call_failed:RuntimeError: Not logged in · Please run /login"
     )
+    assert dream_logged_out == "dream_agent_call_failed:resident_agent_cli_logged_out"
     migrate_model = stored(
         "migrate_agent_call_failed:RuntimeError: Error code: 404 - model_not_found: gpt-9"
     )
@@ -2907,7 +2910,7 @@ def test_v1_memory_lane_account_failures_freeze_as_user_unavailable(clean_rollup
     assert (capture["failed"], capture["user_unavailable"],
             capture["operational_failures"]) == (2, 1, 1)
     assert (dream["failed"], dream["user_unavailable"],
-            dream["operational_failures"]) == (2, 1, 1)
+            dream["operational_failures"]) == (2, 0, 2)
     assert (migrate["failed"], migrate["user_unavailable"],
             migrate["operational_failures"]) == (1, 1, 0)
     for cell in (capture, dream, migrate):

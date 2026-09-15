@@ -62,10 +62,18 @@ USER_UNAVAILABLE_V2_OUTCOME_CODES = frozenset({
 # Additions only: Seven's two sets above are left exactly as approved and are
 # extended by union right after this block, so reverting this block restores
 # them byte-for-byte. Deliberately NOT here (they stay operational failures):
-# upstream_unavailable, rate_limited, timeouts, content_filtered,
-# context_overflow, provider_incompatible, provider_config, cli_config_invalid,
-# unknown, and every Feedling-side code (database_pool_timeout, lease_timeout,
-# watchdog codes, write failures).
+# upstream_unavailable, rate_limited, timeouts (incl. the resident agent call's
+# own ``turn_timeout``), content_filtered, context_overflow,
+# provider_incompatible, provider_config, cli_config_invalid, unknown, and every
+# Feedling-side code (database_pool_timeout, lease_timeout, watchdog codes,
+# write failures).
+#
+# ``resident_agent_cli_logged_out`` is deliberately NOT excused either, matching
+# Seven's chat set: on hosted V1 runners a platform key-injection/decrypt bug
+# makes the Claude CLI print the same "Not logged in · Please run /login"
+# (``agent_runtime/spawners.py``), so excusing it would hide a platform bug from
+# the failure rate. The capture escape valve still treats it as an account class
+# (waits instead of skipping, with the login notice copy).
 #
 # V1 keyspace: the backend stores ``<lane>_agent_call_failed:<class>``
 # (``proactive_core._job_status_patch`` via ``agent_call_failure.normalize_reason``).
@@ -75,17 +83,14 @@ MEMORY_LANE_USER_UNAVAILABLE_V1_REASONS = frozenset({
     "capture_agent_call_failed:quota_insufficient",
     "capture_agent_call_failed:model_not_found",
     "capture_agent_call_failed:provider_account_expired",
-    "capture_agent_call_failed:resident_agent_cli_logged_out",
     "dream_agent_call_failed:auth_invalid",
     "dream_agent_call_failed:quota_insufficient",
     "dream_agent_call_failed:model_not_found",
     "dream_agent_call_failed:provider_account_expired",
-    "dream_agent_call_failed:resident_agent_cli_logged_out",
     "migrate_agent_call_failed:auth_invalid",
     "migrate_agent_call_failed:quota_insufficient",
     "migrate_agent_call_failed:model_not_found",
     "migrate_agent_call_failed:provider_account_expired",
-    "migrate_agent_call_failed:resident_agent_cli_logged_out",
 })
 # V2 keyspace (``agent_jobs.last_error``). ``extraction_failed:quota_insufficient``
 # is already in Seven's set. ``extraction_failed:provider_account_expired`` is

@@ -103,6 +103,23 @@ def test_v1_non_account_failure_keeps_the_generic_notice():
     assert "连续失败 3 次" in n["user_text"]
 
 
+def test_v1_local_agent_timeout_keeps_the_generic_notice():
+    """🔴 本机 agent 调用超时不能提示「你的模型服务暂时不可用」（09-15 审查）。"""
+    for reason in (
+        "capture_agent_call_failed:TimeoutExpired: Command '['claude', '-p']' timed out after 300 seconds",
+        "capture_agent_call_failed:turn_timeout",
+    ):
+        uid = _uid(); seed_user(uid); store = get_store(uid)
+        job = {"job_id": "j", "source": capture_jobs.CAPTURE_JOB_SOURCE,
+               "capture_result": {"status": "failed", "reason": reason}}
+        for _ in range(3):
+            capture_scheduler.record_capture_job_status(store, job, status="failed")
+        n = _rows(uid)["memory_backoff:capture"]
+        assert "连续失败 3 次" in n["user_text"], n["user_text"]
+        assert "模型服务" not in n["user_text"]
+        assert n["blame"] != "user_provider"
+
+
 def test_v2_capture_failures_now_notify_the_user():
     """🔴 V2 落卡失败以前**完全没有提示**（V2 不经过 V1 的状态记录函数）。
 

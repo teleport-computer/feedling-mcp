@@ -141,18 +141,27 @@ change must not be interpreted as an API guarantee.
   is recorded as `…:unknown`. HTTP 403 follows the same rule as chat failure
   notices. Chinese relay messages are recognized when a status label or JSON
   error field accompanies them, for example `错误码 401：API 密钥无效`
-  (`auth_invalid`) or `状态码 429：额度不足` (`quota_insufficient`).
+  (`auth_invalid`) or `状态码 429：额度不足` (`quota_insufficient`). A resident
+  agent call that times out locally (the CLI process or agent request hitting
+  its time limit) is recorded as `…:turn_timeout`, the same class resident chat
+  uses for that case; it is an operational failure, does not make memory capture
+  wait seven days as an account problem, and is not presented to the user as
+  their model service being unavailable. A timeout accompanied by upstream
+  evidence (an HTTP 5xx status, a gateway timeout, a disconnected stream) is
+  still `…:upstream_unavailable`.
 
 - Operational failure rates in admin lane views and runtime health no longer
   count memory capture, dream and migrate failures proven to be the user's own
   account or model setup: `<lane>_agent_call_failed:` `auth_invalid`,
-  `quota_insufficient`, `model_not_found`, `provider_account_expired` or
-  `resident_agent_cli_logged_out` (resident V1), and
-  `extraction_failed:auth_invalid`, `extraction_failed:model_not_found` or
-  `provider_setup:*` model API configuration errors (Runtime V2). They are
-  reported as user-unavailable instead, like the equivalent chat failures.
-  Provider outages, rate limits, timeouts, content filtering and unknown causes
-  remain operational failures.
+  `quota_insufficient`, `model_not_found` or `provider_account_expired`
+  (resident V1), and `extraction_failed:auth_invalid`,
+  `extraction_failed:model_not_found` or `provider_setup:*` model API
+  configuration errors (Runtime V2). They are reported as user-unavailable
+  instead, like the equivalent chat failures. Provider outages, rate limits,
+  timeouts, content filtering and unknown causes remain operational failures, and
+  so does `resident_agent_cli_logged_out`, because a hosted runner can print the
+  same "not logged in" message when the platform fails to provide its
+  credentials.
 
 - Hosted Runtime V2 Dream no longer reports a run as completed when the
   Memory Garden is below the memory kernel's consolidation minimum. Such a run

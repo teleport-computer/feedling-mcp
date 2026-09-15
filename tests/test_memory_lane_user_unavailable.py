@@ -1,14 +1,16 @@
 """Memory-lane failures that are the user's own account problem leave our failure numerator.
 
 Before (2026-09-15): a capture/dream/migrate job that failed because the user's
-key was revoked, balance empty, model retired, resident CLI logged out, or V2
-model API never configured counted as a Feedling operational failure — only
+key was revoked, balance empty, model retired, or V2 model API never
+configured counted as a Feedling operational failure — only
 chat-lane codes were in Seven's user-unavailable sets.
 
 After: hx approved adding the memory-lane codes for exactly those proven
 account classes (additions only, pending Seven's review). Provider outages,
 rate limits, timeouts, content filtering, unknown and Feedling-side codes stay
-operational.
+operational. So does ``resident_agent_cli_logged_out``: on hosted V1 runners a
+platform key-injection bug prints the same "Not logged in" text (review 09-15),
+matching Seven's chat set which also leaves it out.
 
 DB-backed rollup/health coverage lives in tests/test_lane_rollup.py.
 """
@@ -35,9 +37,10 @@ USER_ACCOUNT_CLASSES = frozenset({
     "quota_insufficient",
     "model_not_found",
     "provider_account_expired",
-    "resident_agent_cli_logged_out",
 })
 NOT_USER_CLASSES = frozenset({
+    "resident_agent_cli_logged_out",
+    "turn_timeout",
     "upstream_unavailable",
     "rate_limited",
     "content_filtered",
@@ -112,6 +115,17 @@ def test_every_addition_is_a_value_its_producer_actually_writes():
     }
 
 
+def test_cli_logged_out_still_waits_in_the_escape_valve_but_is_not_excused():
+    """Not excused from the failure rate, yet still an account class for the
+    capture escape valve (wait 7 days with the login notice, never skip at 6)."""
+    for prefix in sorted(agent_call_failure.AGENT_CALL_FAILED_PREFIXES):
+        code = f"{prefix}:resident_agent_cli_logged_out"
+        assert code not in catalog.USER_UNAVAILABLE_V1_REASONS
+        assert catalog.v1_proactive_outcome_class("failed", code) == "operational_failure"
+        assert capture_failure.failure_class(code) == "account"
+        assert capture_failure.account_error_code(code) == "resident_agent_cli_logged_out"
+
+
 def test_excluded_codes_are_a_subset_of_what_the_escape_valve_treats_as_account():
     """One classifier: nothing is excused from the failure rate that the capture
     escape valve does not also treat as an account/provider-setup problem."""
@@ -143,8 +157,13 @@ def test_v1_classifier_splits_account_classes_from_our_failures(prefix):
 @pytest.mark.parametrize(("raw", "expected"), [
     ('capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to authenticate. '
      'API Error: 401 {"error":"Insufficient balance"} (api_status=401)', "user_unavailable"),
+    # CLI logged out: may be a hosted platform key-injection bug — stays ours.
     ("dream_agent_call_failed:RuntimeError: Failed to authenticate: OAuth session expired "
-     "and could not be refreshed", "user_unavailable"),
+     "and could not be refreshed", "operational_failure"),
+    ("capture_agent_call_failed:RuntimeError: Not logged in · Please run /login",
+     "operational_failure"),
+    ("capture_agent_call_failed:TimeoutExpired: Command '['claude', '-p']' timed out after 300 "
+     "seconds", "operational_failure"),
     ("migrate_agent_call_failed:RuntimeError: 403 Your request was blocked", "user_unavailable"),
     ("capture_agent_call_failed:RuntimeError: 错误码 401：API 密钥无效", "user_unavailable"),
     ("capture_agent_call_failed:RuntimeError: provider_http_403: Request failed. "
