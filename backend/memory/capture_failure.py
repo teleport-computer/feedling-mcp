@@ -315,6 +315,32 @@ def skip_threshold_for(reason: str) -> int:
 
 
 
+def windowless_failure_patch(state, *, now_ts: float, reason: str = "") -> dict:
+    """说不清是哪个窗口的失败（平台回收崩溃任务、批次丢失、老任务没带窗口…）怎么改状态。
+
+    只累加总连续失败数（退避 + 提示），**永不跳过**。三个按窗口数的子计数分别这样处理：
+
+    - ``capture_parse_fail_streak``：它数的是**连续的**解析失败。中间夹了一次非解析失败，
+      连续性就断了，必须清零 —— 否则「解析 ×2 → worker 崩溃 → 解析 ×1」会被当成连续 3 次
+      解析失败，立刻跳过这一批（Codex 第 12 轮复现）。带窗口的「其他」失败本来就清零，这里对齐。
+      说不清窗口的**解析**失败保持不动：不知道是不是同一批，既不能接着数、也没理由打断。
+    - ``capture_window_fail_count``：同一窗口里非账号失败的**累计**数（6 次兜底），不是连续计数，
+      带窗口的账号失败也不清它。说不清窗口的失败不能算进某一批（崩溃多半是我们的问题，
+      算进去就等于拿平台故障去凑跳过次数），也没有理由清掉已经数到的次数 —— 保持不动。
+    - ``capture_account_fail_since``（7 天计时）：带窗口的非账号失败不重置它，这里同样不动；
+      计时的「空窗期」判断看 ``last_capture_failed_at``，这次失败会刷新它 —— 期间确实在重试，
+      不算空窗，和带窗口的失败一致。说不清窗口的账号失败也不开始计时（没有窗口可锚）。
+    """
+    patch: dict[str, Any] = {
+        "capture_fail_streak": int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1,
+        "capture_account_error_code": account_error_code(reason),
+        "last_capture_failed_at": now_ts,
+    }
+    if failure_class(reason) != "parse":
+        patch["capture_parse_fail_streak"] = 0
+    return patch
+
+
 def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     """一次落卡失败要怎么改状态。返回 ``(补丁, streak, 是否跳过)``。
 
@@ -347,10 +373,8 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     key = window_key(window)
     if not key:
         # 说不清是哪个窗口 —— 只累加，不跳过（跳过需要知道推到哪）。
-        streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-        return ({"capture_fail_streak": streak,
-                 "capture_account_error_code": account_error_code(reason),
-                 "last_capture_failed_at": now_ts}, streak, False)
+        patch = windowless_failure_patch(state, now_ts=now_ts, reason=reason)
+        return (patch, int(patch["capture_fail_streak"]), False)
     same = key == str(state.get("capture_fail_window_key") or "")
     kind = failure_class(reason)
     # capture_fail_streak 仍是退避/告警用的总连续失败数，语义不变。

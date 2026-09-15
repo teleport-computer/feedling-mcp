@@ -24,7 +24,9 @@ change must not be interpreted as an API guarantee.
   recorded in capture diagnostics. While capture is blocked, the app shows a
   notice naming the cause when it is known. A hosted capture run that crashes or
   hangs the runtime worker and is recovered by the platform now also counts as a
-  failure (backoff and notice apply), but never causes a batch to be skipped.
+  failure (backoff and notice apply), but never causes a batch to be skipped;
+  its notice attributes the problem to the service rather than the account, and
+  it interrupts the count of consecutive unreadable outputs.
   Previously a single bad batch could block all future memories for that account.
 
 - V1 resident proactive wakes now include relevant memory summaries selected
