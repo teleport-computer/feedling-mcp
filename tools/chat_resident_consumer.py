@@ -17595,6 +17595,11 @@ def _capture_existing_cards() -> list[dict] | None:
         type(body.get("user_card_count")) is int and body.get("user_card_count") == 0
     ):
         return None
+    if body.get("truncated") is not False:
+        # 现有卡超过读侧硬上限（FEEDLING_MEMORY_READSIDE_HARD_MAX）时只回前一截、标
+        # truncated（老后端同样带这个字段）。半截当全集交出去，上限之后的真卡被引用时
+        # 会被判成编造丢掉 —— 读不全就不交，缺字段同样按读不全处理。
+        return None
     return garden_component.capture_existing_cards(items)
 
 
@@ -17665,6 +17670,58 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
 
 CAPTURE_BATCH_PAGE_LIMIT = 200  # backend /v1/chat/history 单页上限
 
+#: 按批次发的窗口里，哪些行进落卡提示词。必须和后端切批的判据一模一样：
+#: ``capture_scheduler.CAPTURE_LIVE_SOURCES`` + 角色 user/openclaw
+#: （``db.chat_capture_messages_oldest_after_seq``），也就是 V2 worker 的
+#: ``capture_eligible``（``_CAPTURE_PROMPT_RAW_ROLES`` × ``_CAPTURE_PROMPT_SOURCES``）。
+#: 这里不 import 后端模块（自建 VPS 上 consumer 不带数据库依赖），抄一份，
+#: tests/test_v1_capture_backlog_batches.py 锁住三处一致。
+#:
+#: 以前批次窗口按角色放行、不看来源：两批聊天之间夹着的导入历史、维护提示之类的行
+#: 后端没数进这一批，却被整段喂进落卡 → 重复落卡；窗口超过字数上限时从头截断，
+#: 真正的聊天反而被挤掉。老后端发的窗口（没有 through_seq）不走这里，行为不变。
+CAPTURE_BATCH_ROLES = frozenset({"user", "openclaw"})
+CAPTURE_BATCH_SOURCES = frozenset({
+    "chat", "model_api", "live_activity", "agent_initiated_proactive",
+    "voice_call_transcript",
+})
+
+
+def _capture_batch_row_eligible(msg: Any) -> bool:
+    if not isinstance(msg, dict):
+        return False
+    return (
+        str(msg.get("role") or "") in CAPTURE_BATCH_ROLES
+        and str(msg.get("source") or "") in CAPTURE_BATCH_SOURCES
+    )
+
+
+#: 一次落卡任务翻页最多占多久。不另起数：翻页和后台模型回合一样跑在聊天线程上、
+#: 不可抢占，用同一个上限 AGENT_TURN_TIMEOUT_SEC —— 「后台活一次最多卡住前台多久」
+#: 这件事只有一个数。用户消息在等时根本等不到这个上限（每页之间都会先看一眼）。
+CAPTURE_BATCH_PAGING_BUDGET_SEC = float(AGENT_TURN_TIMEOUT_SEC)
+
+#: 让出之后保存的翻页进度，最多保留多久。不另起数：和「维护任务为聊天最多让多久」
+#: 共用 MAINTENANCE_MAX_DEFER_SEC —— 超过这个时间才回来的已经不算「接着刚才那次」，
+#: 从头翻一遍，不拿太旧的内存快照冒充当前记录。
+CAPTURE_BATCH_RESUME_MAX_AGE_SEC = float(MAINTENANCE_MAX_DEFER_SEC)
+
+CAPTURE_DEFERRED_USER_CHAT = "capture_deferred_user_chat"
+CAPTURE_DEFERRED_PAGING_BUDGET = "capture_deferred_paging_budget"
+
+
+class _CaptureWindowDeferred(Exception):
+    """翻页中途让出（用户有消息在等 / 翻页时间用完）。不是失败：任务报 skipped、游标不动。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+#: 让出时的翻页进度（本进程、单用户）。键是批次边界，下一个同一批次的任务从这里接着翻，
+#: 这样「翻不完就让出」也一定在前进，不会每次从头翻、永远翻不完。
+_capture_batch_resume: dict[str, Any] | None = None
+
 
 def _capture_seq_or_none(value: Any) -> int | None:
     if value is None or value == "" or isinstance(value, bool):
@@ -17675,7 +17732,12 @@ def _capture_seq_or_none(value: Any) -> int | None:
         return None
 
 
-def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dict]:
+def _capture_batch_window_messages(
+    after_seq: int,
+    through_seq: int,
+    *,
+    should_yield: Callable[[], bool] | None = None,
+) -> list[dict]:
     """按 seq 精确取 ``(after_seq, through_seq]`` 这一批（后端按批次发的窗口）。
 
     老逻辑拿「最新 160 行」再从里面找起点：积压超过这 160 行时起点根本不在里面，
@@ -17698,10 +17760,47 @@ def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dic
 
     取不全（解密源失败 / 行没有 seq / 翻页没有进展）返回 []，
     由调用方把任务标失败、游标不动 —— 绝不拿半批冒充整批。
+
+    🔴 **翻页跑在聊天线程上、不可抢占**（Codex review 2026-09-15 第 5 轮）。不设页数上限
+    之后，最坏几百页、每页可能逐行走 enclave 解密，用户的回复一直排在后面。所以：
+
+    - 每翻完一页、翻下一页之前，``should_yield()`` 为真（用户有消息在等）就让出；
+    - 这次任务翻页超过 ``CAPTURE_BATCH_PAGING_BUDGET_SEC`` 也让出；
+    - 让出抛 ``_CaptureWindowDeferred``：调用方报 skipped（不算失败、不计逃生阀）、游标不动。
+      已翻到的进度存进 ``_capture_batch_resume``，同一批次的下一个任务从那里接着翻 ——
+      每个任务至少翻一页，所以「时间用完就让出」也一定会翻完，不会原地打转。
+
+    中途某一页取不到（解密源抖动）照旧返回 []、按失败处理：那是现有的「其它失败」档，
+    带退避、6 次才跳过（和 V2 读窗口失败同一档），不是解析失败的 3 次快跳。
     """
+    global _capture_batch_resume
+    key = f"{int(after_seq)}:{int(through_seq)}"
     out: list[dict] = []
     cursor = int(after_seq)
+    resume = _capture_batch_resume
+    _capture_batch_resume = None
+    if (
+        isinstance(resume, dict)
+        and resume.get("key") == key
+        and time.time() - float(resume.get("saved_at") or 0) <= CAPTURE_BATCH_RESUME_MAX_AGE_SEC
+    ):
+        out = list(resume.get("out") or [])
+        cursor = int(resume.get("cursor") or after_seq)
+    started = time.monotonic()
+    first_page = True
     while True:
+        if not first_page:
+            defer_reason = ""
+            if should_yield is not None and should_yield():
+                defer_reason = CAPTURE_DEFERRED_USER_CHAT
+            elif time.monotonic() - started >= CAPTURE_BATCH_PAGING_BUDGET_SEC:
+                defer_reason = CAPTURE_DEFERRED_PAGING_BUDGET
+            if defer_reason:
+                _capture_batch_resume = {
+                    "key": key, "cursor": cursor, "out": out, "saved_at": time.time(),
+                }
+                raise _CaptureWindowDeferred(defer_reason)
+        first_page = False
         page = get_decrypted_history(
             since=0,
             limit=CAPTURE_BATCH_PAGE_LIMIT,
@@ -17731,7 +17830,9 @@ def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dic
             if seq == through_seq:
                 reached_end = True
                 break
-        out.extend(_capture_live_history(in_range))
+        out.extend(_capture_live_history(
+            [msg for msg in in_range if _capture_batch_row_eligible(msg)]
+        ))
         if reached_end:
             return out
         if page_max <= cursor:
@@ -17740,13 +17841,17 @@ def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dic
         cursor = page_max
 
 
-def _capture_window_messages(job: dict) -> list[dict]:
+def _capture_window_messages(
+    job: dict, *, should_yield: Callable[[], bool] | None = None
+) -> list[dict]:
     window = job.get("window") if isinstance(job.get("window"), dict) else {}
     batch_after_seq = _capture_seq_or_none(window.get("after_seq"))
     batch_through_seq = _capture_seq_or_none(window.get("through_seq"))
     if (batch_after_seq is not None and batch_through_seq is not None
             and batch_through_seq > batch_after_seq >= 0):
-        return _capture_batch_window_messages(batch_after_seq, batch_through_seq)
+        return _capture_batch_window_messages(
+            batch_after_seq, batch_through_seq, should_yield=should_yield
+        )
     # 老后端发的窗口（没有 through_seq）：原样走老逻辑。
     after_id = str(window.get("after_message_id") or "").strip()
     until_id = str(window.get("until_message_id") or "").strip()
@@ -18092,12 +18197,17 @@ def _capture_semantic_retry_reasons(
     return reasons
 
 
-def _process_capture_jobs(jobs: list) -> float:
+def _process_capture_jobs(jobs: list, chat_since: float | None = None) -> float:
     """Realize memory_capture jobs through the native resident agent.
 
     Capture is background memory maintenance: it never writes chat, never uses
     delivery gates, and never runs the V2 tool loop.
+
+    ``chat_since`` (from ``_process_resident_jobs``) lets a long batch-window
+    read yield to a waiting user message between history pages; ``None`` keeps
+    the no-gate behavior.
     """
+    global _resident_jobs_deferred_for_user
     latest = 0.0
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
@@ -18118,7 +18228,36 @@ def _process_capture_jobs(jobs: list) -> float:
             continue
         window = job.get("window") if isinstance(job.get("window"), dict) else {}
         update_proactive_job_status(job_id, "realizing")
-        messages = _capture_window_messages(job)
+        try:
+            if chat_since is None:
+                messages = _capture_window_messages(job)
+            else:
+                messages = _capture_window_messages(
+                    job, should_yield=lambda: _user_chat_pending(chat_since)
+                )
+        except _CaptureWindowDeferred as deferred:
+            # 翻页中途让出：用户有消息在等，或这次翻页时间用完。报 skipped —— 后端对
+            # V1 落卡的 skipped 既不累计失败、不退避、不算逃生阀，也不推游标
+            # （capture_scheduler.record_capture_job_status），同一批之后重新入队，
+            # 从 _capture_batch_resume 接着翻。只带原因码，不带任何内容。
+            log.info("capture window paging deferred id=%s reason=%s", job_id, deferred.reason)
+            update_proactive_job_status(
+                job_id,
+                "skipped",
+                deferred.reason,
+                extra={
+                    "capture_result": {"status": "skipped", "reason": deferred.reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": deferred.reason,
+                },
+            )
+            if deferred.reason == CAPTURE_DEFERRED_USER_CHAT:
+                # 和 _process_resident_jobs 的让出同一个语义：保留旧 checkpoint、这批剩下的不跑。
+                _resident_jobs_deferred_for_user = True
+                break
+            continue
         window_text = ""
         if messages:
             # Names before rendering: the transcript labels use them (never a
@@ -20429,7 +20568,14 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
                     now - _last_user_message_wall, job.get("job_kind") or job.get("source"),
                 )
                 continue
-        latest = max(latest, processor([job]))
+        if class_idx == 0:
+            # Capture's batch-window read can page many times; it checks the same
+            # pending-user peek between pages (see _capture_batch_window_messages).
+            latest = max(latest, processor([job], chat_since=chat_since))
+            if _resident_jobs_deferred_for_user:
+                break
+        else:
+            latest = max(latest, processor([job]))
     return latest
 
 

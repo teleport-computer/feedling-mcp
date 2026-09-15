@@ -65,6 +65,7 @@ import functools
 import hashlib
 import hmac
 import json
+import math
 import os
 import sys
 import time
@@ -127,6 +128,11 @@ def _threshold(name: str, default: float, cast: type = int) -> Any:
         value = cast(raw)
     except ValueError:
         print(f"ignoring invalid {name}; using default {default}", file=sys.stderr)
+        return default
+    if not math.isfinite(value):
+        # float("nan") / float("inf") parse fine, but every comparison with nan is
+        # False, so a nan threshold silently turns its rule off.
+        print(f"ignoring non-finite {name}; using default {default}", file=sys.stderr)
         return default
     if value < 0:
         print(f"ignoring negative {name}; using default {default}", file=sys.stderr)

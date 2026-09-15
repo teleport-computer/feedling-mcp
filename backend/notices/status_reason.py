@@ -60,6 +60,11 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "agent_scheduled_wake_actions",
     "agent_sleep",
     "capture_agent_call_failed",
+    # Batch-window paging yielded (user message waiting / paging budget spent).
+    # Written through the constants CAPTURE_DEFERRED_* (not literals), so the
+    # AST scan cannot see them; test_non_literal_producers_are_sanctioned does.
+    "capture_deferred_paging_budget",
+    "capture_deferred_user_chat",
     "capture_invalid_memory_action",
     "capture_memory_actions_applied",
     "capture_memory_actions_failed",

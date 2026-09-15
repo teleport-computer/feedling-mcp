@@ -12,6 +12,47 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 capture no longer loses a whole batch when two cards update the
+  same existing card.** Before: in one capture round the model returns two cards
+  that both say they replace the same old card → the batch commit refused the
+  whole batch (an old card can only have one successor) → the same messages
+  failed on every retry until the retry limit skipped them, taking the other good
+  cards in that batch with them. After: the first card replaces the old card, the
+  second is dropped (only its count is recorded in the run trajectory), and the
+  rest of the batch is saved. Resident V1 already dropped only the second card.
+
+- **Resident V1 capture yields to the user while reading a long capture batch.**
+  Since the history-page cap was removed, reading one batch can take many history
+  pages on the same thread that answers chat. Before: a message sent while those
+  pages were being read waited until the whole batch had been read. After: the
+  consumer checks for a waiting user message between pages and, if there is one,
+  pauses the capture job; a single read also stops after the agent-turn time
+  limit. The paused job is reported `skipped` with `capture_deferred_user_chat` or
+  `capture_deferred_paging_budget` — not a failure, no retry backoff, the capture
+  position is unchanged — and the next job for the same batch continues from the
+  page it reached. Resident V1 batch windows also now contain only the rows the
+  backend counted into the batch — user and agent messages from live chat
+  sources, the same set Runtime V2 uses. Before: rows from other sources between
+  two chat messages (for example imported history) were fed to capture too,
+  producing duplicate cards, and in a long window could push the real chat past
+  the window's character limit. After: those rows are left out. Windows from an
+  older backend without batch bounds are unchanged. Applies to hosted V1 runners
+  and self-hosted consumers (through self-update).
+
+- **Capture no longer treats a partial existing-card list as complete.** For a
+  garden with more active cards than the read-side hard maximum (1,000 by
+  default), the existing-card index read returns only the first part and marks it
+  `truncated`. Before: Runtime V2 and resident V1 capture used that part as the
+  full list, so a card that updates a real card beyond it was judged to reference
+  a non-existent card and dropped. After: a truncated (or unmarked) read is
+  treated like an unreadable one — capture runs without the index and leaves
+  target checks to the server.
+
+- **`memory.dream.window_missed` also covers a busy Dream admission.** Before: an
+  account whose last in-window Dream decision was `dream_admission_busy` got no
+  diagnostic when the window closed. After: it records the same event with reason
+  `dream_admission_busy_at_window_end`.
+
 - **Resident V1 capture no longer skips a batch it could not read past a long
   run of non-chat rows.** The backend sizes a capture batch by counting only chat
   messages, but the consumer read at most 10 history pages (2,000 rows) to reach

@@ -13270,6 +13270,7 @@ async def _run_extraction(
             # 回调在 extraction 里是**同步**调用的,所以这里只收集事实,
             # 等 to_actions 返回后再统一 await —— 不在同步回调里造未 await 的协程。
             source_time_degraded: list[tuple[int, int, bool]] = []
+            capture_skipped: dict[str, int] = {}
             action_kwargs = {
                 "occurred_at": occurred_at,
                 "source_ids": source_ids,
@@ -13288,7 +13289,22 @@ async def _run_extraction(
                         (int(known), int(missing), bool(fb))
                     )
                 )
+            else:
+                action_kwargs["on_skipped"] = (
+                    lambda why, count: capture_skipped.__setitem__(
+                        str(why), capture_skipped.get(str(why), 0) + int(count)
+                    )
+                )
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            if capture_skipped.get("supersede_target_duplicate"):
+                # 同一轮两张卡覆盖同一张旧卡，第二张被映射层丢掉（见 _to_actions）。
+                # 只记张数，与 unknown_target_dropped 同形。
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "supersede_target_duplicate_dropped",
+                    {"cards": int(capture_skipped["supersede_target_duplicate"])},
+                    best_effort=True,
+                )
             if lane == "dream":
                 dream_counts.update({
                     "actions": len(actions),

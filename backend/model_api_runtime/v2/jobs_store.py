@@ -1521,15 +1521,19 @@ def _enqueue_capture_once(
                     (user_id,),
                 )
                 existing = cur.fetchone()
-                if existing is not None and str(existing["status"]) in {
-                    "claimed",
-                    "running",
-                }:
-                    generation_stale = effective_generation is not None and (
+                generation_stale = (
+                    existing is not None
+                    and effective_generation is not None
+                    and (
                         existing["expected_runtime_generation"] is None
                         or int(existing["expected_runtime_generation"])
                         != int(effective_generation)
                     )
+                )
+                if existing is not None and str(existing["status"]) in {
+                    "claimed",
+                    "running",
+                }:
                     if not generation_stale:
                         # 行锁到手之后才读墙钟，和通用函数同一个判断。
                         cur.execute(
@@ -1554,11 +1558,14 @@ def _enqueue_capture_once(
                             int(cur.fetchone()["id"]), "coalesced_active"
                         ), None
                 if (
-                    existing is None
+                    (existing is None or generation_stale)
                     and backoff_now is not None
                     and _capture_backoff_armed_on_cursor(cur, str(user_id), backoff_now)
                 ):
                     # 调度器判退避之后，另一次入队 / 回收器刚终结崩溃任务并记了账（第 13 轮 I1）。
+                    # 活跃任务属于已过期的 runtime 代时，下面的通用函数会作废它并**建新任务**，
+                    # 同样要过这道闸（Codex review 第 5 轮 M4）。退避里就什么都不动：旧代任务
+                    # 照旧在领取 / 提交时被所有权闸挡掉，退避过后的下一次入队再作废它。
                     return CaptureEnqueueResult(None, "backoff_deferred"), None
                 job_id, coalesced = coalesce_or_insert_on_cursor(
                     cur,

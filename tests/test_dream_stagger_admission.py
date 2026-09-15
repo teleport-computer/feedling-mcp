@@ -544,6 +544,31 @@ def test_capped_until_window_end_emits_one_content_free_event(monkeypatch, dream
     assert len(events) == 1, "once per capped-to-closed transition"
 
 
+def test_admission_busy_until_window_end_also_emits_window_missed(
+    monkeypatch, dream_env, no_v2_jobs
+):
+    """之前：窗口里最后一次判定是 dream_admission_busy（准入锁被别的 tick 占着）的
+    用户，窗口关了也不发 memory.dream.window_missed —— 今晚没做梦查不到原因。
+    之后：和并发上限同样发一次，理由码写明是 busy。"""
+    monkeypatch.setenv("FEEDLING_DREAM_STAGGER", "0")
+    events = _window_missed_events(monkeypatch)
+    store = _user_with_cards("usr_dream_window_missed_busy")
+
+    with db.memory_dream_admission_lock() as held:
+        assert held is True
+        busy = dream_scheduler.tick_memory_dream(store, now=WINDOW_START + 3 * 3600 - 30)
+    assert busy["reason"] == "dream_admission_busy"
+    assert events == []
+
+    closed = dream_scheduler.tick_memory_dream(store, now=WINDOW_START + 3 * 3600 + 30)
+    assert closed["reason"] == "night_not_due"
+    assert len(events) == 1
+    assert events[0]["detail"] == {
+        "reason": "dream_admission_busy_at_window_end",
+        "max_concurrent": dream_scheduler.dream_max_concurrent(),
+    }
+
+
 def test_no_window_missed_event_when_the_user_was_not_capped(monkeypatch, dream_env, no_v2_jobs):
     monkeypatch.setenv("FEEDLING_DREAM_STAGGER", "0")
     events = _window_missed_events(monkeypatch)

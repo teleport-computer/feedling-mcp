@@ -336,6 +336,11 @@ def test_capability_and_batch_size_agree_across_consumer_backend_and_v2():
         advertised = {c.strip() for c in crc._consumer_capabilities(hosted).split(",")}
         assert CAP in advertised
     assert capture_scheduler.CAPTURE_V1_BATCH_LIMIT == v2_worker._CAPTURE_BATCH_LIMIT
+    # The rows a batch window renders are exactly the rows the backend counted
+    # into it — the same set V2 marks capture_eligible.
+    assert crc.CAPTURE_BATCH_SOURCES == capture_scheduler.CAPTURE_LIVE_SOURCES
+    assert crc.CAPTURE_BATCH_SOURCES == v2_worker._CAPTURE_PROMPT_SOURCES
+    assert crc.CAPTURE_BATCH_ROLES == v2_worker._CAPTURE_PROMPT_RAW_ROLES
     # "message_count >= one batch" is only a backlog signal while discovery
     # reads more rows than one batch.
     assert max(64, min(1000, capture_scheduler.turn_backstop() * 2)) > \
@@ -464,3 +469,265 @@ def test_batch_window_is_complete_past_thousands_of_excluded_rows(backend_env, m
     assert "我下周要去大阪出差" in crc._capture_window_text(messages)
     # Really went through the real route, past the old 10-page reach.
     assert len(paths) > 10 and all("/v1/chat/history?" in p and "after_seq=" in p for p in paths)
+
+
+def _route_consumer_posts_to_real_backend(monkeypatch, api_key: str) -> None:
+    """Claim + status POSTs go to the real ASGI app too (so skipped is judged by
+    the real ``record_capture_job_status``, not by a fake)."""
+    from asgi_test_client import make_client
+
+    client = make_client()
+
+    class _Resp:
+        def __init__(self, shim):
+            self._shim = shim
+            self.status_code = shim.status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._shim.get_json()
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        path = url[len(crc.FEEDLING_API_URL):]
+        return _Resp(client.post(path, json=json, headers=dict(headers or {})))
+
+    monkeypatch.setattr(crc._HTTP, "post", fake_post)
+
+
+def _register_paging_user(monkeypatch, *, excluded: int):
+    import base64
+
+    from asgi_test_client import make_client
+
+    registered = make_client().post(
+        "/v1/users/register",
+        json={"public_key": base64.b64encode(b"\x5b" * 32).decode(), "archive_language": "zh"},
+    )
+    assert registered.status_code == 201, registered.get_data(as_text=True)
+    api_key = registered.get_json()["api_key"]
+    store = core_store.get_store(registered.get_json()["user_id"])
+    db.set_blob(store.user_id, "consumer_state", {
+        "consumer_name": "feedling-chat-resident",
+        "consumer_capabilities": ["vision_observer_v1", CAP],
+    })
+    store.append_chat("user", "chat", {"id": "live_first", "body": "我下周要去大阪出差"})
+    with monkeypatch.context() as quiet:
+        quiet.setattr(capture_scheduler, "record_chat_append", lambda *a, **k: {})
+        for i in range(excluded):
+            store.append_chat(
+                "system", "resident_maintenance",
+                {"id": f"sys{i:05d}", "body": f"maintenance {i}"},
+            )
+    store.append_chat("openclaw", "chat", {"id": "live_last", "body": "好的，记得带护照"})
+    return store, api_key
+
+
+def test_batch_window_paging_yields_to_a_waiting_user_and_resumes(backend_env, monkeypatch):
+    """Codex review 2026-09-15 round 5 (I2).
+
+    Before: a batch window spanning many history pages was read in one go on
+    the chat thread; a user message that arrived mid-paging waited for every
+    page (no page cap, possibly per-row enclave decrypts).
+    After: between pages the consumer peeks for a waiting user message; if one
+    is pending the capture job is reported ``skipped`` (no failure streak, no
+    backoff, cursor unchanged), the rest of the job batch is deferred, and the
+    next job for the same window resumes from the saved page cursor.
+    """
+    store, api_key = _register_paging_user(monkeypatch, excluded=650)
+    paths = _route_consumer_http_to_real_backend(monkeypatch, api_key)
+    _route_consumer_posts_to_real_backend(monkeypatch, api_key)
+    monkeypatch.setattr(crc, "_capture_batch_resume", None)
+    # Process-global consumer state other tests leave behind: a recent user
+    # message (maintenance soft-idle) or an already-seen job id would skip the job.
+    monkeypatch.setattr(crc, "_last_user_message_wall", 0.0)
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(
+        crc, "_capture_identity_context",
+        lambda: (_ for _ in ()).throw(AssertionError("model turn started on a deferred window")),
+    )
+    last_ts = float(db.chat_history_page_by_seq_strict(
+        store.user_id, limit=1, latest=True)[0]["ts"])
+    now = last_ts + max(capture_scheduler.quiet_sec(), capture_scheduler.min_interval_sec()) + 5
+    tick = capture_scheduler.tick_quiet_capture(store, now=now)
+    assert tick["enqueued"] is True, tick
+    job = tick["job"]
+    window = job["window"]
+    assert window["through_seq"] - window["after_seq"] > 3 * crc.CAPTURE_BATCH_PAGE_LIMIT
+
+    # Peek #1 is the per-job gate in _process_resident_jobs; the user's message
+    # lands while the second history page is being read.
+    peeks = iter([False, False, True])
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(peeks))
+    crc._process_resident_jobs([job], chat_since=last_ts)
+
+    history = [p for p in paths if p.startswith("/v1/chat/history?")]
+    assert len(history) == 2, history
+    assert crc._resident_jobs_deferred_for_user is True
+    row = next(r for r in store.list_proactive_jobs(since_epoch=0, limit=0)
+               if r["job_id"] == job["job_id"])
+    assert row["status"] == "skipped"
+    assert row["status_reason"] == crc.CAPTURE_DEFERRED_USER_CHAT
+    state = capture_scheduler.load_capture_state(store)
+    assert int(state["capture_fail_streak"]) == 0
+    assert int(state["capture_window_fail_count"]) == 0
+    assert int(state["last_captured_until_seq"]) == int(window["after_seq"])
+    assert not state["last_capture_skipped_at"]
+
+    # The same window is re-issued, and reading it continues where paging stopped.
+    retry = capture_scheduler.tick_quiet_capture(store, now=now + 1)
+    assert retry["enqueued"] is True, retry
+    assert retry["job"]["job_id"] != job["job_id"]
+    assert retry["job"]["window"]["through_seq"] == window["through_seq"]
+    paths.clear()
+    messages = crc._capture_window_messages(retry["job"])
+    ids = [crc._capture_message_id(m) for m in messages]
+    assert ids and ids[0] == "live_first" and ids[-1] == "live_last", ids[:3]
+    import urllib.parse
+
+    resumed = [p for p in paths if p.startswith("/v1/chat/history?")]
+    resumed_from = int(urllib.parse.parse_qs(resumed[0].split("?", 1)[1])["after_seq"][0])
+    assert resumed_from > int(window["after_seq"]), resumed[0]
+    # A cold read of the same window needs exactly the pages already read plus
+    # the resumed ones: nothing was re-read and nothing was skipped.
+    paths.clear()
+    assert crc._capture_window_messages(retry["job"]) == messages
+    cold = [p for p in paths if p.startswith("/v1/chat/history?")]
+    assert len(cold) == len(history) + len(resumed)
+
+
+def test_batch_window_paging_budget_defers_without_failure_and_always_progresses(monkeypatch):
+    """A window nobody is waiting on still cannot hold the chat thread forever:
+    past the paging budget the job is reported ``skipped`` (not failed), and
+    every attempt reads at least one page, so repeated attempts finish."""
+    rows = [
+        {"id": f"r{i}", "seq": i, "ts": float(i), "role": "user" if i % 7 == 0 else "system",
+         "source": "chat", "content": f"row {i}"}
+        for i in range(1, 1001)
+    ]
+    fetched: list[int] = []
+
+    def fake(since=0, limit=20, include_image_body=True, after_seq=None):
+        fetched.append(int(after_seq))
+        return [r for r in rows if r["seq"] > after_seq][:limit]
+
+    monkeypatch.setattr(crc, "get_decrypted_history", fake)
+    monkeypatch.setattr(crc, "_capture_batch_resume", None)
+    monkeypatch.setattr(crc, "CAPTURE_BATCH_PAGING_BUDGET_SEC", 0.0)
+
+    attempts = 0
+    while True:
+        attempts += 1
+        assert attempts < 20
+        try:
+            got = crc._capture_batch_window_messages(0, 950, should_yield=lambda: False)
+            break
+        except crc._CaptureWindowDeferred as deferred:
+            assert deferred.reason == crc.CAPTURE_DEFERRED_PAGING_BUDGET
+    assert [m["seq"] for m in got] == [i for i in range(1, 951) if i % 7 == 0]
+    assert attempts == 5 and fetched == [0, 200, 400, 600, 800]
+
+    # Through the job processor: skipped with the budget reason, not failed, and
+    # the job batch is NOT deferred (no user is waiting).
+    monkeypatch.setattr(crc, "_capture_batch_resume", None)
+    monkeypatch.setattr(crc, "_last_user_message_wall", 0.0)
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    statuses = []
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: statuses.append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    job = {"schema_version": 2, "job_id": "cap_budget", "job_kind": "memory_capture",
+           "source": "memory_capture", "ts": 5.0,
+           "window": {"after_seq": 0, "through_seq": 950, "until_message_id": "r950"}}
+    crc._process_resident_jobs([job], chat_since=1.0)
+    assert statuses == [("realizing", ""), ("skipped", crc.CAPTURE_DEFERRED_PAGING_BUDGET)]
+    assert crc._resident_jobs_deferred_for_user is False
+
+
+def test_mid_paging_source_failure_stays_in_the_retryable_failure_tier(monkeypatch):
+    """A page that cannot be fetched mid-window keeps today's semantics: the job
+    fails as ``capture_window_unavailable`` (cursor unchanged). On the backend
+    that reason is the non-parse tier (6 attempts with backoff), never the
+    3-strike parse tier, and a saved resume point is not reused after it."""
+    from memory import capture_failure
+
+    pages = {0: [{"id": "a", "seq": 1, "ts": 1.0, "role": "user", "source": "chat",
+                  "content": "x"}] + [
+        {"id": f"s{i}", "seq": i, "ts": float(i), "role": "system", "source": "chat",
+         "content": "y"} for i in range(2, 201)]}
+
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since=0, limit=20, include_image_body=True, after_seq=None: pages.get(after_seq),
+    )
+    monkeypatch.setattr(crc, "_capture_batch_resume", None)
+    assert crc._capture_batch_window_messages(0, 500, should_yield=lambda: False) == []
+    assert crc._capture_batch_resume is None
+    assert capture_failure.failure_class("capture_window_unavailable") == "other"
+    assert capture_failure.skip_threshold_for("capture_window_unavailable") == \
+        capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
+
+
+def test_batch_window_renders_only_the_rows_the_backend_counted(backend_env, monkeypatch):
+    """Before: the V1 batch window kept any user/openclaw/assistant/agent row in
+    ``(after_seq, through_seq]`` whatever its source, while the backend cut the
+    batch counting only user/openclaw rows from live sources. Imported history
+    between two chat messages went into the capture prompt (duplicate cards) and,
+    past the window's character cap, pushed the real chat out of it.
+    After: the window renders the same role x source set as the backend batch cut
+    (and V2's ``capture_eligible``). Real scheduler, real /v1/chat/history route.
+    """
+    import base64
+
+    from asgi_test_client import make_client
+
+    registered = make_client().post(
+        "/v1/users/register",
+        json={"public_key": base64.b64encode(b"\x5c" * 32).decode(), "archive_language": "zh"},
+    )
+    assert registered.status_code == 201, registered.get_data(as_text=True)
+    api_key = registered.get_json()["api_key"]
+    store = core_store.get_store(registered.get_json()["user_id"])
+    db.set_blob(store.user_id, "consumer_state", {
+        "consumer_name": "feedling-chat-resident",
+        "consumer_capabilities": ["vision_observer_v1", CAP],
+    })
+    store.append_chat("user", "chat", {"id": "live_first", "body": "我下周要去大阪出差"})
+    with monkeypatch.context() as quiet:
+        quiet.setattr(capture_scheduler, "record_chat_append", lambda *a, **k: {})
+        store.append_chat("user", "history_import",
+                          {"id": "imp_user", "body": "（导入）三年前我在北京上班"})
+        store.append_chat("openclaw", "history_import",
+                          {"id": "imp_reply", "body": "（导入）那时候你住海淀"})
+        store.append_chat("assistant", "chat", {"id": "raw_assistant", "body": "非落卡角色"})
+    store.append_chat("openclaw", "chat", {"id": "live_reply", "body": "大阪几号出发？"})
+    store.append_chat("user", "model_api", {"id": "live_last", "body": "十号，记得提醒我带护照"})
+
+    _route_consumer_http_to_real_backend(monkeypatch, api_key)
+    monkeypatch.setattr(crc, "_capture_batch_resume", None)
+    last_ts = float(db.chat_history_page_by_seq_strict(
+        store.user_id, limit=1, latest=True)[0]["ts"])
+    now = last_ts + max(capture_scheduler.quiet_sec(), capture_scheduler.min_interval_sec()) + 5
+    tick = capture_scheduler.tick_quiet_capture(store, now=now)
+    assert tick["enqueued"] is True, tick
+    window = tick["job"]["window"]
+    assert window["until_message_id"] == "live_last"
+
+    messages = crc._capture_window_messages(tick["job"])
+    ids = [crc._capture_message_id(m) for m in messages]
+    assert ids == ["live_first", "live_reply", "live_last"]
+    text = crc._capture_window_text(messages)
+    assert "导入" not in text and "非落卡角色" not in text
+    # The backend counted exactly these rows into the batch.
+    counted = db.chat_capture_messages_oldest_after_seq(
+        store.user_id, after_seq=int(window["after_seq"]), limit=100,
+        sources=sorted(capture_scheduler.CAPTURE_LIVE_SOURCES),
+    )
+    assert [row["id"] for row in counted] == ids

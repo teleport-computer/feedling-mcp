@@ -5163,6 +5163,7 @@ _CAPTURE_INDEX_BODY = {
          "status": "superseded"},
     ],
     "user_card_count": 3,
+    "truncated": False,
 }
 
 
@@ -5244,13 +5245,19 @@ def test_capture_made_up_target_reask_recovers(monkeypatch):
 @pytest.mark.parametrize(
     "body,expected",
     [
-        ({"items": [], "user_card_count": 0}, []),
+        ({"items": [], "user_card_count": 0, "truncated": False}, []),
         ({"items": []}, None),
         ({"items": [], "user_card_count": 4}, None),
         ({}, None),
         ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
-          "user_card_count": 1},
+          "user_card_count": 1, "truncated": False},
          [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}]),
+        # 超过读侧硬上限（1000 张）只回前一截：当全集用会把之后的真卡判成编造。
+        ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
+          "user_card_count": 1001, "truncated": True}, None),
+        # 缺 truncated 同样说不清读全没有。
+        ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
+          "user_card_count": 1}, None),
     ],
 )
 def test_capture_existing_cards_unreadable_is_none_not_empty(monkeypatch, body, expected):
@@ -12845,7 +12852,7 @@ def _install_resident_job_gate_harness(monkeypatch):
     ran = []
 
     def _fake(kind):
-        def proc(jobs):
+        def proc(jobs, chat_since=None):
             assert len(jobs) == 1            # per-job dispatch, never a batch
             ran.append((kind, jobs[0].get("job_id")))
             return float(jobs[0].get("ts") or 0)

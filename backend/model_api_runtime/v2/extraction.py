@@ -624,10 +624,13 @@ def _to_actions(
     capture_mode: str,
     reason: str,
     voice_call_id: str = "",
+    on_skipped: Callable[[str, int], None] | None = None,
 ) -> tuple[list[dict], int, int]:
     actions: list[dict] = []
     added = 0
     superseded = 0
+    claimed_targets: set[str] = set()
+    duplicate_targets = 0
     for card in cards or []:
         action = str(card.get("action") or "").strip().lower()
         target_id = str(card.get("target_id") or "").strip()
@@ -635,6 +638,18 @@ def _to_actions(
         # cards are discarded so valid cards in the same batch can still land.
         if action in {"merge", "supersede"} and not target_id:
             continue
+        if action in {"merge", "supersede"}:
+            # 同一轮里两张卡都说「覆盖这张旧卡」：只留第一张。
+            # 放行的话 commit 会把整批按 capture_supersede_target_inactive 拒掉
+            # （一张旧卡只能有一个后继），同一窗口反复失败直到逃生阀跳过，
+            # 这批里其余的好卡也一起丢了。V1 逐条写，第二张拿到 409
+            # supersede_targets_changed 被单独丢掉 —— 这里对齐成「只丢第二张」。
+            # 在封装之前判，丢掉的卡不做加密。commit 那道重查保留，
+            # 管的是 prepare 之后花园被并发改掉的情况。
+            if target_id in claimed_targets:
+                duplicate_targets += 1
+                continue
+            claimed_targets.add(target_id)
         base = {
             "envelope": _memory_envelope_from_card(
                 card,
@@ -663,6 +678,9 @@ def _to_actions(
         if str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
         and not str(card.get("target_id") or "").strip()
     )
+    if duplicate_targets and on_skipped is not None:
+        # 只报计数，不带卡内容也不带目标 id。
+        on_skipped("supersede_target_duplicate", duplicate_targets)
     if cards and not actions and rejected_without_target != len(cards):
         # 模型给了卡但一张都没映射成 action —— 说明它返回了我们不认识的 action 名。
         # 静默写零条会把这件事藏起来，所以硬失败（与 resident 同口径）。
@@ -671,13 +689,14 @@ def _to_actions(
 
 
 def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
-                     voice_call_id: str = ""):
+                     voice_call_id: str = "", on_skipped=None):
     return _to_actions(
         cards,
         occurred_at=occurred_at,
         source_ids=source_ids,
         build_envelope=build_envelope,
         voice_call_id=voice_call_id,
+        on_skipped=on_skipped,
         capture_mode="memory_capture",
         reason="Memory captured from a completed chat window.",
     )
