@@ -317,6 +317,5 @@ def test_blob_write_callers_keep_strict_and_best_effort_contracts_explicit():
         ("identity/service.py", "_save_identity"),
         ("memory/memory_core.py", "migration_state_post"),
         ("proactive/capture_scheduler.py", "save_capture_state"),
-        ("proactive/dream_scheduler.py", "save_dream_state"),
         ("proactive/store_v2.py", "save"),
     }

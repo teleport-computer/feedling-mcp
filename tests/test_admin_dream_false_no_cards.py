@@ -9,6 +9,7 @@ way an operator without database access will.
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ from asgi_test_client import make_client  # noqa: E402
 from conftest import seed_user  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from proactive import dream_ledger_audit as audit  # noqa: E402
 from proactive import dream_scheduler  # noqa: E402
 from tee_shadow import mirror  # noqa: E402
@@ -176,6 +178,11 @@ def _repair(client, users, **body):
     return response.status_code, response.get_json()
 
 
+def _target(row):
+    """The per-user repair entry an operator builds from one audit row."""
+    return {key: row[key] for key in ("user_id", "ledger_fingerprint", "job_id", "rewound_job_ids")}
+
+
 def _non_ledger(doc):
     return {
         key: value for key, value in doc.items()
@@ -209,7 +216,7 @@ def test_audit_lists_stuck_user_and_repair_rewinds_only_that_ledger_then_dream_e
 
     # 2. dry run (the default) predicts exactly the rewind and writes nothing
     before = stuck.ledger_doc()
-    target = [{"user_id": stuck.user_id, "ledger_fingerprint": row["ledger_fingerprint"]}]
+    target = [_target(row)]
     status, dry = _repair(client, target)
     assert status == 200 and dry["mode"] == "dry_run"
     [planned] = dry["results"]
@@ -280,8 +287,7 @@ def test_rewind_alone_leaves_the_key_blocked_and_a_rerun_finishes_the_repair(env
     stuck, _previous, incident = _stuck(monkeypatch, "usr_repair_dupkey_0915")
     client = stuck.client
     _status, report = _audit(client, [stuck.user_id])
-    target = [{"user_id": stuck.user_id,
-               "ledger_fingerprint": report["candidates"][0]["ledger_fingerprint"]}]
+    target = [_target(report["candidates"][0])]
     with monkeypatch.context() as lost:
         lost.setattr(db, "log_patch_item", lambda *_a, **_k: None)  # reclassify lost
         _status, applied = _repair(client, target, dry_run=False)
@@ -303,11 +309,10 @@ def test_repair_skips_a_ledger_that_changed_after_the_audit(env, monkeypatch):
     stuck, _previous, _incident = _stuck(monkeypatch, "usr_repair_stale_0915")
     client = stuck.client
     status, report = _audit(client, [stuck.user_id])
-    fingerprint = report["candidates"][0]["ledger_fingerprint"]
-    target = [{"user_id": stuck.user_id, "ledger_fingerprint": fingerprint}]
+    target = [_target(report["candidates"][0])]
 
     # (a) a stale fingerprint (the ledger moved before the repair request)
-    stale = [{"user_id": stuck.user_id, "ledger_fingerprint": "0" * 64}]
+    stale = [{**target[0], "ledger_fingerprint": "0" * 64}]
     status, result = _repair(client, stale, dry_run=False)
     assert status == 200
     assert [(r["action"], r["reason"]) for r in result["results"]] == [
@@ -338,7 +343,8 @@ def test_repair_skips_users_that_are_not_candidates(env, monkeypatch):
     user.add_cards(3)
     user.dream(_verified_completion())
     status, result = _repair(
-        user.client, [{"user_id": user.user_id, "ledger_fingerprint": "a" * 64}], dry_run=False,
+        user.client, [{"user_id": user.user_id, "ledger_fingerprint": "a" * 64,
+                       "job_id": "job_x", "rewound_job_ids": ["job_x"]}], dry_run=False,
     )
     assert status == 200
     assert result["results"] == [{
@@ -348,12 +354,17 @@ def test_repair_skips_users_that_are_not_candidates(env, monkeypatch):
 
 def test_admin_token_is_required(env, monkeypatch):
     client = make_client()
-    body = {"windows": [_window()], "users": [{"user_id": "usr_x", "ledger_fingerprint": "a" * 64}]}
+    body = {"windows": [_window()], "users": [_entry()]}
     for headers in ({}, _admin("wrong-token"), {"X-API-Key": "test_key_usr_x"}):
         assert client.get(_q([("window", _window())]), headers=headers).status_code == 401
         assert client.post(REPAIR_PATH, headers=headers, json=body).status_code == 401
     monkeypatch.delenv("FEEDLING_ADMIN_TOKEN")
     assert client.get(_q([("window", _window())]), headers=_admin()).status_code == 503
+
+
+def _entry(**overrides):
+    return {"user_id": "usr_x", "ledger_fingerprint": "a" * 64, "job_id": "job_x",
+            "rewound_job_ids": ["job_x"], **overrides}
 
 
 @pytest.mark.parametrize(
@@ -363,23 +374,30 @@ def test_admin_token_is_required(env, monkeypatch):
         pytest.param({"windows": ["W"]}, "users_required", id="bulk-without-ids"),
         pytest.param({"windows": ["W"], "users": "all"}, "users_required", id="users-all"),
         pytest.param({"windows": ["W"], "all_users": True,
-                      "users": [{"user_id": "usr_x", "ledger_fingerprint": "a" * 64}]},
+                      "users": [_entry()]},
                      "unknown_fields:all_users", id="unknown-field"),
         pytest.param({"windows": ["W"], "users": [{"user_id": "usr_x"}]},
                      "invalid_user_entry", id="missing-fingerprint"),
-        pytest.param({"windows": ["W"], "users": [{"user_id": "usr_x", "ledger_fingerprint": "zz"}]},
+        pytest.param({"windows": ["W"], "users": [
+            {k: v for k, v in _entry().items() if k != "job_id"}]},
+            "invalid_user_entry", id="missing-job-id"),
+        pytest.param({"windows": ["W"], "users": [_entry(rewound_job_ids=[])]},
+                     "invalid_rewound_job_ids", id="empty-rewound-job-ids"),
+        pytest.param({"windows": ["W"], "users": [_entry(job_id="bad id!")]},
+                     "invalid_job_id", id="bad-job-id"),
+        pytest.param({"windows": ["W"], "users": [_entry(ledger_fingerprint="zz")]},
                      "invalid_ledger_fingerprint", id="bad-fingerprint"),
         pytest.param({"windows": ["W"], "dry_run": "false",
-                      "users": [{"user_id": "usr_x", "ledger_fingerprint": "a" * 64}]},
+                      "users": [_entry()]},
                      "invalid_dry_run", id="string-dry-run"),
         pytest.param({"windows": ["W"], "users": [
-            {"user_id": "usr_x", "ledger_fingerprint": "a" * 64},
-            {"user_id": "usr_x", "ledger_fingerprint": "b" * 64}]},
+            _entry(),
+            _entry(ledger_fingerprint="b" * 64)]},
             "duplicate_user_id", id="duplicate-user"),
-        pytest.param({"users": [{"user_id": "usr_x", "ledger_fingerprint": "a" * 64}]},
+        pytest.param({"users": [_entry()]},
                      "window_required", id="no-window"),
         pytest.param({"windows": ["2026-09-01T00:00:00Z/2026-09-10T00:00:00Z"],
-                      "users": [{"user_id": "usr_x", "ledger_fingerprint": "a" * 64}]},
+                      "users": [_entry()]},
                      "window_too_long", id="window-too-long"),
     ],
 )
@@ -428,8 +446,7 @@ def test_repair_stops_starting_writes_when_the_request_budget_is_spent(env, monk
     result = dream_ledger_repair.repair_payload(
         dream_ledger_repair.parse_repair_body({
             "windows": [_window()], "dry_run": False,
-            "users": [{"user_id": stuck.user_id,
-                       "ledger_fingerprint": report["candidates"][0]["ledger_fingerprint"]}],
+            "users": [_target(report["candidates"][0])],
         }),
         clock=lambda: next(ticks),
     )
@@ -444,20 +461,20 @@ def test_compare_and_merge_primitive_never_creates_or_blindly_writes(env, monkey
     monkeypatch.setattr(mirror, "execute", lambda sql, params=(): mirrored.append(params))
 
     assert db.patch_blob_if_match_strict(
-        user_id, "dream_state", {"a": 1}, precondition=lambda _doc: True,
+        user_id, "dream_state", {"a": 1}, precondition=lambda _doc, _conn: True,
     ) == (False, None)
     assert db.get_blob(user_id, "dream_state") is None
 
     db.set_blob(user_id, "dream_state", {"a": 0, "keep": "x"})
     mirrored.clear()
     assert db.patch_blob_if_match_strict(
-        user_id, "dream_state", {"a": 1}, precondition=lambda doc: doc["a"] == 5,
+        user_id, "dream_state", {"a": 1}, precondition=lambda doc, _conn: doc["a"] == 5,
     ) == (False, {"a": 0, "keep": "x"})
     assert db.get_blob(user_id, "dream_state") == {"a": 0, "keep": "x"}
     assert mirrored == []
 
     applied, doc = db.patch_blob_if_match_strict(
-        user_id, "dream_state", {"a": 1}, precondition=lambda doc: doc["a"] == 0,
+        user_id, "dream_state", {"a": 1}, precondition=lambda doc, _conn: doc["a"] == 0,
         statement_timeout_ms=3000,
     )
     assert applied is True and doc == {"a": 1, "keep": "x"}
@@ -466,5 +483,209 @@ def test_compare_and_merge_primitive_never_creates_or_blindly_writes(env, monkey
 
     with pytest.raises(ValueError):
         db.patch_blob_if_match_strict(
-            user_id, "model_api_runtime", {"a": 1}, precondition=lambda _doc: True,
+            user_id, "model_api_runtime", {"a": 1}, precondition=lambda _doc, _conn: True,
         )
+
+
+def _apply(client, row, **body):
+    status, result = _repair(client, [_target(row)], dry_run=False, **body)
+    assert status == 200, result
+    [only] = result["results"]
+    return only
+
+
+def test_scheduler_and_audit_agree_on_the_ledger_fields():
+    assert audit.LEDGER_FIELDS == dream_scheduler.DREAM_LEDGER_FIELDS
+
+
+@pytest.mark.parametrize("when", ["v1_queued", "v2_queued", "v2_queued_during_repair"])
+def test_repair_refuses_while_the_user_has_an_active_dream_job(env, monkeypatch, when):
+    """Codex r4 I1: no rewind while a Dream job of that user may still record a result."""
+    stuck, _previous, incident = _stuck(monkeypatch, f"usr_repair_active_{when}_0915")
+    client = stuck.client
+    _status, report = _audit(client, [stuck.user_id])
+    [row] = report["candidates"]
+    if when == "v1_queued":
+        stuck.add_cards(1)
+        tick = stuck.tick()
+        assert tick["enqueued"] is True, tick
+        active_id = tick["job"]["job_id"]
+    elif when == "v2_queued":
+        job_id, _merged = jobs_store.enqueue_job(stuck.user_id, "dream", reason="nightly_dream")
+        active_id = f"v2:{job_id}"
+    else:
+        real_cas = db.patch_blob_if_match_strict
+        queued = []
+
+        def job_lands_first(user_id, kind, patch, **kwargs):
+            # After the request's read and dry-run style checks, before the write.
+            queued.append(jobs_store.enqueue_job(user_id, "dream", reason="nightly_dream")[0])
+            return real_cas(user_id, kind, patch, **kwargs)
+
+        monkeypatch.setattr(db, "patch_blob_if_match_strict", job_lands_first)
+    before = stuck.ledger_doc()
+    assert _audit(client, [stuck.user_id])[1]["candidates"][0]["ledger_fingerprint"] == \
+        row["ledger_fingerprint"]
+
+    if when != "v2_queued_during_repair":
+        _status, dry = _repair(client, [_target(row)])
+        assert [(r["action"], r["reason"], r["active_job_ids"]) for r in dry["results"]] == [
+            ("skipped", "dream_job_active", [active_id])
+        ]
+    done = _apply(client, row)
+    if when == "v2_queued_during_repair":
+        active_id = f"v2:{queued[0]}"
+    assert (done["action"], done["reason"]) == ("skipped", "dream_job_active")
+    assert done["active_job_ids"] == [active_id]
+    assert audit.canonical_ledger(stuck.ledger_doc()) == audit.canonical_ledger(before)
+    assert stuck.job(incident["job_id"])["status"] == "completed"
+
+
+class _PausedRead:
+    """Pause the next Dream state read until the test releases it."""
+
+    def __init__(self, monkeypatch):
+        self.read = threading.Event()
+        self.release = threading.Event()
+        self._armed = True
+        self._lock = threading.Lock()
+        real = dream_scheduler.load_dream_state
+
+        def load(store):
+            state = real(store)
+            with self._lock:
+                pause, self._armed = self._armed, False
+            if pause:
+                self.read.set()
+                assert self.release.wait(30)
+            return state
+
+        monkeypatch.setattr(dream_scheduler, "load_dream_state", load)
+
+
+@pytest.mark.parametrize("writer", ["job_status_report", "scheduler_tick"])
+def test_a_dream_writer_that_read_before_the_repair_cannot_put_the_old_ledger_back(
+    env, monkeypatch, writer,
+):
+    """Codex r4 I1: the writer read the incident ledger, the repair committed, the
+    writer then saved. Its save must not resurrect the incident ledger, so the
+    repair's reported ``rewound`` stays true."""
+    stuck, _previous, incident = _stuck(monkeypatch, f"usr_repair_stale_{writer}_0915")
+    client = stuck.client
+    _status, report = _audit(client, [stuck.user_id])
+    [row] = report["candidates"]
+    incident_ledger = audit.canonical_ledger(stuck.ledger_doc())
+    stuck.add_cards(1)
+    if writer == "job_status_report":
+        tick = stuck.tick()
+        assert tick["enqueued"] is True, tick
+        job_id = tick["job"]["job_id"]
+
+        def write():
+            return stuck.client.post(
+                f"/v1/proactive/jobs/{job_id}/status", headers=stuck.headers,
+                json={"status": "failed", "reason": "dream_agent_timeout"},
+            ).get_json()
+    else:
+        write = stuck.tick
+
+    paused = _PausedRead(monkeypatch)
+    out = {}
+    thread = threading.Thread(target=lambda: out.setdefault("writer", write()))
+    thread.start()
+    assert paused.read.wait(30)
+    try:
+        done = _apply(client, row)
+    finally:
+        paused.release.set()
+        thread.join(30)
+    assert not thread.is_alive()
+
+    after = stuck.ledger_doc()
+    assert done["action"] == "rewound", done
+    assert audit.canonical_ledger(after) != incident_ledger
+    assert audit.canonical_ledger(after) == audit.canonical_ledger(row["restore_ledger"])
+    assert done["ledger_fingerprint_after"] == audit.ledger_fingerprint(after)
+    # The writer's own write did land (it was not simply dropped).
+    if writer == "job_status_report":
+        assert out["writer"]["job"]["status"] == "failed"
+        assert after["dream_fail_streak"] == 1
+    else:
+        assert out["writer"]["enqueued"] is True, out
+        assert after["pending_dream_key"] == out["writer"]["job"]["dream_key"]
+    assert stuck.job(incident["job_id"])["status"] == "failed"
+
+
+def test_named_user_is_found_however_long_its_dream_waited_before_completing(env, monkeypatch):
+    """Codex r4 I2: a Dream enqueued 91 days before completing inside the window
+    (self-hosted consumer offline) is past the global scan bound and even the
+    90-day request cap, but naming the user finds and repairs it."""
+    user = _User(monkeypatch, "usr_repair_old_enqueue_0915")
+    user.add_cards(3)
+    enqueued_at = time.time() - 91 * 86400
+    with monkeypatch.context() as late:
+        late.setattr(dream_scheduler, "_trace_now", lambda: enqueued_at)
+        incident = user.dream(_legacy_no_cards())
+    with db.get_pool().connection() as conn:
+        [ts] = conn.execute(
+            "SELECT ts FROM user_logs WHERE user_id=%s AND stream='proactive_jobs' "
+            "AND doc->>'job_id'=%s", (user.user_id, incident["job_id"]),
+        ).fetchone()
+    assert abs(float(ts) - enqueued_at) < 5
+    assert user.tick()["reason"] == "already_dreamed"
+
+    _status, fleet = _audit(user.client, [], max_job_age_days="90")
+    assert user.user_id not in {row["user_id"] for row in fleet["candidates"]}
+    assert fleet["partial"] is True and fleet["scan_bound"]["max_job_age_days"] == 90.0
+
+    _status, named = _audit(user.client, [user.user_id])
+    assert named["partial"] is False and named["scan_bound"] is None
+    [row] = named["candidates"]
+    assert row["job_id"] == incident["job_id"]
+    done = _apply(user.client, row)
+    assert done["action"] == "rewound", done
+    assert user.tick()["enqueued"] is True
+
+
+def test_a_garden_emptied_before_the_legacy_report_is_left_alone(env, monkeypatch):
+    """Codex r4 I3: cards deleted after enqueue, then an old consumer's (true)
+    "no cards" lands in the window. It matches the incident shape, but the repair
+    does not rewind or reclassify it."""
+    user = _User(monkeypatch, "usr_repair_emptied_0915")
+    user.add_cards(3)
+    tick = user.tick()
+    assert tick["enqueued"] is True, tick
+    job_id = tick["job"]["job_id"]
+    db.memory_replace_all(user.user_id, [])  # the user deleted every card
+    # Current backend: zero live cards, so the legacy report stays a completion.
+    reported = user.client.post(
+        f"/v1/proactive/jobs/{job_id}/status", headers=user.headers, json=_legacy_no_cards(),
+    ).get_json()
+    assert reported["job"]["status"] == "completed"
+
+    _status, report = _audit(user.client, [user.user_id])
+    [row] = report["candidates"]  # the selector alone cannot tell
+    before = user.ledger_doc()
+    _status, dry = _repair(user.client, [_target(row)])
+    assert [(r["action"], r["reason"]) for r in dry["results"]] == [
+        ("skipped", "ambiguous_legacy_no_cards")
+    ]
+    done = _apply(user.client, row)
+    assert (done["action"], done["reason"]) == ("skipped", "ambiguous_legacy_no_cards")
+    assert user.ledger_doc() == before
+    assert user.job(job_id)["status"] == "completed"
+    assert CARD_MARKER not in json.dumps([dry, done])
+
+
+def test_repair_is_bound_to_the_job_ids_the_audit_reported(env, monkeypatch):
+    stuck, previous, incident = _stuck(monkeypatch, "usr_repair_bound_jobs_0915", dreamed_before=True)
+    _status, report = _audit(stuck.client, [stuck.user_id])
+    [row] = report["candidates"]
+    before = stuck.ledger_doc()
+    for wrong in ({**row, "job_id": previous["job_id"]},
+                  {**row, "rewound_job_ids": [incident["job_id"], previous["job_id"]]}):
+        done = _apply(stuck.client, wrong)
+        assert (done["action"], done["reason"]) == ("skipped", "jobs_changed_since_audit")
+    assert stuck.ledger_doc() == before
+    assert stuck.job(incident["job_id"])["status"] == "completed"
+    assert _apply(stuck.client, row)["action"] == "rewound"

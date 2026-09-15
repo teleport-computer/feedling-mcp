@@ -398,12 +398,13 @@ def test_tool_finds_a_completion_on_the_middle_day_of_a_multi_day_window(
     assert report["_statement_timeout"] == "7s"
 
 
-def test_tool_scan_is_bounded_on_the_job_enqueue_time(
+def test_tool_scan_is_bounded_on_the_job_enqueue_time_only_without_user_ids(
     tmp_path, monkeypatch, utc_server_clock,
 ):
-    """Jobs enqueued more than ``max_job_age_days`` before the earliest window
-    start are not scanned (index-friendly bound on ``user_logs.ts``, partial
-    index ``ix_user_logs_proactive_jobs_ts``), and the bound is reported."""
+    """Global discovery skips jobs enqueued more than ``max_job_age_days``
+    before the earliest window start (index-friendly bound on
+    ``user_logs.ts``) and says the report is partial; naming the user scans
+    that user's whole job log (Codex r4 I2)."""
     user = "usr_audit_old_enqueue_0915"
     _stuck_user_via_pre_fix_backend(monkeypatch, tmp_path, user, payload=_legacy_payload())
     # Test setup only: pretend the job sat pending for 10 days before the
@@ -414,10 +415,17 @@ def test_tool_scan_is_bounded_on_the_job_enqueue_time(
             (10 * 86400, user),
         )
 
-    bounded = _run_tool_read([user], max_job_age_days=1)
-    assert bounded["users_scanned"] == 0
-    assert bounded["prefilter"]["enqueued_after"] < bounded["windows"][0][0]
+    now = datetime.now(timezone.utc)
+    window = (now - timedelta(hours=1), now + timedelta(hours=1))
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        with conn.transaction():
+            bounded = audit.collect(conn, windows=[window], max_job_age_days=1)
+    assert user not in {row["user_id"] for row in bounded["candidates"]}
+    assert bounded["partial"] is True
+    assert bounded["scan_bound"]["enqueued_after"] < bounded["windows"][0][0]
+    assert bounded["scan_bound"]["max_job_age_days"] == 1.0
 
-    widened = _run_tool_read([user], max_job_age_days=11)
-    assert widened["verdicts"] == {"candidate": 1}
-    assert widened["_statement_timeout"] == "1min"  # the default
+    named = _run_tool_read([user], max_job_age_days=1)
+    assert named["verdicts"] == {"candidate": 1}
+    assert named["partial"] is False and named["scan_bound"] is None
+    assert named["_statement_timeout"] == "1min"  # the default

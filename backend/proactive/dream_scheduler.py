@@ -304,10 +304,39 @@ def load_dream_state(store) -> dict[str, Any]:
     return _state_doc(db.get_blob(store.user_id, DREAM_STATE_KIND))
 
 
-def save_dream_state(store, state: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
+#: The consolidation ledger: only a completed Dream sets these
+#: (``record_dream_job_status``). ``proactive/dream_ledger_audit.LEDGER_FIELDS``
+#: must name the same keys (pinned by a test).
+DREAM_LEDGER_FIELDS = (
+    "last_dream_completed_at",
+    "last_dream_organized_count",
+    "last_dream_merged_count",
+    "last_dreamed_card_count",
+    "last_dreamed_seed_card_count",
+    "last_dreamed_turn_count",
+    "last_dream_signature",
+    "last_dreamed_until",
+)
+
+
+def save_dream_state(
+    store, state: Mapping[str, Any], *, now: float | None = None, ledger: bool = False,
+) -> dict[str, Any]:
+    """Persist ``state`` as one atomic top-level merge; returns the normalised doc.
+
+    Every caller reads the blob, edits a few keys and saves. A full write would
+    put back everything that read saw — including ledger fields an operator
+    repair (``admin/dream_ledger_repair.py``) rewound in between, while a Dream
+    job's status was being recorded. So the ledger is only written by a writer
+    that sets it (``ledger=True``: a completion); every other key is written as
+    before.
+    """
     doc = _state_doc(state)
     doc["updated_at"] = _now_iso(now)
-    db.set_blob(store.user_id, DREAM_STATE_KIND, doc)
+    patch = doc if ledger else {
+        key: value for key, value in doc.items() if key not in DREAM_LEDGER_FIELDS
+    }
+    db.patch_blob_strict(store.user_id, DREAM_STATE_KIND, patch)
     return doc
 
 
@@ -794,7 +823,7 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         state["dream_fail_streak"] = int(state.get("dream_fail_streak") or 0) + 1
         state["last_dream_failed_at"] = now_ts
-    state = save_dream_state(store, state, now=now_ts)
+    state = save_dream_state(store, state, now=now_ts, ledger=status_text == "completed")
     capture_jobs.notify_backoff(store, lane="dream", status=status_text,
                                 streak=int(state.get("dream_fail_streak") or 0))
     return state
