@@ -892,6 +892,23 @@ def _reset_admin_page_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_context_card_cache():
+    """Clear the enclave context-memory decrypt cache (readside._CARD_CACHE) between tests.
+
+    It's process-global and keyed on user_id, so a /v1/chat/history call (or a
+    monkeypatched moments_to_cards) in one test would otherwise serve stale cards to a
+    later test hitting the same user — silently skipping the later test's decrypt path
+    (e.g. the best-effort-on-failure regression test never hitting its `boom`).
+    """
+    yield
+    mod = sys.modules.get("enclave.readside")
+    if mod is None:
+        return
+    with mod._CARD_CACHE_LOCK:
+        mod._CARD_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
 def _disable_setup_auto_vision_probe(monkeypatch, request):
     """Keep setup tests from starting real provider calls in daemon threads.
 
