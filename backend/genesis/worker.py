@@ -1901,6 +1901,79 @@ def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output:
     return body if isinstance(body, dict) else {}
 
 
+def _garden_reducer_output(
+    store,
+    job_id: str,
+    *,
+    runtime: provider_client.ProviderConfig,
+    token: str,
+    chunk_texts: list[str],
+    source_kind: str,
+    existing_persona: dict,
+    existing_voice: dict,
+) -> tuple[dict, list[dict]]:
+    """加密分块导入的记忆卡：memgarden 导入会话（和 plaintext genesis、VPS 同一个引擎）。
+
+    之前 vs 之后：之前 fact_map → fact_write 产出卡和身份卡、交给 apply 路由一次写；
+    之后卡在这里一批一批写（runtime token 读已有卡、写 memory action），apply 路由只收
+    人设/语气/身份卡和「写了几张」。身份卡另走 ``foreground_identity`` 推导（只对聊天
+    记录 —— 用户档案/长期记忆档案本来就不该推出 TA 的身份）。
+
+    分块 worker 没有持久 checkpoint（一个 job 一口气跑完，崩了由回收整单重跑），进度只在内存。
+    """
+    import distillation_ledger
+    from genesis import foreground_identity, import_engine
+    from hosted import history_import
+    from memory import garden_import
+
+    family = _source_family(source_kind)
+    joined = "\n".join(str(t or "") for t in chunk_texts)
+    warnings: list[str] = []
+    messages = history_import._parse_import_history_content(joined, "auto", warnings) if family == "history" else []
+    if not messages:
+        messages = [{"role": "user", "content": joined,
+                     "source": history_import._HISTORY_SOURCE if family == "history"
+                     else f"{family}_import"}]
+    locale = history_import._import_language_for_store(store, messages)
+    state = garden_import.new_state(locale=locale)
+    llm = GenesisLLMClient()
+    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
+        result = garden_import.run_import(
+            sources=[garden_import.ImportSource(
+                key=f"1:{family}", family=family,
+                windows=[t for t in chunk_texts if str(t or "").strip()])],
+            state=state, job_key=job_id, owner_key=str(store.user_id),
+            existing_cards=import_engine.existing_cards(store, None, runtime_token=token, job_id=job_id),
+            complete=import_engine.llm_complete(llm, user_id=str(store.user_id), job_id=job_id, runtime=runtime),
+            write=import_engine.store_writer(store, None, runtime_token=token),
+            save=lambda _s: None,
+        )
+        raw = result.cards_written + result.dropped
+        attempt.finish("not_provided" if raw == 0 else "partial" if result.dropped else "written")
+    cards = [{k: v for k, v in c.items() if k not in {"id", "_source_family"}}
+             for c in (state.get("written") or [])]
+    output = _build_reducer_output(
+        user_id=str(store.user_id), job_id=job_id, runtime=runtime, chunk_texts=chunk_texts,
+        source_kind=source_kind, existing_persona=existing_persona, existing_voice=existing_voice,
+        include_memory=False, llm=llm,
+    ) if family == "history" else {
+        "source_kind": source_kind, "source_family": family,
+        "voice": {"behavior_notes_count": 0, "exemplar_count": 0, "founding_exemplar_count": 0},
+    }
+    output["memories"] = []
+    output["garden_import"] = {"cards_written": result.cards_written, "dropped": result.dropped}
+    if family == "history":
+        # 切换前 fact_write 从消息时间跨度推「认识几天」；这里直接按解析出的时间戳算。
+        output["days_with_user"] = history_import._history_span_days(messages)
+        identity, id_warnings = foreground_identity.derive_foreground_identity(
+            runtime=runtime, analysis_messages=messages, core_memories=cards,
+            days_with_user=int(output["days_with_user"]), language=locale, max_attempts=1)
+        if foreground_identity.has_identity_signal(identity) and not any(
+                "provider_identity_failed" in str(w) for w in id_warnings):
+            output["identity"] = identity
+    return output, cards
+
+
 def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_token: Callable) -> dict:
     started_at = time.time()
     user_id = str(job.get("user_id") or "")
@@ -1945,17 +2018,29 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
     reducer_started_at = time.time()
     _trace_genesis(store, "genesis.worker.reducer.started", job_id=job_id,
                    summary="worker reducer started", detail={"chunk_count": len(chunk_texts)})
-    reducer_output = _build_reducer_output(
-        user_id=user_id,
-        job_id=job_id,
-        runtime=runtime,
-        chunk_texts=chunk_texts,
-        source_kind=str(job.get("source_kind") or "history"),
-        existing_persona=existing_persona,
-        existing_voice=existing_voice,
+    source_kind = str(job.get("source_kind") or "history")
+    if _source_family(source_kind) == "ai_persona":
+        # 人设材料不产出记忆卡（只推身份 + 人设），整段照旧。
+        reducer_output = _build_reducer_output(
+            user_id=user_id,
+            job_id=job_id,
+            runtime=runtime,
+            chunk_texts=chunk_texts,
+            source_kind=source_kind,
+            existing_persona=existing_persona,
+            existing_voice=existing_voice,
+        )
+        garden_cards: list[dict] | None = None
+    else:
+        reducer_output, garden_cards = _garden_reducer_output(
+            store, job_id, runtime=runtime, token=token, chunk_texts=chunk_texts,
+            source_kind=source_kind, existing_persona=existing_persona,
+            existing_voice=existing_voice)
+    profile_source = (
+        {**reducer_output, "memories": garden_cards} if garden_cards is not None else reducer_output
     )
     rendered_cards, _source_count, memory_material = (
-        service.render_genesis_profile_source(reducer_output)
+        service.render_genesis_profile_source(profile_source)
     )
     reducer_output.update(build_profile_output_from_sources(
         user_id=user_id,
