@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 from collections import OrderedDict
 
 from enclave import envelope
@@ -325,6 +326,11 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
 # enclave RAM, exactly where the plaintext already lives during a request.
 _CARD_CACHE: "OrderedDict[str, tuple[str, list[dict]]]" = OrderedDict()
 _CARD_CACHE_MAX_USERS = int(os.environ.get("FEEDLING_CTX_CARD_CACHE_USERS", "512"))
+# _build_context_memories runs on anyio's threadpool (many threads per worker), so the
+# check-then-act dict ops must be atomic: without this, an eviction popitem() racing a
+# hit/insert move_to_end() raises KeyError, the turn is dropped as best-effort, and the
+# history load ships with zero context memories — the very failure this fix targets.
+_CARD_CACHE_LOCK = threading.Lock()
 
 
 def _corpus_fingerprint(moments: list, authorized_user_id: str) -> str:
@@ -348,13 +354,18 @@ def moments_to_cards_cached(
 ) -> list[dict]:
     """Cached moments_to_cards. Hit ⇒ skip all decryption; miss ⇒ decrypt once and store."""
     fp = _corpus_fingerprint(moments, authorized_user_id)
-    hit = _CARD_CACHE.get(authorized_user_id)
-    if hit is not None and hit[0] == fp:
-        _CARD_CACHE.move_to_end(authorized_user_id)
-        return hit[1]
+    with _CARD_CACHE_LOCK:
+        hit = _CARD_CACHE.get(authorized_user_id)
+        if hit is not None and hit[0] == fp:
+            _CARD_CACHE.move_to_end(authorized_user_id)
+            return hit[1]
+    # Decrypt outside the lock (the expensive part). Concurrent same-user misses
+    # double-decrypt and last-write-wins — harmless; the point of the lock is only to
+    # keep the dict mutations atomic.
     cards = moments_to_cards(moments, authorized_user_id, content_sk)
-    _CARD_CACHE[authorized_user_id] = (fp, cards)
-    _CARD_CACHE.move_to_end(authorized_user_id)
-    while len(_CARD_CACHE) > _CARD_CACHE_MAX_USERS:
-        _CARD_CACHE.popitem(last=False)
+    with _CARD_CACHE_LOCK:
+        _CARD_CACHE[authorized_user_id] = (fp, cards)
+        _CARD_CACHE.move_to_end(authorized_user_id)
+        while len(_CARD_CACHE) > _CARD_CACHE_MAX_USERS:
+            _CARD_CACHE.popitem(last=False)
     return cards

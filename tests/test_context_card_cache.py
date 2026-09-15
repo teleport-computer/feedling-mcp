@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,42 @@ def test_lru_eviction(keys, monkeypatch):
         readside.moments_to_cards_cached([_moment(0, keys, item_id="x")], u, keys["content_sk"])
     assert len(readside._CARD_CACHE) == 3
     assert "u1" not in readside._CARD_CACHE     # oldest evicted
+
+
+def test_concurrent_hits_and_evictions_do_not_raise(keys, monkeypatch):
+    """Regression: on anyio's threadpool an eviction popitem() must not race a
+    hit/insert move_to_end() into a KeyError (which drops the turn's context memories)."""
+    import threading
+
+    monkeypatch.setattr(readside, "_CARD_CACHE_MAX_USERS", 2)
+    warm = [_moment(0, keys, item_id="warm")]
+    readside.moments_to_cards_cached(warm, "reader", keys["content_sk"])  # prime a hit target
+    errors: list = []
+    stop = threading.Event()
+
+    def reader():
+        try:
+            while not stop.is_set():
+                readside.moments_to_cards_cached(warm, "reader", keys["content_sk"])
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    def churner(n):
+        try:
+            i = 0
+            while not stop.is_set():
+                readside.moments_to_cards_cached(
+                    [_moment(0, keys, item_id=f"c{n}")], f"user_{n}_{i}", keys["content_sk"])
+                i += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=reader) for _ in range(4)] + \
+              [threading.Thread(target=churner, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(2.0)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert errors == []

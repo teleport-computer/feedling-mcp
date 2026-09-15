@@ -348,7 +348,10 @@ def _build_context_memories(moments, decrypted, query_args):
     )
     context_memories = _back_to_original(picked)
     if query_args.get("context_recent"):
-        fresh = recall_metadata.recent_cards(selectable)
+        # copy: recent_cards returns cache-owned dicts now that the pool is cached
+        # (moments_to_cards_cached); these go into the response, so never hand out the
+        # cached objects themselves.
+        fresh = [dict(c) for c in recall_metadata.recent_cards(selectable)]
         fresh_ids = {c["id"] for c in fresh}
         context_memories = fresh + [c for c in context_memories if c.get("id") not in fresh_ids]
         context_memories = context_memories[:8]
