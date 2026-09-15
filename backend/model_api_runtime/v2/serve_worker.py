@@ -3064,11 +3064,31 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
             store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post
         )
         if status == 200:
+            raw_index_items = body.get("items") if isinstance(body, dict) else None
             index_items = [
-                item for item in (body.get("items") or []) if isinstance(item, dict)
+                item for item in (raw_index_items or []) if isinstance(item, dict)
             ]
             ids = [str(item.get("id") or "").strip() for item in index_items]
             ids = [memory_id for memory_id in ids if memory_id]
+            if full_cards:
+                # HTTP 200 is not a readable garden: the readside drops every
+                # card it cannot decrypt, so an enclave failing all of them
+                # still answers ``items=[]``. Only a well-formed index whose
+                # live total ``user_card_count`` is 0 is an empty garden; a
+                # malformed item is a broken contract, not a card to skip.
+                # Leaving the outcome "unavailable" fails the job (worker).
+                verified_empty = type(body.get("user_card_count")) is int and (
+                    body.get("user_card_count") == 0
+                )
+                if (
+                    not isinstance(raw_index_items, list)
+                    or len(ids) != len(raw_index_items)
+                    or (not ids and not verified_empty)
+                ):
+                    raise RuntimeError(
+                        "dream_cards_index_incomplete:"
+                        f"{len(ids)}/{len(raw_index_items or [])}"
+                    )
             if ids and full_cards:
                 fetched, fetch_status = memory_core.fetch(
                     store,
@@ -3086,9 +3106,15 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     for item in fetched_items
                     if isinstance(item, dict)
                 }
-                if any(memory_id not in by_id for memory_id in ids):
+                flagged = [
+                    mid
+                    for key in ("missing_ids", "unavailable_ids")
+                    for mid in (fetched.get(key) or [])
+                ]
+                if flagged or any(memory_id not in by_id for memory_id in ids):
                     raise RuntimeError(
                         f"dream_cards_fetch_incomplete:{len(ids)}/{len(by_id)}"
+                        f":flagged={len(flagged)}"
                     )
                 selected: list[dict] = []
                 lines: list[str] = []
@@ -4881,6 +4907,7 @@ def _record_extraction_status(
                     "organized_count": item_count,
                     "merged_count": item_count,
                 },
+                "dream_skip_reason": str((detail or {}).get("skip_reason") or ""),
             },
             status=status,
         )

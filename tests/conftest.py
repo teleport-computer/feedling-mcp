@@ -267,6 +267,10 @@ if not _provisioned:
         "test_no_global_mirror_patching.py",
         "test_mirror_group_capture.py",
         "test_resident_wake_memory.py",
+        # 纯函数：记忆 lane 的 agent 调用失败归类（Bug 20），零 DB / 零网络。
+        "test_agent_call_failure_codes.py",
+        # 纯函数：provider 解析层给「思考吃光输出预算」打标 + 抽取截断重问，MockTransport、零 DB。
+        "test_extraction_output_truncation.py",
         "test_resident_decrypt_probe_startup.py",
         "test_memory_bm25.py",
         "test_memory_bm25_readside.py",

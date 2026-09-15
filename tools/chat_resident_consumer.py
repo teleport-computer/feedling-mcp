@@ -18517,43 +18517,158 @@ def _process_capture_jobs(jobs: list) -> float:
     return latest
 
 
+class DreamContextUnavailable(RuntimeError):
+    """Dream's card read failed; content-free (the message is only the code).
+
+    ``_capture_post_json`` answers every failure with ``{}``, which is right for
+    its best-effort callers but made a timed-out card read look exactly like an
+    empty garden: the job completed as ``dream_no_cards_available`` and the
+    backend advanced the Dream ledger, silencing Dream until enough new cards
+    arrived (prod, 09-10 / 09-13 enclave decrypt timeouts).
+    """
+
+    code = "dream_context_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def _dream_post_json(path: str, *, payload: dict[str, Any], timeout: int) -> dict:
+    """Strict readside POST for Dream: transport error, timeout, non-2xx or a
+    non-JSON/non-object body raise ``DreamContextUnavailable``; only a real,
+    readable JSON object is returned. The exception text is deliberately not
+    carried — an upstream body may echo private card content."""
+    _refresh_auth_header()
+    root = FEEDLING_API_URL.rstrip("/")
+    try:
+        resp = _client_for(root).post(
+            f"{root}{path}",
+            json=payload,
+            headers=_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:
+        log.warning(
+            "dream context read failed path=%s error_class=%s", path, type(e).__name__
+        )
+        raise DreamContextUnavailable() from e
+    if not isinstance(body, dict):
+        log.warning("dream context read malformed path=%s check=body", path)
+        raise DreamContextUnavailable()
+    return body
+
+
+def _dream_read_rejected(path: str, check: str, **counts: int) -> DreamContextUnavailable:
+    """Log a content-free reason (check name + counts only) and build the error."""
+    log.warning(
+        "dream context read incomplete path=%s check=%s %s",
+        path,
+        check,
+        " ".join(f"{key}={value}" for key, value in sorted(counts.items())),
+    )
+    return DreamContextUnavailable()
+
+
 def _dream_index_items() -> list[dict]:
-    body = _capture_post_json(
-        "/v1/memory/index",
+    """The Dream card window, or ``DreamContextUnavailable``.
+
+    HTTP 200 is not proof of a readable garden: the backend drops cards it
+    cannot decrypt, so an enclave that fails every card still answers
+    ``{"items": []}``. ``user_card_count`` (the live card total, reported since
+    the endpoint was introduced — before Dream existed) is what separates an
+    empty garden from an unreadable one. A malformed item is a broken contract,
+    not a card to skip.
+    """
+    path = "/v1/memory/index"
+    body = _dream_post_json(
+        path,
         payload={"limit": max(0, DREAM_MEMORY_INDEX_LIMIT)},
         timeout=30,
     )
-    items = body.get("items") if isinstance(body.get("items"), list) else []
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise _dream_read_rejected(path, "items_missing")
     out: list[dict] = []
     seen: set[str] = set()
+    malformed = 0
     for item in items:
-        if not isinstance(item, dict):
+        memory_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+        if not memory_id:
+            malformed += 1
             continue
-        memory_id = str(item.get("id") or "").strip()
-        if not memory_id or memory_id in seen:
+        if memory_id in seen or len(out) >= max(1, DREAM_MEMORY_MAX_CARDS):
             continue
         seen.add(memory_id)
         out.append(dict(item))
-        if len(out) >= max(1, DREAM_MEMORY_MAX_CARDS):
-            break
+    if malformed:
+        raise _dream_read_rejected(
+            path, "item_malformed", items=len(items), malformed=malformed
+        )
+    user_card_count = body.get("user_card_count")
+    if not out and not (type(user_card_count) is int and user_card_count == 0):
+        # Absent/invalid count included: every backend that schedules Dream
+        # reports it, so its absence is not evidence of an empty garden.
+        raise _dream_read_rejected(
+            path,
+            "empty_unverified",
+            items=len(items),
+            user_card_count=user_card_count if type(user_card_count) is int else -1,
+        )
     return out
 
 
 def _dream_fetch_items(ids: list[str]) -> dict[str, dict]:
+    """Full bodies for exactly ``ids``, or ``DreamContextUnavailable``.
+
+    Anything short of every requested card coming back — a failed batch,
+    ``missing_ids`` / ``unavailable_ids``, a truncated request, an omitted or
+    extra id — fails the whole read. A card without its full body would be
+    shown to the model as an index summary and could be superseded from that
+    summary alone (same contract as V2's ``dream_cards_fetch_incomplete``).
+    """
     if not ids:
         return {}
+    path = "/v1/memory/fetch"
     by_id: dict[str, dict] = {}
     batch_size = max(1, min(DREAM_FETCH_BATCH_SIZE, 200))
     for offset in range(0, len(ids), batch_size):
         batch = ids[offset : offset + batch_size]
-        body = _capture_post_json(
-            "/v1/memory/fetch",
+        body = _dream_post_json(
+            path,
             payload={"ids": batch, "limit": len(batch)},
             timeout=30,
         )
-        for item in body.get("items") if isinstance(body.get("items"), list) else []:
-            if isinstance(item, dict) and str(item.get("id") or "").strip():
-                by_id[str(item.get("id") or "").strip()] = dict(item)
+        items = body.get("items")
+        if not isinstance(items, list):
+            raise _dream_read_rejected(path, "items_missing", requested=len(batch))
+        for key in ("missing_ids", "unavailable_ids"):
+            value = body.get(key, [])
+            if not isinstance(value, list) or value:
+                raise _dream_read_rejected(
+                    path,
+                    key,
+                    requested=len(batch),
+                    count=len(value) if isinstance(value, list) else -1,
+                )
+        truncation = body.get("truncation")
+        if isinstance(truncation, dict) and truncation.get("truncated"):
+            raise _dream_read_rejected(path, "truncated", requested=len(batch))
+        wanted = set(batch)
+        returned: dict[str, dict] = {}
+        for item in items:
+            memory_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+            if not memory_id:
+                raise _dream_read_rejected(
+                    path, "item_malformed", requested=len(batch), items=len(items)
+                )
+            returned[memory_id] = dict(item)
+        if set(returned) != wanted:
+            raise _dream_read_rejected(
+                path, "ids_incomplete", requested=len(wanted), returned=len(returned)
+            )
+        by_id.update(returned)
     return by_id
 
 
@@ -18586,7 +18701,8 @@ def _dream_cards_context() -> tuple[str, dict[str, dict]]:
         memory_id = str(item.get("id") or "").strip()
         if not memory_id:
             continue
-        card = {**item, **fetched.get(memory_id, {})}
+        # ``_dream_fetch_items`` guarantees every indexed id has its full body.
+        card = {**item, **fetched[memory_id]}
         merged.append(card)
         by_id[memory_id] = card
     lines: list[str] = []
@@ -18802,6 +18918,36 @@ def _process_dream_jobs(jobs: list) -> float:
         update_proactive_job_status(job_id, "realizing")
         try:
             cards_text, card_map = _dream_cards_context()
+        except DreamContextUnavailable:
+            # A failed read is not an empty garden: fail the job so the backend
+            # applies the Dream failure backoff and leaves the ledger alone.
+            _emit_resident_dream_context_error(job_id)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "dream_context_unavailable",
+                extra={
+                    "dream_result": {
+                        "status": "failed",
+                        "reason": "dream_context_unavailable",
+                        "job_kind": "memory_dream",
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": "dream_context_unavailable",
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="context_unavailable",
+                started_at=dream_started,
+                degraded_context=True,
+                counts=dream_counts,
+            )
+            continue
         except Exception:
             _emit_resident_dream_context_error(job_id)
             _emit_resident_dream_lifecycle(
@@ -18821,7 +18967,17 @@ def _process_dream_jobs(jobs: list) -> float:
                 "completed",
                 "dream_no_cards_available",
                 extra={
-                    "dream_result": {"status": "noop", "reason": "dream_no_cards_available", "job_kind": "memory_dream"},
+                    # ``cards_read: "empty"`` = the index read succeeded and
+                    # the backend reported zero live cards (``user_card_count
+                    # == 0``). The backend only trusts a no-cards completion
+                    # that carries it; older consumers sent the same completion
+                    # after a failed read (see proactive_core).
+                    "dream_result": {
+                        "status": "noop",
+                        "reason": "dream_no_cards_available",
+                        "job_kind": "memory_dream",
+                        "cards_read": "empty",
+                    },
                     "cards_merged": 0,
                     "cards_superseded": 0,
                     "questions": [],

@@ -208,10 +208,20 @@ def test_dream_context_distinguishes_empty_index_from_failed_full_card_read(
         "identity.identity_core.get_identity", lambda *a, **k: ({}, 200)
     )
     monkeypatch.setattr(
-        "memory.memory_core.index", lambda *a, **k: ({"items": []}, 200)
+        "memory.memory_core.index",
+        lambda *a, **k: ({"items": [], "user_card_count": 0}, 200),
     )
     empty = serve_worker._read_dream_memory_context("u_ctx_empty")
     assert empty["_diagnostic_cards_outcome"] == "empty"
+
+    # 200 + no items is only an empty garden when the live card count says so:
+    # the readside drops every card it cannot decrypt and still answers 200.
+    for unverified in ({"items": []}, {"items": [], "user_card_count": 3}):
+        monkeypatch.setattr(
+            "memory.memory_core.index", lambda *a, _b=unverified, **k: (_b, 200)
+        )
+        unreadable = serve_worker._read_dream_memory_context("u_ctx_unreadable")
+        assert unreadable["_diagnostic_cards_outcome"] == "unavailable"
 
     monkeypatch.setattr(
         "memory.memory_core.index",

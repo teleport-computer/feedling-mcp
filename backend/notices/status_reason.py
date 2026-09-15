@@ -47,6 +47,10 @@ PROACTIVE_LIFECYCLE_REASONS = frozenset({
 # append exception text to it (``_agent_call_failed_reason`` deliberately
 # appends ``detail[:400]``, which is how a provider error body reaches this
 # column at all), so the tail is exactly what has to go. The bucket survives.
+# For the capture/dream/migrate ``*_agent_call_failed`` prefixes the status
+# endpoint now stores ``<prefix>:<error class>`` instead
+# (``notices.agent_call_failure``); rows written earlier, and the chat lane's
+# ``agent_call_failed: <text>``, still carry raw tails and rely on this.
 # Producers (kept in sync by tests/test_status_reason_redaction.py):
 #   tools/chat_resident_consumer.py  update_proactive_job_status(..., <reason>)
 RESIDENT_CONSUMER_REASONS = frozenset({
@@ -66,6 +70,7 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "coalesced_into",
     "degenerate_reply_suppressed",
     "dream_agent_call_failed",
+    "dream_context_unavailable",
     "dream_invalid_memory_action",
     "dream_memory_actions_applied",
     "dream_memory_actions_failed",

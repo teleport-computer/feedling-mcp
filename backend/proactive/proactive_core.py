@@ -29,6 +29,7 @@ from core import util
 from core import wake_bus as core_wake_bus
 from hosted import config_store as hosted_config_store
 from model_api_runtime.v2 import jobs_store
+from notices import agent_call_failure as notices_agent_call_failure
 from proactive import capture_jobs, capture_scheduler, dashboard, dream_scheduler, gate, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 
@@ -422,9 +423,31 @@ def proactive_tick(store, payload: dict, *, api_key) -> dict:
 # job status patch + claim / status
 # --------------------------------------------------------------------------- #
 
+def _content_free_agent_call_reason(value):
+    """Classify a resident memory-lane agent-call failure before it is stored.
+
+    The resident consumer appends raw provider/CLI error text to
+    ``<lane>_agent_call_failed:``. Storing it made every content-free surface
+    collapse the value to ``runtime_failed``; classifying here (not in the
+    consumer) also covers self-hosted consumers on older versions. Only strings
+    with those exact prefixes change; everything else passes through untouched.
+    """
+    if not isinstance(value, str) or not notices_agent_call_failure.is_agent_call_failed_reason(value):
+        return value
+    return notices_agent_call_failure.normalize_reason(value)
+
+
+def _content_free_result_doc(value):
+    if isinstance(value, dict) and "reason" in value:
+        value = {**value, "reason": _content_free_agent_call_reason(value.get("reason"))}
+    return value
+
+
 def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
     status = str(payload.get("status") or default_status).strip().lower()
-    reason = str(payload.get("reason") or payload.get("status_reason") or "").strip()
+    reason = _content_free_agent_call_reason(
+        str(payload.get("reason") or payload.get("status_reason") or "").strip()
+    )
     consumer_id = str(payload.get("consumer_id") or "").strip()
     now_iso = datetime.now().isoformat()
     patch: dict = {}
@@ -484,9 +507,13 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
             "copy": str(req.get("copy") or req.get("message") or "")[:500],
         }
     if isinstance(payload.get("capture_result"), dict):
-        patch["capture_result"] = _safe_capture_doc(payload.get("capture_result"), max_items=20)
+        patch["capture_result"] = _safe_capture_doc(
+            _content_free_result_doc(payload.get("capture_result")), max_items=20
+        )
     if isinstance(payload.get("dream_result"), dict):
-        patch["dream_result"] = _safe_capture_doc(payload.get("dream_result"), max_items=20)
+        patch["dream_result"] = _safe_capture_doc(
+            _content_free_result_doc(payload.get("dream_result")), max_items=20
+        )
     if isinstance(payload.get("capture_window"), dict):
         patch["capture_window"] = _safe_capture_doc(payload.get("capture_window"), max_items=12)
     if isinstance(payload.get("memory_action_status"), (dict, list)):
@@ -504,7 +531,9 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
             except (TypeError, ValueError):
                 patch[key] = 0
     if payload.get("noop_reason"):
-        patch["noop_reason"] = str(payload.get("noop_reason"))[:500]
+        patch["noop_reason"] = _content_free_agent_call_reason(
+            str(payload.get("noop_reason"))
+        )[:500]
     return patch
 
 
@@ -559,6 +588,9 @@ def job_status(store, job_id, payload: dict):
             "expected_consumer_id": current_consumer,
         }, 409
     prev_status = str((current or {}).get("status") or "").strip().lower()
+    # Older resident consumers report a failed Dream card read as "no cards";
+    # never let that advance the Dream ledger while the garden has cards.
+    patch = dream_scheduler.reclassify_unverified_no_cards_completion(store, current, patch)
     job = store.update_proactive_job(job_id, patch)
     if job is None:
         return {"error": "job_not_found"}, 404

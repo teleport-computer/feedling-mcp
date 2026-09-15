@@ -839,6 +839,8 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
         "status": "failed",
         "failure_code": "upstream_unavailable",
         "failure_code_provenance": "explicit",
+        "outcome": "",
+        "outcome_reason": "",
         "duration_ms": 289000,
         "provider": "openai",
         "model": "gpt-5.5",
@@ -859,6 +861,40 @@ def test_dream_job_metadata_supports_filters_pagination_and_no_bodies(env):
     rendered = json.dumps([first, second])
     for forbidden in ("prompt", "reply", "content", "body", "NEVER RETURN"):
         assert forbidden not in rendered
+
+
+def test_dream_job_metadata_separates_skipped_runs_from_real_consolidations(env):
+    """A dream that ran but found the garden too small is completed-but-skipped."""
+    uid, _key = _register()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_jobs "
+            "(user_id,lane,status,wake_result,wake_result_reason,created_at,finished_at) "
+            "VALUES (%s,'dream','completed','skipped','not_enough_new_cards',"
+            "'2026-08-13T10:00:00Z','2026-08-13T10:00:01Z'),"
+            "(%s,'dream','completed',NULL,NULL,"
+            "'2026-08-13T09:00:00Z','2026-08-13T09:00:01Z'),"
+            "(%s,'dream','completed','skipped','PRIVATE FREE TEXT',"
+            "'2026-08-13T08:00:00Z','2026-08-13T08:00:01Z')",
+            (uid, uid, uid),
+        )
+
+    status, body = _asgi_json(
+        "GET",
+        f"/v1/admin/memory-dream-jobs?user_id={uid}&status=completed",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert [
+        (job["status"], job["outcome"], job["outcome_reason"])
+        for job in body["jobs"]
+    ] == [
+        ("completed", "skipped", "not_enough_new_cards"),
+        ("completed", "", ""),
+        ("completed", "skipped", ""),
+    ]
+    assert "PRIVATE FREE TEXT" not in json.dumps(body)
 
 
 @pytest.mark.parametrize(

@@ -1877,6 +1877,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_fence_incomplete",
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
+        "dream_context_unavailable",
         "dream_no_memory_actions",
         "dream_source_occurred_at_unavailable",
         "empty_reply",
@@ -12067,6 +12068,9 @@ async def _run_profile(
                     f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
                 ),
             )
+            # Profile shares heavy-0 with Capture/Dream: same 120s stall budget,
+            # so each wire needs the same true wall-clock ceiling.
+            kwargs.setdefault("wire_deadline_sec", v2_extraction.WIRE_DEADLINE_SEC)
             result = await provider_client.reliable_chat_completion_async(
                 *args, **kwargs
             )
@@ -12310,6 +12314,9 @@ async def _run_extraction(
     dream_terminal_outcome = "failed"
     dream_model_attempts = 0
     dream_context_reader_failed = False
+    # Kernel verdict reason when Dream legitimately had nothing to consolidate
+    # (the garden is below memgarden's minimum). "" = a real run.
+    dream_skip_reason = ""
     dream_terminal_emitted = False
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
@@ -12344,7 +12351,9 @@ async def _run_extraction(
         except (TypeError, ValueError):
             return 0.0
 
-    async def _record_extraction_status(status: str, *, item_count: int = 0) -> None:
+    async def _record_extraction_status(
+        status: str, *, item_count: int = 0, skip_reason: str = ""
+    ) -> None:
         nonlocal extraction_status_recorded
         # Production Capture terminal state is committed by the durable batch
         # protocol below.  This callback remains only for the disabled Dream
@@ -12359,13 +12368,24 @@ async def _run_extraction(
             {
                 "window": dict(capture_window),
                 "item_count": max(0, int(item_count)),
+                **({"skip_reason": skip_reason} if skip_reason else {}),
             },
         )
         extraction_status_recorded = True
 
-    async def _complete_extraction(*, item_count: int) -> None:
+    async def _complete_extraction(*, item_count: int, skip_reason: str = "") -> None:
+        # A skip is still a clean terminal (no retry, no backoff), but it is
+        # tagged so the job row, admin dream view and Dream ledger never count
+        # it as a consolidation that actually ran.
         landed = await asyncio.to_thread(
-            jobs_store.mark_completed, job_id, claimed_by=claimed_by
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+            **(
+                {"wake_result": "skipped", "wake_result_reason": skip_reason}
+                if skip_reason
+                else {}
+            ),
         )
         if claimed_by and not landed:
             raise LostJobLease("extraction lease lost before terminalization")
@@ -12376,7 +12396,9 @@ async def _run_extraction(
         # after a lost lease, which is not recoverable.
         try:
             await _record_extraction_status(
-                "completed", item_count=item_count
+                "skipped" if skip_reason else "completed",
+                item_count=item_count,
+                skip_reason=skip_reason,
             )
         except Exception as status_exc:  # noqa: BLE001 — conservative retry repairs it
             log.warning(
@@ -12580,6 +12602,17 @@ async def _run_extraction(
                     component="cards",
                     outcome=cards_outcome,
                 )
+            if cards_outcome == "unavailable":
+                # The card read failed (enclave/readside timeout, non-200,
+                # incomplete fetch). Dreaming on nothing would complete as a
+                # no-op and advance the Dream ledger, so the scheduler reports
+                # ``already_dreamed`` until enough NEW cards arrive — an
+                # inactive user is silenced for good (prod, 09-10 / 09-13).
+                # Fail instead: the job goes through the Dream failure backoff
+                # and the ledger stays put. ``truncated`` (the 60k-char prompt
+                # cap) stays an intentional partial context, and the other
+                # context items (buckets/threads/identity) keep degrading.
+                raise RuntimeError("dream_context_unavailable")
         if lane == "capture" and deps.read_capture_state is not None and tail:
             # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
             # 用来定位「模型为什么吐出坏 JSON」——见 memory/window_fingerprint。
@@ -13052,6 +13085,9 @@ async def _run_extraction(
                 session=_capture_session,
                 step_sink=_step_sink,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                truncation_retry_max_tokens=(
+                    v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
+                ),
                 failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
@@ -13060,8 +13096,35 @@ async def _run_extraction(
                 trajectory_out=extraction_trajectory_out,
             )
             _report_turn_progress("extraction_provider_complete")
-            dream_counts["model_attempts"] = max(1, dream_model_attempts)
+            if not reason and not items and dream_model_attempts == 0:
+                # No provider request and no result: the component declined to
+                # ask the model at all. Only a small-garden verdict becomes a
+                # skip; an empty/unreadable card read keeps its old noop path.
+                dream_skip_reason = garden_component.maintenance_skip_reason(
+                    _capture_session
+                )
+            dream_counts["model_attempts"] = (
+                0 if dream_skip_reason else max(1, dream_model_attempts)
+            )
             dream_counts["proposals"] = len(items or [])
+        if lane == "dream" and dream_skip_reason:
+            await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="ok",
+                outcome="skipped",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
+            if tm is not None:
+                tm.flush(failed=False, status="dream_skipped")
+            return "completed"
         if reason:
             if lane == "dream":
                 dream_terminal_outcome = memory_dream_trace.reason_outcome(reason)

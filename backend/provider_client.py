@@ -61,6 +61,14 @@ class ProviderError(Exception):
         self.raw_response_body = str(raw_response_body or "")[
             :_MAX_RAW_PROVIDER_ERROR_BODY_CHARS
         ]
+        # Set only by ``_mark_output_truncation``: an HTTP-2xx success shape
+        # with no usable reply whose provider stop marker says the output-token
+        # cap was hit (typically a thinking model that spent the whole budget
+        # on hidden reasoning). Content-free: normalized stop marker and the
+        # provider's normalized usage counts only.
+        self.output_truncated = False
+        self.stop_reason = ""
+        self.truncation_usage: dict | None = None
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -103,6 +111,70 @@ def is_token_limit_stop_reason(value: Any) -> bool:
         "max_tokens",
         "max_output_tokens",
     }
+
+
+def _mark_output_truncation(
+    exc: ProviderError, *, stop_reason: Any, usage: dict | None
+) -> ProviderError:
+    """Tag a "no usable reply" error whose response stopped at the token cap.
+
+    Every wire parser raises the same ``ProviderError`` (same class, message and
+    ``status_code=None``) when a required reply is empty, so every existing
+    caller keeps its classification, retry and error mapping. The tag only lets
+    a caller that owns an output-budget policy tell "the model ran out of
+    output budget" apart from a relay returning garbage — see
+    ``is_output_truncation_error`` and ``reliable_chat_completion_async``'s
+    ``retry_output_truncation``.
+    """
+    if is_token_limit_stop_reason(stop_reason):
+        exc.output_truncated = True
+        exc.stop_reason = normalize_stop_reason(stop_reason)
+        exc.truncation_usage = dict(usage) if isinstance(usage, dict) else None
+    return exc
+
+
+def is_output_truncation_error(exc: BaseException) -> bool:
+    """A 2xx reply with no usable text that the provider stopped at its output cap."""
+    return isinstance(exc, ProviderError) and getattr(exc, "output_truncated", False) is True
+
+
+# A 400/422 whose provider message says the requested output-token budget is
+# above what this model accepts. Shapes seen across wires: OpenAI "max_tokens is
+# too large: 24000. This model supports at most 16384 completion tokens",
+# Anthropic "max_tokens: 24000 > 16000, which is the maximum allowed number of
+# output tokens", DeepSeek "Invalid max_tokens value, the valid range of
+# max_tokens is [1, 8192]", Bedrock "The maximum tokens you requested exceeds
+# the model limit", Gemini "maxOutputTokens ... must be less than or equal".
+_OUTPUT_BUDGET_FIELD_RE = re.compile(
+    r"max[_ ]?(?:completion[_ ]|output[_ ]|new[_ ])?tokens|maxoutputtokens"
+    r"|maximum (?:number of )?(?:output )?tokens|(?:output|completion) tokens",
+    re.IGNORECASE,
+)
+_OUTPUT_BUDGET_LIMIT_RE = re.compile(
+    r"too (?:large|big|high|many)|exceed|greater than|larger than|at most"
+    r"|maximum allowed|valid range|out of range|must be (?:less|at most|between|<|in)"
+    r"|less than or equal|\d\s*>\s*\d",
+    re.IGNORECASE,
+)
+
+
+def is_output_budget_rejection(exc: BaseException) -> bool:
+    """A 400/422 that rejects the requested output-token budget as too large.
+
+    Only meaningful to a caller that raised its own budget above one the same
+    route already accepted: it can safely fall back to that accepted budget.
+    Content-free: the verdict is derived from the provider's error text, which
+    is not returned.
+    """
+    if not isinstance(exc, ProviderError) or exc.status_code not in {400, 422}:
+        return False
+    text = " ".join(
+        str(part or "")
+        for part in (exc, getattr(exc, "response_detail", ""), exc.raw_response_body)
+    )
+    return bool(
+        _OUTPUT_BUDGET_FIELD_RE.search(text) and _OUTPUT_BUDGET_LIMIT_RE.search(text)
+    )
 
 
 def cap_chat_output_tokens(value: Any) -> int:
@@ -2877,23 +2949,29 @@ def _parse_openai_responses_body(
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_openai_responses(body)
     media = _extract_openai_responses_media(body)
+    stop_reason = str(
+        (
+            body.get("incomplete_details")
+            if isinstance(body.get("incomplete_details"), dict)
+            else {}
+        ).get("reason")
+        or body.get("status")
+        or "",
+    ).strip()
+    usage = _normalize_usage("openai", body.get("usage"))
     if require_reply and not reply and not tool_calls and not media:
-        raise ProviderError("provider response had no usable reply text")
+        raise _mark_output_truncation(
+            ProviderError("provider response had no usable reply text"),
+            stop_reason=stop_reason,
+            usage=usage,
+        )
     output = body.get("output")
     return {
         "reply": reply,
         "reasoning": reasoning,
-        "usage": _normalize_usage("openai", body.get("usage")),
+        "usage": usage,
         "raw_id": body.get("id", ""),
-        "stop_reason": str(
-            (
-                body.get("incomplete_details")
-                if isinstance(body.get("incomplete_details"), dict)
-                else {}
-            ).get("reason")
-            or body.get("status")
-            or "",
-        ).strip(),
+        "stop_reason": stop_reason,
         "provider": "openai",
         "model": model,
         "tool_calls": tool_calls,
@@ -3413,6 +3491,55 @@ def _extend_attempt_trace(
     return ordinals
 
 
+# Set only by ``reliable_chat_completion_async`` while a caller-supplied
+# ``progress_cb`` is active. One outer attempt can contain several bounded HTTP
+# wires (compatibility fallbacks); without a boundary between them a hosted
+# watchdog sees one long silent await and may kill a healthy slot. Task-local,
+# so concurrent turns never see each other's callback.
+_WIRE_START_CB: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "feedling_provider_wire_start_cb", default=None
+)
+
+
+def _notify_wire_start(inner_attempt: int) -> None:
+    callback = _WIRE_START_CB.get()
+    if callback is None:
+        return
+    try:
+        callback(int(inner_attempt))
+    except Exception:  # noqa: BLE001 — observation must never change a request
+        pass
+
+
+# Set only by ``reliable_chat_completion_async(wire_deadline_sec=...)``: a true
+# wall-clock ceiling for ONE HTTP wire (connect + send + the whole buffered
+# response). httpx's ``timeout=`` bounds each phase separately (read = the gap
+# between two received bytes), so a relay that trickles keep-alive bytes can
+# hold one wire far past it. A hosted watchdog whose stall budget is only a
+# little longer than one wire needs this ceiling to be real. Task-local, like
+# ``_WIRE_START_CB``; unset for every other caller (behaviour unchanged).
+_WIRE_DEADLINE_SEC: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "feedling_provider_wire_deadline_sec", default=None
+)
+
+
+async def _post_within_wire_deadline(post: Any, request_payload: dict[str, Any]) -> Any:
+    deadline = _WIRE_DEADLINE_SEC.get()
+    if deadline is None:
+        return await post(request_payload)
+    try:
+        # ``wait_for`` cancels and joins the in-flight request on expiry, so no
+        # paid socket survives as a detached zombie (same as absolute_deadline).
+        return await asyncio.wait_for(post(request_payload), timeout=deadline)
+    except asyncio.TimeoutError as exc:
+        # Same shape as an httpx read timeout wrapped by the wire adapters
+        # (``ProviderError("provider network error: <Name>")``, no status):
+        # ``classify_provider_error`` → transient, ``is_timeout_error`` → True.
+        raise ProviderError(
+            "provider network error: WireDeadlineExceeded"
+        ) from exc
+
+
 async def _traced_async_json_post(
     *,
     trace: list[dict[str, Any]] | None,
@@ -3429,8 +3556,9 @@ async def _traced_async_json_post(
     therefore preserves the exact JSON body without an extra deep-copy of a large
     prompt on the latency-sensitive path.
     """
+    _notify_wire_start(inner_attempt)
     if trace is None:
-        return await post(request_payload), None
+        return await _post_within_wire_deadline(post, request_payload), None
 
     started_ns = time.monotonic_ns()
     entry: dict[str, Any] = {
@@ -3449,7 +3577,7 @@ async def _traced_async_json_post(
         },
     }
     try:
-        response = await post(request_payload)
+        response = await _post_within_wire_deadline(post, request_payload)
     except Exception as exc:  # noqa: BLE001 -- retain evidence, preserve exception
         status = getattr(exc, "status_code", None)
         entry["status"] = int(status) if isinstance(status, int) else None
@@ -3770,10 +3898,17 @@ def _parse_openai_compat_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
-    reply = _extract_reply(
-        body, required=require_reply and not tool_calls and not media
-    )
     stop_reason = _extract_openai_compatible_stop_reason(body)
+    try:
+        reply = _extract_reply(
+            body, required=require_reply and not tool_calls and not media
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=stop_reason,
+            usage=_normalize_usage(provider, body.get("usage")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -3980,10 +4115,17 @@ def _parse_anthropic_body(
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_anthropic(body)
     content = body.get("content")
-    reply = _extract_anthropic_reply(
-        body, required=require_reply and not tool_calls
-    )
     stop_reason = str(body.get("stop_reason") or "").strip()
+    try:
+        reply = _extract_anthropic_reply(
+            body, required=require_reply and not tool_calls
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=stop_reason,
+            usage=_normalize_usage("anthropic", body.get("usage")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -4267,14 +4409,20 @@ def _parse_bedrock_body(
 ) -> dict[str, Any]:
     tool_calls = _decode_tool_calls_bedrock(body)
     content = _bedrock_output_content(body)
-    return {
-        "reply": _extract_bedrock_reply(
+    stop_reason = str(body.get("stopReason") or "").strip()
+    usage = _normalize_usage("bedrock", body.get("usage"))
+    try:
+        reply = _extract_bedrock_reply(
             body, required=require_reply and not tool_calls
-        ),
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(exc, stop_reason=stop_reason, usage=usage)
+    return {
+        "reply": reply,
         "reasoning": _extract_bedrock_reasoning(body),
-        "usage": _normalize_usage("bedrock", body.get("usage")),
+        "usage": usage,
         "raw_id": str(body.get("requestId") or ""),
-        "stop_reason": str(body.get("stopReason") or "").strip(),
+        "stop_reason": stop_reason,
         "provider": "bedrock",
         "model": model,
         "tool_calls": tool_calls,
@@ -4450,10 +4598,19 @@ def _parse_gemini_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
-    reply = _extract_gemini_reply(
-        body, required=require_reply and not tool_calls and not media
-    )
     stop_reason = _extract_gemini_stop_reason(body)
+    try:
+        reply = _extract_gemini_reply(
+            body, required=require_reply and not tool_calls and not media
+        )
+    except ProviderError as exc:
+        # Only the closed Gemini enum can reach the marker (MAX_TOKENS ->
+        # "max_tokens"); a novel provider string normalizes to "other".
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=_normalize_gemini_finish_reason(stop_reason),
+            usage=_normalize_usage("gemini", body.get("usageMetadata")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -5868,6 +6025,8 @@ async def reliable_chat_completion_async(
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
     absolute_deadline: float | None = None,
+    retry_output_truncation: bool = True,
+    wire_deadline_sec: float | None = None,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
@@ -5877,7 +6036,25 @@ async def reliable_chat_completion_async(
     `provider_config` failures. On final failure the raised exception carries
     `.feedling_error_class` ("transient_exhausted" | "provider_config") so the
     caller can label the job/turn.
+
+    ``retry_output_truncation=False`` is for callers that own an output-budget
+    policy (background extraction): a required reply that came back empty with
+    a token-limit stop marker (``is_output_truncation_error``) is raised on the
+    first attempt with ``.feedling_error_class == "output_truncated"`` instead
+    of being retried as a transient shape error. Re-sending the same prompt at
+    the same budget to a thinking model reliably burns the budget again. The
+    default keeps every other caller's retry, classification and labels.
+
+    ``wire_deadline_sec`` caps the wall-clock of every single HTTP wire
+    (compatibility fallbacks included), unlike ``timeout`` which httpx applies
+    per phase. Expiry raises the same no-status ``ProviderError`` a wrapped
+    read timeout does, so retry and classification are unchanged. For callers
+    whose hosted watchdog stall budget must outlast one wire (Heavy pool).
     """
+    if wire_deadline_sec is not None:
+        wire_deadline_sec = float(wire_deadline_sec)
+        if not math.isfinite(wire_deadline_sec) or wire_deadline_sec <= 0:
+            raise ValueError("wire_deadline_sec must be finite and positive")
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
     config = args[0] if args and isinstance(args[0], ProviderConfig) else None
@@ -5907,6 +6084,31 @@ async def reliable_chat_completion_async(
         except Exception:  # noqa: BLE001
             pass
 
+    async def _with_wire_progress(awaitable: Any, attempt: int) -> Any:
+        # Every HTTP wire inside one attempt (compatibility fallbacks included)
+        # is a real progress boundary; report it through the same callback.
+        # Set and reset inside the awaiting task, so ``wait_for``'s child task
+        # and concurrent turns never see a stale callback or wire deadline.
+        if progress_cb is None and wire_deadline_sec is None:
+            return await awaitable
+        cb_token = (
+            _WIRE_START_CB.set(lambda _inner: _progress("wire_start", attempt))
+            if progress_cb is not None
+            else None
+        )
+        deadline_token = (
+            _WIRE_DEADLINE_SEC.set(wire_deadline_sec)
+            if wire_deadline_sec is not None
+            else None
+        )
+        try:
+            return await awaitable
+        finally:
+            if deadline_token is not None:
+                _WIRE_DEADLINE_SEC.reset(deadline_token)
+            if cb_token is not None:
+                _WIRE_START_CB.reset(cb_token)
+
     for attempt in range(1, attempts + 1):
         started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
@@ -5928,7 +6130,9 @@ async def reliable_chat_completion_async(
                 # detached zombie.
                 try:
                     result = await asyncio.wait_for(
-                        chat_completion_async(*args, **attempt_kwargs),
+                        _with_wire_progress(
+                            chat_completion_async(*args, **attempt_kwargs), attempt
+                        ),
                         timeout=remaining,
                     )
                 except asyncio.TimeoutError as timeout_exc:
@@ -5940,7 +6144,9 @@ async def reliable_chat_completion_async(
                         "provider absolute deadline exceeded"
                     ) from timeout_exc
             else:
-                result = await chat_completion_async(*args, **attempt_kwargs)
+                result = await _with_wire_progress(
+                    chat_completion_async(*args, **attempt_kwargs), attempt
+                )
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
@@ -5987,8 +6193,12 @@ async def reliable_chat_completion_async(
                 absolute_deadline is not None
                 and time.monotonic() >= float(absolute_deadline)
             )
+            truncation_terminal = (
+                not retry_output_truncation and is_output_truncation_error(exc)
+            )
             terminal = (
                 cls == "provider_config"
+                or truncation_terminal
                 or attempt >= attempts
                 or deadline_exhausted
             )
@@ -6032,6 +6242,8 @@ async def reliable_chat_completion_async(
                 exc.feedling_error_class = (
                     "provider_config"
                     if cls == "provider_config"
+                    else "output_truncated"
+                    if truncation_terminal
                     else "transient_exhausted"
                 )
                 if provider_attempt_trace is not None:

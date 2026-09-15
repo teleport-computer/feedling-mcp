@@ -2056,6 +2056,109 @@ def test_dream_completion_advances_state(tmp_path, monkeypatch):
     assert second.get_json()["reason"] == "already_dreamed"
 
 
+def _dream_no_cards_setup(monkeypatch, tmp_path, user_id, *, cards):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    core_store._stores.clear()
+    api_key = f"test_key_{user_id}"
+    registry._key_to_user[registry._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, f"mem_{i}") for i in range(cards)])
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+    tick = client.post("/v1/dream/tick", headers=headers, json={"now": 2000.0})
+    assert tick.get_json()["enqueued"] is True
+    return store, client, headers, tick.get_json()["job"]
+
+
+def _legacy_no_cards_payload(**dream_result_extra):
+    # Exactly what resident consumers before the strict Dream read sent after a
+    # timed-out card read (and after a genuinely empty one).
+    return {
+        "status": "completed",
+        "reason": "dream_no_cards_available",
+        "dream_result": {
+            "status": "noop",
+            "reason": "dream_no_cards_available",
+            "job_kind": "memory_dream",
+            **dream_result_extra,
+        },
+        "cards_merged": 0,
+        "cards_superseded": 0,
+        "questions": [],
+        "noop_reason": "dream_no_cards_available",
+    }
+
+
+def test_legacy_no_cards_completion_with_live_cards_is_a_read_failure(tmp_path, monkeypatch):
+    """Old self-hosted consumers report a failed card read as ``completed`` +
+    ``dream_no_cards_available``. With cards in the garden that must not advance
+    the Dream ledger (prod 09-10 / 09-13 silenced Dream as ``already_dreamed``)."""
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_legacy_no_cards", cards=2
+    )
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json=_legacy_no_cards_payload(),
+    )
+    after = client.post("/v1/dream/tick", headers=headers, json={"now": 2100.0})
+
+    assert done.status_code == 200
+    patched = done.get_json()["job"]
+    assert patched["status"] == "failed"
+    assert patched["status_reason"] == "dream_context_unavailable"
+    assert patched["noop_reason"] == "dream_context_unavailable"
+    assert patched["dream_result"]["status"] == "failed"
+    assert patched["dream_result"]["reason"] == "dream_context_unavailable"
+    assert "completed_at" not in patched and patched.get("failed_at")
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["dream_fail_streak"] == 1
+    assert after.get_json()["enqueued"] is False
+    assert after.get_json()["reason"] == "failure_backoff"
+
+
+def test_verified_empty_no_cards_completion_is_trusted(tmp_path, monkeypatch):
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_verified_empty", cards=2
+    )
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json=_legacy_no_cards_payload(cards_read="empty"),
+    )
+
+    assert done.get_json()["job"]["status"] == "completed"
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] > 0
+    assert state["dream_fail_streak"] == 0
+
+
+def test_legacy_no_cards_completion_with_no_live_cards_stays_completed(tmp_path, monkeypatch):
+    store, client, headers, job = _dream_no_cards_setup(
+        monkeypatch, tmp_path, "usr_dream_cards_gone", cards=1
+    )
+    db.memory_replace_all(store.user_id, [])  # the only card was deleted before the run
+
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json=_legacy_no_cards_payload(),
+    )
+
+    assert done.get_json()["job"]["status"] == "completed"
+    assert done.get_json()["job"]["status_reason"] == "dream_no_cards_available"
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["dream_fail_streak"] == 0
+
+
 def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
     tmp_path, monkeypatch
 ):
@@ -2115,6 +2218,147 @@ def test_dream_output_and_new_turns_do_not_retrigger_without_new_seed_cards(
     # stable ticks must remain independent of chat-history size.
     assert second["new_turns"] == 0
     assert len(_memory_dream_jobs(store)) == 1
+
+
+def test_resident_dream_agent_failure_is_stored_as_a_content_free_code(
+    tmp_path, monkeypatch
+):
+    """Bug 20: old and new resident consumers both send raw provider text."""
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    core_store._stores.clear()
+
+    api_key = "test_dream_agent_failure_key"
+    user_id = "usr_dream_agent_failure_code"
+    registry._key_to_user[registry._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_fail")])
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+    secret = "PRIVATE-PROVIDER-ECHO-51c2"
+    raw = (
+        "dream_agent_call_failed:RuntimeError: pi agent produced no reply: "
+        f"HTTP 401: Insufficient balance {secret}"
+    )
+
+    job = client.post("/v1/dream/tick", headers=headers, json={"now": 3000.0}).get_json()["job"]
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "failed",
+            "reason": raw,
+            "dream_result": {"status": "failed", "reason": raw, "job_kind": "memory_dream"},
+            "cards_merged": 0,
+            "cards_superseded": 0,
+            "questions": [],
+            "noop_reason": raw,
+        },
+    )
+
+    assert done.status_code == 200
+    stored = next(
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_id") == job["job_id"]
+    )
+    code = "dream_agent_call_failed:quota_insufficient"
+    assert stored["status"] == "failed"
+    assert stored["status_reason"] == code
+    assert stored["noop_reason"] == code
+    assert stored["dream_result"]["reason"] == code
+    assert secret not in repr(stored)
+    # Still a real failure for backoff purposes.
+    assert proactive_dream_scheduler.load_dream_state(store)["dream_fail_streak"] == 1
+
+
+def test_dream_skip_spaces_retries_without_success_or_failure_bookkeeping(
+    tmp_path, monkeypatch
+):
+    """Bug 17: a worker-side "garden too small" skip is its own outcome."""
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "3600")
+    core_store._stores.clear()
+
+    user_id = "usr_dream_skip_ledger"
+    seed_user(user_id)
+    store = core_store.UserStore(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_small")])
+
+    first = proactive_dream_scheduler.tick_memory_dream(store, now=1000.0)
+    assert first["enqueued"] is True
+    store.update_proactive_job(first["job"]["job_id"], {"status": "skipped"})
+    job = dict(first["job"], dream_skip_reason="not_enough_new_cards")
+    state = proactive_dream_scheduler.record_dream_job_status(
+        store, job, status="skipped", now=1001.0
+    )
+    assert state["pending_dream_key"] == ""
+    assert state["last_dream_skipped_at"] == 1001.0
+    assert state["last_dream_skip_reason"] == "not_enough_new_cards"
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["dream_fail_streak"] == 0
+    assert state["last_dream_failed_at"] == 0.0
+
+    within = proactive_dream_scheduler.tick_memory_dream(store, now=2000.0)
+    assert (within["enqueued"], within["reason"]) == (False, "not_enough_new_cards")
+    forced = proactive_dream_scheduler.tick_memory_dream(store, now=2001.0, force=True)
+    assert forced["reason"] != "not_enough_new_cards"
+    assert forced["job"] is not None
+
+    # A later real completion clears the skip marker.
+    proactive_dream_scheduler.record_dream_job_status(
+        store, forced["job"], status="completed", now=2002.0
+    )
+    cleared = proactive_dream_scheduler.load_dream_state(store)
+    assert cleared["last_dream_skipped_at"] == 0.0
+    assert cleared["last_dream_skip_reason"] == ""
+
+
+def test_dream_skip_marker_expires_after_min_interval_and_ignores_unknown_reasons(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "3600")
+    core_store._stores.clear()
+
+    user_id = "usr_dream_skip_expiry"
+    seed_user(user_id)
+    store = core_store.UserStore(user_id)
+    db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_small")])
+
+    first = proactive_dream_scheduler.tick_memory_dream(store, now=1000.0)
+    store.update_proactive_job(first["job"]["job_id"], {"status": "skipped"})
+    # A control-plane "skipped" (no worker verdict, or free text) must not
+    # silence Dream for a whole interval.
+    unknown = proactive_dream_scheduler.record_dream_job_status(
+        store,
+        dict(first["job"], dream_skip_reason="provider said: PRIVATE TEXT"),
+        status="skipped",
+        now=1001.0,
+    )
+    assert unknown["last_dream_skipped_at"] == 0.0
+    assert unknown["last_dream_skip_reason"] == ""
+    retry = proactive_dream_scheduler.tick_memory_dream(store, now=1002.0)
+    assert retry["enqueued"] is True
+    store.update_proactive_job(retry["job"]["job_id"], {"status": "skipped"})
+
+    proactive_dream_scheduler.record_dream_job_status(
+        store,
+        dict(retry["job"], dream_skip_reason="not_enough_new_cards"),
+        status="skipped",
+        now=1003.0,
+    )
+    after_interval = proactive_dream_scheduler.tick_memory_dream(
+        store, now=1003.0 + 3601.0
+    )
+    assert after_interval["enqueued"] is True
 
 
 def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkeypatch):

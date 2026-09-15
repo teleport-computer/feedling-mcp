@@ -42,6 +42,8 @@ DREAM_JOB_FIELDS = frozenset(
         "status",
         "failure_code",
         "failure_code_provenance",
+        "outcome",
+        "outcome_reason",
         "duration_ms",
         "provider",
         "model",
@@ -95,6 +97,22 @@ def _safe_failure_code(value: object) -> str:
         len(text),
     )
     return "runtime_failed"
+
+
+# Content-free terminal qualifiers of a *completed* dream job. ``skipped`` means
+# the job ran but the kernel judged the garden too small to consolidate, so it
+# must not be read as a consolidation that happened.
+_DREAM_OUTCOMES = frozenset({"skipped"})
+
+
+def _safe_outcome(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text in _DREAM_OUTCOMES else ""
+
+
+def _safe_outcome_reason(value: object) -> str:
+    text = str(value or "").strip()
+    return text if _ERROR_CODE_RE.fullmatch(text) else ""
 
 
 def _safe_failure_code_provenance(value: object) -> str:
@@ -181,6 +199,12 @@ def dream_job_metadata_from_row(row: Mapping[str, Any]) -> dict:
         ),
         "failure_code_provenance": _safe_failure_code_provenance(
             row.get("failure_code_provenance")
+        ),
+        "outcome": _safe_outcome(row.get("outcome")),
+        "outcome_reason": (
+            _safe_outcome_reason(row.get("outcome_reason"))
+            if _safe_outcome(row.get("outcome"))
+            else ""
         ),
         "duration_ms": safe_duration,
         "provider": _safe_label(row.get("provider")),
@@ -297,6 +321,8 @@ def list_dream_job_metadata(
                         WHEN j.last_error IS NULL OR j.last_error=''
                         THEN 'missing' ELSE 'normalized_invalid'
                    END AS failure_code_provenance,
+                   j.wake_result AS outcome,
+                   j.wake_result_reason AS outcome_reason,
                    CASE WHEN j.finished_at IS NOT NULL THEN
                      GREATEST(0, ROUND(EXTRACT(EPOCH FROM
                        (j.finished_at-COALESCE(j.started_at,j.claimed_at,j.created_at))
@@ -329,12 +355,14 @@ def list_dream_job_metadata(
                 "status": row[2],
                 "failure_code": row[3],
                 "failure_code_provenance": row[4],
-                "duration_ms": row[5],
-                "provider": row[6],
-                "model": row[7],
-                "memory_card_count_now": row[8],
-                "created_at": row[9],
-                "finished_at": row[10],
+                "outcome": row[5],
+                "outcome_reason": row[6],
+                "duration_ms": row[7],
+                "provider": row[8],
+                "model": row[9],
+                "memory_card_count_now": row[10],
+                "created_at": row[11],
+                "finished_at": row[12],
             }
         )
         for row in rows
