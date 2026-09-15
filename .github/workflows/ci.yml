@@ -430,6 +430,7 @@ jobs:
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_v1_capture_backlog_batches.py \
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_garden_language_flip.py \
@@ -1041,6 +1042,7 @@ jobs:
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_v1_capture_backlog_batches.py \
             tests/test_contract_rejection_stats.py \
             tests/test_admin_data_quality_status.py \
             tests/test_data_track_runtime_view.py \

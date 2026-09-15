@@ -43,6 +43,22 @@ change must not be interpreted as an API guarantee.
   skip count shown separately. Days frozen before this change are not
   rewritten. Heartbeat and other wake lanes are unchanged.
 
+- **Resident V1 memory capture now works through a long backlog oldest-first.**
+  Hosted V1 runners and self-hosted consumers now capture the uncaptured chat in
+  bounded batches of up to 60 messages, starting right after the last captured
+  message, and each successful batch advances the capture cursor only to the end
+  of that batch. While at least one full batch is still waiting, the next batch
+  is scheduled on the next capture tick instead of waiting for the 10-minute
+  minimum interval or for the user to go quiet. Previously a backlog larger than
+  one window (for example after an account or provider problem lasting days)
+  was silently skipped: only the most recent messages were captured and the
+  cursor jumped past the rest. This requires a consumer build that advertises
+  the `capture_batch_window_v1` capability; self-hosted consumers get it through
+  self-update. An older consumer keeps the previous behavior (only the most
+  recent messages after a long backlog are captured), and the backend records a
+  `memory.capture.legacy_window_backlog` diagnostic when that happens. Runtime V2
+  capture is unchanged.
+
 - **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
   The block is the user-visible first-person aside shown under the reply, and the
   instruction now says so; it is no longer described as private inner thoughts.
@@ -164,8 +180,7 @@ change must not be interpreted as an API guarantee.
   the raw error text and the stored `capture_agent_call_failed:<class>` code; a
   keyword that only appears in echoed request text does not count. If such
   failures persist for 7 days,
-  the oldest pending batch is skipped. Self-hosted consumers capture only the
-  most recent messages after a long backlog, so older chat may not be captured. Other failures skip
+  the oldest pending batch is skipped. Other failures skip
   the batch after 6 attempts. A skipped batch produces no memories and is
   recorded in capture diagnostics. While capture is blocked, the app shows a
   notice naming the cause when it is known. A hosted capture run that crashes or
