@@ -85,68 +85,8 @@ def test_existing_identity_flows_into_merge_prompt(monkeypatch):
     assert "老c" in calls["prompts"][0]
 
 
-def test_floor_note_below_floor(monkeypatch):
-    monkeypatch.setattr(crc, "_capture_get_json",
-                        lambda path, **kw: {"memory_floor": 38, "memories_count": 2})
-    note = crc._resident_floor_note()
-    assert "2" in note and "38" in note
-    assert "绝不编造" in note
-
-
-def test_floor_note_between_floor_and_aspiration_still_guides(monkeypatch):
-    # two-tier (Xiaoting 763b0b03): floor is only the backstop; guidance keeps
-    # encouraging real facts up to the aspiration (~2.3x floor when backend
-    # doesn't expose one). 40 >= floor 38 but < asp 87 -> note still present.
-    monkeypatch.setattr(crc, "_capture_get_json",
-                        lambda path, **kw: {"memory_floor": 38, "memories_count": 40})
-    note = crc._resident_floor_note()
-    assert "38" in note and "87" in note
-    assert "绝不编造" in note
-
-
-def test_floor_note_empty_at_or_above_aspiration(monkeypatch):
-    monkeypatch.setattr(crc, "_capture_get_json",
-                        lambda path, **kw: {"memory_floor": 38, "memories_count": 90})
-    assert crc._resident_floor_note() == ""
-
-
-def test_floor_note_empty_on_error(monkeypatch):
-    def boom(path, **kw):
-        raise RuntimeError("api down")
-    monkeypatch.setattr(crc, "_capture_get_json", boom)
-    assert crc._resident_floor_note() == ""
-
-
-def test_memory_snapshot_composes_terms_and_known(monkeypatch):
-    def fake_get(path, **kw):
-        if path == "/v1/memory/buckets":
-            return {"buckets": [{"name": "工作", "count": 3}, {"name": "协作方式", "count": 2}]}
-        if path == "/v1/memory/threads":
-            return {"threads": [{"name": "查证不猜"}]}
-        return {}
-    monkeypatch.setattr(crc, "_capture_get_json", fake_get)
-    monkeypatch.setattr(crc, "_resident_memory_index_summaries",
-                        lambda: ["hx 是 Teleport 前端", "hx 的红线:优先成功率"])
-    terms, known = crc._resident_memory_snapshot()
-    assert "工作" in terms and "协作方式" in terms and "查证不猜" in terms
-    assert "复用" in terms          # 引导语:先复用,别造近义/中英重复桶
-    assert known == ["hx 是 Teleport 前端", "hx 的红线:优先成功率"]
-
-
-def test_memory_snapshot_empty_garden_returns_empty(monkeypatch):
-    monkeypatch.setattr(crc, "_capture_get_json", lambda path, **kw: {})
-    monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
-    terms, known = crc._resident_memory_snapshot()
-    assert terms == "" and known == []
-
-
-def test_memory_snapshot_error_returns_empty(monkeypatch):
-    def boom(path, **kw):
-        raise RuntimeError("api down")
-    monkeypatch.setattr(crc, "_capture_get_json", boom)
-    monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
-    terms, known = crc._resident_memory_snapshot()
-    assert terms == "" and known == []
+# 记忆蒸馏的 floor note / 桶名快照随 fact_write 一起退役：VPS 记忆导入换到 memgarden
+# 导入会话（张数、去重、桶复用由包判断），见 tests/test_resident_garden_import.py。
 
 
 # --------------------------------------------------------------------------- #

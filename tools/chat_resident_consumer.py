@@ -22804,36 +22804,9 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
     return windows or ([text] if text.strip() else [])
 
 
-def _resident_floor_note() -> str:
-    """f(days) 蒸馏目标(机制 A,非闸门):数量由素材密度决定,下限只兜底防漏写,
-    期望值给个宽范围当参考。两层——先满足下限,再尽量接近期望上限;素材薄就少写、
-    绝不编造。后端暴露 memory_aspiration 就用真值,否则按下限估一个宽上限。
-    取不到状态返空(零影响)。"""
-    try:
-        st = _capture_get_json("/v1/bootstrap/status")
-        floor = int(st.get("memory_floor") or 0)
-        count = int(st.get("memories_count") or 0)
-        asp = int(st.get("memory_aspiration") or 0)
-        if asp <= floor:  # 后端未暴露期望值 → 按下限估一个宽上限(≈2.3×)
-            asp = max(floor + 2, round(floor * 2.3))
-        # 只要还没到期望上限就给引导(鼓励在下限之上继续挖真实记忆)。
-        if floor > 0 and count < asp:
-            return (
-                f"花园现有 {count} 张卡。真正该有多少,取决于这些素材里有多少【真实、有价值】"
-                f"的持久事实——把它们尽量都写全,别为精简丢真事实。参考:这段关系正常大概在 "
-                f"{floor}–{asp} 张之间;【先满足下限 {floor} 张】,再尽量接近上限。素材薄就少写、"
-                f"【宁缺毋滥、绝不编造】;但若你只找到远低于 {floor} 张,多半是漏了,回去再挖。"
-                f"仍按 known_memories 去重。"
-            )
-    except Exception:
-        pass
-    return ""
-
-
-def _resident_memory_index_summaries() -> list[str]:
-    """Best-effort /v1/memory/index read → per-card summary strings for known_memories
-    (semantic dedup guidance to fact_write). Cap 200 entries x 160 chars — a prompt-sized
-    digest, not a full dump. Any failure/empty garden → [] (zero impact)."""
+def _resident_memory_index_items() -> list[dict]:
+    """Best-effort /v1/memory/index read (id / summary / bucket / status …, no content).
+    Any failure → [] (zero impact)."""
     try:
         body = _capture_post_json(
             "/v1/memory/index",
@@ -22841,53 +22814,9 @@ def _resident_memory_index_summaries() -> list[str]:
             timeout=20,
         )
         items = body.get("items") if isinstance(body.get("items"), list) else []
-        out: list[str] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            summary = str(item.get("summary") or "").strip()
-            if summary:
-                out.append(summary[:160])
-            if len(out) >= 200:
-                break
-        return out
+        return [item for item in items if isinstance(item, dict)]
     except Exception:
         return []
-
-
-def _resident_memory_snapshot() -> tuple[str, list[str]]:
-    """One-shot read of the memory garden before a resident distill job: existing bucket/
-    thread names (so fact_write reuses instead of inventing near-synonym or bilingual
-    duplicate buckets) + known-memory summaries (so fact_write can semantically dedup via
-    known_memories). Fetch ONCE per job, reuse across the whole window loop — not once per
-    window. Empty garden or any error → ("", []), zero impact (parallels _resident_floor_note)."""
-    try:
-        buckets_body = _capture_get_json("/v1/memory/buckets")
-        threads_body = _capture_get_json("/v1/memory/threads")
-        bucket_names = [
-            str(b.get("name") or "").strip()
-            for b in (buckets_body.get("buckets") or [])
-            if isinstance(b, dict) and str(b.get("name") or "").strip()
-        ]
-        thread_names = [
-            str(t.get("name") or "").strip()
-            for t in (threads_body.get("threads") or [])
-            if isinstance(t, dict) and str(t.get("name") or "").strip()
-        ]
-        known = _resident_memory_index_summaries()
-        if not bucket_names and not thread_names:
-            return "", known
-        terms = (
-            "现有记忆桶/线索(先复用现有桶/线索,别造近义或中英重复桶——"
-            "例:已有「工作」别再造「Work」):\n"
-        )
-        if bucket_names:
-            terms += "buckets: " + "、".join(bucket_names) + "\n"
-        if thread_names:
-            terms += "threads: " + "、".join(thread_names) + "\n"
-        return terms.strip(), known
-    except Exception:
-        return "", []
 
 
 def _distill_user_waiting(chat_since: float | None) -> bool:
@@ -22898,163 +22827,181 @@ def _distill_user_waiting(chat_since: float | None) -> bool:
     return chat_since is not None and _user_chat_pending(chat_since)
 
 
+def _resident_guard_distill_card(card: dict) -> dict | None:
+    """Pre-seal guard for distill cards that did NOT come through memgarden's parser
+    (the closing recheck pass). 硬字段脏 → 跳整卡;桶脏 → 按语言默认桶;threads 逐项滤脏。
+    memgarden 的导入会话自己带同一套闸(signals=IO_LEAK_SIGNALS),那条路不需要再过一遍。"""
+    if not card_guard.guard_enabled():
+        return card
+    _summary = str(card.get("summary") or "")
+    _content = str(card.get("content") or "")
+    if card_guard.hard_field_pollution_reason(_summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(_content, IO_LEAK_SIGNALS):
+        return None
+    _bucket = str(card.get("bucket") or "").strip()
+    if _bucket and card_guard.bucket_pollution_reason(_bucket, IO_LEAK_SIGNALS):
+        card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
+    elif _bucket:
+        card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
+    _threads = card.get("threads")
+    if isinstance(_threads, list):
+        card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
+    return card
+
+
+def _resident_import_action(card: dict, *, now_iso: str, supersedes: str = "") -> dict:
+    """One import card → client-sealed memory action (same envelope shape capture uses)."""
+    occurred_at = str(card.get("occurred_at") or "").strip()[:80] or now_iso
+    action = {
+        "type": "memory.add",
+        "envelope": _capture_build_envelope(
+            card, occurred_at=occurred_at, source="genesis_resident_distill"
+        ),
+        "reason": "Distilled from material the user uploaded.",
+        "capture_mode": "genesis_resident_distill",
+        "source_chat_message_ids": [],
+    }
+    if supersedes:
+        action["type"] = "memory.supersede"
+        action["supersedes"] = supersedes
+    return action
+
+
+def _resident_import_rows(actions: list[dict]) -> list:
+    """execute_memory_actions → per-action result rows. A 4xx whose body still carries
+    per-item results (every card rejected) is card-level, not transport — hand the rows
+    back so the engine can tell "this card is bad" from "writing is broken"."""
+    try:
+        body = execute_memory_actions(actions)
+    except ActionsHTTPError as e:
+        body = e.body if isinstance(e.body, dict) else None
+        if not body or not isinstance(body.get("results"), list):
+            raise
+    if not isinstance(body, dict) or not isinstance(body.get("results"), list):
+        # Compatibility for old injected resident writers during rolling updates.
+        return [{"status": "error", "error": "memory_action_results_missing"} for _ in actions]
+    return list(body.get("results") or [])
+
+
+def _resident_import_locale(document: str) -> str:
+    from hosted import history_import  # lazy: heavy import only when a job runs
+
+    return history_import.import_language_with_archive(
+        [{"content": document}], str(_whoami_cache.get("archive_language") or "")
+    )
+
+
 def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> str:
-    """Advance one memory-mode distill job through the CLOUD genesis engine, one model
-    turn at a time: window → fact_map (per window) → fact_write → recheck → memory.add.
-    Same code + prompts as cloud's add_memory path (persist_output=False = no backend DB),
-    so the two stay in lockstep; returns cloud-shaped memory dicts.
+    """Advance one memory-mode distill job through memgarden's import session
+    (``memory.garden_import`` — the SAME engine the cloud import uses): windows →
+    per-batch judgement → client-sealed memory writes → closing recheck → complete.
 
-    Resumable: all progress (windows, next window index, accumulated candidates, the
-    one-shot garden snapshot, written memories, phase) lives in ``state`` — when a user
-    message is pending we return "yielded" BETWEEN turns and the caller re-enters here
-    on a later loop iteration, continuing exactly where we stopped: no chunk re-runs,
-    no lost candidates, no duplicate memory writes. Returns "yielded" | "done"; raises
-    on hard errors (caller keeps the legacy leave-to-reaper semantics).
+    之前 vs 之后:之前是 io 自己的 fact_map → fact_write(genesis/prompts.py 那份判断标准);
+    之后「每批问什么、怎么去重、怎么归桶」全在 memgarden,和托管导入同一份。
 
-    keep_all (A): long-term-memory archive uploads keep facts thoroughly; chat logs stay
-    selective. The app entry passes material_kind → we translate it to keep_all here."""
+    Resumable in memory: the import state (per-batch progress, the pending write, the
+    known-card index) lives in ``state`` — when a user message is pending we return
+    "yielded" BETWEEN model turns and the caller re-enters here later, continuing at the
+    next batch: no batch re-runs, no duplicate writes. Nothing touches disk (the state
+    holds user content). A consumer crash drops it; the backend reaper re-queues the job
+    and the retry's known-card index already contains what was written. Returns
+    "yielded" | "done"; raises on hard errors (caller keeps leave-to-reaper semantics).
+
+    material_kind == "memory_summary" (long-term-memory archive) uses memgarden's
+    curated_archive rubric (keep nearly everything); chat logs use history_import."""
     from datetime import datetime, timezone as _tzmod
     from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
     from genesis.llm_client import GenesisLLMClient
+    from memory import garden_import
     import provider_client
 
-    llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
-    runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")
     job_id = state["job_id"]
-    keep_all = state["material_kind"] == "memory_summary"
+    family = "memory_summary" if state["material_kind"] == "memory_summary" else "history"
 
     if state["phase"] == "start":
-        # one-shot: garden snapshot + deterministic windowing (HTTP only, no model turn).
-        # Snapshotted into state so a resumed job reuses the SAME dedup context the
-        # first pass saw — not once per window, and not re-fetched after yielding.
-        state["terms_note"], state["known_memories"] = _resident_memory_snapshot()
+        # one-shot, HTTP only: known-card index + deterministic windowing + locale.
+        # Snapshotted into state so a resumed job keeps the SAME import parameters
+        # (memgarden refuses to resume progress under a different locale/name).
+        state["known"] = garden_import.index_cards(_resident_memory_index_items())
         state["windows"] = _window_document(state["document"])
-        state["phase"] = "map"
+        existing_identity = _resident_existing_identity()
+        state["garden"] = garden_import.new_state(
+            locale=_resident_import_locale(state["document"]),
+            user_name=str(existing_identity.get("user_preferred_name") or ""),
+        )
+        state["phase"] = "import"
 
-    if state["phase"] == "map":
-        while state["next_window_idx"] <= len(state["windows"]):
-            if _distill_user_waiting(chat_since):
-                return "yielded"
-            idx = state["next_window_idx"]
-            out = genesis_worker.build_foreground_output_from_texts(
-                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
-                runtime=runtime, chunk_texts=[state["windows"][idx - 1]],
-                write_core=False, llm=llm, keep_all=keep_all,
-            )
-            state["candidates"].extend(
-                [c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)]
-            )
-            # Cursor advances ONLY after the window's candidates are safely accumulated,
-            # so a yield/resume boundary can never skip or double-map a window.
-            state["next_window_idx"] = idx + 1
-            genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
-        state["phase"] = "write"
+    if state["phase"] == "import":
+        sources = [garden_import.ImportSource(
+            key=f"1:{family}", family=family, windows=list(state["windows"]))]
 
-    if state["phase"] == "write":
-        if not state["candidates"]:
-            # Nothing mapped → nothing to write/recheck (legacy: early return []).
-            state["memories"] = []
-            state["phase"] = "actions"
-        else:
-            if _distill_user_waiting(chat_since):
-                return "yielded"
-            mem_out = genesis_worker.build_memory_output_from_fact_candidates(
-                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
-                runtime=runtime, fact_candidates=state["candidates"], llm=llm, keep_all=keep_all,
-                floor_note=_resident_floor_note(),
-                known_memories=state["known_memories"], terms_note=state["terms_note"],
-            )
-            state["memories"] = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
-            genesis_resident_heartbeat(job_id)
-            state["phase"] = "recheck"
+        def complete(prompt: str, _purpose: str) -> tuple[str, bool]:
+            reply = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            genesis_resident_heartbeat(job_id)  # each batch is one agent call — keep the lease alive
+            return reply, False
 
+        def write(mutations: list[dict], _key: str) -> list[str]:
+            now_iso = datetime.now(_tzmod.utc).isoformat()
+            return garden_import.write_with_executor(
+                mutations,
+                build_action=lambda m: _resident_import_action(
+                    garden_import.mutation_item(m), now_iso=now_iso,
+                    supersedes=garden_import.supersede_target(m)),
+                execute=_resident_import_rows,
+            )
+
+        result = garden_import.run_import(
+            sources=sources, state=state["garden"], job_key=job_id, owner_key=uid,
+            existing_cards=state["known"], complete=complete, write=write,
+            save=lambda _s: None,  # in memory only, by design
+            should_yield=lambda: _distill_user_waiting(chat_since),
+        )
+        state["known"] = result.known
+        if result.yielded:
+            return "yielded"
+        state["phase"] = "recheck"
+
+    written_total = int((state["garden"].get("totals") or {}).get("cards_written") or 0)
     if state["phase"] == "recheck":
         if _distill_user_waiting(chat_since):
             return "yielded"
-        # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
-        # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+        # 收口二次 pass(仅 VPS resident,切换前就有的行为,保持不变):原始素材 + 这次写进去的卡
+        # 再给 agent,只补真实遗漏、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+        # 一轮模型调用 + 紧接着写库,中间不让路,所以不会重复写。
+        state["phase"] = "complete"
         try:
+            llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
+            runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
+            written_cards = [
+                {k: v for k, v in card.items() if k not in {"id", "_source_family"}}
+                for card in (state["garden"].get("written") or [])
+            ]
             recheck = genesis_worker.build_memory_recheck_from_material(
                 user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
-                runtime=runtime, material=state["document"], written_memories=state["memories"], llm=llm,
+                runtime=runtime, material=state["document"], written_memories=written_cards, llm=llm,
             )
-            genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
-            state["memories"].extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
+            genesis_resident_heartbeat(job_id)
+            now_iso = datetime.now(_tzmod.utc).isoformat()
+            extra = [
+                guarded for guarded in (
+                    _resident_guard_distill_card(dict(m))
+                    for m in (recheck.get("memories") or []) if isinstance(m, dict)
+                ) if guarded is not None
+            ]
+            if extra:
+                rows = _resident_import_rows(
+                    [_resident_import_action(card, now_iso=now_iso) for card in extra]
+                )
+                written_total += sum(1 for row in rows if garden_import.row_memory_id(row))
         except Exception:
             log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
-        state["phase"] = "actions"
 
-    # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
-    # this tail never yields (yielding here would risk double memory.add on resume).
-    now_iso = datetime.now(_tzmod.utc).isoformat()
-    actions: list[dict] = []
-    _guard_on = card_guard.guard_enabled()
-    for card in state["memories"]:
-        # genesis-resident 蒸馏卡直接来自 build_memory_output_from_fact_candidates(不过
-        # parse_capture_cards/actions),会在下面 _capture_build_envelope 提前封信封、绕过所有
-        # guard —— 这是 codex code_review 抓到的活跃 pre-seal 缺口。在封之前套同一套判据:
-        # 硬字段脏 → 跳整卡;桶脏 → 按语言默认桶;threads 逐项滤脏。
-        if _guard_on:
-            _summary = str(card.get("summary") or "")
-            _content = str(card.get("content") or "")
-            if card_guard.hard_field_pollution_reason(_summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(_content, IO_LEAK_SIGNALS):
-                continue
-            _bucket = str(card.get("bucket") or "").strip()
-            if _bucket and card_guard.bucket_pollution_reason(_bucket, IO_LEAK_SIGNALS):
-                card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
-            elif _bucket:
-                # Q3:干净桶按卡片语言归一(与 capture/dream/migrate/history 一致;此前漏了这条路)。
-                card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
-            _threads = card.get("threads")
-            if isinstance(_threads, list):
-                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
-        # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
-        # user's original per-card date through fact_write. Preserve it so decades of uploaded
-        # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;
-        # an LTM card the model couldn't date also falls back to now() — resident has no
-        # server-side relationship anchor to borrow (cloud path uses one; divergence is documented).
-        card_date = str(card.get("occurred_at") or card.get("date") or "").strip()[:80] if keep_all else ""
-        occurred_at = card_date or now_iso
-        envelope = _capture_build_envelope(
-            card, occurred_at=occurred_at, source="genesis_resident_distill"
-        )
-        actions.append({
-            "type": "memory.add",
-            "envelope": envelope,
-            "reason": "Distilled from material the user uploaded.",
-            "capture_mode": "genesis_resident_distill",
-            "source_chat_message_ids": [],
-        })
-    applied_count = 0
-    if actions:
-        memory_result = execute_memory_actions(actions)
-        if isinstance(memory_result, dict) and isinstance(
-            memory_result.get("results"), list
-        ):
-            observation = _memory_batch_observation(actions, memory_result)
-            applied_count = observation["applied_count"]
-            if observation["status"] == "failed":
-                raise RuntimeError("genesis_resident_memory_actions_failed")
-            if observation["failed_count"]:
-                log.warning(
-                    "resident distill memory batch partial job=%s applied=%d "
-                    "skipped=%d failed=%d",
-                    job_id,
-                    observation["applied_count"],
-                    observation["skipped_count"],
-                    observation["failed_count"],
-                )
-        else:
-            # Compatibility for old injected resident writers during rolling
-            # updates; the shipped execute_memory_actions always returns rows.
-            applied_count = len(actions)
     genesis_resident_complete(
-        job_id, memory_action_count=applied_count, identity_status="skipped"
+        job_id, memory_action_count=written_total, identity_status="skipped"
     )
     log.info(
         "resident distill done job=%s mode=%s memories=%d identity=%s",
-        job_id, state["mode"], applied_count, "skipped",
+        job_id, state["mode"], written_total, "skipped",
     )
     return "done"
 
@@ -23231,11 +23178,8 @@ def _distill_state_for_job(job: dict) -> dict | None:
         # memory-mode pipeline progress (see _resident_distill_advance_memory)
         "phase": "start",
         "windows": [],
-        "next_window_idx": 1,
-        "candidates": [],
-        "terms_note": "",
-        "known_memories": [],
-        "memories": [],
+        "known": [],
+        "garden": None,
     }
 
 
