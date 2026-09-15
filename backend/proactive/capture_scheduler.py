@@ -19,6 +19,8 @@ from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 from memory.capture_failure import capture_failure_patch as _capture_failure_patch
+from memory.capture_failure import frontier_seq as _frontier_seq
+from memory.capture_failure import SUCCESS_RESET_PATCH as _SUCCESS_RESET_PATCH
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +135,17 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "capture_parse_fail_streak": max(
             0, int(_safe_float(doc.get("capture_parse_fail_streak"), 0.0))
         ),
+        #: 同一窗口里**非账号类**失败的次数（到 6 兜底跳过）；账号类失败不计。
+        "capture_window_fail_count": max(
+            0, int(_safe_float(doc.get("capture_window_fail_count"), 0.0))
+        ),
+        #: 同一窗口第一次账号/服务类失败的时间；持续 7 天仍失败才跳过。
+        "capture_account_fail_since": _safe_float(doc.get("capture_account_fail_since"), 0.0),
+        #: 最近一次失败若是账号/服务问题，对照表里的类别（如 quota_insufficient），给用户提示说清原因。
+        "capture_account_error_code": str(doc.get("capture_account_error_code") or "")[:80],
+        #: 最近一次亲手累计失败的 V2 任务 id —— 提示只认它（见 worker._notify_capture_backoff）。
+        #: 🔴 必须在这个白名单里：生产读状态走本函数归一化，漏了字段提示就永远不发（Codex 第 7 轮）。
+        "last_capture_failed_job_id": str(doc.get("last_capture_failed_job_id") or "")[:80],
         #: 一共跳过了几批、最近一次跳的是什么时候。只记数字和游标，不记原文。
         "capture_skipped_windows": max(
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))
@@ -320,17 +333,10 @@ def _live_messages_after_capture(store, state: Mapping[str, Any]) -> list[dict[s
     # discovery cursor: an out-of-order later live row can carry an older
     # timestamp and must still trigger Capture. Translate a legacy ID once per
     # read; if it was pruned, restart safely from zero just like V2 extraction.
-    after_seq = max(
-        0, int(_safe_float(state.get("last_captured_until_seq"), 0.0))
+    # 数字和消息 id 两份进度取靠后的 —— 和 V2 worker / 提交路径同一个规则。
+    after_seq = _frontier_seq(
+        state, lambda message_id: db.chat_seq_for_msg_id(store.user_id, message_id)
     )
-    if not bool(state.get("capture_seq_initialized")):
-        after_id = str(state.get("last_captured_until_message_id") or "")
-        translated = (
-            db.chat_seq_for_msg_id(store.user_id, after_id)
-            if after_id
-            else None
-        )
-        after_seq = max(0, int(translated or 0))
     rows = db.chat_capture_messages_after_seq(
         store.user_id,
         after_seq,
@@ -649,6 +655,7 @@ def record_v2_capture_status(
     # completed / failed 两个分支都要用 —— 以前只在 completed 里赋值，
     # failed 分支一走到就 UnboundLocalError（tests/test_v2_capture_lifecycle.py 覆盖）。
     processed = window if isinstance(window, Mapping) else {}
+    skipped = False
     if status_text == "completed":
         until_id = str(processed.get("until_message_id") or "")[:160]
         until_ts = _safe_float(processed.get("until_ts"), 0.0)
@@ -660,8 +667,7 @@ def record_v2_capture_status(
         # newer capture frontier backwards.
         patch = {
             "pending_capture_key": "",
-            "capture_fail_streak": 0,
-            "last_capture_failed_at": 0.0,
+            **_SUCCESS_RESET_PATCH,
         }
         if until_id and current_id == after_id:
             patch.update(
@@ -702,7 +708,9 @@ def record_v2_capture_status(
         store,
         lane="capture",
         status=status_text,
+        account_code=str(state.get("capture_account_error_code") or ""),
         streak=int(state.get("capture_fail_streak") or 0),
+        skipped=skipped,
     )
     return refresh_capture_state_from_chat(store, now=now_ts)
 
@@ -792,6 +800,87 @@ def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now
     return state
 
 
+def _record_legacy_window_failure(store, job: Mapping[str, Any], failed_window: Mapping[str, Any], *,
+                                  capture_key: str, now_ts: float):
+    """老 V1 任务（修复前入队、窗口没带 after_seq）回报失败：判断 + 写入在同一个 fence 事务里。
+
+    游标确实从未推进过（id、seq 都没有）= 首次落卡，起点就是 0，补上 ``after_seq=0``；
+    额外要求窗口终点那条消息**还在**：Chat Clear 会删掉落卡状态，但不会作废清空前入队的
+    V1 任务，那种旧任务回报失败时不能并进清空后的新窗口（Codex 第 11 轮）。
+
+    以前「终点消息还在吗」和「写状态」是两个事务：检查通过 → Chat Clear 提交（删消息、删状态）
+    → 旧任务把清空前读到的整份状态写回去，落卡状态被复活（Codex 第 12 轮 I3）。现在：
+
+    - 持 Chat Clear 的共享 fence（Clear 拿独占）→ ``FOR UPDATE`` 读状态行 → 查终点消息 → 写回，
+      Clear 要么整个在前、要么整个在后。
+    - 窗口终点消息已不在（Clear 在同一个事务里删消息和状态；消息 id 唯一，清空后不会再出现）
+      → 不写、返回 None，调用方不发提示、不记跳过痕迹。以前这种情况仍会把失败写进状态
+      （只是不补 0），清空后的新状态会被旧窗口的失败冲掉计数。
+    - 失败补丁基于**加锁后**读到的状态算，不用调用方事务外读的快照。
+
+    返回 ``(写入后的状态, 实际用的窗口, streak, 是否跳过)`` 或 None。
+    """
+    until_id = str(failed_window.get("until_message_id") or "")
+    reason = _failure_reason_of(job)
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                db._lock_chat_user_fence_on_cursor(cur, store.user_id)
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                    (store.user_id, CAPTURE_STATE_KIND),
+                )
+                row = cur.fetchone()
+                until_exists: bool | None = None
+                if until_id:
+                    cur.execute(
+                        "SELECT 1 FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+                        (store.user_id, until_id),
+                    )
+                    until_exists = cur.fetchone() is not None
+                if until_exists is False:
+                    # 窗口终点消息已经不在 = 这是 Chat Clear 之前的旧任务，它说的那批对话已经没了：
+                    # 不复活被删的状态，也不把旧失败并进清空后的新状态。
+                    return None
+                if row is None:
+                    # 状态行不在、终点消息还在 = 没清空过（只是状态行还没建），照旧建一行记失败。
+                    # 连终点都说不清的旧任务无从判断，不建。
+                    if not until_exists:
+                        return None
+                    cur.execute(
+                        "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,%s) "
+                        "ON CONFLICT (user_id,kind) DO NOTHING",
+                        (store.user_id, CAPTURE_STATE_KIND, Jsonb({})),
+                    )
+                    cur.execute(
+                        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                        (store.user_id, CAPTURE_STATE_KIND),
+                    )
+                    row = cur.fetchone()
+                state = _state_doc(row[0])
+                if not capture_key or str(state.get("pending_capture_key") or "") == capture_key:
+                    state["pending_capture_key"] = ""
+                window = failed_window
+                if (until_exists
+                        and not str(state.get("last_captured_until_message_id") or "")
+                        and not bool(state.get("capture_seq_initialized"))
+                        and int(_safe_float(state.get("last_captured_until_seq"), 0.0)) == 0):
+                    window = {**failed_window, "after_seq": 0}
+                patch, streak, skipped = _capture_failure_patch(
+                    state, window, now_ts=now_ts, reason=reason)
+                state.update(patch)
+                state = _state_doc(state)
+                state["updated_at"] = _now_iso(now_ts)
+                cur.execute(
+                    "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+                    (Jsonb(state), store.user_id, CAPTURE_STATE_KIND),
+                )
+                # 和 _patch_capture_state 一样在 fence 内镜像：Clear 的主库删除 + 镜像删除
+                # 一定排在这次写之后，迟到的镜像不会在 TEE 里复活这一行。
+                db._mirror_persisted_blob(store.user_id, CAPTURE_STATE_KIND, state)
+    return state, window, streak, skipped
+
+
 def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     if not capture_jobs.is_memory_capture_job(job):
         return load_capture_state(store)
@@ -809,6 +898,7 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         state["pending_capture_key"] = ""
     elif not capture_key:
         state["pending_capture_key"] = ""
+    skipped = False
     if status_text == "completed":
         window = job.get("capture_window") if isinstance(job.get("capture_window"), Mapping) else job.get("window")
         window = window if isinstance(window, Mapping) else {}
@@ -823,14 +913,30 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             cards_added=cards_added,
             completed_at=now_ts,
         ))
-        state["capture_fail_streak"] = 0
-        state["last_capture_failed_at"] = 0.0
+        state.update(_SUCCESS_RESET_PATCH)
     elif status_text == "failed":
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         failed_window = (job.get("capture_window")
                          if isinstance(job.get("capture_window"), Mapping)
                          else job.get("window"))
         failed_window = failed_window if isinstance(failed_window, Mapping) else None
+        if (failed_window is not None
+                and not str(failed_window.get("after_message_id") or "")
+                and failed_window.get("after_seq") in (None, "")):
+            # 老任务（修复前入队）没带 after_seq：要不要补 0 取决于游标和聊天记录，
+            # 判断和写入必须在同一个 Chat Clear fence 事务里做完（Codex 第 12 轮 I3）。
+            recorded = _record_legacy_window_failure(
+                store, job, failed_window, capture_key=capture_key, now_ts=now_ts)
+            if recorded is None:
+                # Chat Clear 已经删掉落卡状态：这是清空前的旧任务，什么都不写、不提示、不留痕迹。
+                return load_capture_state(store)
+            state, failed_window, streak, skipped = recorded
+            if skipped:
+                _record_skipped_window(store, window=failed_window, streak=streak,
+                                       job_id=_capture_trace_job_id(job))
+            return _after_capture_status_saved(
+                store, job, state, status_text=status_text, skipped=skipped,
+                cards_added=cards_added, now_ts=now_ts)
         patch, streak, skipped = _capture_failure_patch(
             state, failed_window, now_ts=now_ts, reason=_failure_reason_of(job))
         if skipped:
@@ -840,8 +946,19 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
                                    job_id=_capture_trace_job_id(job))
         state.update(patch)
     state = save_capture_state(store, state, now=now_ts)
+    return _after_capture_status_saved(
+        store, job, state, status_text=status_text, skipped=skipped,
+        cards_added=cards_added, now_ts=now_ts)
+
+
+def _after_capture_status_saved(store, job: Mapping[str, Any], state: Mapping[str, Any], *,
+                                status_text: str, skipped: bool, cards_added: int,
+                                now_ts: float) -> dict[str, Any]:
+    """V1 落卡终态写进状态**之后**：提示、刷新游标、调试痕迹。"""
     capture_jobs.notify_backoff(store, lane="capture", status=status_text,
-                                streak=int(state.get("capture_fail_streak") or 0))
+                                account_code=str(state.get("capture_account_error_code") or ""),
+                                streak=int(state.get("capture_fail_streak") or 0),
+                                skipped=skipped)
     result = refresh_capture_state_from_chat(store, now=now_ts)
 
     import debug_trace  # local import avoids load-order cycle

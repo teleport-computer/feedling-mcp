@@ -64,7 +64,8 @@ def in_failure_backoff(streak: int, last_failed_at: float, now_ts: float) -> boo
 _BACKOFF_NOTICE_STREAK = 3   # 前两次退避噪音价值低，第 3 次才打扰用户
 
 
-def notify_backoff(store, *, lane: str, status: str, streak: int) -> None:
+def notify_backoff(store, *, lane: str, status: str, streak: int,
+                   account_code: str = "", skipped: bool = False) -> None:
     """三条 maintenance lane（capture/migrate/dream）共用的退避通知钩子。
 
     streak>=3 的失败 emit warning（occurrences 天然吸收后续 +1，不刷屏）；
@@ -73,14 +74,41 @@ def notify_backoff(store, *, lane: str, status: str, streak: int) -> None:
     影响原 streak/状态流程（notices.emit/resolve 内部已自吞异常）。"""
     from notices import core as notices
     from notices import catalog
-    if status == "completed":
+    if status == "completed" or skipped:
+        # 跳过一批后游标已经推进、后面继续整理 —— 旧的「受阻/会补记」提示已经不成立，
+        # 留着会一直显示「修好后会补记」，而那批其实已经丢了（Codex 第 6 轮）。
         notices.resolve(store, f"memory_backoff:{lane}")
     elif status == "failed" and int(streak or 0) >= _BACKOFF_NOTICE_STREAK:
-        notices.emit(store, source="memory", error_class="memory_backoff",
-                     blame=catalog.blame_for("memory_backoff"), severity="warning",
-                     user_text=f"记忆整理（{lane}）连续失败 {streak} 次，正在退避重试。",
-                     detail=f"lane={lane} streak={streak}",
-                     dedupe_key=f"memory_backoff:{lane}")
+        # 失败原因是用户自己的账号/服务（余额不足、密钥失效、登录过期…）时，提示里直接说原因：
+        # 只写「连续失败 N 次」用户不知道要去充值，记忆就一直停着（2026-09-13 prod：
+        # 触发过逃生阀的 42 人里 33 人是账号问题）。文案取统一错误对照表，和聊天报错一致。
+        if account_code == "provider_setup":
+            # 模型服务还没配好（未配置/未测试/配置无效）：对照表里没有这一条，单独写。
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame="user_provider", severity="warning",
+                         user_text=("记忆整理暂停了：模型服务还没有配置好或没通过测试，"
+                                    "请到设置里完成模型配置。配好后会自动继续整理。"),
+                         detail=f"lane={lane} streak={streak} cause={account_code}",
+                         dedupe_key=f"memory_backoff:{lane}")
+            return
+        spec = None
+        if account_code:
+            from notices import error_contract
+            spec = error_contract.spec_for(account_code, public_only=False)
+        if spec is not None:
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame=spec.blame, severity="warning",
+                         user_text=(f"记忆整理暂停了：{spec.safe_text_zh}"
+                                    "修好后会自动继续整理；"
+                                    "积压太多或超过 7 天仍未恢复时，较早的聊天可能无法补记。"),
+                         detail=f"lane={lane} streak={streak} cause={account_code}",
+                         dedupe_key=f"memory_backoff:{lane}")
+        else:
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame=catalog.blame_for("memory_backoff"), severity="warning",
+                         user_text=f"记忆整理（{lane}）连续失败 {streak} 次，正在退避重试。",
+                         detail=f"lane={lane} streak={streak}",
+                         dedupe_key=f"memory_backoff:{lane}")
 
 
 def is_memory_capture_job(job: Mapping[str, Any] | None) -> bool:
@@ -124,12 +152,21 @@ def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
         message_count = int(raw.get("message_count") or 0)
     except (TypeError, ValueError):
         message_count = 0
-    return {
+    window = {
         "after_message_id": str(raw.get("after_message_id") or "")[:160],
         "until_message_id": str(raw.get("until_message_id") or "")[:160],
         "until_ts": until_ts,
         "message_count": max(0, message_count),
     }
+    # 🔴 起点 seq 必须跟着任务走，**包括 0**。首次落卡的用户没有 after_message_id，
+    # 丢了 after_seq 的话逃生阀只能按「终点」认窗口 —— 新消息一来终点就变，
+    # 失败次数永远重数、永远到不了阈值（Codex 第 10 轮）。
+    if raw.get("after_seq") is not None and raw.get("after_seq") != "":
+        try:
+            window["after_seq"] = max(0, int(float(raw.get("after_seq"))))
+        except (TypeError, ValueError):
+            pass
+    return window
 
 
 def _active_capture_job(job: Mapping[str, Any]) -> bool:

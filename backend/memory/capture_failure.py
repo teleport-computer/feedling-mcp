@@ -9,7 +9,8 @@ V1（``proactive.capture_scheduler``）和 V2（``model_api_runtime.v2.jobs_stor
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+import re
+from typing import Any, Callable, Mapping
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -79,6 +80,83 @@ DETERMINISTIC_FAILURE_KINDS = (
 )
 
 _V2_FAILURE_SCOPE = "extraction_failed:"
+
+#: 问题出在**账号或模型服务**上、不在这批消息里的失败：不按次数跳过。
+#:
+#: 跳过只对「这批消息本身有毒」有用。账号坏了（余额不足、密钥失效、登录过期）
+#: 或服务不可用时跳过这批，下一批照样失败、照样被跳 —— 账号坏多久，那段时间的
+#: 记忆就丢多久；而不跳过的话，用户充值/重新登录后积压的记忆能补上。
+#:
+#: 2026-09-13 prod 实测：触发过旧逃生阀的 42 人里 41 人后续仍失败，**0 人是引号复发**，
+#: 41 人全卡在模型调用：33 人是自己的账号问题（密钥失效/余额不足），其余是渠道/上游不可用。
+#:
+#: V2 用 extraction 的公开 provider 分类（剥掉 ``extraction_failed:`` 后）。
+#: 🔴 ``provider_config`` **不在此列**：provider_client 把 400/415/422 全归到它，
+#: 其中包括「消息太长超出上下文」这种内容引起的失败 —— 当账号问题永不跳过会把人永久卡死。
+ACCOUNT_FAILURE_KINDS = frozenset({
+    "auth_invalid",
+    "quota_insufficient",
+    "model_not_found",
+    "rate_limited",
+    "upstream_unavailable",
+})
+
+#: V1 报的是 CLI/模型原始错误文本，交给仓库统一的错误对照表（notices.error_contract）认 ——
+#: App 给用户弹的原因提示也查这张表，两边不会再各认各的（上一版自己列关键词，漏了
+#: 「Not logged in · Please run /login」）。这里列的是对照表里属于账号/服务的那些类别。
+ACCOUNT_ERROR_CONTRACT_CODES = frozenset({
+    "quota_insufficient",
+    "provider_account_expired",
+    "auth_invalid",
+    "model_not_found",
+    "rate_limited",
+    "upstream_unavailable",
+    "resident_agent_cli_logged_out",
+    "cli_config_invalid",
+})
+
+#: 对照表之外、prod 上出现过或 V1 consumer 自己也按账号问题处理的原始文本
+#: （``"invalid key" in lowered`` → provider_auth；「Insufficient balance」是某中转站的原话），
+#: 见 account_error_code。
+
+#: 账号/服务类失败**同一批**持续这么久仍没好，才跳过。
+#:
+#: 为什么不是「永不跳过」：有的模型服务「内容被拒」和「密钥无效」回的都是 403，
+#: 被判成账号问题的失败里可能混着真正的毒消息。永不跳过 = 这类用户永久卡死，
+#: 正是逃生阀要修的问题。7 天足够用户发现提示、去充值或重新登录；
+#: 退避间隔会拉长到最多 6 小时一次，7 天内也就重试几十次。
+CAPTURE_ACCOUNT_SKIP_AFTER_SEC = 7 * 86400
+
+
+#: 账号类失败的 7 天计时，中间超过这么久没有新失败就重新计时。
+#: 退避上限是 6 小时，正常重试时两次失败间隔不会超过它；留 4 倍余量。
+ACCOUNT_CLOCK_GAP_RESET_SEC = 24 * 3600
+
+
+#: 明确是我们这边的故障前缀（剥掉 extraction_failed: 之后比对）。见 account_error_code。
+OUR_SIDE_FAILURE_PREFIXES = (
+    "database_pool_timeout",
+    "capture_memory_write_failed",
+    "memory_write_rejected",
+    # 平台回收崩溃/卡死任务时记的码（V2 租约回收器和 watchdog，见
+    # jobs_store._recover_capture_claim）。worker 挂了或卡住是我们这边的问题；
+    # 不在这里先认掉的话，错误对照表会因为字面里有 timeout 把它认成「模型服务不可用」，
+    # 提示就会让用户以为是自己的模型服务坏了。
+    "lease_timeout",
+    "slot_watchdog_timeout",
+    "watchdog_requeue_exhausted",
+)
+
+
+#: V2 provider 解析失败里**用户自己要去设置里修**的那几种（hosted/config_store）。
+#: worker 记成 ``provider_setup:<slug>``。解密失败、runtime token 签发失败是我们的问题，不在此列。
+PROVIDER_SETUP_USER_ERRORS = frozenset({
+    "model_api_not_configured",
+    "model_api_not_tested",
+    "model_api_key_envelope_missing",
+    "model_api_config_invalid",
+})
+PROVIDER_SETUP_ACCOUNT_CODE = "provider_setup"
 
 
 def window_key(window: Mapping | None) -> str:
@@ -150,12 +228,80 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
         # 跳过之后 streak 归零：下一批是干净的，不该带着旧账退避。
         "capture_fail_streak": 0,
         "capture_parse_fail_streak": 0,
+        "capture_window_fail_count": 0,
+        "capture_account_fail_since": 0.0,
         "capture_fail_window_key": "",
         "capture_skipped_windows": max(
             0, int(_safe_float(state.get("capture_skipped_windows"), 0.0))
         ) + 1,
         "last_capture_skipped_at": now_ts,
     }
+
+
+#: 「服务不可用」的强证据：明确的 5xx 状态语境、超时、连接失败、过载。见 account_error_code。
+_STRONG_UPSTREAM_EVIDENCE = re.compile(
+    r"provider_http_5\d\d"
+    r"|(?:http|status|status[_ ]code|api error|error code|returned|responded)\W{0,3}5\d\d\b"
+    r"|\b5\d\d\s+(?:internal server error|bad gateway|service unavailable|gateway time-?out)"
+    r"|timed?[ _-]?out|timeout|connection (?:refused|reset|error|aborted)"
+    r"|service unavailable|bad gateway|overloaded|temporarily unavailable"
+    # 对照表里已认定的其他上游瞬时故障形状（Codex 第 7 轮：漏了会在第 6 次被跳过）
+    r"|unreachable|stream disconnected|ended without finish_reason",
+    re.IGNORECASE,
+)
+
+
+def account_error_code(reason: str) -> str:
+    """账号/服务类失败对应错误对照表里的哪一类（如 ``quota_insufficient``）；不是账号类返回空串。
+
+    用于：① 判断不按次数跳过 ② 给用户的提示里说清原因（「额度不足，充值后即可恢复」）。
+    两处用同一个判断，不会出现「按账号问题处理了、提示却只说连续失败」。
+    """
+    raw = str(reason or "").strip()
+    text = raw.lower()
+    kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
+    if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
+        return ""
+    if any(kind.startswith(p) for p in OUR_SIDE_FAILURE_PREFIXES):
+        # 我们自己的数据库/写库超时，不是用户的模型服务 —— 不能提示「你的模型服务不可用」，
+        # 也不该按账号类等 7 天（独立审查）。
+        return ""
+    if kind in ACCOUNT_FAILURE_KINDS:
+        return kind
+    if kind.startswith(PROVIDER_SETUP_ACCOUNT_CODE + ":"):
+        return PROVIDER_SETUP_ACCOUNT_CODE
+    # 先认对照表之外的原话：prod 上某中转站回「401 {"error":"Insufficient balance"}」，
+    # 对照表按 401 认成「密钥无效」，提示就会让用户去重新填 key，而真实原因是没钱了。
+    if "insufficient balance" in text:
+        return "quota_insufficient"
+    from notices import error_contract  # 延迟导入：只在失败路径上用
+
+    spec = error_contract.classify_text(raw)
+    if spec is not None and spec.code in ACCOUNT_ERROR_CONTRACT_CODES:
+        # 对照表的「服务不可用」是给聊天报错用的，裸三位 5 开头数字就算（``\b5\d{2}\b``）。
+        # 逃生阀要更严：「max_tokens must be <= 500」「rejected at byte 512」是请求/内容问题，
+        # 误判成服务故障会把 6 次兜底拖成 7 天（Codex 第 6 轮复现）。
+        if spec.code == "upstream_unavailable" and not (
+            _STRONG_UPSTREAM_EVIDENCE.search(raw)
+            # 中转站通用 403「Request failed. Please try again later.」—— 对照表按形状锚定在
+            # 开头，这里原因可能带着 capture_agent_call_failed: 等前缀，所以不锚定再认一次。
+            or re.search(error_contract._GENERIC_UPSTREAM_403_SHAPE, raw)
+        ):
+            return ""
+        return spec.code
+    if "invalid key" in text:
+        return "auth_invalid"
+    return ""
+
+
+def failure_class(reason: str) -> str:
+    """一次失败属于哪类：``parse``（坏 JSON，连续 3 次快跳）/ ``account``（账号或服务，
+    持续 7 天才跳）/ ``other``（6 次兜底）。"""
+    text = str(reason or "").strip().lower()
+    kind = text[len(_V2_FAILURE_SCOPE):] if text.startswith(_V2_FAILURE_SCOPE) else text
+    if any(kind.startswith(p) for p in DETERMINISTIC_FAILURE_KINDS):
+        return "parse"
+    return "account" if account_error_code(reason) else "other"
 
 
 def skip_threshold_for(reason: str) -> int:
@@ -167,6 +313,32 @@ def skip_threshold_for(reason: str) -> int:
         return CAPTURE_POISON_SKIP_AFTER
     return CAPTURE_TRANSIENT_SKIP_AFTER
 
+
+
+def windowless_failure_patch(state, *, now_ts: float, reason: str = "") -> dict:
+    """说不清是哪个窗口的失败（平台回收崩溃任务、批次丢失、老任务没带窗口…）怎么改状态。
+
+    只累加总连续失败数（退避 + 提示），**永不跳过**。三个按窗口数的子计数分别这样处理：
+
+    - ``capture_parse_fail_streak``：它数的是**连续的**解析失败。中间夹了一次非解析失败，
+      连续性就断了，必须清零 —— 否则「解析 ×2 → worker 崩溃 → 解析 ×1」会被当成连续 3 次
+      解析失败，立刻跳过这一批（Codex 第 12 轮复现）。带窗口的「其他」失败本来就清零，这里对齐。
+      说不清窗口的**解析**失败保持不动：不知道是不是同一批，既不能接着数、也没理由打断。
+    - ``capture_window_fail_count``：同一窗口里非账号失败的**累计**数（6 次兜底），不是连续计数，
+      带窗口的账号失败也不清它。说不清窗口的失败不能算进某一批（崩溃多半是我们的问题，
+      算进去就等于拿平台故障去凑跳过次数），也没有理由清掉已经数到的次数 —— 保持不动。
+    - ``capture_account_fail_since``（7 天计时）：带窗口的非账号失败不重置它，这里同样不动；
+      计时的「空窗期」判断看 ``last_capture_failed_at``，这次失败会刷新它 —— 期间确实在重试，
+      不算空窗，和带窗口的失败一致。说不清窗口的账号失败也不开始计时（没有窗口可锚）。
+    """
+    patch: dict[str, Any] = {
+        "capture_fail_streak": int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1,
+        "capture_account_error_code": account_error_code(reason),
+        "last_capture_failed_at": now_ts,
+    }
+    if failure_class(reason) != "parse":
+        patch["capture_parse_fail_streak"] = 0
+    return patch
 
 
 def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
@@ -184,9 +356,11 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
 
     ## 两档阈值各数各的
 
-    ``capture_fail_streak`` 是同一窗口的**总失败数**，到 6 次兜底跳过；
+    ``capture_window_fail_count`` 数同一窗口里**非账号类**的失败，到 6 次兜底跳过；
     ``capture_parse_fail_streak`` 只数**连续的**解析类失败，到 3 次快速跳过，
-    中间夹一次别的失败就清零。
+    中间夹一次别的失败就清零。账号类失败不计次数，同一批从第一次账号类失败起持续
+    ``CAPTURE_ACCOUNT_SKIP_AFTER_SEC``（7 天）仍失败才跳（``capture_account_fail_since``）。
+    ``capture_fail_streak`` 仍是退避和告警用的总连续失败数。
 
     以前两档共用一个 streak、阈值只看本次原因，于是
 
@@ -199,29 +373,66 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     key = window_key(window)
     if not key:
         # 说不清是哪个窗口 —— 只累加，不跳过（跳过需要知道推到哪）。
-        streak = int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
-        return ({"capture_fail_streak": streak,
-                 "last_capture_failed_at": now_ts}, streak, False)
+        patch = windowless_failure_patch(state, now_ts=now_ts, reason=reason)
+        return (patch, int(patch["capture_fail_streak"]), False)
     same = key == str(state.get("capture_fail_window_key") or "")
-    parse_failure = skip_threshold_for(reason) == CAPTURE_POISON_SKIP_AFTER
+    kind = failure_class(reason)
+    # capture_fail_streak 仍是退避/告警用的总连续失败数，语义不变。
     streak = (int(_safe_float(state.get("capture_fail_streak"), 0.0)) + 1
               if same else 1)
     prev_parse = (int(_safe_float(state.get("capture_parse_fail_streak"), 0.0))
                   if same else 0)
-    parse_streak = prev_parse + 1 if parse_failure else 0
-    if parse_streak >= CAPTURE_POISON_SKIP_AFTER:
-        # 用阈值 1 只是复用「推游标」的补丁；是否该跳已经在这里判断过。
-        skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
-    elif streak >= CAPTURE_TRANSIENT_SKIP_AFTER:
+    prev_count = (int(_safe_float(state.get("capture_window_fail_count"), 0.0))
+                  if same else 0)
+    parse_streak = prev_parse + 1 if kind == "parse" else 0
+    # 账号类失败**不计入**次数：否则余额不足失败 8 次、充值后再偶发一次超时，
+    # 就会因为「已经 9 次了」立刻跳掉。账号类按**持续时间**算，见 CAPTURE_ACCOUNT_SKIP_AFTER_SEC。
+    window_count = prev_count if kind == "account" else prev_count + 1
+    prev_since = (_safe_float(state.get("capture_account_fail_since"), 0.0)
+                  if same else 0.0)
+    last_failed = _safe_float(state.get("last_capture_failed_at"), 0.0)
+    if prev_since and last_failed and now_ts - last_failed > ACCOUNT_CLOCK_GAP_RESET_SEC:
+        # 中间很久没失败（用户关了落卡、VPS 离线一周…）：那段时间没在重试，不算「持续失败」。
+        # 否则「429 一次 → 关掉落卡 8 天 → 重开又 429 一次」就会立刻跳过（独立审查复现）。
+        prev_since = 0.0
+    account_since = (prev_since or now_ts) if kind == "account" else prev_since
+    account_expired = (kind == "account" and account_since > 0
+                       and now_ts - account_since >= CAPTURE_ACCOUNT_SKIP_AFTER_SEC)
+    if account_expired or (kind != "account" and (
+            parse_streak >= CAPTURE_POISON_SKIP_AFTER
+            or window_count >= CAPTURE_TRANSIENT_SKIP_AFTER)):
+        # 阈值 1 只是复用「推游标」的补丁；该不该跳已经在这里判断过。
         skip = poison_skip_patch(state, window, now_ts=now_ts, threshold=1)
     else:
         skip = None
+    account_code = account_error_code(reason) if kind == "account" else ""
     if skip is not None:
-        return ({**skip, "last_capture_failed_at": now_ts}, streak, True)
+        return ({**skip, "capture_account_error_code": account_code,
+                 "last_capture_failed_at": now_ts}, streak, True)
     return ({"capture_fail_streak": streak,
+             "capture_account_error_code": account_code,
              "capture_parse_fail_streak": parse_streak,
+             "capture_window_fail_count": window_count,
+             "capture_account_fail_since": account_since,
              "capture_fail_window_key": key,
              "last_capture_failed_at": now_ts}, streak, False)
+
+
+#: 落卡**真正成功**（游标推进）时要清掉的整套失败子状态。V1 两个记录函数和 V2 提交共用。
+#:
+#: 以前只清 streak 和失败时间，``capture_account_error_code`` 等留着：
+#:
+#:     余额不足失败 → 成功提交 → 连续 3 次「批次丢失」（服务端问题）
+#:     → 提示读到残留的 quota_insufficient，告诉用户「额度不足」（Codex 第 8 轮复现）
+SUCCESS_RESET_PATCH: dict[str, Any] = {
+    "capture_fail_streak": 0,
+    "last_capture_failed_at": 0.0,
+    "capture_account_error_code": "",
+    "capture_parse_fail_streak": 0,
+    "capture_window_fail_count": 0,
+    "capture_account_fail_since": 0.0,
+    "capture_fail_window_key": "",
+}
 
 
 def window_from_batch_row(batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -243,3 +454,32 @@ def window_after_seq(window: Mapping[str, Any] | None) -> int:
     """窗口起点 seq（缺失/非法按 0）。"""
     w = window if isinstance(window, Mapping) else {}
     return max(0, int(_safe_float(w.get("after_seq"), 0.0)))
+
+
+def frontier_seq(state: Mapping[str, Any] | None,
+                 translate_message_id: Callable[[str], Any]) -> int:
+    """「已经记到第几条了」—— 所有读落卡进度的地方都必须用这一个函数。
+
+    进度有两份记法：数字 ``last_captured_until_seq`` 和消息 id
+    ``last_captured_until_message_id``。两份本该一致，但有几条路只更新了 id：
+    V1 的窗口没有 seq、V1 旧逃生阀跳过时把 seq 写成 0（prod 上 42 人触发过）。
+    以前三处各读各的（worker 读数字、提交读数字、V1 调度器按标志位二选一），
+    数字和 id 对不上时就会：
+
+        worker 按 id 算出从第 N 条开始 → 提交时读到数字 0 → 对不上 → 提交被拒 → 永远重来
+
+    规则：两份都是「已经处理过」的边界，**取靠后的那个**。数字可信（已初始化，
+    或老数据只有数字）才参与比较；id 查不到（被清理）时只看数字。
+    ``translate_message_id`` 由调用方给（查 chat_messages 的 seq），本模块不碰数据库。
+    """
+    st = state if isinstance(state, Mapping) else {}
+    stored_usable = bool(st.get("capture_seq_initialized")) or (
+        "capture_seq_initialized" not in st and "last_captured_until_seq" in st
+    )
+    stored = (max(0, int(_safe_float(st.get("last_captured_until_seq"), 0.0)))
+              if stored_usable else 0)
+    message_id = str(st.get("last_captured_until_message_id") or "")
+    translated = 0
+    if message_id:
+        translated = max(0, int(_safe_float(translate_message_id(message_id), 0.0)))
+    return max(stored, translated)

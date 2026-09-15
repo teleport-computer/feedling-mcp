@@ -1917,6 +1917,13 @@ PUBLIC_FAILURE_CODES = frozenset(
         f"extraction_failed:{kind}"
         for kind in _EXTRACTION_FAILURE_KINDS
     }
+    # 落卡 provider 前置失败里用户要去设置里修的那几种（封闭集合，见 capture_failure）。
+    # 不登记的话 admin 时间线会把它遮掉、rollup 按未知码归类（Codex 第 11 轮）。
+    | {
+        f"{capture_failure.PROVIDER_SETUP_ACCOUNT_CODE}:{slug}"
+        for slug in capture_failure.PROVIDER_SETUP_USER_ERRORS
+    }
+    | {"provider_unavailable"}
 )
 
 
@@ -12392,23 +12399,14 @@ async def _run_extraction(
             after_id = str(
                 capture_state.get("last_captured_until_message_id") or ""
             )
-            raw_seq = capture_state.get("last_captured_until_seq")
-            if capture_state.get("capture_seq_initialized") or raw_seq is not None and (
-                "capture_seq_initialized" not in capture_state
-                and "last_captured_until_seq" in capture_state
-            ):
-                try:
-                    capture_after_seq = max(0, int(raw_seq))
-                except (TypeError, ValueError):
-                    capture_after_seq = 0
-            elif after_id:
-                # One-time legacy upgrade.  A missing/pruned boundary is not
-                # evidence that any later timestamp was covered: restart from
-                # zero rather than risk skipping out-of-order rows.
-                exact_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, after_id
-                )
-                capture_after_seq = int(exact_seq or 0)
+            # 数字和消息 id 两份进度取靠后的；提交那一步（jobs_store）用同一个函数，
+            # 两边算出来的起点必须一致，否则提交会被当成「游标被别人推进了」反复拒绝。
+            # id 被清理时只看数字；两者都没有才从 0 开始（不会越过没处理的消息）。
+            capture_after_seq = await asyncio.to_thread(
+                capture_failure.frontier_seq,
+                capture_state,
+                lambda message_id: db.chat_seq_for_msg_id(user_id, message_id),
+            )
             capture_snapshot_through_seq = await asyncio.to_thread(
                 db.chat_max_seq, user_id
             )
@@ -12495,6 +12493,27 @@ async def _run_extraction(
                     _CAPTURE_BATCH_LIMIT,
                     through_seq=capture_snapshot_through_seq,
                 )
+                if tail:
+                    # 🔴 读到这批就立刻定下窗口终点，**先于**后面任何可能失败的步骤（通话转写、
+                    # 渲染…）。以前终点在转写循环之后才填，转写取不到时失败带出去的窗口没有终点，
+                    # 逃生阀永远不跳 —— 一张转写丢失的通话卡就能让用户永久卡死（独立审查复现）。
+                    last = tail[-1]
+                    last_id = str(last.get("id") or "")
+                    last_seq = last.get("seq")
+                    if last_seq is None and last_id:
+                        last_seq = await asyncio.to_thread(
+                            db.chat_seq_for_msg_id, user_id, last_id
+                        )
+                    if last_seq is None or not last_id:
+                        raise RuntimeError("capture_batch_frontier_unavailable")
+                    capture_window.update(
+                        {
+                            "until_message_id": last_id,
+                            "until_ts": _float_or_zero(last.get("ts")),
+                            "through_seq": int(last_seq),
+                            "message_count": len(tail),
+                        }
+                    )
             elif deps.read_tail_after_seq is not None:
                 through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
                 tail = await asyncio.to_thread(
@@ -12562,23 +12581,6 @@ async def _run_extraction(
                     outcome=cards_outcome,
                 )
         if lane == "capture" and deps.read_capture_state is not None and tail:
-            last = tail[-1]
-            last_id = str(last.get("id") or "")
-            last_seq = last.get("seq")
-            if last_seq is None and last_id:
-                last_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, last_id
-                )
-            if last_seq is None or not last_id:
-                raise RuntimeError("capture_batch_frontier_unavailable")
-            capture_window.update(
-                {
-                    "until_message_id": last_id,
-                    "until_ts": _float_or_zero(last.get("ts")),
-                    "through_seq": int(last_seq),
-                    "message_count": len(tail),
-                }
-            )
             # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
             # 用来定位「模型为什么吐出坏 JSON」——见 memory/window_fingerprint。
             # 窗口文本此刻还没渲染，所以这里只取 role/source；
@@ -12594,11 +12596,20 @@ async def _run_extraction(
             # advances the frontier and releases single-flight. The successor
             # owns a valid job but has no raw seq left; settle it as no-work so
             # it cannot arm failure backoff against the next real message.
-            landed = await asyncio.to_thread(
-                jobs_store.mark_completed,
-                job_id,
-                claimed_by=claimed_by,
-            )
+            # 同时清掉残留的失败子状态（旧退避/提示），见 complete_capture_no_work。
+            if claimed_by and deps.read_capture_state is not None:
+                landed = await asyncio.to_thread(
+                    jobs_store.complete_capture_no_work,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+            else:
+                landed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
             if claimed_by and not landed:
                 raise LostJobLease("capture lease lost before no-work completion")
             if tm is not None:
@@ -17102,7 +17113,61 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     # the honest signal that a terminal state was reached.
     dur_ms = max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000)
     await _emit_job_terminal_trace(deps, job, outcome, dur_ms=dur_ms)
+    await _notify_capture_backoff(deps, job, outcome)
     return outcome
+
+
+async def _notify_capture_backoff(deps: TurnDeps, job: dict, outcome: str) -> None:
+    """V2 落卡结束后给用户发/清「记忆整理受阻」提示，和 V1 用同一个函数、同一套文案。
+
+    以前 V2 落卡失败**完全没有提示**：提示只在 V1 的两个状态记录函数里发，
+    V2 的失败走 jobs_store 的持久批次协议、从不经过那里。用户账号余额不足，
+    记忆一直停着，App 里什么都看不到。
+
+    挂在 _run_turn 这个统一出口，而不是散落在各个 return 前（prepared 恢复、门禁、
+    主流程各有几处出口，漏一处就是一个无声的洞）。纯旁路：读失败/发失败都吞掉。
+    """
+    if str(job.get("lane") or "") != "capture" or deps.read_capture_state is None:
+        return
+    if outcome not in ("completed", "failed"):
+        return
+    user_id = str(job.get("user_id") or "")
+    if not user_id:
+        return
+    try:
+        from types import SimpleNamespace
+
+        from proactive import capture_jobs
+
+        state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
+        job_id = str(job.get("id") or "")
+        streak = int(state.get("capture_fail_streak") or 0)
+        skipped = False
+        if outcome == "failed":
+            # 只认本任务亲手累计的失败。关闭落卡/停机走取消、不累计，却同样返回 "failed"；
+            # 失租的旧 worker 也返回 "failed"。它们读到的是共享状态里的旧次数，拿去发
+            # 「正在自动重试」会误导（Codex 第 6 轮）。
+            if not job_id or str(state.get("last_capture_failed_job_id") or "") != job_id:
+                return
+            last_skip = float(state.get("last_capture_skipped_at") or 0.0)
+            skipped = last_skip > 0 and last_skip == float(state.get("last_capture_failed_at") or 0.0)
+        elif streak > 0:
+            # completed 却还带着失败次数：不是这次推进的（例如延迟回调），不清提示。
+            return
+        await asyncio.to_thread(
+            capture_jobs.notify_backoff,
+            SimpleNamespace(user_id=user_id),
+            lane="capture",
+            status=outcome,
+            streak=streak,
+            account_code=str(state.get("capture_account_error_code") or ""),
+            skipped=skipped,
+        )
+    except Exception as exc:  # noqa: BLE001 — 提示是旁路，绝不影响任务结果
+        log.warning(
+            "[v2.worker] capture backoff notice failed user=%s err=%s",
+            user_id, type(exc).__name__,
+        )
 
 
 async def _emit_job_terminal_trace(
@@ -17289,23 +17354,12 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             prepared = None
             try:
                 state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
-                raw_seq = state.get("last_captured_until_seq")
-                if state.get("capture_seq_initialized") or (
-                    raw_seq is not None
-                    and "capture_seq_initialized" not in state
-                    and "last_captured_until_seq" in state
-                ):
-                    after_seq = max(0, int(raw_seq or 0))
-                else:
-                    legacy_id = str(
-                        state.get("last_captured_until_message_id") or ""
-                    )
-                    after_seq = int(
-                        await asyncio.to_thread(
-                            db.chat_seq_for_msg_id, user_id, legacy_id
-                        )
-                        or 0
-                    )
+                # 同 _run_extraction：读进度只走 capture_failure.frontier_seq。
+                after_seq = await asyncio.to_thread(
+                    capture_failure.frontier_seq,
+                    state,
+                    lambda message_id: db.chat_seq_for_msg_id(user_id, message_id),
+                )
                 prepared = await asyncio.to_thread(
                     deps.get_prepared_capture_batch,
                     job_id=job_id,
@@ -17506,9 +17560,10 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                 best_effort=True,
             )
             return outcome
+        provider_meta: dict = {}
         try:
             async with enclave_sem:
-                provider_config, _meta = await _resolve_provider_for_current_job(
+                provider_config, provider_meta = await _resolve_provider_for_current_job(
                     deps, user_id, job_id
                 )
         except Exception as provider_exc:
@@ -17532,9 +17587,29 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                     {"stage": "provider_resolution", "error_code": err},
                     best_effort=True,
                 )
-                owned = await asyncio.to_thread(
-                    jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+                resolver_error = str(
+                    (provider_meta or {}).get("error") if isinstance(provider_meta, dict) else ""
                 )
+                if lane == "capture" and resolver_error in capture_failure.PROVIDER_SETUP_USER_ERRORS:
+                    # 用户自己的模型配置问题（未配置/未测试/信封缺失/配置无效）：带上具体原因，
+                    # 提示才能告诉他去设置里修，而不是笼统的「系统正在重试」（Codex 第 10 轮）。
+                    # 解密失败、token 签发失败是我们的问题，仍是 provider_unavailable。
+                    err = f"provider_setup:{resolver_error}"
+                if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+                    # 落卡的 provider 前置失败（未配置/未测试/信封缺失/解密失败）也走落卡失败框架：
+                    # 累计退避（否则调度器每轮都重建同一个任务）、记本任务 id（提示才发得出来）。
+                    # 不带窗口 → 不跳过：模型用不了时跳过一批毫无用处，修好后从原处继续（Codex 第 8 轮）。
+                    owned = await asyncio.to_thread(
+                        deps.fail_capture_job,
+                        job_id=job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                        error=err,
+                    )
+                else:
+                    owned = await asyncio.to_thread(
+                        jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+                    )
                 if owned and lane in {"chat", "scheduled"}:
                     if lane == "chat":
                         await _settle_legacy_traced_chat_failure(err)
@@ -17593,13 +17668,28 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             best_effort=True,
         )
         log.warning("[v2.worker] job %s outer turn failure code=%s", job_id, message)
-        owned = await asyncio.to_thread(
-            jobs_store.mark_failed,
-            job_id,
-            message,
-            claimed_by=claimed_by,
-            error_class=_turn_failure_error_class(e),
-        )
+        owned = False
+        if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+            # 落卡在外层就挂了（mint token / provider 解析抛异常等）：同样要累计退避、
+            # 记本任务 id，否则调度器每轮重建同一个任务、用户也看不到提示。不带窗口 → 不跳过。
+            try:
+                owned = bool(await asyncio.to_thread(
+                    deps.fail_capture_job,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    error=message,
+                ))
+            except Exception:  # noqa: BLE001 — 退回通用终态，绝不留下未终结的任务
+                owned = False
+        if not owned:
+            owned = await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                message,
+                claimed_by=claimed_by,
+                error_class=_turn_failure_error_class(e),
+            )
         if owned and lane in {"chat", "scheduled"}:
             if lane == "chat":
                 await _settle_legacy_traced_chat_failure(message)
