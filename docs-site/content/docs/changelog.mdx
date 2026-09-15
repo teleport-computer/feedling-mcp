@@ -12,6 +12,24 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory capture can update an existing card again instead of adding a
+  duplicate.** Since 2026-08-30 the capture prompt in Runtime V2 showed the
+  model an empty existing-memory index, so it could only add cards; resident V1
+  (hosted runner and self-hosted consumers) never had one. Before: the user says
+  "I left ByteDance, joining Tencent next month" while a card says they work at
+  ByteDance → a second, contradicting card. After: the prompt lists up to 60 of
+  the user's active cards (id, bucket, summary; the ones related to the
+  conversation first, at most 16,000 characters, summaries cut at 400) and the
+  model supersedes the ByteDance card. A merge/supersede that names a card the
+  user does not have is re-asked once and, if still wrong, only that card is
+  dropped — in Runtime V2 this previously rejected the whole capture window. If
+  the card list cannot be read completely, capture runs without an index and
+  targets are left to the server's ownership check, as before. Resident V1
+  reports such drops as `supersede_target_unknown` (noop reason and `skipped`
+  count on `POST /v1/proactive/jobs/{job_id}/status`). Capture prompts in both
+  runtimes also use io's naming rule and a sanitized user name again: a stored
+  placeholder name such as 「用户」 is no longer used as the person's name.
+
 - **Memory Dream now reads each card's body, not just its title.** When Dream
   tidies the Memory Garden (merge, thicken or supersede), the model now sees
   every card's summary and full body — in Runtime V2 and in resident V1 (hosted

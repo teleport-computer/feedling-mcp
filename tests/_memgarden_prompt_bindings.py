@@ -10,8 +10,9 @@
 
 - 解析器默认带 ``IO_LEAK_SIGNALS``（capture 另带 ``IO_CONVERSATION_CAPTURE_POLICY``）
 - 提示词构造沿用旧壳的称呼装配（``sanitize_user_name`` + io 的 ``_naming_rule``）。
-  ⚠️ 这一点与生产**不同**：组件落卡时只传原始 ``user_name``、称呼规则用内核默认。
-  断言「运行时真实提示词」的用例应走组件（见 test_garden_dream_session.py /
+  生产落卡的称呼装配与此一致（``memory.garden_component.capture_request``），但还带
+  组件挑的现有卡索引。断言「运行时真实提示词」的用例应走组件（见
+  test_capture_request_index_and_naming.py / test_garden_dream_session.py /
   test_memgarden_dream_migrate_golden.py），不要用这里的构造函数。
 """
 from __future__ import annotations

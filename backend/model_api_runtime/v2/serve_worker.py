@@ -87,6 +87,7 @@ from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import visual_transport
 from hosted import vision_observer
+from memory import garden_component
 from memory import memory_core
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
@@ -2969,7 +2970,8 @@ def _read_profile_cards(
 
 
 def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
-    """capture/dream prompt 要的记忆上下文（buckets/threads/identity 明文串，Dream 另带整张卡）。
+    """capture/dream prompt 要的记忆上下文（buckets/threads/identity 明文串；Capture 另带
+    现有卡 ``capture_cards``（读不全时缺席），Dream 另带整张卡）。
 
     **每一项独立 try/except 降级为 ""**（spec §3.5）：任一子取数失败绝不清空其它项、绝不
     抛——两个 prompt builder 对空串都会 fallback 到按 locale 的占位符（中文「（暂无）」/
@@ -3029,8 +3031,36 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         log.warning(
             "[v2.serve_worker] memory threads unavailable for %s: %s", user_id, e
         )
-    # Only Dream reads cards. Capture's component request carries no card
-    # index, so the Capture context skips this enclave round trip entirely.
+    if not full_cards:
+        # Capture 的「已有记忆索引」来源：这个人现有的 active 卡（id + 摘要）。
+        # 组件按这段对话挑相关的进索引，并只接受指向其中一张的 merge/supersede ——
+        # 08-30 换成组件之后这一读被删掉，模型只能 add，重复卡越积越多。
+        #
+        # limit=0 = 读侧硬上限（与 buckets/threads 取词同一次全量读的规模）：
+        # 校验 target 用的是全部现有卡，只读 60 张会把第 61 张真卡判成编造。
+        #
+        # 读不全就不交（``capture_cards`` 缺席 → 组件退回无索引、不校验 target），
+        # 绝不拿空列表冒充：空列表 = 确认一张卡都没有，会把任何 supersede 判成编造。
+        # 与 Dream 同一判据：200 + 空 items 只有 user_card_count==0 才是真空花园。
+        try:
+            body, status = memory_core.index(
+                store, None, {"limit": 0}, post_enclave=_post
+            )
+            raw_items = body.get("items") if isinstance(body, dict) else None
+            if status != 200 or not isinstance(raw_items, list):
+                raise RuntimeError(f"capture_cards_index_failed:{status}")
+            if not raw_items and not (
+                type(body.get("user_card_count")) is int
+                and body.get("user_card_count") == 0
+            ):
+                raise RuntimeError("capture_cards_index_unverified_empty")
+            ctx["capture_cards"] = garden_component.capture_existing_cards(raw_items)
+        except Exception as e:  # noqa: BLE001 — 单项降级
+            log.warning(
+                "[v2.serve_worker] capture card index unavailable for %s: %s",
+                user_id,
+                e,
+            )
     if full_cards:
         try:
             body, status = memory_core.index(

@@ -304,6 +304,8 @@ if not _provisioned:
         "test_orchestration_is_not_reimplemented.py",
         "test_garden_component_parity.py",
         "test_garden_io_capture_policy.py",
+        # 落卡请求唯一构造点：真组件 + 假 provider，不碰 DB。
+        "test_capture_request_index_and_naming.py",
         # Dream 共用入口（open_dream_session）：假模型 + 真组件，不碰 DB。
         "test_garden_dream_session.py",
         "test_memgarden_dream_migrate_golden.py",
