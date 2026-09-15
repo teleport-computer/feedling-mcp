@@ -119,13 +119,31 @@ change must not be interpreted as an API guarantee.
   language of the uploaded material (English material no longer yields Chinese cards).
   Cards already in the garden are shown to the model, so importing the same material
   again merges into them rather than duplicating them. Card dates come from timestamps
-  in the material. Long-term memory archives still fall back to the relationship
-  start date. The Identity Card is derived in a separate step. Response shapes are
+  in the material. Long-term memory archives imported through
+  `POST /v1/genesis/imports/plaintext` still fall back to the relationship start
+  date; on the legacy upload an undated card stays undated. The Identity Card is
+  derived in a separate step. Response shapes are
   unchanged. On the legacy upload job, `candidate_count` and
   `candidate_cluster_count` now report cards judged and written, because there is no
   separate candidate stage anymore. Imports already in progress with the previous
   pipeline finish on it. Operator setting `FEEDLING_GARDEN_IMPORT_STRATEGY` can be
   `two_pass` (the default) or `single_pass`.
+
+- **History imports on the Memory Garden import session keep the protections the
+  previous pipeline had.** Before: after the switch, a card the model wrote as
+  「用户喜欢骑车」 or "The user likes cycling" was stored that way; uploading only a
+  long-term memory archive no longer set the companion's name, days together and
+  relationship anchor on the Identity Card; a batch whose every card was rejected
+  as invalid finished the import as done with zero cards; on the legacy upload a
+  provider error failed the whole job and undated archive cards got the
+  relationship start date. After: these system placeholders are replaced with the
+  person's name (or 「对方」 / "The person" when unknown) before the import session
+  writes a card, on every import path; product terms such as 「用户增长」 are left alone. An archive-only
+  onboarding or chunked import sets the name, days and anchor again. A batch
+  whose every card was rejected fails the import so it can be retried (the retry
+  asks the model again). On the legacy upload a provider error is recorded in the
+  job's `warnings` and the job still completes, and an undated card stays
+  undated.
 
 - **Automatic Memory Dream runs no longer all start when the night window opens.**
   Each account now has a per-user offset inside the 02:00–05:00 window (in the

@@ -361,3 +361,79 @@ def test_onboarding_with_empty_foreground_falls_back_to_full_path(env, monkeypat
     assert job["status"] == "done"
     assert greetings == []                       # 一次做完那条路不问候（同切换前）
     assert job["memory_action_count"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 切换前的保护，在新引擎上恢复
+# --------------------------------------------------------------------------- #
+
+def test_add_memory_rewrites_user_placeholder_to_the_name(env, monkeypatch):
+    """之前（d72e74c4 / 67bf4b96）：导入卡写库前「用户喜欢…」→「小雨喜欢…」。"""
+    monkeypatch.setattr(plaintext, "_resolve_plaintext_user_name", lambda *_a: "小雨")
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("用户喜欢周末去西湖边骑车")]}))
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=_history_groups("〔窗A〕"))
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert _live_cards(env.user_id) == ["小雨喜欢周末去西湖边骑车"]
+
+
+def test_add_memory_with_every_card_rejected_fails_instead_of_done_with_zero(env, monkeypatch):
+    """之前（6972427d）：整段写卡全被判不合格 → 任务失败（用户可重试），不是「完成、0 张卡」。"""
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("周末常去西湖边骑车"), _card("每天一杯冰美式")]}))
+    monkeypatch.setattr(import_engine.memory_actions, "_execute_memory_actions",
+                        lambda _s, _k, actions, **_kw: ({"results": [
+                            {"status": "error", "error": "memory_card_polluted", "http_status": 422}
+                            for _ in actions]}, 200))
+    failures: list[str] = []
+    real_mark_failed = service.mark_failed
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda s, j, err, **kw: failures.append(err) or real_mark_failed(s, j, err, **kw))
+    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+                                         source_groups=_history_groups("〔窗A〕"))
+    job = db.genesis_get_job(env.user_id, job_id)
+    assert job["status"] != "done"
+    assert failures and "GardenImportCardsRejected" in failures[0]
+    assert env.checkpoints[job_id]["garden_import"]["pending"] is None, "重试要重新问模型"
+
+
+def test_archive_only_onboarding_still_brings_the_ai_name_from_the_archive(env, monkeypatch):
+    """之前（5965e943 / 3fcfc2fc）：只上传长期记忆档案，TA 的名字 / 认识天数 / 关系锚点
+    从档案那次 fact_write 里带出来写进身份卡。切换后那次调用没了，身份卡拿不到名字。"""
+    monkeypatch.setattr(worker, "genesis_v2_enabled", lambda: False)
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="onboarding")
+    _use_model(monkeypatch, FakeModel({"〔档案〕": [_card("最喜欢的书是小王子")]}))
+    fact_writes: list[dict] = []
+
+    def fake_fact_write(_llm, **kwargs):
+        fact_writes.append(kwargs)
+        return {"memories": [{"summary": "不该写进去的卡", "content": "x"}],
+                "identity": {"agent_name": "阿樟", "dimensions": [{"name": "Wrong", "value": 1}]},
+                "days_with_user": 321, "relationship_anchor_evidence": "2024-08 开始"}
+
+    monkeypatch.setattr(worker, "_fact_write", fake_fact_write)
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **_k: ({"agent_name": "", "dimensions": []}, []))
+    identity_outputs: list[dict] = []
+    monkeypatch.setattr(service, "init_identity_if_absent",
+                        lambda _s, output, _k=None, **_kw: identity_outputs.append(output) or "initialized")
+    monkeypatch.setattr(service, "write_persona_artifact", lambda *_a, **_k: ("", ""))
+    monkeypatch.setattr(service, "write_voice_artifact", lambda *_a, **_k: ("", ""))
+    groups = [{"source_kind": "memory_summary_import", "source_family": "memory_summary",
+               "chunk_texts": ["〔档案〕- 最喜欢的书是小王子\n- 叫我阿樟就好\n"]}]
+    plaintext._run_plaintext_genesis_job(
+        env.store, "api_key", job_id, mode="onboarding", source_groups=groups,
+        analysis_messages=[{"role": "user", "content": "- 最喜欢的书是小王子",
+                            "source": "memory_summary_import"}])
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert _live_cards(env.user_id) == ["最喜欢的书是小王子"], "卡只来自导入会话"
+    assert len(fact_writes) == 1 and "小王子" in fact_writes[0]["memory_summary"]
+    merged = identity_outputs[0]
+    assert merged["identity"]["agent_name"] == "阿樟"
+    assert merged["identity"]["dimensions"] == [], "档案不推性格维度（同切换前）"
+    assert merged["days_with_user"] == 321
+    assert merged["relationship_anchor_evidence"] == "2024-08 开始"

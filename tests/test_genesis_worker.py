@@ -1075,6 +1075,53 @@ def test_user_profile_source_writes_memory_facts_without_identity_or_persona(mon
     assert "persona" not in reducer_output
 
 
+def test_chunked_import_rewrites_user_placeholder_before_writing(monkeypatch):
+    """之前（67bf4b96）：分块导入的卡写库前「用户喜欢…」→ 名字未知时「对方喜欢…」；
+    产品词「用户增长」不动。"""
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch, source_kind="user_profile", chunk_texts=["喜欢直接反馈,在做用户增长。"])
+    writes = _patch_garden_writes(monkeypatch)
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["用户喜欢直接反馈,在做用户增长"]),
+                                         usage={}, cached=False, output_ref="x", stop_reason="stop")
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+    result = worker.tick(api_url="http://backend:5001", enclave_url="https://enclave:5003",
+                         mint_runtime_token=mint)
+    assert result["processed"] == 1
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["对方喜欢直接反馈,在做用户增长"]
+
+
+def test_chunked_import_with_every_card_rejected_fails_the_job(monkeypatch):
+    """之前（6972427d）：整段卡全被判不合格 → 任务失败，不是「完成、0 张卡」。"""
+    _install_success_harness(monkeypatch, source_kind="user_profile", chunk_texts=["喜欢直接反馈。"])
+    _patch_garden_writes(monkeypatch)
+    from genesis import import_engine
+
+    monkeypatch.setattr(import_engine.memory_actions, "_execute_memory_actions",
+                        lambda _s, _k, actions, **_kw: ({"results": [
+                            {"status": "error", "error": "memory_card_polluted", "http_status": 422}
+                            for _ in actions]}, 200))
+    failures = []
+    monkeypatch.setattr(worker.service, "mark_failed",
+                        lambda _store, job_id, error, **_kw: failures.append((job_id, error)))
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["喜欢直接反馈"]), usage={},
+                                         cached=False, output_ref="x", stop_reason="stop")
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+    result = worker.tick(api_url="http://backend:5001", enclave_url="https://enclave:5003",
+                         mint_runtime_token=lambda *_a, **_k: "rtok")
+    assert result["failed"] == 1 and result["processed"] == 0
+    assert failures and "GardenImportCardsRejected" in failures[0][1]
+
+
 def test_memory_summary_source_uses_curated_archive_import(monkeypatch):
     llm_calls = []
     apply_payloads, _minted, mint = _install_success_harness(
@@ -1084,8 +1131,22 @@ def test_memory_summary_source_uses_curated_archive_import(monkeypatch):
     )
     writes = _patch_garden_writes(monkeypatch)
 
+    identity_calls = []
+
     class FakeLLM:
         def complete(self, **kwargs):
+            if str(kwargs.get("task_id") or "").startswith("fact-write"):
+                # 档案带出 TA 名字那一次（5965e943 / 3fcfc2fc）：同一个 fact_write，卡丢掉。
+                identity_calls.append(json.loads(kwargs["messages"][1]["content"]))
+                text = json.dumps({
+                    "memories": [{"type": "fact", "summary": "不该被写进去的卡", "content": "x"}],
+                    "identity": {"agent_name": "Mira", "dimensions": [
+                        {"name": "Wrong", "value": 90, "description": "from memory summary"}]},
+                    "days_with_user": 400,
+                    "relationship_anchor_evidence": "2024-05 开始聊天",
+                }, ensure_ascii=False)
+                return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref="f",
+                                             stop_reason="stop")
             prompt = kwargs["messages"][0]["content"]
             llm_calls.append(prompt)
             return types.SimpleNamespace(text=_garden_reply(prompt, ["第一次独立跑完半程马拉松"]),
@@ -1104,8 +1165,13 @@ def test_memory_summary_source_uses_curated_archive_import(monkeypatch):
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["source_family"] == "memory_summary"
     assert reducer_output["garden_import"]["cards_written"] == 1
-    assert writes["actions"][0]["memory"]["summary"] == "第一次独立跑完半程马拉松"
-    assert "identity" not in reducer_output
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["第一次独立跑完半程马拉松"]
+    # 只上传档案时，TA 的名字 / 认识天数 / 关系锚点照切换前带出来；性格维度不从档案推
+    assert len(identity_calls) == 1 and "半程马拉松" in identity_calls[0]["memory_summary"]
+    assert reducer_output["identity"] == {"agent_name": "Mira", "dimensions": []}
+    assert reducer_output["days_with_user"] == 400
+    assert reducer_output["relationship_anchor_evidence"] == "2024-05 开始聊天"
+    assert reducer_output["memories"] == []
     assert "persona" not in reducer_output
 
 

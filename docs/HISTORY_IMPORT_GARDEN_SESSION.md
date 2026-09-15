@@ -51,7 +51,7 @@ canonical_owner: self
 | `policy` / `material_kind` | 长期记忆档案 → `curated_archive`；聊天记录 / 用户档案 / 人设材料 → `history_import` |
 | `locale` | `history_import.import_language_with_archive`（档案语言是中文就中文，否则跟材料走）；第一次运行定下，续跑沿用 |
 | `naming_rule` / `user_name` | `identity.user_naming._naming_rule`（io 的称呼规则） |
-| `fallback_occurred_at` | 只给长期记忆档案，值是关系开始日（与切换前 `preserve_dates` 口径一致）；聊天记录的卡日期来自材料里的时间戳 |
+| `fallback_occurred_at` | 只给 genesis plaintext 的长期记忆档案，值是关系开始日（与切换前 `preserve_dates` 口径一致，bf483fc7）；旧上传入口不给（没日期就留空，0831f3b0）；聊天记录的卡日期来自材料里的时间戳 |
 | `max_total_cards` | 只有旧上传入口用（分层配额）；genesis 以前没有总量上限，现在也不加 |
 | `existing_cards` / `owner_key` | 读侧索引（id / 摘要 / 桶，仅 active）/ user_id |
 | 身份卡 | `foreground_identity.derive_foreground_identity`（前台本来就用它；后台和分块 worker 也改用它，拿真写进去的卡当证据） |
@@ -128,9 +128,30 @@ compare2.py）。
    导入会话的可选收尾。
 2. **VPS 的记忆张数引导（floor note）随 fact_write 退役**：以前 VPS 写卡提示词里带「花园现有 N 张、
    建议 floor–aspiration 张」的引导；memgarden 没有这个概念，现在不再注入。
-3. **分块导入里长期记忆档案不再顺带推出 TA 的名字**：切换前 memory_summary 的 fact_write 会带出
-   `agent_name`；身份推导的守卫在没有人设材料 / 助手发言时本来就不给名字。只影响公开的分块导入 API。
+3. ~~分块导入里长期记忆档案不再顺带推出 TA 的名字~~ —— 已恢复，见下节。
 4. **旧上传入口（`/v1/history_import/upload`）**：iOS 只在调试开关关掉新流程时才调用；记忆卡已接到同一个
    引擎。它剩下的候选抽取 / 打分函数只被 `hosted/turn.py` 的记忆修复（`/v1/model_api/memory/repair`，
    iOS 不调用，退役路线图里标了删除）用着 —— 那条是另一个管线，要删还是接引擎待定。
 5. 大导入的前台采样（8 窗）和 tier 窗口上限（`_select_evenly` 会跳过中间窗口）沿用切换前，没有改。
+
+## 切换后恢复的保护（fix/memx-import-parity）
+
+换引擎时丢了几条切换前的保护（多数是 Seven 的修复）。原则是**在新引擎上原样恢复，不重新设计**：
+
+| 保护 | 切换前出处 | 现在落在 |
+|---|---|---|
+| 写库前把「用户」「The user」这类系统占位确定性换成称呼（代词不动） | d72e74c4 / 67bf4b96 | `garden_import.with_person_references_rewritten`，引擎写库前统一跑：托管 plaintext、分块 worker、旧上传入口、VPS 都覆盖（consumer 源码里不出现改写器，`test_card_user_referent` 的约束不变）。VPS 收口复查补的卡切换前也没改写，不变 |
+| 只上传长期记忆档案时带出 TA 名字 / 认识天数 / 关系锚点 | 5965e943 / 3fcfc2fc `_memory_summary_name_only` | `worker.derive_identity_from_memory_summary`：同一个 fact_write 再跑一次、卡丢掉。分块 worker 在档案 job 里调；plaintext 在要写身份卡的那一步（`_finish_output`）调。多一次模型调用 |
+| 一段写卡全被判不合格 → 任务失败可重试，不是「完成、0 张卡」 | 6972427d | `write_with_executor` 抛 `GardenImportCardsRejected`；引擎在这批一张没写时清掉 pending 再抛（重试重新问模型），同批前几段已写则按部分失败记。重试上限：plaintext / 分块 worker 靠用户重试，VPS 靠后端回收的 attempt 上限（默认 3） |
+| 部分失败只记张数的告警 | 6972427d | 引擎每批 `garden import batch partial job=… written=… dropped=…`；VPS 收口复查另有 `resident distill memory batch partial …` |
+| VPS 收口复查写库整批失败要抛 | 6972427d / 763b0b03 | consumer：复查那次模型调用失败仍不致命，复查卡写库整批失败抛出 |
+| 旧上传入口：没日期的卡留空 | 0831f3b0 | `_GardenMemoryImport.run` 不传兜底日期 |
+| 旧上传入口：模型失败不让整单失败 | 切换前逐窗口吞掉抽取错误 | `_GardenMemoryImport`：模型报错 / 整组判不出来 / 整段被拒只记 warning，任务照常完成；写库本身坏了仍失败 |
+
+**关于旧上传入口的「兜底卡」**：切换前 `_ensure_import_minimum_cards` 在模型一张卡都没出时从原文切片补
+1 张故事卡 + 1 张关于你的卡。但这些兜底卡只有 `title` 没有 `summary`，而 `_append_import_memory_cards`
+自 f7e3db73（2026-06-25）起要求 `summary`，于是**兜底卡一直被静默跳过、从没写进库**；两张又常因取自同一段
+原文被去重成一张，也凑不够「可以进聊天」要的 2 张。所以「保底写卡、保证能进聊天」在切换前已经不存在，
+这次没有恢复写兜底卡（那会是新行为：把原文切片直接写成记忆卡），只恢复了「模型失败不让整单失败」。要不要
+真的写兜底卡是产品决定。
+

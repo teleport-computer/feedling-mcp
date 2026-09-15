@@ -252,3 +252,100 @@ def test_mutation_item_keeps_retrieval_cues_and_dates():
     assert item["occurred_at"] == "2024-05-20"
     assert item["retrieval_cues"] == ["半马"]
     assert item["type"] == "event" and item["importance"] == 0.8
+
+
+# --------------------------------------------------------------------------- #
+# 切换前的失败口径 / 称呼兜底，在引擎上恢复
+# --------------------------------------------------------------------------- #
+
+def _rejecting_writer(written: list[dict], *, reject: set[str]):
+    """真 ``write_with_executor``；执行器按摘要拒卡（``memory_card_polluted`` = 卡本身不合格）。"""
+    def execute(actions: list[dict]) -> list[dict]:
+        rows = []
+        for action in actions:
+            summary = action["card"]["summary"]
+            if summary in reject:
+                rows.append({"status": "error", "error": "memory_card_polluted", "http_status": 422})
+            else:
+                written.append(action["card"])
+                rows.append({"status": "ok", "http_status": 201,
+                             "memory": {"id": f"mom_{len(written)}"}})
+        return rows
+
+    def write(mutations: list[dict], _key: str) -> list[str]:
+        return garden_import.write_with_executor(
+            mutations, build_action=lambda m: {"type": "memory.add", "card": m["card"]},
+            execute=execute)
+    return write
+
+
+def test_batch_with_every_card_rejected_fails_and_retry_asks_the_model_again():
+    """之前（6972427d）：一段写卡指令全被判不合格 → 任务失败（可重试），不是「完成、0 张卡」。
+    重试时这批一张没写，所以重新问模型，而不是把被拒的卡原样再写。"""
+    sources = _sources("窗口：两件事\n")
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    saves: list[dict] = []
+    written: list[dict] = []
+    model = Model([("两件事", _reply(_card("坏卡一"), _card("坏卡二")))])
+    with pytest.raises(garden_import.GardenImportCardsRejected, match="memory_card_polluted"):
+        _run(state, sources, model, _rejecting_writer(written, reject={"坏卡一", "坏卡二"}),
+             saves=saves)
+    assert written == []
+    assert saves[-1]["pending"] is None
+    assert not saves[-1]["sessions"]["1:history"].get("done")
+
+    model2 = Model([("两件事", _reply(_card("周末常去西湖边骑车")))])
+    result = _run(saves[-1], sources, model2, _rejecting_writer(written, reject=set()))
+    assert result.done and model2.prompts, "重试重新问了模型"
+    assert [c["summary"] for c in written] == ["周末常去西湖边骑车"]
+
+
+def test_partial_rejection_logs_counts_only_and_keeps_going(caplog):
+    sources = _sources("窗口：两件事\n")
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    written: list[dict] = []
+    model = Model([("两件事", _reply(_card("周末常去西湖边骑车"), _card("被拒的那张秘密内容")))])
+    with caplog.at_level("WARNING", logger="memory.garden_import"):
+        result = _run(state, sources, model,
+                      _rejecting_writer(written, reject={"被拒的那张秘密内容"}))
+    assert result.done and (result.cards_written, result.dropped) == (1, 1)
+    partial = [r.getMessage() for r in caplog.records if "partial" in r.getMessage()]
+    assert partial == ["garden import batch partial job=job1 source=history written=1 dropped=1"]
+    assert "秘密" not in caplog.text and "西湖" not in caplog.text, "告警里不许有卡的内容"
+
+
+def test_later_chunk_rejected_after_earlier_chunk_landed_counts_as_partial(monkeypatch):
+    """同一批前面几段已经写进去：整批不是「一张没写」，被拒的那段按丢弃记，不抛、不重放。"""
+    monkeypatch.setattr(garden_import, "WRITE_CHUNK", 1)
+    sources = _sources("窗口：两件事\n")
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    written: list[dict] = []
+    model = Model([("两件事", _reply(_card("周末常去西湖边骑车"), _card("坏卡")))])
+    result = _run(state, sources, model, _rejecting_writer(written, reject={"坏卡"}))
+    assert result.done and (result.cards_written, result.dropped) == (1, 1)
+
+
+def test_user_placeholder_is_rewritten_before_writing_and_in_the_index():
+    """之前（d72e74c4 / 67bf4b96）：导入卡写库前把「用户」这类系统占位确定性换成称呼。"""
+    sources = _sources("窗口：骑车\n")
+    state = garden_import.new_state(locale="zh-Hans", user_name="小雨", strategy="single_pass")
+    card = _card("用户喜欢周末去西湖边骑车")
+    card.update(bucket="关于用户", threads=["用户的周末"],
+                content="用户在周末骑车。用户增长和用户画像是她的工作，不是在说她。")
+    store = Store()
+    result = _run(state, sources, Model([("骑车", _reply(card))]), store)
+    written = list(store.cards.values())[0]
+    assert written["summary"] == "小雨喜欢周末去西湖边骑车"
+    assert written["bucket"] == "关于小雨" and written["threads"] == ["小雨的周末"]
+    assert written["content"] == "小雨在周末骑车。用户增长和用户画像是她的工作，不是在说她。"
+    assert result.known[0]["summary"] == "小雨喜欢周末去西湖边骑车"
+    assert state["written"][0]["summary"] == "小雨喜欢周末去西湖边骑车"
+
+
+def test_unknown_name_rewrites_to_the_neutral_referent_and_bad_names_never_crash():
+    sources = _sources("窗口：骑车\n")
+    for name, expected in (("", "对方喜欢骑车"), ("N\\A", "用户喜欢骑车")):
+        state = garden_import.new_state(locale="zh-Hans", user_name=name, strategy="single_pass")
+        store = Store()
+        _run(state, sources, Model([("骑车", _reply(_card("用户喜欢骑车")))]), store)
+        assert [c["summary"] for c in store.cards.values()] == [expected]
