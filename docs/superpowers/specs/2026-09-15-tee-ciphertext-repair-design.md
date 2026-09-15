@@ -222,4 +222,3 @@ small TEST apply batch are required before production deployment.
   migrated shared rows.
 - Enclave latency and error rate stay within the recorded rollout ceilings.
 - The corrected verifier is green independently of the migration worker cache.
-

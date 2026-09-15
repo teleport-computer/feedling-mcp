@@ -78,7 +78,6 @@ def probe_enclave_health(*, max_latency_sec: float = 10.0) -> bool:
         time.monotonic() - started <= float(max_latency_sec)
     )
 
-
 def _wait_until_healthy(
     probe: Callable[[], bool],
     *,
@@ -178,4 +177,3 @@ def run(
         item_counts=dict(sorted(counts.items())),
         failures=failures,
     )
-
