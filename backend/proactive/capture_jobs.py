@@ -166,6 +166,17 @@ def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
             window["after_seq"] = max(0, int(float(raw.get("after_seq"))))
         except (TypeError, ValueError):
             pass
+    # Resident V1 按批次落卡：终点 seq 是这批的精确边界。consumer 靠它按 seq 取批，
+    # 完成时游标只推到这里（capture_scheduler._v1_oldest_batch_window）。
+    # 老窗口没有这个键，consumer 据此走老的取窗逻辑。
+    if raw.get("through_seq") is not None and raw.get("through_seq") != "":
+        try:
+            through_seq = int(float(raw.get("through_seq")))
+        except (TypeError, ValueError):
+            through_seq = 0
+        if through_seq > 0:
+            window["through_seq"] = through_seq
+            window["backlog_remaining"] = bool(raw.get("backlog_remaining"))
     return window
 
 

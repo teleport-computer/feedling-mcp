@@ -12831,6 +12831,52 @@ def chat_capture_messages_after_seq(
     ]
 
 
+def chat_capture_messages_oldest_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    sources: list[str] | tuple[str, ...],
+    limit: int,
+) -> list[dict]:
+    """Return the OLDEST bounded Capture-eligible metadata after an exact seq.
+
+    Counterpart of :func:`chat_capture_messages_after_seq` (which returns the
+    newest rows for trigger heuristics). Resident V1 capture uses this to cut
+    one exact contiguous batch starting right after the capture cursor, so a
+    backlog larger than one batch is drained oldest-first instead of the
+    cursor jumping to the newest message. Same eligibility predicate, same
+    metadata-only shape; ``ORDER BY seq ASC LIMIT`` reads one small index
+    range, never the whole uncaptured transcript.
+    """
+    cursor_seq = int(after_seq)
+    bounded = max(1, min(int(limit), 1000))
+    allowed = [str(source) for source in sources if str(source)]
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    if not allowed:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc->>'role' AS role,"
+            " COALESCE(doc->>'source','') AS source FROM chat_messages "
+            " WHERE user_id=%s AND seq>%s "
+            " AND doc->>'role' IN ('user','openclaw') "
+            " AND COALESCE(doc->>'source','')=ANY(%s::text[]) "
+            " ORDER BY seq ASC LIMIT %s",
+            (str(user_id), cursor_seq, allowed, bounded),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[1]),
+            "ts": float(row[2]),
+            "seq": int(row[0]),
+            "role": str(row[3] or ""),
+            "source": str(row[4] or ""),
+        }
+        for row in rows
+    ]
+
+
 def chat_user_turn_count_strict(user_id: str) -> int:
     """Return the durable count of chat rows whose role is exactly ``user``.
 

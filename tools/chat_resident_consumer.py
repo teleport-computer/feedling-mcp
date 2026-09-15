@@ -396,6 +396,10 @@ FOREGROUND_TIMEOUT_RECOVERY_SEC = max(
 FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS = 1
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
+# 落卡窗口按 seq 精确取批（backend capture_scheduler.CAPTURE_BATCH_WINDOW_CAPABILITY）。
+# 声明了它，后端才会发「游标之后最早的一批」而不是「最新的一段」；老 consumer 不声明，
+# 后端继续发老窗口 —— 老版本只看得到最新 160 行，给它最早一批它取不到。
+CAPTURE_BATCH_WINDOW_CAPABILITY = "capture_batch_window_v1"
 
 # Every lane literal supplied to call_agent in this resident. Recovery is
 # permitted from the user-present lane only; deriving the allow-set from the
@@ -1651,7 +1655,8 @@ def _consumer_capabilities(hosted: bool = False) -> str:
     keys ``_runtime_supported`` off this header, so omitting the web caps makes
     web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1", "agent_body_generate_v1"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1", "agent_body_generate_v1",
+            CAPTURE_BATCH_WINDOW_CAPABILITY]
     if _agent_image_generation_enabled():
         caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
@@ -3221,7 +3226,8 @@ def _filter_since(msgs: list, since: float) -> list:
 
 
 def _fetch_from_enclave(
-    since: float, limit: int, include_image_body: bool = True
+    since: float, limit: int, include_image_body: bool = True,
+    after_seq: int | None = None,
 ) -> list[dict] | None:
     """Direct HTTP to the enclave decrypt proxy.
 
@@ -3239,6 +3245,9 @@ def _fetch_from_enclave(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
+    if after_seq is not None:
+        # 按 seq 从旧往新翻页（落卡取批用）。没有它时是「最新一页」。
+        params["after_seq"] = int(after_seq)
     # T512: ask for the per-card selection trace (reasons/bucket/score, no card
     # bodies) so the injected block can say *why* each card is there. The
     # released memgarden injection_record carries counts only.
@@ -3741,7 +3750,8 @@ def _verify_decrypt_sources() -> bool:
 
 
 def get_decrypted_history(
-    since: float, limit: int = 20, include_image_body: bool = True
+    since: float, limit: int = 20, include_image_body: bool = True,
+    after_seq: int | None = None,
 ) -> list[dict] | None:
     """Try all configured decrypt sources in priority order.
 
@@ -3750,13 +3760,16 @@ def get_decrypted_history(
               (may be empty if no new messages).
       None  — no source configured, or all configured sources failed.
     """
+    # after_seq 只在给了的时候才往下传：其余调用点的请求参数逐字节不变。
+    seq_kwargs = {} if after_seq is None else {"after_seq": int(after_seq)}
     handled, local_result = _fetch_plaintext_or_mixed_history(
-        since, limit, include_image_body=include_image_body)
+        since, limit, include_image_body=include_image_body, **seq_kwargs)
     if handled:
         return local_result
 
     if FEEDLING_ENCLAVE_URL:
-        result = _fetch_from_enclave(since, limit, include_image_body=include_image_body)
+        result = _fetch_from_enclave(
+            since, limit, include_image_body=include_image_body, **seq_kwargs)
         if result is not None:
             return result
         log.warning("enclave source failed")
@@ -3769,6 +3782,7 @@ def _fetch_plaintext_or_mixed_history(
     limit: int,
     *,
     include_image_body: bool,
+    after_seq: int | None = None,
 ) -> tuple[bool, list[dict] | None]:
     """Use backend rows when a page contains plaintext; decrypt sealed rows one-by-one.
 
@@ -3780,6 +3794,8 @@ def _fetch_plaintext_or_mixed_history(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
+    if after_seq is not None:
+        params["after_seq"] = int(after_seq)
     try:
         resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/chat/history",
@@ -3857,6 +3873,10 @@ def _fetch_plaintext_or_mixed_history(
                 resolved = {**row, "body_unavailable": True}
         else:
             resolved = {**row, "body_unavailable": True}
+        if resolved.get("seq") is None and row.get("seq") is not None:
+            # 单条解密/取正文的回包不带 seq（enclave 那边是 "seq": None），合并后会
+            # 把页里的真实 seq 盖掉。落卡按 seq 取批要靠它，还原回来。
+            resolved["seq"] = row.get("seq")
         out.append(_finalize_plaintext_or_mixed_history_row(resolved))
     return True, _filter_since(out, since)
 
@@ -17629,8 +17649,77 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
     return out
 
 
+CAPTURE_BATCH_PAGE_LIMIT = 200  # backend /v1/chat/history 单页上限
+CAPTURE_BATCH_MAX_PAGES = 10
+
+
+def _capture_seq_or_none(value: Any) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _capture_batch_window_messages(after_seq: int, through_seq: int) -> list[dict]:
+    """按 seq 精确取 ``(after_seq, through_seq]`` 这一批（后端按批次发的窗口）。
+
+    老逻辑拿「最新 160 行」再从里面找起点：积压超过这 160 行时起点根本不在里面，
+    只能退回按时间截尾 —— 更早的消息永远记不上。这里从起点往后翻页，直到越过终点，
+    一条不多、一条不少；不按 message_count 截尾（区间里夹着的非落卡来源行不能挤掉
+    这批最早的消息）。
+
+    取不全（解密源失败 / 行没有 seq / 翻页没有进展 / 页数用完）返回 []，
+    由调用方把任务标失败、游标不动 —— 绝不拿半批冒充整批。
+    """
+    out: list[dict] = []
+    cursor = int(after_seq)
+    for _page in range(CAPTURE_BATCH_MAX_PAGES):
+        page = get_decrypted_history(
+            since=0,
+            limit=CAPTURE_BATCH_PAGE_LIMIT,
+            include_image_body=False,
+            after_seq=cursor,
+        )
+        if page is None:
+            return []
+        if not page:
+            # 翻到对话末尾：终点那条可能被删了（Chat Clear 之类），区间里现存的就是全部。
+            return _capture_live_history(out)
+        page_max = cursor
+        for msg in page:
+            seq = _capture_seq_or_none(msg.get("seq") if isinstance(msg, dict) else None)
+            if seq is None:
+                log.warning("capture batch window: history row without seq; refusing a partial batch")
+                return []
+            page_max = max(page_max, seq)
+            if seq <= after_seq:
+                continue
+            if seq > through_seq:
+                return _capture_live_history(out)
+            out.append(msg)
+            if seq == through_seq:
+                return _capture_live_history(out)
+        if page_max <= cursor:
+            log.warning("capture batch window: history paging made no progress at seq=%s", cursor)
+            return []
+        cursor = page_max
+    log.warning(
+        "capture batch window: (%s, %s] not reached within %d pages",
+        after_seq, through_seq, CAPTURE_BATCH_MAX_PAGES,
+    )
+    return []
+
+
 def _capture_window_messages(job: dict) -> list[dict]:
     window = job.get("window") if isinstance(job.get("window"), dict) else {}
+    batch_after_seq = _capture_seq_or_none(window.get("after_seq"))
+    batch_through_seq = _capture_seq_or_none(window.get("through_seq"))
+    if (batch_after_seq is not None and batch_through_seq is not None
+            and batch_through_seq > batch_after_seq >= 0):
+        return _capture_batch_window_messages(batch_after_seq, batch_through_seq)
+    # 老后端发的窗口（没有 through_seq）：原样走老逻辑。
     after_id = str(window.get("after_message_id") or "").strip()
     until_id = str(window.get("until_message_id") or "").strip()
     try:
