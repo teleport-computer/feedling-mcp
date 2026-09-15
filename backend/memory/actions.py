@@ -924,8 +924,17 @@ def _memory_supersede_action(
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.supersede"}, [], 409
     envelope["type"] = mem_type
+    # A correction does not move when the thing happened: without an explicit
+    # occurred_at, inherit the replaced card's date (as bucket/threads/scores are).
+    # last_referenced_at stays "now", as it was before inheritance existed.
+    if not str(raw.get("occurred_at") or "").strip():
+        raw = {k: v for k, v in raw.items() if k != "occurred_at"}
+        raw_for_inner.pop("occurred_at", None)
+        raw_for_inner.setdefault("last_referenced_at", memory_timestamps.now_iso())
     envelope["occurred_at"] = _memory_action_occurred_at(
-        raw, default=memory_timestamps.now_iso()
+        raw,
+        default=memory_timestamps.normalize(old_cards[0].get("occurred_at"))
+        or memory_timestamps.now_iso(),
     )
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "hosted_runtime_state", 80)
     _memory_apply_v1_metadata(envelope, raw_for_inner, source=envelope["source"])

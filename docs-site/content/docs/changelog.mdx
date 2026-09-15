@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Reading or correcting a memory card no longer changes its dates.** Before: a
+  memory fetch stamped the card's `updated_at`, so one read made the next
+  post-turn check regenerate the Runtime V2 profile; and correcting a card dated
+  2024-06-15 through `io_cli memory-patch` or `memory_write` `update` moved it to
+  today. After: a fetch only stamps `last_referenced_at` (now UTC with `Z`), and a
+  plaintext `memory.supersede` without `occurred_at` keeps the replaced card's
+  date; an explicit `occurred_at` still wins. Capture and Dream supersedes carry
+  their own `occurred_at` and are unchanged.
+
 - **Self-hosted history import again tells the model how many memory cards the
   garden should roughly hold.** Before the import moved to memgarden's import
   session, the self-hosted (VPS) consumer added a card-count note to the
