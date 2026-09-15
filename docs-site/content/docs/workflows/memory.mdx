@@ -568,6 +568,8 @@ Plaintext action content may contain at most 5000 Unicode code points after
 outer whitespace is stripped (not bytes or model tokens). Oversize content
 returns `memory_content_too_long` with `actual_chars` and `max_chars`; nothing
 is silently shortened, and a rejected supersede leaves the old card unchanged.
+When tracing is enabled, `memory.content.rejected` records only character counts
+and the route, never the rejected body.
 This is IO's plaintext-write policy, not a MemGarden limit. Opaque prebuilt
 envelopes retain their existing compatibility path; stored historical long
 cards are returned whole by full fetch. Preview/model-context budgets remain

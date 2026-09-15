@@ -10496,6 +10496,7 @@ _DEBUG_STEP_LABELS = {
     "memory.search.called": ("🔍", "搜索记忆"),
     "memory.fetch.called": ("📖", "读取记忆卡"),
     "memory.content.truncation": ("✂️", "记忆卡截断"),
+    "memory.content.rejected": ("⛔", "记忆卡超长拒绝"),
     "identity.dimensions_set": ("🪪", "身份维度重写"),
     "context.truncation": ("✂️", "上下文裁剪"),
 }

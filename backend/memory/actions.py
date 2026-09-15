@@ -7,6 +7,7 @@ import uuid
 
 
 import db
+import debug_trace
 from core.store import UserStore
 
 from bootstrap import gates as boot_gates
@@ -1160,6 +1161,18 @@ def _execute_memory_action(
             return dispatch()
         return action_receipts.execute(store, action, dispatch)
     except content_policy.ContentTooLong as exc:
+        try:
+            debug_trace.trace_event(
+                store, subsystem="memory", type="memory.content.rejected",
+                actor="backend", status="warning", summary="", explain="",
+                detail={"route": "memory_actions", "counts": {
+                    "actual_chars": exc.actual,
+                    "max_chars": content_policy.MAX_CONTENT_CHARS,
+                }},
+            )
+        except Exception as trace_error:  # noqa: BLE001 — do not mask the write rejection
+            log.warning("[memory.actions] rejection trace failed code=%s",
+                        type(trace_error).__name__)
         return {"status": "error", "error": exc.code, "detail": {
             "actual_chars": exc.actual, "max_chars": content_policy.MAX_CONTENT_CHARS,
         }}, [], 400

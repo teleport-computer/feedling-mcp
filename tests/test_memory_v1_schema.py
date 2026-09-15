@@ -178,6 +178,21 @@ def test_memory_add_oversize_returns_content_free_error(monkeypatch):
     assert secret not in json.dumps(body)
 
 
+def test_rejection_trace_failure_does_not_mask_the_write_error(monkeypatch):
+    saved = _install_memory_action_fakes(monkeypatch, [])
+    def fail_trace(*_args, **_kwargs):
+        raise RuntimeError("trace unavailable")
+    monkeypatch.setattr(memory_actions.debug_trace, "trace_event", fail_trace)
+    body, status = memory_actions._execute_memory_actions(
+        types.SimpleNamespace(user_id="usr_rejection_trace"), None,
+        [{"type": "memory.add", "memory": {
+            "summary": "Long card", "content": "x" * 5001, "source": "chat",
+        }}],
+    )
+    assert status == 400 and body["error"] == "memory_content_too_long"
+    assert saved == []
+
+
 def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1")
     saved = _install_memory_action_fakes(monkeypatch, [])
