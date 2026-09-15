@@ -33,8 +33,15 @@ def _install_dream_blob(monkeypatch, initial=None, capture_initial=None):
         blobs.setdefault(kind, {}).clear()
         blobs[kind].update(doc)
 
+    def fake_patch_blob_strict(user_id, kind, patch, **_kwargs):
+        # Same contract as db.patch_blob_strict: top-level merge (upsert).
+        assert user_id == _Store.user_id
+        blobs.setdefault(kind, {}).update(patch)
+        return dict(blobs[kind])
+
     monkeypatch.setattr(dream_scheduler.db, "get_blob", fake_get_blob)
     monkeypatch.setattr(dream_scheduler.db, "set_blob", fake_set_blob)
+    monkeypatch.setattr(dream_scheduler.db, "patch_blob_strict", fake_patch_blob_strict)
     return blobs[dream_scheduler.DREAM_STATE_KIND]
 
 

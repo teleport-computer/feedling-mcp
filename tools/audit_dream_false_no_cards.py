@@ -68,8 +68,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-job-age-days", type=float,
         default=dream_ledger_audit.DEFAULT_MAX_JOB_AGE_DAYS,
-        help="Only consider Dream jobs enqueued at most this long before the "
-             "earliest window start (index-friendly scan bound).",
+        help="Without --user-id: only consider Dream jobs enqueued at most this "
+             "long before the earliest window start (index-friendly scan bound; "
+             "the report then says partial=true). Ignored with --user-id.",
     )
     parser.add_argument(
         "--statement-timeout-sec", type=float,

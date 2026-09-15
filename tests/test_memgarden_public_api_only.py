@@ -22,8 +22,12 @@ imports inside functions and ``importlib.import_module("memgarden...")`` literal
     from memgarden import a              a in memgarden.__all__, or memgarden.a stable
     from memgarden.X import a            X stable and a in X.__all__
     from memgarden.X import *            always rejected
-    alias.attr                           when alias is bound to a stable module,
-                                         attr must be in that module's __all__
+    alias.attr[.more]                    the whole attribute chain is resolved:
+    memgarden.X.attr[.more]              ``import memgarden[.X]`` binds ``memgarden``;
+                                         after the longest stable module in the
+                                         chain, the next name must be in that
+                                         module's __all__; with no stable module,
+                                         memgarden.<name> must be in memgarden.__all__
 
 Complements ``test_orchestration_is_not_reimplemented.py`` (names of
 orchestration functions), which cannot see an import routed through a shim.
@@ -77,7 +81,10 @@ def violations(source: str, path: str = "<memory>") -> list[str]:
                     continue
                 if name != "memgarden" and name not in stable:
                     bad(node, name)
-                elif alias.asname and name in stable:
+                if not alias.asname:
+                    # ``import memgarden.X`` binds ``memgarden``, not ``X``.
+                    aliases["memgarden"] = "memgarden"
+                elif name == "memgarden" or name in stable:
                     aliases[alias.asname] = name
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
@@ -109,12 +116,27 @@ def violations(source: str, path: str = "<memory>") -> list[str]:
             if name != "memgarden" and name not in stable:
                 bad(node, name)
 
+    inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-                and node.value.id in aliases):
-            module = aliases[node.value.id]
-            if node.attr not in _exports(module):
-                bad(node, f"{module}.{node.attr}")
+        # Only whole chains: ``a.b.c`` is checked once, not again as ``a.b``.
+        if not isinstance(node, ast.Attribute) or id(node) in inner:
+            continue
+        attrs: list[str] = []
+        root: ast.AST = node
+        while isinstance(root, ast.Attribute):
+            attrs.insert(0, root.attr)
+            root = root.value
+        if not isinstance(root, ast.Name) or root.id not in aliases:
+            continue
+        parts = aliases[root.id].split(".") + attrs
+        floor = aliases[root.id].count(".") + 1
+        cut = next((i for i in range(len(parts), floor - 1, -1)
+                    if ".".join(parts[:i]) in stable), None)
+        if cut is not None:
+            if cut < len(parts) and parts[cut] not in _exports(".".join(parts[:cut])):
+                bad(node, ".".join(parts[:cut + 1]))
+        elif parts[1] not in top:  # root is the memgarden package itself
+            bad(node, ".".join(parts))
     return found
 
 
@@ -165,6 +187,13 @@ def test_production_code_imports_only_public_memgarden_api():
     ("from memgarden import retrieval as r\nr._evaluate('q', [])", "memgarden.retrieval._evaluate"),
     ("def f():\n    from memgarden.prompts import capture\n", "memgarden.prompts.capture"),
     ("import importlib\nimportlib.import_module('memgarden.scoring.selector')", "memgarden.scoring.selector"),
+    # Codex r4 M1: a dotted import binds ``memgarden``; resolve the whole chain.
+    ("import memgarden.retrieval\nmemgarden.retrieval._evaluate('q', [])", "memgarden.retrieval._evaluate"),
+    ("import memgarden\nmemgarden.retrieval._evaluate('q', [])", "memgarden.retrieval._evaluate"),
+    ("import memgarden\nmemgarden.prompts.capture.build()", "memgarden.prompts.capture.build"),
+    ("import memgarden.text.card_guard\nmemgarden.text.card_guard._strong", "memgarden.text.card_guard._strong"),
+    ("import memgarden as mg\nmg.retrieval._evaluate", "memgarden.retrieval._evaluate"),
+    ("from memgarden import text as t", "memgarden.text"),
 ])
 def test_guard_goes_red_on_internal_use(snippet, expected):
     found = violations(textwrap.dedent(snippet))
@@ -178,6 +207,10 @@ def test_guard_goes_red_on_internal_use(snippet, expected):
     "from memgarden.retrieval import rank, Tokenizer",
     "import memgarden.related as rel\nrel.one_hop([], [])",
     "from memgarden.text import card_guard",
+    "import memgarden.retrieval\nmemgarden.retrieval.rank([], [])",
+    "import memgarden\nmemgarden.GardenComponent\nmemgarden.STABLE_MODULES",
+    "import memgarden.text.card_guard as cg\ncg",
+    "import memgarden.retrieval as r\nr.rank.__name__",
 ])
 def test_guard_accepts_public_api(snippet):
     assert violations(snippet) == []

@@ -43,11 +43,17 @@ Limits: resident jobs are trimmed to the newest ``FEEDLING_PROACTIVE_JOB_MAX``
 (500) per user, so a user whose incident job was trimmed is not found; naive
 ``completed_at`` values (written with the server clock, UTC in the CVMs) are
 read as UTC. Runtime V2 empty-read no-ops do not carry this reason and are not
-covered. The candidate prefilter only considers jobs enqueued (indexed ``ts``
-column) within ``max_job_age_days`` before the earliest window start; a Dream
-job that sat pending longer than that before completing is not found (the
-report echoes the bound under ``prefilter``). Every statement runs under a
-transaction-local ``statement_timeout``.
+covered. Without ``user_ids`` (global discovery) the candidate prefilter only
+considers jobs enqueued (indexed ``ts`` column) within ``max_job_age_days``
+before the earliest window start; a Dream job that sat pending longer than that
+before completing is not found, so such a report carries ``partial: true`` and
+the bound under ``scan_bound``. With ``user_ids`` there is no enqueue-time bound
+(each user's job log is already capped at 500 rows) and ``partial`` is false.
+Every statement runs under a transaction-local ``statement_timeout``.
+
+A garden that is empty NOW is not decided here (this module cannot read
+cards): the repair re-checks it and leaves such a user alone, because an old
+consumer's "no cards" was then possibly true.
 
 REPAIR DESIGN (implemented in ``admin/dream_ledger_repair.py``)
 ---------------------------------------------------------------
@@ -55,7 +61,8 @@ REPAIR DESIGN (implemented in ``admin/dream_ledger_repair.py``)
    completion before the suspicious one — or to the never-dreamed zero state —
    leaving pending/backoff/skip/trace fields alone. The write is a
    compare-and-set on ``ledger_fingerprint`` of the current ledger under a row
-   lock, so a Dream that completed after the audit is never rewound.
+   lock, so a Dream that completed after the audit is never rewound. It is
+   refused while the user has a queued/running Dream job or no live cards.
 2. Reclassify the rewound false completions (``rewound_job_ids``) the way the
    fixed backend classifies them at report time: ``failed`` +
    ``dream_context_unavailable``, plus ``REPAIR_MARKER_KEY`` recording the
@@ -79,9 +86,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 LEGACY_NO_CARDS_REASON = "dream_no_cards_available"
-# Scan bound on a job's enqueue time, before the earliest window start. An
-# assumption, not a measured limit: a self-hosted consumer that was offline can
-# complete an old pending Dream late. Widen it when in doubt.
+# Global discovery only (no user_id given): scan bound on a job's enqueue time,
+# before the earliest window start. Picked in 4759417c when Codex review asked
+# for the fleet-wide prefilter to use the ``ts`` partial index instead of every
+# proactive_jobs row; it is not derived from data. A self-hosted consumer that
+# was offline longer can complete an old pending Dream inside a window, so a
+# bounded report says ``partial: true`` and naming the user removes the bound.
 DEFAULT_MAX_JOB_AGE_DAYS = 30.0
 DEFAULT_STATEMENT_TIMEOUT_SEC = 60.0
 DEFAULT_LEDGER_TOLERANCE_SEC = 300.0
@@ -440,11 +450,15 @@ def collect_inputs(
     Must run as the first statements of a transaction (``SET TRANSACTION READ
     ONLY``). Only users with a completed resident dream job whose
     ``completed_at`` string falls on a UTC date a window touches are loaded in
-    full (cheap prefilter; the exact window test is ``select_user``'s). That
-    scan is also bounded on the indexed enqueue time ``ts`` (partial index
-    ``ix_user_logs_proactive_jobs_ts``): a job completing inside a window was
-    enqueued before the window ended and, by assumption, at most
-    ``max_job_age_days`` before it started. Rows without ``ts`` are kept.
+    full (cheap prefilter; the exact window test is ``select_user``'s).
+
+    Global discovery (no ``user_ids``) also bounds that scan on the indexed
+    enqueue time ``ts`` (partial index ``ix_user_logs_proactive_jobs_ts``): a
+    job completing inside a window was enqueued before the window ended and, by
+    assumption, at most ``max_job_age_days`` before it started; rows without
+    ``ts`` are kept. The assumption can hide rows, so the result says
+    ``partial: True``. Named users are scanned without that bound (their logs
+    are capped per user), ``partial: False``.
     """
     validate_bounds(
         windows=windows,
@@ -458,31 +472,37 @@ def collect_inputs(
         (f"{int(float(statement_timeout_sec) * 1000)}ms",),
     )
     days = window_utc_dates(windows)
-    created_after = min(start for start, _end in windows) - timedelta(
-        days=float(max_job_age_days)
-    )
-    created_before = max(end for _start, end in windows)
     params: list[Any] = [
-        created_after.timestamp(),
-        created_before.timestamp(),
         DREAM_JOB_KIND,
         DREAM_JOB_KIND,
         REPAIR_MARKER_KEY,
         [f"{day}%" for day in days],
     ]
-    user_filter = ""
     if user_ids:
-        user_filter = " AND user_id = ANY(%s)"
-        params.append(list(user_ids))
+        scan_bound = None
+        scan_filter = "AND user_id = ANY(%s) "
+        params.insert(0, list(user_ids))
+    else:
+        created_after = min(start for start, _end in windows) - timedelta(
+            days=float(max_job_age_days)
+        )
+        created_before = max(end for _start, end in windows)
+        scan_bound = {
+            "enqueued_after": format_instant(created_after),
+            "enqueued_before": format_instant(created_before),
+            "max_job_age_days": float(max_job_age_days),
+        }
+        scan_filter = "AND (ts IS NULL OR (ts >= %s AND ts < %s)) "
+        params[0:0] = [created_after.timestamp(), created_before.timestamp()]
     affected = [
         row[0] for row in conn.execute(
             "SELECT DISTINCT user_id FROM user_logs "
             "WHERE stream = 'proactive_jobs' "
-            "AND (ts IS NULL OR (ts >= %s AND ts < %s)) "
+            + scan_filter +
             "AND (doc->>'job_kind' = %s OR doc->>'source' = %s) "
             # A repaired job is ``failed`` but keeps completed_at + the marker.
             "AND (doc->>'status' = 'completed' OR doc ? %s) "
-            "AND doc->>'completed_at' LIKE ANY(%s)" + user_filter,
+            "AND doc->>'completed_at' LIKE ANY(%s)",
             params,
         ).fetchall()
     ]
@@ -520,10 +540,10 @@ def collect_inputs(
         "v2_last_completed": v2_last,
         "prefilter": {
             "completed_on_utc_dates": days,
-            "enqueued_after": format_instant(created_after),
-            "enqueued_before": format_instant(created_before),
             "statement_timeout_sec": float(statement_timeout_sec),
         },
+        "scan_bound": scan_bound,
+        "partial": scan_bound is not None,
     }
 
 
@@ -552,4 +572,35 @@ def collect(
         ledger_tolerance_sec=ledger_tolerance_sec,
     )
     report["prefilter"] = inputs["prefilter"]
+    report["scan_bound"] = inputs["scan_bound"]
+    report["partial"] = inputs["partial"]
     return report
+
+
+def active_dream_job_ids(
+    conn,
+    user_id: str,
+    *,
+    resident_statuses: Iterable[str],
+    v2_statuses: Iterable[str],
+) -> list[str]:
+    """Ids of this user's Dream jobs that are still queued or running, both runtimes.
+
+    Resident ``memory_dream`` rows (a missing status reads as ``pending``, like
+    ``capture_jobs``) and Runtime V2 ``agent_jobs`` in the ``dream`` lane. The
+    status vocabularies come from the caller so they cannot drift from the job
+    modules that own them. Ids only.
+    """
+    rows = conn.execute(
+        "SELECT doc->>'job_id' FROM user_logs WHERE stream = 'proactive_jobs' "
+        "AND user_id = %s AND (doc->>'job_kind' = %s OR doc->>'source' = %s) "
+        "AND lower(COALESCE(NULLIF(btrim(doc->>'status'), ''), 'pending')) = ANY(%s) "
+        "UNION ALL "
+        "SELECT 'v2:' || id::text FROM agent_jobs "
+        "WHERE user_id = %s AND lane = 'dream' AND status = ANY(%s)",
+        (
+            user_id, DREAM_JOB_KIND, DREAM_JOB_KIND, sorted(resident_statuses),
+            user_id, sorted(v2_statuses),
+        ),
+    ).fetchall()
+    return sorted(str(row[0] or "") for row in rows)

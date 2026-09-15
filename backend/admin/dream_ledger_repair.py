@@ -19,14 +19,23 @@ rules.
 Safety properties, each covered by ``tests/test_admin_dream_false_no_cards.py``:
 
 - no bulk mode: the repair only touches ``user_id``s named in the request, each
-  paired with the ``ledger_fingerprint`` the audit reported for it;
+  paired with the ``ledger_fingerprint``, ``job_id`` and ``rewound_job_ids`` the
+  audit reported for it (a mismatch is skipped: ``jobs_changed_since_audit``);
 - ``dry_run`` defaults to true and must be the JSON boolean ``false`` to write;
 - the selector is re-run inside the request; a user that is no longer a
   candidate is skipped with its verdict, and ``already_repaired`` is a no-op;
+- a garden with no live cards NOW is skipped (``ambiguous_legacy_no_cards``):
+  the user may have deleted every card after the Dream was queued, and then the
+  old consumer's "no cards" was true. Rewinding would not help such a user
+  anyway — the scheduler enqueues nothing for an empty garden;
 - the ledger write is ``db.patch_blob_if_match_strict``: row lock, fingerprint
-  compare, top-level merge, TEE shadow mirror of the committed document. A
-  Dream that completed after the audit changes the fingerprint and is skipped
-  (and then no job is reclassified either);
+  compare, no active Dream job for the user (both runtimes, checked in the same
+  transaction; ``dream_job_active``), top-level merge, TEE shadow mirror of the
+  committed document. A Dream that completed after the audit changes the
+  fingerprint and is skipped (and then no job is reclassified either). A Dream
+  job recording its result after this commit cannot put the old ledger back:
+  ``dream_scheduler.save_dream_state`` only writes ledger fields for a
+  completion, which is a real Dream;
 - job reclassification runs only after the ledger is at the rewind target, via
   ``db.log_patch_item`` guarded on ``status = 'completed'`` (mirrored to TEE
   only when the guard matched). An interrupted run is finished by re-running:
@@ -48,6 +57,8 @@ from typing import Any, Iterable, Mapping
 
 import db
 import debug_trace
+from model_api_runtime.v2 import jobs_store
+from proactive import capture_jobs
 from proactive import dream_ledger_audit
 from proactive import dream_scheduler
 
@@ -79,7 +90,9 @@ _AUDIT_PARAMS = frozenset({
 _REPAIR_KEYS = frozenset({
     "windows", "users", "dry_run", "max_job_age_days", "ledger_tolerance_sec",
 })
-_REPAIR_USER_KEYS = frozenset({"user_id", "ledger_fingerprint"})
+_REPAIR_USER_KEYS = frozenset({"user_id", "ledger_fingerprint", "job_id", "rewound_job_ids"})
+#: A user's resident job log is capped at this many rows (``PROACTIVE_JOB_MAX``).
+MAX_REWOUND_JOB_IDS = 500
 
 
 class BadRequest(ValueError):
@@ -131,10 +144,10 @@ def _bounded_float(raw: Any, name: str, *, default: float, maximum: float,
     return value
 
 
-def _user_id(raw: Any) -> str:
+def _id(raw: Any, detail: str = "invalid_user_id") -> str:
     text = raw.strip() if isinstance(raw, str) else ""
     if not _ID_RE.match(text):
-        raise BadRequest("invalid_user_id")
+        raise BadRequest(detail)
     return text
 
 
@@ -151,7 +164,7 @@ def parse_audit_query(items: Iterable[tuple[str, str]]) -> dict[str, Any]:
         if key in single:
             raise BadRequest(f"duplicate_{key}")
         single[key] = value
-    user_ids = sorted({_user_id(value) for key, value in pairs if key == "user_id"})
+    user_ids = sorted({_id(value) for key, value in pairs if key == "user_id"})
     if len(user_ids) > MAX_AUDIT_USER_IDS:
         raise BadRequest("too_many_user_ids")
     return {
@@ -198,14 +211,23 @@ def parse_repair_body(payload: Any) -> dict[str, Any]:
     for entry in users:
         if not isinstance(entry, Mapping) or set(entry) != _REPAIR_USER_KEYS:
             raise BadRequest("invalid_user_entry")
-        user_id = _user_id(entry.get("user_id"))
+        user_id = _id(entry.get("user_id"))
         fingerprint = entry.get("ledger_fingerprint")
         if not isinstance(fingerprint, str) or not _FINGERPRINT_RE.match(fingerprint):
             raise BadRequest("invalid_ledger_fingerprint")
+        job_id = _id(entry.get("job_id"), "invalid_job_id")
+        rewound = entry.get("rewound_job_ids")
+        if (not isinstance(rewound, list) or not rewound
+                or len(rewound) > MAX_REWOUND_JOB_IDS):
+            raise BadRequest("invalid_rewound_job_ids")
+        rewound_ids = sorted({_id(item, "invalid_rewound_job_ids") for item in rewound})
         if user_id in seen:
             raise BadRequest("duplicate_user_id")
         seen.add(user_id)
-        targets.append({"user_id": user_id, "ledger_fingerprint": fingerprint})
+        targets.append({
+            "user_id": user_id, "ledger_fingerprint": fingerprint,
+            "job_id": job_id, "rewound_job_ids": rewound_ids,
+        })
     return {
         "dry_run": dry_run,
         "windows": _parse_windows(raw_windows),
@@ -252,6 +274,8 @@ def audit_payload(params: Mapping[str, Any]) -> dict[str, Any]:
     )
     report["mode"] = "read_only"
     report["prefilter"] = inputs["prefilter"]
+    report["scan_bound"] = inputs["scan_bound"]
+    report["partial"] = inputs["partial"]
     report["user_filter_count"] = len(params["user_ids"])
     report["ledger_tolerance_sec"] = params["ledger_tolerance_sec"]
     report["generated_at"] = _now_iso()
@@ -342,6 +366,40 @@ def _reclassify_jobs(user_id: str, jobs: Iterable[Mapping[str, Any]],
     return changed
 
 
+def _active_job_ids(conn, user_id: str) -> list[str]:
+    return dream_ledger_audit.active_dream_job_ids(
+        conn, user_id,
+        resident_statuses=capture_jobs.CAPTURE_ACTIVE_STATUSES,
+        v2_statuses=jobs_store._ACTIVE_STATUSES,
+    )
+
+
+def _read_active_job_ids(user_id: str) -> list[str]:
+    """Dry-run preview of the in-transaction check the write repeats."""
+    with db.get_pool().connection(timeout=POOL_ACQUIRE_TIMEOUT_SEC) as conn:
+        with conn.transaction():
+            conn.execute("SET TRANSACTION READ ONLY")
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{REPAIR_WRITE_STATEMENT_TIMEOUT_MS}ms",),
+            )
+            return _active_job_ids(conn, user_id)
+
+
+def _live_card_count(user_id: str) -> int | None:
+    """The owner's live card count the scheduler enqueues on; ``None`` if unreadable.
+
+    Only a count leaves this function — no card content.
+    """
+    try:
+        snapshot = dream_scheduler._dream_snapshot(SimpleNamespace(user_id=user_id))
+        return int(snapshot.get("card_count") or 0)
+    except Exception as exc:  # noqa: BLE001 — unreadable garden: do not write
+        log.warning("[admin:dream-ledger-repair] card count failed user=%s code=%s",
+                    user_id, type(exc).__name__)
+        return None
+
+
 def _result_row(user_id: str, action: str, reason: str,
                 row: Mapping[str, Any] | None = None, **extra) -> dict[str, Any]:
     out: dict[str, Any] = {"user_id": user_id, "action": action, "reason": reason}
@@ -360,7 +418,9 @@ def repair_payload(params: Mapping[str, Any], *, clock=time.monotonic) -> dict[s
     ``action`` per user: ``would_rewind`` (dry run), ``rewound``,
     ``already_repaired`` (ledger already at the target; apply mode only finishes
     any ``unreclassified_job_ids``), ``skipped`` (``reason`` = the selector
-    verdict, ``ledger_changed_since_audit``, or ``ledger_missing``) or
+    verdict, ``jobs_changed_since_audit``, ``ambiguous_legacy_no_cards``,
+    ``garden_unreadable``, ``dream_job_active`` (+ ``active_job_ids``),
+    ``ledger_changed_since_audit``, or ``ledger_missing``) or
     ``not_attempted`` (write budget exhausted). Re-running is idempotent.
     """
     dry_run = bool(params["dry_run"])
@@ -388,6 +448,15 @@ def repair_payload(params: Mapping[str, Any], *, clock=time.monotonic) -> dict[s
             v2_last_completed=inputs["v2_last_completed"].get(user_id),
             ledger_tolerance_sec=params["ledger_tolerance_sec"],
         )
+        if verdict in ("already_repaired", "candidate") and (
+            row["job_id"] != target["job_id"]
+            or sorted(set(row["rewound_job_ids"])) != target["rewound_job_ids"]
+        ):
+            result = _result_row(user_id, "skipped", "jobs_changed_since_audit", row)
+            results.append(result)
+            if not dry_run:
+                _emit_repair_event(user_id, result)
+            continue
         if verdict == "already_repaired":
             pending = list(row["unreclassified_job_ids"])
             if dry_run or not pending:
@@ -417,23 +486,53 @@ def repair_payload(params: Mapping[str, Any], *, clock=time.monotonic) -> dict[s
             if not dry_run:
                 _emit_repair_event(user_id, result)
             continue
+        if clock() - started > REPAIR_WRITE_BUDGET_SEC:
+            results.append(_result_row(user_id, "not_attempted", "request_budget_exhausted", row))
+            continue
+        card_count = _live_card_count(user_id)
+        if not card_count:
+            result = _result_row(
+                user_id, "skipped",
+                "ambiguous_legacy_no_cards" if card_count == 0 else "garden_unreadable",
+                row,
+            )
+            results.append(result)
+            if not dry_run:
+                _emit_repair_event(user_id, result)
+            continue
         changes = _ledger_changes(row["expected_ledger"], row["restore_ledger"])
         if dry_run:
+            active = _read_active_job_ids(user_id)
+            if active:
+                results.append(_result_row(
+                    user_id, "skipped", "dream_job_active", row, active_job_ids=active,
+                ))
+                continue
             results.append(_result_row(
                 user_id, "would_rewind", verdict, row, changes=changes,
                 would_reclassify_job_ids=list(row["unreclassified_job_ids"]),
             ))
             continue
-        if clock() - started > REPAIR_WRITE_BUDGET_SEC:
-            results.append(_result_row(user_id, "not_attempted", "request_budget_exhausted", row))
-            continue
+        refusal: dict[str, Any] = {}
+
+        def precondition(doc, conn, *, _user_id=user_id, _fp=expected, _refusal=refusal):
+            if dream_ledger_audit.ledger_fingerprint(doc) != _fp:
+                _refusal["reason"] = "ledger_changed_since_audit"
+                return False
+            # Same transaction as the write, after the row lock: a job queued
+            # after this read starts from the repaired ledger or, if it read
+            # earlier, can only merge non-ledger fields (``save_dream_state``).
+            active = _active_job_ids(conn, _user_id)
+            if active:
+                _refusal.update(reason="dream_job_active", active_job_ids=active)
+                return False
+            return True
+
         applied, persisted = db.patch_blob_if_match_strict(
             user_id,
             dream_ledger_audit.DREAM_STATE_KIND,
             dict(row["restore_ledger"]),
-            precondition=lambda doc, fp=expected: (
-                dream_ledger_audit.ledger_fingerprint(doc) == fp
-            ),
+            precondition=precondition,
             statement_timeout_ms=REPAIR_WRITE_STATEMENT_TIMEOUT_MS,
         )
         if applied:
@@ -448,11 +547,13 @@ def repair_payload(params: Mapping[str, Any], *, clock=time.monotonic) -> dict[s
                     job_id for job_id in row["unreclassified_job_ids"] if job_id not in done
                 ],
             )
+        elif persisted is None:
+            result = _result_row(user_id, "skipped", "ledger_missing", row)
         else:
             result = _result_row(
-                user_id, "skipped",
-                "ledger_changed_since_audit" if persisted is not None else "ledger_missing",
-                row,
+                user_id, "skipped", refusal.get("reason", "ledger_changed_since_audit"), row,
+                **({"active_job_ids": refusal["active_job_ids"]}
+                   if "active_job_ids" in refusal else {}),
             )
         results.append(result)
         _emit_repair_event(user_id, result)
@@ -469,5 +570,7 @@ def repair_payload(params: Mapping[str, Any], *, clock=time.monotonic) -> dict[s
         "counts": dict(sorted(counts.items())),
         "results": results,
         "prefilter": inputs["prefilter"],
+        "scan_bound": inputs["scan_bound"],
+        "partial": inputs["partial"],
         "generated_at": _now_iso(),
     }

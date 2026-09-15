@@ -466,7 +466,8 @@ async def dream_false_no_cards_repair(request: Request):
     """Per-user compare-and-set rewind of the Dream ledger fields only.
 
     Dry run unless the body says ``"dry_run": false``; only the listed
-    ``user_id``s, each with the ``ledger_fingerprint`` its audit row reported.
+    ``user_id``s, each with the ``ledger_fingerprint``, ``job_id`` and
+    ``rewound_job_ids`` its audit row reported.
     """
     _require_admin(request)
     try:
