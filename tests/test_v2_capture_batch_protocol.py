@@ -3184,3 +3184,152 @@ def test_opt_out_waits_for_crash_accounting_and_suppresses_its_notice(monkeypatc
     assert state["last_capture_failed_job_id"] == str(job_id)
     # 但提交后发提示时落卡已经关了：不再告诉用户「正在重试」。
     assert _backoff_notice(uid) is None
+
+
+# --- 整个 worker 容器死了、租约还没到期（#9 余项） ------------------------------ #
+
+_DEAD_WORKER = "v2-worker-deadtest-1-0a1b2c3d-abc1234"
+
+
+def _fleet_owner(worker_id: str = _DEAD_WORKER, pool: str = "heavy") -> str:
+    return f"{worker_id}:{pool}-0:{'0' * 31}1"
+
+
+def _beat(worker_id: str, *, age_sec: float) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_worker_heartbeats (worker_id, beat_at, kind, capacity, pool) "
+            "VALUES (%s, clock_timestamp() - make_interval(secs => %s), %s, 1, %s) "
+            "ON CONFLICT (worker_id) DO UPDATE SET beat_at=EXCLUDED.beat_at",
+            (
+                worker_id,
+                float(age_sec),
+                "genesis" if worker_id.endswith(":genesis") else "turn",
+                worker_id.rsplit(":", 1)[-1],
+            ),
+        )
+
+
+def _age_claim(job_id: int, *, age_sec: float) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE agent_jobs SET claimed_at=clock_timestamp() - make_interval(secs => %s) "
+            "WHERE id=%s",
+            (float(age_sec), job_id),
+        )
+
+
+@pytest.fixture()
+def _dead_worker_heartbeats():
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_worker_heartbeats WHERE worker_id LIKE 'v2-worker-deadtest-%'")
+    yield
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_worker_heartbeats WHERE worker_id LIKE 'v2-worker-deadtest-%'")
+
+
+def _whole_worker_went_silent(worker_id: str = _DEAD_WORKER) -> None:
+    stale = jobs_store.CAPTURE_OWNER_DEAD_SEC + 60
+    for name in ("foreground", "wake", "heavy", "genesis"):
+        _beat(f"{worker_id}:{name}", age_sec=stale)
+
+
+def test_fleet_claim_owner_parses_only_the_production_slot_shape():
+    assert jobs_store.fleet_claim_owner(_fleet_owner()) == (_DEAD_WORKER, "heavy")
+    assert jobs_store.fleet_claim_owner(
+        f"a:b:wake-12:{'f' * 32}"
+    ) == ("a:b", "wake")
+    for unknown in (
+        "live-capture",
+        f"{_DEAD_WORKER}#0",
+        f"{_DEAD_WORKER}:heavy-0:g0",
+        f"{_DEAD_WORKER}:genesis",
+        f"{_DEAD_WORKER}:other-0:{'0' * 32}",
+        None,
+    ):
+        assert jobs_store.fleet_claim_owner(unknown) is None
+
+
+def test_chat_preempt_counts_a_capture_whose_whole_worker_died_before_its_lease_expired(
+    _dead_worker_heartbeats,
+):
+    """容器整个死掉时租约还有几分钟：活跃聊天每次抢占都重投，崩溃就永远记不上账。
+
+    主人的全部心跳（三个池 + genesis）都停了超过窗口、claim 也早于窗口 → 按崩溃终结 + 记一次。
+    """
+    uid = "u_capture_chat_preempt_dead_worker"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    owner = _fleet_owner()
+    job_id, _job = _running(uid, owner=owner)
+    _age_claim(job_id, age_sec=jobs_store.CAPTURE_OWNER_DEAD_SEC + 60)
+    _whole_worker_went_silent()
+    assert _job_row(job_id)[5] is True  # lease still set and not expired
+
+    _seq, chat_id = _chat_send(uid, "chat-after-worker-death")
+
+    assert chat_id is not None
+    assert _job_row(job_id)[:4] == ("expired", 1, "lease_timeout", owner)
+    state = _capture_state(uid)
+    assert int(state["capture_fail_streak"]) == 1
+    assert state["last_capture_failed_job_id"] == str(job_id)
+    # The lease reaper later sees a terminal row and must not count it again.
+    assert all(r["lane"] != "capture" for r in _reap_future())
+    assert int(_capture_state(uid)["capture_fail_streak"]) == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "home_pool_beating",
+        "genesis_thread_still_beating",
+        "other_pool_still_beating",
+        "owner_never_registered",
+        "claim_younger_than_window",
+        "unknown_claim_shape",
+    ],
+)
+def test_chat_preempt_still_requeues_a_capture_whose_owner_is_not_provably_dead(
+    _dead_worker_heartbeats, case
+):
+    uid = f"u_capture_chat_preempt_alive_{case}"[:60]
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    owner = "live-capture" if case == "unknown_claim_shape" else _fleet_owner()
+    job_id, _job = _running(uid, owner=owner)
+    if case != "claim_younger_than_window":
+        _age_claim(job_id, age_sec=jobs_store.CAPTURE_OWNER_DEAD_SEC + 60)
+    if case != "owner_never_registered":
+        _whole_worker_went_silent()
+    fresh = {
+        "home_pool_beating": "heavy",
+        "genesis_thread_still_beating": "genesis",
+        "other_pool_still_beating": "foreground",
+    }.get(case)
+    if fresh:
+        _beat(f"{_DEAD_WORKER}:{fresh}", age_sec=0)
+
+    _chat_send(uid, f"chat-{case}")
+
+    assert _job_row(job_id)[:3] == ("pending", 0, "foreground_chat_preempted")
+    assert int(_capture_state(uid).get("capture_fail_streak") or 0) == 0
+
+
+def test_chat_preempt_of_a_dead_workers_non_capture_job_is_unchanged(
+    _dead_worker_heartbeats,
+):
+    """死主人判据只接在落卡分支上：别的 lane 照旧让位（superseded），不记落卡失败。"""
+    uid = "u_dead_worker_non_capture"
+    _seed(uid)
+    owner = _fleet_owner(pool="wake")
+    job_id, coalesced = jobs_store.enqueue_job(uid, "heartbeat")
+    assert not coalesced
+    job = jobs_store.claim_next_job(owner, lanes={"heartbeat"})
+    assert job is not None and int(job["id"]) == job_id
+    _age_claim(job_id, age_sec=jobs_store.CAPTURE_OWNER_DEAD_SEC + 60)
+    _whole_worker_went_silent()
+
+    _chat_send(uid, "chat-dead-heartbeat")
+
+    assert _job_row(job_id)[:3] == ("superseded", 0, "foreground_chat_preempted")
+    assert int(_capture_state(uid).get("capture_fail_streak") or 0) == 0

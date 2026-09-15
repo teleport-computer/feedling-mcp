@@ -1067,6 +1067,68 @@ def coalesce_or_insert_on_cursor(
     return int(cur.fetchone()["id"]), False
 
 
+# --- 整个 worker 容器死了、租约还没到期：前台抢占怎么认出来 --------------------- #
+#
+# 生产上每个 slot 子进程认领 job 时 claimed_by = ``{worker_id}:{pool}-{index}:{代次 uuid hex}``
+# （turn_child._run），而同一个父进程每 ~10s 往 v2_worker_heartbeats 写 ``{worker_id}:{pool}``
+# 三行（_fleet_heartbeat_loop），Genesis 线程另写 ``{worker_id}:genesis``。worker_id 每次进程
+# 启动都带随机段（runner_identity / _default_worker_id），重启后的新容器**不会**冒用死掉的
+# 那个身份。于是「这个 claim 的主人整个没了」有一个不靠猜的判据：
+#   1. claimed_by 是上面这个生产形状（别的形状一律判不了 → 照旧重投）；
+#   2. 主人所在池的心跳行**存在**（证明登记过这个主人，不是还没来得及写第一拍）；
+#   3. 这个主人的**全部**心跳行（三个池 + genesis）都超过窗口没更新——只一个池的循环卡住
+#      而进程还活着，不算死；Genesis 心跳走独立线程，事件循环卡死时它还在跳；
+#   4. claim 本身也早于窗口（刚认领的 job 不可能已经被一个「窗口前就死了」的主人持有）。
+#
+# 窗口默认 120s，与 Genesis 孤儿回收的 FEEDLING_GENESIS_WORKER_DEAD_SEC 同值同语义：
+# 心跳间隔 10s 的 12 倍；大于 _run_forever 的最长重启退避 30s + slot 排空 12s。
+# 下限 60s。判错（主人其实还活着）的代价与租约回收器判过期相同：这一轮落卡被终结并记
+# 一次失败，存活的子进程提交时被 claimed_by/状态栅栏挡掉，批次协议保证不会双写。
+CAPTURE_OWNER_DEAD_SEC = max(
+    60.0, _positive_float_env("FEEDLING_V2_CAPTURE_OWNER_DEAD_SEC", "120")
+)
+_FLEET_POOLS = ("foreground", "wake", "heavy")
+_FLEET_CLAIM_RE = re.compile(
+    r"^(?P<worker>.+):(?P<pool>foreground|wake|heavy)-[0-9]+:[0-9a-f]{32}$"
+)
+
+
+def fleet_claim_owner(claimed_by: object) -> tuple[str, str] | None:
+    """``(worker_id, pool)`` for a production slot claim; ``None`` when the shape is unknown."""
+    match = _FLEET_CLAIM_RE.fullmatch(str(claimed_by or ""))
+    if match is None:
+        return None
+    return match.group("worker"), match.group("pool")
+
+
+def _capture_owner_dead_on_cursor(cur: psycopg.Cursor, row: dict) -> bool:
+    owner = fleet_claim_owner(row.get("claimed_by"))
+    if owner is None:
+        return False
+    worker, pool = owner
+    family = [f"{worker}:{name}" for name in (*_FLEET_POOLS, "genesis")]
+    cur.execute(
+        "SELECT EXISTS (SELECT 1 FROM v2_worker_heartbeats WHERE worker_id=%s) "
+        "AND NOT EXISTS (SELECT 1 FROM v2_worker_heartbeats "
+        "  WHERE worker_id = ANY(%s) "
+        "  AND beat_at > clock_timestamp() - make_interval(secs => %s)) "
+        "AND EXISTS (SELECT 1 FROM agent_jobs WHERE id=%s "
+        "  AND claimed_at <= clock_timestamp() - make_interval(secs => %s)) "
+        "AS dead",
+        (
+            f"{worker}:{pool}",
+            family,
+            float(CAPTURE_OWNER_DEAD_SEC),
+            int(row["id"]),
+            float(CAPTURE_OWNER_DEAD_SEC),
+        ),
+    )
+    found = cur.fetchone()
+    if found is None:
+        return False
+    return bool(found["dead"] if isinstance(found, dict) else found[0])
+
+
 def _expire_overdue_capture_for_chat_on_cursor(
     cur: psycopg.Cursor, row: dict
 ) -> PreemptedJob | None:
@@ -1079,7 +1141,8 @@ def _expire_overdue_capture_for_chat_on_cursor(
     调用方（chat 发送事务）已持有 chat fence →（runtime 行）→ 这些 job 行，这里接着拿
     设置行 ``FOR SHARE`` 和 capture_state，顺序与落卡其他边界一致。runtime 行不再加锁
     （它必须排在 job 行之前），只读一次用来比对 generation。
-    租约仍有效的任务走下面原来的重投分支，逐字节不变。
+    租约仍有效、但能证明持有它的整个 worker 已死（``_capture_owner_dead_on_cursor``，
+    只读心跳表、不加锁）的任务同样终结 + 记账；其余租约仍有效的任务走下面原来的重投分支。
     """
     cur.execute(
         "SELECT id,user_id,lane,status,claimed_by,attempt_count,"
@@ -1092,10 +1155,13 @@ def _expire_overdue_capture_for_chat_on_cursor(
     job = cur.fetchone()
     if (
         job is None
-        or not bool(job["overdue"])
         or str(job["status"]) != str(row["status"])
         or job["claimed_by"] != row["claimed_by"]
     ):
+        return None
+    # 租约没过期、但持有它的整个 worker 已经死了（见 CAPTURE_OWNER_DEAD_SEC）：同样是崩溃，
+    # 同样终结 + 记账。判不了（形状不认识 / 心跳还新 / 刚认领）就照旧走重投。
+    if not bool(job["overdue"]) and not _capture_owner_dead_on_cursor(cur, dict(job)):
         return None
     cur.execute(
         "SELECT hosted_runtime_state,runtime_generation "

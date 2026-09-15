@@ -5347,13 +5347,56 @@ _LANE_ROLLUP_V2_SPOKE_JOIN = """
 # PG head 上实证过减法的洞:一次尝试可以先投出中间气泡、随后因租约超时终结成
 # expired(或 superseded),只扣 failed 的减法盖不住,恒等式当场不闭合。直接数
 # completed 那一侧结构上不会长出这类洞——除 completed 外的终态根本不在这个和里。
-_LANE_ROLLUP_V2_VOICE_SELECT = """
+#
+# 「显式声明的沉默」谓词只写**一份**，declared 用它、undeclared 用它的 NOT——
+# 两边各写一份时，改了一边忘了另一边，恒等式就会悄悄不闭合。谓词刻意写成
+# 永不为 NULL 的形态（IS NOT DISTINCT FROM），NOT 之后才是严格的补集。
+#
+# dream 的「花园太小、这次不整理」（2026-09-15 hx 拍板，不加列）：V2 worker 把它
+# 记成 status='completed' + wake_result='skipped'——一次模型都没问。它仍算
+# completed（终态口径不变），但落进 silent_declared 而不是 silent_undeclared：
+# 这是内核**明确声明**「没活可干」，与 sleep 同性质，而不是「不知道为什么没产出」
+# 的盲区。于是 dream 格子的三分解读作：
+#     spoke_completed   = 0（dream 结构上不说话，spoke 锚产出，这个 0 是真的）
+#     silent_declared   = skip（没真跑）
+#     silent_undeclared = 真跑过的完成
+# dream 的「真成功」= completed - silent_declared，读侧据此算成功率。
+# 不能把真跑的完成塞进 spoke_completed：0093 的 CHECK 要求 spoke_completed <= spoke，
+# 而 spoke 锚的是用户可见产出，为 dream 伪造 spoke 等于污染说话率。
+# 只认 lane='dream'：wake_result='skipped' 目前只有 dream 会写；别的 lane 将来若
+# 写了同一个词，语义要另行拍板，不能被这里静默吸收成「声明沉默」。
+_LANE_ROLLUP_V2_DECLARED_SILENCE = (
+    "(j.wake_result IS NOT DISTINCT FROM 'sleep' "
+    "OR (j.lane = 'dream' AND j.wake_result IS NOT DISTINCT FROM 'skipped'))"
+)
+# 读侧用：哪些 lane 的 silent_declared 是「没真跑的完成」（要从成功里剔掉）。
+# 心跳等唤醒 lane 的 sleep 是一次真跑过、模型选择闭嘴的完成，**仍算成功**，
+# 所以这里只放 dream。Python 与 SQL 两份表达都从这个集合出，别手抄 lane 名。
+LANE_ROLLUP_SKIP_DECLARED_LANES = frozenset({"dream"})
+_LANE_ROLLUP_ATTEMPTED_COMPLETED_SQL = (
+    "(completed - CASE WHEN lane IN ("
+    + ",".join(f"'{name}'" for name in sorted(LANE_ROLLUP_SKIP_DECLARED_LANES))
+    + ") THEN silent_declared ELSE 0 END)"
+)
+
+
+def lane_rollup_skipped(lane: object, silent_declared: object) -> int:
+    """How many of a frozen cell's completions never actually ran (dream skip)."""
+    if str(lane or "") not in LANE_ROLLUP_SKIP_DECLARED_LANES:
+        return 0
+    try:
+        return max(0, int(silent_declared or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+_LANE_ROLLUP_V2_VOICE_SELECT = f"""
                COUNT(*) FILTER (WHERE spoke.hit)::int,
                COUNT(*) FILTER (WHERE spoke.hit AND j.status = 'completed')::int,
                COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
-                                  AND j.wake_result = 'sleep')::int,
+                                  AND {_LANE_ROLLUP_V2_DECLARED_SILENCE})::int,
                COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
-                                  AND j.wake_result IS DISTINCT FROM 'sleep')::int"""
+                                  AND NOT {_LANE_ROLLUP_V2_DECLARED_SILENCE})::int"""
 
 # resident 的送达锚：聊天行自带 proactive_job_id，能落到具体那一次尝试。
 #
@@ -7318,7 +7361,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
         return {
             "completed": 0, "failed": 0, "expired": 0, "superseded": 0,
             "operational_failures": 0, "control_outcomes": 0,
-            "user_unavailable": 0, "failure_codes": {},
+            "user_unavailable": 0, "skipped": 0, "failure_codes": {},
         }
 
     output: dict[str, dict] = {}
@@ -7396,6 +7439,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                 "operational_failures": int(row[11] or 0),
                 "control_outcomes": int(row[12] or 0),
                 "user_unavailable": int(row[13] or 0),
+                "skipped": lane_rollup_skipped(lane, row[14]),
             }
             for bucket in (
                 lanes.setdefault(lane, empty_counts()),
@@ -7406,7 +7450,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -7416,7 +7460,9 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
             per_user = per_user_lane.setdefault(
                 (lane, user_id), {"completed": 0, "failed": 0}
             )
-            per_user["completed"] += counts["completed"]
+            # 集中度的「零成功」按真跑过的完成算：只有 skip + 失败的 dream 用户
+            # 就是零成功，不能被 skip 充当成功。
+            per_user["completed"] += counts["completed"] - counts["skipped"]
             per_user["failed"] += counts["failed"]
 
         if coverage_level == "green":
@@ -7516,7 +7562,8 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                   SELECT user_id, day, route, lane, enqueue_source,
                          completed, failed, expired, superseded, failure_codes,
                          operational_failures, control_outcomes,
-                         user_unavailable
+                         user_unavailable, silent_declared,
+                         {attempted_completed} AS attempted_completed
                   FROM lane_daily_rollup
                   WHERE day >= %s AND day <= %s
                     AND route IN ('resident', 'model_api')
@@ -7531,7 +7578,9 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          coalesce(sum(control_outcomes), 0)::bigint
                            AS control_outcomes,
                          coalesce(sum(user_unavailable), 0)::bigint
-                           AS user_unavailable
+                           AS user_unavailable,
+                         coalesce(sum(silent_declared), 0)::bigint
+                           AS silent_declared
                   FROM filtered
                   GROUP BY day, route, lane, enqueue_source
                 ), code_counts AS (
@@ -7559,11 +7608,12 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                 ), per_user_lane AS (
                   SELECT route, lane, user_id,
                          bool_or(day = %s) AS active_24h,
-                         coalesce(sum(completed)
+                         coalesce(sum(attempted_completed)
                            FILTER (WHERE day = %s), 0)::bigint AS completed_24h,
                          coalesce(sum(failed)
                            FILTER (WHERE day = %s), 0)::bigint AS failed_24h,
-                         coalesce(sum(completed), 0)::bigint AS completed_7d,
+                         coalesce(sum(attempted_completed), 0)::bigint
+                           AS completed_7d,
                          coalesce(sum(failed), 0)::bigint AS failed_7d
                   FROM filtered
                   GROUP BY route, lane, user_id
@@ -7606,13 +7656,17 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          'users_zero_success', lc.users_zero_success_7d,
                          'top_user_failure_share',
                            lc.top_user_failure_share_7d
-                       ) AS concentration_7d
+                       ) AS concentration_7d,
+                       c.silent_declared
                 FROM cells c
                 LEFT JOIN codes x USING (day, route, lane, enqueue_source)
                 JOIN route_users u USING (route)
                 JOIN lane_concentration lc USING (route, lane)
                 ORDER BY c.day, c.route, c.lane, c.enqueue_source
-                """,
+                """.replace(
+                    "{attempted_completed}",
+                    _LANE_ROLLUP_ATTEMPTED_COMPLETED_SQL,
+                ),
                 (
                     earliest.isoformat(), end_day.isoformat(),
                     end_day.isoformat(), end_day.isoformat(),
@@ -7628,7 +7682,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                 SELECT day, access_path, mode_source, user_id, lane,
                        enqueue_source, completed, failed, expired, superseded,
                        failure_codes, operational_failures, control_outcomes,
-                       user_unavailable
+                       user_unavailable, silent_declared
                 FROM lane_daily_rollup
                 WHERE day >= %s AND day <= %s
                   AND access_path <> 'unavailable'
@@ -7721,6 +7775,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
             "operational_failures": int(row[8] or 0),
             "control_outcomes": int(row[9] or 0),
             "user_unavailable": int(row[10] or 0),
+            "skipped": lane_rollup_skipped(row[2], row[16]),
             "failure_codes": {
                 str(code): int(count or 0)
                 for code, count in dict(row[11] or {}).items()
@@ -7778,13 +7833,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     {"completed": 0, "failed": 0,
                      "expired": 0, "superseded": 0,
                      "operational_failures": 0, "control_outcomes": 0,
-                     "user_unavailable": 0,
+                     "user_unavailable": 0, "skipped": 0,
                      "failure_codes": {}},
                 )
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -7796,13 +7851,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     {"completed": 0, "failed": 0,
                      "expired": 0, "superseded": 0,
                      "operational_failures": 0, "control_outcomes": 0,
-                     "user_unavailable": 0,
+                     "user_unavailable": 0, "skipped": 0,
                      "failure_codes": {}},
                 )
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     source_bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
