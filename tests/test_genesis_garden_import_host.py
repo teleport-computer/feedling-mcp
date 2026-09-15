@@ -236,3 +236,133 @@ def test_apply_route_rejects_engine_output_that_still_carries_cards(monkeypatch)
         service.apply_reducer_output(
             types.SimpleNamespace(user_id="usr_x"), None, "job_1",
             {"memories": [{"summary": "x"}], "garden_import": {"cards_written": 1}})
+
+
+# --------------------------------------------------------------------------- #
+# 旧上传入口 _process_history_import_sync：切换前的保护，在新引擎上恢复
+# --------------------------------------------------------------------------- #
+
+def _upload_env(monkeypatch, *, reply=None, rows=None, user_name: str = "TA") -> dict:
+    """真 ``_process_history_import_sync`` + 真引擎 + 真 memory action 映射；替身：模型、
+    执行器（落库）、已有卡读取、身份推导/问候（provider）、job 进度写库、台账。"""
+    import distillation_ledger
+    import genesis.llm_client as llm_client
+
+    monkeypatch.setenv(garden_import.STRATEGY_ENV, "single_pass")
+    calls: dict = {"actions": [], "prompts": [], "identity": [], "phases": []}
+
+    class FakeLLM:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            calls["prompts"].append(prompt)
+            if isinstance(reply, Exception):
+                raise reply
+            return types.SimpleNamespace(text=reply, stop_reason="stop")
+
+    def execute(_store, _api_key, actions, *, runtime_token=""):
+        start = len(calls["actions"])
+        calls["actions"].extend(actions)
+        out = rows(actions) if rows else [
+            _ok(f"mom_{start + i + 1}") for i in range(len(actions))]
+        return {"results": out}, 200
+
+    class Attempt:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def finish(self, _outcome):
+            pass
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(llm_client, "GenesisLLMClient", FakeLLM)
+    monkeypatch.setattr(memory_actions, "_execute_memory_actions", execute)
+    monkeypatch.setattr(import_engine, "existing_cards", lambda *_a, **_k: [])
+    monkeypatch.setattr(distillation_ledger, "history_attempt", Attempt)
+    monkeypatch.setattr(hi, "_update_history_job_phase",
+                        lambda _s, job, phase, **kw: calls["phases"].append(phase) or job)
+    monkeypatch.setattr(hi.hosted_config_store, "_load_runtime_provider_config",
+                        lambda *_a: types.SimpleNamespace(provider="p", model="m", base_url=""))
+    monkeypatch.setattr(hi, "_resolve_import_user_name", lambda *_a: (user_name, []))
+    monkeypatch.setattr(hi, "_import_language_for_store", lambda *_a: "zh-Hans")
+    monkeypatch.setattr(hi, "_derive_identity_with_provider",
+                        lambda _rt, _msgs, cards, *_a: calls["identity"].append(cards) or (
+                            {"agent_name": "小满", "dimensions": []}, []))
+    monkeypatch.setattr(hi, "_store_identity_payload", lambda *_a, **_k: {"id": "idn"})
+    monkeypatch.setattr(hi, "_generate_model_api_onboarding_greeting", lambda *_a: ("你好", []))
+    monkeypatch.setattr(hi, "_append_model_api_onboarding_greeting", lambda *_a: {"id": "msg_1"})
+    monkeypatch.setattr(hi.notices, "resolve", lambda *_a, **_k: None)
+    return calls
+
+
+_CHAT = ("[2025-03-01 10:00] 小雨: 我每周六早上都去西湖边骑车，已经坚持三年了。\n"
+         "[2025-03-01 10:01] 小满: 好厉害，下次带上我。\n")
+
+
+def _cards_reply(*cards: dict) -> str:
+    return json.dumps({"cards": [
+        {"action": "add", "type": "fact", "bucket": "爱好", "threads": [],
+         "importance": 0.6, "pulse": 0.3, **c} for c in cards]}, ensure_ascii=False)
+
+
+def _upload(payload: dict) -> dict:
+    return hi._process_history_import_sync(
+        types.SimpleNamespace(user_id="usr_upload"), "k", {"job_id": "hi_up"}, payload)
+
+
+def test_upload_model_failure_completes_job_like_before_instead_of_failing(monkeypatch):
+    """之前（切换前本入口）：每个窗口的抽取错误被吞掉，任务照常完成（身份卡、问候写了，0 张卡）。
+    切换后一度变成：模型一报错整单失败。恢复前者；写库本身坏了仍然失败（见下一条）。"""
+    calls = _upload_env(monkeypatch, reply=RuntimeError("provider_timeout_simulated"))
+    job = _upload({"content": _CHAT, "format": "plaintext"})
+    assert calls["prompts"], "确实问过模型"
+    assert job["status"] == "completed"
+    assert job["identity_written"] is True and job["onboarding_greeting_written"] is True
+    assert job["memories_created"] == 0 and calls["actions"] == []
+    assert any(w.startswith("provider_memory_import_failed:initial:history:RuntimeError")
+               for w in job["warnings"])
+    assert all("西湖" not in w for w in job["warnings"]), "warning 里不带材料内容"
+
+
+def test_upload_storage_failure_still_fails_the_job(monkeypatch):
+    _upload_env(monkeypatch, reply=_cards_reply({"summary": "每周六去西湖边骑车",
+                                                 "content": "每周六早上去西湖边骑车，坚持三年。"}),
+                rows=lambda actions: [_err("enclave_unavailable", 409) for _ in actions])
+    with pytest.raises(RuntimeError, match="memory_actions_failed:enclave_unavailable"):
+        _upload({"content": _CHAT, "format": "plaintext"})
+
+
+def test_upload_rewrites_user_placeholder_to_the_name_before_writing(monkeypatch):
+    """之前：模型写出「用户喜欢…」→ 写库前确定性改成「小雨喜欢…」（d72e74c4 / 67bf4b96）；
+    「用户增长」这类产品词不动。"""
+    calls = _upload_env(monkeypatch, user_name="小雨", reply=_cards_reply({
+        "summary": "用户喜欢周六早上去西湖边骑车",
+        "content": "用户喜欢清晨骑车，用户增长这个词不是在说人。",
+        "bucket": "关于用户", "threads": ["用户的周末"]}))
+    job = _upload({"content": _CHAT, "format": "plaintext"})
+    assert job["status"] == "completed"
+    mem = calls["actions"][0]["memory"]
+    assert mem["summary"] == "小雨喜欢周六早上去西湖边骑车"
+    assert mem["content"] == "小雨喜欢清晨骑车，用户增长这个词不是在说人。"
+    assert mem["bucket"] == "关于小雨" and mem["threads"] == ["小雨的周末"]
+    assert calls["identity"][0][0]["summary"] == "小雨喜欢周六早上去西湖边骑车"
+
+
+def test_upload_undated_archive_card_stays_undated(monkeypatch):
+    """之前（0831f3b0）：本入口材料里没写日期的卡 occurred_at 留空，不拿「认识那天」硬填。"""
+    calls = _upload_env(monkeypatch, reply=_cards_reply(
+        {"summary": "最喜欢的书是《小王子》", "content": "档案里写着最喜欢的书是《小王子》。"},
+        {"summary": "2019 年搬到杭州", "content": "2019-08-01 搬到杭州。", "occurred_at": "2019-08-01"}))
+    job = _upload({"memory_summary_content": "- 最喜欢的书是《小王子》\n- 2019-08-01 搬到杭州\n",
+                   "relationship_started_at": "2025-01-01"})
+    assert job["status"] == "completed"
+    assert any("[The entries they wrote]" in p for p in calls["prompts"])   # 档案走 curated_archive
+    dates = {a["memory"]["summary"]: a["memory"]["occurred_at"] for a in calls["actions"]}
+    assert dates == {"最喜欢的书是《小王子》": "", "2019 年搬到杭州": "2019-08-01"}

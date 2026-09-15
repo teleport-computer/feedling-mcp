@@ -2839,10 +2839,20 @@ def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
         return winner
 
 
+class _ImportModelStepFailed(RuntimeError):
+    """本入口里「问模型」那一步失败（provider 超时、限流、断连……）。"""
+
+
 class _GardenMemoryImport:
     """旧上传入口的记忆卡那一步，接到 genesis 同一个导入引擎上（没有持久进度：本入口
     失败后整单重跑，和切换前一样）。窗口划分沿用本入口：历史窗口在大档位时先采样
-    ``initial_windows`` 个跑前台，剩下的后台补；张数上限是本入口的分层配额。"""
+    ``initial_windows`` 个跑前台，剩下的后台补；张数上限是本入口的分层配额。
+
+    失败口径沿用切换前本入口：**模型那一侧**的失败（问模型报错、整组判不出来、整段卡
+    全被判不合格）只记一条 warning、这组材料不写卡，任务照常往下走（身份卡、问候、完成）；
+    **写库本身坏了**（信封/存储/鉴权）才让任务失败。
+    切换前是每个窗口各自吞掉抽取错误、继续下一个窗口；引擎里一组材料是一整个会话，
+    这里的粒度是「这一组」。"""
 
     def __init__(self, store: UserStore, api_key: str | None, job: dict, runtime, *,
                  analysis_messages: list[dict], fresh_start: bool, window_limit: int,
@@ -2875,10 +2885,19 @@ class _GardenMemoryImport:
         self.state = garden_import.new_state(locale=language, user_name=user_name)
         job_id = str(job.get("job_id") or "")
         self.job_id = job_id
-        self._fallback = relationship_start.isoformat()
-        self._complete = import_engine.llm_complete(
+        self._api_key = api_key
+        self.warnings: list[str] = []
+        complete = import_engine.llm_complete(
             GenesisLLMClient(persist_output=False), user_id=store.user_id, job_id=job_id,
             runtime=runtime)
+
+        def _complete(prompt: str, purpose: str) -> tuple[str, bool]:
+            try:
+                return complete(prompt, purpose)
+            except Exception as exc:  # noqa: BLE001
+                raise _ImportModelStepFailed(type(exc).__name__) from exc
+
+        self._complete = _complete
         self._write = import_engine.store_writer(store, api_key, source="history_import")
         self._known = import_engine.existing_cards(store, api_key, job_id=job_id) if groups else []
 
@@ -2888,9 +2907,11 @@ class _GardenMemoryImport:
         totals = self.state["totals"]
         before_written = int(totals.get("cards_written") or 0)
         before_dropped = int(totals.get("dropped") or 0)
+        # 不给兜底日期：材料里没写日期的卡（包括长期记忆档案）就留空，不拿「认识那天」硬填
+        # —— 本入口 0831f3b0 定下的规矩。genesis plaintext 的档案卡用关系开始日兜底是
+        # 那条入口自己的规矩（bf483fc7），不在这里。
         sources = gi.sources_from_groups(
-            self.groups, prefix=f"{stage}:", fallback_occurred_at=self._fallback,
-            fallback_families={"memory_summary"}, window_indices=indices)
+            self.groups, prefix=f"{stage}:", fallback_occurred_at="", window_indices=indices)
         done_windows = 0
         for source in sources:
             remaining = self.max_cards - int(totals.get("cards_written") or 0)
@@ -2907,15 +2928,29 @@ class _GardenMemoryImport:
                     memories_created=int(totals.get("cards_written") or 0),
                 )
 
-            result = gi.run_import(
-                sources=[source], state=self.state, job_key=self.job_id,
-                owner_key=str(self.store.user_id), existing_cards=self._known,
-                complete=self._complete, write=self._write, save=lambda _s: None,
-                on_batch=on_batch)
-            self._known = result.known
+            try:
+                result = gi.run_import(
+                    sources=[source], state=self.state, job_key=self.job_id,
+                    owner_key=str(self.store.user_id), existing_cards=self._known,
+                    complete=self._complete, write=self._write, save=lambda _s: None,
+                    on_batch=on_batch)
+            except (_ImportModelStepFailed, gi.GardenImportFailed, gi.GardenImportCardsRejected) as exc:
+                # 只记类别，不记内容。这组前面已经写进去的卡照样算数（totals 里有）；
+                # 已有记忆索引重读一次，免得后面的组看不到这组已经写进去的卡。
+                cause = exc.__cause__ if isinstance(exc, _ImportModelStepFailed) else exc
+                self.warnings.append(
+                    f"provider_memory_import_failed:{stage}:{source.family}:{type(cause).__name__}")
+                self._known = self._garden_import_index()
+            else:
+                self._known = result.known
             done_windows += len(source.windows)
         return {"written": int(totals.get("cards_written") or 0) - before_written,
                 "dropped": int(totals.get("dropped") or 0) - before_dropped}
+
+    def _garden_import_index(self) -> list[dict]:
+        from genesis import import_engine
+
+        return import_engine.existing_cards(self.store, self._api_key, job_id=self.job_id)
 
     def cards(self) -> list[dict]:
         return [{k: v for k, v in c.items() if k not in {"id", "_source_family"}}
@@ -3050,6 +3085,7 @@ def _process_history_import_sync(
         store, str(job["job_id"]), "memory"
     ) as attempt:
         initial = memory_import.run("initial")
+        warnings.extend(memory_import.warnings)
         attempt.finish(
             "not_provided" if not (initial["written"] + initial["dropped"])
             else "partial" if initial["dropped"]
@@ -3156,7 +3192,9 @@ def _process_history_import_sync(
             with distillation_ledger.history_attempt(
                 store, str(job["job_id"]), "memory"
             ) as attempt:
+                warned = len(memory_import.warnings)
                 extra = memory_import.run("background")
+                warnings.extend(memory_import.warnings[warned:])
                 attempt.finish(
                     "not_provided" if not (extra["written"] + extra["dropped"])
                     else "partial" if extra["dropped"]

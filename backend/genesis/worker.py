@@ -1886,6 +1886,41 @@ def derive_identity_from_persona(
     return doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
 
 
+def derive_identity_from_memory_summary(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    material: str,
+    llm: GenesisLLMClient | None = None,
+    user_name: str = "",
+) -> dict:
+    """长期记忆档案里带出来的 TA 名字、认识天数、关系锚点证据。
+
+    切换前这三样是档案那次 fact_write 顺带产出的（5965e943 / 3fcfc2fc 的
+    ``_memory_summary_name_only``：只留名字，不留性格维度）。记忆卡换到 memgarden 导入会话
+    之后，那次调用不再发生；这里原样再跑一次同一个 fact_write（和
+    ``derive_identity_from_persona`` 对人设材料的做法一样），**卡丢掉、只取身份那几样**
+    —— 卡已经由导入会话写过了。一次模型调用。没有名字时返回 {}（从不编造）。"""
+    text = str(material or "").strip()
+    if not text:
+        return {}
+    llm = llm or GenesisLLMClient()
+    doc = _memory_summary_name_only(_fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=f"{_idempotency_prefix(job_id, key_prefix)}:memory_summary_identity",
+        runtime=runtime,
+        fact_candidates=[],
+        memory_summary=text,
+        user_name=user_name,
+    ))
+    return {key: doc[key] for key in ("identity", "days_with_user", "relationship_anchor_evidence")
+            if key in doc}
+
+
 def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
     try:
         resp = httpx.post(
@@ -1962,6 +1997,11 @@ def _garden_reducer_output(
     }
     output["memories"] = []
     output["garden_import"] = {"cards_written": result.cards_written, "dropped": result.dropped}
+    if family == "memory_summary":
+        # 只上传长期记忆档案时，TA 的名字 / 认识天数 / 关系锚点照切换前从档案里带出来。
+        output.update(derive_identity_from_memory_summary(
+            user_id=str(store.user_id), job_id=job_id, runtime=runtime,
+            material=_joined_material(chunk_texts), llm=llm))
     if family == "history":
         # 切换前 fact_write 从消息时间跨度推「认识几天」；这里直接按解析出的时间戳算。
         output["days_with_user"] = history_import._history_span_days(messages)

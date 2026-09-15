@@ -32,11 +32,14 @@ id 记进去；续跑时发现 ``pending`` 就是当前这批，直接接着写�
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from memory import garden_component
+
+log = logging.getLogger(__name__)
 
 # ``ImportProgress`` / ``ImportRequest`` / ``ImportBatchResult`` 的批次字段来自 memgarden 的
 # 宿主驱动导入（0.20.1 之后的版本）。在函数里取：pin 升级之前，只 import 本模块的地方
@@ -265,8 +268,9 @@ def index_cards(items: Sequence[Mapping[str, Any]] | None) -> list[dict]:
     return out
 
 
-#: 这些是「这张卡本身不合格」—— 丢这一张、别的照写。其余错误（信封、存储、鉴权）
-#: 说明写库这件事本身坏了：整段抛出去，进度里的 pending 还在，下次续跑补写。
+#: 这些是「这张卡本身不合格」—— 丢这一张、别的照写；但一整段全被这样拒掉（一张没写进去）
+#: 就抛 ``GardenImportCardsRejected``。其余错误（信封、存储、鉴权）说明写库这件事本身坏了：
+#: 一张都没写成时整段抛出去，进度里的 pending 还在，下次续跑补写。
 CARD_LEVEL_ERRORS = frozenset({
     "title_required",
     "description_required",
@@ -292,6 +296,14 @@ def _row_error(row: Any) -> str:
     return str(row.get("error") or "") if isinstance(row, Mapping) else ""
 
 
+class GardenImportCardsRejected(RuntimeError):
+    """一段写卡指令交给执行器之后**一张都没写进去**，而且每张都是被判「这张卡不合格」拒掉的。
+
+    和切换前 ``genesis.service.apply_memory_outputs``（每 20 条一段，整段全被拒就抛）以及 VPS
+    「整批 failed 就抛」同一条规矩（6972427d）：一整段全被拒说明这次模型输出本身有问题，
+    不能当成「导入完成、0 张卡」收尾。"""
+
+
 def write_with_executor(
     mutations: Sequence[Mapping[str, Any]],
     *,
@@ -313,6 +325,7 @@ def write_with_executor(
     if not planned:
         return ids
     hard: list[str] = []
+    rejected: list[str] = []
     retry: list[tuple[int, dict]] = []
     rows = list(execute([a for _i, a in planned]) or [])
     if len(rows) < len(planned):
@@ -326,7 +339,9 @@ def write_with_executor(
         if str(action.get("type") or "") == "memory.supersede" and err in STALE_TARGET_ERRORS:
             retry.append((idx, {**{k: v for k, v in action.items() if k != "supersedes"},
                                 "type": "memory.add"}))
-        elif err not in CARD_LEVEL_ERRORS:
+        elif err in CARD_LEVEL_ERRORS:
+            rejected.append(err)
+        else:
             hard.append(err or "memory_action_failed")
     if retry:
         rows2 = list(execute([a for _i, a in retry]) or [])
@@ -334,10 +349,15 @@ def write_with_executor(
             rid = row_memory_id(row)
             if rid:
                 ids[idx] = rid
-            elif _row_error(row) not in CARD_LEVEL_ERRORS:
+            elif _row_error(row) in CARD_LEVEL_ERRORS:
+                rejected.append(_row_error(row))
+            else:
                 hard.append(_row_error(row) or "memory_action_failed")
-    if hard and not any(ids):
-        raise RuntimeError(f"memory_actions_failed:{hard[0]}")
+    if not any(ids):
+        if hard:
+            raise RuntimeError(f"memory_actions_failed:{hard[0]}")
+        if rejected:
+            raise GardenImportCardsRejected(f"memory_actions_failed:{rejected[0]}")
     return ids
 
 
@@ -386,6 +406,43 @@ def _request(source: ImportSource, params: Mapping[str, Any], *, job_key: str):
         max_total_cards=source.max_total_cards,
         idempotency_key=f"{job_key}:{source.key}",
     )
+
+
+#: 卡上用户看得见的文字字段 —— 和切换前 genesis ``worker._rewrite_memory_person_references``
+#: 改写的是同一批（导入卡没有 title / description，那两个字段这里不存在）。
+_PERSON_REFERENCE_FIELDS = ("summary", "content", "bucket")
+
+
+def _rewrite_text(text: str, user_name: str) -> str:
+    from identity import user_naming
+
+    try:
+        return user_naming.rewrite_user_reference(text, user_name)
+    except Exception:  # noqa: BLE001
+        # 已知：名字里带反斜杠时改写器会抛（test_card_user_referent 记着）。改写只是
+        # 最后一道兜底，不能因为它让整次导入失败 —— 原文照写。
+        return text
+
+
+def with_person_references_rewritten(mutation: Mapping[str, Any], user_name: str) -> dict:
+    """写库前把卡里指代本人的系统占位（「用户喜欢…」「The user wants…」）换成称呼。
+
+    恢复切换前的确定性兜底（d72e74c4 / 67bf4b96，``identity.user_naming.rewrite_user_reference``）：
+    提示词里的称呼规则是第一道，这里是写库前的最后一道。只在**导入**写卡这条路上跑 ——
+    日常落卡 / 做梦刻意不跑（产品语境会被改坏，见 tests/test_card_user_referent.py）。
+    代词不改（``subject`` 取中性默认值）：导入卡不带「这张卡说的是谁」，猜错会把 TA 自己的
+    「她」改成本人的名字 —— 与切换前 genesis fact_write 的口径一致。"""
+    out = dict(mutation)
+    card = dict(out.get("card") or {})
+    if not card:
+        return out
+    for key in _PERSON_REFERENCE_FIELDS:
+        if isinstance(card.get(key), str) and card[key]:
+            card[key] = _rewrite_text(card[key], user_name)
+    if isinstance(card.get("threads"), list):
+        card["threads"] = [_rewrite_text(str(t or ""), user_name) for t in card["threads"]]
+    out["card"] = card
+    return out
 
 
 def _register_known(known: list[dict], mutations: Sequence[Mapping], ids: Sequence[str]) -> None:
@@ -525,7 +582,12 @@ def run_import(
                     on_batch(source)
                 continue
 
-            mutations = list(outcome.mutations)
+            if replay:
+                mutations = list(outcome.mutations)  # 存进 pending 之前已经改写过
+            else:
+                user_name = str(params.get("user_name") or "")
+                mutations = [with_person_references_rewritten(m, user_name)
+                             for m in outcome.mutations]
             ids: list[str] = list((pending or {}).get("ids") or []) if replay else []
             state["pending"] = {
                 "session": source.key, "stage": outcome.stage, "offset": outcome.offset,
@@ -535,7 +597,19 @@ def run_import(
             save(state)
             while len(ids) < len(mutations):
                 chunk = mutations[len(ids):len(ids) + WRITE_CHUNK]
-                got = [str(x or "") for x in write(chunk, outcome.idempotency_key)]
+                try:
+                    got = [str(x or "") for x in write(chunk, outcome.idempotency_key)]
+                except GardenImportCardsRejected:
+                    if any(ids):
+                        # 这批前面几段已经写进去了：整批不是「一张没写」，这一段按丢弃记
+                        # （部分失败），别让一段坏卡把已写的也拖进反复重放。
+                        got = [""] * len(chunk)
+                    else:
+                        # 整批一张没写进去：job 以可重试失败结束。清掉 pending —— 什么都
+                        # 没写，重试时重新问模型，而不是把同一批被拒的卡原样再写一遍。
+                        state["pending"] = None
+                        save(state)
+                        raise
                 if len(got) != len(chunk):
                     raise RuntimeError("garden_import_write_ids_mismatch")
                 ids.extend(got)
@@ -545,6 +619,10 @@ def run_import(
             _register_known(known, mutations, ids)
             written = sum(1 for rid in ids if rid)
             dropped = len(ids) - written
+            if dropped:
+                # 只记张数，不记卡的内容（6972427d 的 VPS 部分失败告警，现在各入口共用）。
+                log.warning("garden import batch partial job=%s source=%s written=%d dropped=%d",
+                            job_key, source.family, written, dropped)
             totals["cards_written"] = int(totals.get("cards_written") or 0) + written
             totals["dropped"] = int(totals.get("dropped") or 0) + dropped
             entry["cards_written"] = int(entry.get("cards_written") or 0) + written
@@ -575,6 +653,7 @@ __all__ = [
     "DEFAULT_STRATEGY",
     "ENGINE",
     "FAMILY_POLICY",
+    "GardenImportCardsRejected",
     "GardenImportFailed",
     "ImportRunResult",
     "ImportSource",
@@ -594,5 +673,6 @@ __all__ = [
     "skip_sources",
     "sources_from_groups",
     "supersede_target",
+    "with_person_references_rewritten",
     "write_with_executor",
 ]

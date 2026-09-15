@@ -12194,6 +12194,83 @@ def test_distill_supersede_goes_out_as_supersede_action(monkeypatch):
     assert "mom_1" in batch2       # batch 1's real id is in batch 2's existing-memory index
 
 
+def test_distill_rewrites_user_placeholder_to_the_name_before_sealing(monkeypatch):
+    # 之前(d72e74c4 / 67bf4b96,经 genesis fact_write):VPS 导入卡封信封前「用户喜欢…」
+    # 确定性换成称呼。换引擎后只剩提示词规则;改写在引擎里(consumer 自己不调改写器)。
+    calls = _patch_memory_distill(monkeypatch, windows=1, cards_by_window={1: [
+        _import_card("用户喜欢周末去西湖边骑车")]})
+    monkeypatch.setattr(crc, "_resident_existing_identity",
+                        lambda: {"user_preferred_name": "小雨"})
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert [summary for summary, *_x in calls["envelopes"]] == ["小雨喜欢周末去西湖边骑车"]
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+
+
+def _reject_all(actions):
+    return {"status": "failed", "results": [
+        {"status": "error", "error": "memory_card_polluted", "http_status": 422} for _ in actions]}
+
+
+def test_distill_batch_with_every_card_rejected_fails_instead_of_completing(monkeypatch):
+    # 之前(6972427d):整批写卡全被拒 → 抛,job 留给后端回收重跑(受 attempt 上限约束),
+    # 不是「完成、0 张卡」。
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.setattr(crc, "execute_memory_actions",
+                        lambda actions: calls["actions"].append(len(actions)) or _reject_all(actions))
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["actions"] == [1]
+    assert calls["complete"] == []
+    assert calls["recheck"] == 0
+    assert crc._distill_in_progress is None
+
+
+def _recheck_returns(monkeypatch, memories):
+    fake_genesis = sys.modules["genesis"]
+    fake_genesis.worker = types.SimpleNamespace(
+        build_memory_recheck_from_material=lambda **kw: {"memories": memories})
+
+
+def test_distill_closing_recheck_write_failure_raises_instead_of_being_swallowed(monkeypatch):
+    # 之前:复查补的卡和第一遍一起写,整批失败就抛。换引擎后一度被 try/except 吞成「完成」。
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    _recheck_returns(monkeypatch, [{"summary": "复查补的一张卡", "content": "复查补的一张卡,有正文。",
+                                    "bucket": "爱好", "threads": []}])
+    real_execute = crc.execute_memory_actions
+    monkeypatch.setattr(crc, "execute_memory_actions",
+                        lambda actions: _reject_all(actions) if calls["actions"] else real_execute(actions))
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["complete"] == [], "复查卡整批写不进去 → job 不能以完成收尾"
+    assert crc._distill_in_progress is None
+
+
+def test_distill_closing_recheck_partial_write_logs_counts_only(monkeypatch, caplog):
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    _recheck_returns(monkeypatch, [
+        {"summary": "复查补的好卡", "content": "复查补的好卡,有正文。", "bucket": "爱好", "threads": []},
+        {"summary": "复查补的秘密坏卡", "content": "秘密内容。", "bucket": "爱好", "threads": []},
+    ])
+    real_execute = crc.execute_memory_actions
+
+    def execute(actions):
+        if not calls["actions"]:
+            return real_execute(actions)
+        calls["actions"].append(["recheck"])
+        return {"status": "partial", "results": [
+            {"status": "ok", "http_status": 201, "memory": {"id": "mom_r1"}},
+            {"status": "error", "error": "memory_card_polluted", "http_status": 422}]}
+
+    monkeypatch.setattr(crc, "execute_memory_actions", execute)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    with caplog.at_level("WARNING"):
+        crc._process_resident_distill_once()
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert "resident distill memory batch partial job=jobm applied=1 skipped=0 failed=1" in caplog.text
+    assert "秘密" not in caplog.text
+
+
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.

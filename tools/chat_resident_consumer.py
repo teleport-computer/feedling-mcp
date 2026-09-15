@@ -23112,7 +23112,10 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
         # 收口二次 pass(仅 VPS resident,切换前就有的行为,保持不变):原始素材 + 这次写进去的卡
         # 再给 agent,只补真实遗漏、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
         # 一轮模型调用 + 紧接着写库,中间不让路,所以不会重复写。
+        # 失败口径同切换前(6972427d):复查那次**模型调用**失败不致命(保留第一遍的卡);
+        # 复查卡**写库**整批失败要抛(交给后端回收重跑,受重试次数上限约束),部分失败只记张数。
         state["phase"] = "complete"
+        extra: list[dict] = []
         try:
             llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
             runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
@@ -23125,20 +23128,30 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
                 runtime=runtime, material=state["document"], written_memories=written_cards, llm=llm,
             )
             genesis_resident_heartbeat(job_id)
-            now_iso = datetime.now(_tzmod.utc).isoformat()
             extra = [
                 guarded for guarded in (
                     _resident_guard_distill_card(dict(m))
                     for m in (recheck.get("memories") or []) if isinstance(m, dict)
                 ) if guarded is not None
             ]
-            if extra:
-                rows = _resident_import_rows(
-                    [_resident_import_action(card, now_iso=now_iso) for card in extra]
-                )
-                written_total += sum(1 for row in rows if garden_import.row_memory_id(row))
         except Exception:
             log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
+        if extra:
+            now_iso = datetime.now(_tzmod.utc).isoformat()
+            actions = [_resident_import_action(card, now_iso=now_iso) for card in extra]
+            observation = _memory_batch_observation(actions, {"results": _resident_import_rows(actions)})
+            if observation["status"] == "failed":
+                raise RuntimeError("genesis_resident_memory_actions_failed")
+            if observation["failed_count"]:
+                log.warning(
+                    "resident distill memory batch partial job=%s applied=%d "
+                    "skipped=%d failed=%d",
+                    job_id,
+                    observation["applied_count"],
+                    observation["skipped_count"],
+                    observation["failed_count"],
+                )
+            written_total += observation["applied_count"]
 
     genesis_resident_complete(
         job_id, memory_action_count=written_total, identity_status="skipped"

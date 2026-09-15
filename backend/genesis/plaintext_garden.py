@@ -199,6 +199,28 @@ def _persona_voice_outputs(store, job_id: str, *, runtime, groups: list[dict], l
     return outputs
 
 
+def _memory_summary_identity_outputs(store, job_id: str, *, runtime, groups: list[dict], llm,
+                                     user_name: str) -> list[dict]:
+    """长期记忆档案带出来的 TA 名字 / 认识天数 / 关系锚点（切换前档案那次 fact_write 顺带
+    产出，见 ``worker.derive_identity_from_memory_summary``）。只在要写身份卡的那一步跑；
+    进 ``_plaintext_merge_reducer_outputs`` 时和切换前一样按 ``memory_summary`` 来源参与合并
+    （名字排在人设、聊天记录之后）。"""
+    out: list[dict] = []
+    for idx, group in enumerate(groups, start=1):
+        kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
+        family = str(group.get("source_family") or worker._source_family(kind))
+        chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
+        if family != "memory_summary" or not chunks:
+            continue
+        doc = worker.derive_identity_from_memory_summary(
+            user_id=store.user_id, job_id=job_id,
+            key_prefix=f"{job_id}:source_pass:{idx}:{family}", runtime=runtime,
+            material=worker._joined_material(chunks), llm=llm, user_name=user_name)
+        if doc:
+            out.append({**doc, "memories": [], "source_kind": kind, "source_family": family})
+    return out
+
+
 def _apply_non_memory(store, api_key: str | None, job_id: str, output: dict, *,
                       memory_action_count: int) -> dict:
     """``service.apply_reducer_output`` 去掉记忆那一段（卡已经由导入会话写过了）。"""
@@ -384,6 +406,9 @@ def _finish_output(store, api_key, job_id, *, runtime, source_groups, relationsh
     if include_persona_voice:
         outputs = _persona_voice_outputs(store, job_id, runtime=runtime, groups=source_groups,
                                          llm=llm, progress=progress, user_name=user_name)
+    if write_identity:
+        outputs.extend(_memory_summary_identity_outputs(
+            store, job_id, runtime=runtime, groups=source_groups, llm=llm, user_name=user_name))
     family = str((source_groups[0] if source_groups else {}).get("source_family") or "history")
     merged = pt._plaintext_merge_reducer_outputs(
         [*outputs, {"memories": cards, "source_family": family}],
@@ -394,7 +419,11 @@ def _finish_output(store, api_key, job_id, *, runtime, source_groups, relationsh
         identity, warnings = _derive_identity(runtime, msgs, cards, days=days, language=language,
                                               max_attempts=1)
         if foreground_identity.has_identity_signal(identity) and not pt._provider_identity_failure(warnings):
-            merged["identity"] = {**(merged.get("identity") or {}), **identity}
+            before = merged.get("identity") or {}
+            merged["identity"] = {**before, **identity}
+            if not str(identity.get("agent_name") or "").strip() and before.get("agent_name"):
+                # 推导没给名字（只有性格维度）时，别把档案里带出来的名字盖成空。
+                merged["identity"]["agent_name"] = before["agent_name"]
         elif isinstance(merged.get("persona"), dict) and str(merged["persona"].get("content") or "").strip():
             baseline = worker.derive_identity_from_persona(
                 user_id=store.user_id, job_id=job_id, runtime=runtime,
