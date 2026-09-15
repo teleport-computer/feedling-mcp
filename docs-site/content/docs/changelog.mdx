@@ -21,6 +21,12 @@ change must not be interpreted as an API guarantee.
   null/empty clearing remain supported. Existing preferences and ciphertext are
   not migrated, and `local_only` still requires encryption.
 
+- Tool schemas sent through OpenAI Chat Completions, OpenAI Responses,
+  Anthropic, and Bedrock now omit the internal `enforceItemBounds` annotation.
+  This prevents compatible relays from rejecting tools because of that local
+  validation marker. Standard constraints remain in the outgoing schemas, and
+  server-side memory tag limits remain enforced; Gemini keeps its existing schema adaptation.
+
 - **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
   The block is the user-visible first-person aside shown under the reply, and the
   instruction now says so; it is no longer described as private inner thoughts.
