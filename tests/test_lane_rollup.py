@@ -1487,7 +1487,7 @@ def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
     assert windows["7d"]["routes"]["resident"]["lanes"]["heartbeat"] == {
         "completed": 8, "failed": 1, "expired": 0, "superseded": 0,
         "operational_failures": 0, "control_outcomes": 0,
-        "user_unavailable": 0,
+        "user_unavailable": 0, "skipped": 0,
         "failure_codes": {"unknown": 1},
         "concentration": {
             "users_active": 1,
@@ -1498,7 +1498,7 @@ def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
     assert windows["24h"]["routes"]["model_api"]["lanes"]["chat"] == {
         "completed": 6, "failed": 4, "expired": 0, "superseded": 2,
         "operational_failures": 0, "control_outcomes": 0,
-        "user_unavailable": 0,
+        "user_unavailable": 0, "skipped": 0,
         "failure_codes": {
             "extraction_failed:quota_insufficient": 1,
             "extraction_failed:upstream_unavailable": 3,
@@ -2796,3 +2796,107 @@ def test_the_resident_anchor_has_an_index_to_stand_on():
         # CONCURRENTLY cannot run inside the migration's transaction.
         assert "autocommit_block()" in (_P(__file__).parent.parent
                                         / source).read_text()
+
+
+# --- dream skip rides silent_declared (2026-09-15, no schema change) -------- #
+#
+# A V2 Dream on a too-small garden terminates ``completed`` with
+# ``wake_result='skipped'`` without asking the model. The frozen cell keeps it
+# in ``completed`` but files it under ``silent_declared``; every reader that
+# shows a Dream success rate must count only completions that actually ran.
+
+
+def test_dream_skip_freezes_as_declared_silence_and_is_not_a_success(
+        clean_rollup):
+    t = datetime(2030, 6, 3, 2, 0, tzinfo=timezone.utc)  # Beijing 06-03 10:00
+    ran = "usr_rollup_dream_ran"
+    only_skips = "usr_rollup_dream_only_skips"
+    seed_user(ran)
+    seed_user(only_skips)
+    for _ in range(2):
+        _insert_job(ran, "dream", "completed", finished=t)
+    for _ in range(3):
+        _insert_job(ran, "dream", "completed", finished=t,
+                    wake_result="skipped")
+    _insert_job(ran, "dream", "failed", finished=t,
+                last_error="extraction_failed:upstream_unavailable")
+    # This user never had a Dream that really ran: skip + failure only.
+    _insert_job(only_skips, "dream", "completed", finished=t,
+                wake_result="skipped")
+    _insert_job(only_skips, "dream", "failed", finished=t,
+                last_error="extraction_failed:upstream_unavailable")
+    # Wake lanes keep their meaning: sleep is declared, and the word 'skipped'
+    # on a non-dream lane is NOT silently absorbed as a declaration.
+    _insert_job(ran, "heartbeat", "completed", finished=t, wake_result="sleep")
+    _insert_job(ran, "heartbeat", "completed", finished=t,
+                wake_result="skipped")
+    _insert_job(ran, "heartbeat", "completed", finished=t)
+    # An older job starts the watermark early enough for a green 7d window.
+    _insert_job(ran, "heartbeat", "completed",
+                finished=datetime(2030, 5, 28, 2, 0, tzinfo=timezone.utc))
+
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+
+    cells = {(r["user_id"], r["lane"]): r for r in _cells(since_day="2030-06-03")}
+    dream = cells[(ran, "dream")]
+    assert dream["completed"] == 5
+    assert dream["spoke"] == 0 and dream["spoke_completed"] == 0
+    assert dream["silent_declared"] == 3
+    assert dream["silent_undeclared"] == 2
+    heartbeat = cells[(ran, "heartbeat")]
+    assert heartbeat["silent_declared"] == 1
+    assert heartbeat["silent_undeclared"] == 2
+    for cell in cells.values():
+        assert cell["completed"] == (
+            cell["spoke_completed"]
+            + cell["silent_declared"] + cell["silent_undeclared"]
+        ), cell
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-03")
+    day = next(w for w in payload["windows"] if w["key"] == "24h")
+    route_dream = day["routes"]["model_api"]["lanes"]["dream"]
+    assert route_dream["completed"] == 6
+    assert route_dream["skipped"] == 4
+    assert day["routes"]["model_api"]["lanes"]["heartbeat"]["skipped"] == 0
+    # Zero-success concentration counts real runs: skip + failure is zero.
+    assert route_dream["concentration"]["users_zero_success"] == 1
+    week = next(w for w in payload["windows"] if w["key"] == "7d")
+    assert week["routes"]["model_api"]["coverage"]["level"] == "green"
+    assert (week["routes"]["model_api"]["lanes"]["dream"]["concentration"]
+            ["users_zero_success"]) == 1
+    assert day["paths"]["apikey_v2"]["lanes"]["dream"]["skipped"] == 4
+    assert (day["paths"]["apikey_v2"]["lanes"]["dream"]["concentration"]
+            ["users_zero_success"]) == 1
+
+    master = data_track._event_path_master_payload(payload)
+    runtime_24h = next(w for w in master["runtime_windows"]
+                       if w["key"] == "24h")
+    rows = {r["key"]: r for r in runtime_24h["rows"]}
+    v2_dream = rows["dream"]["cells"]["runtime_v2"]
+    assert v2_dream["state"] == "metric"
+    assert (v2_dream["success"], v2_dream["failure"],
+            v2_dream["denominator"], v2_dream["skipped"]) == (2, 2, 4, 4)
+    path_24h = next(w for w in master["windows"] if w["key"] == "24h")
+    path_dream = next(r for r in path_24h["rows"] if r["key"] == "dream")
+    assert path_dream["cells"]["apikey_v2"]["success"] == 2
+    v2_heartbeat = rows["heartbeat"]["cells"]["runtime_v2"]
+    assert v2_heartbeat["success"] == 3 and v2_heartbeat["skipped"] == 0
+    rendered = data_track._render_event_master_tables(master)
+    assert "skip 4（没真跑，剔除）" in rendered
+    assert "50.0% 成功" in rendered
+
+
+def test_dream_skip_on_the_open_day_is_declared_in_the_live_tail(clean_rollup):
+    """The live top-up shares the freezer's voice expressions, so today's
+    not-yet-frozen Dream skip is declared too."""
+    uid = "usr_rollup_dream_live_skip"
+    seed_user(uid)
+    now = datetime.now(timezone.utc)
+    _insert_job(uid, "dream", "completed", finished=now,
+                wake_result="skipped")
+    _insert_job(uid, "dream", "completed", finished=now)
+    payload = db.admin_lane_rollup(user_id=uid, route="model_api")
+    (live,) = [r for r in payload["today_partial"] if r["lane"] == "dream"]
+    assert live["frozen"] is False
+    assert (live["completed"], live["silent_declared"],
+            live["silent_undeclared"]) == (2, 1, 1)

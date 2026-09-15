@@ -11164,7 +11164,15 @@ def _event_path_master_payload(
                 "required_days": int(coverage.get("required_days") or 0),
                 "effective_from": coverage.get("effective_from"),
             }
-        completed = int(counts.get("completed") or 0)
+        # dream 的「花园太小、这次不整理」冻进 silent_declared（completed 仍含它）。
+        # 它一次模型都没问，不是一次成功的整理：成功只数真跑过的完成，skip 单列。
+        # 冻结侧只对 LANE_ROLLUP_SKIP_DECLARED_LANES 给非 0 的 skipped。
+        skipped = int(counts.get("skipped") or 0)
+        completed = max(0, int(counts.get("completed") or 0) - skipped)
+        skip_rule = (
+            "；dream skip（花园太小、没问模型）从 completed 剔除单列"
+            if lane in db.LANE_ROLLUP_SKIP_DECLARED_LANES else ""
+        )
         failed = int(counts.get("failed") or 0)
         expired = int(counts.get("expired") or 0)
         superseded = int(counts.get("superseded") or 0)
@@ -11205,14 +11213,15 @@ def _event_path_master_payload(
                 "state": "metric", "coverage": "green",
                 "success": completed, "failure": operational,
                 "failed": failed, "expired": expired,
-                "superseded": superseded,
+                "superseded": superseded, "skipped": skipped,
                 "raw_non_success": failed,
                 "control_outcomes": control_outcomes,
                 "user_unavailable": user_unavailable,
                 "denominator": completed + operational,
                 "denominator_rule": (
                     "completed + operational failure；control、明确用户侧不可用、"
-                    "superseded 剔除；过去的日子没有回填；"
+                    "superseded 剔除；过去的日子没有回填"
+                    + skip_rule + "；"
                     + (
                         "成员按冻结时 route 资格→接入方式×effective runtime 分层"
                         if path is not None
@@ -11240,7 +11249,7 @@ def _event_path_master_payload(
             "state": "metric", "coverage": "green",
             "success": completed, "failure": failure,
             "failed": failed, "expired": expired,
-            "superseded": superseded,
+            "superseded": superseded, "skipped": skipped,
             "raw_non_success": raw_non_success,
             "control_outcomes": control_outcomes,
             "user_unavailable": user_unavailable,
@@ -11248,6 +11257,7 @@ def _event_path_master_payload(
             "denominator_rule": (
                 "completed + operational failure；control、明确用户侧不可用、"
                 "superseded 剔除；未知码/expired 仍算 operational failure"
+                + skip_rule
             ),
             # 原样透传:上游给什么就带什么,脏数据由 _concentration_line 统一判。
             # ⚠️ 这里**不做**校验,否则「上游没给」和「上游给了但不合法」会在
@@ -11675,6 +11685,8 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
             excluded += f" · control {int(cell['control_outcomes'])}（剔除）"
         if no_write:
             excluded += f" · no-write {no_write}（单列剔除）"
+        if int(cell.get("skipped") or 0):
+            excluded += f" · skip {int(cell['skipped'])}（没真跑，剔除）"
         outcomes = cell.get("outcomes") if isinstance(cell.get("outcomes"), dict) else {}
         outcome_detail = ""
         if outcomes:

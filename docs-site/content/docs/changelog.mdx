@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Admin Dream success rates no longer count a skipped Dream as a success. A
+  Runtime V2 Dream that finds the Memory Garden too small completes without
+  asking the model; the frozen daily lane cells now record it under the
+  existing `silent_declared` count (it stays in `completed`), and the admin
+  event table reports Dream success as completed runs minus skips, with the
+  skip count shown separately. Days frozen before this change are not
+  rewritten. Heartbeat and other wake lanes are unchanged.
+
 - **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
   The block is the user-visible first-person aside shown under the reply, and the
   instruction now says so; it is no longer described as private inner thoughts.
