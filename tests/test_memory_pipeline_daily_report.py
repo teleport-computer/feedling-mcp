@@ -834,6 +834,16 @@ def test_thresholds_keep_defaults_and_follow_env_overrides(monkeypatch):
         assert report_tool.OUR_SIDE_USERS_ATTENTION == 5
         # The override reaches the rule, not just the constant.
         assert any("完全卡死 3 人" in r for r in _report(_stuck_rows(3)).attention)
+
+        # nan compares False with everything (the rule would silently never
+        # fire) and inf is just as unreachable: both keep the default.
+        monkeypatch.setenv("MEMORY_REPORT_FAILURE_RATE", "nan")
+        monkeypatch.setenv("MEMORY_REPORT_FAILURE_RATE_JUMP_PP", "inf")
+        monkeypatch.setenv("MEMORY_REPORT_ACTIVE_DROP_RATIO", "-inf")
+        importlib.reload(report_tool)
+        assert report_tool.FAILURE_RATE_ATTENTION == 0.5
+        assert report_tool.FAILURE_RATE_JUMP_PP == 15.0
+        assert report_tool.ACTIVE_DROP_RATIO == 0.5
     finally:
         for name in report_tool.THRESHOLD_ENV_VARS:
             monkeypatch.delenv(name, raising=False)

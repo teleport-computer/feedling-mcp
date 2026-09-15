@@ -457,23 +457,35 @@ def _emit_window_missed_at_cap(store, outcome: Mapping[str, Any]) -> None:
 
     The trace cursor always holds the previous tick's reason (a reason change is
     always traced), so ``dream_concurrency_cap`` → ``night_not_due`` means the
-    user was due and capped until the window ended. Fires once per such
-    transition; content-free (reason codes only).
+    user was due and capped until the window ended. ``dream_admission_busy``
+    (the fleet admission lock held by another tick) is the same "due but not
+    admitted" outcome, so it counts too: a user whose last in-window decision
+    was busy also went without Dream tonight. Fires once per such transition;
+    content-free (reason codes only).
     """
     if str(outcome.get("reason") or "") != "night_not_due":
         return
     state = _state_doc(outcome.get("state"))
-    if state.get("last_dream_trace_reason") != "dream_concurrency_cap":
+    last_reason = str(state.get("last_dream_trace_reason") or "")
+    if last_reason not in _ADMISSION_HELD_REASONS:
         return
-    log.warning("dream window closed while user was still capped: user=%s", store.user_id)
+    log.warning(
+        "dream window closed while user was still not admitted: user=%s reason=%s",
+        store.user_id, last_reason,
+    )
     debug_trace.trace_event(
         store, subsystem="memory", type="memory.dream.window_missed", actor="backend",
         status="warning",
-        summary="夜间窗口结束时仍被做梦并发上限挡住，今晚未做梦",
-        explain="上一次判定是 dream_concurrency_cap、这一次窗口已关。只记理由码，不含卡片内容。",
-        detail={"reason": "dream_concurrency_cap_at_window_end",
+        summary="夜间窗口结束时仍被做梦准入挡住，今晚未做梦",
+        explain=(f"上一次判定是 {last_reason}、这一次窗口已关。"
+                 "只记理由码，不含卡片内容。"),
+        detail={"reason": f"{last_reason}_at_window_end",
                 "max_concurrent": dream_max_concurrent()},
     )
+
+
+#: 「到点了但没被准入」的两种判定：并发上限满了 / 准入锁被别的 tick 占着。
+_ADMISSION_HELD_REASONS = frozenset({"dream_concurrency_cap", "dream_admission_busy"})
 
 
 def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,

@@ -2007,6 +2007,35 @@ def test_capture_made_up_target_twice_drops_only_that_card(monkeypatch):
     assert docs["mom_job"]["status"] == "active"
 
 
+def test_capture_two_cards_superseding_one_card_land_the_batch_end_to_end(monkeypatch):
+    """之前：模型一轮里两张卡都覆盖 mom_job → commit 整批按 target_inactive 拒掉，同窗口
+    反复失败到逃生阀跳过，同批的新卡也丢了。之后：第二张被映射层丢掉（只记张数），
+    其余照常落库，任务完成。"""
+    events: list[tuple[str, dict]] = []
+
+    async def _record(_recorder, kind, payload, *, best_effort=False):
+        events.append((kind, dict(payload)))
+        return True
+
+    monkeypatch.setattr(worker, "_record_trajectory", _record)
+    first = json.loads(_supersede_reply("mom_job"))["cards"][0]
+    second = {**first, "action": "merge", "summary": "Z 换工作去了腾讯",
+              "content": "Z 从字节跳动跳槽到腾讯。"}
+    added = {**first, "action": "add", "target_id": "", "summary": "Z 下个月入职",
+             "content": "Z 下个月一号入职腾讯。"}
+    status, job_id, _prompts, docs, _ = _run_capture_e2e(
+        monkeypatch, "u_x_capture_dup_target_e2e",
+        [json.dumps({"cards": [first, second, added]}, ensure_ascii=False)],
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    new_ids = set(docs) - set(_CAPTURE_SUMMARIES)
+    assert len(new_ids) == 2
+    assert docs["mom_job"]["status"] == "superseded"
+    assert docs["mom_job"]["superseded_by"] in new_ids
+    assert ("supersede_target_duplicate_dropped", {"cards": 1}) in events
+
+
 def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
     """spec §4: read_memory_context (3 post_enclave round-trips) and read_tail (per-message
     decrypt) are BOTH enclave-bound. The enclave is a shared, capacity-bounded decrypt proxy

@@ -159,6 +159,7 @@ def test_capture_context_reads_all_existing_cards_for_the_index(monkeypatch):
             {"id": "m0", "summary": "旧的", "status": "superseded"},
         ],
         "user_card_count": 2,
+        "truncated": False,
     }, 200))
     assert calls == [{"limit": 0}]
     assert ctx["capture_cards"] == [
@@ -169,7 +170,9 @@ def test_capture_context_reads_all_existing_cards_for_the_index(monkeypatch):
 
 
 def test_capture_context_verified_empty_garden_is_an_empty_list(monkeypatch):
-    ctx, _ = _capture_ctx(monkeypatch, ({"items": [], "user_card_count": 0}, 200))
+    ctx, _ = _capture_ctx(
+        monkeypatch, ({"items": [], "user_card_count": 0, "truncated": False}, 200)
+    )
     assert ctx["capture_cards"] == []
 
 
@@ -181,6 +184,11 @@ def test_capture_context_unreadable_index_is_absent_not_empty(monkeypatch):
     for index in (
         ({"items": []}, 200),                        # 200 但没证明是空花园
         ({"items": [], "user_card_count": 5}, 200),  # 读侧解不开全部卡
+        # 超过读侧硬上限：只回了前一截。当全集交出去，上限之后的真卡会被判成编造。
+        ({"items": [{"id": "m1", "summary": "s"}], "user_card_count": 1001,
+          "truncated": True}, 200),
+        # 缺 truncated 字段同样说不清读全没有。
+        ({"items": [{"id": "m1", "summary": "s"}], "user_card_count": 1}, 200),
         ({"error": "readside_unavailable"}, 503),
         _boom,
     ):

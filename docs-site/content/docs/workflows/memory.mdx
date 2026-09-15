@@ -292,7 +292,8 @@ the next tick re-evaluates. The count and the enqueue are decided under one
 deployment-wide lock; a tick that meets another admission in progress answers
 `dream_admission_busy` and also re-evaluates next tick. All three are scheduling
 delays, not failures: they do not start backoff or advance the Dream ledger. An
-account that is still capped when the window closes records a content-free
+account whose last decision in the window was still `dream_concurrency_cap` or
+`dream_admission_busy` when the window closes records a content-free
 `memory.dream.window_missed` diagnostic event.
 
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a

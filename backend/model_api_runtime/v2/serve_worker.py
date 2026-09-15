@@ -3054,6 +3054,12 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                 and body.get("user_card_count") == 0
             ):
                 raise RuntimeError("capture_cards_index_unverified_empty")
+            if body.get("truncated") is not False:
+                # 现有卡超过读侧硬上限（FEEDLING_MEMORY_READSIDE_HARD_MAX）时只回前一截、
+                # 标 truncated。拿半截当全集交出去，第 1001 张之后的真卡被 merge/supersede
+                # 引用时会被组件判成编造、整张丢掉 —— 同上「读不全就不交」。
+                # 缺字段也按读不全处理（与 profile 卡读同一判据）。
+                raise RuntimeError("capture_cards_index_truncated")
             ctx["capture_cards"] = garden_component.capture_existing_cards(raw_items)
         except Exception as e:  # noqa: BLE001 — 单项降级
             log.warning(

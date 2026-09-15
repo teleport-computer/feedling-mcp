@@ -1539,6 +1539,64 @@ def test_capture_commit_rejects_two_supersedes_of_one_target_in_one_batch():
     assert db.memory_load(uid)[0]["status"] == "active"
 
 
+def test_two_model_cards_superseding_one_target_keep_the_first_and_commit():
+    """之前：模型一轮给出两张卡都说「覆盖同一张旧卡」→ 映射原样放行 → commit
+    整批按 target_inactive 拒绝 → 同窗口反复失败直到逃生阀跳过，好卡全丢。
+    之后：映射层按目标去重（留第一张），剩下的计入 skipped，整批照常落地。
+
+    走生产入口：cards_to_actions → prepare_capture_batch → commit_capture_batch。
+    """
+    from model_api_runtime.v2 import extraction
+
+    uid = "u_capture_dup_target_mapper"
+    _seed(uid)
+    assert db.memory_upsert(uid, "target", "2026-07-20", _manual_card(uid, "target"))
+    built: list[str] = []
+
+    def seal(inner: dict) -> dict:
+        memory_id = f"successor-{len(built)}"
+        built.append(memory_id)
+        envelope = _envelope(uid, memory_id, body=f"sealed-{len(built)}")
+        for key in ("type", "occurred_at", "importance", "pulse", "source",
+                    "last_referenced_at"):
+            envelope.pop(key, None)
+        return envelope
+
+    skipped: dict[str, int] = {}
+    cards = [
+        {"action": "supersede", "target_id": "target", "summary": "a",
+         "content": "a", "bucket": "b", "type": "fact"},
+        {"action": "merge", "target_id": " target ", "summary": "b",
+         "content": "b", "bucket": "b", "type": "fact"},
+        {"action": "add", "summary": "c", "content": "c", "bucket": "b",
+         "type": "fact"},
+    ]
+    actions, added, superseded = extraction.cards_to_actions(
+        cards,
+        occurred_at="2026-07-20T12:00:00Z",
+        source_ids=["m1"],
+        build_envelope=seal,
+        on_skipped=lambda reason, count: skipped.__setitem__(
+            reason, skipped.get(reason, 0) + count
+        ),
+    )
+    assert (added, superseded) == (1, 1)
+    assert skipped == {"supersede_target_duplicate": 1}
+    # The dropped card is never sealed: no enclave/encrypt work for it.
+    assert len(built) == 2
+
+    job_id, batch = _prepare_supersede(uid, actions)
+    result = jobs_store.commit_capture_batch(
+        job_id=job_id, user_id=uid, claimed_by="capture-worker", batch_id=batch["id"],
+    )
+
+    assert result["committed"] is True, result
+    moments = {m["id"]: m for m in db.memory_load(uid)}
+    assert set(moments) == {"target", "successor-0", "successor-1"}
+    assert moments["target"]["superseded_by"] == "successor-0"
+    assert int(_capture_state(uid)["last_captured_until_seq"]) == 1
+
+
 def test_prepared_retry_commits_before_provider_or_enclave(monkeypatch):
     uid = "u_capture_early_retry"
     _seed(uid)
@@ -3558,6 +3616,34 @@ def test_capture_enqueue_backoff_recheck_matches_the_scheduler_when_nothing_chan
     # 不传 backoff_now（手动 force / 通用 enqueue_job）不重判。
     assert jobs_store.enqueue_capture(uid).disposition == "created"
     assert jobs_store.enqueue_capture(uid, backoff_now=now).disposition == "coalesced_active"
+
+
+@pytest.mark.parametrize("start", [True, False], ids=["running", "pending"])
+def test_capture_enqueue_over_a_stale_generation_job_honours_the_backoff(start):
+    """之前：活跃的落卡任务属于已经过期的 runtime 代时，入队不做退避重判，直接交给通用
+    函数「作废旧任务 + 建新任务」—— 刚记下的失败退避被绕过，退避期里又跑一次。
+    之后：只要这次入队会建新任务（没有活跃任务 / 活跃任务的代已过期），都按同一个时刻
+    重判退避；退避里就不建、也不动旧任务（旧代任务照旧在领取 / 提交时被所有权闸挡掉）。"""
+    uid = f"u_capture_enqueue_stale_gen_backoff_{'running' if start else 'pending'}"
+    _seed(uid)
+    if start:
+        job_id, _job = _running(uid, owner="old-generation-worker")
+    else:
+        job_id, _coalesced = jobs_store.enqueue_job(uid, "capture")
+    conftest.set_v2_runtime_owner(uid, generation=2)
+    now = _time.time()
+    _write_capture_state(uid, {"capture_fail_streak": 1, "last_capture_failed_at": now - 10})
+
+    assert jobs_store.enqueue_capture(uid, backoff_now=now) == jobs_store.CaptureEnqueueResult(
+        None, "backoff_deferred")
+    assert [tuple(r) for r in _active_capture_jobs(uid)] == [
+        (job_id, "running" if start else "pending")]
+
+    # 退避过了：照旧作废旧代任务、建当前代的新任务。
+    _write_capture_state(uid, {"capture_fail_streak": 1, "last_capture_failed_at": now - 601})
+    result = jobs_store.enqueue_capture(uid, backoff_now=now)
+    assert result.disposition == "created" and result.job_id != job_id
+    assert _job_row(job_id)[0] == "superseded"
 
 
 def test_v2_capture_submit_reports_deferred_rounds_without_a_fake_pending_job(monkeypatch):

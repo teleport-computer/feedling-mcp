@@ -234,6 +234,12 @@ def test_non_literal_producers_are_sanctioned():
     throttled = gate.HEARTBEAT_THROTTLED_REASON
     assert status_reason.sanitize_status_reason(throttled) == throttled
     assert status_reason.sanitize_status_reason("runtime_failed") == "runtime_failed"
+    # The consumer's capture paging defer writes these through constants.
+    source = CONSUMER.read_text(encoding="utf-8")
+    for name in ("CAPTURE_DEFERRED_USER_CHAT", "CAPTURE_DEFERRED_PAGING_BUDGET"):
+        line = next(l for l in source.splitlines() if l.startswith(f"{name} = "))
+        value = ast.literal_eval(line.split("=", 1)[1].strip())
+        assert status_reason.sanitize_status_reason(value) == value, name
 
 
 def test_registry_codes_survive_unchanged():
