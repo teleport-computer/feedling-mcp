@@ -526,7 +526,6 @@ def test_live_pointer_plaintext_migration_is_atomic_and_preserves_metadata(
 ):
     uid = _uid()
     seed_user(uid)
-    registry._set_user_content_encryption(uid, "off")
     mid = uuid.uuid4().hex
     plaintext = b"\x00new-plaintext-file"
 
@@ -630,7 +629,7 @@ def test_archive_pointer_plaintext_migration_preserves_immutable_columns(
     assert old_key in _cleanup_keys(uid)
 
 
-def test_plaintext_pointer_migration_refuses_non_explicit_off_tier(
+def test_plaintext_pointer_migration_refuses_explicit_on_tier(
     backend_env, monkeypatch,
 ):
     client = _FakeS3()

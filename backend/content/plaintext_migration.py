@@ -236,7 +236,7 @@ def _mark_requeue(user_id: str, item: Item) -> None:
 
 
 def cas_inline_doc(user_id: str, item: Item, new_doc: dict) -> bool:
-    """Install one transformed doc iff preference and exact old doc still match."""
+    """Install one transformed doc iff effective-off and old doc still match."""
     if not isinstance(item.doc, dict):
         return False
     won = False
@@ -249,7 +249,10 @@ def cas_inline_doc(user_id: str, item: Item, new_doc: dict) -> bool:
                     (user_id,),
                 )
                 preference = cur.fetchone()
-                if preference is None or str(preference[0] or "").strip().lower() != "off":
+                if (
+                    preference is None
+                    or str(preference[0] or "").strip().lower() == "on"
+                ):
                     return False
 
                 if item.surface == "chat_live":
@@ -485,8 +488,8 @@ def run(
         raise ValueError("rate must be > 0")
     if not user_exists(user_id):
         raise ValueError("target user does not exist")
-    if apply and content_encryption_preference(user_id) != "off":
-        raise PermissionError("content_encryption must be explicitly off")
+    if apply and content_encryption_preference(user_id) == "on":
+        raise PermissionError("content_encryption must be effective off")
 
     items = list(inventory(user_id))
     counts: Counter[str] = Counter()
