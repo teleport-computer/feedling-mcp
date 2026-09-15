@@ -6,6 +6,7 @@ V1 consumer 和 V2 worker 都经这一处开整理会话。这里钉住三件两
 1. 老卡字段名翻成组件认识的名字，模型才看得到正文
 2. 披露面（模型实际看过哪些卡、哪些被截断）和组件渲染的一致
 3. 截断硬闸只丢碰了截断卡的方案
+4. 称呼规则用 io 的那份（和落卡同源），旧组件不认这个字段时照旧跑
 """
 from __future__ import annotations
 
@@ -121,6 +122,69 @@ def test_open_fails_closed_on_a_memgarden_without_body_rendering(monkeypatch):
     with pytest.raises(gc.DreamKernelOutdated) as raised:
         _open(_cards(12))
     assert str(raised.value) == gc.DREAM_KERNEL_OUTDATED == "dream_kernel_outdated"
+
+
+@pytest.mark.parametrize("locale,user_name", [
+    ("en", "Alex"), ("en", "user"), ("zh-Hans", "小雨"), ("zh-Hans", " 用户 "),
+])
+def test_the_dream_prompt_carries_io_naming_rule(locale, user_name):
+    """和 capture_request 同一份规则、同一个原始名字。英文花园里内核默认版不点名禁「用户」/「TA」。"""
+    from identity.user_naming import _naming_rule
+    from memgarden.naming import naming_rule as kernel_naming_rule
+
+    assert gc.dream_kernel_accepts_naming_rule() is True
+    session, _ = _open(_cards(12), locale=locale, user_name=user_name)
+    prompt = session.next_prompt()
+
+    io_rule = _naming_rule(user_name, locale=locale)
+    assert io_rule in prompt
+    if locale == "en":
+        assert kernel_naming_rule(user_name, locale=locale) != io_rule
+        assert kernel_naming_rule(user_name, locale=locale) not in prompt
+        assert "the placeholder 「TA」" in prompt
+
+
+def test_old_kernel_without_naming_rule_still_opens_the_session(monkeypatch):
+    """自建 VPS 自更新时新 io 可能跑在旧 memgarden 上：不传这个字段，行为同修复之前。"""
+    fields = {f.name: f for f in dataclasses.fields(gc.MaintenanceRequest)}
+    assert "naming_rule" in fields
+
+    seen = {}
+
+    @dataclasses.dataclass
+    class _OldMaintenanceRequest:
+        cards: list = dataclasses.field(default_factory=list)
+        all_cards: list = dataclasses.field(default_factory=list)
+        locale: str = ""
+        ai_name: str = ""
+        user_name: str = ""
+        recent_conversations: str = ""
+        known_ids: tuple = ()
+        cards_limit: int = 60
+        cards_budget_chars: int = 60_000
+        card_body_chars: int = 5_000
+        card_summary_chars: int = 2_000
+
+    real = gc.MaintenanceRequest
+
+    class _Garden:
+        def maintenance_session(self, request):
+            seen["request"] = request
+            # 交给真组件时补回默认值，等价于旧组件的「不认 naming_rule」。
+            return _garden().maintenance_session(real(**dataclasses.asdict(request)))
+
+    monkeypatch.setattr(gc, "MaintenanceRequest", _OldMaintenanceRequest)
+    assert gc.dream_kernel_renders_card_bodies() is True
+    assert gc.dream_kernel_accepts_naming_rule() is False
+
+    session, disclosure = gc.open_dream_session(
+        _Garden(), cards=_cards(12), locale="en", ai_name="Iris", user_name="Alex",
+        recent_conversations="- Alex: learning to swim")
+
+    assert isinstance(seen["request"], _OldMaintenanceRequest)
+    assert disclosure.needed
+    from memgarden.naming import naming_rule as kernel_naming_rule
+    assert kernel_naming_rule("Alex", locale="en") in session.next_prompt()
 
 
 def test_truncated_guard_drops_only_proposals_touching_a_truncated_card():

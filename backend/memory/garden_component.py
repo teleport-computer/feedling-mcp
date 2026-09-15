@@ -108,7 +108,8 @@ def build_garden(
 #      只能 add，同一件事说两次就是两张卡。（V2 08-03 起有过这份索引；
 #      V1 从来没有。）
 #   2. **io 的称呼规则** —— 没传 ``naming_rule``，用的是内核默认那版
-#      （英文花园里不禁「TA」占位符，和 io 的转写标签、Dream 的规则对不上）。
+#      （英文花园里不禁「TA」占位符，和 io 的转写标签对不上）。Dream 同样漏了，
+#      而且当时内核的 ``MaintenanceRequest`` 根本没有这个字段，见 ``open_dream_session``。
 #   3. **洗过的名字** —— V2 把身份卡里的原始 ``user_preferred_name`` 直接交出去，
 #      存成「用户」的人会在提示词里被叫做「用户」，正是称呼规则禁止的词。
 #
@@ -289,6 +290,17 @@ def dream_kernel_renders_card_bodies() -> bool:
     return all(name in names for name in _DREAM_BUDGET_FIELDS)
 
 
+def dream_kernel_accepts_naming_rule() -> bool:
+    """装的 memgarden 认不认 ``MaintenanceRequest.naming_rule``。
+
+    不认时**照旧跑**，不失败：旧组件用内核默认的称呼规则（中文逐字相同，英文版
+    不点名禁「用户」/「TA」），和这次修复之前的行为一样，比整晚不整理好。
+    自建 VPS 的 consumer 自更新先切代码、后装依赖，会短暂出现这种组合。
+    """
+    names = {field.name for field in dataclasses.fields(MaintenanceRequest)}
+    return "naming_rule" in names
+
+
 def _one_line(value: Any) -> str:
     return " ".join(str(value or "").split())
 
@@ -396,6 +408,13 @@ def open_dream_session(
         seen.add(mid)
         eligible.append(card)
     known_ids = tuple(_one_line(card.get("id")) for card in eligible)
+    # io 的称呼规则，和 capture_request 一样按**原始** user_name 生成（内部也洗）。
+    # 以前 Dream 不传，整理时退回内核默认规则：英文花园里不点名禁「用户」/「TA」，
+    # 白天落卡守住的称呼夜里被重写。
+    naming = (
+        {"naming_rule": _naming_rule(user_name, locale=locale)}
+        if dream_kernel_accepts_naming_rule() else {}
+    )
     session = garden.maintenance_session(MaintenanceRequest(
         cards=eligible,
         all_cards=eligible,
@@ -411,6 +430,7 @@ def open_dream_session(
         cards_budget_chars=DREAM_CARDS_BUDGET_CHARS,
         card_body_chars=DREAM_CARD_BODY_CHARS,
         card_summary_chars=DREAM_CARD_SUMMARY_CHARS,
+        **naming,
     ))
     outcome = session.result()
     trace = outcome.trace if isinstance(getattr(outcome, "trace", None), dict) else {}
