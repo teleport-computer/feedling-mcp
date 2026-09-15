@@ -62,10 +62,12 @@ _STRONG_UPSTREAM_EVIDENCE = re.compile(
     r"|stream disconnected|ended without finish_reason",
     re.IGNORECASE,
 )
-# The registry's auth matcher runs before upstream_unavailable and claims every
-# 403 except the relay's generic "Request failed" shell; a 403 that still lands
-# on upstream_unavailable is therefore that shell, which is real evidence.
-_RELAY_403 = re.compile(r"\b403\b|provider_http_403", re.IGNORECASE)
+# The relay's generic "Request failed. Please try again later." 403 shell (the
+# registry's exact, whole-candidate shape) is real upstream evidence. Any other
+# 403 is not: a bare 403 without auth semantics no longer stops at auth_invalid
+# (see ``_STRONG_EVIDENCE``), so it can reach upstream_unavailable through an
+# unrelated number in the tail ("403 ... wrote 500 tokens").
+_RELAY_403 = re.compile(error_contract._GENERIC_UPSTREAM_403, re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -79,10 +81,15 @@ _RELAY_403 = re.compile(r"\b403\b|provider_http_403", re.IGNORECASE)
 # their key, balance or model is broken. So every class below additionally
 # needs one of: an explicit provider error code, an HTTP status in a status
 # position (``HTTP 401``, ``api_status=401``, ``provider_http_402``, a status
-# leading the message, ``401 Unauthorized``), or the term inside a JSON error
-# field (``{"error": "Insufficient balance"}``). When the registry's first
-# match lacks that evidence, the next registry match is tried; nothing left
-# means ``unknown``.
+# leading the message, ``401 Unauthorized``, a Chinese relay's ``错误码 401：``
+# / ``状态码 401``), or the term inside a JSON error field
+# (``{"error": "Insufficient balance"}``, ``{"msg": "鉴权失败"}``). When the
+# registry's first match lacks that evidence, the next registry match is tried;
+# nothing left means ``unknown``.
+#
+# 403 carries no auth semantics by itself (relays answer content blocks, WAF
+# blocks and region blocks with 403 too), so only 401 counts on its own; a 403
+# needs an auth term next to it.
 
 
 def _status_position(codes: str) -> str:
@@ -90,14 +97,17 @@ def _status_position(codes: str) -> str:
         rf"provider_http_(?:{codes})\b"
         rf"|\b(?:https?|status(?:[ _-]?code)?|error[ _-]?code|api[ _-]?error"
         rf"|api_status|code)\b\W{{0,3}}(?:{codes})\b"
+        # Chinese relay labels: 错误码 401：… / 状态码：401 / HTTP 状态码 403
+        rf"|(?:错误码|错误代码|状态码|返回码)\s*[:：=]?\s*(?:{codes})\b"
         # a status leading the message after an exception type / CLI prefix
-        rf"|(?:\A|:\s)(?:{codes})\b(?=\s*(?:[-:{{(]|[A-Za-z]))"
+        rf"|(?:\A|:\s)(?:{codes})\b(?=\s*(?:[-:：{{(]|[A-Za-z]|[\u4e00-\u9fff]))"
     )
 
 
 def _json_error_field(term: str) -> str:
     return (
-        r"""["'](?:error|message|errorMessage|detail|code|type)["']\s*:\s*"""
+        r"""["'](?:error|message|errorMessage|error_msg|errmsg|msg|detail|code|type)["']"""
+        r"""\s*:\s*"""
         rf"""(?:\{{[^}}]{{0,200}}?)?["'][^"']{{0,200}}?(?:{term})"""
     )
 
@@ -115,11 +125,19 @@ def _evidence(*, codes: str, term: str, tokens: str = "") -> re.Pattern:
 
 _QUOTA_TERM = (
     r"insufficient[ _-]?(?:balance|quota|credits?|funds)|quota|credit balance"
-    r"|余额|额度|payment required|out of credits|requires more credits"
+    r"|余额|额度|配额|payment required|out of credits|requires more credits"
+)
+# Auth semantics only. "forbidden" is the reason phrase of every 403 and
+# "blocked" / "permission" describe content, WAF or region blocks just as often,
+# so none of them makes a 403 an invalid key.
+_CHINESE_AUTH_TERM = (
+    r"(?:api\s*)?(?:密钥|秘钥|令牌|token)\s*(?:无效|错误|不正确|已失效|已过期)"
+    r"|无效的?\s*(?:api\s*)?(?:密钥|秘钥|令牌|token)"
+    r"|鉴权失败|认证失败|身份验证失败|未授权|未经授权"
 )
 _AUTH_TERM = (
     r"unauthori[sz]ed|authentication|invalid[ _-]?(?:x-)?api[ _-]?key|invalid[ _-]?key"
-    r"|incorrect api key|forbidden|blocked|permission"
+    r"|incorrect api key|api key not valid|" + _CHINESE_AUTH_TERM
 )
 _MODEL_TERM = (
     r"model[ _-]?not[ _-]?found|no such model|unknown model|invalid model name"
@@ -133,7 +151,7 @@ _STRONG_EVIDENCE: dict[str, re.Pattern] = {
         tokens=(
             r"provider_http_402\b|insufficient_quota|insufficient_user_quota"
             r"|insufficient_balance|billing_hard_limit_reached"
-            r"|credit balance is too low|余额不足|额度不足"
+            r"|credit balance is too low"
             rf"|{_status_position('402')}"
         ),
     ),
@@ -146,7 +164,7 @@ _STRONG_EVIDENCE: dict[str, re.Pattern] = {
         tokens=(
             r"invalid_api_key|authentication_error|incorrect api key"
             r"|invalid[ _-]?(?:x-)?api[ _-]?key|failed to authenticate"
-            rf"|{_status_position('401|403')}"
+            rf"|{_status_position('401')}"
         ),
     ),
     "model_not_found": _evidence(
@@ -168,7 +186,7 @@ _STRONG_EVIDENCE: dict[str, re.Pattern] = {
     ),
     "content_filtered": _evidence(
         codes="400|403|422",
-        term=r"content[ _]?filter|content policy|safety|blocked",
+        term=r"content[ _]?filter|content policy|safety|blocked by",
         tokens=r"\bcontent_filter\b|content_policy_violation",
     ),
     "rate_limited": _evidence(
@@ -186,6 +204,9 @@ _BARE_INVALID_KEY_MESSAGE = re.compile(r":\s*invalid[ _-]?key\s*\.?\s*\Z", re.IG
 # Emitted only by resident code with an exact, non-echoable phrase (the
 # registry matchers are the whole sentence), so no extra evidence is required.
 _SELF_EVIDENT = frozenset({"cli_config_invalid", "resident_agent_cli_logged_out"})
+_CHINESE_AUTH_IN_ERROR_FIELD = re.compile(
+    _json_error_field(_CHINESE_AUTH_TERM), re.IGNORECASE
+)
 
 
 def _has_strong_evidence(code: str, text: str) -> bool:
@@ -216,6 +237,11 @@ def classify_failure_text(text: object) -> str:
     # Outside the registry: the pi relay's bare "invalid key" message, which the
     # resident consumer itself already treats as an auth failure.
     if _BARE_INVALID_KEY_MESSAGE.search(candidate):
+        return "auth_invalid"
+    # Outside the registry: a Chinese auth message with no English keyword or
+    # status for the registry to match, but inside a JSON error field
+    # (``{"code": "invalid_token", "msg": "鉴权失败"}``). Never the bare words.
+    if _CHINESE_AUTH_IN_ERROR_FIELD.search(candidate):
         return "auth_invalid"
     return "unknown"
 

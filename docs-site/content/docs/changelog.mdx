@@ -67,7 +67,19 @@ change must not be interpreted as an API guarantee.
   request class is only assigned with provider error evidence (an HTTP status,
   a provider error code, or the phrase inside an error field); a keyword that
   merely appears in echoed request text, such as "quota" or "authentication",
-  is recorded as `…:unknown`.
+  is recorded as `…:unknown`. HTTP 403 alone is not treated as an invalid key:
+  a 403 needs authentication wording next to it (a 403 "Forbidden" or "Your
+  request was blocked" without it is `…:unknown`). Chinese relay messages are
+  recognized when a status label or JSON error field accompanies them, for
+  example `错误码 401：API 密钥无效` (`auth_invalid`) or `状态码 429：额度不足`
+  (`quota_insufficient`).
+
+- A provider HTTP 403 whose message is a content-policy block (for example
+  "HTTP 403 content policy blocked this request") is now classified as
+  `content_filtered` instead of `auth_invalid` in chat failure notices and
+  resident error classification, so users are no longer told to re-save their
+  API key. Explicit authentication wording still yields `auth_invalid`, and a
+  bare 403 without policy wording keeps its existing classification.
 
 - Hosted Runtime V2 Dream no longer reports a run as completed when the
   Memory Garden is below the memory kernel's consolidation minimum. Such a run

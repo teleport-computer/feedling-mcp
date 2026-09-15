@@ -556,13 +556,21 @@ def test_t497_positive_and_negative_forms_share_one_shape():
     两条都认领),而单测若各自写死字面量是看不出来的。所以这里从被测模块**派生**。
     """
     shape = error_contract._GENERIC_UPSTREAM_403_SHAPE
+    # The bare-403 branches also step aside for content-policy wording, derived
+    # from the content_filtered matcher itself (Codex r2 I2).
+    not_policy = (
+        r"(?![\s\S]*(?:" + error_contract._CONTENT_POLICY + r"))"
+    )
     assert error_contract._GENERIC_UPSTREAM_403 == r"\A" + shape
-    assert error_contract._AUTH_403 == r"\A(?!" + shape + r")[\s\S]*?\b403\b"
+    assert error_contract._AUTH_403 == (
+        r"\A(?!" + shape + r")" + not_policy + r"[\s\S]*?\b403\b"
+    )
     assert error_contract._AUTH_PROVIDER_HTTP_403 == (
-        r"\A(?!" + shape + r")[\s\S]*?\bprovider_http_403\b"
+        r"\A(?!" + shape + r")" + not_policy + r"[\s\S]*?\bprovider_http_403\b"
     )
     assert error_contract._GENERIC_UPSTREAM_403_MESSAGE in shape
     specs = {spec.code: spec for spec in error_contract.all_specs()}
+    assert specs["content_filtered"].matcher_pattern == error_contract._CONTENT_POLICY
     assert error_contract._AUTH_403 in specs["auth_invalid"].matcher_pattern
     assert (
         error_contract._AUTH_PROVIDER_HTTP_403
