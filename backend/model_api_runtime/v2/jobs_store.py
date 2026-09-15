@@ -1101,32 +1101,32 @@ def fleet_claim_owner(claimed_by: object) -> tuple[str, str] | None:
     return match.group("worker"), match.group("pool")
 
 
-def _capture_owner_dead_on_cursor(cur: psycopg.Cursor, row: dict) -> bool:
-    owner = fleet_claim_owner(row.get("claimed_by"))
+def _capture_owner_dead_sql(claimed_by: object) -> tuple[str, tuple]:
+    """SELECT-list expression (and its params) for "the whole owner is dead".
+
+    Evaluated inside the job-row SELECT of the chat preemption, so the chat send
+    path pays no extra round trip. Reads only the heartbeat table, takes no
+    lock. An unknown claim shape is a constant ``false``.
+    """
+    owner = fleet_claim_owner(claimed_by)
     if owner is None:
-        return False
+        return "false AS owner_dead", ()
     worker, pool = owner
     family = [f"{worker}:{name}" for name in (*_FLEET_POOLS, "genesis")]
-    cur.execute(
-        "SELECT EXISTS (SELECT 1 FROM v2_worker_heartbeats WHERE worker_id=%s) "
+    return (
+        "(EXISTS (SELECT 1 FROM v2_worker_heartbeats WHERE worker_id=%s) "
         "AND NOT EXISTS (SELECT 1 FROM v2_worker_heartbeats "
         "  WHERE worker_id = ANY(%s) "
         "  AND beat_at > clock_timestamp() - make_interval(secs => %s)) "
-        "AND EXISTS (SELECT 1 FROM agent_jobs WHERE id=%s "
-        "  AND claimed_at <= clock_timestamp() - make_interval(secs => %s)) "
-        "AS dead",
+        "AND claimed_at <= clock_timestamp() - make_interval(secs => %s)"
+        ") IS TRUE AS owner_dead",
         (
             f"{worker}:{pool}",
             family,
             float(CAPTURE_OWNER_DEAD_SEC),
-            int(row["id"]),
             float(CAPTURE_OWNER_DEAD_SEC),
         ),
     )
-    found = cur.fetchone()
-    if found is None:
-        return False
-    return bool(found["dead"] if isinstance(found, dict) else found[0])
 
 
 def _expire_overdue_capture_for_chat_on_cursor(
@@ -1141,16 +1141,19 @@ def _expire_overdue_capture_for_chat_on_cursor(
     调用方（chat 发送事务）已持有 chat fence →（runtime 行）→ 这些 job 行，这里接着拿
     设置行 ``FOR SHARE`` 和 capture_state，顺序与落卡其他边界一致。runtime 行不再加锁
     （它必须排在 job 行之前），只读一次用来比对 generation。
-    租约仍有效、但能证明持有它的整个 worker 已死（``_capture_owner_dead_on_cursor``，
-    只读心跳表、不加锁）的任务同样终结 + 记账；其余租约仍有效的任务走下面原来的重投分支。
+    租约仍有效、但能证明持有它的整个 worker 已死（``_capture_owner_dead_sql``，
+    只读心跳表、不加锁，和取 job 行是同一条查询）的任务同样终结 + 记账；其余租约仍有效的
+    任务走下面原来的重投分支。
     """
+    owner_dead_sql, owner_dead_params = _capture_owner_dead_sql(row.get("claimed_by"))
     cur.execute(
         "SELECT id,user_id,lane,status,claimed_by,attempt_count,"
         "expected_runtime_generation,"
         "COALESCE(lease_expires_at,deadline_at) IS NOT NULL "
-        "AND COALESCE(lease_expires_at,deadline_at) <= clock_timestamp() AS overdue "
+        "AND COALESCE(lease_expires_at,deadline_at) <= clock_timestamp() AS overdue, "
+        f"{owner_dead_sql} "
         "FROM agent_jobs WHERE id=%s",
-        (row["id"],),
+        (*owner_dead_params, row["id"]),
     )
     job = cur.fetchone()
     if (
@@ -1161,7 +1164,7 @@ def _expire_overdue_capture_for_chat_on_cursor(
         return None
     # 租约没过期、但持有它的整个 worker 已经死了（见 CAPTURE_OWNER_DEAD_SEC）：同样是崩溃，
     # 同样终结 + 记账。判不了（形状不认识 / 心跳还新 / 刚认领）就照旧走重投。
-    if not bool(job["overdue"]) and not _capture_owner_dead_on_cursor(cur, dict(job)):
+    if not bool(job["overdue"]) and not bool(job["owner_dead"]):
         return None
     cur.execute(
         "SELECT hosted_runtime_state,runtime_generation "

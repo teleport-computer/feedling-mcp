@@ -3278,6 +3278,49 @@ def test_chat_preempt_counts_a_capture_whose_whole_worker_died_before_its_lease_
     assert int(_capture_state(uid)["capture_fail_streak"]) == 1
 
 
+def test_dead_owner_check_rides_on_the_job_row_select(_dead_worker_heartbeats):
+    """The chat send transaction pays no extra round trip for the dead-owner
+    check: it is a column of the job-row SELECT (review 09-15)."""
+    from psycopg.rows import dict_row
+
+    uid = "u_capture_dead_owner_one_statement"
+    _seed(uid)
+    core_store.UserStore(uid).save_proactive_settings({"capture_enabled": True})
+    owner = _fleet_owner()
+    job_id, _job = _running(uid, owner=owner)
+    _age_claim(job_id, age_sec=jobs_store.CAPTURE_OWNER_DEAD_SEC + 60)
+    _whole_worker_went_silent()
+    statements: list[str] = []
+
+    class _Spy:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def execute(self, sql, params=None):
+            statements.append(str(sql))
+            return self._cur.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._cur, name)
+
+    with db.get_pool().connection() as conn:
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                preempted = jobs_store._expire_overdue_capture_for_chat_on_cursor(
+                    _Spy(cur),
+                    {"id": job_id, "user_id": uid, "status": "running",
+                     "claimed_by": owner},
+                )
+        finally:
+            conn.rollback()
+    assert preempted is not None and preempted.recovery == "terminal"
+    first_runtime_read = next(
+        i for i, sql in enumerate(statements) if "v2_runtime_state" in sql
+    )
+    assert len(statements[:first_runtime_read]) == 1, statements[:first_runtime_read]
+    assert "v2_worker_heartbeats" in statements[0] and "agent_jobs" in statements[0]
+
+
 @pytest.mark.parametrize(
     "case",
     [
