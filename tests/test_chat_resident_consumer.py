@@ -16375,3 +16375,55 @@ def test_hidden_body_logs_content_free_completion(monkeypatch, caplog, outcome, 
     records = [r.getMessage() for r in caplog.records if r.name == crc.log.name]
     assert records == [f"agent_body job_id=body-job-1 status={expected_status} error_code={expected_error} attempts={attempts} dur_ms={250 * attempts}"]
     assert crc._AGENT_BODY_PRIVATE.get() is False
+
+
+# --- resident distill: import review fixes (import6) ---
+
+def test_distill_region_tagged_archive_language_completes_with_english_prompts(monkeypatch):
+    """C1 之前：whoami 的档案语言 ``en-US`` 原样进导入 → memgarden UnknownBucketLocaleError，
+    job 留给回收、重试同处炸。之后：导入引擎入口归一成 ``en``。"""
+    calls = _patch_memory_distill(monkeypatch, windows=1, cards_by_window={
+        1: [_import_card("Rides a bike around the lake every Saturday")]})
+    monkeypatch.setattr(crc, "_resident_import_locale", lambda document: "en-US")
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+    assert "简体中文" not in calls["agent"][0] and "Health" in calls["agent"][0]
+
+
+def test_distill_on_memgarden_without_batched_import_logs_the_named_code(monkeypatch, caplog):
+    """C1' 之前：旧 memgarden 上是裸 ImportError（cannot import name 'ImportBatchResult'）。"""
+    import memgarden
+
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.delattr(memgarden, "ImportBatchResult")
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    with caplog.at_level("ERROR"):
+        crc._process_resident_distill_once()
+    assert calls["agent"] == [] and calls["complete"] == []
+    failed = [r.getMessage() for r in caplog.records if "resident distill failed" in r.getMessage()]
+    assert failed == ["resident distill failed job=jobm: garden_import_kernel_outdated"]
+    assert crc._distill_in_progress is None
+
+
+def test_distill_cut_off_agent_reply_triggers_memgarden_truncation_reask(monkeypatch):
+    """M3 之前：VPS 的 complete 恒报「没截断」，半截 JSON 只会走通用格式重问。
+    之后：回复里 JSON 没闭合就报截断，memgarden 用「更紧凑地重做」重问一次。"""
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    real_agent = crc.call_agent
+    replies = iter(['{"cards": [{"action": "add", "summary": "第1段里提到的一件具'])
+
+    def cut_off_once(prompt, **kw):
+        try:
+            reply = next(replies)
+        except StopIteration:
+            return real_agent(prompt, **kw)
+        calls["agent"].append(prompt)
+        return reply
+
+    monkeypatch.setattr(crc, "call_agent", cut_off_once)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert len(calls["agent"]) == 2
+    assert "因长度上限被截断" in calls["agent"][1]
+    assert calls["complete"] == [("jobm", 1, "skipped")]

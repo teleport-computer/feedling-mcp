@@ -12,6 +12,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **History import no longer fails when the account's archive language carries
+  a region tag.** The iOS app stores the device's preferred language (for
+  example `en-US`, `zh-Hans-CN` or `zh-Hant-TW`) as the archive language, and the
+  import passed it unchanged to memgarden, whose bucket lists only exist for `en`
+  and `zh-Hans`. Before: a user whose phone is set to `en-US` imports chat history
+  → the import fails (hosted plaintext genesis after already spending model calls
+  on candidate extraction, every retry failing at the same spot; the legacy
+  upload finished with zero memory cards). After: the import language is
+  normalized to `en` or `zh-Hans` with the same rule daily capture uses (`zh`/`yue`
+  tags → `zh-Hans`, `en` tags → `en`), and the English naming rule now applies
+  to `en-US` too. Covers hosted plaintext genesis, the encrypted chunk worker,
+  `/v1/history_import/upload`, and self-hosted distill (through self-update); jobs
+  already stuck on a raw tag recover on their next retry.
+
 - **Self-hosted history import again tells the model how many memory cards the
   garden should roughly hold.** Before the import moved to memgarden's import
   session, the self-hosted (VPS) consumer added a card-count note to the

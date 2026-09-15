@@ -1956,7 +1956,6 @@ def _garden_reducer_output(
 
     分块 worker 没有持久 checkpoint（一个 job 一口气跑完，崩了由回收整单重跑），进度只在内存。
     """
-    import distillation_ledger
     from genesis import foreground_identity, import_engine
     from hosted import history_import
     from memory import garden_import
@@ -1972,19 +1971,18 @@ def _garden_reducer_output(
     locale = history_import._import_language_for_store(store, messages)
     state = garden_import.new_state(locale=locale)
     llm = GenesisLLMClient()
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-        result = garden_import.run_import(
-            sources=[garden_import.ImportSource(
-                key=f"1:{family}", family=family,
-                windows=[t for t in chunk_texts if str(t or "").strip()])],
-            state=state, job_key=job_id, owner_key=str(store.user_id),
-            existing_cards=import_engine.existing_cards(store, None, runtime_token=token, job_id=job_id),
-            complete=import_engine.llm_complete(llm, user_id=str(store.user_id), job_id=job_id, runtime=runtime),
-            write=import_engine.store_writer(store, None, runtime_token=token),
-            save=lambda _s: None,
-        )
-        raw = result.cards_written + result.dropped
-        attempt.finish("not_provided" if raw == 0 else "partial" if result.dropped else "written")
+    sources = [garden_import.ImportSource(
+        key=f"1:{family}", family=family,
+        windows=[t for t in chunk_texts if str(t or "").strip()])]
+    known = import_engine.existing_cards(store, None, runtime_token=token, job_id=job_id)
+    complete = import_engine.llm_complete(llm, user_id=str(store.user_id), job_id=job_id, runtime=runtime)
+    # 台账只包写库、outcome 按这次 run 的差值（Seven b0ef0c24 的口径，见 run_with_memory_ledger）。
+    result = import_engine.run_with_memory_ledger(
+        store, job_id, state,
+        lambda write: garden_import.run_import(
+            sources=sources, state=state, job_key=job_id, owner_key=str(store.user_id),
+            existing_cards=known, complete=complete, write=write, save=lambda _s: None),
+        import_engine.store_writer(store, None, runtime_token=token))
     cards = [{k: v for k, v in c.items() if k not in {"id", "_source_family"}}
              for c in (state.get("written") or [])]
     output = _build_reducer_output(

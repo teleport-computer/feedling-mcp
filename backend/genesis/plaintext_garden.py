@@ -48,7 +48,9 @@ class HostedImport:
         self._write = import_engine.store_writer(store, api_key)
         self._known: list[dict] | None = None
 
-    def run(self, sources: list[garden_import.ImportSource], *, stage: str) -> garden_import.ImportRunResult:
+    def run(self, sources: list[garden_import.ImportSource], *, stage: str,
+            record_empty: bool = True) -> garden_import.ImportRunResult:
+        """跑这些来源；记忆台账每次调用记一行（口径见 ``import_engine.run_with_memory_ledger``）。"""
         if self._known is None:
             self._known = import_engine.existing_cards(self.store, self.api_key, job_id=self.job_id)
 
@@ -56,11 +58,14 @@ class HostedImport:
             self.progress.publish(stage=stage, source_family=source.family,
                                   source_pass=_source_pass(source), status="processing")
 
-        result = garden_import.run_import(
-            sources=sources, state=self.state, job_key=self.job_id,
-            owner_key=str(self.store.user_id), existing_cards=self._known,
-            complete=self._complete, write=self._write, save=self.progress.save_garden,
-            on_batch=on_batch)
+        result = import_engine.run_with_memory_ledger(
+            self.store, self.job_id, self.state,
+            lambda write: garden_import.run_import(
+                sources=sources, state=self.state, job_key=self.job_id,
+                owner_key=str(self.store.user_id), existing_cards=self._known,
+                complete=self._complete, write=write, save=self.progress.save_garden,
+                on_batch=on_batch),
+            self._write, record_empty=record_empty)
         self._known = result.known
         return result
 
@@ -86,13 +91,6 @@ def _source_pass(source: garden_import.ImportSource) -> int:
 def _prompt_card(card: dict) -> dict:
     """进提示词/画像的卡：不带宿主内部键（id、来源标记）。"""
     return {k: v for k, v in dict(card).items() if k not in {"id", "_source_family"}}
-
-
-def _memory_outcome(result: garden_import.ImportRunResult) -> str:
-    raw = result.cards_written + result.dropped
-    if raw == 0:
-        return "not_provided"
-    return "partial" if result.dropped else "written"
 
 
 def _emit_partial(store, job_id: str, dropped: int) -> None:
@@ -133,9 +131,7 @@ def run_add_memory(store, api_key: str | None, job_id: str, *, runtime, source_g
                           language=language, user_name=user_name)
     sources = _sources(source_groups, prefix="am:", relationship_anchor=relationship_anchor)
     progress.publish(stage="plaintext_add_memory", status="processing")
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-        result = runner.run(sources, stage="plaintext_add_memory")
-        attempt.finish(_memory_outcome(result))
+    result = runner.run(sources, stage="plaintext_add_memory")
     keep_all_job = any(s.family == "memory_summary" for s in sources)
     if keep_all_job and result.cards_written == 0:
         # 与切换前同一个失败码：长期记忆档案一张卡都没落，不能以「完成」收尾。
@@ -306,9 +302,8 @@ def _run_v2(store, api_key, job_id, *, runtime, source_groups, relationship_anch
         progress.save_garden(runner.state)
         fg_result = garden_import.ImportRunResult(done=True)
     else:
-        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-            fg_result = runner.run(fg_sources, stage="genesis_v2_foreground")
-            attempt.finish(_memory_outcome(fg_result))
+        # 前台 0 张会转去一次做完的那条路，那一趟自己记台账：这里不为「空」单独开一行。
+        fg_result = runner.run(fg_sources, stage="genesis_v2_foreground", record_empty=False)
         if fg_result.cards_written == 0:
             return False  # 前台窗口里什么都没有：交给一次做完的那条路（同切换前）
 
@@ -440,9 +435,7 @@ def _run_background(store, api_key, job_id, *, runtime, source_groups, bg_source
                     msgs, user_name, llm, progress, runner: HostedImport, language: str,
                     write_identity: bool, include_persona_voice: bool, completion: dict) -> None:
     progress.publish(stage="genesis_v2_background", status="processing")
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-        result = runner.run(bg_sources, stage="genesis_v2_background")
-        attempt.finish(_memory_outcome(result))
+    result = runner.run(bg_sources, stage="genesis_v2_background")
     merged = _finish_output(
         store, api_key, job_id, runtime=runtime, source_groups=source_groups,
         relationship_anchor=relationship_anchor, msgs=msgs, user_name=user_name, llm=llm,
@@ -480,9 +473,7 @@ def _run_full(store, api_key, job_id, *, runtime, source_groups, relationship_an
     else:
         sources = _sources(source_groups, prefix="all:", relationship_anchor=relationship_anchor)
     progress.publish(stage="plaintext_reducer", status="processing")
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-        result = runner.run(sources, stage="plaintext_reducer")
-        attempt.finish(_memory_outcome(result))
+    result = runner.run(sources, stage="plaintext_reducer")
     merged = _finish_output(
         store, api_key, job_id, runtime=runtime, source_groups=source_groups,
         relationship_anchor=relationship_anchor, msgs=msgs, user_name=user_name, llm=llm,

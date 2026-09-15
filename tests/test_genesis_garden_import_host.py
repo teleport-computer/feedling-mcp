@@ -366,3 +366,19 @@ def test_upload_undated_archive_card_stays_undated(monkeypatch):
     assert any("[The entries they wrote]" in p for p in calls["prompts"])   # 档案走 curated_archive
     dates = {a["memory"]["summary"]: a["memory"]["occurred_at"] for a in calls["actions"]}
     assert dates == {"最喜欢的书是《小王子》": "", "2019 年搬到杭州": "2019-08-01"}
+
+
+def test_upload_region_tagged_archive_language_imports_instead_of_crashing(monkeypatch):
+    """C1 之前：iOS 存的档案语言 ``en-US`` 经 ``import_language_with_archive`` 原样返回、
+    进 ImportRequest → memgarden UnknownBucketLocaleError。旧上传入口吞模型侧错误，
+    表现为「完成、0 张卡」+ 一条 warning。之后：导入引擎入口归一，卡照常写进去。"""
+    assert hi.import_language_with_archive([{"content": "hello there"}], "en-US") == "en-US"
+    calls = _upload_env(monkeypatch, reply=_cards_reply({
+        "summary": "Rides a bike around West Lake every Saturday",
+        "content": "Every Saturday morning they ride a bike around West Lake."}))
+    monkeypatch.setattr(hi, "_import_language_for_store", lambda *_a: "en-US")
+    job = _upload({"content": _CHAT, "format": "plaintext"})
+    assert job["status"] == "completed"
+    assert job["memories_created"] == 1 and len(calls["actions"]) == 1
+    assert not any("provider_memory_import_failed" in w for w in job["warnings"])
+    assert "Health" in calls["prompts"][0]

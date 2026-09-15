@@ -138,16 +138,36 @@ def sources_from_groups(
 # 状态（JSON 可序列化，宿主负责加密保存）
 # --------------------------------------------------------------------------- #
 
+def garden_locale(raw: str) -> str:
+    """导入语言 → memgarden 认的花园语言（``zh-Hans`` / ``en``）。空串原样返回。
+
+    之前：档案语言 ``en-US`` / ``zh-Hans-CN``（iOS 存的是 ``Locale.preferredLanguages.first``）
+    原样进 ``ImportRequest.locale`` → memgarden 桶清单只认 ``en`` / ``zh-Hans`` → 整个导入抛
+    ``UnknownBucketLocaleError``。之后：在导入引擎入口归一，四个导入入口都经过这里。
+
+    判定复用日常落卡 / 做梦的花园语言函数（``chat.reply_language.infer_garden_language``，
+    只看标签、不看内容），不另写一套映射 —— 同一个花园不能导入一种判法、落卡另一种。
+    函数内 import：那是纯函数模块（只依赖 core.util + memgarden），不引入上层状态。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    from chat import reply_language
+
+    return reply_language.infer_garden_language(None, archive_language=text)
+
+
 def new_state(*, locale: str, user_name: str = "", strategy: str | None = None,
               host_note: str = "") -> dict:
     """一次导入的进度。**导入语义参数在第一次就定下来**，续跑沿用 ——
     否则中途档案语言或称呼变了，续传指纹对不上，整个导入只能从头来。
 
+    ``locale`` 存的是归一后的花园语言（见 :func:`garden_locale`）。
+
     ``host_note``：给写卡提示词的补充指引（memgarden ``ImportRequest.host_note``）。
     目前只有 VPS 传（切换前 fact_write 的张数引导 floor_note）；托管 / 明文导入不传。
     空串时不进 params，状态形状与之前一致。"""
     chosen = strategy if strategy in _STRATEGIES else default_strategy()
-    params = {"locale": str(locale or ""), "user_name": str(user_name or ""),
+    params = {"locale": garden_locale(locale), "user_name": str(user_name or ""),
               "strategy": chosen}
     if str(host_note or "").strip():
         params["host_note"] = str(host_note)
@@ -394,6 +414,36 @@ class ImportRunResult:
     known: list[dict] = field(default_factory=list)
 
 
+#: 装的 memgarden 太老、没有宿主驱动分批导入时的失败码（content-free）。
+#: io 钉的 memgarden 升到带 ``ImportRequest.batches`` / ``ImportBatchResult`` 的版本之前、
+#: 或自建 VPS 自更新「先切代码、后装依赖」没装完时会出现。
+IMPORT_KERNEL_OUTDATED = "garden_import_kernel_outdated"
+
+
+class GardenImportKernelOutdated(RuntimeError):
+    """装的 memgarden 不支持宿主驱动的分批导入。"""
+
+    code = IMPORT_KERNEL_OUTDATED
+
+
+def import_kernel_drives_batches() -> bool:
+    """装的 memgarden 能不能跑宿主驱动的分批导入（看公开契约：``ImportBatchResult`` 和
+    ``ImportRequest.batches``）。和 ``garden_component.dream_kernel_renders_card_bodies``
+    同一种判据。旧包上导入不能降级跑（没有旧路径可退），只能带名字失败，而不是在
+    半路抛裸 ImportError / TypeError。"""
+    try:
+        import memgarden
+    except ImportError:
+        return False
+    request = getattr(memgarden, "ImportRequest", None)
+    if request is None or not hasattr(memgarden, "ImportBatchResult"):
+        return False
+    try:
+        return "batches" in {f.name for f in dataclasses.fields(request)}
+    except TypeError:
+        return False
+
+
 def import_request_accepts_host_note() -> bool:
     """装的 memgarden 认不认 ``ImportRequest.host_note``。
 
@@ -492,6 +542,52 @@ def _remember_written(state: dict, mutations: Sequence[Mapping], ids: Sequence[s
         kept.append({**mutation_item(mutation), "id": rid, "_source_family": family})
 
 
+def _bump(entry: dict, key: str, stage: str) -> None:
+    counts = entry.setdefault(key, {})
+    counts[stage] = int(counts.get(stage) or 0) + 1
+
+
+def _reset_session_counters(entry: dict) -> None:
+    entry.update({"progress": None, "batches_skipped": 0, "stage_ok": {},
+                  "stage_skipped": {}, "done": False})
+
+
+def _open_session(garden, source: ImportSource, params: Mapping[str, Any], state: dict,
+                  entry: dict, *, job_key: str, owner_key: str, known: list[dict],
+                  save: Callable[[dict], None]):
+    """开这一组的导入会话；存下的进度续不上时，清掉这组进度从头来。
+
+    续不上 = memgarden 判定这份进度和当前请求不是同一次导入（续传指纹 / 材料摘要 / 批次
+    边界对不上），比如跨发版改了批次规则、改了环境变量里的策略、老 checkpoint 里的
+    locale 被归一。之前这会抛 ValueError，job 每次重试都在同一处炸、永久失败。
+    判据不靠匹配报错文案：**带进度开不了、不带进度开得了**，就是进度的问题；
+    不带进度也开不了（请求本身不合法）照常抛。
+
+    已经写进去的卡不回收：重试时它们在「已有记忆索引」里，会被合并 —— 与已接受的
+    「崩溃重跑」口径一致。"""
+    request = _request(source, params, job_key=job_key)
+    progress = _progress_from(entry.get("progress"))
+    if progress is None:
+        return garden.import_session(request, progress=None, existing_cards=known,
+                                     owner_key=owner_key)
+    try:
+        return garden.import_session(request, progress=progress, existing_cards=known,
+                                     owner_key=owner_key)
+    except ValueError:
+        session = garden.import_session(request, progress=None, existing_cards=known,
+                                        owner_key=owner_key)
+    # 只记类别和来源，不记内容。
+    log.warning("garden import progress not resumable; restarting source job=%s source=%s",
+                job_key, source.family)
+    _reset_session_counters(entry)
+    entry["resume_resets"] = int(entry.get("resume_resets") or 0) + 1
+    pending = state.get("pending")
+    if isinstance(pending, dict) and pending.get("session") == source.key:
+        state["pending"] = None
+    save(state)
+    return session
+
+
 def run_import(
     *,
     sources: Sequence[ImportSource],
@@ -511,19 +607,27 @@ def run_import(
     在每次问模型之前检查（VPS 让用户消息先走）；返回 True 时本函数带着 ``yielded`` 返回，
     ``state`` 已经存好，下次用同一个 ``state`` 再调就接着跑。
     """
+    if not import_kernel_drives_batches():
+        raise GardenImportKernelOutdated(IMPORT_KERNEL_OUTDATED)
     from memgarden import ImportBatchResult
 
     if not is_state(state):
         raise ValueError("garden_import_state_invalid")
-    params = state.get("params") or {}
-    if not str(params.get("locale") or "").strip():
+    params = state.setdefault("params", {})
+    locale = garden_locale(params.get("locale") or "")
+    if not locale:
         # 两段式没有 locale 会整批拒绝（locale_required），被下面的「跳过坏批」吞成
         # 「没什么可记」—— 用户看到导入成功、一张卡没有。宁可当场炸。
         raise ValueError("garden_import_locale_required")
+    if params.get("locale") != locale:
+        # 归一之前开始的 job：checkpoint 里存的是 ``en-US`` 这类原样标签。改成归一值后
+        # 续传指纹会变，旧进度由 _open_session 清掉重来（那些进度是在崩溃前存下的候选，
+        # 带原样标签的写卡提示词一张卡都没写成过）。
+        params["locale"] = locale
+        save(state)
     known = [dict(c) for c in (existing_cards or [])]
     garden = garden_component.build_garden(garden_component.CallableModel(lambda _p: ""))
     totals = state.setdefault("totals", {"cards_written": 0, "dropped": 0, "batches_skipped": 0})
-    totals.setdefault("batches_ok", 0)
     batches_total = sum(len(s.windows) for s in sources)
 
     def _result(*, done: bool, yielded: bool = False) -> ImportRunResult:
@@ -534,6 +638,10 @@ def run_import(
             batches_skipped=int(totals.get("batches_skipped") or 0),
             batches_total=batches_total, known=known)
 
+    def _add_dropped(entry: dict, n: int) -> None:
+        totals["dropped"] = int(totals.get("dropped") or 0) + n
+        entry["dropped"] = int(entry.get("dropped") or 0) + n
+
     for source in sources:
         entries = state.setdefault("sessions", {})
         entry = entries.setdefault(source.key, {"done": False, "cards_written": 0,
@@ -541,10 +649,8 @@ def run_import(
         entry["window_ends"] = _window_ends(source)
         if entry.get("done"):
             continue
-        session = garden.import_session(
-            _request(source, params, job_key=job_key),
-            progress=_progress_from(entry.get("progress")),
-            existing_cards=known, owner_key=owner_key)
+        session = _open_session(garden, source, params, state, entry, job_key=job_key,
+                                owner_key=owner_key, known=known, save=save)
         attempts = 0
         while True:
             if should_yield is not None and should_yield():
@@ -588,6 +694,11 @@ def run_import(
                 session.commit(empty)
                 totals["batches_skipped"] = int(totals.get("batches_skipped") or 0) + 1
                 entry["batches_skipped"] = int(entry.get("batches_skipped") or 0) + 1
+                _bump(entry, "stage_skipped", outcome.stage)
+                if outcome.stage == "write":
+                    # 两段式写卡组被跳过：这组候选（offset..end 是候选下标）一张没写成，
+                    # 按丢弃计 —— genesis_partial 通知靠它发出来。
+                    _add_dropped(entry, max(0, int(outcome.end) - int(outcome.offset)))
                 entry["progress"] = dataclasses.asdict(session.progress)
                 attempts = 0
                 save(state)
@@ -595,8 +706,7 @@ def run_import(
                     on_batch(source)
                 continue
             attempts = 0
-            totals["batches_ok"] = int(totals.get("batches_ok") or 0) + 1
-            entry["batches_ok"] = int(entry.get("batches_ok") or 0) + 1
+            _bump(entry, "stage_ok", outcome.stage)
             if outcome.stage == "candidates":
                 session.commit(outcome)
                 entry["progress"] = dataclasses.asdict(session.progress)
@@ -607,17 +717,28 @@ def run_import(
 
             if replay:
                 mutations = list(outcome.mutations)  # 存进 pending 之前已经改写过
+                ids: list[str] = list((pending or {}).get("ids") or [])
+                replays = int((pending or {}).get("replays") or 0) + 1
             else:
                 user_name = str(params.get("user_name") or "")
                 mutations = [with_person_references_rewritten(m, user_name)
                              for m in outcome.mutations]
-            ids: list[str] = list((pending or {}).get("ids") or []) if replay else []
+                ids = []
+                replays = 0
             state["pending"] = {
                 "session": source.key, "stage": outcome.stage, "offset": outcome.offset,
                 "end": outcome.end, "idempotency_key": outcome.idempotency_key,
                 "mutations": mutations, "cards": list(outcome.cards), "ids": ids,
+                "replays": replays,
             }
             save(state)
+            if replays >= BATCH_ATTEMPTS and len(ids) < len(mutations):
+                # 同一段写库已经原样重放过、还是没写完（持久的写库错误，每次重试都在同一张卡
+                # 上炸）：和「同一批反复判不出来」同一个次数口径，剩下的按丢弃处理，
+                # 别让整个导入永远卡在这一段。只记张数。
+                log.warning("garden import pending write gave up job=%s source=%s remaining=%d",
+                            job_key, source.family, len(mutations) - len(ids))
+                ids.extend([""] * (len(mutations) - len(ids)))
             while len(ids) < len(mutations):
                 chunk = mutations[len(ids):len(ids) + WRITE_CHUNK]
                 try:
@@ -638,7 +759,9 @@ def run_import(
                 ids.extend(got)
                 state["pending"]["ids"] = ids
                 save(state)
-            session.commit(outcome, record_ids=ids)
+            # 提交给会话的是**改写过称呼**的指令：会话把它登记进后面批次的已有记忆索引，
+            # 交原始指令的话，后面批次的模型看到的还是「用户…」。
+            session.commit(dataclasses.replace(outcome, mutations=mutations), record_ids=ids)
             _register_known(known, mutations, ids)
             written = sum(1 for rid in ids if rid)
             dropped = len(ids) - written
@@ -647,22 +770,29 @@ def run_import(
                 log.warning("garden import batch partial job=%s source=%s written=%d dropped=%d",
                             job_key, source.family, written, dropped)
             totals["cards_written"] = int(totals.get("cards_written") or 0) + written
-            totals["dropped"] = int(totals.get("dropped") or 0) + dropped
             entry["cards_written"] = int(entry.get("cards_written") or 0) + written
-            entry["dropped"] = int(entry.get("dropped") or 0) + dropped
+            _add_dropped(entry, dropped)
             _remember_written(state, mutations, ids, source.family)
             entry["progress"] = dataclasses.asdict(session.progress)
             state["pending"] = None
             save(state)
             if on_batch is not None:
                 on_batch(source)
-        if int(entry.get("batches_skipped") or 0) and not int(entry.get("batches_ok") or 0):
-            # 这组**每一批**都判不出来 —— 不是「材料里没东西」，是模型/回复格式出了问题。
-            # 清掉这组的进度再抛：job 以可重试失败结束，重试时这组从头来，而不是
-            # 因为游标已经走到头而把「全失败」当成「做完了」。
-            entry.update({"progress": None, "batches_skipped": 0, "done": False})
+        skipped = entry.get("stage_skipped") or {}
+        ok = entry.get("stage_ok") or {}
+        failed_stages = sorted(s for s, n in skipped.items() if int(n or 0) and not int(ok.get(s) or 0))
+        if failed_stages:
+            # 这组某个阶段**每一批**都判不出来 —— 不是「材料里没东西」，是模型/回复格式出了问题。
+            # 按阶段看：两段式候选都抽出来了、写卡组却一个没成，也算失败（之前候选阶段的成功
+            # 把它盖住，显示「完成、0 张卡」）。清掉这组的进度再抛：job 以可重试失败结束，
+            # 重试时这组从头来，而不是因为游标已经走到头而把「全失败」当成「做完了」。
+            # 失败的这组一张卡都没写成，它记下的丢弃数随进度一起撤掉（重试会重新算）。
+            totals["dropped"] = max(0, int(totals.get("dropped") or 0) - int(entry.get("dropped") or 0))
+            entry["dropped"] = 0
+            _reset_session_counters(entry)
             save(state)
-            raise GardenImportFailed(f"garden_import_all_batches_failed:{source.key}")
+            raise GardenImportFailed(
+                f"garden_import_all_batches_failed:{source.key}:{','.join(failed_stages)}")
         entry["progress"] = dataclasses.asdict(session.progress)
         entry["done"] = True
         save(state)
@@ -678,12 +808,16 @@ __all__ = [
     "FAMILY_POLICY",
     "GardenImportCardsRejected",
     "GardenImportFailed",
+    "GardenImportKernelOutdated",
+    "IMPORT_KERNEL_OUTDATED",
     "ImportRunResult",
     "ImportSource",
     "STRATEGY_ENV",
     "WRITE_CHUNK",
     "default_strategy",
     "entry_windows_done",
+    "garden_locale",
+    "import_kernel_drives_batches",
     "import_request_accepts_host_note",
     "index_cards",
     "is_state",
