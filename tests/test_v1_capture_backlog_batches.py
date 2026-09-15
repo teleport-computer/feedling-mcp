@@ -365,3 +365,102 @@ def test_mixed_history_keeps_page_seq_for_single_decrypted_rows(monkeypatch):
         0, 200, include_image_body=False, after_seq=6)
     assert handled is True
     assert [r["seq"] for r in rows] == [7, 8]
+
+
+def _route_consumer_http_to_real_backend(monkeypatch, api_key: str) -> list[str]:
+    """Send the consumer's backend GETs to the real assembled ASGI app."""
+    import urllib.parse
+
+    from asgi_test_client import make_client
+
+    client = make_client()
+    paths: list[str] = []
+
+    class _Resp:
+        def __init__(self, shim):
+            self._shim = shim
+            self.status_code = shim.status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._shim.get_json()
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        path = url[len(crc.FEEDLING_API_URL):]
+        if params:
+            path = f"{path}?{urllib.parse.urlencode(params)}"
+        paths.append(path)
+        return _Resp(client.get(path, headers=dict(headers or {})))
+
+    monkeypatch.setattr(crc._HTTP, "get", fake_get)
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    # This consumer authenticates as the registered user with its API key only
+    # (other tests may leave a hosted runtime token in the shared header dict).
+    headers = {k: v for k, v in crc._HEADERS.items() if k != "X-Feedling-Runtime-Token"}
+    headers["X-API-Key"] = api_key
+    monkeypatch.setattr(crc, "_HEADERS", headers)
+    return paths
+
+
+def test_batch_window_is_complete_past_thousands_of_excluded_rows(backend_env, monkeypatch):
+    """Codex review 2026-09-15 (C1).
+
+    Before: the consumer gave up after 10 history pages (2000 raw rows). The
+    backend cuts the batch counting only live user/openclaw rows, so >2000
+    non-live rows between the cursor and ``through_seq`` made every attempt
+    return an empty window -> ``capture_window_unavailable`` -> the escape valve
+    eventually skipped 60 real messages that were never read.
+
+    After: paging continues while seq advances, so the window is complete.
+    Runs the real scheduler, the real ``/v1/chat/history`` route and the real
+    consumer history reader (plaintext rows, no history fake).
+    """
+    import base64
+
+    from asgi_test_client import make_client
+
+    registered = make_client().post(
+        "/v1/users/register",
+        json={"public_key": base64.b64encode(b"\x5a" * 32).decode(), "archive_language": "zh"},
+    )
+    assert registered.status_code == 201, registered.get_data(as_text=True)
+    api_key = registered.get_json()["api_key"]
+    store = core_store.get_store(registered.get_json()["user_id"])
+    db.set_blob(store.user_id, "consumer_state", {
+        "consumer_name": "feedling-chat-resident",
+        "consumer_capabilities": ["vision_observer_v1", CAP],
+    })
+
+    store.append_chat("user", "chat", {"id": "live_first", "body": "我下周要去大阪出差"})
+    # More non-live rows than the old 10-page (2000-row) reach. The backend batch
+    # cut never counts them (server-authored maintenance prompts here).
+    excluded = 2250
+    with monkeypatch.context() as quiet:
+        quiet.setattr(capture_scheduler, "record_chat_append", lambda *a, **k: {})
+        for i in range(excluded):
+            store.append_chat(
+                "system", "resident_maintenance",
+                {"id": f"sys{i:05d}", "body": f"maintenance {i}"},
+            )
+    store.append_chat("openclaw", "chat", {"id": "live_last", "body": "好的，记得带护照"})
+
+    paths = _route_consumer_http_to_real_backend(monkeypatch, api_key)
+    last_ts = float(db.chat_history_page_by_seq_strict(
+        store.user_id, limit=1, latest=True)[0]["ts"])
+    now = last_ts + max(capture_scheduler.quiet_sec(), capture_scheduler.min_interval_sec()) + 5
+    tick = capture_scheduler.tick_quiet_capture(store, now=now)
+    assert tick["enqueued"] is True, tick
+    job = tick["job"]
+    window = job["window"]
+    assert window["until_message_id"] == "live_last"
+    assert window["through_seq"] - window["after_seq"] > excluded
+
+    messages = crc._capture_window_messages(job)
+    ids = [crc._capture_message_id(m) for m in messages]
+    assert ids and ids[0] == "live_first" and ids[-1] == "live_last", ids[:3]
+    assert "我下周要去大阪出差" in crc._capture_window_text(messages)
+    # Really went through the real route, past the old 10-page reach.
+    assert len(paths) > 10 and all("/v1/chat/history?" in p and "after_seq=" in p for p in paths)

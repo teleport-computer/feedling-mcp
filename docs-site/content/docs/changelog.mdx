@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Resident V1 capture no longer skips a batch it could not read past a long
+  run of non-chat rows.** The backend sizes a capture batch by counting only chat
+  messages, but the consumer read at most 10 history pages (2,000 rows) to reach
+  the batch's end. Before: more than 2,000 other rows (for example maintenance
+  prompts) between two chat messages → every attempt failed with
+  `capture_window_unavailable` → after the retry limit the batch of up to 60 chat
+  messages was skipped without ever being read, and its memories were lost.
+  After: the consumer keeps paging while the history cursor advances and captures
+  the whole batch. Applies to hosted V1 runners and self-hosted consumers (through
+  self-update); Runtime V2 is unchanged.
+
 - **Nightly memory consolidation (Dream) follows the same naming rule as
   capture.** Dream prompts in Runtime V2 and resident V1 (hosted runner and
   self-hosted consumers) used the memory kernel's default naming rule instead of
@@ -131,13 +142,16 @@ change must not be interpreted as an API guarantee.
   Each account now has a per-user offset inside the 02:00–05:00 window (in the
   user's timezone) that stays fixed within a night and rotates between nights,
   and a fleet-wide ceiling (default 4) limits how many automatic Dream jobs may
-  hold enclave work at once (resident V1 queued or running, Runtime V2 claimed
-  or running). An account still capped when the window closes records a
+  be queued or running at once (resident V1 queued or running, Runtime V2 queued
+  within the last hour, claimed or running). The count and the enqueue are one
+  decision under a deployment-wide lock, so simultaneous ticks cannot all take
+  the same free slot. An account still capped when the window closes records a
   `memory.dream.window_missed` diagnostic event. Previously every eligible account became due at 02:00 and the
   simultaneous whole-garden card reads coincided with enclave decrypt timeouts.
   `POST /v1/dream/tick` can now answer `enqueued: false` with the reasons
-  `dream_stagger_not_due` or `dream_concurrency_cap`; both are scheduling
-  delays, not failures. User-requested organize (`force`) bypasses both. New
+  `dream_stagger_not_due`, `dream_concurrency_cap` or `dream_admission_busy`
+  (another account's admission was being decided at that moment); all are
+  scheduling delays, not failures. User-requested organize (`force`) bypasses both. New
   operator settings: `FEEDLING_DREAM_STAGGER` (default on) and
   `FEEDLING_DREAM_MAX_CONCURRENT` (default `4`, `0` disables).
 

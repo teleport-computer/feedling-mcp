@@ -61,6 +61,16 @@ jobs:
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
           LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
+          # 告警阈值（可选）：是 2026-09-15 定的初始值、没有用 prod 基线校准过。
+          # 在仓库 Variables 里设同名变量即可调，不设就用脚本里的默认值。
+          MEMORY_REPORT_STUCK_USERS: ${{ vars.MEMORY_REPORT_STUCK_USERS }}
+          MEMORY_REPORT_OUR_SIDE_USERS: ${{ vars.MEMORY_REPORT_OUR_SIDE_USERS }}
+          MEMORY_REPORT_MIN_ATTEMPTS_FOR_RATE: ${{ vars.MEMORY_REPORT_MIN_ATTEMPTS_FOR_RATE }}
+          MEMORY_REPORT_FAILURE_RATE: ${{ vars.MEMORY_REPORT_FAILURE_RATE }}
+          MEMORY_REPORT_FAILURE_RATE_JUMP_PP: ${{ vars.MEMORY_REPORT_FAILURE_RATE_JUMP_PP }}
+          MEMORY_REPORT_ACTIVE_DROP_RATIO: ${{ vars.MEMORY_REPORT_ACTIVE_DROP_RATIO }}
+          MEMORY_REPORT_ACTIVE_DROP_MIN_PREVIOUS: ${{ vars.MEMORY_REPORT_ACTIVE_DROP_MIN_PREVIOUS }}
+          MEMORY_REPORT_LIVE_STUCK_JOBS: ${{ vars.MEMORY_REPORT_LIVE_STUCK_JOBS }}
           REPORT_DAY: ${{ inputs.day }}
           REPORT_DRY_RUN: ${{ inputs.dry_run }}
         run: |

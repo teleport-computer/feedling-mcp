@@ -6,6 +6,7 @@ agent, write chat, or consult proactive reach-out gates.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -89,8 +90,9 @@ def night_end_hour() -> int:
 #    within one night; a different slot next night, so under saturation the users
 #    stuck in late slots rotate instead of the same ones losing every night).
 # 2. Admission ceiling — no new Dream is enqueued while the fleet already has
-#    ``dream_max_concurrent()`` Dream jobs holding enclave work (V1 queued or
-#    running + V2 claimed or running; see ``active_dream_job_count``).
+#    ``dream_max_concurrent()`` Dream jobs queued or running (V1 queued/running +
+#    V2 recently pending/claimed/running; see ``active_dream_job_count``), counted
+#    and enqueued under one fleet-wide lock (``_admission_slot``).
 #
 # ``force`` (a user-requested organize) bypasses both, like every other gate.
 # ---------------------------------------------------------------------------
@@ -103,6 +105,9 @@ DREAM_STAGGER_TAIL_MARGIN_SEC = 5400
 #: A V1 Dream job created longer ago than this no longer counts toward the
 #: admission ceiling. A resident Dream is at most a couple of 300s agent turns;
 #: an hour-old active row is an orphan (consumer gone), not load.
+#: It also bounds a *pending* V2 Dream's slot: V2 has no pending expiry for this
+#: lane (no queue deadline; the reaper's pending TTL is chat-only). Trade-off: a
+#: stalled V2 queue blocks admission for up to this long.
 DREAM_ADMISSION_LEGACY_HORIZON_SEC = 3600.0
 #: Default ceiling. The enclave serves decrypts from 4 GIL-bound worker
 #: processes (FEEDLING_ENCLAVE_WORKERS=4 in the prod compose), and a Dream's
@@ -110,10 +115,9 @@ DREAM_ADMISSION_LEGACY_HORIZON_SEC = 3600.0
 #: one worker instance's enclave requests at 4. More than 4 simultaneous Dreams
 #: can therefore occupy every decrypt worker at once and starve foreground reads.
 DREAM_MAX_CONCURRENT_DEFAULT = 4
-#: V2 Dream jobs hold a slot only once a worker has them. A ``pending`` V2 Dream
-#: has no queue deadline, so a stalled or drained V2 queue would otherwise keep
-#: pending rows forever and block Dream fleet-wide (V1 included); a pending row
-#: reads nothing from the enclave.
+#: Plus ``pending`` V2 Dreams within the horizon: the pool claims them as soon as
+#: it has room, so leaving them out let a burst far past the ceiling (Codex review
+#: 2026-09-15); counting them forever let a stalled queue block Dream fleet-wide.
 _V2_ADMISSION_JOB_STATUSES = ("claimed", "running")
 
 
@@ -187,8 +191,7 @@ def active_dream_job_count() -> int:
     - V1: active ``memory_dream`` rows created within the orphan horizon. A V1
       job is only ever claimed by a live consumer shortly after it is queued, so
       pending and claimed both count; the horizon retires orphans.
-    - V2: ``claimed``/``running`` dream-lane jobs only — see
-      ``_V2_ADMISSION_JOB_STATUSES``.
+    - V2: claimed/running + in-horizon pending — see ``_V2_ADMISSION_JOB_STATUSES``.
 
     The orphan horizon is measured on server time, and scheduler-enqueued V1
     rows carry server time too (``_tick_memory_dream``): the decision ``now`` of
@@ -198,6 +201,7 @@ def active_dream_job_count() -> int:
         legacy_since_epoch=time.time() - DREAM_ADMISSION_LEGACY_HORIZON_SEC,
         legacy_active_statuses=sorted(capture_jobs.CAPTURE_ACTIVE_STATUSES),
         v2_active_statuses=list(_V2_ADMISSION_JOB_STATUSES),
+        v2_pending_horizon_sec=DREAM_ADMISSION_LEGACY_HORIZON_SEC,
     )
 
 
@@ -211,6 +215,29 @@ def _admission_ceiling_reached() -> bool:
         log.warning("dream admission count failed; admitting: %s", type(exc).__name__)
         return False
     return active >= cap
+
+
+@contextlib.contextmanager
+def _admission_slot(*, force: bool):
+    """Yield ``None`` (may enqueue, body runs under the fleet lock — see
+    ``db.memory_dream_admission_lock``) or the skip reason. ``force`` / the ``0``
+    kill switch take no lock; a DB error on the lock admits (like a failed count);
+    a lock held elsewhere answers ``dream_admission_busy`` (retry next tick)."""
+    if force or dream_max_concurrent() <= 0:
+        yield None
+        return
+    with contextlib.ExitStack() as stack:
+        try:
+            held = stack.enter_context(db.memory_dream_admission_lock())
+        except Exception as exc:  # noqa: BLE001 — a failed lock must not stop Dream
+            log.warning("dream admission lock unavailable; admitting: %s", type(exc).__name__)
+            held = None
+        if held is False:
+            yield "dream_admission_busy"
+        elif _admission_ceiling_reached():
+            yield "dream_concurrency_cap"
+        else:
+            yield None
 
 
 def _now_iso(now: float | None = None) -> str:
@@ -481,7 +508,7 @@ def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
 _EXPECTED_SKIP_REASONS = frozenset({
     "dream_disabled", "no_memory_cards", "dream_already_pending",
     "night_not_due", "min_interval", "not_enough_new_cards", "already_dreamed",
-    "dream_stagger_not_due", "dream_concurrency_cap",
+    "dream_stagger_not_due", "dream_concurrency_cap", "dream_admission_busy",
 })
 
 
@@ -577,65 +604,67 @@ def _tick_memory_dream(
         }
 
     # Fleet admission ceiling — last, so only genuine enqueue candidates pay for
-    # the count, and a capped user simply re-evaluates on the next tick.
-    if not force and _admission_ceiling_reached():
-        return {
-            "enqueued": False,
-            "reason": "dream_concurrency_cap",
-            "state": state,
-            "job": None,
-            "snapshot": snapshot,
-            "new_cards": new_cards,
-            "new_turns": 0,
-        }
+    # the count. Count + enqueue are one decision under a fleet-wide lock, else
+    # concurrent producers (V1 ticks, the V2 scheduler) all take one free slot.
+    with _admission_slot(force=force) as admission_skip:
+        if admission_skip is not None:
+            return {
+                "enqueued": False,
+                "reason": admission_skip,
+                "state": state,
+                "job": None,
+                "snapshot": snapshot,
+                "new_cards": new_cards,
+                "new_turns": 0,
+            }
 
-    # Chat turns do not decide whether a dream is needed. Count them only for
-    # a real enqueue candidate, where they remain part of the legacy job stats
-    # and idempotency material without creating a periodic history-sized read.
-    turn_count = max(0, _live_user_turn_count(store))
-    snapshot = dict(snapshot)
-    snapshot["turn_count"] = turn_count
-    new_turns = max(0, turn_count - last_turn_count)
-    key = dream_key_for_snapshot(state, snapshot)
-    trigger = "force_dream" if force else "nightly_dream"
-    # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为
-    # （append 进 legacy proactive_jobs 流）。V2 的 scheduler 传入一个把 job 塞进
-    # agent_jobs 的 submitter —— 上面的所有早退（disabled / no_memory_cards /
-    # dream_already_pending / night_not_due / failure_backoff / already_dreamed /
-    # min_interval / not_enough_new_cards）原样复用，零漂移。submit 的返回值
-    # 直接就是这个函数的 enqueue 结果，形状与 legacy 分支一致。
-    if submit is not None:
-        submitted = submit(store, trigger=trigger, now=now_ts)
-        job = submitted.get("job")
-        enqueued = bool(submitted.get("enqueued"))
-        reason = submitted.get("reason")
-    else:
-        stats = {
-            "card_count": card_count,
-            "new_cards": new_cards,
-            "new_turns": new_turns,
-            "last_dreamed_card_count": max(0, int(state.get("last_dreamed_card_count") or 0)),
-            "last_dreamed_seed_card_count": max(
-                0, int(state.get("last_dreamed_seed_card_count") or 0)
-            ),
-            "seed_card_count": max(0, int(snapshot.get("seed_card_count") or 0)),
-            "last_dreamed_turn_count": last_turn_count,
-            "turn_count": turn_count,
-            "signature": snapshot.get("signature") or "",
-        }
-        job, enqueued, reason = capture_jobs.enqueue_memory_dream_job(
-            store,
-            trigger=trigger,
-            dream_key=key,
-            dream_until={
+        # Chat turns do not decide whether a dream is needed. Count them only for
+        # a real enqueue candidate, where they remain part of the legacy job stats
+        # and idempotency material without creating a periodic history-sized read.
+        turn_count = max(0, _live_user_turn_count(store))
+        snapshot = dict(snapshot)
+        snapshot["turn_count"] = turn_count
+        new_turns = max(0, turn_count - last_turn_count)
+        key = dream_key_for_snapshot(state, snapshot)
+        trigger = "force_dream" if force else "nightly_dream"
+        # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为
+        # （append 进 legacy proactive_jobs 流）。V2 的 scheduler 传入一个把 job 塞进
+        # agent_jobs 的 submitter —— 上面的所有早退（disabled / no_memory_cards /
+        # dream_already_pending / night_not_due / failure_backoff / already_dreamed /
+        # min_interval / not_enough_new_cards）原样复用，零漂移。submit 的返回值
+        # 直接就是这个函数的 enqueue 结果，形状与 legacy 分支一致。
+        if submit is not None:
+            submitted = submit(store, trigger=trigger, now=now_ts)
+            job = submitted.get("job")
+            enqueued = bool(submitted.get("enqueued"))
+            reason = submitted.get("reason")
+        else:
+            stats = {
+                "card_count": card_count,
+                "new_cards": new_cards,
+                "new_turns": new_turns,
+                "last_dreamed_card_count": max(0, int(state.get("last_dreamed_card_count") or 0)),
+                "last_dreamed_seed_card_count": max(
+                    0, int(state.get("last_dreamed_seed_card_count") or 0)
+                ),
+                "seed_card_count": max(0, int(snapshot.get("seed_card_count") or 0)),
+                "last_dreamed_turn_count": last_turn_count,
+                "turn_count": turn_count,
                 "signature": snapshot.get("signature") or "",
-                "last_until": snapshot.get("last_until") or "",
-            },
-            dream_stats=stats,
-            # Server time, not the (possibly client-supplied) decision ``now``:
-            # the row's ts is what the admission ceiling's orphan horizon reads.
-            now=_trace_now(),
-        )
+            }
+            job, enqueued, reason = capture_jobs.enqueue_memory_dream_job(
+                store,
+                trigger=trigger,
+                dream_key=key,
+                dream_until={
+                    "signature": snapshot.get("signature") or "",
+                    "last_until": snapshot.get("last_until") or "",
+                },
+                dream_stats=stats,
+                # Server time, not the (possibly client-supplied) decision ``now``:
+                # the row's ts is what the admission ceiling's orphan horizon reads.
+                now=_trace_now(),
+            )
     # Only arm pending for a genuinely in-flight job (mirror capture fix): arming on
     # a terminal duplicate is what caused the permanent dream_already_pending lock.
     if job is not None and (enqueued or capture_jobs._active_dream_job(job)):

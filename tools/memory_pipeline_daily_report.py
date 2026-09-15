@@ -111,26 +111,61 @@ GROUP_LABELS = {
 }
 
 # ---- attention thresholds (message is marked 需要关注 when any rule fires) --
+#
+# 🔴 Provenance: every number below is an INITIAL value proposed by Claude Code
+# on 2026-09-15 when this report was written. None was derived from a measured
+# prod baseline; tune them after observing a few weeks of real reports. Each
+# can be overridden without a code change through the environment variable
+# named next to it (the workflow passes the same-named GitHub repository
+# variable; an unset/empty or unparsable value keeps the default).
+
+def _threshold(name: str, default: float, cast: type = int) -> Any:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        print(f"ignoring invalid {name}; using default {default}", file=sys.stderr)
+        return default
+    if value < 0:
+        print(f"ignoring negative {name}; using default {default}", file=sys.stderr)
+        return default
+    return value
+
+
 #: Users on one lane/route with failures and zero successes that day.
-STUCK_USERS_ATTENTION = 10
+STUCK_USERS_ATTENTION = _threshold("MEMORY_REPORT_STUCK_USERS", 10)
 #: Distinct users hit by our-side failures on one lane/route.
-OUR_SIDE_USERS_ATTENTION = 5
+OUR_SIDE_USERS_ATTENTION = _threshold("MEMORY_REPORT_OUR_SIDE_USERS", 5)
 #: Failure-rate rules only apply with at least this many terminal attempts,
 #: so a 1-of-2 day on a quiet lane does not page anyone.
-MIN_ATTEMPTS_FOR_RATE = 20
+MIN_ATTEMPTS_FOR_RATE = _threshold("MEMORY_REPORT_MIN_ATTEMPTS_FOR_RATE", 20)
 #: Absolute failure rate that is abnormal on its own.
-FAILURE_RATE_ATTENTION = 0.5
+FAILURE_RATE_ATTENTION = _threshold("MEMORY_REPORT_FAILURE_RATE", 0.5, float)
 #: Day-over-day increase, in percentage points.
-FAILURE_RATE_JUMP_PP = 15.0
+FAILURE_RATE_JUMP_PP = _threshold("MEMORY_REPORT_FAILURE_RATE_JUMP_PP", 15.0, float)
 #: Active users dropping below this share of the previous day. A scheduler
 #: that stops enqueuing produces no failures at all — only this rule sees it.
-ACTIVE_DROP_RATIO = 0.5
-ACTIVE_DROP_MIN_PREVIOUS = 10
+ACTIVE_DROP_RATIO = _threshold("MEMORY_REPORT_ACTIVE_DROP_RATIO", 0.5, float)
+ACTIVE_DROP_MIN_PREVIOUS = _threshold("MEMORY_REPORT_ACTIVE_DROP_MIN_PREVIOUS", 10)
 #: Non-terminal jobs past their deadline right now (lane-rollup ``stuck``).
 #: V1 rows count only jobs created within the endpoint's
 #: ``resident_recent_hours`` (24h): an older non-terminal V1 job is an orphan
 #: left by a consumer that went away, not something stuck today.
-LIVE_STUCK_JOBS_ATTENTION = 20
+LIVE_STUCK_JOBS_ATTENTION = _threshold("MEMORY_REPORT_LIVE_STUCK_JOBS", 20)
+
+#: The override variables, in one place for the workflow wiring test.
+THRESHOLD_ENV_VARS = (
+    "MEMORY_REPORT_STUCK_USERS",
+    "MEMORY_REPORT_OUR_SIDE_USERS",
+    "MEMORY_REPORT_MIN_ATTEMPTS_FOR_RATE",
+    "MEMORY_REPORT_FAILURE_RATE",
+    "MEMORY_REPORT_FAILURE_RATE_JUMP_PP",
+    "MEMORY_REPORT_ACTIVE_DROP_RATIO",
+    "MEMORY_REPORT_ACTIVE_DROP_MIN_PREVIOUS",
+    "MEMORY_REPORT_LIVE_STUCK_JOBS",
+)
 
 LANE_ROLLUP_PAGE_LIMIT = 500
 LANE_ROLLUP_MAX_PAGES = 40
@@ -643,7 +678,15 @@ def _default_opener(request: urllib.request.Request, timeout: float):
 def post_to_lark(webhook: str, payload: Mapping[str, Any], *,
                  opener: Opener = _default_opener) -> None:
     """POST and require Lark's own success code (HTTP 200 alone is not success:
-    a bad signature comes back as 200 with ``code != 0``)."""
+    a bad signature comes back as 200 with ``code != 0``).
+
+    Success means a JSON object that explicitly carries ``code`` and/or
+    ``StatusCode`` (the older webhook field), every one present being the
+    integer ``0``. Anything else raises ``RuntimeError`` so ``deliver`` reports
+    the post as failed: an empty body, ``{}``, ``[]``, a missing code or
+    ``"0"`` used to count as delivered (or crash outside ``deliver``) while
+    nobody received the report (Codex review 2026-09-15).
+    """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         webhook, data=body, method="POST",
@@ -651,12 +694,17 @@ def post_to_lark(webhook: str, payload: Mapping[str, Any], *,
     with opener(request, HTTP_TIMEOUT_SEC) as response:
         raw = response.read()
     try:
-        parsed = json.loads(raw or b"{}")
+        parsed = json.loads(raw)
     except ValueError as exc:
         raise RuntimeError("lark_response_not_json") from exc
-    code = parsed.get("code", parsed.get("StatusCode"))
-    if code not in (0, None):
-        raise RuntimeError(f"lark_rejected:code={code}")
+    if not isinstance(parsed, Mapping):
+        raise RuntimeError("lark_invalid_response")
+    codes = [parsed[key] for key in ("code", "StatusCode") if key in parsed]
+    if not codes or any(type(code) is not int for code in codes):
+        raise RuntimeError("lark_invalid_response")
+    rejected = next((code for code in codes if code != 0), None)
+    if rejected is not None:
+        raise RuntimeError(f"lark_rejected:code={rejected}")
 
 
 # --------------------------------------------------------------------------- #
