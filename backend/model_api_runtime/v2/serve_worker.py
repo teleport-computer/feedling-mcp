@@ -2854,41 +2854,11 @@ async def _generate_image_for_chat(
     return media
 
 
-# Candidate count and whole-card prompt budget for one Dream run. Selected
-# cards are never field-truncated: once the bounded prompt cannot fit another
-# complete fetched card, it stops and leaves that card for a later run.
+# Candidate count for one Dream run: the index window whose full cards are
+# fetched. The prompt budget (cards / total chars / per-card body and summary)
+# is applied by the Garden component, not here -- see
+# ``memory.garden_component.open_dream_session``.
 _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
-_DREAM_CARDS_MAX_CHARS = int(
-    os.environ.get("FEEDLING_V2_DREAM_CARDS_MAX_CHARS", "60000")
-)
-
-
-def _render_card_line(item: dict) -> str:
-    """Render every available plaintext field of one fetched Dream card.
-
-    V2 used to give the model only the first non-empty title/summary/content
-    value from ``memory.index``.  In practice that was just a one-line summary,
-    so 1:1 ``thicken`` operations irreversibly reconstructed cards without
-    seeing their bodies.  Dream now consumes ``memory.fetch`` results and
-    labels summary/content separately, matching the information V1 can inspect
-    through memory-index + memory-get.
-    """
-    if not isinstance(item, dict):
-        return ""
-    mid = str(item.get("id") or "").strip()
-    summary = str(item.get("summary") or item.get("title") or "").strip()
-    content = str(item.get("content") or "").strip()
-    if not summary and not content:
-        return ""
-    bucket = str(item.get("bucket") or "").strip()
-    source = str(item.get("source") or "").strip()
-    created_at = str(item.get("created_at") or item.get("occurred_at") or "").strip()
-    parts = [f"id={mid}", f"bucket={bucket}", f"source={source}", f"created_at={created_at}"]
-    if summary:
-        parts.append(f"summary={summary}")
-    if content:
-        parts.append(f"content={content}")
-    return "- " + " | ".join(parts)
 
 
 PROFILE_CARD_BATCH_SIZE = 64
@@ -2999,11 +2969,12 @@ def _read_profile_cards(
 
 
 def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
-    """capture/dream prompt 要的记忆上下文（buckets/threads/identity/cards 明文串）。
+    """capture/dream prompt 要的记忆上下文（buckets/threads/identity 明文串，Dream 另带整张卡）。
 
     **每一项独立 try/except 降级为 ""**（spec §3.5）：任一子取数失败绝不清空其它项、绝不
     抛——两个 prompt builder 对空串都会 fallback 到按 locale 的占位符（中文「（暂无）」/
-    英文 "(none)"）。buckets/threads/cards 走
+    英文 "(none)"）。Dream 的卡片（``full_cards``）不渲染成串：读到的整张卡原样放进
+    ``card_items``，由 Garden 组件带正文渲染并按预算截断。buckets/threads/cards 走
     enclave readside（用 runtime token 认证，服务器不本地解密）；runtime token 铸造失败
     也只让这三项降级（token=""，post_enclave 会 raise 被各自 try 吞掉），不影响 identity。
 
@@ -3035,7 +3006,6 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         "buckets": "",
         "threads": "",
         "identity": "",
-        "cards": "",
         "card_items": [],
     }
     if full_cards:
@@ -3059,18 +3029,20 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
         log.warning(
             "[v2.serve_worker] memory threads unavailable for %s: %s", user_id, e
         )
-    try:
-        body, status = memory_core.index(
-            store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post
-        )
-        if status == 200:
-            raw_index_items = body.get("items") if isinstance(body, dict) else None
-            index_items = [
-                item for item in (raw_index_items or []) if isinstance(item, dict)
-            ]
-            ids = [str(item.get("id") or "").strip() for item in index_items]
-            ids = [memory_id for memory_id in ids if memory_id]
-            if full_cards:
+    # Only Dream reads cards. Capture's component request carries no card
+    # index, so the Capture context skips this enclave round trip entirely.
+    if full_cards:
+        try:
+            body, status = memory_core.index(
+                store, None, {"limit": _MEMORY_CARDS_LIMIT}, post_enclave=_post
+            )
+            if status == 200:
+                raw_index_items = body.get("items") if isinstance(body, dict) else None
+                index_items = [
+                    item for item in (raw_index_items or []) if isinstance(item, dict)
+                ]
+                ids = [str(item.get("id") or "").strip() for item in index_items]
+                ids = [memory_id for memory_id in ids if memory_id]
                 # HTTP 200 is not a readable garden: the readside drops every
                 # card it cannot decrypt, so an enclave failing all of them
                 # still answers ``items=[]``. Only a well-formed index whose
@@ -3089,69 +3061,45 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                         "dream_cards_index_incomplete:"
                         f"{len(ids)}/{len(raw_index_items or [])}"
                     )
-            if ids and full_cards:
-                fetched, fetch_status = memory_core.fetch(
-                    store,
-                    None,
-                    {"ids": ids, "limit": 0},
-                    post_enclave=_post,
-                )
-                fetched_items = (
-                    fetched.get("items") if isinstance(fetched, dict) else None
-                )
-                if fetch_status != 200 or not isinstance(fetched_items, list):
-                    raise RuntimeError(f"dream_cards_fetch_failed:{fetch_status}")
-                by_id = {
-                    str(item.get("id") or ""): item
-                    for item in fetched_items
-                    if isinstance(item, dict)
-                }
-                flagged = [
-                    mid
-                    for key in ("missing_ids", "unavailable_ids")
-                    for mid in (fetched.get(key) or [])
-                ]
-                if flagged or any(memory_id not in by_id for memory_id in ids):
-                    raise RuntimeError(
-                        f"dream_cards_fetch_incomplete:{len(ids)}/{len(by_id)}"
-                        f":flagged={len(flagged)}"
+                if ids:
+                    fetched, fetch_status = memory_core.fetch(
+                        store,
+                        None,
+                        {"ids": ids, "limit": 0},
+                        post_enclave=_post,
                     )
-                selected: list[dict] = []
-                lines: list[str] = []
-                rendered_chars = 0
-                for memory_id in ids:
-                    item = by_id[memory_id]
-                    line = _render_card_line(item)
-                    if not line:
-                        continue
-                    added_chars = len(line) + (1 if lines else 0)
-                    if rendered_chars + added_chars > _DREAM_CARDS_MAX_CHARS:
-                        log.warning(
-                            "[v2.serve_worker] dream cards truncated user=%s "
-                            "kept=%d/%d chars=%d cap=%d empty_context=%s",
-                            user_id,
-                            len(selected),
-                            len(ids),
-                            rendered_chars,
-                            _DREAM_CARDS_MAX_CHARS,
-                            not selected,
+                    fetched_items = (
+                        fetched.get("items") if isinstance(fetched, dict) else None
+                    )
+                    if fetch_status != 200 or not isinstance(fetched_items, list):
+                        raise RuntimeError(f"dream_cards_fetch_failed:{fetch_status}")
+                    by_id = {
+                        str(item.get("id") or ""): item
+                        for item in fetched_items
+                        if isinstance(item, dict)
+                    }
+                    flagged = [
+                        mid
+                        for key in ("missing_ids", "unavailable_ids")
+                        for mid in (fetched.get(key) or [])
+                    ]
+                    if flagged or any(memory_id not in by_id for memory_id in ids):
+                        raise RuntimeError(
+                            f"dream_cards_fetch_incomplete:{len(ids)}/{len(by_id)}"
+                            f":flagged={len(flagged)}"
                         )
-                        break
-                    selected.append(item)
-                    lines.append(line)
-                    rendered_chars += added_chars
-                ctx["card_items"] = selected
-                ctx["cards"] = "\n".join(lines)
-                ctx["_diagnostic_cards_outcome"] = (
-                    "ready" if len(selected) == len(ids) else "truncated"
-                )
-            elif full_cards:
-                ctx["_diagnostic_cards_outcome"] = "empty"
-            elif not full_cards:
-                lines = [_render_card_line(item) for item in index_items]
-                ctx["cards"] = "\n".join(line for line in lines if line)
-    except Exception as e:  # noqa: BLE001 — 单项降级
-        log.warning("[v2.serve_worker] memory index unavailable for %s: %s", user_id, e)
+                    # Every fetched card goes to the Garden component, which
+                    # renders bodies and applies the prompt budget itself; the
+                    # cards it leaves out are reported by the session (worker),
+                    # not pre-selected here.
+                    ctx["card_items"] = [by_id[memory_id] for memory_id in ids]
+                    ctx["_diagnostic_cards_outcome"] = "ready"
+                else:
+                    ctx["_diagnostic_cards_outcome"] = "empty"
+        except Exception as e:  # noqa: BLE001 — 单项降级
+            log.warning(
+                "[v2.serve_worker] memory index unavailable for %s: %s", user_id, e
+            )
     try:
         ident = _load_identity_card_view(store, runtime_token=token)
         if ident:

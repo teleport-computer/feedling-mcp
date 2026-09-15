@@ -255,6 +255,16 @@ async def _record_provider_failure_class(
     )
 
 
+def _session_only_parse(_reply: str) -> tuple[None, str]:
+    """Placeholder ``parse`` for lanes driven by a Garden component session.
+
+    ``extraction.extract`` ignores ``prompt`` / ``parse`` / ``parse_retry`` when
+    a session is given; this makes an accidental non-session call fail loudly
+    instead of parsing with a builder the component no longer uses.
+    """
+    return None, "component_session_required"
+
+
 async def _extract_with_provider_health(
     user_id: str,
     **kwargs: Any,
@@ -1878,8 +1888,10 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
         "dream_context_unavailable",
+        "dream_kernel_outdated",
         "dream_no_memory_actions",
         "dream_source_occurred_at_unavailable",
+        "dream_truncated_card_rejected",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",
@@ -12318,6 +12330,9 @@ async def _run_extraction(
     # (the garden is below memgarden's minimum). "" = a real run.
     dream_skip_reason = ""
     dream_terminal_emitted = False
+    # What the Garden component actually showed the model this run (ids and
+    # counts only). Set when the Dream session opens.
+    dream_disclosure = garden_component.DreamDisclosure()
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
 
@@ -12592,7 +12607,7 @@ async def _run_extraction(
                 cards_outcome = (
                     "ready" if dream_counts["active_cards"] else "empty"
                 )
-            if cards_outcome in {"unavailable", "truncated"}:
+            if cards_outcome == "unavailable":
                 dream_degraded_context = True
                 await _emit_v2_dream_context_error(
                     deps,
@@ -12602,16 +12617,17 @@ async def _run_extraction(
                     component="cards",
                     outcome=cards_outcome,
                 )
-            if cards_outcome == "unavailable":
                 # The card read failed (enclave/readside timeout, non-200,
                 # incomplete fetch). Dreaming on nothing would complete as a
                 # no-op and advance the Dream ledger, so the scheduler reports
                 # ``already_dreamed`` until enough NEW cards arrive — an
                 # inactive user is silenced for good (prod, 09-10 / 09-13).
                 # Fail instead: the job goes through the Dream failure backoff
-                # and the ledger stays put. ``truncated`` (the 60k-char prompt
-                # cap) stays an intentional partial context, and the other
-                # context items (buckets/threads/identity) keep degrading.
+                # and the ledger stays put. A prompt that cannot fit every card
+                # (the component's budget) stays an intentional partial
+                # context — reported as ``truncated`` once the session is open
+                # — and the other context items (buckets/threads/identity)
+                # keep degrading.
                 raise RuntimeError("dream_context_unavailable")
         if lane == "capture" and deps.read_capture_state is not None and tail:
             # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
@@ -12715,71 +12731,61 @@ async def _run_extraction(
                 build_truncation_prompt=build_truncation_retry_prompt,
             )
         else:
-            prompt = build_dream_prompt(
-                ai_name=ctx.get("ai_name", ""),
-                user_name=ctx.get("user_name", ""),
-                cards=ctx.get("cards", ""),
-                recent_conversations=window,
-                # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
-                # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
-                # 光同源不同证据一样会判出两个结果。
-                locale=infer_garden_language(
-                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
-                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
-                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
-                    ctx.get("identity"),
-                    written=user_written_text(prompt_tail),
-                    existing_buckets=str(ctx.get("buckets") or ""),
-                ),
-            )
-            # parse_dream_consolidations 返回 (consolidations, questions, err)。
-            # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
-            # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个
-            # 即「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
-            dream_known_ids = frozenset(
-                str(card.get("id") or "").strip()
-                for card in (ctx.get("card_items") or [])
-                if isinstance(card, dict) and str(card.get("id") or "").strip()
-            )
-            parse, to_actions = (
-                lambda reply: parse_dream_consolidations(
-                    reply, known_ids=dream_known_ids
-                ),
-                v2_extraction.consolidations_to_actions,
-            )
-            parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_retryable_parse_error,
-                build_prompt=build_dream_retry_prompt,
-                parse=lambda reply: parse_dream_consolidations(
-                    reply, strict=False, known_ids=dream_known_ids
-                ),
-                build_truncation_prompt=build_truncation_retry_prompt,
-            )
-            # 整理也走组件的会话。和 capture 同构 —— provider 那步仍归
-            # extract()，组件只决定问什么、怎么重问。
+            # 整理走组件的会话：提示词、带正文的卡片区、预算截断、解析与重问都在组件里；
+            # provider 那步仍归 extract()（截断检测、用量、失败分类、退避、轨迹）。
             #
-            # known_ids 是墓碑卡守卫：整理结果里不许出现喂进去的卡 id，
-            # 出现了就是模型把整理注记当成了内容本身（usr_a40e 事故）。
+            # 交给组件的是读到的**整张卡**（serve_worker 不再预先按字数挑卡）。
+            # 组件实际给模型看了哪些、截断了哪些，从 disclosure 读 —— 下面的
+            # mapper 目标集、截断硬闸、爆炸半径分母都以它为准。
+            #
+            # 墓碑卡守卫（known_ids）覆盖读到的全部卡：整理结果里出现任何一个 id
+            # 即「把整理注记当成内容」(usr_a40e)，由组件的解析同路打回重问。
+            prompt = ""
+            parse = _session_only_parse
+            parse_retry = None
+            to_actions = v2_extraction.consolidations_to_actions
             _step_sink = garden_component.BounceTracker()
-            _capture_session = garden_component.build_garden(
-                garden_component.CallableModel(lambda _p: ""),
-                on_step=_step_sink,
-            ).maintenance_session(mg_contracts.MaintenanceRequest(
-                cards=list(ctx.get("card_items") or []),
-                all_cards=list(ctx.get("card_items") or []),
-                locale=infer_garden_language(
-                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
-                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
-                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
-                    ctx.get("identity"),
-                    written=user_written_text(prompt_tail),
-                    existing_buckets=str(ctx.get("buckets") or ""),
-                ),
-                ai_name=ctx.get("ai_name", ""),
-                user_name=ctx.get("user_name", ""),
-                recent_conversations=window,
-                known_ids=tuple(dream_known_ids),
-            ))
+            dream_stage = "prompt"
+            try:
+                _capture_session, dream_disclosure = garden_component.open_dream_session(
+                    garden_component.build_garden(
+                        garden_component.CallableModel(lambda _p: ""),
+                        on_step=_step_sink,
+                    ),
+                    cards=list(ctx.get("card_items") or []),
+                    # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
+                    # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
+                    # 光同源不同证据一样会判出两个结果。
+                    locale=infer_garden_language(
+                        # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                        # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                        # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                        ctx.get("identity"),
+                        written=user_written_text(prompt_tail),
+                        existing_buckets=str(ctx.get("buckets") or ""),
+                    ),
+                    ai_name=ctx.get("ai_name", ""),
+                    user_name=ctx.get("user_name", ""),
+                    recent_conversations=window,
+                )
+            except garden_component.DreamKernelOutdated as outdated:
+                raise RuntimeError(garden_component.DREAM_KERNEL_OUTDATED) from outdated
+            dream_stage = "context"
+            if dream_disclosure.needed:
+                dream_counts["active_cards"] = len(dream_disclosure.rendered_ids)
+            if dream_disclosure.partial:
+                # Some fetched cards did not fit the component's prompt budget.
+                # Intentional partial context (those cards wait for a later
+                # night), but visible: same content-free event as before.
+                dream_degraded_context = True
+                await _emit_v2_dream_context_error(
+                    deps,
+                    user_id,
+                    job_id=str(job_id),
+                    trace_id=trace_id,
+                    component="cards",
+                    outcome="truncated",
+                )
 
         async def _extraction_trajectory(kind: str, payload: dict) -> None:
             nonlocal dream_model_attempts
@@ -13154,6 +13160,33 @@ async def _run_extraction(
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
+        if lane == "dream" and items and dream_disclosure.truncated_ids:
+            # Host-side hard block: the prompt forbids rewriting a card the
+            # model only saw part of, but a prompt is not a guarantee. Drop
+            # every consolidation that touches one before mapping; if that
+            # leaves nothing, fail (ledger stays put) rather than report a
+            # no-op for a run whose every proposal was forbidden.
+            items, truncated_rejected = (
+                garden_component.reject_truncated_consolidations(
+                    items, dream_disclosure.truncated_ids
+                )
+            )
+            if truncated_rejected:
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "dream_truncated_card_guard",
+                    {
+                        "rejected": truncated_rejected,
+                        "kept": len(items),
+                        "truncated_cards": len(dream_disclosure.truncated_ids),
+                    },
+                    best_effort=True,
+                )
+                if not items:
+                    dream_terminal_outcome = "guard_rejected"
+                    raise RuntimeError(
+                        garden_component.DREAM_TRUNCATED_CARD_REJECTED
+                    )
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
@@ -13260,11 +13293,12 @@ async def _run_extraction(
                 "build_envelope": _build_extraction_envelope,
             }
             if lane == "dream" and "card_items" in ctx:
-                # Bind every destructive result to the exact full-text cards
-                # disclosed for this run.  Unknown and overlapping targets are
+                # Bind every destructive result to the cards the component
+                # showed the model in full this run (not the omitted ones, not
+                # the truncated ones). Unknown and overlapping targets are
                 # rejected deterministically by the pure mapper before any
                 # write reaches Memory Garden.
-                action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+                action_kwargs["existing_cards"] = dream_disclosure.editable_cards()
             if lane == "dream":
                 action_kwargs["on_source_time_degraded"] = (
                     lambda known, missing, fb: source_time_degraded.append(
@@ -13297,7 +13331,10 @@ async def _run_extraction(
             if lane == "dream":
                 # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显
                 # 不对(834→1 事故的最后防线),整个 job 失败等人查,不部分执行。
-                active_count = len(ctx.get("card_items") or [])
+                # Denominator = the cards the model saw this run (what one
+                # night can rewrite), same as before the component took over
+                # the prompt budget.
+                active_count = len(dream_disclosure.rendered_ids)
                 if memory_dream_gates.blast_radius_exceeded(
                     _superseded, active_count
                 ):

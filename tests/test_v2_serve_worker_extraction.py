@@ -6,7 +6,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import serve_worker
-from memory.dream_prompt_v1 import build_dream_prompt
 
 
 def test_memory_context_degrades_each_field_independently(monkeypatch):
@@ -83,11 +82,11 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
 
     ctx = serve_worker._read_dream_memory_context("u_ctx_full")
 
-    assert "完整摘要" in ctx["cards"]
-    assert "只有 fetch 才返回的完整正文。" in ctx["cards"]
-    assert "dream-new" in ctx["cards"]
-    assert "上一轮 Dream 卡可在后续运行重新参与整理。" in ctx["cards"]
+    # The reader hands the fetched cards over whole; rendering (with bodies)
+    # and the prompt budget belong to the Garden component.
+    assert "cards" not in ctx
     assert [item["id"] for item in ctx["card_items"]] == ["capture-old", "dream-new"]
+    assert ctx["card_items"][0]["content"] == "只有 fetch 才返回的完整正文。"
     assert [item["occurred_at"] for item in ctx["card_items"]] == [
         "2026-05-01T00:00:00Z",
         "2026-07-01T00:00:00Z",
@@ -95,10 +94,14 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
     assert ctx["_diagnostic_cards_outcome"] == "ready"
 
 
-def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
+def test_dream_context_does_not_pre_budget_cards(monkeypatch):
+    """Every fetched card reaches the worker, however long. The component
+    applies the Dream prompt budget (and reports what it left out), so a
+    second, different budget here would silently drop cards before it."""
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
-    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 250)
+    assert not hasattr(serve_worker, "_DREAM_CARDS_MAX_CHARS")
+    assert not hasattr(serve_worker, "_render_card_line")
     monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
     monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
     monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
@@ -110,10 +113,9 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
         {
             "id": memory_id,
             "summary": f"摘要-{memory_id}",
-            "content": "正文" * 40,
+            "content": "正文" * 40_000,
             "source": "memory_capture",
             "occurred_at": "2026-07-01T00:00:00Z",
-            "created_at": "2026-07-01T00:00:00Z",
         }
         for memory_id in ("m1", "m2")
     ]
@@ -123,74 +125,30 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
 
     ctx = serve_worker._read_dream_memory_context("u_ctx_budget")
 
-    assert [item["id"] for item in ctx["card_items"]] == ["m1"]
-    assert "id=m1" in ctx["cards"]
-    assert "id=m2" not in ctx["cards"]
-    assert ctx["card_items"][0]["content"] == "正文" * 40
-    assert ctx["_diagnostic_cards_outcome"] == "truncated"
+    assert [item["id"] for item in ctx["card_items"]] == ["m1", "m2"]
+    assert ctx["card_items"][1]["content"] == "正文" * 40_000
+    assert ctx["_diagnostic_cards_outcome"] == "ready"
 
 
-def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
-    monkeypatch, caplog,
-):
+def test_capture_context_skips_the_card_read(monkeypatch):
+    """Capture's component request carries no card index, so its context must
+    not pay an enclave round trip for one."""
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
-    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 150)
     monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
     monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
-    monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
-    monkeypatch.setattr(
-        "memory.memory_core.index",
-        lambda *a, **k: ({"items": [{"id": "oversized-first"}]}, 200),
-    )
-    monkeypatch.setattr(
-        "memory.memory_core.fetch",
-        lambda *a, **k: (
-            {
-                "items": [
-                    {
-                        "id": "oversized-first",
-                        "summary": "超限首卡",
-                        "content": "正文" * 100,
-                        "source": "memory_capture",
-                        "created_at": "2026-07-01T00:00:00Z",
-                    }
-                ]
-            },
-            200,
-        ),
-    )
 
-    with caplog.at_level("WARNING", logger="feedling.runtime_v2.serve_worker"):
-        ctx = serve_worker._read_dream_memory_context("u_ctx_oversized_first")
-    prompt = build_dream_prompt(
-        ai_name=ctx["ai_name"],
-        user_name=ctx["user_name"],
-        cards=ctx["cards"],
-        recent_conversations="",
-        locale="zh-Hans",
-    )
-    empty_prompt = build_dream_prompt(
-        ai_name=ctx["ai_name"],
-        user_name=ctx["user_name"],
-        cards="",
-        recent_conversations="",
-        locale="zh-Hans",
-    )
+    def _no_index(*_a, **_k):
+        raise AssertionError("capture context must not read the card index")
+
+    monkeypatch.setattr("memory.memory_core.index", _no_index)
+    monkeypatch.setattr("memory.memory_core.fetch", _no_index)
+
+    ctx = serve_worker._read_memory_context("u_ctx_capture")
 
     assert ctx["card_items"] == []
-    assert len(prompt) == len(empty_prompt)
-    assert "oversized-first" not in prompt
-    budget_logs = [
-        record.getMessage()
-        for record in caplog.records
-        if "dream cards truncated" in record.getMessage()
-    ]
-    assert len(budget_logs) == 1
-    assert "kept=0/1" in budget_logs[0]
-    assert "empty_context=True" in budget_logs[0]
-    assert "oversized-first" not in budget_logs[0]
-    assert ctx["_diagnostic_cards_outcome"] == "truncated"
+    assert "cards" not in ctx
+    assert "_diagnostic_cards_outcome" not in ctx
 
 
 def test_dream_context_distinguishes_empty_index_from_failed_full_card_read(

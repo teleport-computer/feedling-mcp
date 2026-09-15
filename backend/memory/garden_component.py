@@ -29,11 +29,13 @@ io 拿到之后自己封信封、自己落库。
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+import dataclasses
+from typing import Any, Callable, Iterable, Mapping
 
-from memgarden import GardenComponent
+from memgarden import GardenComponent, MaintenanceRequest
 from memgarden.contracts import Step
 
+from identity.user_naming import sanitize_user_name
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 # io 的落卡档位（``IO_CONVERSATION_CAPTURE_POLICY``，max_cards=50）由调用点经
@@ -119,6 +121,222 @@ def maintenance_skip_reason(session: Any) -> str:
     trace = getattr(outcome, "trace", None)
     reason = str(trace.get("reason") or "") if isinstance(trace, dict) else ""
     return reason if reason in MAINTENANCE_SKIP_REASONS else ""
+
+
+# --------------------------------------------------------------------------- #
+# Dream：两条 runtime 共用的整理请求、披露面与截断硬闸
+# --------------------------------------------------------------------------- #
+#
+# 之前 V1 自己拼卡片区（摘要 500 / 正文 900 / 全文 2 万字硬切，切在半张卡中间，
+# 切掉的卡却仍可被退休），V2 自己按 6 万字预算挑卡、渲染好的串又没人用 ——
+# 组件那边只收到卡的 id 和摘要，模型看不到正文就去 thicken/merge。
+# 现在两边都把**读到的整张卡**交给组件，由组件带正文渲染并统一截断；
+# io 只负责：把老字段名翻成组件认识的名字、看组件实际给模型看了哪些卡、
+# 以及拒绝动「只给模型看了一半」的卡。
+
+#: Dream 渲染预算。**显式传**而不是依赖组件默认值：默认值换了，这里不跟着悄悄变。
+#: 单卡正文上限取 io 写入端的正文上限（5000 字），按 io 规则写出的卡永远完整呈现。
+DREAM_CARDS_LIMIT = 60
+DREAM_CARDS_BUDGET_CHARS = 60_000
+DREAM_CARD_BODY_CHARS = 5_000
+DREAM_CARD_SUMMARY_CHARS = 2_000
+
+_DREAM_BUDGET_FIELDS = (
+    "cards_limit", "cards_budget_chars", "card_body_chars", "card_summary_chars",
+)
+
+#: 装的 memgarden 太老、不会带正文渲染卡片时的失败码（content-free）。
+#: 老版本会把整理提示词退化成「只有 id 和摘要」—— 模型看不到正文就重写整张卡，
+#: 旧正文随旧卡退休。宁可这一晚整理失败退避，也不能静默走那条路。
+DREAM_KERNEL_OUTDATED = "dream_kernel_outdated"
+#: 模型的整理方案**全部**碰了被截断的卡时的失败码（content-free）。
+DREAM_TRUNCATED_CARD_REJECTED = "dream_truncated_card_rejected"
+
+# 老卡的字段名。组件只认 summary / content / bucket / threads。
+_SUMMARY_KEYS = ("summary", "title", "description")
+_CONTENT_KEYS = ("content", "body", "text", "plaintext")
+
+
+class DreamKernelOutdated(RuntimeError):
+    """装的 memgarden 不支持带正文的 Dream 渲染。"""
+
+    code = DREAM_KERNEL_OUTDATED
+
+
+def dream_kernel_renders_card_bodies() -> bool:
+    """装的 memgarden 能不能带正文渲染 Dream 卡片（看公开请求契约上有没有预算字段）。
+
+    自建 VPS 的 consumer 自更新时先切代码、再 pip 装依赖；装依赖失败时新代码会
+    跑在旧 memgarden 上。这里判出来，调用方就让这一晚的 Dream 失败，而不是
+    拿旧组件的「只给标题」提示词去整理。
+    """
+    names = {field.name for field in dataclasses.fields(MaintenanceRequest)}
+    return all(name in names for name in _DREAM_BUDGET_FIELDS)
+
+
+def _one_line(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _first_text(card: Mapping[str, Any], keys: tuple[str, ...], *, one_line: bool) -> str:
+    for key in keys:
+        value = card.get(key)
+        if not isinstance(value, str):
+            continue
+        text = _one_line(value) if one_line else value.strip()
+        if text:
+            return value
+    return ""
+
+
+def dream_card(item: Any) -> dict | None:
+    """把一张读到的卡翻成组件认识的形状；不能进 Dream 的返回 None。
+
+    老字段名映射：title/description → summary，body/text/plaintext → content，
+    category → bucket，单个 thread → threads。其余字段（id、occurred_at、
+    retrieval_cues …）原样保留 —— 下游 mapper 还要用它们算事件时间。
+
+    「不能进 Dream」与组件渲染时跳过的卡同一判据：没有 id（模型无法引用），
+    或者既没摘要也没正文。先在这里滤掉，组件实际渲染的就恰好是这份列表的前 N 张，
+    io 才能不猜地知道模型看过哪些卡。
+    """
+    if not isinstance(item, Mapping):
+        return None
+    card = dict(item)
+    if not _one_line(card.get("id")):
+        return None
+    summary = _first_text(card, _SUMMARY_KEYS, one_line=True)
+    content = _first_text(card, _CONTENT_KEYS, one_line=False)
+    if not summary and not content:
+        return None
+    card["summary"] = summary
+    card["content"] = content
+    if not _one_line(card.get("bucket")) and isinstance(card.get("category"), str):
+        card["bucket"] = card["category"]
+    if not isinstance(card.get("threads"), list) and isinstance(card.get("thread"), str):
+        card["threads"] = [card["thread"]]
+    return card
+
+
+@dataclasses.dataclass(frozen=True)
+class DreamDisclosure:
+    """组件这一晚实际给模型看了什么。只有 id 和计数，不含卡片内容。
+
+    ``rendered_ids``  模型看到的卡（按顺序）
+    ``truncated_ids`` 其中正文或摘要被截断、标了 TRUNCATED 的卡 —— 不许动
+    ``omitted``       读到了、但预算内放不下而没给模型看的卡数
+    ``skip_reason``   组件判「花园太小不必整理」时的理由，否则 ""
+    """
+
+    cards: tuple[dict, ...] = ()
+    rendered_ids: tuple[str, ...] = ()
+    truncated_ids: frozenset[str] = frozenset()
+    omitted: int = 0
+    skip_reason: str = ""
+    needed: bool = False
+
+    @property
+    def partial(self) -> bool:
+        """读到的卡没有全部给模型看（组件的总预算/张数上限截掉了一部分）。"""
+        return self.needed and self.omitted > 0
+
+    def editable_cards(self) -> list[dict]:
+        """整理方案允许退休的卡：模型完整看过的那些。
+
+        没给模型看的卡、只给看了一半的卡，都不在里面 —— 交给 mapper 的
+        ``existing_cards`` 用这份，指向其余卡的方案会被结构判据拒掉。
+        """
+        allowed = set(self.rendered_ids) - set(self.truncated_ids)
+        return [card for card in self.cards if _one_line(card.get("id")) in allowed]
+
+
+def open_dream_session(
+    garden: GardenComponent,
+    *,
+    cards: Iterable[Any],
+    locale: str,
+    ai_name: str,
+    user_name: str,
+    recent_conversations: str,
+) -> tuple[Any, DreamDisclosure]:
+    """开一个 Dream 会话，并告诉调用方组件实际披露了哪些卡。
+
+    ``cards`` 是这一晚**读到的全部可整理卡**（不用预先按字数挑）：
+    张数、总字数、单卡截断都由组件按上面的预算做。
+
+    披露面从会话的公开 ``result()`` 读：会话刚建好、还没问模型时，它的 trace
+    已带上渲染计数和 ``truncated_card_ids``，且不改会话状态（问模型、喂回复
+    照常进行）。和 :func:`maintenance_skip_reason` 用的是同一个契约。
+    """
+    if not dream_kernel_renders_card_bodies():
+        raise DreamKernelOutdated(DREAM_KERNEL_OUTDATED)
+    eligible: list[dict] = []
+    seen: set[str] = set()
+    for item in cards:
+        card = dream_card(item)
+        mid = _one_line(card.get("id")) if card is not None else ""
+        if card is None or mid in seen:
+            # 重复 id 只留第一张：组件会把两张都渲染出来，披露面就对不上了。
+            continue
+        seen.add(mid)
+        eligible.append(card)
+    known_ids = tuple(_one_line(card.get("id")) for card in eligible)
+    session = garden.maintenance_session(MaintenanceRequest(
+        cards=eligible,
+        all_cards=eligible,
+        locale=locale,
+        ai_name=ai_name,
+        # 组件只把字面 "TA" 当未知标记；「用户」「user」这类占位名要在这里洗掉，
+        # 否则会原样当成名字写进提示词。
+        user_name=sanitize_user_name(user_name),
+        recent_conversations=recent_conversations,
+        # 墓碑卡守卫覆盖读到的全部卡（组件会再并入实际渲染的那些）。
+        known_ids=known_ids,
+        cards_limit=DREAM_CARDS_LIMIT,
+        cards_budget_chars=DREAM_CARDS_BUDGET_CHARS,
+        card_body_chars=DREAM_CARD_BODY_CHARS,
+        card_summary_chars=DREAM_CARD_SUMMARY_CHARS,
+    ))
+    outcome = session.result()
+    trace = outcome.trace if isinstance(getattr(outcome, "trace", None), dict) else {}
+    skip = str(trace.get("reason") or "") if not outcome.needed else ""
+    rendered_count = max(0, int(trace.get("cards_rendered") or 0))
+    disclosure = DreamDisclosure(
+        cards=tuple(eligible),
+        rendered_ids=known_ids[:rendered_count] if outcome.needed else (),
+        truncated_ids=frozenset(
+            _one_line(mid) for mid in (trace.get("truncated_card_ids") or [])
+        ),
+        omitted=max(0, int(trace.get("cards_omitted") or 0)),
+        skip_reason=skip if skip in MAINTENANCE_SKIP_REASONS else "",
+        needed=bool(outcome.needed),
+    )
+    return session, disclosure
+
+
+def reject_truncated_consolidations(
+    consolidations: Iterable[Any],
+    truncated_ids: Iterable[str],
+) -> tuple[list[dict], int]:
+    """宿主侧硬闸：丢掉动了被截断卡的整理方案，返回 ``(留下的, 丢掉的条数)``。
+
+    提示词已经禁止模型把 TRUNCATED 卡放进 ``card_ids``，但提示词不是保证：
+    模型只看过前 5000 字就去重写整张卡，后半段正文会随旧卡一起退休，
+    而用户看不出发生了什么。这道闸是确定性的，不看内容。
+    """
+    blocked = {_one_line(mid) for mid in truncated_ids if _one_line(mid)}
+    kept: list[dict] = []
+    rejected = 0
+    for row in consolidations or []:
+        if not isinstance(row, dict):
+            continue
+        raw_ids = row.get("card_ids")
+        ids = {_one_line(mid) for mid in (raw_ids if isinstance(raw_ids, list) else [])}
+        if blocked and ids & blocked:
+            rejected += 1
+            continue
+        kept.append(row)
+    return kept, rejected
 
 
 # --------------------------------------------------------------------------- #
