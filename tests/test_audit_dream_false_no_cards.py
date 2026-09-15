@@ -160,6 +160,17 @@ def test_report_counts_verdicts_and_carries_no_card_content():
     }
 
 
+def test_window_dates_cover_every_utc_day_a_window_touches():
+    """A 3-day window must load its middle day (Codex r2 I3)."""
+    window = audit.parse_window("2026-09-10T18:00:00Z/2026-09-12T02:00:00Z")
+    assert audit.window_utc_dates([window]) == ["2026-09-10", "2026-09-11", "2026-09-12"]
+    # Non-UTC offsets are bucketed by UTC day, overlapping windows deduplicate.
+    shifted = audit.parse_window("2026-09-11T07:00:00+08:00/2026-09-11T09:00:00+08:00")
+    assert audit.window_utc_dates([window, shifted]) == [
+        "2026-09-10", "2026-09-11", "2026-09-12",
+    ]
+
+
 def test_window_argument_must_be_an_ordered_pair():
     import argparse
 
@@ -192,7 +203,9 @@ def _stuck_user_via_pre_fix_backend(monkeypatch, tmp_path, user_id, *, payload):
     db.memory_replace_all(user_id, [_memory(user_id, f"mem_{i}") for i in range(4)])
     client = make_client()
     headers = {"X-API-Key": api_key}
-    job = client.post("/v1/dream/tick", headers=headers, json={"now": 2000.0}).get_json()["job"]
+    # Real clock: the tool bounds its scan on the job's enqueue time (``ts``).
+    now = time.time()
+    job = client.post("/v1/dream/tick", headers=headers, json={"now": now}).get_json()["job"]
     # The backend before this fix recorded whatever the consumer reported.
     with monkeypatch.context() as pre_fix:
         pre_fix.setattr(
@@ -203,7 +216,7 @@ def _stuck_user_via_pre_fix_backend(monkeypatch, tmp_path, user_id, *, payload):
             f"/v1/proactive/jobs/{job['job_id']}/status", headers=headers, json=payload,
         )
     assert done.status_code == 200
-    stuck = client.post("/v1/dream/tick", headers=headers, json={"now": 2100.0}).get_json()
+    stuck = client.post("/v1/dream/tick", headers=headers, json={"now": now + 100.0}).get_json()
     return job, stuck
 
 
@@ -218,14 +231,23 @@ def _legacy_payload(**dream_result_extra):
     }
 
 
-def _run_tool_read(user_ids):
+def _run_tool_read(user_ids, *, window=None, **kwargs):
     now = datetime.now(timezone.utc)
-    window = (now - timedelta(hours=1), now + timedelta(hours=1))
+    window = window or (now - timedelta(hours=1), now + timedelta(hours=1))
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         with conn.transaction():
-            report = audit.collect(conn, windows=[window], user_ids=user_ids)
+            report = audit.collect(conn, windows=[window], user_ids=user_ids, **kwargs)
+            timeout = conn.execute("SHOW statement_timeout").fetchone()[0]
+            # Savepoint, so the refused write does not abort (and roll back)
+            # the outer read transaction: it commits normally below.
             with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-                conn.execute("DELETE FROM user_blobs WHERE user_id = %s", (user_ids[0],))
+                with conn.transaction():
+                    conn.execute(
+                        "DELETE FROM user_blobs WHERE user_id = %s", (user_ids[0],)
+                    )
+        # Transaction-local: the session default is back after a committed read.
+        assert conn.execute("SHOW statement_timeout").fetchone()[0] != timeout
+    report["_statement_timeout"] = timeout
     return report
 
 
@@ -267,3 +289,52 @@ def test_tool_finds_a_user_stuck_by_the_real_pre_fix_flow(
     assert candidate["expected_ledger"]["last_dream_signature"] == ledger["last_dream_signature"]
     # Read-only: the tool left the stuck ledger exactly as it found it.
     assert dream_scheduler.load_dream_state(core_store.get_store(stuck_user)) == ledger
+
+
+def test_tool_finds_a_completion_on_the_middle_day_of_a_multi_day_window(
+    tmp_path, monkeypatch, utc_server_clock,
+):
+    """The incident completion is today; the window runs from before yesterday
+    to after tomorrow, so today is neither its start nor its end UTC date."""
+    user = "usr_audit_middle_day_0915"
+    job, stuck = _stuck_user_via_pre_fix_backend(
+        monkeypatch, tmp_path, user, payload=_legacy_payload()
+    )
+    assert stuck["reason"] == "already_dreamed"
+    now = datetime.now(timezone.utc)
+    window = (now - timedelta(hours=25), now + timedelta(hours=25))
+    assert now.date().isoformat() not in {
+        window[0].date().isoformat(), window[1].date().isoformat()
+    }
+
+    report = _run_tool_read([user], window=window, statement_timeout_sec=7)
+
+    assert report["verdicts"] == {"candidate": 1}
+    assert report["candidates"][0]["job_id"] == job["job_id"]
+    assert now.date().isoformat() in report["prefilter"]["completed_on_utc_dates"]
+    assert report["_statement_timeout"] == "7s"
+
+
+def test_tool_scan_is_bounded_on_the_job_enqueue_time(
+    tmp_path, monkeypatch, utc_server_clock,
+):
+    """Jobs enqueued more than ``max_job_age_days`` before the earliest window
+    start are not scanned (index-friendly bound on ``user_logs.ts``, partial
+    index ``ix_user_logs_proactive_jobs_ts``), and the bound is reported."""
+    user = "usr_audit_old_enqueue_0915"
+    _stuck_user_via_pre_fix_backend(monkeypatch, tmp_path, user, payload=_legacy_payload())
+    # Test setup only: pretend the job sat pending for 10 days before the
+    # completion that lands in today's window.
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        conn.execute(
+            "UPDATE user_logs SET ts = ts - %s WHERE user_id = %s AND stream = 'proactive_jobs'",
+            (10 * 86400, user),
+        )
+
+    bounded = _run_tool_read([user], max_job_age_days=1)
+    assert bounded["users_scanned"] == 0
+    assert bounded["prefilter"]["enqueued_after"] < bounded["windows"][0][0]
+
+    widened = _run_tool_read([user], max_job_age_days=11)
+    assert widened["verdicts"] == {"candidate": 1}
+    assert widened["_statement_timeout"] == "1min"  # the default

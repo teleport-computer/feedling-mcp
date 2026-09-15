@@ -36,7 +36,11 @@ Limits: resident jobs are trimmed to the newest ``FEEDLING_PROACTIVE_JOB_MAX``
 (500) per user, so a user whose incident job was trimmed is not found; naive
 ``completed_at`` values (written with the server clock, UTC in the CVMs) are
 read as UTC. Runtime V2 empty-read no-ops do not carry this reason and are not
-covered.
+covered. The candidate prefilter only considers jobs enqueued (indexed ``ts``
+column) within ``--max-job-age-days`` before the earliest window start; a Dream
+job that sat pending longer than that before completing is not found (the
+report echoes the bound under ``prefilter``). Every statement runs under
+``--statement-timeout-sec``.
 
 REPAIR DESIGN (not implemented as a write path here, on purpose)
 ---------------------------------------------------------------
@@ -64,12 +68,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEGACY_NO_CARDS_REASON = "dream_no_cards_available"
+# Scan bound on a job's enqueue time, before the earliest window start. An
+# assumption, not a measured limit: a self-hosted consumer that was offline can
+# complete an old pending Dream late. Widen with --max-job-age-days when in doubt.
+DEFAULT_MAX_JOB_AGE_DAYS = 30.0
+DEFAULT_STATEMENT_TIMEOUT_SEC = 60.0
 DREAM_JOB_KIND = "memory_dream"
 # The dream_state keys ``dream_scheduler.record_dream_job_status`` sets on a
 # completion. A repair rewinds exactly these and nothing else.
@@ -110,6 +119,22 @@ def parse_window(value: str) -> tuple[datetime, datetime]:
             f"window must be START/END ISO instants with END after START: {value!r}"
         )
     return start, end
+
+
+def window_utc_dates(windows: Iterable[tuple[datetime, datetime]]) -> list[str]:
+    """Every UTC calendar date a window touches, as ``YYYY-MM-DD``.
+
+    A multi-day window covers its middle days too; loading only the start and
+    end dates silently skipped completions in between.
+    """
+    days: set[str] = set()
+    for start, end in windows:
+        day = start.astimezone(timezone.utc).date()
+        last = end.astimezone(timezone.utc).date()
+        while day <= last:
+            days.add(day.isoformat())
+            day += timedelta(days=1)
+    return sorted(days)
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -303,19 +328,49 @@ def build_report(
 # read-only database collection
 # --------------------------------------------------------------------------- #
 
-def collect(conn, *, windows, user_ids=None, ledger_tolerance_sec=300.0) -> dict[str, Any]:
+def collect(
+    conn,
+    *,
+    windows,
+    user_ids=None,
+    ledger_tolerance_sec=300.0,
+    max_job_age_days: float = DEFAULT_MAX_JOB_AGE_DAYS,
+    statement_timeout_sec: float = DEFAULT_STATEMENT_TIMEOUT_SEC,
+) -> dict[str, Any]:
     """Read everything ``build_report`` needs in one read-only transaction.
 
     Only users with a completed resident dream job whose ``completed_at``
-    string mentions a window day are loaded in full (cheap prefilter; the exact
-    window test is ``select_user``'s).
+    string falls on a UTC date a window touches are loaded in full (cheap
+    prefilter; the exact window test is ``select_user``'s). That scan is also
+    bounded on the indexed enqueue time ``ts`` (partial index
+    ``ix_user_logs_proactive_jobs_ts``): a job completing inside a window was
+    enqueued before the window ended and, by assumption, at most
+    ``max_job_age_days`` before it started. Rows without ``ts`` are kept.
     """
+    if not windows:
+        raise ValueError("at least one window is required")
+    if not float(max_job_age_days) > 0:
+        raise ValueError("max_job_age_days must be positive")
+    if not float(statement_timeout_sec) > 0:
+        raise ValueError("statement_timeout_sec must be positive")
     conn.execute("SET TRANSACTION READ ONLY")
-    days = sorted({
-        day for start, end in windows
-        for day in {start.date().isoformat(), end.date().isoformat()}
-    })
-    params: list[Any] = [DREAM_JOB_KIND, DREAM_JOB_KIND, [f"{day}%" for day in days]]
+    # Transaction-local: never outlives this read.
+    conn.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{int(float(statement_timeout_sec) * 1000)}ms",),
+    )
+    days = window_utc_dates(windows)
+    created_after = min(start for start, _end in windows) - timedelta(
+        days=float(max_job_age_days)
+    )
+    created_before = max(end for _start, end in windows)
+    params: list[Any] = [
+        created_after.timestamp(),
+        created_before.timestamp(),
+        DREAM_JOB_KIND,
+        DREAM_JOB_KIND,
+        [f"{day}%" for day in days],
+    ]
     user_filter = ""
     if user_ids:
         user_filter = " AND user_id = ANY(%s)"
@@ -324,6 +379,7 @@ def collect(conn, *, windows, user_ids=None, ledger_tolerance_sec=300.0) -> dict
         row[0] for row in conn.execute(
             "SELECT DISTINCT user_id FROM user_logs "
             "WHERE stream = 'proactive_jobs' "
+            "AND (ts IS NULL OR (ts >= %s AND ts < %s)) "
             "AND (doc->>'job_kind' = %s OR doc->>'source' = %s) "
             "AND doc->>'status' = 'completed' "
             "AND doc->>'completed_at' LIKE ANY(%s)" + user_filter,
@@ -358,13 +414,20 @@ def collect(conn, *, windows, user_ids=None, ledger_tolerance_sec=300.0) -> dict
                 v2_last[user_id] = (
                     finished if finished.tzinfo else finished.replace(tzinfo=timezone.utc)
                 ).astimezone(timezone.utc)
-    return build_report(
+    report = build_report(
         jobs_by_user,
         ledgers,
         windows=windows,
         v2_last_completed=v2_last,
         ledger_tolerance_sec=ledger_tolerance_sec,
     )
+    report["prefilter"] = {
+        "completed_on_utc_dates": days,
+        "enqueued_after": created_after.isoformat().replace("+00:00", "Z"),
+        "enqueued_before": created_before.isoformat().replace("+00:00", "Z"),
+        "statement_timeout_sec": float(statement_timeout_sec),
+    }
+    return report
 
 
 def _dsn(env: str) -> str:
@@ -391,6 +454,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-id", action="append", default=[],
                         help="Restrict to these users (repeatable).")
     parser.add_argument("--ledger-tolerance-sec", type=float, default=300.0)
+    parser.add_argument(
+        "--max-job-age-days", type=float, default=DEFAULT_MAX_JOB_AGE_DAYS,
+        help="Only consider Dream jobs enqueued at most this long before the "
+             "earliest window start (index-friendly scan bound).",
+    )
+    parser.add_argument(
+        "--statement-timeout-sec", type=float, default=DEFAULT_STATEMENT_TIMEOUT_SEC,
+        help="Postgres statement_timeout for every read (transaction-local).",
+    )
     return parser
 
 
@@ -407,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
                 windows=args.window,
                 user_ids=args.user_id or None,
                 ledger_tolerance_sec=args.ledger_tolerance_sec,
+                max_job_age_days=args.max_job_age_days,
+                statement_timeout_sec=args.statement_timeout_sec,
             )
     report["environment"] = args.env
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
