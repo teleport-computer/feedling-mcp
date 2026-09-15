@@ -65,9 +65,29 @@ def test_wire_version_names_the_real_tokenizer_and_memgarden_ranker():
     assert contract.TOKENIZER_NAME == jt.NAME == jt.TOKENIZER.name
     real = retrieval.rank("x", [{"id": "a", "summary": "x"}], tokenizer=jt.TOKENIZER,
                           **contract.RANK_OPTIONS)
-    assert contract.VERSION == real.version == "memgarden-bm25-v1+tok:jieba-0.42.1"
-    assert contract.ACCEPTED == (contract.VERSION, contract.PREVIOUS, contract.LEGACY)
-    assert len(set(contract.ACCEPTED)) == 3
+    assert contract.VERSION == real.version == "memgarden-bm25-v2+tok:jieba-0.42.1"
+    assert contract.ACCEPTED == (contract.VERSION, contract.PREVIOUS_MEMGARDEN,
+                                 contract.PREVIOUS, contract.LEGACY)
+    assert len(set(contract.ACCEPTED)) == 4
+    assert tuple(contract.SERVED) == contract.ACCEPTED[:3]
+    assert contract.FALLBACKS == (contract.PREVIOUS_MEMGARDEN, contract.PREVIOUS)
+    # Automatic recall: same ranker, looser strong-evidence gate -> +cfg: suffix.
+    assert contract.RECALL_VERSION == "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+
+
+def test_previous_memgarden_protocol_is_the_v1_coverage_gate():
+    # v2 counts coverage IDF over at least 20 cards, so a new user's tiny garden
+    # finds its answer; the v1 label keeps the old gate for an old backend.
+    items = [{"id": "a", "summary": "喜欢喝美式咖啡，不加糖"}]
+    query = "我平时早上一般喝什么咖啡"
+    assert ids(memory_search.rank(items, query)) == ["a"]
+    assert ids(memory_search.rank(items, query, protocol=contract.PREVIOUS_MEMGARDEN)) == []
+    # From 20 candidates on, the two protocols are the same ranking.
+    for seed in range(40):
+        garden, q = _garden(seed)
+        if len(garden) >= 20:
+            assert ids(memory_search.rank(garden, q)) == ids(
+                memory_search.rank(garden, q, protocol=contract.PREVIOUS_MEMGARDEN)), seed
 
 
 # --------------------------------------------------------------------------- #

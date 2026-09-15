@@ -19394,7 +19394,14 @@ def _process_dream_jobs(jobs: list) -> float:
             )
             continue
         dream_counts["model_attempts"] = max(1, dream_calls)
-        dream_counts["proposals"] = len(consolidations or [])
+        # Proposals = what the model returned, including the ones the component
+        # dropped at its exit for touching a TRUNCATED / unrendered card.
+        kernel_truncated_dropped = _dream_tracker.dropped_truncated_target
+        dream_counts["proposals"] = (
+            len(consolidations or [])
+            + kernel_truncated_dropped
+            + _dream_tracker.dropped_unrendered_target
+        )
         if err:
             update_proactive_job_status(
                 job_id,
@@ -19433,7 +19440,7 @@ def _process_dream_jobs(jobs: list) -> float:
             "memory.dream.model.done",
             job_id=job_id,
             status="ok",
-            outcome=("accepted" if consolidations else "no_proposals"),
+            outcome=("accepted" if dream_counts["proposals"] else "no_proposals"),
             started_at=dream_started,
             degraded_context=dream_degraded_context,
             counts=dream_counts,
@@ -19443,13 +19450,18 @@ def _process_dream_jobs(jobs: list) -> float:
         # only saw part of (TRUNCATED), but a prompt is not a guarantee. Drop
         # those proposals; if every proposal was one, fail (ledger untouched)
         # rather than complete as "nothing to consolidate".
-        consolidations, truncated_rejected = garden_component.reject_truncated_consolidations(
+        # A memgarden that already drops these at the component exit leaves
+        # nothing for the host check; count its drops as the same guard so an
+        # all-forbidden run still fails instead of completing as a noop.
+        consolidations, host_truncated_rejected = garden_component.reject_truncated_consolidations(
             consolidations, dream_disclosure.truncated_ids
         )
+        truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
         if truncated_rejected:
             log.warning(
-                "dream truncated-card guard id=%s rejected=%d kept=%d",
-                job_id, truncated_rejected, len(consolidations),
+                "dream truncated-card guard id=%s rejected=%d (component=%d host=%d) kept=%d",
+                job_id, truncated_rejected, kernel_truncated_dropped,
+                host_truncated_rejected, len(consolidations),
             )
         if truncated_rejected and not consolidations:
             reason = garden_component.DREAM_TRUNCATED_CARD_REJECTED

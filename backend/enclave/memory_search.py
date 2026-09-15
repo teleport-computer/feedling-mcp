@@ -23,9 +23,9 @@ def search_text(item: dict) -> str:
 
 
 def rank(items: list[dict], query: str, *, protocol: str = search_contract.VERSION) -> list[dict]:
-    """Ordered matching items. ``protocol`` PREVIOUS reproduces the old enclave BM25."""
-    options = (search_contract.PREVIOUS_RANK_OPTIONS if protocol == search_contract.PREVIOUS
-               else search_contract.RANK_OPTIONS)
+    """Ordered matching items. An older ``protocol`` reproduces that ranking."""
+    options = (search_contract.SERVED.get(protocol, search_contract.RANK_OPTIONS)
+               if isinstance(protocol, str) else search_contract.RANK_OPTIONS)
     try:
         result = retrieval.rank(
             query, items, tokenizer=jieba_tokenizer.TOKENIZER, text_of=search_text,
@@ -44,6 +44,8 @@ def rank(items: list[dict], query: str, *, protocol: str = search_contract.VERSI
 def search(moments: list[dict], user_id: str, content_sk, payload: dict) -> dict:
     search_contract.check_request({**payload, "moments": moments})
     protocol = payload.get("search_protocol") or search_contract.VERSION
+    if not isinstance(protocol, str) or protocol not in search_contract.SERVED:
+        protocol = search_contract.VERSION
     items, unavailable = [], []
     chunk_size = readside.memory_readside_hard_max()
     for offset in range(0, len(moments), chunk_size):
@@ -63,5 +65,4 @@ def search(moments: list[dict], user_id: str, content_sk, payload: dict) -> dict
         clean.pop("_search_content", None)
         public.append(clean)
     return {"user_id": user_id, "items": public, "unavailable_ids": unavailable,
-            "ranking": (search_contract.PREVIOUS if protocol == search_contract.PREVIOUS
-                        else search_contract.VERSION)}
+            "ranking": protocol}

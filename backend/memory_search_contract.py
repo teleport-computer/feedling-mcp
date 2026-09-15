@@ -46,14 +46,35 @@ VERSION = retrieval.rank("", [], tokenizer=_NameOnly(), **RANK_OPTIONS).version
 #: default gate (no hit returns empty). The version string carries ``+cfg:``.
 RECALL_RANK_OPTIONS: dict = {**RANK_OPTIONS, "strong_evidence": 0.5}
 RECALL_VERSION = retrieval.rank("", [], tokenizer=_NameOnly(), **RECALL_RANK_OPTIONS).version
+#: memgarden's ranking before ``memgarden-bm25-v2`` (2026-09-15): the coverage
+#: gate counted IDF over the real candidate pool, so gardens under ~20 cards
+#: gated out correct answers. Kept as a literal (the current kernel cannot
+#: derive it) and still served during a rolling restart, for a backend that
+#: predates v2. ``coverage_pool_floor=1`` is memgarden's documented switch back
+#: to the old gate; scores, order and the strong-evidence gate are unchanged.
+PREVIOUS_MEMGARDEN = "memgarden-bm25-v1+tok:jieba-0.42.1"
+PREVIOUS_MEMGARDEN_RANK_OPTIONS: dict = {**RANK_OPTIONS, "coverage_pool_floor": 1}
 #: The enclave BM25 before memgarden owned the ranking (io ``memory_bm25``). Still
 #: served, bit-identical, for a backend that asks for it during a rolling restart.
 PREVIOUS = "bm25-jieba-0.42.1-v1"
 #: Exact old-ranker semantics: no stopwords, no gate, every positive score returns.
 PREVIOUS_RANK_OPTIONS = {"stopwords": frozenset(), "min_coverage": 0.0}
 LEGACY = "substring-legacy"
+#: Search protocols an enclave serves, each with its ``retrieval.rank`` options.
+#: On a memgarden that predates v2, VERSION *is* PREVIOUS_MEMGARDEN and has no
+#: ``coverage_pool_floor`` knob; the older entry then collapses into VERSION.
+SERVED: dict[str, dict] = {
+    VERSION: RANK_OPTIONS,
+    **({PREVIOUS_MEMGARDEN: PREVIOUS_MEMGARDEN_RANK_OPTIONS}
+       if PREVIOUS_MEMGARDEN != VERSION else {}),
+    PREVIOUS: PREVIOUS_RANK_OPTIONS,
+}
+#: What a backend asks next, in order, when an enclave answers
+#: ``memory_search_protocol_unsupported``: an enclave one release behind serves
+#: PREVIOUS_MEMGARDEN, one that predates memgarden only PREVIOUS.
+FALLBACKS = tuple(p for p in (PREVIOUS_MEMGARDEN, PREVIOUS) if p != VERSION)
 #: Ranking labels a backend accepts from an enclave response.
-ACCEPTED = (VERSION, PREVIOUS, LEGACY)
+ACCEPTED = tuple(dict.fromkeys((VERSION, PREVIOUS_MEMGARDEN, PREVIOUS, LEGACY)))
 MAX_CARDS = 4096
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_TEXT_BYTES = 16 * 1024 * 1024

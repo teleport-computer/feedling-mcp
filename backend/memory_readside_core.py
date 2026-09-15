@@ -436,17 +436,21 @@ def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict
               if str(row.get("id") or "") in by_id]
     request = {**payload, "search_protocol": search_contract.VERSION}
     search_contract.check_request({**request, "moments": corpus})
-    try:
-        response = post(api_key, corpus, operation="index", payload=request)
-    except RuntimeError as exc:
-        # Rolling restart: an enclave that predates the memgarden ranker rejects
-        # the new protocol with this exact 400. Ask once for the old protocol it
-        # does serve; every other failure (auth, timeout, 5xx) still propagates.
-        if not (str(exc).startswith("enclave_http_400:")
-                and "memory_search_protocol_unsupported" in str(exc)):
-            raise
-        request = {**payload, "search_protocol": search_contract.PREVIOUS}
-        response = post(api_key, corpus, operation="index", payload=request)
+    fallbacks = iter(search_contract.FALLBACKS)
+    while True:
+        try:
+            response = post(api_key, corpus, operation="index", payload=request)
+            break
+        except RuntimeError as exc:
+            # Rolling restart: an enclave that predates this ranker rejects the
+            # protocol with this exact 400. Step down once per older protocol
+            # (memgarden v1, then the pre-memgarden BM25); every other failure
+            # (auth, timeout, 5xx) still propagates.
+            older = next(fallbacks, None)
+            if older is None or not (str(exc).startswith("enclave_http_400:")
+                                     and "memory_search_protocol_unsupported" in str(exc)):
+                raise
+            request = {**payload, "search_protocol": older}
     # A successful previous-protocol response has this exact envelope. Missing
     # ranking on that known shape is rolling compatibility, not permission to
     # swallow HTTP/auth/timeouts or unknown/malformed future protocols.
