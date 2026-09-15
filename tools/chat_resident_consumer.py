@@ -22948,6 +22948,32 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
     return windows or ([text] if text.strip() else [])
 
 
+def _resident_floor_note() -> str:
+    """f(days) 蒸馏目标(机制 A,非闸门):数量由素材密度决定,下限只兜底防漏写,
+    期望值给个宽范围当参考。两层——先满足下限,再尽量接近期望上限;素材薄就少写、
+    绝不编造。后端暴露 memory_aspiration 就用真值,否则按下限估一个宽上限。
+    取不到状态返空(零影响)。"""
+    try:
+        st = _capture_get_json("/v1/bootstrap/status")
+        floor = int(st.get("memory_floor") or 0)
+        count = int(st.get("memories_count") or 0)
+        asp = int(st.get("memory_aspiration") or 0)
+        if asp <= floor:  # 后端未暴露期望值 → 按下限估一个宽上限(≈2.3×)
+            asp = max(floor + 2, round(floor * 2.3))
+        # 只要还没到期望上限就给引导(鼓励在下限之上继续挖真实记忆)。
+        if floor > 0 and count < asp:
+            return (
+                f"花园现有 {count} 张卡。真正该有多少,取决于这些素材里有多少【真实、有价值】"
+                f"的持久事实——把它们尽量都写全,别为精简丢真事实。参考:这段关系正常大概在 "
+                f"{floor}–{asp} 张之间;【先满足下限 {floor} 张】,再尽量接近上限。素材薄就少写、"
+                f"【宁缺毋滥、绝不编造】;但若你只找到远低于 {floor} 张,多半是漏了,回去再挖。"
+                f"仍按 known_memories 去重。"
+            )
+    except Exception:
+        pass
+    return ""
+
+
 def _resident_memory_index_items() -> list[dict]:
     """Best-effort /v1/memory/index read (id / summary / bucket / status …, no content).
     Any failure → [] (zero impact)."""
@@ -23072,6 +23098,9 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
         state["garden"] = garden_import.new_state(
             locale=_resident_import_locale(state["document"]),
             user_name=str(existing_identity.get("user_preferred_name") or ""),
+            # 张数引导(Seven 763b0b03,切换前传给 fact_write 的 floor_note,仅 VPS):
+            # 每个 job 算一次、存进导入参数,让路/续跑沿用同一份。取不到状态 → 空串 → 不传。
+            host_note=_resident_floor_note(),
         )
         state["phase"] = "import"
 

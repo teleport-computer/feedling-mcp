@@ -11918,15 +11918,29 @@ def _import_material(prompt: str) -> str:
     return prompt[start:end] if start >= 0 else ""
 
 
-def _patch_memory_distill(monkeypatch, *, windows=3, cards_by_window=None, material_kind=""):
+def _patch_memory_distill(monkeypatch, *, windows=3, cards_by_window=None, material_kind="",
+                          status=None, strategy="single_pass"):
     """Memory-mode distill harness: REAL import engine + consumer state machine; fake
     agent, fake memory writer, fake recheck module (sys.modules, so the lazy genesis
-    imports never pull the real worker). Returns the call ledger."""
+    imports never pull the real worker). Returns the call ledger.
+
+    ``status``: what ``/v1/bootstrap/status`` returns (the floor-note input). Default {}
+    (floor 0 → no note); an Exception instance is raised instead."""
     import types as _types
 
-    monkeypatch.setenv("FEEDLING_GARDEN_IMPORT_STRATEGY", "single_pass")
+    monkeypatch.setenv("FEEDLING_GARDEN_IMPORT_STRATEGY", strategy)
     calls = {"pending": 0, "agent": [], "recheck": 0, "actions": [], "complete": [],
-             "heartbeat": [], "lease": [], "envelopes": []}
+             "heartbeat": [], "lease": [], "envelopes": [], "status_reads": 0}
+
+    def fake_get_json(path, **kw):
+        if path == "/v1/bootstrap/status":
+            calls["status_reads"] += 1
+            if isinstance(status, Exception):
+                raise status
+            return dict(status or {})
+        return {}
+
+    monkeypatch.setattr(crc, "_capture_get_json", fake_get_json)
     job = {"job_id": "jobm", "mode": "add_memory", "material_kind": material_kind,
            "sealed": {"envelope": {"body_ct": "x"}}}
     cards_by_window = cards_by_window or {
@@ -12180,6 +12194,100 @@ def test_distill_long_term_memory_uses_curated_archive_rubric(monkeypatch):
     calls2 = _patch_memory_distill(monkeypatch, windows=1)
     crc._process_resident_distill_once()
     assert "[The material they handed you]" in calls2["agent"][0]  # history_import
+
+
+# --- VPS 张数引导（floor note）：切换前传给 fact_write，切换后走 memgarden host_note ---
+#
+# 之前(34cd8164):VPS 导入写卡提示词里带「花园现有 N 张卡…参考 floor–asp 张…绝不编造」;
+# 切到 memgarden 导入后丢了。现在恢复:同样的算法和措辞,作为 ImportRequest.host_note
+# 进每个写卡批次;托管导入一直没有这段,仍然没有。
+
+_HOST_GUIDANCE = "[Host guidance]"
+
+
+def _write_prompts(calls) -> list[str]:
+    return [p for p in calls["agent"] if "[The material]" not in p]
+
+
+def test_distill_floor_note_reaches_every_vps_write_prompt_with_the_numbers(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=2,
+                                  status={"memory_floor": 38, "memories_count": 2})
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    note = crc._resident_floor_note()
+    assert "花园现有 2 张卡" in note and "38–87 张之间" in note and "绝不编造" in note
+    assert len(calls["agent"]) == 2
+    for prompt in calls["agent"]:
+        assert f"\n{_HOST_GUIDANCE}\n{note}\n" in prompt
+        assert prompt.index(_HOST_GUIDANCE) < prompt.index("[Output]")
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+
+
+def test_distill_floor_note_uses_exposed_aspiration_and_two_pass_write_stage_only(monkeypatch):
+    calls = _patch_memory_distill(
+        monkeypatch, windows=1, strategy="two_pass",
+        status={"memory_floor": 38, "memories_count": 40, "memory_aspiration": 60})
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    monkeypatch.setattr(crc, "call_agent", lambda prompt, **kw: (
+        calls["agent"].append(prompt) or (
+            json.dumps({"candidates": [{"about": "person", "summary": "周末爬山",
+                                        "evidence": "这一段材料", "occurred_at": None}]},
+                       ensure_ascii=False)
+            if "[The material]" in prompt
+            else json.dumps({"cards": [_import_card("周末常去爬山")]}, ensure_ascii=False))))
+    crc._process_resident_distill_once()
+    candidates = [p for p in calls["agent"] if "[The material]" in p]
+    writes = _write_prompts(calls)
+    assert len(candidates) == 1 and len(writes) == 1
+    assert _HOST_GUIDANCE not in candidates[0]
+    assert "花园现有 40 张卡" in writes[0] and "38–60 张之间" in writes[0]
+
+
+@pytest.mark.parametrize("status", [
+    {"memory_floor": 0, "memories_count": 0},
+    {"memory_floor": 38, "memories_count": 87},
+    {"memory_floor": 38, "memories_count": 90, "memory_aspiration": 60},
+    RuntimeError("api down"),
+])
+def test_distill_no_floor_note_when_floor_zero_or_reached_or_status_fails(monkeypatch, status):
+    calls = _patch_memory_distill(monkeypatch, windows=1, status=status)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["agent"] and all(_HOST_GUIDANCE not in p for p in calls["agent"])
+    assert calls["complete"] == [("jobm", 1, "skipped")]    # zero impact on the import
+
+
+def test_distill_floor_note_computed_once_per_job_across_yield_and_resume(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=3,
+                                  status={"memory_floor": 38, "memories_count": 2})
+    pending = {"flag": False}
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
+    real_agent = crc.call_agent
+
+    def agent_then_user_arrives(prompt, **kw):
+        pending["flag"] = True
+        return real_agent(prompt, **kw)
+
+    monkeypatch.setattr(crc, "call_agent", agent_then_user_arrives)
+    crc._process_resident_distill_once(chat_since=1.0)
+    pending["flag"] = False
+    monkeypatch.setattr(crc, "call_agent", real_agent)
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert _agent_windows(calls) == [1, 2, 3]
+    assert calls["status_reads"] == 1
+    assert all("花园现有 2 张卡" in p for p in calls["agent"])
+
+
+def test_distill_on_old_memgarden_skips_the_note_instead_of_failing(monkeypatch):
+    from memory import garden_import
+
+    calls = _patch_memory_distill(monkeypatch, windows=1,
+                                  status={"memory_floor": 38, "memories_count": 2})
+    monkeypatch.setattr(garden_import, "import_request_accepts_host_note", lambda: False)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["agent"] and _HOST_GUIDANCE not in calls["agent"][0]
+    assert calls["complete"] == [("jobm", 1, "skipped")]
 
 
 def test_distill_supersede_goes_out_as_supersede_action(monkeypatch):

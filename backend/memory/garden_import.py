@@ -138,15 +138,23 @@ def sources_from_groups(
 # 状态（JSON 可序列化，宿主负责加密保存）
 # --------------------------------------------------------------------------- #
 
-def new_state(*, locale: str, user_name: str = "", strategy: str | None = None) -> dict:
+def new_state(*, locale: str, user_name: str = "", strategy: str | None = None,
+              host_note: str = "") -> dict:
     """一次导入的进度。**导入语义参数在第一次就定下来**，续跑沿用 ——
-    否则中途档案语言或称呼变了，续传指纹对不上，整个导入只能从头来。"""
+    否则中途档案语言或称呼变了，续传指纹对不上，整个导入只能从头来。
+
+    ``host_note``：给写卡提示词的补充指引（memgarden ``ImportRequest.host_note``）。
+    目前只有 VPS 传（切换前 fact_write 的张数引导 floor_note）；托管 / 明文导入不传。
+    空串时不进 params，状态形状与之前一致。"""
     chosen = strategy if strategy in _STRATEGIES else default_strategy()
+    params = {"locale": str(locale or ""), "user_name": str(user_name or ""),
+              "strategy": chosen}
+    if str(host_note or "").strip():
+        params["host_note"] = str(host_note)
     return {
         "engine": ENGINE,
         "v": STATE_VERSION,
-        "params": {"locale": str(locale or ""), "user_name": str(user_name or ""),
-                   "strategy": chosen},
+        "params": params,
         "sessions": {},
         "pending": None,
         "written": [],
@@ -386,6 +394,17 @@ class ImportRunResult:
     known: list[dict] = field(default_factory=list)
 
 
+def import_request_accepts_host_note() -> bool:
+    """装的 memgarden 认不认 ``ImportRequest.host_note``。
+
+    自建 VPS 的 consumer 自更新时先切代码、再装依赖；旧包上不传这个字段（少一段张数引导，
+    导入照常跑），而不是构造请求时 TypeError 把整个导入炸掉。
+    """
+    from memgarden import ImportRequest
+
+    return "host_note" in {f.name for f in dataclasses.fields(ImportRequest)}
+
+
 def _request(source: ImportSource, params: Mapping[str, Any], *, job_key: str):
     from memgarden import ImportRequest
 
@@ -393,6 +412,9 @@ def _request(source: ImportSource, params: Mapping[str, Any], *, job_key: str):
 
     locale = str(params.get("locale") or "")
     name = sanitize_user_name(str(params.get("user_name") or ""))
+    host_note = str(params.get("host_note") or "")
+    extra = ({"host_note": host_note}
+             if host_note.strip() and import_request_accepts_host_note() else {})
     return ImportRequest(
         material="",
         batches=tuple({"text": w} for w in source.windows),
@@ -405,6 +427,7 @@ def _request(source: ImportSource, params: Mapping[str, Any], *, job_key: str):
         fallback_occurred_at=source.fallback_occurred_at,
         max_total_cards=source.max_total_cards,
         idempotency_key=f"{job_key}:{source.key}",
+        **extra,
     )
 
 
@@ -661,6 +684,7 @@ __all__ = [
     "WRITE_CHUNK",
     "default_strategy",
     "entry_windows_done",
+    "import_request_accepts_host_note",
     "index_cards",
     "is_state",
     "mutation_item",
