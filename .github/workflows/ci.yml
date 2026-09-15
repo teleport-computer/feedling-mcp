@@ -423,6 +423,7 @@ jobs:
             tests/test_window_fingerprint.py \
             tests/test_v2_capture_poison_window_escape.py \
             tests/test_agent_call_failure_codes.py \
+            tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
             tests/test_audit_dream_false_no_cards.py \
             tests/test_dream_stagger_admission.py \
@@ -1032,6 +1033,7 @@ jobs:
             tests/test_window_fingerprint.py \
             tests/test_v2_capture_poison_window_escape.py \
             tests/test_agent_call_failure_codes.py \
+            tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
             tests/test_audit_dream_false_no_cards.py \
             tests/test_dream_stagger_admission.py \

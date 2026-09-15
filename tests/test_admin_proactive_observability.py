@@ -54,7 +54,11 @@ def test_v1_failure_classifier_is_fail_closed_and_keeps_keyspace_separate():
         "model_not_found",
         "image_generation_model_not_found",
     })
-    assert notices_catalog.USER_UNAVAILABLE_V1_REASONS == expected
+    # 2026-09-15: Seven's exact set plus the separately reviewed, hx-approved
+    # memory-lane block (pinned in tests/test_memory_lane_user_unavailable.py).
+    assert notices_catalog.USER_UNAVAILABLE_V1_REASONS == (
+        expected | notices_catalog.MEMORY_LANE_USER_UNAVAILABLE_V1_REASONS
+    )
     for reason in expected:
         assert notices_catalog.v1_proactive_outcome_class(
             "failed", reason

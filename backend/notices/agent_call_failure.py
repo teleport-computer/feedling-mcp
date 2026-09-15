@@ -50,6 +50,14 @@ AGENT_CALL_FAILURE_CLASSES = frozenset({
     "unknown",
     "upstream_unavailable",
 })
+# Every stored value ``normalize_reason`` can produce (besides a bare prefix):
+# the exact producer vocabulary consumers such as the user-unavailable
+# exemption in ``notices.catalog`` are checked against.
+PUBLIC_REASON_CODES = frozenset(
+    f"{prefix}:{error_class}"
+    for prefix in AGENT_CALL_FAILED_PREFIXES
+    for error_class in AGENT_CALL_FAILURE_CLASSES
+)
 
 _STRONG_UPSTREAM_EVIDENCE = re.compile(
     r"provider_http_5\d{2}"

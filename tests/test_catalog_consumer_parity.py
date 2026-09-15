@@ -39,6 +39,7 @@ except ModuleNotFoundError:
     sys.modules["content_encryption"] = _fake_enc
 
 from notices import catalog  # noqa: E402
+from notices import agent_call_failure  # noqa: E402
 from notices import core  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
@@ -69,6 +70,10 @@ def test_catalog_covers_all_consumer_error_classes():
 def test_user_unavailable_v1_reasons_are_producer_registered():
     producer_codes = set(crc.CONSUMER_ERROR_CLASSES) | set(
         worker.PUBLIC_FAILURE_CODES
+    ) | set(
+        # 2026-09-15: V1 memory-lane reasons are produced by the backend's
+        # status-endpoint normalizer, not the consumer (catalog memory-lane block).
+        agent_call_failure.PUBLIC_REASON_CODES
     )
     missing = set(catalog.USER_UNAVAILABLE_V1_REASONS) - producer_codes
     assert not missing, f"用户侧豁免未由产生方导出: {sorted(missing)}"
