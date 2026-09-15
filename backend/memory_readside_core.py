@@ -65,7 +65,7 @@ def _time_ts(moment: dict) -> float:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return memory_timestamps.now_iso()
 
 
 def _now_ts() -> float:
@@ -597,8 +597,9 @@ def memory_fetch_core(
                 fresh = memory_service._load_moments(store)
                 for m in fresh:
                     if isinstance(m, dict) and str(m.get("id") or "") in referenced_ids:
+                        # Only the reference stamp: updated_at means "the card
+                        # changed" (profile refresh witness), and a read is not a change.
                         m["last_referenced_at"] = now
-                        m["updated_at"] = now
                 memory_service._save_moments(store, fresh)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],

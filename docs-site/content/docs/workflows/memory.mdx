@@ -525,6 +525,10 @@ known records that cannot be returned under some archive, supersession, or
 encryption rules. Compare requested IDs with returned item IDs and treat any
 unaccounted-for ID as not available.
 
+Fetching a card records the read in its `last_referenced_at` (UTC, `Z` suffix).
+A fetch does not change `updated_at`, so reading cards never makes the profile
+refresh witness look like a Garden change.
+
 ## 4. Apply a batch of memory actions
 
 After selecting with `index` and reading the necessary cards with `fetch`, use
@@ -561,9 +565,12 @@ replaced is unaffected: the rejection requires an internal-id-like hex string
 next to the phrase.
 
 A `memory.supersede` action accepts one source ID or an array of at most 20
-source IDs. An oversized array fails that action with
-`too_many_supersedes` before any card is changed; it is never truncated to a
-successful prefix. On success, `superseded_ids` lists the cards the mutation
+source IDs. A plaintext `memory` successor that omits `occurred_at` (or sends
+it empty) keeps the first source card's `occurred_at`, the same way it inherits
+bucket, threads, importance, and pulse; an explicit `occurred_at` still wins.
+An envelope successor must carry `occurred_at` itself. An oversized array fails
+that action with `too_many_supersedes` before any card is changed; it is never
+truncated to a successful prefix. On success, `superseded_ids` lists the cards the mutation
 actually retired rather than echoing the requested IDs. Every requested source
 must still be active when the mutation commits. If a source is already
 unavailable, the action fails with `supersede_targets_unavailable`; if one

@@ -7091,6 +7091,10 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             # 不接受模型自报(schema 里也没有这个字段)。
             "occurred_at": memory_timestamps.now_iso(),
         }
+        if op in ("update", "supersede", "merge", "patch"):
+            # 改卡不改「事情什么时候发生」:不带 occurred_at,由 supersede 继承旧卡的日期
+            # (同 bucket/threads)。否则每次修正都把 2024 年的卡挪到今天。
+            del inner["occurred_at"]
         # ⚠️ 只在模型**真的传了**的时候才放这两个键。
         #
         # update 走的是 supersede(新写一张替换旧的),`actions._memory_supersede_action`

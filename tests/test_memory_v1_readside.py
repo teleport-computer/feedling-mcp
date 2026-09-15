@@ -159,6 +159,8 @@ def test_fetch_core_updates_last_referenced_at_for_returned_items(monkeypatch):
     assert [item["id"] for item in body["items"]] == ["ok_fetch"]
     assert next(m for m in saved if m["id"] == "ok_fetch")["last_referenced_at"] == "2026-06-25T12:00:00+00:00"
     assert next(m for m in saved if m["id"] == "not_returned")["last_referenced_at"] == "2026-06-20T00:00:00"
+    # A read is not a change: updated_at is the profile refresh witness.
+    assert next(m for m in saved if m["id"] == "ok_fetch")["updated_at"] == "2026-06-20T10:00:00"
 
 
 def test_memory_score_applies_decay_from_last_referenced_at(monkeypatch):

@@ -438,19 +438,6 @@ DEVIATIONS: dict[str, Deviation] = {
         "plaintext memory.add/supersede cut content at MEMORY_CONTENT_MAX_CHARS=5000 "
         "(OpenAPI maxLength 5000) and emit only a content-free memory.content.truncation "
         "trace; the write receipt is a plain success."),
-    # ---- bugs: evidence is in the clause failures; not fixed in this change --
-    "reads.no_side_effects/no_timestamp_change": Deviation(
-        "bug",
-        "memory_readside_core.memory_fetch_core stamps updated_at (not only "
-        "last_referenced_at) on every fetched card. updated_at is the V2 profile "
-        "refresh witness (profile_refresh.refresh_due), so any memory_fetch makes the "
-        "next post-turn check regenerate the profile."),
-    "patch.preserves_provenance/occurred_at": Deviation(
-        "bug",
-        "memory.supersede takes occurred_at from the new payload or now(); neither "
-        "io_cli memory-patch nor the V2 memory_write 'update' schema can carry it, so "
-        "every correction moves a dated card (2024-06-15 here) to today while "
-        "bucket/threads/importance/pulse are inherited."),
 }
 
 
@@ -462,13 +449,6 @@ def results(io_world):
 def test_io_write_path_meets_shared_scenarios_or_declares_why(results):
     kit.assert_conformant(list(results.values()))
     print("\n" + kit.results_table(list(results.values()), host="io"))
-
-
-def test_declared_bugs_are_still_reproduced_with_evidence(results):
-    evidence = {f.clause: f.evidence for r in results.values() for f in r.failures}
-    assert "2024-06-15" in evidence["patch.preserves_provenance/occurred_at"]
-    before_after = evidence["reads.no_side_effects/no_timestamp_change"]
-    assert "before" in before_after and "after" in before_after
 
 
 # --------------------------------------------------------------------------- #
@@ -573,3 +553,73 @@ def test_v2_capture_commit_rejects_supersede_of_a_card_retired_after_prepare(io_
                             (prepared["id"],)).fetchone()[0] == 0
     assert host.capture_progress("alice") == 0
 
+
+
+def _raw_row(host, owner: str, record_id: str) -> dict:
+    return next(r for r in db.memory_load_strict(host._uid(owner)) if r["id"] == record_id)
+
+
+def test_fetch_marks_reference_without_changing_the_card_or_waking_profile_refresh(
+        io_world, monkeypatch):
+    """Regression: memory_fetch stamped updated_at on every fetched card. updated_at
+    is the V2 profile refresh witness, so one read made the next post-turn check
+    regenerate the profile. A read stamps last_referenced_at only."""
+    from model_api_runtime.v2 import profile_refresh, profile_store
+
+    host = IoHost(io_world)
+    rid = host.add("alice", kit.card("kitfetchquiet", source=host.sources[0])).record_ids[0]
+    uid = host._uid("alice")
+    before = _raw_row(host, "alice", rid)
+    count, max_updated = db.memory_profile_source_stats(uid)
+    profile = profile_store.build_profile_document(
+        uid, state="ok",
+        source={"card_count": count, "max_updated_at": max_updated, "generated_at": "x"},
+        last_attempt={"at": "x", "reject_code": "", "attempts": 1, "retry_not_before": 0},
+        memory_text="m", style_text="s",
+        seal_text=lambda _uid, text: {"body_ct": "ct", "nonce": "n"})
+    monkeypatch.setattr(profile_refresh.db, "get_blob_strict", lambda *_a: profile)
+    assert profile_refresh.refresh_due(uid, enabled=True) is False
+    host.tick()
+
+    assert [i["id"] for i in host.fetch("alice", [rid])] == [rid]
+
+    after = _raw_row(host, "alice", rid)
+    assert after["updated_at"] == before["updated_at"]
+    assert after["last_referenced_at"] != before.get("last_referenced_at")
+    assert after["last_referenced_at"].endswith("Z")
+    assert profile_refresh.refresh_due(uid, enabled=True) is False
+
+
+def test_correction_keeps_the_cards_date_on_v1_and_v2_unless_one_is_given(io_world):
+    """Regression: every correction moved a dated card to today, because
+    memory.supersede took occurred_at from the payload or now() and neither
+    io_cli memory-patch (V1) nor memory_write 'update' (V2) carries one."""
+    from model_api_runtime.v2 import worker
+
+    host = IoHost(io_world)
+    src = host.sources[0]
+    dated = "2024-06-15T12:00:00Z"
+
+    # V1: io_cli memory-patch payload through /v1/memory/actions.
+    v1_old = host.add("alice", kit.card("kitdatedvone", source=src, occurred_at=dated)).record_ids[0]
+    v1 = host.patch("alice", v1_old, {"content": "kitdatedvone body: fixed wording."})
+    assert v1.ok, v1
+    assert host.inspect("alice", v1.record_ids[0])["occurred_at"] == dated
+
+    # V2: memory_write op=update, translated by the worker, same executor.
+    v2_old = host.add("alice", kit.card("kitdatedvtwo", source=src, occurred_at="2024-06-15")).record_ids[0]
+    actions = worker._memory_tool_actions([{
+        "op": "update", "target_id": v2_old, "summary": "kitdatedvtwo summary fixed",
+        "content": "kitdatedvtwo body: fixed wording."}])
+    v2 = host._act("alice", actions[0])
+    assert v2.ok, v2
+    assert host.inspect("alice", v2.record_ids[0])["occurred_at"] == "2024-06-15"
+    new_row = _raw_row(host, "alice", v2.record_ids[0])
+    assert new_row["last_referenced_at"] != "2024-06-15"  # a correction is a fresh reference
+
+    # An explicit occurred_at on the supersede still wins.
+    explicit_old = host.add("alice", kit.card("kitdatedexp", source=src, occurred_at=dated)).record_ids[0]
+    explicit = host.supersede("alice", [explicit_old],
+                              kit.card("kitdatedexpnew", source=src, occurred_at="2025-01-02T03:04:05Z"))
+    assert explicit.ok, explicit
+    assert host.inspect("alice", explicit.record_ids[0])["occurred_at"] == "2025-01-02T03:04:05Z"
