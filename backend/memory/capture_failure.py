@@ -9,7 +9,6 @@ V1（``proactive.capture_scheduler``）和 V2（``model_api_runtime.v2.jobs_stor
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Callable, Mapping
 
 
@@ -101,9 +100,15 @@ ACCOUNT_FAILURE_KINDS = frozenset({
     "upstream_unavailable",
 })
 
-#: V1 报的是 CLI/模型原始错误文本，交给仓库统一的错误对照表（notices.error_contract）认 ——
-#: App 给用户弹的原因提示也查这张表，两边不会再各认各的（上一版自己列关键词，漏了
-#: 「Not logged in · Please run /login」）。这里列的是对照表里属于账号/服务的那些类别。
+#: V1 报的是 CLI/模型原始错误文本（``capture_agent_call_failed:RuntimeError: …``），
+#: 或者状态接口已经归一过的 ``capture_agent_call_failed:<类别>``。两种写法都交给
+#: **记忆整理统一的失败分类器** ``notices.agent_call_failure`` 认 —— lane rollup 的失败码、
+#: 失败率里「用户自己的问题」的豁免、这里的逃生阀，三处用同一套规则，不会再各认各的。
+#: （2026-09-15 以前这里自己查对照表 + 补关键词，和那边的强证据门槛、中文中转站形状、
+#: 403 规则各写一份；而状态接口开始归一之后，这里还拿对照表去认 ``…:auth_invalid``
+#: 这种已经归一的码，认不出来，账号类失败在 V1 上又回到了 6 次就跳。）
+#:
+#: 这里列的是分类器的结果里算「账号或模型服务」的那些。
 ACCOUNT_ERROR_CONTRACT_CODES = frozenset({
     "quota_insufficient",
     "provider_account_expired",
@@ -114,10 +119,6 @@ ACCOUNT_ERROR_CONTRACT_CODES = frozenset({
     "resident_agent_cli_logged_out",
     "cli_config_invalid",
 })
-
-#: 对照表之外、prod 上出现过或 V1 consumer 自己也按账号问题处理的原始文本
-#: （``"invalid key" in lowered`` → provider_auth；「Insufficient balance」是某中转站的原话），
-#: 见 account_error_code。
 
 #: 账号/服务类失败**同一批**持续这么久仍没好，才跳过。
 #:
@@ -238,19 +239,6 @@ def poison_skip_patch(state: Mapping, window: Mapping | None, *,
     }
 
 
-#: 「服务不可用」的强证据：明确的 5xx 状态语境、超时、连接失败、过载。见 account_error_code。
-_STRONG_UPSTREAM_EVIDENCE = re.compile(
-    r"provider_http_5\d\d"
-    r"|(?:http|status|status[_ ]code|api error|error code|returned|responded)\W{0,3}5\d\d\b"
-    r"|\b5\d\d\s+(?:internal server error|bad gateway|service unavailable|gateway time-?out)"
-    r"|timed?[ _-]?out|timeout|connection (?:refused|reset|error|aborted)"
-    r"|service unavailable|bad gateway|overloaded|temporarily unavailable"
-    # 对照表里已认定的其他上游瞬时故障形状（Codex 第 7 轮：漏了会在第 6 次被跳过）
-    r"|unreachable|stream disconnected|ended without finish_reason",
-    re.IGNORECASE,
-)
-
-
 def account_error_code(reason: str) -> str:
     """账号/服务类失败对应错误对照表里的哪一类（如 ``quota_insufficient``）；不是账号类返回空串。
 
@@ -270,28 +258,17 @@ def account_error_code(reason: str) -> str:
         return kind
     if kind.startswith(PROVIDER_SETUP_ACCOUNT_CODE + ":"):
         return PROVIDER_SETUP_ACCOUNT_CODE
-    # 先认对照表之外的原话：prod 上某中转站回「401 {"error":"Insufficient balance"}」，
-    # 对照表按 401 认成「密钥无效」，提示就会让用户去重新填 key，而真实原因是没钱了。
-    if "insufficient balance" in text:
-        return "quota_insufficient"
-    from notices import error_contract  # 延迟导入：只在失败路径上用
+    from notices import agent_call_failure  # 延迟导入：只在失败路径上用
 
-    spec = error_contract.classify_text(raw)
-    if spec is not None and spec.code in ACCOUNT_ERROR_CONTRACT_CODES:
-        # 对照表的「服务不可用」是给聊天报错用的，裸三位 5 开头数字就算（``\b5\d{2}\b``）。
-        # 逃生阀要更严：「max_tokens must be <= 500」「rejected at byte 512」是请求/内容问题，
-        # 误判成服务故障会把 6 次兜底拖成 7 天（Codex 第 6 轮复现）。
-        if spec.code == "upstream_unavailable" and not (
-            _STRONG_UPSTREAM_EVIDENCE.search(raw)
-            # 中转站通用 403「Request failed. Please try again later.」—— 对照表按形状锚定在
-            # 开头，这里原因可能带着 capture_agent_call_failed: 等前缀，所以不锚定再认一次。
-            or re.search(error_contract._GENERIC_UPSTREAM_403_SHAPE, raw)
-        ):
-            return ""
-        return spec.code
-    if "invalid key" in text:
-        return "auth_invalid"
-    return ""
+    if agent_call_failure.is_agent_call_failed_reason(raw):
+        # V1 记忆整理的原因：原始尾巴或已经归一的类别，归一函数两种都认（幂等）。
+        code = agent_call_failure.normalize_reason(raw).partition(":")[2]
+    else:
+        # 没带 lane 前缀的原始文本（老任务、调度器自己记的原因）。强证据门槛同样生效：
+        # 「max_tokens must be <= 500」这种裸三位数字不算服务故障，
+        # 请求回显里的「insufficient balance」「invalid key」不算账号问题。
+        code = agent_call_failure.classify_failure_text(raw)
+    return code if code in ACCOUNT_ERROR_CONTRACT_CODES else ""
 
 
 def failure_class(reason: str) -> str:
