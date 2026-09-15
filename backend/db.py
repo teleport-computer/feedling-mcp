@@ -5292,6 +5292,10 @@ _LANE_ROLLUP_LIVE_MAX_DAYS = 3
 _LANE_ROLLUP_NONTERMINAL = ("pending", "claimed", "running")
 _LANE_ROLLUP_V1_NONTERMINAL = ("pending", "active", "claimed", "realizing")
 _LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
+# resident stuck 没有下界：consumer 早已离开留下的 claimed/pending 孤儿会永远算 stuck。
+# 每行额外给出「创建于最近这么多小时内」的计数（``recent_count``），读的人要看
+# 「最近卡住的」而不是「历史孤儿」时用它；``count`` 口径不变。
+_LANE_ROLLUP_V1_STUCK_RECENT_HOURS = 24.0
 
 # --- 说话率与沉默分解（Seven 2026-08-18 拍板：主动侧要两个数） ---------------- #
 #
@@ -6610,7 +6614,8 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                    operational_failures, control_outcomes, user_unavailable,
                    spoke, spoke_completed, silent_declared, silent_undeclared
             FROM lane_daily_rollup{clause}
-            ORDER BY day DESC, user_id, lane, enqueue_source
+            ORDER BY day DESC, user_id, route, lane, enqueue_source,
+                     access_path, mode_source
             LIMIT %s OFFSET %s
             """,
             params + [int(limit), int(offset)],
@@ -6829,11 +6834,13 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
         if not route or route == "resident":
             cutoff = (datetime.now(zone)
                       - timedelta(hours=_LANE_ROLLUP_STUCK_AFTER_HOURS))
+            recent_cutoff = (datetime.now(zone)
+                             - timedelta(hours=_LANE_ROLLUP_V1_STUCK_RECENT_HOURS))
             v1_where = ["l.stream IN ('proactive_jobs','memory_capture_jobs')",
                         "COALESCE(r.route,'resident') = 'resident'",
                         "COALESCE(l.doc->>'status','') = ANY(%s)",
                         f"{_LANE_ROLLUP_V1_CREATED_TS} < %s"]
-            v1_params: list = [list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
+            v1_params: list = [recent_cutoff, list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
             if user_id:
                 v1_where.append("l.user_id = %s")
                 v1_params.append(user_id)
@@ -6845,7 +6852,9 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                     FROM user_blobs WHERE kind = 'onboarding_route'
                 )
                 SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, COUNT(*)::int,
-                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5]  -- noqa
+                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5],  -- noqa
+                       COUNT(*) FILTER (
+                         WHERE {_LANE_ROLLUP_V1_CREATED_TS} >= %s)::int
                 FROM user_logs l
                 LEFT JOIN routes r ON r.user_id = l.user_id,
                 LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
@@ -6864,6 +6873,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                      "oldest_at": (datetime.fromtimestamp(float(r[3]), timezone.utc)
                                    .isoformat() if r[3] else None),
                      "job_seqs": [int(x) for x in (r[4] or [])],
+                     "recent_count": int(r[5] or 0),
                      "basis": "older_than_threshold"})
     return {
         "rows": out_rows,
@@ -6872,6 +6882,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
             "rows": stuck_rows,
             "total": sum(r["count"] for r in stuck_rows),
             "stuck_after_hours": _LANE_ROLLUP_STUCK_AFTER_HOURS,
+            "resident_recent_hours": _LANE_ROLLUP_V1_STUCK_RECENT_HOURS,
             "note": ("非终态尝试不进失败率的分子或分母（Seven 2026-08-18 定 A）；"
                      "它们只出现在这里，必须与失败率并排读"),
         },

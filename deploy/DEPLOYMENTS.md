@@ -455,19 +455,33 @@ incidents only through [`HOSTED_RUNTIME_V2_ROLLOUT.md`](HOSTED_RUNTIME_V2_ROLLOU
 Once a day (01:30 UTC = 09:30 Beijing) GitHub Actions runs
 `tools/memory_pipeline_daily_report.py` against **prod** and posts one Chinese
 message to the deploy-notice Lark group: capture and dream, split by V1
-`resident` / V2 `model_api`, with active users, successes, failures, users with
-failures and zero successes, V2 skipped dreams, and failures grouped as 用户自己的账号/配置 /
-模型服务 / 我们这边 / 未知 (grouping reuses `notices.error_contract` blame and
-`memory.capture_failure`). The first line is `[需要关注]` when any threshold in
-the tool fires (stuck users ≥ 10, our-side failures ≥ 5 users, failure rate
-≥ 50% or +15 pp day over day on ≥ 20 attempts, active users halved, ≥ 20 live
-stuck jobs, or unfrozen/missing data).
+`resident` / V2 `model_api`, with active users, real completions, operational
+failures and failure rate, users with operational failures and zero real
+completions, and operational failures grouped as 账号/配置类 / 模型服务 /
+我们这边 / 未知 (grouping reuses `notices.error_contract` blame and
+`memory.capture_failure`). The failure rate uses the admin lane views'
+definition — operational failures ÷ (real completions + operational failures).
+Control outcomes (V1 `skipped`; V2 `capture_disabled`, `dream_disabled`,
+`turns_halted`, …), failures proven to be the user's own account
+(`notices.catalog` user-unavailable sets) and Dream skips (garden too small,
+rollup `silent_declared`) are shown on a separate 不算失败 line and never trigger
+attention. V1 reads the frozen `operational_failures` / `control_outcomes` /
+`user_unavailable` columns; V2 classifies `failure_codes` like
+`jobs_store.terminal_outcome_class`. The first line is `[需要关注]` when any
+threshold in the tool fires (stuck users ≥ 10, our-side failures ≥ 5 users,
+failure rate ≥ 50% or +15 pp day over day on ≥ 20 attempts, active users halved,
+≥ 20 live stuck jobs, or unfrozen/missing/unclassified data).
 
 - **Runs outside the CVM on purpose**: the CVM never holds the webhook secret,
-  and a dead backend still yields a "没生成出来" message instead of silence.
-- **Reads only** `GET /v1/admin/lane-rollup` and `GET /v1/admin/memory-dream-jobs`
-  (both content-free). The message carries counts and sanitized failure codes
+  and a dead backend still yields a "没生成出来" message instead of silence. Any
+  unexpected error (response shape change, bug in the tool) also posts that
+  message, naming only the exception type, and fails the run.
+- **Reads only** `GET /v1/admin/lane-rollup` (content-free). Pages are merged
+  by the full cell key. The message carries counts and sanitized failure codes
   only — no user ids.
+- **Live stuck jobs**: V2 jobs past their own deadline; V1 jobs older than 6 h
+  but created within the last 24 h (`stuck.rows[].recent_count`). Older V1
+  non-terminal rows are orphans of consumers that went away and are not counted.
 - **Day** is the previous **Beijing** day, because lane-rollup cells are frozen
   per Beijing day.
 - **Secrets / vars** (all pre-existing): `FEEDLING_ADMIN_TOKEN`,
@@ -476,9 +490,12 @@ stuck jobs, or unfrozen/missing data).
 - **Verify locally without sending**: `python tools/memory_pipeline_daily_report.py --fixture tests/fixtures/memory_pipeline_daily_report/sources_2026-09-14.json --day 2026-09-14 --dry-run`;
   or `workflow_dispatch` with `dry_run=true`.
 - **Known gaps**: capture escape-valve skips (`memory.capture.window_skipped`)
-  have no aggregate admin read yet, so they are not in the message; V1 skipped
-  dreams are not distinguishable from V1 failures in the rollup. The schedule
-  only fires from the default branch.
+  have no aggregate admin read yet, so they are not in the message. A V1 cell
+  records reasons without their status, so when a cell has both control
+  outcomes and failures whose codes cannot be matched exactly, its failures are
+  shown as 未知 `unattributed` instead of being guessed into a group. Dream days
+  frozen before Dream skips were written to `silent_declared` show those skips
+  as completions. The schedule only fires from the default branch.
 
 ## Enclave configuration
 

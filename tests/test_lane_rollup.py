@@ -929,15 +929,13 @@ def test_resident_dream_agent_failures_keep_their_class_in_frozen_codes(
     assert secret not in repr(cell)
 
 
-def test_daily_report_fixture_matches_real_rollup_and_dream_job_projections(
+def test_daily_report_fixture_matches_real_rollup_projection(
         clean_rollup):
     """tools/memory_pipeline_daily_report.py is tested from a saved fixture.
     Lock that fixture to what the producers really return, so a renamed or
     dropped column fails here instead of silently zeroing the daily report."""
     import json as _json
     from pathlib import Path as _P
-
-    from admin import memory_metadata
 
     sys.path.insert(0, str(_P(__file__).parent.parent))
     from tools import memory_pipeline_daily_report as report_tool
@@ -952,11 +950,24 @@ def test_daily_report_fixture_matches_real_rollup_and_dream_job_projections(
     _insert_job(v2_uid, "capture", "failed", finished=fin,
                 last_error="extraction_failed:auth_invalid")
     _insert_job(v2_uid, "capture", "expired", finished=fin)
+    _insert_job(v2_uid, "capture", "failed", finished=fin,
+                last_error="capture_disabled")
+    _insert_job(v2_uid, "capture", "failed", finished=fin,
+                last_error="lease_timeout")
     db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
     _seed_resident(v1_uid)
     t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
     _log_job(v1_uid, ts=t, status="completed", job_kind="memory_capture",
              terminal_at=t)
+    # A scheduler skip (control) and a user's own empty balance: neither may
+    # count as our failure in the report.
+    _log_job(v1_uid, ts=t, status="skipped", job_kind="memory_capture",
+             terminal_at=t, status_reason="capture_window_unavailable")
+    _log_job(v1_uid, ts=t, status="failed", job_kind="memory_capture",
+             terminal_at=t,
+             status_reason="capture_agent_call_failed:quota_insufficient")
+    _log_job(v1_uid, ts=t, status="failed", job_kind="memory_capture",
+             terminal_at=t, status_reason="capture_memory_write_failed")
     _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
 
     payload = db.admin_lane_rollup(lane="capture", since_day="2030-05-31",
@@ -974,15 +985,35 @@ def test_daily_report_fixture_matches_real_rollup_and_dream_job_projections(
 
     v2 = report_tool.aggregate_day(real_rows, lane="capture", route="model_api",
                                    day="2030-06-01")
-    assert (v2.failed, v2.stuck_users) == (2, 1)
-    assert v2.causes["user_account"].codes == {"extraction_failed:auth_invalid": 1}
+    assert (v2.failed_raw, v2.operational, v2.control, v2.user_unavailable) == (4, 2, 1, 1)
+    assert v2.stuck_users == 1
+    assert v2.user_unavailable_codes == {"extraction_failed:auth_invalid": 1}
+    assert v2.causes["our_side"].codes == {"lease_timeout": 1}
     assert v2.causes["unknown"].codes == {"no_code": 1}
     v1 = report_tool.aggregate_day(real_rows, lane="capture", route="resident",
                                    day="2030-06-01")
-    assert (v1.completed, v1.failed) == (1, 0)
+    assert (v1.completed, v1.failed_raw) == (1, 3)
+    assert (v1.operational, v1.control, v1.user_unavailable) == (1, 1, 1)
+    assert not v1.unclassified
+    assert v1.stuck_users == 0
 
-    for job in fixture["dream_jobs"]["jobs"]:
-        assert set(job) == memory_metadata.DREAM_JOB_FIELDS
+    # V1 stuck rows carry the recent count the report bounds itself to.
+    stuck_uid = "usr_rollup_report_stuck"
+    _seed_resident(stuck_uid)
+    now = datetime.now(timezone.utc)
+    for age_h in (8, 30, 30 * 24):
+        created = now - timedelta(hours=age_h)
+        db.log_append(stuck_uid, "proactive_jobs", {
+            "status": "claimed", "job_kind": "memory_capture",
+            "created_at": created.isoformat()}, ts=created.timestamp())
+    stuck = db.admin_lane_rollup(user_id=stuck_uid)["stuck"]
+    (row,) = [r for r in stuck["rows"] if r["user_id"] == stuck_uid]
+    assert (row["count"], row["recent_count"]) == (3, 1)
+    assert stuck["resident_recent_hours"] == 24.0
+    assert report_tool.live_stuck_total(stuck) == 1
+    fixture_stuck_row = next(r for r in fixture_payload["stuck"]["rows"]
+                             if r["route"] == "resident")
+    assert set(fixture_stuck_row) == set(row)
 
 
 def test_discarded_reason_operational_log_is_bounded(caplog):
@@ -3088,3 +3119,31 @@ def test_dream_skip_on_the_open_day_is_declared_in_the_live_tail(clean_rollup):
     assert live["frozen"] is False
     assert (live["completed"], live["silent_declared"],
             live["silent_undeclared"]) == (2, 1, 1)
+
+
+def test_lane_rollup_pages_have_a_total_order_across_routes(clean_rollup):
+    """Offset paging needs an ORDER BY that reaches the cell key: one user can
+    hold a resident and a model_api cell for the same day/lane (runtime switch),
+    and without ``route`` in the order the tied pair may come back in a
+    different order on each page read — the daily report then double-counts one
+    cell and misses the other."""
+    users = [f"usr_rollup_page_order_{i:02d}" for i in range(20)]
+    with db.get_pool().connection() as conn:
+        for uid in users:
+            seed_user(uid)
+        for route in ("resident", "model_api"):
+            for uid in reversed(users):
+                conn.execute(
+                    "INSERT INTO lane_daily_rollup (user_id, day, route, lane,"
+                    " completed, failed, expired, superseded, failure_codes)"
+                    " VALUES (%s, '2030-06-01', %s, 'capture', 1, 0, 0, 0,"
+                    " '{}'::jsonb)", (uid, route))
+    seen = []
+    for offset in range(0, 2 * len(users), 3):
+        seen.extend(
+            (row["user_id"], row["route"])
+            for row in db.admin_lane_rollup(
+                since_day="2030-06-01", until_day="2030-06-01",
+                limit=3, offset=offset)["rows"]
+        )
+    assert seen == [(uid, route) for uid in users for route in ("model_api", "resident")]
