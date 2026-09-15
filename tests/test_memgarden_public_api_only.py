@@ -47,12 +47,6 @@ ALLOWED_INTERNAL: dict[str, set[str]] = {
     # back to the deprecated legacy selector. TODO(feat/memx-garden-recall): delete
     # with the switch once the unified ranker has run on prod for a release.
     "backend/enclave/routes/chat.py": {"memgarden.scoring.relevance"},
-    # TODO(IO-7, import-shim cleanup): `import *` re-export shims over internal
-    # prompt modules. Owned by the capture/dream adoption work, not this branch.
-    "backend/memory/capture_prompt_v1.py": {"memgarden.prompts.capture"},
-    # TODO(IO-5, feat/memx-garden-dream): V1 dream still builds/parses through the
-    # internal prompt module; removed when V1 dream moves to maintenance_session.
-    "backend/memory/dream_prompt_v1.py": {"memgarden.prompts.dream"},
 }
 
 

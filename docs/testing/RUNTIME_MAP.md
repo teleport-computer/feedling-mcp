@@ -113,7 +113,7 @@ resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
 
 2026-09-15 起 `memory/dream_prompt_v1.py` 已删、`memory/capture_prompt_v1.py` 只剩 io 的落卡档位:
 两条 runtime 不再直接调内核的提示词/解析函数,只 import memgarden 公开 API
-(守卫:`tests/test_orchestration_is_not_reimplemented.py`)。
+(守卫:`tests/test_memgarden_public_api_only.py`)。
 
 **改动影响面**:动 capture / dream 的模板 = **同时改变托管用户与自建服务器用户的行为**。
 逐字节 golden 见 `tests/test_memgarden_capture_golden.py` 与
