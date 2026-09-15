@@ -171,6 +171,30 @@ _ASIDE_SUBSTITUTIONS = (
 )
 
 
+# Providers whose models are asked for the ``aside`` rendering on every
+# runtime (Runtime V2 chat/scheduled wakes/terminal rounds, resident V1 with any
+# driver). Measured 2026-09-15 on gemini-3.6-flash only (T586/T588/T591):
+#   - tag-only bisect (only ``<think>``→``<aside>`` swapped, wording unchanged),
+#     direct V2-shaped calls, counted among HTTP-200 responses: ``<think>``
+#     7/11 ``finishReason=MALFORMED_RESPONSE`` vs ``<aside>`` 0/13 (each arm 20
+#     attempts; the rest were HTTP 503 / transport errors on both arms);
+#   - tag-only replay of one captured pi-wire request body: ``<think>`` 6/10
+#     HTTP 503 vs ``<aside>`` 0/10 in the same window;
+#   - the full aside rendering below (tag plus two wording substitutions) was
+#     separately confirmed on the V2 shape: 8/8 and 8/8 STOP with an
+#     ``<aside>`` opener.
+# Keyed by provider, not model name, like the resident's Claude Code rule.
+ASIDE_TAG_PROVIDERS = frozenset({"gemini"})
+
+
+def tag_for_provider(provider: str | None) -> str:
+    """Protocol tag for one provider id: ``aside`` for ``ASIDE_TAG_PROVIDERS``,
+    the historical ``think`` for everything else (including unknown/empty)."""
+    if str(provider or "").strip().lower() in ASIDE_TAG_PROVIDERS:
+        return TAG_ASIDE
+    return TAG_THINK
+
+
 def _retag(text: str, tag: str) -> str:
     return text.replace("<think>", f"<{tag}>").replace("</think>", f"</{tag}>")
 

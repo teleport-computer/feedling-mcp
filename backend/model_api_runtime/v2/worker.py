@@ -474,10 +474,21 @@ MAX_TERMINAL_TOOL_CALL_RETRIES = _positive_int_env(
 # final-reply rewrite path.  Keep this as a named hard bound instead of growing
 # a second provider-call budget beside ``max_calls``.
 MAX_SELF_THINKING_ABSENT_RETRIES = 1
+def _self_thinking_absent_correction_instruction(tag: str = self_thinking.TAG_THINK) -> str:
+    """Correction prompt for a final reply that skipped the aside block, rendered
+    for the same protocol tag the turn's system prompt used (T591: gemini runs
+    the ``aside`` rendering; a ``<think>`` correction would re-trigger the very
+    failure the tag swap avoids)."""
+    return (
+        f"上一轮最终回复缺少规定的 <{tag}>…</{tag}> 结构。"
+        "请重新输出最终回复，严格遵守以下既有契约：\n\n"
+        + self_thinking.instruction(tag).strip()
+    )
+
+
+# Historical ``think`` rendering kept as a module constant for existing readers.
 _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION = (
-    "上一轮最终回复缺少规定的 <think>…</think> 结构。"
-    "请重新输出最终回复，严格遵守以下既有契约：\n\n"
-    + self_thinking.INSTRUCTION.strip()
+    _self_thinking_absent_correction_instruction(self_thinking.TAG_THINK)
 )
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
@@ -1043,13 +1054,18 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 )
 
 
-def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
-    """Attach the shared thinking contract and lane-specific suffixes."""
+def _wake_system_prompt_for_lane(
+    lane: str, base_prompt: str, *, tag: str = self_thinking.TAG_THINK,
+) -> str:
+    """Attach the shared thinking contract and lane-specific suffixes.
+
+    ``tag`` selects the mandatory instruction rendering for the scheduled lane
+    (``context.self_thinking_tag(provider_config)``; gemini → ``aside``, T591)."""
     if not self_thinking.enabled():
         return base_prompt
     blocks = [base_prompt]
     if lane == "scheduled":
-        blocks.append(self_thinking.INSTRUCTION)
+        blocks.append(self_thinking.instruction(tag))
     else:
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
     if lane == "screen_watch":
@@ -11155,7 +11171,9 @@ async def _run_wake(
             # Same as the chat lane's context.chat_system_prompt(): ask the model to
             # open its reply with a <think> block so proactive turns show a clean
             # self-authored thought instead of raw native reasoning.
-            _wake_sys = _wake_system_prompt_for_lane(lane, _wake_sys)
+            _wake_sys = _wake_system_prompt_for_lane(
+                lane, _wake_sys, tag=context.self_thinking_tag(provider_config),
+            )
             reply_language = infer_reply_language(
                 locale=str(temporal_snapshot.get("locale") or ""),
                 archive_language=str(
@@ -15708,7 +15726,9 @@ async def process_job(
                     self_thinking_absent_retry_requests += 1
                     self_thinking_absent_retry_pending = True
                     correction_instruction = (
-                        _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+                        _self_thinking_absent_correction_instruction(
+                            context.self_thinking_tag(provider_config)
+                        )
                     )
                     return v2_tool_loop.FinalReplyCorrectionRequest(
                         instruction=correction_instruction,

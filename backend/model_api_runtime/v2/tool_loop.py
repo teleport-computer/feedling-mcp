@@ -1626,6 +1626,13 @@ async def run_tool_loop(
             return re.search(r"[A-Za-z]", completion_message) is not None
         return False
 
+    # T591: the self-thinking rendering this turn's system prompt uses (gemini →
+    # ``aside``). Every place the loop restates or continues the contract must
+    # use the same tag, or the model is asked for two different openers.
+    self_thinking_tag = self_thinking.tag_for_provider(
+        getattr(provider_config, "provider", "")
+    )
+
     def _compact_delivery_system_prompt(
         instruction: str, *, require_self_thinking: bool = True
     ) -> str:
@@ -1633,7 +1640,11 @@ async def run_tool_loop(
 
         if not suppress_native_reasoning or not require_self_thinking:
             return instruction
-        return instruction.rstrip() + "\n\n" + self_thinking.INSTRUCTION.strip()
+        return (
+            instruction.rstrip()
+            + "\n\n"
+            + self_thinking.instruction(self_thinking_tag).strip()
+        )
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
@@ -2636,13 +2647,20 @@ async def run_tool_loop(
                 provider_kwargs["tool_choice"] = "required"
             if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
-            if suppress_native_reasoning and terminal_text_round:
+            if (
+                suppress_native_reasoning
+                and terminal_text_round
+                and self_thinking_tag == self_thinking.TAG_THINK
+            ):
                 # A continuation prefix is safe only once the loop has made
                 # this a text-only terminal request. Live Anthropic testing
                 # showed that adding it to an ordinary tool round can produce
                 # a mismatched </thinking> block or a prefix-only tool turn.
                 # Unsupported provider/model pairs discard this hint in the
                 # payload builder and therefore retain their exact old request.
+                # The prefix is the ``<think>`` opener, so it is only sent when
+                # the system prompt asked for that tag; an ``aside`` turn sends
+                # no continuation hint (an ``<aside>`` prefill is unverified).
                 provider_kwargs["assistant_prefill"] = (
                     provider_client.SELF_THINKING_ASSISTANT_PREFILL
                 )
