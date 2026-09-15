@@ -21,6 +21,7 @@ from hosted import image_resize
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import service as memory_service
+from memgarden import timestamps as memory_timestamps
 import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import history_import as hosted_history_import
@@ -278,7 +279,7 @@ def _archive_model_api_memory_cards(
     # concurrent writer vs foreground memory.add — the exact collision the plain
     # Lock masked under Flask -w1). RLock lets _append_memory_change re-enter.
     archived = 0
-    now = core_util._now_iso()
+    now = memory_timestamps.now_iso()
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         for idx, moment in enumerate(moments):

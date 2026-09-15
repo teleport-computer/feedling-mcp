@@ -2701,7 +2701,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "readable one-hop id/summary pointers; related_status distinguishes complete, "
         "bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
     ),
-    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
+    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409).",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
@@ -3196,10 +3196,25 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         }
     },
     ("post", "/v1/memory/add"): {
+        "200": {
+            "description": (
+                "Replay: a card with this envelope id is already stored with exactly "
+                "this ciphertext. Nothing is written; the stored card is returned with "
+                "replayed: true."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
         "201": {
             "description": "Encrypted memory created.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        }
+        },
+        "409": {
+            "description": (
+                "memory_id_conflict: the envelope id already belongs to a different "
+                "stored card. The stored card is unchanged and neither card is echoed."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
     ("post", "/v1/onboarding/archive"): {
         "201": {
@@ -3477,7 +3492,6 @@ def apply_public_contracts(schema: dict[str, Any]) -> dict[str, Any]:
                     ("post", "/v1/users/register"),
                     ("post", "/v1/access/link-token"),
                     ("post", "/v1/access/claim-token"),
-                    ("post", "/v1/memory/add"),
                     ("post", "/v1/onboarding/archive"),
                     ("post", "/v1/diagnostics/logs"),
                     ("post", "/v1/identity/init"),

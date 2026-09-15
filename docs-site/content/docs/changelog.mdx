@@ -30,6 +30,22 @@ change must not be interpreted as an API guarantee.
   runtimes also use io's naming rule and a sanitized user name again: a stored
   placeholder name such as 「用户」 is no longer used as the person's name.
 
+- **A memory add can no longer overwrite a stored card.** Before: `memory.add`
+  in `/v1/memory/actions` (and `POST /v1/memory/add`) with an envelope ID that
+  was already stored silently replaced that card; for a superseded card this
+  wiped `superseded_by`, so the old card became active again next to its
+  successor. Now re-sending the exact same sealed envelope succeeds with
+  `replayed: true` and writes nothing, and any other envelope under a stored ID
+  fails with `409 memory_id_conflict` without changing or echoing the stored
+  card. Runtime V2 Capture also re-checks at commit that every card it
+  supersedes is still active; a batch whose target was corrected, superseded or
+  archived after the batch was prepared is rejected as
+  `capture_supersede_target_inactive` and the window is captured again, instead
+  of leaving two active successors. Card `updated_at` (and the `archived_at` /
+  `retyped_at` stamps written with it) is now UTC with a `Z` suffix, matching
+  `created_at`; a new card's two stamps are the same instant. Stored values are
+  not backfilled.
+
 - **Memory Dream now reads each card's body, not just its title.** When Dream
   tidies the Memory Garden (merge, thicken or supersede), the model now sees
   every card's summary and full body — in Runtime V2 and in resident V1 (hosted

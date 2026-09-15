@@ -126,8 +126,9 @@ def io_world(monkeypatch):
 
     monkeypatch.setattr(capture_daily, "daily_capture_patch", daily_patch)
 
-    # Pin a non-UTC process timezone so the naive-local updated_at stamp behaves
-    # the same on every machine (CI and the CVMs run UTC, a laptop may not).
+    # Pin a non-UTC process timezone: CI and the CVMs run UTC, which would hide a
+    # writer that stamps naive local time (updated_at did, until it moved to the
+    # same UTC "Z" stamp as created_at).
     previous_tz = os.environ.get("TZ")
     os.environ["TZ"] = "Asia/Shanghai"
     time.tzset()
@@ -146,7 +147,7 @@ def io_world(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 _NOT_FOUND = {"not_found", "not_owned", "memory_id_required"}
-_CONFLICT = {"supersede_targets_unavailable", "supersede_targets_changed"}
+_CONFLICT = {"supersede_targets_unavailable", "supersede_targets_changed", "memory_id_conflict"}
 
 
 class IoHost:
@@ -226,7 +227,12 @@ class IoHost:
         inner = {k: card.get(k) for k in ("summary", "content", "bucket", "threads")}
         envelope = {**_seal(inner, owner=uid, item_id=item_id), "type": "fact",
                     "occurred_at": card.get("occurred_at"), "source": card.get("source")}
-        return self._act(owner, {"type": "memory.add", "envelope": envelope})
+        out = self._act(owner, {"type": "memory.add", "envelope": envelope})
+        if request_id and out.detail == "409:memory_id_conflict":
+            # The envelope id is the request identity here, so a taken id with a
+            # different card is exactly the kit's idempotency conflict.
+            return Outcome(ok=False, error="idempotency_conflict", detail=out.detail)
+        return out
 
     def patch(self, owner, record_id, changes, *, based_on=None):
         # Exactly what `io_cli memory-patch` sends (the V2 memory_write 'update'
@@ -427,28 +433,12 @@ DEVIATIONS: dict[str, Deviation] = {
         "a correction records who edited: io_cli defaults source=resident_patch, the "
         "server defaults hosted_runtime_state; the original source stays on the "
         "superseded card."),
-    "idempotency.replay/no_rewrite": Deviation(
-        "by_design",
-        "explicit /v1/memory/actions writes carry no request identity; the public docs "
-        "(workflows/memory.mdx) say a client id 'is not an idempotency guarantee'. "
-        "Replaying an envelope with the same id keeps one row but re-stamps "
-        "created_at/updated_at. The V2 capture batch protocol is idempotent "
-        "(capture.write_failure passes)."),
     "content.length/stored_whole": Deviation(
         "by_design",
         "plaintext memory.add/supersede cut content at MEMORY_CONTENT_MAX_CHARS=5000 "
         "(OpenAPI maxLength 5000) and emit only a content-free memory.content.truncation "
         "trace; the write receipt is a plain success."),
     # ---- bugs: evidence is in the clause failures; not fixed in this change --
-    "add.write_times/updated_at_explicit_utc": Deviation(
-        "bug",
-        "updated_at is core.util._now_iso() = naive local datetime, created_at is "
-        "memgarden.timestamps.now_iso() (UTC 'Z'); readers parse naive values as UTC."),
-    "add.write_times/same_write_instant": Deviation(
-        "bug",
-        "same root cause: under a non-UTC process TZ (pinned to +08:00 here) a new "
-        "card's updated_at is 8 hours after its created_at. CI/CVM run UTC, so prod "
-        "rows only carry the format mismatch."),
     "reads.no_side_effects/no_timestamp_change": Deviation(
         "bug",
         "memory_readside_core.memory_fetch_core stamps updated_at (not only "
@@ -461,22 +451,6 @@ DEVIATIONS: dict[str, Deviation] = {
         "io_cli memory-patch nor the V2 memory_write 'update' schema can carry it, so "
         "every correction moves a dated card (2024-06-15 here) to today while "
         "bucket/threads/importance/pulse are inherited."),
-    "idempotency.key_reuse/conflict": Deviation(
-        "bug",
-        "memory.add with an envelope whose id already exists appends a duplicate and "
-        "memory_replace_all keeps the last one: the existing card is replaced with no "
-        "error. commit_capture_batch rejects the same case (capture_memory_id_conflict)."),
-    "idempotency.key_reuse/second_not_written": Deviation(
-        "bug", "same root cause: the second payload replaced the first card."),
-    "idempotency.key_reuse/first_kept": Deviation(
-        "bug", "same root cause: the first card's content is gone."),
-    "add.supplied_id_never_overwrites/refused": Deviation(
-        "bug",
-        "memory.add with the id of an existing (here superseded) card succeeds and "
-        "overwrites it: superseded_by is wiped and the old id is active again next to "
-        "its successor."),
-    "add.supplied_id_never_overwrites/existing_untouched": Deviation(
-        "bug", "same root cause as add.supplied_id_never_overwrites/refused."),
 }
 
 
@@ -493,7 +467,6 @@ def test_io_write_path_meets_shared_scenarios_or_declares_why(results):
 def test_declared_bugs_are_still_reproduced_with_evidence(results):
     evidence = {f.clause: f.evidence for r in results.values() for f in r.failures}
     assert "2024-06-15" in evidence["patch.preserves_provenance/occurred_at"]
-    assert "kitkeytwo" not in evidence["idempotency.key_reuse/conflict"]
     before_after = evidence["reads.no_side_effects/no_timestamp_change"]
     assert "before" in before_after and "after" in before_after
 
@@ -561,12 +534,11 @@ def test_history_written_by_io_supersede_is_readable_through_include_superseded(
     assert body["items"] == [] and body["unavailable_ids"] == [shelved]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG: commit_capture_batch locks supersede targets but never rechecks that they "
-    "are still active. A prepared batch (durable across retries) that supersedes a "
-    "card retired meanwhile re-points superseded_by and leaves two active successors. "
-    "memory/actions.py fences the same case with supersede_targets_changed."))
 def test_v2_capture_commit_rejects_supersede_of_a_card_retired_after_prepare(io_world):
+    """Regression (fixed here): a prepared batch (durable across retries) that
+    supersedes a card the user corrected meanwhile used to re-point
+    superseded_by and leave two active successors. The commit now re-checks the
+    locked target the way memory/actions.py fences supersede_targets_changed."""
     host = IoHost(io_world)
     src = host.sources[0]
     uid = host._uid("alice")
@@ -588,6 +560,16 @@ def test_v2_capture_commit_rejects_supersede_of_a_card_retired_after_prepare(io_
     committed = jobs_store.commit_capture_batch(
         job_id=job_id, user_id=uid, claimed_by="conf-worker", batch_id=prepared["id"])
     active = sorted(v["summary"] for v in host.history("alice") if v["status"] == "active")
-    assert not committed.get("committed"), (committed, active)
+    assert committed == {"committed": False, "reason": "capture_supersede_target_inactive",
+                         "rejected": True}, (committed, active)
     assert (host.inspect("alice", target) or {})["superseded_by"] == user_edit.record_ids[0]
+    assert [v["id"] for v in host.history("alice") if v["status"] == "active"] == [
+        user_edit.record_ids[0]]
+    assert host.inspect("alice", "mom_cap_successor") is None
+    # Same rejection as the other semantic branches: the journal is dropped and the
+    # window travels with the failure so the escape valve can count it.
+    with db.get_pool().connection() as conn:
+        assert conn.execute("SELECT count(*) FROM v2_capture_batches WHERE id=%s",
+                            (prepared["id"],)).fetchone()[0] == 0
+    assert host.capture_progress("alice") == 0
 

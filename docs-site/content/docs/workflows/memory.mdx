@@ -354,9 +354,12 @@ not a generic service-wide rate limit.
 
 For new cards, datetime-valued `occurred_at` metadata is normalized to the same
 instant in UTC with a `Z` suffix. A date-only `YYYY-MM-DD` value remains
-date-only. The server stamps `created_at` in UTC with a `Z` suffix. Existing
-cards keep their stored timestamp strings when they are retyped, rewrapped, or
-otherwise updated; this does not backfill historical records.
+date-only. The server stamps `created_at` in UTC with a `Z` suffix, and memory
+actions stamp `updated_at` the same way (a new card's two stamps are the same
+instant). Existing cards keep their stored `occurred_at` and `created_at` strings
+when they are retyped, rewrapped, or otherwise updated; this does not backfill
+historical records, so older `updated_at` values may still lack an offset and are
+read as UTC.
 
 ```http
 HTTP/1.1 201 Created
@@ -385,8 +388,15 @@ Content-Type: application/json
 
 The server can generate `moment.id` if it is absent, but a stable unique
 client-generated ID is easier to reconcile after an ambiguous network failure.
-It is not an idempotency guarantee: posting the same payload again can append
-another record, and clients must not rely on the ID to deduplicate requests.
+An add never overwrites a stored card. Re-sending the exact same sealed envelope
+(same id, ciphertext, nonce and wrapped keys) returns `200` with the stored card
+and `replayed: true` and writes nothing. Any other envelope under an ID that is
+already stored — including the ID of a superseded or archived card — fails with
+`409 memory_id_conflict`, leaves the stored card unchanged, and echoes neither
+card. Sealing again produces a new nonce, so a retry must re-send the envelope it
+already built rather than re-encrypting. `memory.add` in `/v1/memory/actions`
+follows the same rule per item. Only the envelope is compared, so the ID is not a
+general request idempotency key.
 
 ## 2. Discover cards with the lightweight index
 
