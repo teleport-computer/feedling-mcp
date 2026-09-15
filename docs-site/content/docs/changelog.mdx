@@ -12,6 +12,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Self-hosted history import again tells the model how many memory cards the
+  garden should roughly hold.** Before the import moved to memgarden's import
+  session, the self-hosted (VPS) consumer added a card-count note to the
+  card-writing prompt: how many cards the garden already has, a reference range
+  from the relationship's memory floor to its aspiration, "meet the floor first,
+  write less when the material is thin, never invent". The switch dropped it.
+  Before: a VPS user imports three years of chat into a nearly empty garden → the
+  model has no sense of how much to keep. After: the same note, computed the same
+  way from `/v1/bootstrap/status` once per import job, is passed as memgarden's
+  `ImportRequest.host_note` to every card-writing batch. Self-hosted only; hosted
+  and plaintext imports never had it and are unchanged. It takes effect once the
+  installed memgarden supports `host_note`; on an older memgarden the import runs
+  without the note instead of failing. If the status read fails, there is no note.
+
 - **Resident V1 capture no longer skips a batch it could not read past a long
   run of non-chat rows.** The backend sizes a capture batch by counting only chat
   messages, but the consumer read at most 10 history pages (2,000 rows) to reach

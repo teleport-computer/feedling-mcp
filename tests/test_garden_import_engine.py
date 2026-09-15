@@ -349,3 +349,47 @@ def test_unknown_name_rewrites_to_the_neutral_referent_and_bad_names_never_crash
         store = Store()
         _run(state, sources, Model([("骑车", _reply(_card("用户喜欢骑车")))]), store)
         assert [c["summary"] for c in store.cards.values()] == [expected]
+
+
+# --------------------------------------------------------------- host_note（VPS 张数引导）
+
+_NOTE = "花园现有 2 张卡。参考 38–87 张。绝不编造。"
+
+
+def test_host_note_goes_into_write_prompts_only_when_given():
+    noted = garden_import.new_state(locale="zh-Hans", strategy="single_pass", host_note=_NOTE)
+    model = Model([("窗一", _reply(_card("不吃辣")))])
+    _run(noted, _sources("窗一 我不吃辣\n"), model, Store())
+    assert f"[Host guidance]\n{_NOTE}\n" in model.prompts[0]
+
+    # 托管 / 明文导入不传：状态形状和提示词都与之前一致。
+    plain = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    assert "host_note" not in plain["params"]
+    assert garden_import.new_state(locale="zh-Hans", strategy="single_pass",
+                                   host_note="  ")["params"] == plain["params"]
+    model2 = Model([("窗一", _reply(_card("不吃辣")))])
+    _run(plain, _sources("窗一 我不吃辣\n"), model2, Store())
+    assert "[Host guidance]" not in model2.prompts[0]
+    assert model2.prompts[0] == model.prompts[0].replace(f"\n[Host guidance]\n{_NOTE}\n", "", 1)
+
+
+def test_old_memgarden_without_host_note_field_builds_the_request_without_it(monkeypatch):
+    import dataclasses
+
+    import memgarden
+
+    real = memgarden.ImportRequest
+    old_fields = [(f.name, f.type, f) for f in dataclasses.fields(real) if f.name != "host_note"]
+    OldImportRequest = dataclasses.make_dataclass(
+        "ImportRequest", [(n, t, dataclasses.field(default=f.default,
+                                                   default_factory=f.default_factory))
+                          for n, t, f in old_fields])
+    monkeypatch.setattr(memgarden, "ImportRequest", OldImportRequest)
+    assert garden_import.import_request_accepts_host_note() is False
+    params = garden_import.new_state(locale="zh-Hans", host_note=_NOTE)["params"]
+    request = garden_import._request(_sources("窗一\n")[0], params, job_key="j")
+    assert isinstance(request, OldImportRequest)
+
+    monkeypatch.setattr(memgarden, "ImportRequest", real)
+    assert garden_import.import_request_accepts_host_note() is True
+    assert garden_import._request(_sources("窗一\n")[0], params, job_key="j").host_note == _NOTE
