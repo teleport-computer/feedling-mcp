@@ -54,11 +54,12 @@ SECRET = "PRIVATE-PROMPT-ECHO-7f3a"
          '{"error":"Insufficient balance"} (api_status=401)', "quota_insufficient"),
         ("RuntimeError: Failed to authenticate: OAuth session expired and could not "
          "be refreshed", "resident_agent_cli_logged_out"),
-        # A relay/WAF block: 403 alone carries no auth semantics and there is no
-        # policy wording either, so the class is honestly unknown (it used to
-        # tell the user their API key was invalid).
-        ("RuntimeError: 403 Your request was blocked", "unknown"),
-        (f"RuntimeError: HTTP 403 content policy blocked this request {SECRET}", "content_filtered"),
+        # 403 follows the chat registry (Seven's T497/T504): any 403 except the
+        # relay's generic "Request failed" shell is auth. Memory lanes and chat agree.
+        ("RuntimeError: 403 Your request was blocked", "auth_invalid"),
+        (f"RuntimeError: HTTP 403 content policy blocked this request {SECRET}", "auth_invalid"),
+        ("RuntimeError: provider_http_403: Request failed. Please try again later.",
+         "upstream_unavailable"),
         (f"RuntimeError: 403 Forbidden: invalid api key {SECRET}", "auth_invalid"),
         (f'RuntimeError: HTTP 403 {{"error":{{"message":"Unauthorized"}}}} {SECRET}', "auth_invalid"),
         # Chinese relay shapes: a status label / JSON error field AND auth or
@@ -102,12 +103,6 @@ def test_memory_lane_reasons_classify_into_content_free_codes(raw_tail, expected
         f"RuntimeError: user wrote about content policy and safety {SECRET}",
         f"RuntimeError: prompt says rate limit yourself {SECRET}",
         f"RuntimeError: that feature is not supported in the diary {SECRET}",
-        # Bare 403 / "Forbidden" / "blocked" / "permission" are not auth semantics.
-        f"RuntimeError: HTTP 403 Forbidden {SECRET}",
-        f"RuntimeError: provider_http_403: request blocked {SECRET}",
-        f"RuntimeError: status 403: permission to use this region is restricted {SECRET}",
-        # A 403 plus an unrelated 5xx-looking number is not upstream evidence.
-        f"RuntimeError: 403 agent wrote 500 tokens {SECRET}",
         # Chinese auth/quota words without a status label or JSON error field.
         f"RuntimeError: 用户说他的密钥无效，还说余额不足 {SECRET}",
         f"RuntimeError: prompt 里写着 鉴权失败 和 未授权 {SECRET}",
@@ -129,27 +124,19 @@ def test_echoed_keyword_does_not_hide_a_real_error_later_in_the_tail():
 
 
 @pytest.mark.parametrize(
-    ("text", "expected"),
+    "text",
     [
-        # Chat / resident notice: a 403 whose message is a content-policy block
-        # used to stop at auth_invalid ("API Key 无效…重新保存").
-        ("HTTP 403 content policy blocked this request", "content_filtered"),
-        ("provider_http_403: blocked by safety system", "content_filtered"),
-        ('403 {"error":{"type":"content_filter","message":"flagged"}}', "content_filtered"),
-        # Explicit auth words still win over policy wording.
-        ("HTTP 403 unauthorized: content policy", "auth_invalid"),
-        ("401 invalid api key", "auth_invalid"),
-        ("cli agent exited 1: unexpected status 401 Unauthorized", "auth_invalid"),
-        # The historical fail-closed bare 403 (T497/T504 ruling) is unchanged
-        # when there is no policy wording.
-        ("provider_http_403: forbidden", "auth_invalid"),
-        ("403 Your request was blocked", "auth_invalid"),
-        ("provider_http_403: Request failed. Please try again later.", "upstream_unavailable"),
+        "RuntimeError: HTTP 403 Forbidden",
+        "RuntimeError: provider_http_403: request blocked",
+        "RuntimeError: status 403: permission to use this region is restricted",
+        "RuntimeError: HTTP 403 content policy blocked this request",
+        "RuntimeError: 403 Your request was blocked",
     ],
 )
-def test_registry_403_with_content_policy_wording_is_not_auth(text, expected):
-    assert error_contract.classify_text(text).code == expected
-    assert notices_catalog.classify_upstream(text) == expected
+def test_memory_lane_403_matches_the_chat_registry(text):
+    """记忆整理对 403 的判断必须和聊天侧（Seven 的 T497/T504 规则）一致。"""
+    chat = error_contract.classify_text(text)
+    assert agent_call_failure.classify_failure_text(text) == chat.code == "auth_invalid"
 
 
 def test_normalization_is_idempotent_and_leaves_other_reasons_alone():

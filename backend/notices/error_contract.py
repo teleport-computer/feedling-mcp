@@ -160,19 +160,10 @@ _GENERIC_UPSTREAM_403_SHAPE = (
 # upstream_unavailable 用的正向式；auth_invalid 的裸 403 分支用它的否定式。
 # 二者共用 _SHAPE，不会各改各的；裸 403 只在整条 candidate **不是**该形状时才算鉴权。
 _GENERIC_UPSTREAM_403 = r"\A" + _GENERIC_UPSTREAM_403_SHAPE
-# content_filtered 的判据，同时是裸 403 分支的第二个否定式：403 本身不带鉴权语义，
-# "HTTP 403 content policy blocked this request" 是内容策略拦截。auth_invalid 排在
-# content_filtered 前面，若裸 403 仍认领它，用户会被叫去重存 key。显式鉴权词
-# （unauthorized / invalid api key / authentication）是并列分支，不受这个否定式影响。
-_CONTENT_POLICY = r"content_filter|content policy|safety|blocked by"
-_NOT_CONTENT_POLICY = r"(?![\s\S]*(?:" + _CONTENT_POLICY + r"))"
-_AUTH_403 = (
-    r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE + r")" + _NOT_CONTENT_POLICY
-    + r"[\s\S]*?\b403\b"
-)
+_AUTH_403 = r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE + r")[\s\S]*?\b403\b"
 _AUTH_PROVIDER_HTTP_403 = (
-    r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE + r")" + _NOT_CONTENT_POLICY
-    + r"[\s\S]*?\bprovider_http_403\b"
+    r"\A(?!" + _GENERIC_UPSTREAM_403_SHAPE
+    + r")[\s\S]*?\bprovider_http_403\b"
 )
 
 _EXPLICIT_PROVIDER_AUTH = re.compile(
@@ -270,7 +261,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("provider_tool_history_rejected", "chat", "provider", "user_provider", "模型似乎调用工具出错了，这个通道暂时无法使用工具，换个模型或稍后重试。", en="The model seems to have hit an error calling tools, so tools are temporarily unavailable on this channel. Switch models or try again later.", matcher=r"function_response\.name:\s*\[required_field_missing\]|function call is missing a thought_signature in functioncall parts|please ensure that function call turn comes immediately after a user turn or after a function response turn"),
         _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", en="The current model does not support a capability used by this request. Choose another model or adjust it in Settings.", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
         _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", en="This conversation is too long for the model's context window. Shorten it and try again.", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
-        _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=_CONTENT_POLICY),
+        _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=r"content_filter|content policy|safety|blocked by"),
         _spec("rate_limited", "chat", "provider", "provider_transient", "模型服务限流了，稍等几分钟再试。", matcher=r"\b429\b|provider_http_429|too many requests|rate.?limit"),
         _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason|" + _GENERIC_UPSTREAM_403),
         _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。"),

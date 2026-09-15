@@ -63,10 +63,7 @@ _STRONG_UPSTREAM_EVIDENCE = re.compile(
     re.IGNORECASE,
 )
 # The relay's generic "Request failed. Please try again later." 403 shell (the
-# registry's exact, whole-candidate shape) is real upstream evidence. Any other
-# 403 is not: a bare 403 without auth semantics no longer stops at auth_invalid
-# (see ``_STRONG_EVIDENCE``), so it can reach upstream_unavailable through an
-# unrelated number in the tail ("403 ... wrote 500 tokens").
+# registry's exact, whole-candidate shape, Seven's T497) is real upstream evidence.
 _RELAY_403 = re.compile(error_contract._GENERIC_UPSTREAM_403, re.IGNORECASE)
 
 
@@ -87,9 +84,8 @@ _RELAY_403 = re.compile(error_contract._GENERIC_UPSTREAM_403, re.IGNORECASE)
 # registry's first match lacks that evidence, the next registry match is tried;
 # nothing left means ``unknown``.
 #
-# 403 carries no auth semantics by itself (relays answer content blocks, WAF
-# blocks and region blocks with 403 too), so only 401 counts on its own; a 403
-# needs an auth term next to it.
+# 403 follows the chat registry (Seven's T497/T504): every 403 except the
+# relay's generic "Request failed" shell is auth. Keep the two sides identical.
 
 
 def _status_position(codes: str) -> str:
@@ -164,7 +160,8 @@ _STRONG_EVIDENCE: dict[str, re.Pattern] = {
         tokens=(
             r"invalid_api_key|authentication_error|incorrect api key"
             r"|invalid[ _-]?(?:x-)?api[ _-]?key|failed to authenticate"
-            rf"|{_status_position('401')}"
+            # 403 同聊天侧（Seven 的 T497/T504 规则）：除中转站通用 403 空壳外都算鉴权。
+            rf"|{_status_position('401|403')}"
         ),
     ),
     "model_not_found": _evidence(
