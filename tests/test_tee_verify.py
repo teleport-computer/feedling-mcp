@@ -31,7 +31,8 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import object_storage  # noqa: E402
-from tee_replicator import transforms  # noqa: E402
+from tee_replicator import policy, transforms  # noqa: E402
+from tee_replicator import worker as tee_worker  # noqa: E402
 from tee_shadow import mirror, verify  # noqa: E402
 from tee_shadow import table_registry as reg  # noqa: E402
 from conftest import seed_user  # noqa: E402
@@ -48,6 +49,35 @@ def _stub_decrypt(envelope, purpose):
 
 def _make_stub(_user_id):
     return _stub_decrypt
+
+
+def test_expected_doc_does_not_trust_worker_policy_cache(monkeypatch):
+    user_id = "usr_verify_independent_policy"
+    tee_worker._carry_verbatim_cache[user_id] = (10**20, True)
+    monkeypatch.setattr(
+        policy, "resolve_content_encryption", lambda _user_id: "off"
+    )
+    monkeypatch.setattr(
+        verify,
+        "_get_decrypt",
+        lambda _cache, _user_id: lambda _env, purpose: b"plaintext",
+    )
+    doc = {
+        "id": "msg-verify",
+        "body_ct": "Y3Q=",
+        "nonce": "bm9uY2U=",
+        "K_user": "a3U=",
+        "K_enclave": "a2U=",
+        "visibility": "shared",
+    }
+
+    expected, error = verify._expected_doc(
+        user_id, doc, transforms.plaintext_chat_doc, {}
+    )
+
+    assert error is None
+    assert expected["body"] == "plaintext"
+    assert "body_ct" not in expected
 
 
 @pytest.fixture(autouse=True)
