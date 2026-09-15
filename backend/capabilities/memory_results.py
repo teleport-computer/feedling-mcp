@@ -9,9 +9,9 @@ import json
 import re
 import memory_search_contract as search_contract
 from memgarden.prompts.recall_fields import retrieval_cues
+from memgarden import related
 
 from capabilities import result_budget
-from memory import recall_metadata
 
 
 # An ASCII dot is a boundary only before whitespace/end/CJK, and not after
@@ -68,8 +68,8 @@ def index_payload(body: dict, *, tool_name: str) -> dict:
             "date": str(item.get("occurred_at") or item.get("created_at") or "")[:10],
             "bucket": str(item.get("bucket") or ""),
             "summary": " ".join(summary.split()),
-            **({"threads": recall_metadata.links(item.get("threads"))[:3]}
-               if recall_metadata.links(item.get("threads")) else {}),
+            **({"threads": related.links(item.get("threads"))[:3]}
+               if related.links(item.get("threads")) else {}),
             **({"retrieval_cues": retrieval_cues(item.get("retrieval_cues"))}
                if retrieval_cues(item.get("retrieval_cues")) else {}),
         })

@@ -14,7 +14,6 @@ from core import envelope as core_envelope
 from enclave import readside as enclave_readside
 from memory import service as memory_service
 from memory import card_shape
-from memory import recall_metadata
 from memgarden import related as mg_related
 from memgarden import timestamps as memory_timestamps
 
@@ -563,7 +562,7 @@ def memory_fetch_core(
             # Reuse the authenticated, lifecycle-filtered index projection;
             # decrypted bodies stay within the existing enclave boundary.
             linked_ids = {mid for item in source_items for key in ("anchor_memory_ids", "supersedes")
-                          for mid in recall_metadata.links(item.get(key))}
+                          for mid in mg_related.links(item.get(key))}
             neighbors = [m for m in moments if memory_available(
                 m, store.user_id, include_superseded=True)]
             # Explicit links win seats before thread discovery. A superseded

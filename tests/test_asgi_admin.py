@@ -354,7 +354,7 @@ def _norm_html(text: str) -> str:
     return _TS_RE.sub("TS", without_cache_note)
 
 
-def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
+def test_memory_length_rejection_is_queryable_through_admin_data_track(
     env,
     tee_primary,
     monkeypatch,
@@ -399,25 +399,26 @@ def test_memory_truncation_real_action_is_queryable_through_admin_data_track(
             },
         }]},
     )
-    assert written.status_code == 200, written.get_data(as_text=True)
+    assert written.status_code == 400, written.get_data(as_text=True)
+    assert written.get_json()["error"] == "memory_content_too_long"
+    assert db.memory_load_strict(user_id) == []
 
     debug_trace._flush_pending_for_user(user_id)
     status, payload = _asgi_json(
         "GET",
         "/v1/admin/data-track/debug"
-        "?q=memory.content.truncation&mode=flat&limit=10",
+        "?q=memory.content.rejected&mode=flat&limit=10",
         headers=_admin(),
     )
 
     assert status == 200
     assert payload["summary"]["events_total"] == 1
     event = payload["events"][0]
-    assert event["type"] == "memory.content.truncation"
+    assert event["type"] == "memory.content.rejected"
     assert event["detail"] == {
         "route": "memory_actions",
         "counts": {
-            "original_chars": len(raw_content),
-            "truncated_chars": len(raw_content) - 5000,
+            "max_chars": 5000,
         },
         db.TRACE_OUTCOME_PROVENANCE_FIELD: "missing",
     }

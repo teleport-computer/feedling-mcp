@@ -96,11 +96,12 @@ def test_store_writer_raises_when_writing_itself_is_broken():
         write([_mutation("一"), _mutation("二")], "k1")
 
 
-def test_store_writer_partial_hard_failure_keeps_written_ids():
-    # 一张写进去了、另一张是存储错误：已写的 id 必须交回（否则会话登记不到、续跑重复写）
+def test_store_writer_partial_hard_failure_stays_retryable():
+    # 已成功的卡靠稳定回执重放；不能把另一个存储错误算成内容丢弃。
     write = import_engine.store_writer(object(), "k", execute=_executor(
         [[_ok("mom_1"), _err("envelope_failed", 409)]], []))
-    assert write([_mutation("一"), _mutation("二")], "k1") == ["mom_1", ""]
+    with pytest.raises(RuntimeError, match="envelope_failed"):
+        write([_mutation("一"), _mutation("二")], "k1")
 
 
 def test_existing_cards_degrades_to_empty_index_with_trace(monkeypatch):

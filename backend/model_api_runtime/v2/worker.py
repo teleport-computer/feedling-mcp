@@ -1892,6 +1892,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "dream_no_memory_actions",
         "dream_source_occurred_at_unavailable",
         "dream_truncated_card_rejected",
+        "maintenance_targets_rejected",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",
@@ -13106,6 +13107,17 @@ async def _run_extraction(
                 + _step_sink.dropped_truncated_target
                 + _step_sink.dropped_unrendered_target
             )
+            if _step_sink.dropped_truncated_target:
+                # Preserve the existing content-free metric. Filtering is now
+                # exclusively in the package; host_rejected stays zero.
+                await _record_trajectory(
+                    trajectory_recorder, "dream_truncated_card_guard",
+                    {"rejected": _step_sink.dropped_truncated_target,
+                     "component_rejected": _step_sink.dropped_truncated_target,
+                     "host_rejected": 0, "kept": len(items or []),
+                     "truncated_cards": len(dream_disclosure.truncated_ids)},
+                    best_effort=True,
+                )
         if lane == "dream" and dream_skip_reason:
             await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
             await _emit_v2_dream_lifecycle(
@@ -13153,43 +13165,9 @@ async def _run_extraction(
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
-        kernel_truncated_dropped = (
-            _step_sink.dropped_truncated_target if lane == "dream" else 0
-        )
-        if lane == "dream" and (
-            (items and dream_disclosure.truncated_ids) or kernel_truncated_dropped
-        ):
-            # Host-side hard block: the prompt forbids rewriting a card the
-            # model only saw part of, but a prompt is not a guarantee. Drop
-            # every consolidation that touches one before mapping; if that
-            # leaves nothing, fail (ledger stays put) rather than report a
-            # no-op for a run whose every proposal was forbidden. A memgarden
-            # that already drops these at the component exit leaves nothing
-            # for this check; its drops count as the same guard.
-            items, host_truncated_rejected = (
-                garden_component.reject_truncated_consolidations(
-                    items or [], dream_disclosure.truncated_ids
-                )
-            )
-            truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
-            if truncated_rejected:
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "dream_truncated_card_guard",
-                    {
-                        "rejected": truncated_rejected,
-                        "component_rejected": kernel_truncated_dropped,
-                        "host_rejected": host_truncated_rejected,
-                        "kept": len(items),
-                        "truncated_cards": len(dream_disclosure.truncated_ids),
-                    },
-                    best_effort=True,
-                )
-                if not items:
-                    dream_terminal_outcome = "guard_rejected"
-                    raise RuntimeError(
-                        garden_component.DREAM_TRUNCATED_CARD_REJECTED
-                    )
+        # memgarden >=0.21.1 validates truncated/unrendered targets and reports
+        # all-rejected plans through the normal error path above. Mixed plans
+        # retain safe proposals; the Step tracker owns rejection counts.
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
@@ -13895,7 +13873,7 @@ def _inject_tail_images(
                 # Deliberate second read: this is the auditable disclosure gate.
                 # Successful dedicated targets are absent from this exact list.
                 fallback_fetched = read_images(user_id, selected_ids) or {}
-            except Exception as exc:  # noqa: BLE001 — preserve dedicated identity
+            except Exception:  # noqa: BLE001 — preserve dedicated identity
                 raise_dedicated("vision fallback image read failed")
             if any(
                 not image_items(fallback_fetched.get(message_id))

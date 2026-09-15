@@ -10,14 +10,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from memgarden.prompts.recall_fields import retrieval_cues
+from memgarden import related
 
 from memory import card_shape
-
-
-def links(value: object) -> list[str]:
-    values = [value] if isinstance(value, str) else value
-    return list(dict.fromkeys(v for v in (values if isinstance(values, list) else [])
-                             if isinstance(v, str) and v and len(v) <= 160))[:20]
 
 
 def fields(inner: dict, envelope: dict) -> dict:
@@ -26,7 +21,7 @@ def fields(inner: dict, envelope: dict) -> dict:
     if hints:
         result["retrieval_cues"] = hints
     for key in ("anchor_memory_ids", "supersedes"):
-        values = links(inner.get(key)) or links(envelope.get(key))
+        values = related.links(inner.get(key)) or related.links(envelope.get(key))
         if values:
             result[key] = values
     return result

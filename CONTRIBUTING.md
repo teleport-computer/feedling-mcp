@@ -149,13 +149,11 @@ asgi_app.py（装配，最高）
      semantic_analysis / memory_readside_core / memory_index_selector /
      context_memory_selection（最低；均为无业务依赖的共享/底层模块）
   ↑ memgarden（外部低层依赖；记忆判断力内核，不 import IO 模块）
-  ↑ agent_protocol_core（外部最低层依赖；模型协议判据，只依赖标准库；
-     memgarden → agent_protocol_core，二者都不依赖 backend/core）
 ```
 
 > `memgarden` 是安装进来的外部判断力内核（什么值得记 / 怎么归桶 / 打分排序 /
-> 要不要整理 / 解析并算 mutation），不是 `backend/` 下的本地包。它只依赖标准库和
-> 同一外部发行物里的 `agent_protocol_core`，被 `memory` / `genesis` /
+> 要不要整理 / 解析并算 mutation），不是 `backend/` 下的本地包。它只依赖标准库，
+> 不依赖 `agent_protocol_core`；被 `memory` / `genesis` /
 > `model_api_runtime` 等 IO 上层单向 import。
 > 加解密、身份装配、锁、审计、调模型一律不在其中 —— 那些由调用方提供。
 >

@@ -3544,7 +3544,7 @@ def admin_data_track_growth_accounting(
     try:
         with get_pool().connection() as conn:
             act_rows = conn.execute(
-                f"""
+                """
                 SELECT DISTINCT user_id,
                        (timezone(%s, to_timestamp(ts)))::date AS d
                 FROM (
@@ -13660,7 +13660,7 @@ def memory_user_mutation_fence(user_id: str):
     """
     normalized = str(user_id)
     if _memory_mutation_context(normalized) is not None:
-        yield
+        yield _memory_mutation_context(normalized)[0]
         return
 
     callbacks: list = []
@@ -13673,7 +13673,7 @@ def memory_user_mutation_fence(user_id: str):
             current[normalized] = (conn, callbacks)
             token = _memory_mutation_contexts.set(current)
             try:
-                yield
+                yield conn
             finally:
                 _memory_mutation_contexts.reset(token)
 
@@ -18882,12 +18882,18 @@ def log_append(user_id: str, stream: str, doc: dict,
                ts: float | None = None, item_key: str | None = None) -> bool:
     sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
            "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
-    try:
-        with get_pool().connection() as conn:
-            row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
-    except Exception as e:
-        log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
-        return False
+    context = _memory_mutation_context(user_id)
+    if context is not None:
+        # A memory action and its change log must roll back together. Let a
+        # database failure abort the owning transaction, not look successful.
+        row = context[0].execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
+    else:
+        try:
+            with get_pool().connection() as conn:
+                row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
+        except Exception as e:
+            log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
+            return False
     if row is None:
         return False
     # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
@@ -18902,7 +18908,8 @@ def log_append(user_id: str, stream: str, doc: dict,
         "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
-    mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+    _defer_memory_post_commit(user_id, lambda: mirror.execute(
+        mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc))))
     return True
 
 

@@ -114,11 +114,6 @@ def test_genesis_profile_source_uses_only_current_valid_proposals(monkeypatch):
         "index",
         lambda *_args, **_kwargs: pytest.fail("Genesis must not read the Garden"),
     )
-    monkeypatch.setattr(
-        service.memory_actions,
-        "trace_memory_content_truncation",
-        lambda *_args, **_kwargs: None,
-    )
 
     captured = {}
     monkeypatch.setattr(

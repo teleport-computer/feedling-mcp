@@ -433,11 +433,6 @@ DEVIATIONS: dict[str, Deviation] = {
         "a correction records who edited: io_cli defaults source=resident_patch, the "
         "server defaults hosted_runtime_state; the original source stays on the "
         "superseded card."),
-    "content.length/stored_whole": Deviation(
-        "by_design",
-        "plaintext memory.add/supersede cut content at MEMORY_CONTENT_MAX_CHARS=5000 "
-        "(OpenAPI maxLength 5000) and emit only a content-free memory.content.truncation "
-        "trace; the write receipt is a plain success."),
 }
 
 
