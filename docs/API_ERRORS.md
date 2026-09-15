@@ -194,6 +194,7 @@ canonical_owner: self
 | `summary_required` | 400 | — | | |
 | `supersedes_required` | 400 | — | | |
 | `envelope_id_mismatch` | 400 | — | envelope.id 必须等于目标 memory_id（AEAD-bound） | |
+| `memory_id_conflict` | 409 | — | `memory.add`（actions）与 `/v1/memory/add` 带的 id 已被另一张卡占用；原卡不动、不回显任何卡内容。同一张密文卡原样重发是重放，返回成功不重写 | |
 | `action_must_be_object` | 400 | — | | |
 | `actions_required` | 400 | — | | |
 | `unsupported_memory_action` | 400 | — | | |

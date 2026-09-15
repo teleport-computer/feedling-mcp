@@ -4253,21 +4253,20 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
 
 
 def _capture_same_memory(existing: dict, wanted: dict) -> bool:
-    return all(
-        existing.get(key) == wanted.get(key)
-        for key in (
-            "id",
-            "type",
-            "body",
-            "body_ct",
-            "nonce",
-            "K_user",
-            "K_enclave",
-            "visibility",
-            "owner_user_id",
-            "supersedes",
-        )
-    )
+    # Same replay test as the /v1/memory/actions add path, so the two writers
+    # cannot disagree about what counts as "this exact card again".
+    from memory import service as memory_service  # 延迟导入：与本模块既有惯例一致
+
+    return memory_service.same_memory_write(existing, wanted)
+
+
+def _capture_supersede_target_is_active(target: dict) -> bool:
+    # The explicit-write supersede fence's own predicate (status active and no
+    # archive marker), not a copy, so capture and memory.supersede agree on
+    # which cards may still be replaced.
+    from memory import actions as memory_actions  # 延迟导入：与本模块既有惯例一致
+
+    return memory_actions._memory_supersede_target_is_active(target)
 
 
 def _capture_fail_on_cursor(
@@ -4728,6 +4727,7 @@ def commit_capture_batch(
                     ] = []
                     rejection = ""
                     cards_added = 0
+                    retired_in_batch: set[str] = set()
                     # Validate and lock the complete effect set before the first
                     # write.  Semantic poison is rejected durably; transient DB
                     # errors still roll back and retain the prepared journal.
@@ -4769,6 +4769,30 @@ def commit_capture_batch(
                                 ):
                                     rejection = "capture_supersede_not_owned"
                                     break
+                                # The batch was prepared against an earlier Garden
+                                # and survives retries, so the target may have been
+                                # corrected, retired or archived since. Re-check
+                                # under this row lock (the same fence
+                                # memory/actions.py applies as
+                                # supersede_targets_changed): retiring it again
+                                # would re-point superseded_by and leave two active
+                                # successors. The same holds for a second action in
+                                # this batch retiring a target an earlier one took.
+                                # Rejecting the whole batch keeps capture's
+                                # all-or-nothing journal: the next job re-reads the
+                                # current Garden and re-derives this window.
+                                already_ours = (
+                                    existing is not None
+                                    and str(target.get("superseded_by") or "")
+                                    == memory_id
+                                )
+                                if target_id in retired_in_batch or not (
+                                    already_ours
+                                    or _capture_supersede_target_is_active(target)
+                                ):
+                                    rejection = "capture_supersede_target_inactive"
+                                    break
+                                retired_in_batch.add(target_id)
                                 targets_locked.append((target_id, target))
                         if rejection:
                             break

@@ -4245,7 +4245,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported."
+        "description": "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409)."
       }
     },
     "/v1/memory/add": {
@@ -4253,6 +4253,16 @@
         "summary": "Memory Add",
         "operationId": "memory_add_v1_memory_add_post",
         "responses": {
+          "200": {
+            "description": "Replay: a card with this envelope id is already stored with exactly this ciphertext. Nothing is written; the stored card is returned with replayed: true.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
           "default": {
             "description": "Error response.",
             "content": {
@@ -4269,6 +4279,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "memory_id_conflict: the envelope id already belongs to a different stored card. The stored card is unchanged and neither card is echoed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }

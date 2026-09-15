@@ -1461,6 +1461,84 @@ def test_poisoned_supersede_batch_is_rejected_and_next_job_can_regenerate():
     )["committed"]
 
 
+def _prepare_supersede(uid: str, actions: list[dict]) -> tuple[int, dict]:
+    job_id, _job = _running(uid)
+    batch = jobs_store.prepare_capture_batch(
+        job_id=job_id,
+        user_id=uid,
+        claimed_by="capture-worker",
+        window=_window(),
+        actions=actions,
+    )
+    assert batch is not None
+    return job_id, batch
+
+
+@pytest.mark.parametrize(
+    "retired_fields",
+    [
+        {"status": "superseded", "superseded_by": "user-correction"},
+        {"is_archived": True, "archived_at": "2026-07-21T00:00:00Z",
+         "archive_reason": "repair"},
+    ],
+    ids=["superseded", "archived"],
+)
+def test_capture_commit_rejects_supersede_of_target_retired_after_prepare(retired_fields):
+    """之前：prepare 后用户改/归档了目标卡，commit 仍然再退休一次 → 两张 active 后继。
+    之后：commit 在行锁下重查目标，已不 active 就整批按语义拒绝（和目标缺失同一分支）。"""
+    uid = "u_capture_target_retired"
+    _seed(uid)
+    assert db.memory_upsert(uid, "target", "2026-07-20", _manual_card(uid, "target"))
+    job_id, batch = _prepare_supersede(uid, [{
+        "type": "memory.supersede",
+        "supersedes": ["target"],
+        "envelope": _envelope(uid, "replacement"),
+    }])
+    retired = {**_manual_card(uid, "target"), **retired_fields}
+    assert db.memory_upsert(uid, "target", "2026-07-20", retired)
+
+    result = jobs_store.commit_capture_batch(
+        job_id=job_id, user_id=uid, claimed_by="capture-worker", batch_id=batch["id"],
+    )
+
+    assert result == {
+        "committed": False,
+        "reason": "capture_supersede_target_inactive",
+        "rejected": True,
+    }
+    moments = {m["id"]: m for m in db.memory_load(uid)}
+    assert set(moments) == {"target"}
+    assert moments["target"] == retired
+    state = _capture_state(uid)
+    assert int(state.get("last_captured_until_seq") or 0) == 0
+    # The window travels with the rejection, so the escape valve can count it.
+    assert int(state["capture_fail_streak"]) == 1
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0
+
+
+def test_capture_commit_rejects_two_supersedes_of_one_target_in_one_batch():
+    uid = "u_capture_target_twice"
+    _seed(uid)
+    assert db.memory_upsert(uid, "target", "2026-07-20", _manual_card(uid, "target"))
+    job_id, batch = _prepare_supersede(uid, [
+        {"type": "memory.supersede", "supersedes": ["target"],
+         "envelope": _envelope(uid, "successor-a", body="a")},
+        {"type": "memory.supersede", "supersedes": ["target"],
+         "envelope": _envelope(uid, "successor-b", body="b")},
+    ])
+
+    result = jobs_store.commit_capture_batch(
+        job_id=job_id, user_id=uid, claimed_by="capture-worker", batch_id=batch["id"],
+    )
+
+    assert result["reason"] == "capture_supersede_target_inactive"
+    assert {m["id"] for m in db.memory_load(uid)} == {"target"}
+    assert db.memory_load(uid)[0]["status"] == "active"
+
+
 def test_prepared_retry_commits_before_provider_or_enclave(monkeypatch):
     uid = "u_capture_early_retry"
     _seed(uid)

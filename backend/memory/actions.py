@@ -12,7 +12,6 @@ from core.store import UserStore
 
 from bootstrap import gates as boot_gates
 from core import envelope as core_envelope
-from core import util as core_util
 from identity import service as identity_service
 from memgarden.text import card_guard
 from memgarden.text import card_text
@@ -414,7 +413,8 @@ def _memory_record_from_prebuilt_envelope(store: UserStore, envelope: dict, *, e
 
 
 def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
-    now = core_util._now_iso()
+    # One UTC "Z" instant for every stamp this write makes (created_at of a new
+    # card and updated_at always), so the two never disagree by format or zone.
     card_now = memory_timestamps.now_iso()
     if existing is not None:
         occurred_at = str(existing.get("occurred_at") or "")
@@ -430,7 +430,7 @@ def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: 
         "id": envelope.get("id") or (existing.get("id") if existing else f"mom_{uuid.uuid4().hex[:12]}"),
         "occurred_at": occurred_at,
         "created_at": created_at,
-        "updated_at": now,
+        "updated_at": card_now,
         "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
         "enclave_pk_fpr": "",
         **core_envelope.envelope_storage_fields(envelope),
@@ -472,6 +472,29 @@ def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None 
         "memory_id": memory_id,
         "fields": fields or [],
     }
+
+
+def _memory_add_existing_id_result(outcome: str, existing: dict | None) -> tuple[dict, list[dict], int]:
+    """Receipt for a memory.add whose card id is already stored.
+
+    An add never overwrites. Replaying the exact same sealed card (a client
+    retry after a lost response) succeeds without writing, logging or emitting
+    an effect; any other card under that id is refused. The refusal carries no
+    card content and names no field, so it cannot be used to probe a card.
+    """
+    if outcome == "replay" and isinstance(existing, dict):
+        return {
+            "status": "ok",
+            "action": "memory.add",
+            "replayed": True,
+            "memory": {
+                "id": str(existing.get("id") or ""),
+                "type": str(existing.get("type") or ""),
+                "occurred_at": str(existing.get("occurred_at") or ""),
+                "status": str(existing.get("status") or "active"),
+            },
+        }, [], 200
+    return {"status": "error", "error": "memory_id_conflict", "action": "memory.add"}, [], 409
 
 
 def _memory_add_action(
@@ -533,10 +556,10 @@ def _memory_add_action(
     moment = _memory_record_from_envelope(store, envelope)
     # Re-read + append + save under one memory_lock hold (the load above was for
     # validation only) so a concurrent same-user write can't lost-update.
-    with memory_service.mutation_lock(store):
-        moments = memory_service._load_moments(store)
-        moments.append(moment)
-        memory_service._save_moments(store, moments)
+    outcome, existing = memory_service.insert_new_moment(store, moment)
+    if outcome != "inserted":
+        # The server minted this id; only a random collision lands here.
+        return _memory_add_existing_id_result(outcome, existing)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
     change = memory_service._append_memory_change(store, {
         "action": "insert",
@@ -575,10 +598,9 @@ def _memory_add_envelope_action(
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
     moment = _memory_record_from_prebuilt_envelope(store, envelope)
-    with memory_service.mutation_lock(store):
-        moments = memory_service._load_moments(store)
-        moments.append(moment)
-        memory_service._save_moments(store, moments)
+    outcome, existing = memory_service.insert_new_moment(store, moment)
+    if outcome != "inserted":
+        return _memory_add_existing_id_result(outcome, existing)
     boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
     anchor_ids = envelope.get("anchor_memory_ids") or []
     change = memory_service._append_memory_change(store, {
@@ -771,7 +793,7 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
         if old_type == new_type and anchor_ids == (target.get("anchor_memory_ids") or []):
             return {"status": "ok", "action": "memory.retype", "changed_fields": [], "noop": True}, [], 200
         target["type"] = new_type
-        target["updated_at"] = core_util._now_iso()
+        target["updated_at"] = memory_timestamps.now_iso()
         target["retyped_at"] = target["updated_at"]
         if anchor_ids:
             target["anchor_memory_ids"] = list(anchor_ids)
@@ -912,7 +934,7 @@ def _memory_supersede_action(
         envelope["anchor_memory_ids"] = list(anchor_ids)
     new_moment = _memory_record_from_envelope(store, envelope)
 
-    now = core_util._now_iso()
+    now = memory_timestamps.now_iso()
     retired_docs: list[dict] = []
     # Re-read + re-find-by-id + retire + append + save under one memory_lock hold
     # (any enclave decrypt above stays OUTSIDE the lock). Find by stable id, not
@@ -1021,7 +1043,7 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
         return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
 
     new_moment = _memory_record_from_prebuilt_envelope(store, envelope)
-    now = core_util._now_iso()
+    now = memory_timestamps.now_iso()
     retired_docs: list[dict] = []
     # Re-read + re-find-by-id + retire + append + save under one memory_lock hold
     # (any enclave decrypt above stays OUTSIDE the lock). Find by stable id, not
