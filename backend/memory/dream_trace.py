@@ -105,6 +105,8 @@ def reason_outcome(reason: object) -> str:
         return "empty_reply"
     if code == "output_truncated":
         return "output_truncated"
+    if code == "maintenance_targets_rejected":
+        return "guard_rejected"
     return "parse_rejected"
 
 

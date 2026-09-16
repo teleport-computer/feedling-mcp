@@ -201,6 +201,10 @@ canonical_owner: self
 | `supersedes_required` | 400 | — | | |
 | `envelope_id_mismatch` | 400 | — | envelope.id 必须等于目标 memory_id（AEAD-bound） | |
 | `memory_id_conflict` | 409 | — | `memory.add`（actions）与 `/v1/memory/add` 带的 id 已被另一张卡占用；原卡不动、不回显任何卡内容。同一张密文卡原样重发是重放，返回成功不重写 | |
+| `memory_content_too_long` | 400 | — | 明文 action 正文去首尾空白后超过 5000 Unicode 码点；detail 仅含 actual_chars/max_chars，不截断、不改旧卡。信封兼容路径不在此校验范围 | |
+| `memory_idempotency_key_invalid` | 400 | — | action 的可选 idempotency_key 不是非空白字符串，或超过 160 字符 | |
+| `memory_idempotency_conflict` | 409 | — | 同一用户复用已成功 action 的 key，但 JSON 载荷不同；旧回执不变。以上为 item 状态，整批失败遵循 actions 的 HTTP 400 规则 | |
+| `maintenance_targets_rejected` | — | — | MemGarden 0.21.1 的 Dream 提案全部触碰截断或未渲染目标；IO 将任务记为失败、outcome=guard_rejected，不推进整理账本，不是 HTTP 写入错误 | |
 | `action_must_be_object` | 400 | — | | |
 | `actions_required` | 400 | — | | |
 | `unsupported_memory_action` | 400 | — | | |

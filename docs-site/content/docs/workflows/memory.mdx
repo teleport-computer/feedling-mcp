@@ -551,6 +551,30 @@ batch returns HTTP `200`; skipped actions do not count as failures. Read every
 `failed_count`; top-level `status` is `ok`, `partial`, or `failed`. Each result
 includes its own `http_status`.
 
+Each action may carry an `idempotency_key` (nonblank string, at most 160 Unicode
+characters). It is scoped to the authenticated user and applies to one action,
+not the whole batch or an HTTP header. Retrying the exact JSON action returns
+the original content-free receipt with `replayed: true` and no new effects;
+reusing its key with changed fields returns item-level
+`memory_idempotency_conflict` (409). Preserve the original envelope when
+retrying: newly encrypting it changes the request. Keys are optional for
+existing callers; imports use stable keys. Failed actions do not consume a key.
+Receipts retain only a request digest and non-content identifiers, not card text
+or the full original response. They remain after card deletion so retries cannot
+resurrect the card; account deletion removes them. Use a new key for a genuinely
+new operation, and fetch the card separately when you need its current contents.
+
+Plaintext action content may contain at most 5000 Unicode code points after
+outer whitespace is stripped (not bytes or model tokens). Oversize content
+returns `memory_content_too_long` with `actual_chars` and `max_chars`; nothing
+is silently shortened, and a rejected supersede leaves the old card unchanged.
+When tracing is enabled, `memory.content.rejected` records only the configured
+character limit and the route, never the rejected body or exception payload.
+This is IO's plaintext-write policy, not a MemGarden limit. Opaque prebuilt
+envelopes retain their existing compatibility path; stored historical long
+cards are returned whole by full fetch. Preview/model-context budgets remain
+separate.
+
 `source` and `capture_mode` are closed enums. Unknown values produce an
 item-level failure (`source_invalid` or `capture_mode_invalid`) rather than
 being stored or rewritten, while later valid actions in the same batch still
@@ -777,18 +801,13 @@ or update details, and `effects` is the flattened change summary:
 }
 ```
 
-The batch is ordered but not transactional. Execution stops on the first failed
-action and returns that action's HTTP status. Earlier results and effects remain
-committed; they are included in the error response and are not rolled back.
-Split independent writes when partial completion would be hard to reconcile.
-
-There is no `Idempotency-Key` support and the server does not scan existing
-cards for duplicate content. Every accepted add creates a new memory ID and
-emits a write effect, even when its title and content match an active card.
-Prebuilt envelopes are validated from their plaintext metadata and envelope
-shape without decrypting their body during the add. Read `index` or `fetch`,
-reconcile stable memory IDs, and construct a new batch instead of replaying the
-original blindly.
+The batch is ordered but not transactional; a failed item does not stop later
+items. Read every result as described above. Earlier successful items are not
+rolled back. Use the per-action replay key for retryable writes; the HTTP
+`Idempotency-Key` header is not supported. Without a replay identity, repeated
+plaintext adds create new cards even if their contents match. Prebuilt envelopes
+are validated from metadata and envelope shape without decrypting their body
+during the add, and exact sealed-card replays follow the ID rule in section 1.
 
 `memory.upgrade` exists for controlled legacy migration, but it is not part of
 the public Memory workflow and should not be emitted by ordinary clients.

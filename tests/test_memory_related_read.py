@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from memgarden import related  # noqa: E402
 from memgarden.prompts.recall_fields import retrieval_cues  # noqa: E402
-from memory import card_shape, recall_metadata  # noqa: E402
+from memory import card_shape  # noqa: E402
 
 
 def _reference_one_hop(sources, candidates, *, cap=6):
@@ -22,15 +22,15 @@ def _reference_one_hop(sources, candidates, *, cap=6):
     excluded = {c.get("id") for c in sources}
     found = {}
     for source in sources:
-        anchors = recall_metadata.links(source.get("anchor_memory_ids"))
-        supersedes = recall_metadata.links(source.get("supersedes"))
-        threads = recall_metadata.links(source.get("threads"))
+        anchors = related.links(source.get("anchor_memory_ids"))
+        supersedes = related.links(source.get("supersedes"))
+        threads = related.links(source.get("threads"))
         for card in candidates:
             mid = card.get("id")
             if not isinstance(mid, str) or mid in excluded:
                 continue
             reason = ("anchor" if mid in anchors else "supersedes" if mid in supersedes
-                      else "thread" if set(threads).intersection(recall_metadata.links(card.get("threads")))
+                      else "thread" if set(threads).intersection(related.links(card.get("threads")))
                       else "")
             if card_shape.is_retired(card) and not (
                 reason in {"anchor", "supersedes"} and card.get("status") == "superseded"

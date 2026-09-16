@@ -11654,14 +11654,20 @@
               "memory.delete",
               "memory.retype"
             ],
-            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
+            "description": "New memory.add requests create a new card; repeated content is not deduplicated. An identical idempotency_key replay returns the original receipt."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "Optional per-action, per-user replay key. Reuse only with identical JSON action fields (including an existing envelope); a changed payload fails with memory_idempotency_conflict. Replay returns a content-free receipt, replayed=true and no effects, even after card deletion. Not an HTTP header or whole-batch transaction."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"
           },
           "memory": {
             "$ref": "#/components/schemas/MemoryRecordInput",
-            "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content."
+            "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content. Content over 5000 Unicode code points after outer whitespace is stripped fails with memory_content_too_long (400), never truncates. Historical full fetch and opaque envelope bodies are not subject to this plaintext validation limit."
           },
           "memory_id": {
             "type": "string"

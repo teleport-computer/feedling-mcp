@@ -106,19 +106,22 @@ compare2.py）。
   旧流水线进度（`map_outputs` / `tasks` / `voice_outputs` / `material_cards`）的 job 在旧流水线上跑完；
   其余（含刚建好、还没进度的）写入标记后一直走新引擎。update_identity 不写卡，不受影响。
 - **崩溃续写**：写库之前先把这批的写卡指令存进进度（`pending`），每写完 20 张存一次拿到的 id；续跑时
-  pending 就是当前这批就只补写，不再问模型。最坏情况是「写完一段、id 还没存下」那一瞬，重复上限一段。
+  pending 就是当前这批就只补写，不再问模型。每条写入现在有稳定幂等键，卡、变更日志和无正文回执在同一
+  PostgreSQL 事务提交；写入后进度未保存时重放返回原 id。同 key 改载荷报冲突，不能当成功跳过。
+  即使部分卡成功，存储失败也必须保留 pending 并抛出；重试次数耗尽不是完成、也不是内容丢弃。
 - **加密**：进度走既有 `service.write_genesis_checkpoint`（共享信封 + sha256 回读），信封 id / K_enclave /
   AAD 都没动；只是 checkpoint 文档里多了 `garden_import` 一块。
 - **VPS**：进度只在内存（和切换前一样不落盘）。consumer 自更新重启 = 丢进度、job 由后端回收后重跑；
-  重跑时已写的卡在已有记忆索引里。
+  重跑时已写的卡在已有记忆索引里。同一份 pending 内预构建并复用原 action，避免重封信封改变载荷；
+  不承诺整个进程丢失内存进度后的 exactly-once。没有持久 checkpoint 的入口不能借用托管续跑的证据。
 - **分块 worker / 旧上传入口**：一个 job 一口气跑完，没有持久进度（和切换前一样）。
 
 ## 需要 memgarden 版本
 
 `ImportRequest.batches` / `strategy` / `max_total_cards` / `fallback_occurred_at` / `naming_rule`、
-`GardenComponent.import_session`、顶层 `ImportProgress` / `ImportBatchResult` —— 0.20.1 之后的下一个发布
-（当前在 memgarden `release/next`）。io 的 pin 升级之前，引擎模块只在函数里取这些名字，加载不受影响，
-但新引擎的测试和运行需要新版本。
+`GardenComponent.import_session`、顶层 `ImportProgress` / `ImportBatchResult` 已随 0.21.0 发布。
+当前 pin 以 `backend/requirements.txt` 和哈希锁为准，不能仅从代码合入推断部署态版本。
+0.21.1 补 Dream 全拒绝错误及共同验收的完整 fetch 检查，不新增历史导入功能。
 
 ## 还没定的产品问题
 
@@ -126,8 +129,8 @@ compare2.py）。
    它仍是 io 自己的写卡提示词（判断标准的第二份），而且整份材料一次喂进去、大材料会撑爆单次调用。
    two_pass 已经是「先读完全部材料再写卡」，这一遍的边际价值需要产品决定：删掉，还是交给 memgarden 做成
    导入会话的可选收尾。
-2. **VPS 的记忆张数引导（floor note）随 fact_write 退役**：以前 VPS 写卡提示词里带「花园现有 N 张、
-   建议 floor–aspiration 张」的引导；memgarden 没有这个概念，现在不再注入。
+2. **VPS 的记忆张数引导（floor note）已恢复**：IO 计算现有张数与 floor–aspiration 引导，
+   通过宿主指令传入导入会话，不把 IO 的产品目标变成 MemGarden 的默认规则。
 3. ~~分块导入里长期记忆档案不再顺带推出 TA 的名字~~ —— 已恢复，见下节。
 4. **旧上传入口（`/v1/history_import/upload`）**：iOS 只在调试开关关掉新流程时才调用；记忆卡已接到同一个
    引擎。它剩下的候选抽取 / 打分函数只被 `hosted/turn.py` 的记忆修复（`/v1/model_api/memory/repair`，
@@ -154,4 +157,3 @@ compare2.py）。
 原文被去重成一张，也凑不够「可以进聊天」要的 2 张。所以「保底写卡、保证能进聊天」在切换前已经不存在，
 这次没有恢复写兜底卡（那会是新行为：把原文切片直接写成记忆卡），只恢复了「模型失败不让整单失败」。要不要
 真的写兜底卡是产品决定。
-

@@ -82,6 +82,7 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     # TRUNCATED card, and the component's small-garden skip verdict.
     "dream_kernel_outdated",
     "dream_truncated_card_rejected",
+    "maintenance_targets_rejected",
     "not_enough_new_cards",
     "dream_memory_actions_applied",
     "dream_memory_actions_failed",
