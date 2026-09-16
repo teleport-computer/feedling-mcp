@@ -37,6 +37,7 @@ import base64
 import concurrent.futures
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -109,7 +110,31 @@ _RESTART_BACKOFF_SEC = (15.0, 60.0, 300.0, 900.0, 1800.0)
 _RESTART_HEALTHY_RESET_SEC = 300.0
 _RESTART_CIRCUIT_WINDOW_SEC = 1800.0
 _RESTART_CIRCUIT_FAILURES = 5
-_RESTART_CIRCUIT_RETRY_SEC = 3600.0
+_RESTART_CIRCUIT_RETRY_SEC = 300.0
+
+# Mirrors the standalone consumer's closed diagnostic vocabulary; no body/key.
+_STARTUP_EXIT_REASONS = frozenset({
+    "content_encryption_missing", "whoami_failed", "api_key_invalid",
+})
+# No current startup exit is a user-provider failure. Reserve this branch for
+# future explicitly classified provider-auth/payment failures, not runner keys.
+_USER_PROVIDER_STARTUP_REASONS: frozenset[str] = frozenset()
+
+
+def _read_startup_exit_reason(home: str, started_at: float) -> str:
+    try:
+        data = json.loads((Path(home) / "startup_exit.json").read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return "unknown"
+        reason, ts = data.get("reason"), data.get("ts")
+        if (not isinstance(reason, str) or reason not in _STARTUP_EXIT_REASONS
+                or type(ts) not in (int, float) or not math.isfinite(ts)
+                or not math.isfinite(started_at) or ts < started_at):
+            return "unknown"
+        return reason
+    except (OSError, ValueError, TypeError, OverflowError):
+        return "unknown"
+
 
 # `_fetch_identity_plain_for_intro` returns identity=None for several reasons.
 # Only these two mean the card GENUINELY does not exist yet (a fresh / no-card
@@ -285,6 +310,7 @@ class Supervisor:
         detail: str,
         *,
         started_at: float | None = None,
+        startup_reason: str = "unknown",
     ) -> dict:
         now = self._now()
         with self._lock:
@@ -331,7 +357,7 @@ class Supervisor:
                 user_id,
                 "runner_spawn_failed",
                 (
-                    f"resident crash loop ({len(recent)} failures/"
+                    f"{detail}; resident crash loop ({len(recent)} failures/"
                     f"{int(_RESTART_CIRCUIT_WINDOW_SEC)}s); retrying in "
                     f"{int(_RESTART_CIRCUIT_RETRY_SEC)}s; check provider API key, "
                     "balance, model, and runner logs"
@@ -339,6 +365,8 @@ class Supervisor:
                 user_text=(
                     "AI 助手连续退出，可能是模型 API Key、额度或模型设置问题。"
                     "请检查设置；系统会自动重试。"
+                    if startup_reason in _USER_PROVIDER_STARTUP_REASONS
+                    else catalog.user_text_for("runner_spawn_failed", language="zh")
                 ),
             )
         return dict(state)
@@ -351,14 +379,18 @@ class Supervisor:
             # Keep child removal and ledger creation atomic to the competing
             # tick/renew threads. The lock is reentrant, so the helper can
             # update the ledger without exposing a no-child/no-backoff window.
+            started_at = float(child.get("started_at", self._now()))
+            reason = _read_startup_exit_reason(child["home"], started_at)
             state = self._record_restart_failure(
                 user_id,
-                "consumer_exited",
-                started_at=float(child.get("started_at") or self._now()),
+                f"consumer_exited:{reason}",
+                started_at=started_at,
+                startup_reason=reason,
             )
         log.info(
-            "child for %s exited; restart deferred %.0fs%s",
+            "child for %s exited (%s); restart deferred %.0fs%s",
             user_id,
+            reason,
             max(0.0, float(state["next_retry_at"]) - self._now()),
             " (circuit open)" if state["circuit_open"] else "",
         )
@@ -499,6 +531,7 @@ class Supervisor:
                             db.chat_expire_reply_claims(user_id)
                         except Exception:  # noqa: BLE001
                             log.exception("claim release failed for %s", user_id)
+                        started_at = self._now()
                         try:
                             pid = self.spawn_fn(entry, user_id, home)
                         except Exception as e:  # noqa: BLE001
@@ -516,7 +549,7 @@ class Supervisor:
                                 "pid": pid,
                                 "entry": entry,
                                 "home": home,
-                                "started_at": self._now(),
+                                "started_at": started_at,
                             }
                     if spawn_ok:
                         # respawn ok -> clear spawn/decrypt notices only; NOT degraded
@@ -609,6 +642,7 @@ class Supervisor:
             # acquired-but-never-spawned lease. Failure marks the lease 'error'
             # (surfaced to the user via a runner notice) and moves on; the lease
             # is retried as a fresh acquisition next tick once it's reaped.
+            started_at = self._now()
             try:
                 pid = self.spawn_fn(entry, user_id, home)
             except Exception as e:  # noqa: BLE001
@@ -625,7 +659,7 @@ class Supervisor:
                     "pid": pid,
                     "entry": entry,
                     "home": home,
-                    "started_at": self._now(),
+                    "started_at": started_at,
                 }
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
             self._keyless_since.pop(user_id, None)

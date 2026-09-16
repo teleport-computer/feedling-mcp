@@ -23806,6 +23806,31 @@ def _process_resident_distill_once(chat_since: float | None = None) -> None:
         state["active"] = None  # done → next queued job (if any)
 
 
+_STARTUP_EXIT_REASONS = frozenset({
+    "content_encryption_missing", "whoami_failed", "api_key_invalid",
+})
+
+
+def _write_startup_exit(reason: str) -> None:
+    """Best-effort reason only, scoped to the resident's per-user home."""
+    if reason not in _STARTUP_EXIT_REASONS:
+        return
+    try:
+        FEEDLING_HOME.mkdir(parents=True, exist_ok=True)
+        (FEEDLING_HOME / "startup_exit.json").write_text(
+            json.dumps({"reason": reason, "ts": time.time()}), encoding="utf-8",
+        )
+    except OSError:
+        pass  # Diagnostics must not prevent the existing exit.
+
+
+def _clear_startup_exit() -> None:
+    try:
+        (FEEDLING_HOME / "startup_exit.json").unlink(missing_ok=True)
+    except OSError:
+        pass  # A stale file is also rejected by the supervisor's timestamp gate.
+
+
 def run() -> None:
     # Hard auth check before entering the poll loop.
     # A missing user_id or public_key means every encrypted reply will fail;
@@ -23815,6 +23840,7 @@ def run() -> None:
             "content_encryption module not found — v1 envelope posting disabled. "
             "Make sure the consumer runs from the feedling-mcp repo root."
         )
+        _write_startup_exit("content_encryption_missing")
         sys.exit(1)
 
     if not _load_whoami_with_retries():
@@ -23822,6 +23848,7 @@ def run() -> None:
             "whoami failed at startup — cannot obtain user_id or public_key. "
             "Check FEEDLING_API_URL and FEEDLING_API_KEY, then restart."
         )
+        _write_startup_exit("whoami_failed")
         sys.exit(1)
 
     _warn_if_agent_entry_may_drift()
@@ -23908,6 +23935,7 @@ def run() -> None:
         CAPTURE_TICK_INTERVAL_SEC,
     )
 
+    _clear_startup_exit()
     consecutive_errors = 0
 
     while _running:
@@ -24233,6 +24261,7 @@ def run() -> None:
                         "whoami returned 401 — API key is invalid. "
                         "Update FEEDLING_API_KEY and restart the service."
                     )
+                    _write_startup_exit("api_key_invalid")
                     sys.exit(1)
             consecutive_errors += 1
             time.sleep(min(2 ** consecutive_errors, 60))

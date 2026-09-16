@@ -1085,6 +1085,7 @@ jobs:
             tests/test_t550_empty_diagnostics_and_retry.py \
             tests/test_resident_failure_diagnostics.py \
             tests/test_resident_cli_output_cap.py \
+            tests/test_agent_runtime_supervisor.py \
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_p0_pool_safety.py \

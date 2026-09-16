@@ -60,7 +60,7 @@ def _mock_cli_run(monkeypatch, consumer, run):
 
 
 @pytest.fixture(autouse=True)
-def _reset_proactive_guard_state_between_tests():
+def _reset_proactive_guard_state_between_tests(tmp_path, monkeypatch):
     """The proactive self-wake loop guard + failure backoff are module-global
     state that accumulates across proactive realizations. Reset before each test
     so a prior test's self-wakes don't trip the guard and skip this one's.
@@ -71,6 +71,7 @@ def _reset_proactive_guard_state_between_tests():
     the agent call entirely. The foreground notice throttle is also process
     global; clear it both before and after each test so this module cannot
     suppress notices in a subsequently collected test module."""
+    monkeypatch.setattr(crc, "FEEDLING_HOME", tmp_path / "resident-home")
     crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
@@ -16441,3 +16442,74 @@ def test_distill_cut_off_agent_reply_triggers_memgarden_truncation_reask(monkeyp
     assert len(calls["agent"]) == 2
     assert "因长度上限被截断" in calls["agent"][1]
     assert calls["complete"] == [("jobm", 1, "skipped")]
+
+
+@pytest.fixture
+def startup_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(crc, "FEEDLING_HOME", tmp_path)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", lambda: True)
+    monkeypatch.setattr(crc, "_warn_if_agent_entry_may_drift", lambda: None)
+    monkeypatch.setattr(crc, "_resident_ipc_listener_enabled", lambda: False)
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
+    monkeypatch.setattr(crc, "_apply_infra_health", lambda _status: None)
+    monkeypatch.setattr(crc, "_load_checkpoint", lambda: 1.0)
+    monkeypatch.setattr(crc, "_save_checkpoint", lambda _ts: None)
+    monkeypatch.setattr(crc, "_load_proactive_checkpoint", lambda: 1.0)
+    monkeypatch.setattr(crc, "PROACTIVE_POLL_ENABLED", False)
+    monkeypatch.setattr(crc, "_running", False)
+    return tmp_path / "startup_exit.json"
+
+
+@pytest.mark.parametrize("reason", ["content_encryption_missing", "whoami_failed", "api_key_invalid"])
+def test_startup_exit_writes_actual_exit_reason(startup_home, monkeypatch, reason):
+    monkeypatch.setattr(crc.time, "time", lambda: 1234.5)
+    if reason == "content_encryption_missing":
+        monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", False)
+    elif reason == "whoami_failed":
+        monkeypatch.setattr(crc, "_load_whoami_with_retries", lambda: False)
+    else:
+        monkeypatch.setattr(crc, "_running", True)
+        monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+        def unauthorized():
+            response = crc.httpx.Response(401, request=crc.httpx.Request("GET", "http://test/poll"))
+            raise crc.httpx.HTTPStatusError("unauthorized", request=response.request, response=response)
+        monkeypatch.setattr(crc, "_refresh_auth_header", unauthorized)
+    def exit_checked(code):
+        assert json.loads(startup_home.read_text()) == {"reason": reason, "ts": 1234.5}
+        raise SystemExit(code)
+    monkeypatch.setattr(crc.sys, "exit", exit_checked)
+    with pytest.raises(SystemExit) as exited:
+        crc.run()
+    assert exited.value.code == 1
+
+
+@pytest.mark.parametrize("decrypt_ok", [True, False])
+def test_successful_startup_deletes_old_exit_even_when_decrypt_degraded(startup_home, monkeypatch, decrypt_ok):
+    startup_home.write_text(json.dumps({"reason": "whoami_failed", "ts": 1}))
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave")
+    monkeypatch.setattr(crc, "_verify_decrypt_sources", lambda: decrypt_ok)
+    crc.run()
+    assert not startup_home.exists()
+
+
+def test_startup_reason_closed_set_matches_supervisor(startup_home):
+    from agent_runtime import supervisor
+    assert crc._STARTUP_EXIT_REASONS == supervisor._STARTUP_EXIT_REASONS == frozenset({
+        "content_encryption_missing", "whoami_failed", "api_key_invalid",
+    })
+    crc._write_startup_exit("invented")
+    assert not startup_home.exists()
+
+
+def test_startup_exit_write_failure_preserves_exit(startup_home, monkeypatch):
+    startup_home.mkdir()
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", False)
+    with pytest.raises(SystemExit) as exited:
+        crc.run()
+    assert exited.value.code == 1
+
+
+def test_startup_exit_cleanup_failure_preserves_startup(startup_home):
+    startup_home.mkdir()
+    crc.run()  # diagnostic cleanup failure must not abort startup

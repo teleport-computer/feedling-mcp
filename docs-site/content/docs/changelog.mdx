@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Resident crash-loop circuits now retry every five minutes at a fixed
+  interval. Startup exits record bounded per-user reasons; current startup
+  failures use the system-owned spawn-failure notice instead of asking users
+  to check their model API key or balance.
+
 - **Screen-watch wakes follow the same speaking default as regular V2 wakes.**
   The agent is prompted to say something about what it sees when it wants to;
   silence is appropriate when it has nothing to say or would break the user's
