@@ -31,6 +31,7 @@ from memory import service as memory_service
 from notices import catalog as notices_catalog
 from notices import status_reason as notices_status_reason
 from notices import core as notices_core
+from notices import error_contract as notices_error_contract
 from proactive import service as proactive_service
 from screen import screen_read_core
 from bootstrap import gates as boot_gates
@@ -3865,6 +3866,22 @@ def _debug_event_public_json(
         public_detail,
         trace_public_fields=trace_public_fields,
     )
+    if isinstance(raw_detail, dict) and isinstance(public_detail, dict):
+        if ev.get("type") in {"agent.turn.failure", "agent.model.call.error", "agent.reply"}:
+            reason = raw_detail.get("sanitizer_reason")
+            if isinstance(reason, str) and reason in notices_error_contract.RESIDENT_SANITIZER_REASONS:
+                public_detail["sanitizer_reason"] = reason
+        if ev.get("type") in {"agent.turn.failure", "agent.model.call.error"}:
+            status_class = raw_detail.get("provider_status_class")
+            if isinstance(status_class, str) and status_class in notices_error_contract.PROVIDER_STATUS_CLASSES:
+                public_detail["provider_status_class"] = status_class
+        if ev.get("type") == "agent.turn.failure" and raw_detail.get("error_class") == "reply_parse_failed":
+            # T617 / explicit trace-content authorization: bounded assistant
+            # excerpts only for this failure, not a general string allowlist.
+            for key, limit in (("raw_reply_head", 300), ("raw_reply_tail", 120)):
+                value = raw_detail.get(key)
+                if isinstance(value, str) and len(value) <= limit:
+                    public_detail[key] = value
     if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail

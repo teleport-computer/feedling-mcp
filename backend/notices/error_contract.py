@@ -15,6 +15,10 @@ from typing import Callable, Iterable, Mapping
 
 
 REGISTRY_STATUS_VALUES = frozenset({"ok", "partial", "unavailable"})
+RESIDENT_SANITIZER_REASONS = frozenset({
+    "thinking_gate_failed", "protocol_leak", "file_citation", "unknown",
+})
+PROVIDER_STATUS_CLASSES = frozenset({"4xx", "5xx", "none"})
 REGISTRY_SOURCE_NAMES = frozenset({
     "chat",
     "platform",

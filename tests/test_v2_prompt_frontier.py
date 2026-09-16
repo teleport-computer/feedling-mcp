@@ -87,7 +87,7 @@ def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_793
+_REAL_TOOL_CATALOG_BYTES = 36_827
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -142,6 +142,8 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     T585 updates only the stay_silent description to the approved concrete-reason
     policy, adding 91 UTF-8 bytes to the catalog (36,793 total). The existing
     MCP padding, tool count, and parameter schemas remain unchanged.
+    T619 replaces that description with the approved agent-led choice wording,
+    adding another 34 UTF-8 bytes (36,827 total) with the same MCP padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

@@ -273,6 +273,9 @@ class AgentTurn:
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
+    # Local observations only; never read these from provider JSON.
+    sanitizer_reason: str = ""
+    raw_reply_diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1040,6 +1043,87 @@ EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
 # 判据必须取在 **parse 之前**:_agent_turn_from_raw 内部就跑 sanitizer,
 # 拿它的输出回头判空,永远分不出这两种情况(codex2 gatekeep R3)。
 SANITIZED_TO_EMPTY_MARK = "feedling:sanitized_to_empty"
+SANITIZER_REASONS = _error_contract.RESIDENT_SANITIZER_REASONS
+PROVIDER_STATUS_CLASSES = _error_contract.PROVIDER_STATUS_CLASSES
+
+
+def _sanitizer_reason(value: object) -> str:
+    return value if isinstance(value, str) and value in SANITIZER_REASONS else "unknown"
+
+
+def _raw_reply_diagnostics(raw: str) -> dict[str, Any]:
+    from agent_protocol_core import self_thinking
+
+    tags = re.finditer(
+        rf"<\s*(?P<close>/?)\s*{self_thinking.tag_name_pattern()}\s*>",
+        raw, re.IGNORECASE,
+    )
+    opened = closed = 0
+    for tag in tags:
+        if tag.group("close"):
+            closed += 1
+        else:
+            opened += 1
+    return {
+        "raw_reply_head": raw[:300], "raw_reply_tail": raw[-120:],
+        "raw_reply_len": len(raw),
+        "think_open_count": opened, "think_close_count": closed,
+    }
+
+
+def _record_sanitizer(turn: AgentTurn, reason: str, raw: str) -> None:
+    turn.sanitizer_reason = _sanitizer_reason(reason)
+    turn.raw_reply_diagnostics = _raw_reply_diagnostics(raw)
+
+
+def _sanitized_reply_error(
+    message: str, turn: AgentTurn | None = None, *, raw_reply: str | None = None,
+) -> ValueError:
+    exc = ValueError(message)
+    exc.sanitizer_reason = _sanitizer_reason(getattr(turn, "sanitizer_reason", ""))
+    exc.raw_reply_diagnostics = dict(getattr(turn, "raw_reply_diagnostics", {}))
+    if raw_reply is not None:
+        exc.raw_reply_diagnostics = _raw_reply_diagnostics(raw_reply)
+    return exc
+
+
+def _parse_failure_raw_fields(exc: BaseException) -> dict:
+    # Legacy/unobserved failures must not pretend we measured an empty reply.
+    return {
+        "raw_reply_head": "", "raw_reply_tail": "", "raw_reply_len": None,
+        "think_open_count": None, "think_close_count": None,
+        **getattr(exc, "raw_reply_diagnostics", {}),
+    }
+
+
+def _pi_no_reply_error(detail: str) -> RuntimeError:
+    # Keep exception text (and therefore every existing matcher) unchanged.
+    exc = RuntimeError(f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: {detail}")
+    # Only status-shaped numbers, not arbitrary token counts/request IDs.
+    match = re.search(
+        r"(?:^\s*(?:Error:\s*)?|\bHTTP(?:/\d(?:\.\d)?)?\s+|"
+        r"\b(?:provider_http_|api_status\s*=|status(?:_code| code)?\s*[:=]?\s*))"
+        r"([45]\d{2})(?!\d)", detail, re.IGNORECASE,
+    )
+    exc.provider_status_code = int(match.group(1)) if match else None
+    exc.provider_status_class = (
+        f"{exc.provider_status_code // 100}xx" if match else "none"
+    )
+    return exc
+
+
+def _failure_diagnostics(exc: BaseException | None, *, error_class: str = "") -> dict:
+    fields: dict[str, Any] = {}
+    if exc is None:
+        return fields
+    if error_class == "reply_parse_failed" or hasattr(exc, "sanitizer_reason"):
+        fields["sanitizer_reason"] = _sanitizer_reason(getattr(exc, "sanitizer_reason", ""))
+    if hasattr(exc, "provider_status_class"):
+        code = getattr(exc, "provider_status_code", None)
+        code = code if type(code) is int and 400 <= code <= 599 else None
+        fields.update(provider_status_class=f"{code // 100}xx" if code else "none",
+                      provider_status_code=code)
+    return fields
 
 
 def _empty_reply_diagnostics(body: Any) -> str:
@@ -1213,11 +1297,25 @@ def _consume_reply_parse_failed() -> str:
     return was
 
 
+class _ReplyParseFailureCode(str):
+    """Existing consumable short code with call-local diagnostic metadata."""
+
+    def __new__(cls, code: str, turn: AgentTurn):
+        value = super().__new__(cls, code)
+        value.turn = AgentTurn(
+            sanitizer_reason=turn.sanitizer_reason,
+            raw_reply_diagnostics=dict(turn.raw_reply_diagnostics),
+        )
+        return value
+
+
 def _reply_parse_failure_exc(reason: str) -> ValueError:
     """把 _consume_reply_parse_failed 的短码铸成分类器认识的异常文本。"""
     if reason == "provider_empty_reply":
         return ValueError(f"agent received {EMPTY_PROVIDER_REPLY_MARK}")
-    return ValueError("agent produced no usable reply after sanitization")
+    return _sanitized_reply_error(
+        "agent produced no usable reply after sanitization", getattr(reason, "turn", None)
+    )
 
 
 def _reset_system_notice_state() -> None:
@@ -1282,6 +1380,11 @@ def _notify_agent_turn_failure(
                 "blame": notice.blame,
                 "foreground": bool(foreground),
                 "lane": lane,
+                **_failure_diagnostics(exc, error_class=notice.error_class),
+                **(
+                    _parse_failure_raw_fields(exc)
+                    if notice.error_class == "reply_parse_failed" else {}
+                ),
             },
         )
         _report_runtime_error(
@@ -5124,7 +5227,7 @@ _TAGGED_THINKING_RE = re.compile(
 )
 
 
-def _split_tagged_thinking(text: str) -> tuple[str, str]:
+def _split_tagged_thinking(text: str, *, diagnostics: AgentTurn | None = None) -> tuple[str, str]:
     """Split leaked reasoning tags from visible reply text.
 
     Structured reasoning fields remain the preferred path. This only handles
@@ -5146,6 +5249,8 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
         status, thinking, reply = _st.strip_all_thinking(raw, sanitize=False)
         if status == _st.FAILED:
             # 失败关闭：宁可这轮没有可发内容，也不把带标签的残文端给用户。
+            if diagnostics is not None:
+                _record_sanitizer(diagnostics, "thinking_gate_failed", raw)
             return "", thinking
         return reply, thinking
 
@@ -5794,6 +5899,9 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.tool_calls.extend(src.tool_calls)
     _prefer_thinking(dst, src)
     dst.runtime_debug.update(src.runtime_debug)
+    if src.sanitizer_reason and not dst.sanitizer_reason:
+        dst.sanitizer_reason = src.sanitizer_reason
+        dst.raw_reply_diagnostics = dict(src.raw_reply_diagnostics)
     return dst
 
 
@@ -6073,7 +6181,10 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         # LAYER 2 — visible reply. Strip thinking HERE (after transport, so a
         # legit `{"result":"<think>..</think>.."}` is not corrupted), truncate any
         # unclosed thinking, then scan for a text-top-level protocol root.
-        raw, tagged_thinking = _split_tagged_thinking(raw)
+        original_visible = obj
+        raw, tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
+        if turn.sanitizer_reason:
+            turn.raw_reply_diagnostics = _raw_reply_diagnostics(original_visible)
         raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
             # Our self-authored <think> block, parsed locally on THIS host. With the
@@ -6094,12 +6205,16 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             _merge_agent_turn(turn, _agent_turn_from_obj(payload))
             return turn
         if decision == "drop":
+            _record_sanitizer(turn, "protocol_leak", original_visible)
             return turn
         if _looks_like_agent_protocol_text(raw):
+            _record_sanitizer(turn, "protocol_leak", original_visible)
             return turn
         clean = _sanitize_reply_text(raw)
         if clean:
             turn.messages.append(clean)
+        else:
+            _record_sanitizer(turn, "unknown", original_visible)
         return turn
 
     if isinstance(obj, list):
@@ -8537,9 +8652,10 @@ def _call_agent_http_simple(
             present = sorted(f for f in _JSON_REPLY_FIELDS if f in body)
             diagnostics = _empty_reply_diagnostics(body)
             if str(_raw_assistant_text(body) or "").strip():
-                raise ValueError(
+                raise _sanitized_reply_error(
                     f"{SANITIZED_TO_EMPTY_MARK}: reply field {present} was "
-                    f"emptied by our sanitizer {diagnostics}".strip()
+                    f"emptied by our sanitizer {diagnostics}".strip(), turn,
+                    raw_reply=_raw_assistant_text(body),
                 )
             raise ValueError(
                 f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
@@ -8682,9 +8798,10 @@ def _call_agent_http_openai(
     # 那里面已经跑过 sanitizer,拿它判等于把两种情况混成一种(codex2 gatekeep R3)。
     diagnostics = _empty_reply_diagnostics(body)
     if str(_raw_assistant_text(body) or "").strip():
-        raise ValueError(
+        raise _sanitized_reply_error(
             f"{SANITIZED_TO_EMPTY_MARK}: openai-compatible assistant text was "
-            f"emptied by our sanitizer {diagnostics}".strip()
+            f"emptied by our sanitizer {diagnostics}".strip(), turn,
+            raw_reply=_raw_assistant_text(body),
         )
     # 真的没给内容 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
     # 带上 body 的协议层诊断:200+{"error":insufficient_quota} 这种要让规则表先命中。
@@ -11520,6 +11637,7 @@ def _emit_cli_model_call_terminal(
                     )
                 },
                 "error_class": error_class,
+                **(_failure_diagnostics(failure) if not succeeded else {}),
                 "thinking_present": bool(trace_turn.thinking_summary),
                 "thinking_source": trace_turn.thinking_source or "",
                 "thinking_len": len(trace_turn.thinking_summary or ""),
@@ -12101,10 +12219,7 @@ def _call_agent_cli_impl(
         # 标记 + 原 detail 一起带上:pi 退出码永远是 0,API 错误(配额/鉴权/断流)
         # 只在 detail 里,而分类器把空回复判定排在规则表**之后** —— detail 有错误
         # 特征时仍然命中 quota_insufficient 等更具体的类,不会被空回复遮蔽。
-        raise RuntimeError(
-            f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: "
-            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
-        )
+        raise _pi_no_reply_error(_cli_error_detail(result.stdout or '', result.stderr or ''))
 
     # codex `exec --json` streams JSONL events; the assistant's text and its
     # reasoning summary live in dedicated events, NOT in any field the generic
@@ -12489,6 +12604,7 @@ def _suppress_torn_protocol_leaks(turn: "AgentTurn", *, lane: str) -> None:
             "torn protocol fragment dropped lane=%s evidence=%s frag=%r",
             lane, evidence, str(text)[:48],
         )
+        _record_sanitizer(turn, "protocol_leak", str(text))
         return True
 
     if turn.messages:
@@ -12667,6 +12783,10 @@ def call_agent(
     failure_class = (
         "reply_parse_failed" if model_said_something else "provider_empty_reply"
     )
+    if failure_class == "reply_parse_failed":
+        original_text = _raw_assistant_text(raw)
+        if original_text:
+            turn.raw_reply_diagnostics = _raw_reply_diagnostics(original_text)
     if failure_class == "reply_parse_failed" and cli_parse_failure_source:
         source_raw = str(cli_parse_failure_source.get("raw") or "")
         source_cmd = list(cli_parse_failure_source.get("cmd") or [])
@@ -12681,9 +12801,9 @@ def call_agent(
                 trace_id=trace_id,
             )
     if SEND_FALLBACK_ON_AGENT_ERROR:
-        _turn_reply_parse_failed = failure_class
+        _turn_reply_parse_failed = _ReplyParseFailureCode(failure_class, turn)
         return [FALLBACK_REPLY]
-    raise _reply_parse_failure_exc(failure_class)
+    raise _reply_parse_failure_exc(_ReplyParseFailureCode(failure_class, turn))
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
@@ -13188,12 +13308,16 @@ def _sanitize_outbound_file_reply(
     text: str,
     *,
     attachment_staged: bool = False,
+    diagnostics: AgentTurn | None = None,
 ) -> tuple[str, bool]:
     """Remove runtime-local attachment references from visible reply text."""
-    return sanitize_downloadable_reply(
+    cleaned, removed = sanitize_downloadable_reply(
         text,
         attachment_staged=attachment_staged,
     )
+    if removed and text.strip() and not cleaned.strip() and diagnostics is not None:
+        _record_sanitizer(diagnostics, "file_citation", text)
+    return cleaned, removed
 
 
 # The tested wording. Changing it invalidates the cross-model evidence in
@@ -21785,6 +21909,7 @@ def _process_messages(messages: list) -> float:
                     attachment_staged=bool(
                         staged_outbound_files or staged_outbound_images
                     ),
+                    diagnostics=finalized,
                 )
                 stripped_file_citation = stripped_file_citation or removed
                 if sanitized.strip():
@@ -21908,7 +22033,8 @@ def _process_messages(messages: list) -> float:
             explain=("回复已解析：" + f"{len(turn.messages)} 段"
                      + ("，含思考摘要" if turn.thinking_summary else "，无思考摘要")),
             detail={"n_messages": len(turn.messages), "n_actions": len(turn.actions),
-                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or ""},
+                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or "",
+                    **({"sanitizer_reason": turn.sanitizer_reason} if turn.sanitizer_reason else {})},
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages

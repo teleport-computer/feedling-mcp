@@ -3,6 +3,7 @@
 fixture 在 origin/test 基线的 checkout 上跑 scripts/dump_perception_baseline.py 得到。
 一旦红，说明某段说明书被改动了 —— 那是行为变更，不能混在重构批次里悄悄发生。
 T585 按批准文案更新 wake 及其派生快照；scheduled 专用与 screen_watch 基础文案保持原值。
+T619 仅更新普通 wake 第二段及其派生快照，包含复用该段的 scheduled_no_notes。
 
 ★ 四格验收矩阵（2026-08-20 补，见
   .superpowers/sdd/2026-08-19-perception-extraction-step1/matrix-report.md）：
