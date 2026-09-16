@@ -567,3 +567,93 @@ def test_t590_malformed_response_full_chain_has_no_raw_stop_reason():
         "type": "provider.empty_response", "detail": detail,
     }, trace_public_fields={})
     assert public["detail"]["stop_reason"] == reason.lower()
+
+
+# ---------------------------------------------------------------- T604
+# A relay-fronted Gemini model (openai_compatible wire) answered content:"" with
+# completion_tokens 133–916 for 14 rounds and the trace could not say whether
+# those were hidden thinking or lost text. Relays that front Gemini report the
+# split; project it onto the same provider_* fields the native wire uses.
+
+def _relay_body(*, content="", finish="stop", thoughts=600, candidates=0, prompt=30697,
+                gemini_block=True, reasoning_tokens=None, text_tokens=None):
+    usage = {"prompt_tokens": prompt, "completion_tokens": thoughts + candidates,
+             "total_tokens": prompt + thoughts + candidates}
+    details = {}
+    if reasoning_tokens is not None: details["reasoning_tokens"] = reasoning_tokens
+    if text_tokens is not None: details["text_tokens"] = text_tokens
+    if details: usage["completion_tokens_details"] = details
+    if gemini_block:
+        usage["billing_usage"] = {"source": "gemini_chat", "semantic": "gemini",
+                                  "gemini_usage_metadata": {"promptTokenCount": prompt, "candidatesTokenCount": candidates,
+                                                            "thoughtsTokenCount": thoughts, "totalTokenCount": prompt + thoughts + candidates}}
+    return {"id": "chatcmpl-x", "choices": [{"index": 0, "finish_reason": finish,
+                                              "message": {"role": "assistant", "content": content}}],
+            "usage": usage}
+
+
+def test_t604_relay_diagnostics_project_gemini_usage_split():
+    d = pc._openai_compat_empty_diagnostics(_relay_body())
+    assert d == {"finish_reason": "stop", "prompt_token_count": 30697,
+                 "candidates_token_count": 0, "thoughts_token_count": 600,
+                 "upstream_usage_reported": True}
+
+
+def test_t604_relay_diagnostics_fall_back_to_completion_tokens_details():
+    d = pc._openai_compat_empty_diagnostics(
+        _relay_body(gemini_block=False, reasoning_tokens=412, text_tokens=0, prompt=1000))
+    assert d["thoughts_token_count"] == 412 and d["candidates_token_count"] == 0
+    assert d["prompt_token_count"] == 1000 and d["upstream_usage_reported"] is False
+
+
+def test_t604_relay_diagnostics_are_content_free_and_closed():
+    body = _relay_body(finish="weird-relay-string")
+    body["usage"]["billing_usage"]["gemini_usage_metadata"]["thoughtsTokenCount"] = "not-a-number"
+    body["usage"]["billing_usage"]["gemini_usage_metadata"]["candidatesTokenCount"] = -5
+    d = pc._openai_compat_empty_diagnostics(body)
+    assert d["finish_reason"] == "other"
+    assert d["thoughts_token_count"] is None and d["candidates_token_count"] is None
+    assert all(isinstance(v, (int, bool, str, type(None))) for v in d.values())
+    assert pc._openai_compat_empty_diagnostics({}) == {
+        "finish_reason": "", "prompt_token_count": None, "candidates_token_count": None,
+        "thoughts_token_count": None, "upstream_usage_reported": False}
+
+
+def test_t604_relay_empty_reply_carries_split_to_trace_detail():
+    from provider_types import ProviderResponse
+    class _Resp:  # the parser takes the httpx response, not the body
+        status_code = 200
+        text = ""
+        def __init__(self, body): self._body = body
+        def json(self): return self._body
+    normalized = pc._parse_openai_compat_body(_Resp(_relay_body()), provider="openai_compatible",
+                                              model="[relay]gemini-3.7-flash-high", require_reply=False)
+    response = ProviderResponse.from_result(normalized)
+    assert response.text == ""
+    shape = tl._empty_response_shape(response)
+    assert shape["stop_reason"] == "stop" and "raw_stop_reason" not in shape
+    assert shape["provider_diagnostics"]["thoughts_token_count"] == 600
+    detail = _safe_detail(worker._empty_response_trace_detail(shape, "chat"))
+    assert detail["provider_thoughts_token_count"] == 600
+    assert detail["provider_candidates_token_count"] == 0
+    assert detail["provider_prompt_token_count"] == 30697
+    assert detail["provider_finish_reason"] == "stop"
+    assert detail["provider_upstream_usage_reported"] is True
+    # Part-shape / safety fields are a native-Gemini measurement; a relay must
+    # not report them as "checked and clean".
+    assert not any(k.startswith("provider_safety") for k in detail)
+    assert "provider_only_thought_parts" not in detail
+
+
+def test_t604_native_gemini_detail_still_carries_safety_fields():
+    body = {"candidates": [{"content": {}, "finishReason": "STOP",
+                            "safetyRatings": [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "LOW", "blocked": False}]}],
+            "usageMetadata": {"thoughtsTokenCount": 50, "candidatesTokenCount": 0, "promptTokenCount": 10}}
+    from provider_types import ProviderResponse
+    normalized = pc._parse_gemini_body(body, model="gemini-3.6-flash", require_reply=False)
+    shape = tl._empty_response_shape(ProviderResponse.from_result(normalized))
+    detail = _safe_detail(worker._empty_response_trace_detail(shape, "chat"))
+    assert detail["provider_safety_blocked"] is False
+    assert detail["provider_only_thought_parts"] is False
+    assert detail["provider_thoughts_token_count"] == 50
+    assert "provider_upstream_usage_reported" not in detail
