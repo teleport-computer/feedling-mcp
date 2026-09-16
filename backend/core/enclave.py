@@ -15,6 +15,7 @@ import time
 import httpx
 
 import debug_trace
+from core import runtime_token as runtime_tokens
 
 
 _QUIET_SUCCESS_PURPOSE_PREFIXES = ("tee_replicate:",)
@@ -473,35 +474,50 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
         path=path,
         summary="enclave decrypt call started",
     )
-    try:
-        resp = _client().post(
-            f"{enclave_url}{path}",
-            headers=headers,
-            json={"envelope": envelope, "purpose": purpose},
-            timeout=20,
-        )
-    except httpx.HTTPError as e:
-        failure_detail = type(e).__name__[:_DECRYPT_DETAIL_MAX]
-        _trace_enclave(
-            store,
-            "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
-            purpose=purpose,
-            path=path,
-            status="error",
-            summary="enclave decrypt call failed",
-            detail={
-                "error_class": type(e).__name__,
-                "failure_class": "enclave_transport_error",
-                "failure_detail": failure_detail,
-            },
-            dur_ms=(time.time() - started_at) * 1000,
-        )
-        raise _decrypt_error(
-            f"enclave_error:{type(e).__name__}",
-            failure_class="enclave_transport_error",
-            failure_detail=failure_detail,
-        ) from e
-    if resp.status_code >= 400:
+    for attempt in (1, 2):
+        try:
+            resp = _client().post(
+                f"{enclave_url}{path}",
+                headers=headers,
+                json={"envelope": envelope, "purpose": purpose},
+                timeout=20,
+            )
+        except httpx.HTTPError as e:
+            failure_detail = type(e).__name__[:_DECRYPT_DETAIL_MAX]
+            _trace_enclave(
+                store,
+                "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
+                purpose=purpose,
+                path=path,
+                status="error",
+                summary="enclave decrypt call failed",
+                detail={
+                    "error_class": type(e).__name__,
+                    "failure_class": "enclave_transport_error",
+                    "failure_detail": failure_detail,
+                },
+                dur_ms=(time.time() - started_at) * 1000,
+            )
+            raise _decrypt_error(
+                f"enclave_error:{type(e).__name__}",
+                failure_class="enclave_transport_error",
+                failure_detail=failure_detail,
+            ) from e
+        if resp.status_code < 400:
+            break
+        claims = None
+        token_detail = {}
+        secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+        if resp.status_code == 401 and runtime_token and secret:
+            try:
+                claims = runtime_tokens.decode_claims(secret, runtime_token)
+            except runtime_tokens.TokenError:
+                pass  # Unverified identity must never authorize a refresh.
+            if claims is not None:
+                try:
+                    token_detail["token_age_sec"] = int(time.time() - float(claims["iat"]))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    pass  # Unknown age is omitted, never reported as zero.
         failure_class = (
             "enclave_http_403" if resp.status_code == 403 else "enclave_http_error"
         )
@@ -517,11 +533,35 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
             summary="enclave decrypt call returned error",
             detail={
                 "status_code": resp.status_code,
+                **token_detail,
                 "failure_class": failure_class,
                 "failure_detail": failure_detail,
             },
             dur_ms=(time.time() - started_at) * 1000,
         )
+        if (
+            attempt == 1
+            and claims is not None
+            and caller_user_id
+            and claims.get("user_id") == caller_user_id
+        ):
+            runtime_token = runtime_tokens.mint(
+                secret,
+                user_id=caller_user_id,
+                runtime_instance_id="enclave_decrypt_refresh",
+                scope=["envelope_decrypt"],
+                ttl=900.0,
+            )
+            headers = {"X-Feedling-Runtime-Token": runtime_token}
+            _trace_enclave(
+                store,
+                "enclave.call.token_refreshed",
+                purpose=purpose,
+                path=path,
+                summary="enclave decrypt runtime token refreshed",
+                detail={**token_detail, "attempt": 2},
+            )
+            continue
         raise _decrypt_error(
             f"enclave_http_{resp.status_code}:{resp.text[:180]}",
             failure_class=failure_class,
