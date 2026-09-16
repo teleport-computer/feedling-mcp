@@ -1660,11 +1660,12 @@ async def run_tool_loop(
             return re.search(r"[A-Za-z]", completion_message) is not None
         return False
 
-    # T591: the self-thinking rendering this turn's system prompt uses (gemini →
-    # ``aside``). Every place the loop restates or continues the contract must
+    # The self-thinking rendering this turn's system prompt uses (official or
+    # named relay Gemini → ``aside``). Every restatement or continuation must
     # use the same tag, or the model is asked for two different openers.
-    self_thinking_tag = self_thinking.tag_for_provider(
-        getattr(provider_config, "provider", "")
+    self_thinking_tag = self_thinking.tag_for_route(
+        getattr(provider_config, "provider", ""),
+        getattr(provider_config, "model", ""),
     )
 
     def _compact_delivery_system_prompt(

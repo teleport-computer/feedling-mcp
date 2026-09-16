@@ -12857,16 +12857,16 @@ def _wake_self_thinking_allowed() -> bool:
 
 
 def _self_thinking_tag() -> str:
-    """协议标签按 driver / provider 选:Claude Code 用 ``aside``,gemini(任何 driver)
-    用 ``aside``(T591),其余 pi / codex 保持 ``think``。
+    """协议标签按 driver / route 选:Claude Code、官方 Gemini 与指定中转的
+    Gemini 模型用 ``aside``，其余 pi / codex 保持 ``think``。
 
     T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
     用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
     隐藏思维链,Opus 5 家族每轮拒答。标签按 driver 不按模型:矩阵里 sonnet-4-6 /
     opus-4-8 / opus-5 / opus-5[1m] 用 ``aside`` 全部正常,不用维护型号名单。
     只有 ``AGENT_MODE == "cli"`` 且 ``cmd[0]`` 是 ``claude`` 才算 Claude Code;
-    pi / codex / http 模式(哪怕留着一条 claude 命令)/ 其他 CLI 的指令渲染逐字节
-    不变(见 tests)。"""
+    其余 driver 再按共享 provider/model 规则选择标签；http 模式里残留的
+    claude 命令不参与判断(见 tests)。"""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
     # Only a turn that really runs the Claude Code CLI gets the aside tag: in
@@ -12877,9 +12877,11 @@ def _self_thinking_tag() -> str:
     # gemini-3.6-flash via the pi wire with a tag-only swap in one captured
     # request body: 6/10 replays came back HTTP 503 with ``<think>``, 0/10 with
     # ``<aside>`` in the same window (replay only; no delivery path exercised).
-    # The provider set is shared with Runtime V2 (self_thinking.ASIDE_TAG_PROVIDERS);
-    # every other provider and driver keeps ``think`` byte for byte.
-    return _self_thinking_v1.tag_for_provider(AGENT_RUNTIME_METADATA.get("provider"))
+    # T601: named Gemini routes on openai_compatible/openrouter share the same
+    # selector as V2; other routes keep ``think`` byte for byte.
+    return _self_thinking_v1.tag_for_route(
+        AGENT_RUNTIME_METADATA.get("provider"), AGENT_RUNTIME_METADATA.get("model")
+    )
 
 
 def _foreground_self_thinking_instruction() -> str:

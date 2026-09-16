@@ -1,4 +1,4 @@
-"""T591: gemini gets the ``aside`` self-thinking rendering on both runtimes.
+"""T591/T601: official and named relay Gemini routes use ``aside`` on both runtimes.
 
 Measured 2026-09-15 on gemini-3.6-flash only (T586/T588/T591). Tag-only bisect
 (just ``<think>``→``<aside>``, wording unchanged), direct V2-shaped calls,
@@ -10,8 +10,9 @@ substitutions) was confirmed separately on the V2 shape, 8/8 and 8/8. These
 tests pin the configured behavior; Gemini's server-side reason is not
 observable.
 
-Every other provider keeps the ``think`` rendering byte for byte; the Claude Code
-driver rule from T587 is untouched. The V2 tool loop restates/continues the
+T601 extends this to openai_compatible/openrouter models whose name contains
+gemini. Other routes keep ``think`` byte for byte; the Claude Code driver rule
+from T587 is untouched. The V2 tool loop restates/continues the
 contract with the same tag: compact delivery rounds render ``instruction(tag)``
 and the ``<think>`` assistant prefill is only sent on ``think`` turns.
 """
@@ -56,7 +57,7 @@ def _pc(provider: str, model: str = "gemini-3.6-flash"):
 # ---------------------------------------------------------------- Runtime V2
 
 def test_aside_providers_is_the_single_source_and_names_gemini():
-    # The provider set is the one knob; a change there is a deliberate decision.
+    # The unconditional provider set stays separate from relay model matching.
     assert st.ASIDE_TAG_PROVIDERS == frozenset({"gemini"})
     assert context._ASIDE_TAG_PROVIDERS is st.ASIDE_TAG_PROVIDERS
 
@@ -67,6 +68,42 @@ def test_aside_providers_is_the_single_source_and_names_gemini():
 ])
 def test_tag_for_provider(provider, tag):
     assert st.tag_for_provider(provider) == tag
+
+
+_ROUTE_TAG_CASES = [
+    ("gemini", "any-model", st.TAG_ASIDE),
+    (" GEMINI ", None, st.TAG_ASIDE),
+    ("openai_compatible", "gemini-3-flash-preview", st.TAG_ASIDE),
+    ("openrouter", "google/gemini-3.6-flash", st.TAG_ASIDE),
+    (" OPENAI_COMPATIBLE ", "Gemini-3-Flash-Preview", st.TAG_ASIDE),
+    ("openrouter", "Google/GeMiNi-3.6-Flash", st.TAG_ASIDE),
+    ("openai_compatible", "[AG4]claude-sonnet-4-6", st.TAG_THINK),
+    ("openrouter", "anthropic/claude-sonnet-4-6", st.TAG_THINK),
+    ("anthropic", "gemini-x", st.TAG_THINK),
+    ("openai", "gemini", st.TAG_THINK),
+    ("deepseek", "gemini", st.TAG_THINK),
+    ("unknown", "gemini", st.TAG_THINK),
+    ("", "", st.TAG_THINK),
+    (None, None, st.TAG_THINK),
+    ("openai_compatible", "", st.TAG_THINK),
+    ("openrouter", None, st.TAG_THINK),
+]
+
+
+@pytest.mark.parametrize("provider,model,tag", _ROUTE_TAG_CASES)
+def test_route_tag_matches_only_official_or_named_gemini_relays(provider, model, tag):
+    assert st.tag_for_route(provider, model) == tag
+
+
+@pytest.mark.parametrize("provider,model,tag", _ROUTE_TAG_CASES)
+def test_context_renders_the_route_model_tag(provider, model, tag):
+    config = _pc(provider, model)
+    assert context.self_thinking_tag(config) == tag
+    assert context.chat_system_prompt(config) == context._join_policy_blocks(
+        context._CHAT_REPLY_POLICY,
+        st.instruction(tag),
+        context._CHAT_POLICY_AFTER_THINKING,
+    )
 
 
 @pytest.mark.parametrize("provider", ["gemini", "Gemini", " gemini "])
@@ -155,8 +192,21 @@ def test_resident_pi_gemini_uses_aside(monkeypatch, _resident_pi):
 @pytest.mark.parametrize("provider", ["openai_compatible", "openrouter", "deepseek", ""])
 def test_resident_pi_other_providers_keep_think(monkeypatch, _resident_pi, provider):
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", provider)
+    monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "model", "claude-sonnet-4-6")
     assert crc._self_thinking_tag() == st.TAG_THINK
     assert crc._foreground_self_thinking_instruction() == st.INSTRUCTION.strip()
+
+
+@pytest.mark.parametrize("provider,model,tag", _ROUTE_TAG_CASES)
+def test_resident_renders_the_metadata_model_tag(monkeypatch, _resident_pi, provider, model, tag):
+    monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", provider)
+    monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "model", model)
+    assert crc._self_thinking_tag() == tag
+    assert crc._foreground_self_thinking_instruction() == st.instruction(tag).strip()
+    permission = crc._wake_think_permission_line()
+    assert f"<{tag}>" in permission
+    other = st.TAG_THINK if tag == st.TAG_ASIDE else st.TAG_ASIDE
+    assert f"<{other}>" not in permission
 
 
 def test_resident_claude_driver_rule_still_wins(monkeypatch):
@@ -210,7 +260,7 @@ import asyncio
 
 def _drive_loop(monkeypatch, provider: str, model: str, *, correction: bool):
     config = provider_client.ProviderConfig(provider=provider, model=model, api_key="offline-placeholder")
-    tag = st.tag_for_provider(provider)
+    tag = st.tag_for_route(provider, model)
     calls: list[dict] = []
 
     async def fake(cfg, messages, **kwargs):
@@ -262,6 +312,19 @@ def test_real_loop_sends_no_think_prefill_on_gemini_aside_turns(monkeypatch, mod
     for c in calls:
         assert c["system_has_aside"] and not c["system_has_think"], c
         assert c["requested"] == "" and c["effective"] == "", c
+
+
+@pytest.mark.parametrize("provider,model", [
+    ("openai_compatible", "gemini-3-flash-preview"),
+    ("openrouter", "google/gemini-3.6-flash"),
+    ("openai_compatible", "Gemini-3-Flash-Preview"),
+])
+@pytest.mark.parametrize("correction", [False, True])
+def test_real_loop_relay_gemini_uses_model_for_tag_and_prefill(monkeypatch, provider, model, correction):
+    calls = _drive_loop(monkeypatch, provider, model, correction=correction)
+    for call in calls:
+        assert call["system_has_aside"] and not call["system_has_think"], call
+        assert call["requested"] == "" and call["effective"] == "", call
 
 
 @pytest.mark.parametrize("correction", [False, True])
