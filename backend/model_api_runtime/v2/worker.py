@@ -1797,6 +1797,20 @@ class ImageGenerationInternalError(ImageGenerationUnavailable):
         )
 
 
+# Exception messages that may ride a failure log/trajectory as ``error_detail``.
+# A closed allowlist, not a shape rule: a shape rule waves through anything
+# that happens to look like a slug (a synthetic token, a private path with
+# underscores), and the message came from an exception, i.e. from code we do
+# not fully control. Grow this set only with codes a module defines itself.
+_KNOWN_EXCEPTION_DETAIL_CODES = frozenset(generated_image.GENERATED_IMAGE_REJECT_CODES)
+
+
+def _known_exception_detail(exc: BaseException) -> str:
+    """Return ``str(exc)`` only when it is a registered content-free code."""
+    text = str(exc or "").strip()
+    return text if text in _KNOWN_EXCEPTION_DETAIL_CODES else ""
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
@@ -3256,6 +3270,14 @@ def _provider_tool_surface_trace_detail(
 ) -> dict[str, Any]:
     """Apply the production worker-owned provider-surface detail projection."""
     trace_detail = {"lane": lane, **dict(detail)}
+    protocol_token = trace_detail.pop("protocol_token_reply", None)
+    if isinstance(protocol_token, str) and protocol_token in (
+        v2_tool_loop._PROTOCOL_TOKEN_REPLY_NAMES | {"__sentinel__"}
+    ):
+        # Only this suppression branch substitutes a more specific choice fact
+        # for the request flag, keeping wake_kind inside the 20-key trace cap.
+        trace_detail.pop("wake_choice_required", None)
+        trace_detail["protocol_token_reply"] = protocol_token
     trace_detail["call_rejection_reasons"] = (
         v2_tool_loop._normalize_provider_call_rejection_reasons(
             detail.get("call_rejection_reasons")
@@ -17082,6 +17104,11 @@ async def process_job(
                     ),
                 )
         message = _safe_failure_code("turn_failed", failure_exc)
+        # A registered exception code (e.g. generated_image_too_large) is the
+        # only clue to WHICH check raised; "turn_failed:valueerror" alone cost a
+        # day on usr_7f30 (T620). Anything outside the allowlist is dropped —
+        # exception text can hold user content, tokens, or provider bodies.
+        error_detail = _known_exception_detail(failure_exc)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -17089,15 +17116,17 @@ async def process_job(
                 "stage": "process_job",
                 "error_class": type(failure_exc).__name__,
                 "error_code": message,
+                **({"error_detail": error_detail} if error_detail else {}),
             },
             best_effort=True,
         )
         log.warning(
-            "[v2.worker] job %s failed code=%s status=%s upstream_detail=%r",
+            "[v2.worker] job %s failed code=%s status=%s upstream_detail=%r detail=%s",
             job_id,
             message,
             getattr(failure_exc, "status_code", None),
             str(getattr(failure_exc, "upstream_detail", "") or "")[:240],
+            error_detail or "-",
         )
         owned = await asyncio.to_thread(
             jobs_store.mark_failed,
