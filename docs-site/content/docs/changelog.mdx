@@ -14,6 +14,13 @@ change must not be interpreted as an API guarantee.
 
 - History imports now reject individual oversized or idempotency-conflicting cards while saving valid siblings, instead of failing the entire job; an entirely rejected batch still fails and asks the model again on retry.
 
+- Empty-response diagnostics on OpenAI-compatible relays now record the relay's
+  thinking-vs-visible output token split (`provider_thoughts_token_count`,
+  `provider_candidates_token_count`, `provider_prompt_token_count`, and whether
+  the upstream Gemini usage block was reported), on the same fields the native
+  Gemini wire uses. Counts and a closed finish-reason enum only; part-shape and
+  safety fields stay native-Gemini-only rather than being reported as clean.
+
 - **Memory writes no longer silently shorten plaintext card bodies at 5000
   characters.** Oversize writes return `memory_content_too_long`; full fetch
   preserves historical longer cards. Optional per-action `idempotency_key`

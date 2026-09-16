@@ -3464,23 +3464,33 @@ def _empty_provider_diagnostics_fields(
     # a future over-long list is visible rather than silently cut.
     capped = categories[:8]
 
-    return {
+    fields: dict[str, Any] = {
         "provider_finish_reason": _enum(raw.get("finish_reason")),
-        "provider_candidates_count": _count(raw.get("candidates_count")),
-        "provider_only_thought_parts": bool(raw.get("only_thought_parts")),
-        "provider_visible_text_part_count": _count(raw.get("visible_text_part_count")),
-        "provider_thought_part_count": _count(raw.get("thought_part_count")),
-        "provider_safety_blocked": bool(raw.get("safety_blocked")),
-        "provider_safety_blocked_categories": capped,
-        "provider_safety_blocked_category_count": len(categories),
-        "provider_safety_blocked_unknown_count": _count(
-            raw.get("safety_blocked_unknown_count")
-        ),
-        "provider_safety_max_probability": _enum(raw.get("safety_max_probability")),
         "provider_prompt_token_count": _count(raw.get("prompt_token_count")),
         "provider_candidates_token_count": _count(raw.get("candidates_token_count")),
         "provider_thoughts_token_count": _count(raw.get("thoughts_token_count")),
     }
+    # Part-shape and safety fields exist only on the native Gemini wire. A relay
+    # (T604) reports just the token split; emitting ``False``/``None`` for the
+    # rest would read as "checked and clean", so those keys are omitted unless
+    # the provider seam measured them.
+    if "safety_blocked" in raw:
+        fields.update({
+            "provider_candidates_count": _count(raw.get("candidates_count")),
+            "provider_only_thought_parts": bool(raw.get("only_thought_parts")),
+            "provider_visible_text_part_count": _count(raw.get("visible_text_part_count")),
+            "provider_thought_part_count": _count(raw.get("thought_part_count")),
+            "provider_safety_blocked": bool(raw.get("safety_blocked")),
+            "provider_safety_blocked_categories": capped,
+            "provider_safety_blocked_category_count": len(categories),
+            "provider_safety_blocked_unknown_count": _count(
+                raw.get("safety_blocked_unknown_count")
+            ),
+            "provider_safety_max_probability": _enum(raw.get("safety_max_probability")),
+        })
+    if "upstream_usage_reported" in raw:
+        fields["provider_upstream_usage_reported"] = bool(raw.get("upstream_usage_reported"))
+    return fields
 
 
 def _empty_provider_response_debug_callback(

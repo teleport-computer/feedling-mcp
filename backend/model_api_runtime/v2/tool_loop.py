@@ -1233,10 +1233,13 @@ def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
         pr.raw.get("gemini_diagnostics"), dict
     ):
         shape["raw_stop_reason"] = str(pr.raw.get("stop_reason") or "").strip()
-    # Provider-owned content-free root-cause diagnostics (currently Gemini:
-    # finishReason / safety categories / thought-only shape / token split),
-    # projected at the provider seam so this never reaches back through content.
+    # Provider-owned content-free root-cause diagnostics (Gemini: finishReason /
+    # safety categories / thought-only shape / token split; OpenAI-compatible
+    # relays: the thinking-vs-visible token split they report, T604), projected
+    # at the provider seam so this never reaches back through content.
     diagnostics = pr.raw.get("gemini_diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = pr.raw.get("openai_compat_diagnostics")
     if isinstance(diagnostics, dict):
         shape["provider_diagnostics"] = dict(diagnostics)
     return shape

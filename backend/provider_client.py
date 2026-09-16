@@ -2502,6 +2502,74 @@ def _extract_openai_compatible_reasoning(body: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
+# OpenAI-compatible finish_reason values we pass through as an enum; a relay
+# can put anything here, so everything else collapses to "other".
+_OPENAI_COMPAT_FINISH_REASONS = frozenset({
+    "stop", "length", "content_filter", "tool_calls", "function_call",
+})
+
+
+def _count_or_none(value: Any) -> int | None:
+    """Finite non-negative whole number or None — never fake or raise."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (math.isfinite(value) and value.is_integer()):
+            return None
+        value = int(value)
+    if not isinstance(value, int):
+        try:
+            value = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+    return value if value >= 0 else None
+
+
+def _openai_compat_empty_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
+    """Content-free counts a relay reports beside a (possibly empty) choice.
+
+    T604 (2026-09-16): a relay-fronted Gemini model returned ``content: ""``
+    with ``completion_tokens`` 133–916 for 14 rounds in a row and the trace
+    could not say whether those tokens were hidden thinking or lost text.
+    Relays that front Gemini (new-api style) report the split themselves:
+    ``usage.completion_tokens_details.{reasoning_tokens,text_tokens}`` and,
+    for the gemini channel, ``usage.billing_usage.gemini_usage_metadata``
+    (``candidatesTokenCount`` / ``thoughtsTokenCount``). Project them onto the
+    same keys the native Gemini diagnostics use so the admin trace reads the
+    same way on both wires. Numbers and a closed enum only — no text.
+    """
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    billing = usage.get("billing_usage")
+    billing = billing if isinstance(billing, dict) else {}
+    upstream = billing.get("gemini_usage_metadata")
+    upstream = upstream if isinstance(upstream, dict) else {}
+    thoughts = _count_or_none(upstream.get("thoughtsTokenCount"))
+    if thoughts is None:
+        thoughts = _count_or_none(details.get("reasoning_tokens"))
+    candidates = _count_or_none(upstream.get("candidatesTokenCount"))
+    if candidates is None:
+        candidates = _count_or_none(details.get("text_tokens"))
+    prompt = _count_or_none(upstream.get("promptTokenCount"))
+    if prompt is None:
+        prompt = _count_or_none(usage.get("prompt_tokens"))
+    raw_finish = _extract_openai_compatible_stop_reason(body).lower()
+    finish = (
+        raw_finish if raw_finish in _OPENAI_COMPAT_FINISH_REASONS
+        else ("other" if raw_finish else "")
+    )
+    return {
+        "finish_reason": finish,
+        "prompt_token_count": prompt,
+        "candidates_token_count": candidates,
+        "thoughts_token_count": thoughts,
+        # Whether the relay exposed the upstream Gemini usage block at all, so a
+        # missing split is distinguishable from a reported zero.
+        "upstream_usage_reported": bool(upstream),
+    }
+
+
 def _extract_openai_compatible_stop_reason(body: dict[str, Any]) -> str:
     choices = body.get("choices")
     if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
@@ -3945,6 +4013,7 @@ def _parse_openai_compat_body(
         "usage": _normalize_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": stop_reason,
+        "openai_compat_diagnostics": _openai_compat_empty_diagnostics(body),
         "provider": provider,
         "model": model,
         "tool_calls": tool_calls,
