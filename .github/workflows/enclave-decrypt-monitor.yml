@@ -1,0 +1,58 @@
+# External read-only enclave monitor: a dead backend must still yield a
+# "量不到" alert. Running in Actions also keeps Lark secrets off the CVM and
+# adds no outbound dependency to the backend. Same shape as memory-pipeline-daily.
+# schedule runs only on default branch main; merging into test does not activate it.
+# Split the same */15 cadence so delayed runners retain the scheduled hour slot.
+# Window comparison is stateless, not exactly-once delivery across retries/delays.
+name: Enclave decrypt monitor
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+    - cron: '15,30,45 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只取数打印，不发飞书"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enclave-decrypt-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read health and conditionally post alert (stdlib only)
+        env:
+          FEEDLING_API_URL: ${{ vars.PROD_MAIN_API_URL || 'https://api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
+          LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
+          ENCLAVE_ALERT_WINDOW_MINUTES: ${{ vars.ENCLAVE_ALERT_WINDOW_MINUTES }}
+          ENCLAVE_ALERT_MIN_UNAVAILABLE: ${{ vars.ENCLAVE_ALERT_MIN_UNAVAILABLE }}
+          ENCLAVE_ALERT_UNAVAILABLE_RATE: ${{ vars.ENCLAVE_ALERT_UNAVAILABLE_RATE }}
+          ALERT_SCHEDULE: ${{ github.event.schedule }}
+          ALERT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=()
+          case "${ALERT_SCHEDULE:-}" in
+            '0 * * * *') args+=(--run-minute 0) ;;
+            '15,30,45 * * * *') args+=(--run-minute 15) ;;
+          esac
+          if [ "${ALERT_DRY_RUN:-false}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 tools/enclave_decrypt_alert.py "${args[@]}"

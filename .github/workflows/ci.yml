@@ -1030,6 +1030,8 @@ jobs:
             tests/test_chat_incremental_sync.py \
             tests/test_v2_jobs_migration.py \
             tests/test_lane_rollup.py \
+            tests/test_enclave_decrypt_health.py \
+            tests/test_enclave_decrypt_alert.py \
             tests/test_distillation_ledger.py \
             tests/test_e2e_tools.py \
             tests/test_e2e_p0_fallback_gate.py \
