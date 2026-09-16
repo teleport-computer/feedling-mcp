@@ -59,6 +59,8 @@ canonical_owner: self
 
 ## 排查入口
 
+- enclave 解密告警：`GET /v1/admin/enclave-decrypt-health`（admin 鉴权、`window_minutes=15`、可选 `end_epoch`）读取最后两个墙钟对齐的完整 `(start, end]` 窗口，只返回已记录的终态 trace 计数和白名单 purpose 标签；不是全部调用成功率（成功 trace 可被静默/合批）。`tools/enclave_decrypt_alert.py` 经外部 `.github/workflows/enclave-decrypt-monitor.yml` 每 15 分钟读取，默认不可用事件 ≥20 且 `不可用/(done+不可用) ≥20%` 才触发；401/403/其他非传输错误不参与判定，无分母返回 `null`。开始/持续中/已恢复由两窗比较，持续提醒仅整点计划，取数失败发“量不到”并非零退出。阈值由 `ENCLAVE_ALERT_*` repository variables 覆盖；窗口改长时仍须考虑固定 15 分钟调度和无状态比较的重复/漏报边界，延迟/重跑不保证恰好一次。只用已有 admin/Lark secrets；schedule 仅在 main 生效，合入 test 不会启用告警。
+
 - 运行时名词与两侧符号映射：`docs/testing/RUNTIME_MAP.md`。
 - 测试选择入口：`docs/testing/README.md`；完成标准与 L1/L2/L3 矩阵：`docs/testing/TESTING.md`。
 - 部署流程和环境记录：`deploy/DEPLOYMENTS.md`。其中已明确标为 superseded/historical 的段落不是当前指令。
