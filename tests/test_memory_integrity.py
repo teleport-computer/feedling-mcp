@@ -4,7 +4,7 @@ import copy
 import pytest
 
 from genesis import import_engine
-from memory import action_receipts, garden_import
+from memory import action_receipts, actions, garden_import
 import db
 from test_memory_store_conformance import IoHost
 import test_memory_store_conformance as conformance_host
@@ -180,3 +180,89 @@ def test_import_fallback_replay_keeps_original_success(io_world):
     assert first[0]
     assert writer([mutation], "fallback_batch") == first
     assert len(host.history("alice")) == 1
+
+
+@pytest.mark.parametrize("rejection,status", [
+    ("memory_content_too_long", 400),
+    ("memory_idempotency_conflict", 409),
+])
+def test_import_card_rejection_keeps_valid_siblings_without_replay(io_world, rejection, status):
+    host = IoHost(io_world)
+    store = host._store("alice")
+    executions = []
+
+    def execute(*args, **kwargs):
+        result = actions._execute_memory_actions(*args, **kwargs)
+        executions.append(copy.deepcopy(result[0]["results"]))
+        return result
+
+    real_writer = import_engine.store_writer(store, None, execute=execute)
+    seeded_ids = []
+
+    def write(mutations, key):
+        if rejection == "memory_idempotency_conflict" and not seeded_ids:
+            # Commit a different payload under the first card's actual import
+            # key, so the real receipt lookup returns 409 for just that card.
+            original = copy.deepcopy(mutations[0])
+            original["card"]["content"] = "先前写入的完整内容必须保留，不能被冲突卡覆盖。"
+            seeded_ids.extend(import_engine.store_writer(store, None)([original], key))
+        return real_writer(mutations, key)
+
+    rejected = fixture._card("周末常去西湖边骑车")
+    if rejection == "memory_content_too_long":
+        rejected["content"] = "字" * 5001
+    valid = [fixture._card("每天早上一杯冰美式"), fixture._card("三月十二号是妈妈的生日")]
+    model = fixture.Model([("三件事", fixture._reply(rejected, *valid))])
+    saves = []
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    kwargs = dict(sources=fixture._sources("窗口：三件事\n"), job_key="card-rejection",
+                  owner_key=host._uid("alice"), write=write,
+                  save=lambda doc: saves.append(copy.deepcopy(doc)))
+    result = garden_import.run_import(**kwargs, state=state, existing_cards=[], complete=model)
+
+    assert result.done and (result.cards_written, result.dropped) == (2, 1)
+    assert len(model.prompts) == len(executions) == 1
+    rows = executions[0]
+    assert len(rows) == 3
+    assert (rows[0]["error"], rows[0]["http_status"]) == (rejection, status)
+    ids = [garden_import.row_memory_id(row) for row in rows]
+    assert ids[0] == "" and all(ids[1:])
+    assert [host.inspect("alice", rid)["content"] for rid in ids[1:]] == [
+        card["content"] for card in valid]
+    assert len(host.history("alice")) == 2 + len(seeded_ids)
+    if seeded_ids:
+        assert host.inspect("alice", seeded_ids[0])["content"] == "先前写入的完整内容必须保留，不能被冲突卡覆盖。"
+    assert saves[-1]["pending"] is None
+    assert all((doc.get("pending") or {}).get("replays", 0) == 0 for doc in saves)
+
+    resumed_model = fixture.Model([], default="MUST NOT CALL")
+    resumed = garden_import.run_import(**kwargs, state=saves[-1],
+                                      existing_cards=host.history("alice"), complete=resumed_model)
+    assert resumed.done and (resumed.cards_written, resumed.dropped) == (2, 1)
+    assert not resumed_model.prompts and len(executions) == 1
+
+
+def test_import_all_oversized_cards_clear_pending_and_retry_model(io_world):
+    host = IoHost(io_world)
+    writer = import_engine.store_writer(host._store("alice"), None)
+    cards = [{**fixture._card(summary), "content": "字" * 5001}
+             for summary in ("周末常去西湖边骑车", "每天早上一杯冰美式")]
+    model = fixture.Model([("两件事", fixture._reply(*cards))])
+    state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
+    saves = []
+    kwargs = dict(sources=fixture._sources("窗口：两件事\n"), job_key="all-oversized",
+                  owner_key=host._uid("alice"), existing_cards=[], write=writer,
+                  save=lambda doc: saves.append(copy.deepcopy(doc)))
+
+    with pytest.raises(garden_import.GardenImportCardsRejected, match="memory_content_too_long"):
+        garden_import.run_import(**kwargs, state=state, complete=model)
+    assert len(model.prompts) == 1 and host.history("alice") == []
+    assert saves[-1]["pending"] is None
+    assert not saves[-1]["sessions"]["1:history"].get("done")
+
+    valid = fixture._card("周末常去西湖边骑车")
+    retry_model = fixture.Model([("两件事", fixture._reply(valid))])
+    result = garden_import.run_import(**kwargs, state=saves[-1], complete=retry_model)
+    assert result.done and (result.cards_written, result.dropped) == (1, 0)
+    assert len(retry_model.prompts) == 1
+    assert len(host.history("alice")) == 1 and saves[-1]["pending"] is None

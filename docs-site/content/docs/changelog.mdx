@@ -12,6 +12,8 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- History imports now reject individual oversized or idempotency-conflicting cards while saving valid siblings, instead of failing the entire job; an entirely rejected batch still fails and asks the model again on retry.
+
 - **Memory writes no longer silently shorten plaintext card bodies at 5000
   characters.** Oversize writes return `memory_content_too_long`; full fetch
   preserves historical longer cards. Optional per-action `idempotency_key`

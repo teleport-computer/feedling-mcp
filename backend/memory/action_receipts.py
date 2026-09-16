@@ -15,6 +15,7 @@ from core.store import UserStore
 from memory import service
 
 MAX_IDEMPOTENCY_KEY_CHARS = 160
+IDEMPOTENCY_CONFLICT = "memory_idempotency_conflict"
 
 
 def execute(
@@ -40,7 +41,7 @@ def execute(
             if row is not None:
                 saved = row[0]
                 if saved["digest"] != digest:
-                    return {"status": "error", "error": "memory_idempotency_conflict"}, [], 409
+                    return {"status": "error", "error": IDEMPOTENCY_CONFLICT}, [], 409
                 return {**saved["receipt"], "replayed": True}, [], 200
             result, effects, status = dispatch()
             if status < 400:
