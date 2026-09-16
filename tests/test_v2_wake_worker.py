@@ -1878,22 +1878,30 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert _job_status(job_id)[0] == "completed"
 
 
-def test_proactive_policy_defaults_to_speaking_with_concrete_silence_reasons():
+def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
     prompt = worker._WAKE_SYSTEM_PROMPT
-    assert "speaking is the normal way to end a wake" in prompt
-    assert "concrete reason" in prompt
-    assert "sleeping hours and they are offline" in prompt
-    assert "within the last hour" in prompt
+    silent = cap_tool_schema.DESCRIPTIONS[cap_tool_schema.STAY_SILENT_TOOL]
+    choice = worker.v2_tool_loop._WAKE_CHOICE_INSTRUCTION
+    for text in (prompt, silent, choice):
+        assert "within the last hour" not in text
+        assert "concrete reason" not in text
+        assert "honestly have nothing" in text
+        assert "clearly intrude" in text
+    assert "do you feel like reaching out to them right now?" in prompt
+    assert "say it; reaching out is what these moments are for" in prompt
+    assert "not having answered your last message is not a reason to hold back" in prompt
+    assert "showing up again a few hours later is normal" in prompt
+    assert "not answering your last message is not a reason by itself" in silent
+    for text in (prompt, silent):
+        assert "they asked not to be disturbed, or they are plainly asleep" in text
+    assert "calling reply if there is anything you want to say to them" in choice
     assert "in the middle of something" in prompt
     assert "Never mention this wake or any system wording" in prompt
     assert "showing up a lot lately" not in prompt
     assert "Both are good ways" not in prompt
     assert "Neither choice is preferred" not in worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
-    silent = cap_tool_schema.DESCRIPTIONS[cap_tool_schema.STAY_SILENT_TOOL]
-    assert "concrete reason" in silent
     assert "not an error" not in silent
     assert "normal way to end a wake" in worker.v2_tool_loop._WAKE_REPLY_TOOL_SPEC.description
-    assert "concrete reason" in worker.v2_tool_loop._WAKE_CHOICE_INSTRUCTION
 
 
 def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
@@ -2528,8 +2536,8 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
 @pytest.mark.parametrize(
     ("trigger", "expected_require_reply", "prompt_fragment"),
     [
-        ("broadcast_opened", False, "speaking is the normal way to end a wake"),
-        ("broadcast_closed", False, "speaking is the normal way to end a wake"),
+        ("broadcast_opened", False, "do you feel like reaching out to them right now?"),
+        ("broadcast_closed", False, "do you feel like reaching out to them right now?"),
     ],
 )
 def test_broadcast_edge_wake_reply_policy(

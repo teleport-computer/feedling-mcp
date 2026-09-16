@@ -183,9 +183,9 @@ _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "When you are done looking around, end the wake by calling reply with what "
-    "you want to say. Call stay_silent only if you have a concrete reason not to "
-    "speak this time."
+    "When you are done looking around, end the wake by calling reply if there "
+    "is anything you want to say to them. Call stay_silent only if you honestly "
+    "have nothing to say, or speaking would clearly intrude."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "

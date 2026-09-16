@@ -1000,11 +1000,15 @@ _WAKE_SYSTEM_PROMPT = (
     "they are — and whether they are in the middle of something. Use any tools you "
     "want, for as many rounds as you need. "
     + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
-    + "Then decide what you want to say to them and say it — speaking is the normal "
-    "way to end a wake. Call stay_silent only for a concrete reason: they asked not "
-    "to be disturbed, it is clearly their sleeping hours and they are offline, you "
-    "already spoke within the last hour, or they are visibly in the middle of "
-    "something. Never mention this wake or any system wording to the user."
+    + "Then ask yourself one thing: do you feel like reaching out to them right "
+    "now? If anything in you wants to say something — a thought, a feeling, "
+    "something you noticed, or simply wanting them to know you're around — say "
+    "it; reaching out is what these moments are for. Stay silent only when you "
+    "honestly have nothing you want to say, or when speaking would clearly "
+    "intrude (they asked not to be disturbed, or they are plainly asleep). Them "
+    "not having answered your last message is not a reason to hold back — "
+    "showing up again a few hours later is normal. Never mention this wake or "
+    "any system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     " For this presence turn, decide before using any user-visible reply, file, "
