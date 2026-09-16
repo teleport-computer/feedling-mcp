@@ -1232,6 +1232,7 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
             "final": True,
             "error_class": "upstream_unavailable",
             "reason": "tool_markup_leak_sanitized",
+            "narrated_tool_calls": 0,
         }
     ]
 
@@ -1347,6 +1348,67 @@ def test_wake_prose_fragment_delivery_is_not_changed_by_cut_signal(
             "final": True,
         }
         assert prose not in json.dumps(cut_events, ensure_ascii=False)
+
+
+def test_wake_full_chain_strips_narrated_tool_call(monkeypatch):
+    """T621 on the wake outlet: a proactive message that narrates a call keeps
+    its prose and drops the bracket; the trace counts the narrated call."""
+    lane = "heartbeat"
+    uid = "u_wake_narrated_tool_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    prompt = "一只在夜景里打伞的猫"
+    narrated = f'想你了，给你画一张\n[Calling generate_image with prompt: "{prompt}"]'
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    decryptor = _patch_user_decryptable_envelopes(monkeypatch, uid)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "晚安"}]
+    )
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    try:
+        status = asyncio.run(
+            worker._run_wake(
+                job_id,
+                uid,
+                lane,
+                deps,
+                _BYOK,
+                asyncio.Semaphore(4),
+                claimed_by,
+            )
+        )
+        store = core_store.get_store(uid)
+        store.reload()
+        bubble = next(
+            row for row in store.chat_messages
+            if row.get("role") == "openclaw" and row.get("source") == "model_api"
+        )
+        plaintext = decryptor.decrypt_reply(bubble)
+    finally:
+        decryptor._http.close()
+
+    assert status == "completed"
+    assert plaintext == "想你了，给你画一张"
+    sanitized = [
+        trace for trace in traces if trace["event_type"] == "agent.reply.sanitized"
+    ]
+    assert [trace["detail"] for trace in sanitized] == [
+        {
+            "lane": lane,
+            "final": True,
+            "error_class": "upstream_unavailable",
+            "reason": "tool_markup_leak_sanitized",
+            "narrated_tool_calls": 1,
+        }
+    ]
+    assert prompt not in json.dumps(sanitized, ensure_ascii=False)
 
 
 def test_wake_markup_only_reply_sleeps_without_bubble(monkeypatch):

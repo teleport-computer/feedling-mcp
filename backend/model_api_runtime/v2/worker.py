@@ -1686,6 +1686,18 @@ def _coverage_incomplete_reason(reject_code: str = "") -> str:
 _is_degenerate_reply = tool_markup_leak.is_degenerate_visible_text
 
 
+def _leak_guard_tool_names(mcp_tool_specs) -> frozenset[str]:
+    """Tool names the model could have narrated this turn (T621).
+
+    Platform catalogue plus the MCP tools offered on this turn; the guard also
+    accepts tool-looking names on its own, so this only widens the anchor to
+    names like ``task`` that carry no underscore.
+    """
+    names = {str(spec.name) for spec in cap_tool_schema.build_tool_specs()}
+    names.update(str(spec.name) for spec in (mcp_tool_specs or ()) if str(spec.name))
+    return frozenset(names)
+
+
 class DedicatedVisionUnavailable(RuntimeError):
     """A pinned V2 image observer failed before the main model saw pixels."""
 
@@ -10649,16 +10661,25 @@ async def _run_wake(
             # wake fails silently), but every user-visible text outlet must call the
             # same closed-set parser before sealing an envelope.
             if text:
-                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                leak_guard_names = _leak_guard_tool_names(
+                    _current_offered_mcp_tool_specs()
+                )
+                narrated_tool_calls = tool_markup_leak.find_narrated_tool_calls(
+                    text, tool_names=leak_guard_names
+                )
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(
+                    text, tool_names=leak_guard_names
+                )
                 if removed_tool_markup:
                     log.warning(
                         "[v2.worker] wake tool markup stripped user=%s job=%s "
-                        "lane=%s final=%s error_class=%s",
+                        "lane=%s final=%s error_class=%s narrated_tool_calls=%d",
                         user_id,
                         job_id,
                         lane,
                         final,
                         tool_markup_leak.ERROR_CLASS,
+                        len(narrated_tool_calls),
                     )
                     if deps.emit_debug_trace is not None:
                         try:
@@ -10669,14 +10690,15 @@ async def _run_wake(
                                 status="error",
                                 summary="V2 主动回复已剥离工具调用标记",
                                 explain=(
-                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
-                                    "标记已在下发前移除。"
+                                    "可见文本混入工具协议标记（中转的 XML 标记，或模型把"
+                                    "工具调用写成了文字）；正文已保留，标记已在下发前移除。"
                                 ),
                                 detail={
                                     "lane": lane,
                                     "final": bool(final),
                                     "error_class": tool_markup_leak.ERROR_CLASS,
                                     "reason": tool_markup_leak.REASON,
+                                    "narrated_tool_calls": len(narrated_tool_calls),
                                 },
                             )
                         except Exception as exc:  # noqa: BLE001 — best-effort trace
@@ -15741,16 +15763,30 @@ async def process_job(
             # calls.  Keep any useful reply body, but never render the closed set
             # of known tool markers.  This intentionally runs after the JSON
             # protocol guard and before downloadable-reply sanitization.
+            # T621: the same closed set also covers a *narrated* call —
+            # ``[Calling generate_image with prompt: "…"]`` written as prose with
+            # finish=stop and no structured call (usr_7f30, 2026-09-16). Nothing
+            # ran, so the bracket must not reach the user; the prose around it
+            # still does.
             if file_reply is None and text:
-                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                leak_guard_names = _leak_guard_tool_names(
+                    _current_offered_mcp_tool_specs()
+                )
+                narrated_tool_calls = tool_markup_leak.find_narrated_tool_calls(
+                    text, tool_names=leak_guard_names
+                )
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(
+                    text, tool_names=leak_guard_names
+                )
                 if removed_tool_markup:
                     log.warning(
                         "[v2.worker] chat tool markup stripped user=%s job=%s "
-                        "final=%s error_class=%s",
+                        "final=%s error_class=%s narrated_tool_calls=%d",
                         user_id,
                         job_id,
                         final,
                         tool_markup_leak.ERROR_CLASS,
+                        len(narrated_tool_calls),
                     )
                     if deps.emit_debug_trace is not None:
                         try:
@@ -15761,14 +15797,15 @@ async def process_job(
                                 status="error",
                                 summary="V2 回复已剥离工具调用标记",
                                 explain=(
-                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
-                                    "标记已在下发前移除。"
+                                    "可见文本混入工具协议标记（中转的 XML 标记，或模型把"
+                                    "工具调用写成了文字）；正文已保留，标记已在下发前移除。"
                                 ),
                                 detail={
                                     "lane": "chat",
                                     "final": bool(final),
                                     "error_class": tool_markup_leak.ERROR_CLASS,
                                     "reason": tool_markup_leak.REASON,
+                                    "narrated_tool_calls": len(narrated_tool_calls),
                                 },
                             )
                         except Exception as exc:  # noqa: BLE001 — best-effort trace
