@@ -2852,7 +2852,10 @@ async def _generate_image_for_chat(
         except ValueError as exc:
             # Closed set only: Pillow's own ValueError text (e.g. its
             # decompression-bomb guard) must not reach trace/log verbatim.
-            reject_code = generated_image.reject_code(exc)
+            # ``classify_generated_image_reject`` is a declared sanitizer; only
+            # its ``code`` field may be read into a trace.
+            reject = generated_image.classify_generated_image_reject(exc)
+            reject_code = reject.code
             _emit_v2_debug_trace(
                 _image_store, "agent.image.generate.invalid", status="warning",
                 summary="generated image rejected before delivery",

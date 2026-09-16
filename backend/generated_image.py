@@ -28,10 +28,25 @@ GENERATED_IMAGE_REJECT_CODES = frozenset({
 _CANONICAL_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
 
+@dataclass(frozen=True)
+class GeneratedImageReject:
+    """Classified normalization failure. ``code`` is the only field a trace
+    may carry; it is always a member of ``GENERATED_IMAGE_REJECT_CODES``."""
+    code: str
+
+
+def classify_generated_image_reject(exc: BaseException) -> GeneratedImageReject:
+    """Closed-set classification of one normalization failure (the sanitizer
+    seam ``tests/test_trace_detail_provenance.py`` recognises by name)."""
+    text = str(exc or "").strip()
+    return GeneratedImageReject(
+        code=text if text in GENERATED_IMAGE_REJECT_CODES else "generated_image_invalid"
+    )
+
+
 def reject_code(exc: BaseException) -> str:
     """Closed-set reject code for one normalization failure."""
-    text = str(exc or "").strip()
-    return text if text in GENERATED_IMAGE_REJECT_CODES else "generated_image_invalid"
+    return classify_generated_image_reject(exc).code
 
 
 def canonical_declared_mime(value: object) -> str:

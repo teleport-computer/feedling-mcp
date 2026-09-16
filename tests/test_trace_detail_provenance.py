@@ -91,6 +91,12 @@ SANITIZER_RESULT_FIELDS: dict[str, frozenset[str]] = {
     #                status_class=<"400"|"401"|...|"4xx">) — T528: the server's
     # rejection text stays in the process log; only these two codes reach the trace.
     "classify_reply_rejection": frozenset({"error_class", "status_class"}),
+    # GeneratedImageReject(code=<member of generated_image.GENERATED_IMAGE_REJECT_CODES>)
+    # — T620: a rejected generated image is traced by its closed-set code; the
+    # raising check's own text (Pillow's wording included) never leaves the
+    # classifier. ``tests/test_v2_worker_failure_detail.py`` pins the set to the
+    # module's raise sites.
+    "classify_generated_image_reject": frozenset({"code"}),
 }
 
 # Producers that may still carry exception text, each with the reason it is
