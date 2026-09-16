@@ -18,6 +18,15 @@ change must not be interpreted as an API guarantee.
   a chat bubble. Ordinary sentences containing those words still pass through;
   foreground chat and explicitly scheduled reminders retain their existing behavior.
 
+- Runtime V2 now validates a generated image inside the image-generation step
+  instead of while publishing the reply. When a provider or relay returns media
+  the runtime cannot decode or normalize, the agent receives an
+  `image_generation_invalid_output` tool error and may retry the generation or
+  reply in text; the turn no longer fails with the generic fallback message
+  after the image had already been generated. The specific reject reason is traced as
+  `agent.image.generate.invalid` (code only, never pixels), and worker failure
+  records may carry a registered `error_detail` code naming the check that raised.
+
 - **Regular V2 wakes let the agent decide whether it wants to reach out.**
   The instructions remove the fixed recent-contact exception list. Silence is
   appropriate when the agent has nothing it wants to say or speaking would

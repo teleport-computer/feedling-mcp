@@ -10473,6 +10473,7 @@ _DEBUG_STEP_LABELS = {
     "vision.provider.completed": ("👁", "视觉模型 · 调用结束"),
     "agent.image.generate.start": ("🎨", "生图 · 开始"),
     "agent.image.generate.done": ("🎨", "生图 · 成功"),
+    "agent.image.generate.invalid": ("🎨", "生图 · 图片无法处理"),
     "agent.image.generate.failed": ("🎨", "生图 · 失败"),
     # 语音四个失败出口在页面上本来长得一模一样。标签里必须写出
     # 「仍返回 200」——那是这条道最反直觉、最容易被当成成功的地方:

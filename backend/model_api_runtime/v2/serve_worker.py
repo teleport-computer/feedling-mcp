@@ -2835,6 +2835,57 @@ async def _generate_image_for_chat(
         await raise_provider_failure(
             provider_client.ProviderError("image_generation_invalid_output")
         )
+    # Validate the pixels HERE, inside the generation step, not later in the
+    # reply publisher. usr_7f30 2026-09-15/16: a relay's gpt-image-2 answered
+    # media the normalizer rejected; ``on_reply`` raised ValueError after
+    # ``agent.image.generate.done`` had already fired, the whole turn was
+    # marked failed, and the user got the fallback bubble instead of either
+    # the image or an honest sentence (3 of 5 generations). Failing in this
+    # step lands in the tool loop's existing generation-failure branch: the
+    # model gets a tool error and answers truthfully, the turn survives, and
+    # the specific reject code is traced instead of swallowed as "valueerror".
+    for index, item in enumerate(media, start=1):
+        try:
+            await asyncio.to_thread(
+                v2_worker._generated_image_reply_from_provider, item, index=index
+            )
+        except ValueError as exc:
+            # Closed set only: Pillow's own ValueError text (e.g. its
+            # decompression-bomb guard) must not reach trace/log verbatim.
+            # ``classify_generated_image_reject`` is a declared sanitizer; only
+            # its ``code`` field may be read into a trace.
+            reject = generated_image.classify_generated_image_reject(exc)
+            reject_code = reject.code
+            _emit_v2_debug_trace(
+                _image_store, "agent.image.generate.invalid", status="warning",
+                summary="generated image rejected before delivery",
+                explain="生图模型返回的图片无法处理,本轮按生图失败交回模型。",
+                detail={
+                    **_image_route_detail,
+                    "media_count": len(media),
+                    "media_index": index,
+                    "reject_code": reject_code,
+                    "declared_mime": generated_image.canonical_declared_mime(
+                        getattr(item, "mime_type", "")
+                    ),
+                },
+            )
+            log.warning(
+                "[v2.image] generated image rejected user=%s provider=%s model=%s "
+                "index=%d reject_code=%s",
+                str(user_id)[:8],
+                _image_route_detail["provider"],
+                _image_route_detail["model"],
+                index,
+                reject_code,
+            )
+            raise v2_worker.ImageGenerationUnavailable(
+                "generated image rejected",
+                error_code="image_generation_invalid_output",
+                model=str(getattr(config, "model", "") or ""),
+                provider=str(getattr(config, "provider", "") or ""),
+                upstream_detail=reject_code,
+            ) from exc
     _emit_v2_debug_trace(
         _image_store, "agent.image.generate.done", status="ok",
         summary="image generation done",
