@@ -17,7 +17,6 @@ import db
 from psycopg.types.json import Jsonb
 from notices import status_reason as notices_status_reason
 from proactive import capture_daily, capture_jobs
-from memory import migration as memory_migration
 from memory.capture_failure import capture_failure_patch as _capture_failure_patch
 from memory.capture_failure import frontier_seq as _frontier_seq
 from memory.capture_failure import SUCCESS_RESET_PATCH as _SUCCESS_RESET_PATCH
@@ -95,16 +94,6 @@ def append_refresh_deferred() -> bool:
     return str(mode or "deferred").strip().lower() != "sync"
 
 
-def migrate_window_sec() -> float:
-    # One legacy-migration batch per user per this window (default 1h). Lower to
-    # drain a backlog faster in test / quiet windows.
-    return _env_float("FEEDLING_MIGRATE_WINDOW_SEC", 3600.0, lo=60.0, hi=86400.0)
-
-
-def migrate_reaudit_sec() -> float:
-    return _env_float("FEEDLING_MIGRATE_REAUDIT_SEC", memory_migration.DEFAULT_REAUDIT_SEC, hi=2592000.0)
-
-
 def _now_iso(now: float | None = None) -> str:
     ts = time.time() if now is None else float(now)
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -164,8 +153,6 @@ def _state_doc(raw: Any) -> dict[str, Any]:
             0, int(_safe_float(doc.get("capture_skipped_windows"), 0.0))
         ),
         "last_capture_skipped_at": _safe_float(doc.get("last_capture_skipped_at"), 0.0),
-        "migrate_fail_streak": max(0, int(_safe_float(doc.get("migrate_fail_streak"), 0.0))),
-        "last_migrate_failed_at": _safe_float(doc.get("last_migrate_failed_at"), 0.0),
         "last_seen_message_id": str(doc.get("last_seen_message_id") or "")[:160],
         "last_seen_ts": _safe_float(doc.get("last_seen_ts"), 0.0),
         "turns_since_capture": max(0, int(_safe_float(doc.get("turns_since_capture"), 0.0))),
@@ -858,43 +845,6 @@ def record_v2_capture_status(
     return refresh_capture_state_from_chat(store, now=now_ts)
 
 
-def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
-    """Legacy→v1 migration trigger — rides the same quiet window as capture.
-
-    Enqueues one migration batch job when the user is quiet AND the migration-state
-    cache isn't 'done'. Card SHAPE stays the source of truth (handler re-scans), so
-    the state blob is only a cheap gate. Single-flight + active-maintenance guard
-    live in enqueue_memory_migrate_job, so this never runs alongside capture/dream."""
-    if not memory_migration.migration_enabled():
-        return {"enqueued": False, "reason": "migration_disabled", "job": None}
-    now_ts = time.time() if now is None else float(now)
-    state = load_capture_state(store)
-    quiet_for = now_ts - _safe_float(state.get("last_seen_ts"), 0.0)
-    if quiet_for < quiet_sec():
-        return {"enqueued": False, "reason": "quiet_not_due", "quiet_for_sec": quiet_for, "job": None}
-    # 失败退避（同 _enqueue_window）：migrate 的每小时新 window key 不挡同 key
-    # 重试，坏钥用户会在窗口内每 tick 重建 job。
-    if capture_jobs.in_failure_backoff(
-        int(state.get("migrate_fail_streak") or 0),
-        _safe_float(state.get("last_migrate_failed_at"), 0.0),
-        now_ts,
-    ):
-        return {"enqueued": False, "reason": "failure_backoff", "job": None}
-    mig_state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    if not memory_migration.should_enqueue(mig_state):
-        # 'done' — but periodically re-scan once (a card may have reverted to old
-        # shape via some legacy path); handler re-confirms done if nothing legacy.
-        if not memory_migration.reaudit_due(mig_state, now=now_ts, reaudit_sec=migrate_reaudit_sec()):
-            return {"enqueued": False, "reason": "migration_done", "job": None}
-    # One batch per user per window (single-flight serializes anyway); a new window
-    # = a new key = the next batch. Default 1h; FEEDLING_MIGRATE_WINDOW_SEC to tune.
-    window_id = str(int(now_ts // max(1.0, migrate_window_sec())))
-    migrate_key = memory_migration.migrate_key_for_window(store.user_id, window_id)
-    job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
-        store, trigger="quiet_window_migrate", migrate_key=migrate_key, now=now_ts)
-    return {"enqueued": enqueued, "reason": reason, "job": job}
-
-
 def _capture_trace_job_id(job: Mapping[str, Any]) -> str:
     return str(job.get("job_id") or "")[:120]
 
@@ -919,28 +869,6 @@ def _trace_safe_reason(job: Mapping[str, Any]) -> str:
     """
     raw = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
     return notices_status_reason.sanitize_status_reason(raw)
-
-
-def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
-    """migrate 终态只维护失败退避 streak——window 游标由 handler 自己重扫，
-    这里不像 capture 那样推进 last_captured_*。"""
-    if not capture_jobs.is_memory_migrate_job(job):
-        return load_capture_state(store)
-    status_text = str(status or job.get("status") or "").strip().lower()
-    now_ts = time.time() if now is None else float(now)
-    state = load_capture_state(store)
-    if status_text == "completed":
-        state["migrate_fail_streak"] = 0
-        state["last_migrate_failed_at"] = 0.0
-    elif status_text == "failed":
-        state["migrate_fail_streak"] = int(state.get("migrate_fail_streak") or 0) + 1
-        state["last_migrate_failed_at"] = now_ts
-    else:
-        return state
-    state = save_capture_state(store, state, now=now_ts)
-    capture_jobs.notify_backoff(store, lane="migrate", status=status_text,
-                                streak=int(state.get("migrate_fail_streak") or 0))
-    return state
 
 
 def _record_legacy_window_failure(store, job: Mapping[str, Any], failed_window: Mapping[str, Any], *,

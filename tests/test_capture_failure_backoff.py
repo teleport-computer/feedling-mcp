@@ -1,4 +1,4 @@
-"""Memory-maintenance（capture/dream/migrate）失败退避（2026-07-06 修复的回归测试）。
+"""Memory-maintenance（capture/dream）失败退避（2026-07-06 修复的回归测试）。
 
 背景：坏钥用户的 capture 窗口永远失败，而 min_interval 只看
 last_capture_completed_at（仅 completed 时更新），failed 属
@@ -13,7 +13,7 @@ CAPTURE_RETRYABLE_TERMINAL 会立即重新入队 → 每个调度 tick（现网 
   （默认 6h）。
 - completed 重置 streak。
 - 手动 force（debug 面板）绕过退避。
-- dream / migrate 两条 maintenance lane 同样退避。
+- dream maintenance lane 同样退避。
 """
 from __future__ import annotations
 
@@ -165,58 +165,11 @@ def test_dream_failed_job_backs_off(tmp_path, monkeypatch):
     assert after["enqueued"] is True
 
 
-def test_migrate_failed_job_backs_off(tmp_path, monkeypatch):
-    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
-    store = _store(tmp_path, monkeypatch, "usr_migrate_backoff")
-
-    now = 2_000_000.0
-    first = capture_scheduler.tick_quiet_migrate(store, now=now)
-    assert first["enqueued"] is True
-    _fail_job(store, first["job"], now + 5, capture_scheduler.record_migrate_job_status)
-
-    retry = capture_scheduler.tick_quiet_migrate(store, now=now + 80)
-    assert retry["enqueued"] is False
-    assert retry["reason"] == "failure_backoff"
-
-    after = capture_scheduler.tick_quiet_migrate(store, now=now + 5 + 601)
-    assert after["enqueued"] is True
-
-
-def test_job_status_route_records_migrate_failure(tmp_path, monkeypatch):
-    """proactive_core.job_status 是 consumer 上报终态的真实入口——migrate 失败
-    必须像 capture/dream 一样被记入退避状态。"""
-    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
-    from proactive import proactive_core
-    store = _store(tmp_path, monkeypatch, "usr_migrate_route_backoff")
-
-    first = capture_scheduler.tick_quiet_migrate(store, now=3_000_000.0)
-    assert first["enqueued"] is True
-    body, code = proactive_core.job_status(
-        store, first["job"]["job_id"], {"status": "failed", "reason": "boom"},
-    )
-    assert code == 200
-
-    state = capture_scheduler.load_capture_state(store)
-    assert int(state.get("migrate_fail_streak") or 0) == 1
-    assert float(state.get("last_migrate_failed_at") or 0.0) > 0.0
-
-
 def test_duplicate_failed_report_does_not_double_streak(tmp_path, monkeypatch):
     """consumer 可能对同一 job 重复上报终态 failed（重试/幂等重放）——streak
     只在状态真正转变为 failed 的那次推进，否则退避会被无故翻倍。"""
-    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
     monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "10")
     from proactive import proactive_core
-
-    # migrate lane（route 级）
-    store = _store(tmp_path, monkeypatch, "usr_migrate_dup_failed")
-    first = capture_scheduler.tick_quiet_migrate(store, now=4_000_000.0)
-    assert first["enqueued"] is True
-    job_id = first["job"]["job_id"]
-    proactive_core.job_status(store, job_id, {"status": "failed", "reason": "boom"})
-    proactive_core.job_status(store, job_id, {"status": "failed", "reason": "boom again"})
-    state = capture_scheduler.load_capture_state(store)
-    assert int(state.get("migrate_fail_streak") or 0) == 1
 
     # capture lane（route 级）
     store2 = _store(tmp_path, monkeypatch, "usr_capture_dup_failed")
@@ -454,3 +407,16 @@ def test_chat_clear_waits_for_the_fenced_legacy_failure_write(tmp_path, monkeypa
     assert errors == []
     assert results["clear"] is not None
     assert db.get_blob_strict(store.user_id, "capture_state") is None
+
+
+def test_capture_state_ignores_retired_migration_fields_without_rewriting_blob(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, "usr_retired_migration_fields")
+    old_state = {"capture_fail_streak": 2, "last_seen_message_id": "m1",
+                 "migrate_fail_streak": "obsolete", "last_migrate_failed_at": "obsolete"}
+    db.set_blob(store.user_id, capture_scheduler.CAPTURE_STATE_KIND, old_state)
+    state = capture_scheduler.load_capture_state(store)
+    assert state["capture_fail_streak"] == 2
+    assert state["last_seen_message_id"] == "m1"
+    assert "migrate_fail_streak" not in state
+    assert "last_migrate_failed_at" not in state
+    assert db.get_blob(store.user_id, capture_scheduler.CAPTURE_STATE_KIND) == old_state

@@ -809,8 +809,11 @@ plaintext adds create new cards even if their contents match. Prebuilt envelopes
 are validated from metadata and envelope shape without decrypting their body
 during the add, and exact sealed-card replays follow the ID rule in section 1.
 
-`memory.upgrade` exists for controlled legacy migration, but it is not part of
-the public Memory workflow and should not be emitted by ordinary clients.
+`memory.upgrade` has been retired and returns HTTP 400 with
+`unsupported_memory_action`. The former `/v1/memory/legacy_batch` and
+`/v1/memory/migration_state` endpoints return HTTP 404. Existing cards with legacy
+`title`/`description` fields remain readable and recallable through the read-side
+adapters; they are not rewritten.
 
 ## Synchronize encrypted records
 

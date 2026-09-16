@@ -17,6 +17,8 @@ change must not be interpreted as an API guarantee.
   failures use the system-owned spawn-failure notice instead of asking users
   to check their model API key or balance.
 
+- Retired legacy-card migration endpoints (`/v1/memory/legacy_batch` and `/v1/memory/migration_state`) and the `memory.upgrade` action. Existing legacy cards remain readable and recallable through read-side adapters, without rewriting stored data.
+
 - **Screen-watch wakes follow the same speaking default as regular V2 wakes.**
   The agent is prompted to say something about what it sees when it wants to;
   silence is appropriate when it has nothing to say or would break the user's

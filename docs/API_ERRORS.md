@@ -473,7 +473,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `genesis_partial` | — | system | warning | genesis：蒸馏跑完但有记忆卡片被丢弃（`apply_reducer_output` / `plaintext.py` 直传路径统计 dropped>0） |
 | `import_failed` | — | system | error | history_import：聊天记录导入失败 |
 | `import_stale` | — | system | error | history_import：导入 job 卡在 queued/processing 超过阈值，判定超时失败 |
-| `memory_backoff` | — | system；capture 失败原因可识别为账号/模型服务问题时为 user_provider / provider_transient | warning | memory：capture/migrate/dream 三条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避。capture 的 `user_text` 会带上错误对照表里的原因（如额度不足）；capture 跳过一批或成功后 resolve |
+| `memory_backoff` | — | system；capture 失败原因可识别为账号/模型服务问题时为 user_provider / provider_transient | warning | memory：capture/dream 两条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避。capture 的 `user_text` 会带上错误对照表里的原因（如额度不足）；capture 跳过一批或成功后 resolve |
 | `runner_spawn_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 拉起 per-user 子进程失败 |
 | `runner_key_decrypt_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 为 per-user 子进程解密 provider key 失败 |
 | `runner_degraded` | — | system | warning | **历史兼容，不再产生**：旧 resident 子进程 runtime-token 刷新失败 |

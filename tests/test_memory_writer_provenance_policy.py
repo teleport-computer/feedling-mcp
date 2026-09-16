@@ -217,7 +217,6 @@ def test_repo_memory_writer_provenance_matches_closed_policy():
         "hosted_runtime_state",
         "memory_capture",
         "memory_dream",
-        "memory_migrate",
         "model_api_correction",
         "model_api_repair",
     }

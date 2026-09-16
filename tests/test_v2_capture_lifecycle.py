@@ -408,7 +408,7 @@ def test_v2_device_boundary_and_compatibility_endpoints_never_write_legacy(
     assert event["capture"]["reason"] == "v2_coalesced"
     assert status == 200 and capture_tick["reason"] == "v2_coalesced"
     assert capture_tick["dream"]["reason"] == "v2_scheduler_owned"
-    assert capture_tick["migrate"]["reason"] == "v2_scheduler_owned"
+    assert "migrate" not in capture_tick
     assert capture_force["reason"] == "v2_coalesced"
     assert dream_status == 200 and dream_tick["reason"] == "v2_scheduler_owned"
     assert len(calls) == 3

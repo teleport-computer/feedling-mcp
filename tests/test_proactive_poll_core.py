@@ -278,7 +278,6 @@ def test_old_watermark_exempt_jobs_do_not_expire(store, monkeypatch):
     for job_id, job_kind in (
         ("pj_old_capture", "memory_capture"),
         ("pj_old_dream", "memory_dream"),
-        ("pj_old_migrate", "memory_migrate"),
     ):
         _append_pending_job(store, job_id=job_id, job_kind=job_kind, ts=old_ts)
 
@@ -286,7 +285,6 @@ def test_old_watermark_exempt_jobs_do_not_expire(store, monkeypatch):
         "pj_old_intro",
         "pj_old_capture",
         "pj_old_dream",
-        "pj_old_migrate",
     }
     assert all(job["status"] == "pending" for job in _proactive_jobs_by_id(store).values())
 
@@ -295,8 +293,8 @@ def test_old_watermark_exempt_jobs_do_not_expire(store, monkeypatch):
 # memory maintenance latest-only selection
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("job_kind", ["memory_dream", "memory_migrate"])
-def test_dream_and_migrate_only_poll_latest_pending_by_ts(store, job_kind):
+def test_dream_only_polls_latest_pending_by_ts(store):
+    job_kind = "memory_dream"
     # Append out of timestamp order so selection cannot accidentally rely on seq.
     _append_pending_job(store, job_id=f"{job_kind}_newest", job_kind=job_kind, ts=300.0)
     _append_pending_job(
@@ -337,21 +335,17 @@ def test_all_pending_memory_capture_jobs_remain_pollable(store):
 def test_latest_only_selection_is_independent_per_maintenance_kind(store):
     for job_id, job_kind, ts in (
         ("dream_old", "memory_dream", 100.0),
-        ("migrate_new", "memory_migrate", 400.0),
         ("capture_fixed", "memory_capture", 150.0),
         ("dream_new", "memory_dream", 300.0),
-        ("migrate_old", "memory_migrate", 200.0),
     ):
         _append_pending_job(store, job_id=job_id, job_kind=job_kind, ts=ts)
 
     assert {job["job_id"] for job in _poll(store)} == {
         "dream_new",
-        "migrate_new",
         "capture_fixed",
     }
     jobs = _proactive_jobs_by_id(store)
     assert jobs["dream_old"]["status_reason"] == "superseded_by_newer"
-    assert jobs["migrate_old"]["status_reason"] == "superseded_by_newer"
 
 
 def test_latest_only_selection_does_not_touch_claimed_or_realizing(store):

@@ -234,8 +234,9 @@ def test_public_operation_and_parameter_inventory(
     # GET /v1/chat/workspace/body and GET /v1/chat/canvases add two bodyless
     # Canvas read operations.
     # Agent body generation adds one API-key-only JSON operation.
-    assert len(operations) == 179
-    assert sum("requestBody" in operation for operation in operations.values()) == 85
+    # Retiring legacy-card migration removes one GET and two POST operations.
+    assert len(operations) == 176
+    assert sum("requestBody" in operation for operation in operations.values()) == 83
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -1061,3 +1062,10 @@ def test_resident_vision_probe_result_is_not_public(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
     assert ("post", "/v1/internal/vision/main/test/result") not in operations
+
+
+def test_retired_memory_migration_is_not_advertised(public_schema):
+    assert "/v1/memory/legacy_batch" not in public_schema["paths"]
+    assert "/v1/memory/migration_state" not in public_schema["paths"]
+    action_types = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]["enum"]
+    assert "memory.upgrade" not in action_types

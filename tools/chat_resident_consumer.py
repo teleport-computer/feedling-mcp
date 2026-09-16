@@ -197,7 +197,6 @@ from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
 from memgarden.prompts.buckets import normalize_bucket_language
-from memgarden import contracts as mg_contracts
 from memory import garden_component
 from memgarden.text.card_text import (
     count_user_token_residuals,
@@ -247,7 +246,6 @@ class _AgentBodyLogFilter(logging.Filter):
 
 
 log.addFilter(_AgentBodyLogFilter())
-
 
 
 @dataclass
@@ -558,7 +556,7 @@ PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", 
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
 PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
 PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
-# Maintenance soft-idle: memory maintenance jobs (capture/dream/migrate) wait for a
+# Maintenance soft-idle: memory maintenance jobs (capture/dream) wait for a
 # lull in the conversation — don't start a maintenance model turn within IDLE_SEC of
 # the user's last message ("the user just came back and wants to TALK"), but never
 # defer a job past MAX_DEFER_SEC (a heavy chatter must still get memory upkeep).
@@ -572,8 +570,6 @@ CAPTURE_AGENT_REASK_BUDGET = 1
 # 12000 装不下一通电话 + 同窗口的文字聊天，会把前面的文字**静默**砍掉。
 # 40000 = 转写预算 30000 + 文字聊天 10000。
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "40000"))
-
-
 
 
 # 单通电话展开进窗口的预算。**必须大于通话时长上限能产出的字数**，否则采样会
@@ -1497,7 +1493,7 @@ def _note_agent_turn_success() -> None:
 def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:
     """Failure reason that keeps the underlying message, not just the exception
     type. The chat lane records the full error (``agent_call_failed: {e}``), but
-    the capture/dream/migrate lanes historically recorded only
+    the capture/dream lanes historically recorded only
     ``{prefix}:{type(e).__name__}`` — so a relay rejection (call_agent raises
     ``RuntimeError("pi agent produced no reply: 403 ...insufficient_user_quota")``)
     surfaced in job aggregations as an opaque ``RuntimeError``, indistinguishable
@@ -13943,15 +13939,15 @@ def canonicalize_action_type(action_type: str) -> str:
     return _ACTION_TYPE_ALIASES.get(str(action_type or ""), str(action_type or ""))
 
 
-# spec 3.4 十二类型(canonical 形态)。故意把别名字面量也留在集合里跟 spec 逐字
-# 对齐——canonicalize 之后真正会被查到的只有 7 个 canonical 值(其余 5 个别名
+# 当前十一类型(canonical 形态)。故意把别名字面量也留在集合里跟 spec 逐字
+# 对齐——canonicalize 之后真正会被查到的只有 6 个 canonical 值(其余 5 个别名
 # 经 canonicalize 后已经折叠掉,不会以别名形式出现在判定里),多留的条目是防御
 # 性的,无害。identity.replace 刻意不在清单里:写卡原则只有蒸馏任务可以整卡替
 # 换,其余一律走 profile_patch。
 _ACTION_ALLOWLIST: frozenset = frozenset({
     "memory.add", "memory.create", "memory.add_correction",
     "memory.patch", "memory.content_patch", "memory.supersede",
-    "memory.upgrade", "memory.delete",
+    "memory.delete",
     "identity.profile_patch", "identity.patch",
     "identity.dimension_nudge", "identity.relationship_days_set",
 })
@@ -14016,7 +14012,6 @@ def _memory_batch_observation(actions: list[dict], body: dict) -> dict:
     applied: dict[str, int] = {
         "added": 0,
         "superseded": 0,
-        "upgraded": 0,
         "deleted": 0,
         "retyped": 0,
     }
@@ -14032,7 +14027,6 @@ def _memory_batch_observation(actions: list[dict], body: dict) -> dict:
             key = {
                 "memory.add": "added",
                 "memory.supersede": "superseded",
-                "memory.upgrade": "upgraded",
                 "memory.delete": "deleted",
                 "memory.retype": "retyped",
             }.get(action_type, "other")
@@ -18275,7 +18269,7 @@ def _capture_inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
     return inner
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "", voice_call_id: str = "") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -18295,10 +18289,6 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         user_pk_bytes=user_pk,
         enclave_pk_bytes=enc_pk,
         visibility="shared",
-        # Migration must seal with the ORIGINAL card id so the AEAD AAD (owner|v|id)
-        # matches on decrypt and the upgraded card stays readable AND id-stable.
-        # capture/dream (new cards) pass "" -> build_envelope mints a random id.
-        item_id=item_id or None,
     )
     envelope.update({
         "type": str(card.get("type") or "event").strip().lower() or "event",
@@ -19892,7 +19882,7 @@ def _process_dream_jobs(jobs: list) -> float:
 def _process_proactive_jobs(jobs: list) -> float:
     """Realize hidden proactive jobs through the same configured agent entry.
     The user-turn priority gate lives in ``_process_resident_jobs`` (it must
-    cover capture/dream/migrate model turns too, not just proactive)."""
+    cover capture/dream model turns too, not just proactive)."""
     latest = 0.0
     # One moment, one turn: decide the folds before realizing anything, so a
     # burst of perception triggers becomes a single agent turn instead of one
@@ -20495,192 +20485,6 @@ def _process_proactive_jobs(jobs: list) -> float:
     return latest
 
 
-def _is_memory_migrate_job(job: dict) -> bool:
-    return (
-        str((job or {}).get("job_kind") or "").strip() == "memory_migrate"
-        or str((job or {}).get("source") or "").strip() == "memory_migrate"
-    )
-
-
-def _migrate_render_old_cards(batch: list[dict]) -> str:
-    """Render the legacy batch (raw old inner) for the migrate prompt — id + only
-    the old content fields that are present."""
-    lines: list[str] = []
-    for row in batch:
-        inner = row.get("inner") if isinstance(row.get("inner"), dict) else {}
-        fields = {
-            k: inner.get(k)
-            for k in ("title", "description", "her_quote", "context", "linked_dimension")
-            if inner.get(k)
-        }
-        lines.append(json.dumps({"id": row.get("id"), **fields}, ensure_ascii=False))
-    return "\n".join(lines) if lines else "（没有要升级的卡）"
-
-
-def _process_migrate_jobs(jobs: list) -> float:
-    """Realize memory_migrate jobs: upgrade a batch of legacy cards to v1 in place.
-
-    Server picks + raw-decrypts the legacy batch (/v1/memory/legacy_batch); the
-    agent derives v1; we write each back via memory.upgrade (in-place,保 id, CAS).
-    A card counts as migrated ONLY on upgrade status=ok; skipped(stale)/empty(db
-    write fail)/parser-dropped all stay for the next quiet window (self-heal);
-    skipped(not_found) just drops (card gone). Writes only memory actions + the
-    migration-state cache; never posts chat.
-    """
-    latest = 0.0
-    from memory.migration import migration_enabled
-    if not migration_enabled():
-        return latest  # FEEDLING_MIGRATE_ENABLE off → full stop, don't process queued migrate jobs
-    for job in jobs:
-        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
-        latest = max(latest, ts)
-        if not _is_memory_migrate_job(job):
-            continue
-        key = _proactive_job_key(job)
-        if not _mark_seen(key):
-            continue
-        job_id = str(job.get("job_id") or "")
-        try:
-            if not claim_proactive_job(job_id):
-                log.info("migrate job not claimed id=%s", job_id)
-                continue
-        except Exception as e:
-            log.error("migrate job claim failed id=%s: %s", job_id, e)
-            continue
-        update_proactive_job_status(job_id, "realizing")
-
-        try:
-            batch_size = max(1, min(int(os.environ.get("FEEDLING_MIGRATE_BATCH", "8")), 50))
-        except (TypeError, ValueError):
-            batch_size = 8
-        batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": batch_size})
-        if not isinstance(batch_body.get("batch"), list) or "legacy_remaining" not in batch_body:
-            reason = "legacy_batch_unavailable"
-            update_proactive_job_status(
-                job_id, "failed", reason,
-                extra={"migrate_result": {"status": "failed", "reason": reason}},
-            )
-            log.warning("migrate job failed id=%s reason=%s body_keys=%s",
-                        job_id, reason, sorted(batch_body.keys()) if isinstance(batch_body, dict) else [])
-            continue
-        batch = batch_body.get("batch") if isinstance(batch_body.get("batch"), list) else []
-        legacy_remaining = int(batch_body.get("legacy_remaining") or 0)
-        if not batch:
-            _capture_post_json("/v1/memory/migration_state", payload={"migrated": 0, "legacy_remaining": 0})
-            update_proactive_job_status(
-                job_id, "completed", "migrate_no_legacy",
-                extra={"migrate_result": {"status": "noop", "reason": "no_legacy", "migrated": 0}},
-            )
-            log.info("migrate job completed noop (no legacy) id=%s", job_id)
-            continue
-
-        allowed_ids = {str(r.get("id")) for r in batch if r.get("id")}
-        hash_by_id = {str(r.get("id")): str(r.get("old_body_hash") or "") for r in batch}
-        _identity, ai_name, user_name, _identity_text = _capture_identity_context()
-        buckets_text, threads_text = _capture_memory_terms_context()
-        # 迁移走 GardenComponent —— 拼提示词 / 调模型 / 解析在包里。
-        # 白名单必填是接口保证的：模型可能凭空造 id，那会把不存在的卡
-        # 「升级」成新内容或覆盖别的卡。
-        _migrate_garden = garden_component.build_garden(
-            garden_component.CallableModel(
-                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
-            ),
-        )
-        try:
-            _migrated = _migrate_garden.migrate(mg_contracts.MigrateRequest(
-                old_cards=_migrate_render_old_cards(batch),
-                allowed_ids=tuple(sorted(allowed_ids)),
-                vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
-                ai_name=ai_name,
-                user_name=user_name,
-                locale=infer_garden_language(
-                    _identity,
-                    existing_buckets=buckets_text,
-                    archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
-                ),
-            ))
-        except Exception as e:
-            reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
-            log.error("migrate agent call failed id=%s: %s", job_id, e)
-            update_proactive_job_status(
-                job_id, "failed", reason,
-                extra={"migrate_result": {"status": "failed", "reason": reason}},
-            )
-            continue
-        upgrades, unmigrated_ids, err = (
-            _migrated.upgrades, _migrated.unmigrated_ids, _migrated.error
-        )
-        if err:
-            update_proactive_job_status(
-                job_id, "failed", err,
-                extra={"migrate_result": {"status": "failed", "reason": err}},
-            )
-            continue
-
-        occurred_at = _format_message_time(time.time())
-        migrated = 0
-        # A11: any batch card that did NOT migrate this round is a failed attempt — the
-        # agent dropped it (unmigrated_ids) OR envelope build / memory.upgrade failed.
-        # Seed with the parser's unmigrated set, then add per-card write failures and
-        # remove the ones that actually succeed. The server bumps each card's attempt
-        # count; after FEEDLING_MIGRATE_MAX_ATTEMPTS it marks the card skipped so it
-        # stops looping and legacy_remaining can reach 0.
-        failed_ids: set[str] = set(unmigrated_ids)
-        for up in upgrades:
-            mid = str(up.get("id") or "")
-            if not mid:
-                continue
-            try:
-                envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate", item_id=mid)
-            except Exception as e:
-                log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
-                failed_ids.add(mid)
-                continue  # retry next round (until cap)
-            # Let memory.upgrade carry the existing metadata (don't reset). Migration
-            # is not a "user just used this memory", so last_referenced_at must NOT be
-            # bumped to now — drop it (and importance/pulse) so existing values stay.
-            envelope.pop("importance", None)
-            envelope.pop("pulse", None)
-            envelope.pop("last_referenced_at", None)
-            body = _capture_post_json("/v1/memory/actions", payload={"action": {
-                "type": "memory.upgrade",
-                "id": mid,
-                "envelope": envelope,
-                "old_body_hash": hash_by_id.get(mid, ""),
-            }})
-            res = (body.get("results") or [{}])[0] if isinstance(body, dict) else {}
-            if res.get("status") == "ok" and not res.get("skipped"):
-                migrated += 1
-                failed_ids.discard(mid)
-            else:
-                # skipped(stale)/empty(db_write_failed,network)/dropped → not migrated → counts
-                # as a failed attempt → retry next window until the per-card cap is hit.
-                failed_ids.add(mid)
-
-        remaining = max(0, legacy_remaining - migrated)
-        _capture_post_json("/v1/memory/migration_state", payload={
-            "migrated": migrated,
-            "legacy_remaining": remaining,
-            "failed_ids": sorted(failed_ids),
-        })
-        update_proactive_job_status(
-            job_id, "completed", "migrate_batch_done",
-            extra={"migrate_result": {
-                "status": "ok",
-                "migrated": migrated,
-                "batch": len(batch),
-                "unmigrated": len(unmigrated_ids),
-                "failed": len(failed_ids),
-                "remaining": remaining,
-            }},
-        )
-        log.info(
-            "migrate job completed id=%s migrated=%d/%d unmigrated=%d failed=%d remaining=%d",
-            job_id, migrated, len(batch), len(unmigrated_ids), len(failed_ids), remaining,
-        )
-    return latest
-
-
 _resident_jobs_deferred_for_user = False
 
 # Wall-clock time of the last REAL user message this process routed to the agent
@@ -20690,12 +20494,12 @@ _last_user_message_wall = 0.0
 
 
 def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float:
-    """Dispatch background jobs (capture → dream → migrate → proactive) one at
+    """Dispatch background jobs (capture → dream → proactive) one at
     a time, each through its class processor as a single-element batch.
 
     ① user-turn priority: when ``chat_since`` is given, peek (claim-free,
     non-blocking) for a waiting user message BEFORE each job's model turn — ALL
-    four classes call the agent, so the gate must sit here, not inside any one
+    three classes call the agent, so the gate must sit here, not inside any one
     processor. If a user message is pending, stop and defer the remaining jobs:
     a waiting human then waits at most the current, non-preemptible model turn,
     never a whole batch. On defer, sets ``_resident_jobs_deferred_for_user`` so
@@ -20712,10 +20516,8 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
             ordered.append((0, _process_capture_jobs, job))
         elif isinstance(job, dict) and _is_memory_dream_job(job):
             ordered.append((1, _process_dream_jobs, job))
-        elif isinstance(job, dict) and _is_memory_migrate_job(job):
-            ordered.append((2, _process_migrate_jobs, job))
         else:
-            ordered.append((3, _process_proactive_jobs, job))
+            ordered.append((2, _process_proactive_jobs, job))
     ordered.sort(key=lambda entry: entry[0])  # stable: keeps arrival order within a class
     latest = 0.0
     now = time.time()
@@ -20733,7 +20535,7 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
         # on the server, so they re-serve on a later poll — no defer flag, no break,
         # wake-class jobs after them still run this pass. The MAX_DEFER cap stops a
         # heavy chatter from starving memory maintenance forever.
-        if class_idx < 3 and _last_user_message_wall > 0:
+        if class_idx < 2 and _last_user_message_wall > 0:
             job_ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
             recently_chatting = (now - _last_user_message_wall) < MAINTENANCE_IDLE_SEC
             deferrable = not job_ts or (now - job_ts) < MAINTENANCE_MAX_DEFER_SEC
@@ -24055,7 +23857,7 @@ def run() -> None:
                     jobs = job_result.get("jobs") or []
                     if jobs:
                         # ① user-turn priority: a waiting user must never queue behind
-                        # background job turns (capture/dream/migrate/proactive — each
+                        # background job turns (capture/dream/proactive — each
                         # a full model turn). Turns are single-flight per user, so a
                         # batch would otherwise hold the lock while the user's reply
                         # waits — the "typing… forever" the user sees.

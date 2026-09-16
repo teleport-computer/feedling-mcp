@@ -5,15 +5,11 @@ Mirrors the Flask ``/v1/memory/*`` routes: each requires an authenticated user
 delegates to the framework-neutral ``memory.memory_core`` so the response bodies
 are byte-identical to Flask's.
 
-Auth/scope: the Flask routes gate three write surfaces on
-``runtime_auth.authorize_scope("memory")`` — ``/actions``, ``/legacy_batch`` and
-the **POST** side of ``/migration_state`` — so those carry
-``Depends(require_scope("memory"))`` here. The GET side of ``/migration_state``
-and every read route gate on auth only, matching Flask exactly.
+Auth/scope: ``/actions`` requires ``Depends(require_scope("memory"))``.
+Every read route requires authentication only.
 
 E2E boundary: ``body_ct`` fields are v1 E2E envelopes, never decrypted
-server-side. The readside (index/fetch/buckets/threads) and the migration
-decrypt (legacy_batch) forward the caller's credential to the enclave exactly as
+server-side. The readside (index/fetch/buckets/threads) forwards the caller's credential to the enclave exactly as
 Flask does — api key from the resolved ``AuthResult`` (the same value
 ``auth._extract_api_key()`` returns on the api-key path) and the raw
 ``X-Feedling-Runtime-Token`` header (which the enclave prefers when present, so
@@ -116,7 +112,7 @@ async def memory_threads(request: Request, auth: AuthResult = Depends(require_au
 async def memory_actions(request: Request, auth: AuthResult = Depends(require_scope("memory"))):
     # The runtime token is forwarded for the SAME reason as the four readside
     # routes above: a hosted caller (Stage D swaps X-API-Key for the token) has no
-    # per-user api_key, and supersede/patch/upgrade must decrypt the OLD card via
+    # per-user api_key, and supersede/patch must decrypt the OLD card via
     # the enclave before rewriting it. Without it that decrypt raises
     # api_key_unavailable → 409 memory_decrypt_failed for every hosted user.
     runtime_token = auth_core.extract_runtime_token(request.headers) or ""
@@ -124,37 +120,6 @@ async def memory_actions(request: Request, auth: AuthResult = Depends(require_sc
     body, status = await threadpool.run_db(
         memory_core.actions, auth.store, auth.api_key, payload,
         runtime_token=runtime_token)
-    return JSONResponse(body, status_code=status)
-
-
-# --------------------------------------------------------------------------- #
-# migration state — GET auth-only, POST scope:memory (two handlers, same path)
-# --------------------------------------------------------------------------- #
-
-@router.get("/v1/memory/migration_state")
-async def memory_migration_state_get(auth: AuthResult = Depends(require_auth)):
-    body, status = await threadpool.run_db(memory_core.migration_state_get, auth.store)
-    return JSONResponse(body, status_code=status)
-
-
-@router.post("/v1/memory/migration_state")
-async def memory_migration_state_post(
-    request: Request, auth: AuthResult = Depends(require_scope("memory"))
-):
-    payload = (await asgi_http.read_json_silent(request)) or {}
-    body, status = await threadpool.run_db(
-        memory_core.migration_state_post, auth.store, payload)
-    return JSONResponse(body, status_code=status)
-
-
-@router.post("/v1/memory/legacy_batch")
-async def memory_legacy_batch(
-    request: Request, auth: AuthResult = Depends(require_scope("memory"))
-):
-    runtime_token = auth_core.extract_runtime_token(request.headers) or ""
-    payload = (await asgi_http.read_json_silent(request)) or {}
-    body, status = await threadpool.run_db(
-        memory_core.legacy_batch, auth.store, auth.api_key, runtime_token, payload)
     return JSONResponse(body, status_code=status)
 
 

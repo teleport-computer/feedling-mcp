@@ -863,7 +863,7 @@ def run_proactive_probe(c, cfg) -> dict:
         cases.extend([
             _case("wake_coalescing_window", lambda: _case_wake_coalescing(c)),
             _case("stale_wake_900s_expiry", lambda: _case_stale_wake_expiry(c)),
-            _case("dream_migrate_latest_only", lambda: _case_dream_latest_only(c)),
+            _case("dream_latest_only", lambda: _case_dream_latest_only(c)),
             _blocked_case(
                 "maintenance_soft_gap_backoff",
                 "the user/admin surfaces expose legacy job aggregates but no controllable resident-consumer soft-gap clock",

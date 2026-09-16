@@ -336,13 +336,10 @@ def capture_tick(store, payload: dict):
             )
         )
         out["dream"] = _dream_response_doc(_v2_dream_scheduler_noop(store))
-        out["migrate"] = {"enqueued": False, "reason": "v2_scheduler_owned"}
         return out, 200
     result = capture_scheduler.tick_quiet_capture(store, now=now)
     out = _capture_response_doc(result)
     out["dream"] = _dream_response_doc(dream_scheduler.tick_memory_dream(store, now=now))
-    migrate = capture_scheduler.tick_quiet_migrate(store, now=now)
-    out["migrate"] = {"enqueued": bool(migrate.get("enqueued")), "reason": migrate.get("reason", "")}
     return out, 200
 
 
@@ -613,8 +610,6 @@ def job_status(store, job_id, payload: dict):
             capture_scheduler.record_capture_job_status(store, job, status=new_status)
         if capture_jobs.is_memory_dream_job(job):
             dream_scheduler.record_dream_job_status(store, job, status=new_status)
-        if capture_jobs.is_memory_migrate_job(job):
-            capture_scheduler.record_migrate_job_status(store, job, status=new_status)
     return {"job": job}, 200
 
 
