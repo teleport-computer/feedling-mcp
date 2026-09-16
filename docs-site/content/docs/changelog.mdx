@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 now validates a generated image inside the image-generation step
+  instead of while publishing the reply. When a provider or relay returns media
+  the runtime cannot decode or normalize, the agent receives an
+  `image_generation_invalid_output` tool error and may retry the generation or
+  reply in text; the turn no longer fails with the generic fallback message
+  after the image had already been generated. The specific reject reason is traced as
+  `agent.image.generate.invalid` (code only, never pixels), and worker failure
+  records may carry a slug-shaped `error_detail` naming the check that raised.
+
 - Long-running memory jobs now refresh a same-user runtime token and retry enclave decryption once after a 401, preventing expired tokens from failing the remaining decryptions when the enclave is slow.
 
 - History imports now reject individual oversized or idempotency-conflicting cards while saving valid siblings, instead of failing the entire job; an entirely rejected batch still fails and asks the model again on retry.

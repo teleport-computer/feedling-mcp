@@ -267,3 +267,92 @@ def test_v2_internal_media_processing_bug_does_not_poison_route(monkeypatch):
 
     assert marked == [], "an internal adapter bug must not change route health"
     assert [event["type"] for event in events] == ["agent.image.generate.start"]
+
+
+# --------------------------------------------------------------------------- #
+# T620: media the normalizer rejects fails INSIDE the generation step, not in
+# the reply publisher. usr_7f30 2026-09-15/16: a relay's gpt-image-2 answered
+# something decode/normalize refused; the ValueError escaped from on_reply after
+# "generate.done" had fired, the whole turn was marked failed and the user saw
+# the fallback bubble (3 of 5 generations). Now the tool loop's ordinary
+# generation-failure branch handles it and the reject code is traced.
+# --------------------------------------------------------------------------- #
+
+def _run_media(monkeypatch, media):
+    events = []
+    marked = []
+    monkeypatch.setattr(serve_worker.db, "model_api_image_generation_route", lambda _uid: None)
+    monkeypatch.setattr(serve_worker.db, "model_api_active_route", lambda _uid: {"id": "active-route"})
+    monkeypatch.setattr(serve_worker.db, "model_api_route_mark_image_generation_test",
+                        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True)
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda uid: SimpleNamespace(user_id=uid))
+    monkeypatch.setattr(serve_worker, "_emit_v2_debug_trace",
+                        lambda _store, event_type, **kwargs: events.append({"type": event_type, **kwargs}))
+
+    async def generated(*_args, **_kwargs):
+        return {"media": media}
+    monkeypatch.setattr(serve_worker.provider_client, "generate_image_async", generated)
+    coro = serve_worker._generate_image_for_chat(
+        "usr_test", "private image prompt", main_provider_config=_cfg(), api_key=None, runtime_token="tok")
+    return coro, events, marked
+
+
+@pytest.mark.parametrize("data_base64,expected_reject", [
+    ("https://relay.example/out.png", "generated_image_base64_invalid"),   # URL instead of bytes
+    ("aW1hZ2U=", "generated_image_invalid"),                                # bytes that are not an image
+    ("data:image/png,notbase64", "generated_image_data_url_invalid"),       # data URL without ;base64
+])
+def test_rejected_generated_media_fails_as_tool_error_with_reject_code(monkeypatch, data_base64, expected_reject):
+    coro, events, marked = _run_media(monkeypatch, [{"mime_type": "image/png", "data_base64": data_base64}])
+    with pytest.raises(serve_worker.v2_worker.ImageGenerationUnavailable) as caught:
+        asyncio.run(coro)
+    # the tool loop keys its generation-failure branch on this class + code
+    assert caught.value.error_code == "image_generation_invalid_output"
+    assert caught.value.upstream_detail == expected_reject
+    assert expected_reject not in str(caught.value)            # message stays content/code-free
+    kinds = [event["type"] for event in events]
+    assert kinds == ["agent.image.generate.start", "agent.image.generate.invalid"]
+    invalid = events[1]
+    assert invalid["status"] == "warning"
+    assert invalid["detail"]["reject_code"] == expected_reject
+    assert invalid["detail"]["media_index"] == 1
+    assert "data_base64" not in json.dumps(invalid)              # pixels never traced
+    assert marked == [], "a bad answer from the relay must not flip route health"
+
+
+def test_valid_generated_media_still_completes_and_marks_route_ok(monkeypatch):
+    import base64, io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (255, 128, 0)).save(buf, format="PNG")
+    png_b64 = base64.b64encode(buf.getvalue()).decode()
+    coro, events, marked = _run_media(monkeypatch, [{"mime_type": "image/png", "data_base64": png_b64}])
+    media = asyncio.run(coro)
+    assert len(media) == 1
+    assert [event["type"] for event in events] == ["agent.image.generate.start", "agent.image.generate.done"]
+    assert marked == [{"status": "ok"}]
+
+
+
+def test_pillow_free_text_and_arbitrary_mime_never_reach_trace_or_exception(monkeypatch):
+    import base64, io
+    from PIL import Image
+    # A real PNG whose body is corrupted after the header: Pillow raises with
+    # its own wording, which must collapse to the closed-set code.
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(buf, format="PNG")
+    corrupt = bytearray(buf.getvalue()); corrupt[40:60] = b"\x00" * 20
+    weird_mime = "image/png; secret=sk_test_synthetic_secret_123"
+    coro, events, marked = _run_media(monkeypatch, [{"mime_type": weird_mime,
+                                                    "data_base64": base64.b64encode(bytes(corrupt)).decode()}])
+    with pytest.raises(serve_worker.v2_worker.ImageGenerationUnavailable) as caught:
+        asyncio.run(coro)
+    from generated_image import GENERATED_IMAGE_REJECT_CODES
+    assert caught.value.upstream_detail in GENERATED_IMAGE_REJECT_CODES
+    invalid = events[1]
+    assert invalid["type"] == "agent.image.generate.invalid"
+    assert invalid["detail"]["reject_code"] in GENERATED_IMAGE_REJECT_CODES
+    assert invalid["detail"]["declared_mime"] == "image/png"
+    serialized = json.dumps(events) + str(caught.value)
+    assert "secret" not in serialized and "Decompress" not in serialized and "Too Large" not in serialized
+    assert marked == []

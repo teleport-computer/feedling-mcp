@@ -961,6 +961,8 @@ jobs:
             tests/test_v2_multimodal_e2e.py \
             tests/test_v2_serve_worker_images.py \
             tests/test_v2_worker_images.py \
+            tests/test_v2_worker_failure_detail.py \
+            tests/test_v2_image_generation_guidance.py \
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
