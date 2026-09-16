@@ -38,7 +38,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
-from memory import garden_component
+from memory import action_receipts, content_policy, garden_component
 
 log = logging.getLogger(__name__)
 
@@ -305,6 +305,8 @@ CARD_LEVEL_ERRORS = frozenset({
     "description_required",
     "memory_card_polluted",
     "memory_card_tombstone",
+    content_policy.ContentTooLong.code,
+    action_receipts.IDEMPOTENCY_CONFLICT,
 })
 
 #: supersede 的目标已经不在了（被删、被别的写入先取代）—— 新卡内容仍然有效，改成新增，
