@@ -22,6 +22,12 @@ change must not be interpreted as an API guarantee.
   with a tool-looking name is recognized; ordinary bracketed text and fenced
   code are untouched.
 
+- **Regular V2 wakes suppress bare protocol tokens sent as reply text.**
+  An otherwise valid `reply` whose entire text is a token such as `stay_silent`,
+  `speak`, or `__verify_ack__` now ends silently without retrying or creating
+  a chat bubble. Ordinary sentences containing those words still pass through;
+  foreground chat and explicitly scheduled reminders retain their existing behavior.
+
 - Runtime V2 now validates a generated image inside the image-generation step
   instead of while publishing the reply. When a provider or relay returns media
   the runtime cannot decode or normalize, the agent receives an
