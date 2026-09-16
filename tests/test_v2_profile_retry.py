@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from model_api_runtime.v2 import profile_retry
+from model_api_runtime.v2 import profile_retry, profile_store
 
 
 @pytest.mark.parametrize(
@@ -96,7 +96,7 @@ def test_retry_policy_matrix(
 
 @pytest.mark.parametrize(
     ("previous_attempts", "delay"),
-    [(0, 300.0), (1, 600.0), (2, 1200.0), (99, 21600.0)],
+    [(0, 300.0), (1, 600.0), (2, 1200.0), (7, 21600.0)],
 )
 def test_transient_retry_uses_bounded_exponential_delay(previous_attempts, delay):
     decision = profile_retry.decide_profile_retry(
@@ -166,3 +166,47 @@ def test_unknown_code_cannot_be_promoted_by_partial_text_match():
 
     assert decision.disposition == "terminal"
     assert decision.retry_not_before == 0.0
+
+
+# ── T607: transient backoff is bounded; a relay answering a dead route with 5xx
+# must not keep a profile job alive forever. Past the cap the job parks as
+# provider_config (auto re-armed by the next successful foreground chat), never
+# terminal (operator-only).
+
+@pytest.mark.parametrize(
+    ("previous_attempts", "disposition"),
+    [
+        (profile_retry.TRANSIENT_MAX_RETRY_ATTEMPTS - 1, "scheduled"),   # attempt == cap: last retry
+        (profile_retry.TRANSIENT_MAX_RETRY_ATTEMPTS, "provider_config"),  # attempt == cap + 1: park
+        (10, "provider_config"),                                          # prod shape: attempt 11
+    ],
+)
+def test_transient_retry_parks_as_provider_config_after_cap(previous_attempts, disposition):
+    decision = profile_retry.decide_profile_retry(
+        error_class="transient_exhausted",
+        reject_code="profile_generation_failed:providererror",
+        previous_retry_family="transient",
+        previous_retry_attempts=previous_attempts,
+        now=1000.0,
+    )
+    assert decision.disposition == disposition
+    assert decision.retry_family == "transient"
+    assert decision.retry_attempts == previous_attempts + 1
+    assert decision.reason == "profile_generation_failed:providererror"
+    if disposition == "provider_config":
+        assert decision.retry_not_before == 0.0
+        assert decision.disposition in profile_store.PROFILE_PROVIDER_SUCCESS_RECOVERABLE_DISPOSITIONS
+        assert decision.disposition != "terminal"
+
+
+def test_transient_cap_counts_only_consecutive_transient_attempts():
+    # A family switch resets the counter: the cap never "remembers" a different
+    # failure family's attempts.
+    decision = profile_retry.decide_profile_retry(
+        error_class="transient_exhausted",
+        reject_code="profile_generation_failed:providererror",
+        previous_retry_family="shape",
+        previous_retry_attempts=profile_retry.TRANSIENT_MAX_RETRY_ATTEMPTS + 5,
+        now=1000.0,
+    )
+    assert decision.disposition == "scheduled" and decision.retry_attempts == 1

@@ -39,6 +39,17 @@ _SOURCE_CODE_RE = re.compile(
     r"index_failed:[0-9]+|fetch_failed:[0-9]+))$"
 )
 _GENERATION_ERROR_RE = re.compile(r"^profile_generation_failed:[a-z0-9_]+$")
+# Transient failures (5xx / 429 / timeouts / exhausted transport retries) back
+# off exponentially, but a relay that answers a dead key or a retired model
+# with 503 instead of 4xx looks "transient" forever. Measured 2026-09-16 on
+# prod (T607): 8 profile jobs created at the V2 cutover for users whose route
+# had been failing since June–August were on attempt 11 after 32 hours, one
+# retry every 6 hours, with no success in sight. After this many consecutive
+# transient attempts (~16.6 h of backoff) the job parks as ``provider_config``:
+# it stops on its own, and the existing rule "one successful foreground chat
+# re-arms provider-config failures" resumes it once the user's key works again.
+# Deliberately not ``terminal`` — that disposition needs an operator.
+TRANSIENT_MAX_RETRY_ATTEMPTS = 8
 
 
 @dataclass(frozen=True)
@@ -100,6 +111,10 @@ def decide_profile_retry(
     )
     reason = _retry_reason(family, reject_code)
     if family == "transient":
+        if retry_attempts > TRANSIENT_MAX_RETRY_ATTEMPTS:
+            return ProfileRetryDecision(
+                "provider_config", family, retry_attempts, 0.0, reason
+            )
         delay = min(21600.0, 300.0 * (2 ** max(0, retry_attempts - 1)))
         return ProfileRetryDecision(
             "scheduled", family, retry_attempts, float(now) + delay, reason
