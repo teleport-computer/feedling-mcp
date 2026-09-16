@@ -39,7 +39,7 @@ from memgarden import CaptureRequest  # noqa: E402
 from memgarden.policies import CONVERSATION_CAPTURE  # noqa: E402
 
 from memory import garden_component  # noqa: E402
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402
+from memory.garden_component import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402
 from model_api_runtime.v2 import extraction as v2_extraction  # noqa: E402
 
 LOCALE = "zh-Hans"
@@ -209,7 +209,7 @@ for name in order:
 from memgarden import CaptureRequest
 from memgarden.policies import CONVERSATION_CAPTURE
 from memory import garden_component
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
+from memory.garden_component import IO_CONVERSATION_CAPTURE_POLICY
 import memgarden.component as kc
 import memgarden.prompts.capture as kp
 
@@ -231,11 +231,9 @@ print(json.dumps({{
 
 @pytest.mark.parametrize("order", [
     ["memgarden.component", "memgarden.prompts.capture",
-     "memory.capture_prompt_v1", "memory.garden_component"],
-    ["memory.garden_component", "memory.capture_prompt_v1",
-     "memgarden.component"],
-    ["model_api_runtime.v2.extraction", "memory.capture_prompt_v1",
      "memory.garden_component"],
+    ["memory.garden_component", "memgarden.component"],
+    ["model_api_runtime.v2.extraction", "memory.garden_component"],
 ])
 def test_import_order_does_not_change_policy_behaviour(order) -> None:
     code = _ORDER_PROBE.format(backend=str(BACKEND), order=order,
@@ -270,7 +268,4 @@ def test_kernel_component_functions_are_not_monkeypatched_by_io(attr, source) ->
     不许改写内核模块属性 —— 那种改法对同进程里的所有实例生效，且升级内核后
     悄悄失效或反向生效。
     """
-    import memory.capture_prompt_v1  # noqa: F401
-    import memory.garden_component  # noqa: F401
-
     assert getattr(kernel_component, attr) is getattr(source, attr)

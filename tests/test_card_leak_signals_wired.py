@@ -176,7 +176,7 @@ ACCIDENT_CARD = (
 def _io_capture(reply):
     from memgarden import CaptureRequest
     from memory import garden_component
-    from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
+    from memory.garden_component import IO_CONVERSATION_CAPTURE_POLICY
 
     garden = garden_component.build_garden(garden_component.CallableModel(lambda _p: reply))
     return garden.capture(CaptureRequest(

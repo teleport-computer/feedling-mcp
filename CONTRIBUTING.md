@@ -220,13 +220,13 @@ result = chat_completion(runtime, messages)
 - ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
 - ❌ 不准新建 `backend/app.py`。
 
-**关于 `memgarden` 搬迁期的兼容壳**（2026-09-15 全部收尾）：
+**关于 `memgarden` 搬迁期的兼容壳**（2026-09-16 全部收尾）：
 
 内核提取时，被搬走的模块曾在原路径保留一层 re-export，让调用方不必一次性全改。
 纯转发壳 2026-08-14 已删；最后两个 `import *` 壳 —— `memory/capture_prompt_v1.py`
-与 `memory/dream_prompt_v1.py` —— 随两条 runtime 的落卡 / 整理换成组件会话一起删除：
-`dream_prompt_v1.py` 不复存在，`capture_prompt_v1.py` 只剩 io 的落卡档位
-`IO_CONVERSATION_CAPTURE_POLICY`。
+与 `memory/dream_prompt_v1.py` —— 随两条 runtime 的落卡 / 整理换成组件会话退出运行时。
+两个文件现已删除；io 的落卡档位 `IO_CONVERSATION_CAPTURE_POLICY`（50 张）
+定义在 `memory/garden_component.py`，仍经公开的 `CaptureRequest.policy` 传入组件。
 
 记忆 runtime 的入口文件只 import memgarden 的**公开 API**（顶层 `__all__`，或
 `memgarden.STABLE_MODULES` 中模块的 `__all__`）；`prompts.capture` / `prompts.dream`

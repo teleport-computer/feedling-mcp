@@ -415,7 +415,7 @@ jobs:
             tests/test_v2_provider_output_edges.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_screen_vision_verdict_runtime.py \
-            tests/test_capture_prompt_v1.py \
+            tests/test_capture_prompt_contract.py \
             tests/test_garden_io_capture_policy.py \
             tests/test_capture_request_index_and_naming.py \
             tests/test_garden_dream_session.py \
@@ -1042,7 +1042,7 @@ jobs:
             tests/test_v2_pool_config.py \
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
-            tests/test_capture_prompt_v1.py \
+            tests/test_capture_prompt_contract.py \
             tests/test_garden_io_capture_policy.py \
             tests/test_capture_request_index_and_naming.py \
             tests/test_garden_dream_session.py \
