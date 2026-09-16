@@ -45,6 +45,12 @@ except ModuleNotFoundError:
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 
+def _mock_cli_run(monkeypatch, consumer, run):
+    # Mock the CLI invocation boundary; production capture now uses Popen.
+    monkeypatch.setattr(consumer, "_run_cli_subprocess",
+                        lambda cmd, kwargs, **extra: run(cmd, **kwargs))
+
+
 def _recorder():
     calls = []
 
@@ -164,7 +170,7 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
         args=["mycli", "ask", "hi"], returncode=0,
         stdout='{"type":"result","duration_ms":10}', stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -204,7 +210,7 @@ def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0, stdout=stdout, stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -231,7 +237,7 @@ def test_call_agent_cli_warns_when_claude_stdout_has_unparsed_thinking_marker(mo
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0, stdout=stdout, stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -257,7 +263,7 @@ def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
         seen["env"] = kw.get("env")
         return result
 
-    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    _mock_cli_run(monkeypatch, crc, _fake_run)
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
 
@@ -275,7 +281,7 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=1, stdout="", stderr="boom",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -316,7 +322,7 @@ def test_call_agent_cli_exit_zero_logical_failure_is_not_done(monkeypatch):
         ),
         stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -349,7 +355,7 @@ def test_call_agent_cli_pi_parsed_reply_remains_done(monkeypatch):
         ),
         stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -370,7 +376,7 @@ def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     def _raise_timeout(*a, **kw):
         raise subprocess.TimeoutExpired(cmd=["mycli", "ask", "hi"], timeout=120)
 
-    monkeypatch.setattr(crc.subprocess, "run", _raise_timeout)
+    _mock_cli_run(monkeypatch, crc, _raise_timeout)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -411,7 +417,7 @@ def test_call_agent_cli_clamps_subprocess_to_absolute_deadline(monkeypatch):
         seen["timeout"] = kwargs["timeout"]
         return result
 
-    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    _mock_cli_run(monkeypatch, crc, _fake_run)
     monkeypatch.setattr(crc, "_emit_debug_trace", lambda *args, **kwargs: None)
 
     crc.call_agent_cli("hi", absolute_deadline=100.25)
@@ -430,9 +436,7 @@ def test_call_agent_cli_expired_absolute_deadline_never_spawns(monkeypatch):
         ),
     )
     monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(
-        crc.subprocess,
-        "run",
+    _mock_cli_run(monkeypatch, crc,
         lambda *args, **kwargs: pytest.fail("expired deadline must not spawn"),
     )
 
@@ -509,7 +513,7 @@ def test_error_event_carries_error_detail_beyond_the_reply_head_cap(monkeypatch)
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -540,7 +544,7 @@ def test_error_event_extracts_nested_codex_turn_failed_detail(monkeypatch):
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -561,7 +565,7 @@ def test_error_detail_absent_on_successful_turns(monkeypatch):
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)

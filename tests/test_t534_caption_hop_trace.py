@@ -31,6 +31,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import chat_resident_consumer as crc  # noqa: E402
 
 
+def _mock_cli_run(monkeypatch, consumer, run):
+    # Mock the CLI invocation boundary; production capture now uses Popen.
+    monkeypatch.setattr(consumer, "_run_cli_subprocess",
+                        lambda cmd, kwargs, **extra: run(cmd, **kwargs))
+
+
 @pytest.fixture
 def emitted(monkeypatch):
     calls: list[dict] = []
@@ -242,6 +248,7 @@ def test_later_unrelated_cli_preparation_emits_no_ghost(monkeypatch, tmp_path):
         crc, "_emit_debug_trace",
         lambda subsystem, type, **kw: hops.append({"type": type, **kw}),
     )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._prepare_cli_command("一条与图片无关的后台消息")
     assert not [h for h in hops if h["type"] == "chat.image_caption.hop"], (
         f"上一轮的 caption 漏进了无关调用;实际 ={hops}"
@@ -282,7 +289,7 @@ def test_cli_carrier_hop_measures_the_real_driver_payload(monkeypatch, tmp_path,
         seen["cmd"] = cmd
         return _sp.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     token = crc._CAPTION_HOP_CTX.set((caption, "carrier-msg-1"))
     try:
         crc._call_agent_cli_impl(composed)
