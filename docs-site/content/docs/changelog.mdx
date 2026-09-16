@@ -14,6 +14,12 @@ change must not be interpreted as an API guarantee.
 
 - Long-running memory jobs now refresh a same-user runtime token and retry enclave decryption once after a 401, preventing expired tokens from failing the remaining decryptions when the enclave is slow.
 
+- Resident failure traces now distinguish thinking-tag, protocol-leak, file-reference,
+  and unclassified sanitizer failures. Parse failures include bounded assistant reply
+  excerpts and thinking-tag counts. Pi no-reply failures also report any recognized
+  upstream HTTP status code and class. Error classification, retries, and reply
+  delivery behavior are unchanged.
+
 - History imports now reject individual oversized or idempotency-conflicting cards while saving valid siblings, instead of failing the entire job; an entirely rejected batch still fails and asks the model again on retry.
 
 - Empty-response diagnostics on OpenAI-compatible relays now record the relay's

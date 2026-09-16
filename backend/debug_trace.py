@@ -831,7 +831,14 @@ def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
         elif isinstance(v, (int, float, bool)):
             out[key] = v
         elif isinstance(v, str):
-            out[key] = v[:_DETAIL_MAX_STR]
+            # T617: an explicitly authorized parse-failure excerpt needs 300
+            # characters. Keep the generic bound for every other field/event.
+            limit = (
+                300 if key == "raw_reply_head"
+                and detail.get("error_class") == "reply_parse_failed"
+                else _DETAIL_MAX_STR
+            )
+            out[key] = v[:limit]
         elif isinstance(v, list):
             out[key] = [
                 None if x is None else str(x)[:_DETAIL_MAX_ITEM]
