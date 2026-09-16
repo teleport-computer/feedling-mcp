@@ -83,10 +83,17 @@ def _status_events(uid):
 
 def test_screen_watch_policy_does_not_default_to_silence():
     prompt = worker._SCREEN_WATCH_SYSTEM_PROMPT.lower()
-    assert "both are good ways to be here" in prompt
-    assert "don't swallow it" in prompt
+    assert "both are good ways" not in prompt
+    assert "showing up a lot lately" not in prompt
+    assert "feel like saying to them" in prompt
+    assert "if so, say it" in prompt
+    assert "honestly have nothing you want to say" in prompt
+    assert "clearly break their flow" in prompt
+    assert "not having answered your last message is not a reason to hold back" in prompt
     assert "in the middle of something" in prompt
-    assert "showing up a lot lately" in prompt
+    assert "attention_facts to avoid interrupting or repeating yourself" in prompt
+    assert "one coherent thought rather than reporting the screen state" in prompt
+    assert "never narrate that you are watching or that you looked at frames" in prompt
     assert "only if" not in prompt
     assert "silence is the correct answer most of the time" not in prompt
 

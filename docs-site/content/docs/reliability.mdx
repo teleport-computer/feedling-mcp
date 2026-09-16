@@ -95,6 +95,8 @@ fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
 A regular wake's otherwise valid `reply` whose entire text is a bare protocol
 token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
+The screen-watch lane follows the same default while keeping its own guidance
+to avoid interrupting the user's flow.
 
 Regular wake provider calls, including choice-correction retries, now use the
 same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
