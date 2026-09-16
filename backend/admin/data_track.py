@@ -11127,6 +11127,7 @@ _EVENT_MASTER_ACTIONS = (
      "desc": "一次 dream job 的终态。",
      "runtime_metrics": {"runtime_v1": ("dream", None),
                          "runtime_v2": ("dream", None)}},
+    # 历史 job_kind，机制已删；保留历史终态统计口径。
     {"key": "migrate", "label": "记忆整理 · Migrate",
      "desc": "resident 有独立 migrate 终态；V2 maintenance 不是同一动作。",
      "runtime_metrics": {"runtime_v1": ("migrate", None)}},

@@ -56,7 +56,6 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | E33 | `backend/accounts/registry.py` 明确把 survivor selection 归于 `tools/recover_orphan_accounts.py`；[`docs/runbooks/lost-account-credentials-recovery.md`](../runbooks/lost-account-credentials-recovery.md) 和 `tests/test_recover_orphan_survivor.py` 分别保留 operator/recovery guard。 |
 | E34 | [`README.md`](README.md) 将 `tools/repository_inventory.py` 作为确定性 tracked 分类器；`tests/test_repository_inventory.py` 覆盖分类。 |
 | E35 | `backend/copytext/service.py` 明确说明 `tools/seed_copytext.py` 通过 admin HTTP endpoint 使用该服务。 |
-| E36 | [`candidates/README.md`](candidates/README.md) 明确 `tools/seed_legacy_memory.py` 是兼容 fixture，仍需保留。 |
 | E37 | `tests/test_store_load_contract.py` import inventory，并在 snapshot 变化时给出精确 `--write` command。 |
 | E38 | `tools/chat_resident_consumer.py` 在 VPS 运行时 lazy-import 两个 user-MCP helper；`tests/test_user_mcp_consumer.py` 将二者纳入 self-update files，另有各自的 helper unit tests。 |
 | E39 | [`candidates/v2-user-triage-semantic-compaction.md`](candidates/v2-user-triage-semantic-compaction.md) 记录已实施的局部诊断清理，并保留现行只读 CLI。 |
@@ -110,7 +109,6 @@ tool/script taxonomy。清单记录当前 owner、分类、生命周期和**精�
 | `tools/recover_orphan_accounts.py`（1） | Account recovery | recovery | retain | E33 |
 | `tools/repository_inventory.py`（1） | Repository cleanup | generated helper | retain | E34 |
 | `tools/seed_copytext.py`（1） | Product copy operations | active diagnostic | retain | E35 |
-| `tools/seed_legacy_memory.py`（1） | Memory compatibility | test support | retain | E36 |
 | `tools/store_per_load_mode_inventory.py`（1） | Store-load contract | generated helper | retain | E37 |
 | `tools/strict_yaml.py`（1） | Deployment configuration validation | test support | retain | E41 |
 | `tools/user_mcp_ca_fetch.py`<br>`tools/user_mcp_materialize.py`（2） | Resident user-MCP runtime | production companion | **retain-protected** | E38 |

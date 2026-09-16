@@ -308,7 +308,7 @@ if not _provisioned:
         "test_capture_request_index_and_naming.py",
         # Dream 共用入口（open_dream_session）：假模型 + 真组件，不碰 DB。
         "test_garden_dream_session.py",
-        "test_memgarden_dream_migrate_golden.py",
+        "test_memgarden_dream_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",
         "test_memgarden_prompt_params.py",

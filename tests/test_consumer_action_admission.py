@@ -135,14 +135,14 @@ def test_canonicalize_action_type_passthrough_for_unknown_and_canonical():
 
 
 # ---------------------------------------------------------------------------
-# _ACTION_ALLOWLIST — spec 3.4 十二类型, identity.replace excluded
+# _ACTION_ALLOWLIST — spec 3.4 十一类型, identity.replace excluded
 # ---------------------------------------------------------------------------
 
-def test_action_allowlist_has_the_twelve_spec_types_and_excludes_replace():
+def test_action_allowlist_has_the_current_types_and_excludes_replace():
     assert crc._ACTION_ALLOWLIST == frozenset({
         "memory.add", "memory.create", "memory.add_correction",
         "memory.patch", "memory.content_patch", "memory.supersede",
-        "memory.upgrade", "memory.delete",
+        "memory.delete",
         "identity.profile_patch", "identity.patch",
         "identity.dimension_nudge", "identity.relationship_days_set",
     })
@@ -254,7 +254,7 @@ def test_rewrite_reply_mixed_multiple_unexecuted_uses_count():
          "outcome": "applied", "error_code": ""},
         {"original_type": "memory.frobnicate", "canonical_type": "memory.frobnicate",
          "outcome": "rejected_allowlist", "error_code": ""},
-        {"original_type": "memory.upgrade", "canonical_type": "memory.upgrade",
+        {"original_type": "memory.delete", "canonical_type": "memory.delete",
          "outcome": "noop", "error_code": ""},
     ]
     result = crc.rewrite_reply_for_outcomes(["记好了。"], outcomes, fallback_ok="记好了。")
@@ -457,12 +457,12 @@ def test_execute_agent_actions_noop_result_is_not_reported_as_applied(monkeypatc
         crc._HTTP, "post",
         _http_router(memory=_Resp(200, {
             "status": "ok",
-            "results": [{"status": "ok", "action": "memory.upgrade", "skipped": "not_found", "noop": True}],
+            "results": [{"status": "ok", "action": "memory.delete", "skipped": "not_found", "noop": True}],
             "effects": [],
         })),
     )
 
-    result = crc.execute_agent_actions([{"type": "memory.upgrade", "memory_id": "missing"}])
+    result = crc.execute_agent_actions([{"type": "memory.delete", "memory_id": "missing"}])
 
     assert result["outcomes"][0]["outcome"] == "noop"
     # I2: a noop is not a failure — distinct copy, not the failure sentence.

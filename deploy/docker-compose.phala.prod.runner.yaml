@@ -86,7 +86,6 @@ services:
       AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # Genesis import worker: ON here because once the main prod CVM's inline
       # agent-runner is removed, the runner CVMs are the ONLY place genesis import
       # jobs get drained. Safe on multiple runner CVMs — claim is FOR UPDATE SKIP

@@ -492,7 +492,7 @@ jobs:
             tests/test_card_leak_signals_wired.py \
             tests/test_memgarden_policies.py \
             tests/test_memgarden_capture_golden.py \
-            tests/test_memgarden_dream_migrate_golden.py \
+            tests/test_memgarden_dream_golden.py \
             tests/test_memgarden_prompt_params.py \
             tests/test_memgarden_storage_port.py \
             tests/test_memgarden_dreaming.py \
@@ -729,7 +729,7 @@ jobs:
       # Keep one pytest process per batch: the tests share one session database,
       # so file-order pollution stays visible instead of being hidden by process
       # isolation. The explicit paths also feed the discovery coverage ratchet.
-      - name: Run CI security tier 1 (35 files)
+      - name: Run CI security tier 1 (32 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -749,15 +749,12 @@ jobs:
             tests/test_memory_guard_endpoint.py \
             tests/test_memory_index_selector.py \
             tests/test_memory_lane_torn_protocol_no_write.py \
-            tests/test_memory_legacy_batch_token.py \
             tests/test_memory_m2_write_loop.py \
-            tests/test_memory_migration.py \
             tests/test_memory_readside.py \
             tests/test_memory_readside_core.py \
             tests/test_memory_readside_docker_e2e.py \
             tests/test_memory_readside_sandbox.py \
             tests/test_memory_timestamps.py \
-            tests/test_memory_upgrade_id_stable.py \
             tests/test_memory_v1_readers.py \
             tests/test_memory_v1_readside.py \
             tests/test_memory_v1_schema.py \
@@ -2670,7 +2667,6 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
           FEEDLING_V2_NEW_USER_CUTOFF:   ${{ vars.PROD_FEEDLING_V2_NEW_USER_CUTOFF }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
           # env channel; default off, flip via repo var + redeploy.
@@ -2740,7 +2736,6 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
             -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
@@ -2938,7 +2933,6 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
           FEEDLING_V2_NEW_USER_CUTOFF:   ${{ vars.TEST_FEEDLING_V2_NEW_USER_CUTOFF }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
           # env channel; default off, flip via repo var + redeploy.
@@ -3004,7 +2998,6 @@ jobs:
             -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
@@ -3236,7 +3229,6 @@ jobs:
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -3263,8 +3255,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # runner image pull + boot regularly exceeds it. Poll with our own
           # configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -3399,7 +3390,6 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           # Empty until the environment-specific admission rollout is activated.
           FEEDLING_V2_NEW_USER_CUTOFF:   ${{ vars.PRE_FEEDLING_V2_NEW_USER_CUTOFF }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
           # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
           # env channel; default off, flip via repo var + redeploy.
@@ -3459,7 +3449,6 @@ jobs:
             -e "FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY=$FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_V2_NEW_USER_CUTOFF=$FEEDLING_V2_NEW_USER_CUTOFF" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
@@ -3635,7 +3624,6 @@ jobs:
           AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.PRE_AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:            ${{ vars.PRE_FEEDLING_HOST_ALL }}
-          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -3662,8 +3650,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
           # phala deploy --wait has a fixed 300-second ceiling; runner image
           # pulls routinely exceed it. Use the repo's explicit bounded poll.
           ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
@@ -3812,7 +3799,6 @@ jobs:
           AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
           FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
-          FEEDLING_MIGRATE_ENABLE:       ${{ vars.FEEDLING_MIGRATE_ENABLE }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::DATABASE_URL not set — runner has no lease store"; exit 1
@@ -3849,8 +3835,7 @@ jobs:
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
-              -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
-              -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE"
+              -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
             # NOT --wait: the CLI's readiness wait is hard-capped at 300s and
             # the runner image pull + boot regularly exceeds it. Poll with our
             # own configurable deadline instead (deploy/wait-cvm-ready.sh).

@@ -5011,38 +5011,11 @@ def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypa
     monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
-    assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
+    assert crc._capture_post_json("/v1/memory/fetch", payload={"ids": ["m1"]}) == {"ok": True}
     assert calls[0][2].get("X-Feedling-Runtime-Token") == "fresh-token"
     assert calls[1][2].get("X-Feedling-Runtime-Token") == "fresh-token"
     assert "X-API-Key" not in calls[0][2]
     assert "X-API-Key" not in calls[1][2]
-
-
-def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
-    job = {
-        "job_id": "migr_missing_batch",
-        "job_kind": "memory_migrate",
-        "source": "memory_migrate",
-        "status": "pending",
-        "migrate_key": "migrate:v1:u:w1",
-        "ts": 123.0,
-    }
-    statuses = []
-
-    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
-    monkeypatch.setattr(crc, "update_proactive_job_status",
-                        lambda job_id, status, reason="", **kwargs: statuses.append((job_id, status, reason, kwargs)))
-    monkeypatch.setattr(crc, "_capture_post_json", lambda path, **kwargs: {})
-    monkeypatch.setattr(crc, "_seen_ids", set())
-    monkeypatch.setattr(crc, "_seen_ids_order", [])
-    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
-
-    assert crc._process_migrate_jobs([job]) == pytest.approx(123.0)
-    assert statuses[0][:3] == ("migr_missing_batch", "realizing", "")
-    assert statuses[-1][0] == "migr_missing_batch"
-    assert statuses[-1][1] == "failed"
-    assert "legacy_batch_unavailable" in statuses[-1][2]
-    assert all(row[2] != "migrate_no_legacy" for row in statuses)
 
 
 def test_capture_identity_context_decodes_plaintext_without_enclave(monkeypatch):
@@ -8063,7 +8036,6 @@ def test_memory_occurred_at_sites_remain_utc_z():
 
     assert utc_calls_by_function["_capture_occurred_at"] == 1
     assert utc_calls_by_function["_process_dream_jobs"] == 1
-    assert utc_calls_by_function["_process_migrate_jobs"] == 1
 
 
 def test_user_timezone_empty_when_whoami_has_none(monkeypatch):
@@ -11857,8 +11829,7 @@ def test_call_agent_cli_non_session_error_does_not_heal(monkeypatch, tmp_path):
 
 
 def test_maintenance_jobs_wait_for_conversation_lull(monkeypatch):
-    # Soft idle: the user talked 1 min ago → memory maintenance (capture/dream/
-    # migrate) waits for a lull; wake-class jobs are NOT affected. Distinct from
+    # Soft idle: the user talked 1 min ago → memory maintenance (capture/dream) waits for a lull; wake-class jobs are NOT affected. Distinct from
     # the user-pending defer: no flag, no break — later jobs still run this pass.
     ran = _install_resident_job_gate_harness(monkeypatch)
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
@@ -11867,7 +11838,6 @@ def test_maintenance_jobs_wait_for_conversation_lull(monkeypatch):
     jobs = [
         {"job_id": "c1", "ts": now - 30, "source": "memory_capture"},
         {"job_id": "d1", "ts": now - 30, "source": "memory_dream"},
-        {"job_id": "m1", "ts": now - 30, "source": "memory_migrate"},
         {"job_id": "p1", "ts": now - 20, "source": crc.PROACTIVE_JOB_SOURCE},
     ]
     out = crc._process_resident_jobs(jobs, chat_since=10.0)
@@ -12973,14 +12943,13 @@ def _install_resident_job_gate_harness(monkeypatch):
 
     monkeypatch.setattr(crc, "_process_capture_jobs", _fake("capture"))
     monkeypatch.setattr(crc, "_process_dream_jobs", _fake("dream"))
-    monkeypatch.setattr(crc, "_process_migrate_jobs", _fake("migrate"))
     monkeypatch.setattr(crc, "_process_proactive_jobs", _fake("proactive"))
     return ran
 
 
 def test_resident_jobs_gate_covers_all_classes_and_defers_mid_batch(monkeypatch):
     # ① user-turn priority: the gate sits in _process_resident_jobs and covers
-    # ALL background classes (capture/dream/migrate/proactive — each is a model
+    # ALL background classes (capture/dream/proactive — each is a model
     # turn). When the user message arrives after the first job, the second job
     # must NOT run, the defer flag is set (run() then keeps the OLD checkpoint
     # so unrun jobs re-poll; _mark_seen replays safely), and only the completed
@@ -13000,7 +12969,7 @@ def test_resident_jobs_gate_covers_all_classes_and_defers_mid_batch(monkeypatch)
 
 def test_resident_jobs_defer_before_any_job_and_class_order_kept(monkeypatch):
     # pending before job #1 → nothing runs at all, no ts progress; without a
-    # pending user the dispatch order is capture → dream → migrate → proactive
+    # pending user the dispatch order is capture → dream → proactive
     # regardless of arrival order (matches the old per-class batching).
     ran = _install_resident_job_gate_harness(monkeypatch)
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: True)
@@ -13016,13 +12985,12 @@ def test_resident_jobs_defer_before_any_job_and_class_order_kept(monkeypatch):
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
     jobs = [
         {"job_id": "p1", "ts": 444.0, "source": crc.PROACTIVE_JOB_SOURCE},
-        {"job_id": "m1", "ts": 200.0, "source": "memory_migrate"},
         {"job_id": "d1", "ts": 333.0, "source": "memory_dream"},
         {"job_id": "c1", "ts": 111.0, "source": "memory_capture"},
     ]
     assert crc._process_resident_jobs(jobs, chat_since=10.0) == pytest.approx(444.0)
     assert ran == [
-        ("capture", "c1"), ("dream", "d1"), ("migrate", "m1"), ("proactive", "p1"),
+        ("capture", "c1"), ("dream", "d1"), ("proactive", "p1"),
     ]
     assert crc._resident_jobs_deferred_for_user is False
 
@@ -14205,7 +14173,7 @@ def test_foreground_timeout_recovery_failure_is_not_retried(monkeypatch):
 
 
 def test_agent_call_failed_reason_keeps_message_and_prefix():
-    """Capture/dream/migrate lanes must record the underlying error message, not
+    """Capture/dream lanes must record the underlying error message, not
     just the exception type — a relay 403 (RuntimeError "pi agent produced no
     reply: 403 ... insufficient_user_quota") otherwise aggregates as an opaque
     "RuntimeError" (usr_77b37bd1, 2026-07-21). Prefix stays stable for matching."""
@@ -14225,10 +14193,10 @@ def test_agent_call_failed_reason_keeps_message_and_prefix():
     detail = big.split(": ", 1)[1]
     assert len(detail) <= 400 and "\n" not in big
     # empty (and control-only) message falls back to the type-only form
-    assert crc._agent_call_failed_reason("migrate_agent_call_failed", RuntimeError("")) \
-        == "migrate_agent_call_failed:RuntimeError"
-    assert crc._agent_call_failed_reason("migrate_agent_call_failed", RuntimeError("\x00\r\n")) \
-        == "migrate_agent_call_failed:RuntimeError"
+    assert crc._agent_call_failed_reason("dream_agent_call_failed", RuntimeError("")) \
+        == "dream_agent_call_failed:RuntimeError"
+    assert crc._agent_call_failed_reason("dream_agent_call_failed", RuntimeError("\x00\r\n")) \
+        == "dream_agent_call_failed:RuntimeError"
 
 
 # ---------------------------------------------------------------------------
