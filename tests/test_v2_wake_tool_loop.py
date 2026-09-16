@@ -28,6 +28,7 @@ import pytest
 
 import conftest
 import db
+import debug_trace
 import provider_client
 from provider_types import ToolCall, ToolExchange
 from core import store as core_store
@@ -358,6 +359,206 @@ def test_wake_empty_terminal_text_completes_with_zero_bubbles(monkeypatch):
     assert surface_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
+
+
+def _run_protocol_token_choice(
+    monkeypatch, response, *, regular=True, provider_config=_BYOK,
+):
+    """Exercise the real loop and worker trace projection with recorded sinks."""
+    loop = worker.v2_tool_loop
+    calls = _script_provider(monkeypatch, [response])
+    replies, reasons, events, surfaces = [], [], [], []
+
+    async def on_reply(text, **_kwargs):
+        replies.append(text)
+
+    async def on_silent(reason):
+        reasons.append(reason)
+
+    async def dispatch(_calls):
+        pytest.fail("terminal choices must not dispatch platform tools")
+
+    async def fold():
+        return []
+
+    async def record(kind, payload):
+        events.append((kind, payload))
+
+    def emit(_uid, kind, **kwargs):
+        if kind == "mcp.surface.provider":
+            projected = kwargs["detail"]
+            safe = debug_trace._safe_detail(projected)
+            assert set(safe) == set(projected), "trace keys were silently truncated"
+            surfaces.append(safe)
+
+    deps = _wake_deps()
+    deps.emit_debug_trace = emit
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_protocol_choice", "heartbeat" if regular else "scheduled"
+    )
+    outcome = asyncio.run(loop.run_tool_loop(
+        provider_config=provider_config,
+        build_messages=lambda _transcript: [{"role": "user", "content": "hello"}],
+        dispatch_tools=dispatch,
+        on_reply=on_reply,
+        on_stay_silent=on_silent if regular else None,
+        regular_wake_choice_required=regular,
+        fold_new_messages=fold,
+        add_usage=lambda _usage: None,
+        on_trajectory_event=record,
+        on_provider_tool_surface=trace,
+        require_reply=not regular,
+        max_calls=1,
+    ))
+    return outcome, calls, replies, reasons, events, surfaces
+
+
+@pytest.mark.parametrize("provider_name", ["anthropic", "openai_compatible"])
+@pytest.mark.parametrize("text,token", [
+    ("stay_silent", "stay_silent"),
+    ("stay silent", "stay_silent"),
+    ("Stay_silent.", "stay_silent"),
+    ("  ‘STAY   SILENT!’  ", "stay_silent"),
+    ("stay-silent", "stay_silent"),
+    ("stay.silent", "stay_silent"),
+    ("reply", "reply"),
+    ("`speak`", "speak"),
+    ("stay quiet", "stay_quiet"),
+    ("stay_quiet", "stay_quiet"),
+    ("stay-quiet", "stay_quiet"),
+    ("proactive.sleep", "proactive_sleep"),
+    ("proactive_sleep", "proactive_sleep"),
+    ("proactive-sleep", "proactive_sleep"),
+    ("sleep", "sleep"),
+    ("__verify_ack__", "__sentinel__"),
+    ("【`__PRIVATE_SENTINEL__`】。", "__sentinel__"),
+])
+def test_wake_reply_bare_protocol_token_stays_silent_without_retry(
+    monkeypatch, text, token, provider_name,
+):
+    config = provider_client.ProviderConfig(
+        provider=provider_name, model="test-model", api_key="test-key", base_url=""
+    )
+    result = _run_protocol_token_choice(
+        monkeypatch, _wake_reply_round(text), provider_config=config,
+    )
+    outcome, calls, replies, reasons, events, surfaces = result
+    assert outcome.stop_reason == "stay_silent"
+    assert outcome.final_text == ""
+    assert outcome.rounds == 1
+    assert len(calls) == 1
+    assert replies == []
+    assert len(reasons) == 1 and "protocol token" in reasons[0]
+    assert [p["choice"] for k, p in events if k == "wake_choice_response"] == [
+        "silent_from_protocol_token"
+    ]
+    assert len([1 for k, _ in events if k == "stay_silent_planned"]) == 1
+    assert len(surfaces) == 1
+    assert surfaces[0]["protocol_token_reply"] == token
+    assert surfaces[0]["wake_kind"] == "heartbeat"
+    assert "wake_choice_required" not in surfaces[0]
+    assert len(surfaces[0]) == 20
+    assert "PRIVATE_SENTINEL" not in json.dumps(surfaces)
+
+
+@pytest.mark.parametrize("untrusted", ["__PRIVATE_SENTINEL__", "arbitrary text", {}, None])
+def test_worker_protocol_token_trace_rejects_noncanonical_values(untrusted):
+    source = {"wake_choice_required": True, "call_rejection_reasons": []}
+    baseline = worker._provider_tool_surface_trace_detail("heartbeat", source)
+    actual = worker._provider_tool_surface_trace_detail(
+        "heartbeat", {**source, "protocol_token_reply": untrusted}
+    )
+    assert actual == baseline
+    assert "protocol_token_reply" not in actual
+    assert worker._provider_tool_surface_added_detail_keys("heartbeat") == {
+        "lane", "wake_kind",
+    }
+
+
+@pytest.mark.parametrize("text", [
+    "我先安静一会儿", "我先 stay silent 一会儿", "stay silent for now, love",
+    "speak up!", "Please reply.", "sleep well", "`speak` and listen",
+    "__verify_ack__ received", "😴sleep", "speaker",
+])
+def test_wake_reply_natural_language_is_not_a_protocol_token(monkeypatch, text):
+    outcome, calls, replies, reasons, events, surfaces = _run_protocol_token_choice(
+        monkeypatch, _wake_reply_round(text)
+    )
+    assert outcome.stop_reason == "final_text"
+    assert replies == [text]
+    assert isinstance(replies[0], worker.v2_tool_loop.ValidatedWakeReply)
+    assert reasons == [] and len(calls) == 1
+    assert [p["choice"] for k, p in events if k == "wake_choice_response"] == ["reply"]
+    assert len(surfaces) == 1 and len(surfaces[0]) == 20
+    assert "protocol_token_reply" not in surfaces[0]
+    assert "wake_choice_required" in surfaces[0]
+    assert surfaces[0]["wake_kind"] == "heartbeat"
+
+
+@pytest.mark.parametrize("malformation", [
+    "missing_think", "extra_arg", "missing_id", "mixed_batch", "too_long", "media",
+])
+def test_protocol_token_does_not_make_an_invalid_reply_a_silent_choice(
+    monkeypatch, malformation,
+):
+    response = _wake_reply_round("stay_silent")
+    call = response["tool_calls"][0]
+    if malformation == "missing_think":
+        call["args"].pop("think")
+    elif malformation == "extra_arg":
+        call["args"]["extra"] = True
+    elif malformation == "missing_id":
+        call["id"] = ""
+    elif malformation == "mixed_batch":
+        response["tool_calls"].append(_tc("second", "stay_silent", reason="quiet"))
+    elif malformation == "too_long":
+        call["args"]["text"] = "__" + "x" * 8192 + "__"
+    elif malformation == "media":
+        response["media"] = [{"mime_type": "image/png", "data_base64": "AA=="}]
+    with pytest.raises(worker.v2_tool_loop.WakeChoiceInvalid):
+        _run_protocol_token_choice(monkeypatch, response)
+
+
+@pytest.mark.parametrize("text", ["stay_silent", "sleep", "__verify_ack__"])
+def test_non_choice_terminal_text_keeps_existing_delivery(monkeypatch, text):
+    outcome, calls, replies, reasons, _events, surfaces = _run_protocol_token_choice(
+        monkeypatch, _text_round(text), regular=False
+    )
+    assert outcome.stop_reason == "final_text" and replies == [text]
+    assert len(calls) == 1 and reasons == []
+    assert all("protocol_token_reply" not in surface for surface in surfaces)
+
+
+@pytest.mark.parametrize("token", ["stay_silent", "`speak`", "__verify_ack__"])
+def test_protocol_token_wake_completes_as_sleep_with_no_bubble(monkeypatch, token):
+    uid = "u_wake_protocol_token"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_wake_reply_round(token)])
+    sink_calls = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+        sink_calls=sink_calls,
+    )
+    trajectory = _TrajectoryCapture()
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+        trajectory_recorder=trajectory,
+    ))
+    assert status == "completed" and len(calls) == 1
+    assert _bubbles(uid) == [] and sink_calls == []
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+    assert row[0] == "sleep" and "protocol token" in row[1]
+    assert not any(e["kind"] == "error" for e in _status_events(uid))
+    assert any(k == "wake_choice_response" and p["choice"] == "silent_from_protocol_token"
+               for _scope, k, p in trajectory.events)
 
 
 # ------------------------------------------------------------------

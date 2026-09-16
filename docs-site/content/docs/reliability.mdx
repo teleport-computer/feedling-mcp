@@ -93,6 +93,8 @@ previous message is not by itself a reason to stay silent. These are model
 instructions, not new scheduler gates. Missing or invalid choices still
 fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
+A regular wake's otherwise valid `reply` whose entire text is a bare protocol
+token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
 
 Regular wake provider calls, including choice-correction retries, now use the
 same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
