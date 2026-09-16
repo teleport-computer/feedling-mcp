@@ -1959,8 +1959,9 @@ def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
     assert "calling reply if there is anything you want to say to them" in choice
     assert "in the middle of something" in prompt
     assert "Never mention this wake or any system wording" in prompt
-    assert "showing up a lot lately" not in prompt
-    assert "Both are good ways" not in prompt
+    for wake_prompt in (prompt, worker._SCREEN_WATCH_SYSTEM_PROMPT):
+        assert "showing up a lot lately" not in wake_prompt
+        assert "Both are good ways" not in wake_prompt
     assert "Neither choice is preferred" not in worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
     assert "not an error" not in silent
     assert "normal way to end a wake" in worker.v2_tool_loop._WAKE_REPLY_TOOL_SPEC.description

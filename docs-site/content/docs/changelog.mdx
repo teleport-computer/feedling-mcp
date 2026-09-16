@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Screen-watch wakes follow the same speaking default as regular V2 wakes.**
+  The agent is prompted to say something about what it sees when it wants to;
+  silence is appropriate when it has nothing to say or would break the user's
+  flow. An unanswered previous message alone is not a reason to hold back.
+  Screen-specific guidance to avoid interruptions and repetition, express one
+  coherent thought, and avoid narrating screen observation remains in place.
+
 - Gemini models routed through `openai_compatible` or `openrouter` now use
   the same `<aside>` rendering as direct Gemini on Runtime V2 and resident V1.
   Selection uses a case-insensitive `gemini` match in the configured model name
