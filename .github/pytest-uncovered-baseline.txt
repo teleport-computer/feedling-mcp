@@ -11,7 +11,6 @@ tests/test_agent_runtime_resolve_cache.py
 tests/test_agent_runtime_supervisor.py
 tests/test_ai_msg_live_activity_gate.py
 tests/test_api_errors_doc.py
-tests/test_asgi_accounts_remaining.py
 tests/test_asgi_agent.py
 tests/test_asgi_bootstrap_post.py
 tests/test_asgi_client_disconnect.py
@@ -76,7 +75,6 @@ tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
 tests/test_deploy_canary.py
 tests/test_diagnostics_routes.py
-tests/test_dream_card_render_bucket.py
 tests/test_dream_status.py
 tests/test_e2b_template_contract.py
 tests/test_error_slug_convergence.py

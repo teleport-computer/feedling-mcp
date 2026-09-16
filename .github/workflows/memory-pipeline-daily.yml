@@ -1,0 +1,85 @@
+# .github/workflows/memory-pipeline-daily.yml — 记忆管线日报（落卡 capture / 做梦 dream）
+#
+# 起因：2026-09 落卡静默坏了 3 天以上（22–58 个用户零成功），直到用户来问才发现。
+# 每天北京时间 09:30 读一次 prod 的 content-free admin 接口，按失败原因归类后发一条
+# 飞书群消息；超过阈值时消息开头标 [需要关注]。取数失败也会发一条「没生成出来」，
+# 不会静默。
+#
+# 为什么放在 GitHub Actions 而不是后端定时任务：
+#   - CVM 不需要拿到飞书 webhook 密钥，后端也不新增出网依赖；
+#   - 后端挂了恰恰是最需要告警的时候，放在后端里就会一起哑掉；
+#   - 与 pg-monitor.yml 同形：外部定时读、只读。
+#
+# 需要的配置（全部复用已有项，不新增 secret）：
+#   secrets.FEEDLING_ADMIN_TOKEN  admin 接口 token（各环境通用，ci.yml 部署步骤已在用）
+#   secrets.LARK_BOT_WEBHOOK      飞书自定义机器人 webhook（ci.yml 部署通知同一个群）
+#   secrets.LARK_BOT_SECRET       机器人签名密钥；为空时发未签名消息（与 ci.yml 一致）
+#   vars.PROD_MAIN_API_URL        可选；缺省 https://api.feedling.app
+#
+# 本地核对（只打印、不发飞书）：
+#   python tools/memory_pipeline_daily_report.py \
+#     --fixture tests/fixtures/memory_pipeline_daily_report/sources_2026-09-14.json \
+#     --day 2026-09-14 --dry-run
+#
+# 注意：schedule 只在默认分支（main）上生效；合进 test 不会开始发。
+name: Memory pipeline daily report
+
+on:
+  schedule: [{ cron: '30 1 * * *' }]
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "北京日期 YYYY-MM-DD；留空 = 昨天"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "true = 只在日志里打印，不发飞书"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-pipeline-daily
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and post the report (stdlib only)
+        env:
+          FEEDLING_API_URL: ${{ vars.PROD_MAIN_API_URL || 'https://api.feedling.app' }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
+          LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
+          # 告警阈值（可选）：是 2026-09-15 定的初始值、没有用 prod 基线校准过。
+          # 在仓库 Variables 里设同名变量即可调，不设就用脚本里的默认值。
+          MEMORY_REPORT_STUCK_USERS: ${{ vars.MEMORY_REPORT_STUCK_USERS }}
+          MEMORY_REPORT_OUR_SIDE_USERS: ${{ vars.MEMORY_REPORT_OUR_SIDE_USERS }}
+          MEMORY_REPORT_MIN_ATTEMPTS_FOR_RATE: ${{ vars.MEMORY_REPORT_MIN_ATTEMPTS_FOR_RATE }}
+          MEMORY_REPORT_FAILURE_RATE: ${{ vars.MEMORY_REPORT_FAILURE_RATE }}
+          MEMORY_REPORT_FAILURE_RATE_JUMP_PP: ${{ vars.MEMORY_REPORT_FAILURE_RATE_JUMP_PP }}
+          MEMORY_REPORT_ACTIVE_DROP_RATIO: ${{ vars.MEMORY_REPORT_ACTIVE_DROP_RATIO }}
+          MEMORY_REPORT_ACTIVE_DROP_MIN_PREVIOUS: ${{ vars.MEMORY_REPORT_ACTIVE_DROP_MIN_PREVIOUS }}
+          MEMORY_REPORT_LIVE_STUCK_JOBS: ${{ vars.MEMORY_REPORT_LIVE_STUCK_JOBS }}
+          REPORT_DAY: ${{ inputs.day }}
+          REPORT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "${REPORT_DAY:-}" ]; then
+            args+=(--day "$REPORT_DAY")
+          fi
+          if [ "${REPORT_DRY_RUN:-false}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 tools/memory_pipeline_daily_report.py "${args[@]}"

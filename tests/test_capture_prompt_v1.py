@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from memory.capture_prompt_v1 import (  # noqa: E402
+from _memgarden_prompt_bindings import (  # noqa: E402
     CAPTURE_TYPES,
     build_capture_prompt,
     build_capture_semantic_retry_prompt,
@@ -125,7 +125,7 @@ def test_reserved_placeholder_names_are_treated_as_unknown():
     """A stored placeholder "name" (用户/user/TA, any case) must not be
     instructed as a real name — `提到 用户 就用「用户」` would re-pollute the
     very cards this rule fixes."""
-    from memory.capture_prompt_v1 import sanitize_user_name
+    from _memgarden_prompt_bindings import sanitize_user_name
 
     for reserved in ("用户", "user", "USER", "ta", "TA", "「用户」", "`user`", "", "  "):
         assert sanitize_user_name(reserved) == "TA", repr(reserved)

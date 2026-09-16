@@ -85,6 +85,11 @@ def test_existing_identity_flows_into_merge_prompt(monkeypatch):
     assert "老c" in calls["prompts"][0]
 
 
+# 桶名快照随 fact_write 一起退役（VPS 记忆导入换到 memgarden 导入会话，桶复用由包判断）。
+# floor note 恢复了（34cd8164 同款算法和措辞），经 memgarden ImportRequest.host_note 进写卡提示词；
+# 下面四条是切换前的原测试，接线测试见 tests/test_chat_resident_consumer.py。
+
+
 def test_floor_note_below_floor(monkeypatch):
     monkeypatch.setattr(crc, "_capture_get_json",
                         lambda path, **kw: {"memory_floor": 38, "memories_count": 2})
@@ -115,38 +120,6 @@ def test_floor_note_empty_on_error(monkeypatch):
         raise RuntimeError("api down")
     monkeypatch.setattr(crc, "_capture_get_json", boom)
     assert crc._resident_floor_note() == ""
-
-
-def test_memory_snapshot_composes_terms_and_known(monkeypatch):
-    def fake_get(path, **kw):
-        if path == "/v1/memory/buckets":
-            return {"buckets": [{"name": "工作", "count": 3}, {"name": "协作方式", "count": 2}]}
-        if path == "/v1/memory/threads":
-            return {"threads": [{"name": "查证不猜"}]}
-        return {}
-    monkeypatch.setattr(crc, "_capture_get_json", fake_get)
-    monkeypatch.setattr(crc, "_resident_memory_index_summaries",
-                        lambda: ["hx 是 Teleport 前端", "hx 的红线:优先成功率"])
-    terms, known = crc._resident_memory_snapshot()
-    assert "工作" in terms and "协作方式" in terms and "查证不猜" in terms
-    assert "复用" in terms          # 引导语:先复用,别造近义/中英重复桶
-    assert known == ["hx 是 Teleport 前端", "hx 的红线:优先成功率"]
-
-
-def test_memory_snapshot_empty_garden_returns_empty(monkeypatch):
-    monkeypatch.setattr(crc, "_capture_get_json", lambda path, **kw: {})
-    monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
-    terms, known = crc._resident_memory_snapshot()
-    assert terms == "" and known == []
-
-
-def test_memory_snapshot_error_returns_empty(monkeypatch):
-    def boom(path, **kw):
-        raise RuntimeError("api down")
-    monkeypatch.setattr(crc, "_capture_get_json", boom)
-    monkeypatch.setattr(crc, "_resident_memory_index_summaries", lambda: [])
-    terms, known = crc._resident_memory_snapshot()
-    assert terms == "" and known == []
 
 
 # --------------------------------------------------------------------------- #

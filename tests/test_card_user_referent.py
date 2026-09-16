@@ -200,8 +200,8 @@ def test_all_three_write_paths_carry_the_naming_rule():
     2026-07-26 Seven 问的正是这个:"早期进来第一次走蒸馏"和"做梦整理旧记忆"
     这两条有没有被约束。规则本身三条都有,漏的是**转写标签**(见下一条)。
     """
-    from memory.capture_prompt_v1 import build_capture_prompt
-    from memory.dream_prompt_v1 import build_dream_prompt
+    from _memgarden_prompt_bindings import build_capture_prompt
+    from _memgarden_prompt_bindings import build_dream_prompt
 
     capture = build_capture_prompt(ai_name="小柒", user_name="", buckets="",
                                    threads="", identity="", window="- 对方: hi",

@@ -190,15 +190,7 @@ from notices import rejection_stats as _rejection_stats
 # 各写一份就会漂——本文件前台原本就漂成了没有 UNTRUSTED 标注的弱版本。
 import worldbook_match as _worldbook_match
 
-from memory.capture_prompt_v1 import (
-    IO_CONVERSATION_CAPTURE_POLICY,
-    build_capture_prompt,
-    build_capture_retry_prompt,
-    build_capture_semantic_retry_prompt,
-    parse_capture_cards,
-    sanitize_user_name,
-)
-from identity.user_naming import transcript_speaker_label
+from identity.user_naming import sanitize_user_name, transcript_speaker_label
 from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
@@ -207,12 +199,6 @@ from memgarden import contracts as mg_contracts
 from memory import garden_component
 from memgarden.text.card_text import (
     count_user_token_residuals,
-    is_retryable_parse_error,
-)
-from memory.dream_prompt_v1 import (
-    build_dream_prompt,
-    build_dream_retry_prompt,
-    parse_dream_consolidations,
 )
 from chat.reply_language import (
     format_time_anchor,
@@ -396,6 +382,10 @@ FOREGROUND_TIMEOUT_RECOVERY_SEC = max(
 FOREGROUND_TIMEOUT_RECOVERY_ATTEMPTS = 1
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 AGENT_IMAGE_GENERATION_CAPABILITY = "agent_image_generation_v1"
+# 落卡窗口按 seq 精确取批（backend capture_scheduler.CAPTURE_BATCH_WINDOW_CAPABILITY）。
+# 声明了它，后端才会发「游标之后最早的一批」而不是「最新的一段」；老 consumer 不声明，
+# 后端继续发老窗口 —— 老版本只看得到最新 160 行，给它最早一批它取不到。
+CAPTURE_BATCH_WINDOW_CAPABILITY = "capture_batch_window_v1"
 
 # Every lane literal supplied to call_agent in this resident. Recovery is
 # permitted from the user-present lane only; deriving the allow-set from the
@@ -1651,7 +1641,8 @@ def _consumer_capabilities(hosted: bool = False) -> str:
     keys ``_runtime_supported`` off this header, so omitting the web caps makes
     web read ``effective = false`` for self-hosted accounts.
     """
-    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1", "agent_body_generate_v1"]
+    caps = ["vision_observer_v1", "vision_probe_v2", "image_generation_v1", "agent_body_generate_v1",
+            CAPTURE_BATCH_WINDOW_CAPABILITY]
     if _agent_image_generation_enabled():
         caps.append(AGENT_IMAGE_GENERATION_CAPABILITY)
     if hosted:
@@ -3221,7 +3212,8 @@ def _filter_since(msgs: list, since: float) -> list:
 
 
 def _fetch_from_enclave(
-    since: float, limit: int, include_image_body: bool = True
+    since: float, limit: int, include_image_body: bool = True,
+    after_seq: int | None = None,
 ) -> list[dict] | None:
     """Direct HTTP to the enclave decrypt proxy.
 
@@ -3239,6 +3231,9 @@ def _fetch_from_enclave(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
+    if after_seq is not None:
+        # 按 seq 从旧往新翻页（落卡取批用）。没有它时是「最新一页」。
+        params["after_seq"] = int(after_seq)
     # T512: ask for the per-card selection trace (reasons/bucket/score, no card
     # bodies) so the injected block can say *why* each card is there. The
     # released memgarden injection_record carries counts only.
@@ -3741,7 +3736,8 @@ def _verify_decrypt_sources() -> bool:
 
 
 def get_decrypted_history(
-    since: float, limit: int = 20, include_image_body: bool = True
+    since: float, limit: int = 20, include_image_body: bool = True,
+    after_seq: int | None = None,
 ) -> list[dict] | None:
     """Try all configured decrypt sources in priority order.
 
@@ -3750,13 +3746,16 @@ def get_decrypted_history(
               (may be empty if no new messages).
       None  — no source configured, or all configured sources failed.
     """
+    # after_seq 只在给了的时候才往下传：其余调用点的请求参数逐字节不变。
+    seq_kwargs = {} if after_seq is None else {"after_seq": int(after_seq)}
     handled, local_result = _fetch_plaintext_or_mixed_history(
-        since, limit, include_image_body=include_image_body)
+        since, limit, include_image_body=include_image_body, **seq_kwargs)
     if handled:
         return local_result
 
     if FEEDLING_ENCLAVE_URL:
-        result = _fetch_from_enclave(since, limit, include_image_body=include_image_body)
+        result = _fetch_from_enclave(
+            since, limit, include_image_body=include_image_body, **seq_kwargs)
         if result is not None:
             return result
         log.warning("enclave source failed")
@@ -3769,6 +3768,7 @@ def _fetch_plaintext_or_mixed_history(
     limit: int,
     *,
     include_image_body: bool,
+    after_seq: int | None = None,
 ) -> tuple[bool, list[dict] | None]:
     """Use backend rows when a page contains plaintext; decrypt sealed rows one-by-one.
 
@@ -3780,6 +3780,8 @@ def _fetch_plaintext_or_mixed_history(
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
+    if after_seq is not None:
+        params["after_seq"] = int(after_seq)
     try:
         resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/chat/history",
@@ -3857,6 +3859,10 @@ def _fetch_plaintext_or_mixed_history(
                 resolved = {**row, "body_unavailable": True}
         else:
             resolved = {**row, "body_unavailable": True}
+        if resolved.get("seq") is None and row.get("seq") is not None:
+            # 单条解密/取正文的回包不带 seq（enclave 那边是 "seq": None），合并后会
+            # 把页里的真实 seq 盖掉。落卡按 seq 取批要靠它，还原回来。
+            resolved["seq"] = row.get("seq")
         out.append(_finalize_plaintext_or_mixed_history_row(resolved))
     return True, _filter_since(out, since)
 
@@ -12737,7 +12743,8 @@ def _wake_self_thinking_allowed() -> bool:
 
 
 def _self_thinking_tag() -> str:
-    """协议标签按 driver 选:Claude Code 用 ``aside``,pi / codex 保持 ``think``。
+    """协议标签按 driver / provider 选:Claude Code 用 ``aside``,gemini(任何 driver)
+    用 ``aside``(T591),其余 pi / codex 保持 ``think``。
 
     T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
     用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
@@ -12752,7 +12759,13 @@ def _self_thinking_tag() -> str:
     # http mode AGENT_CLI_CMD is dead configuration and must not change copy.
     if AGENT_MODE == "cli" and _is_claude_code_cmd(_cli_cmd_tokens()):
         return _self_thinking_v1.TAG_ASIDE
-    return _self_thinking_v1.TAG_THINK
+    # T591 (2026-09-15): gemini gets ``aside`` on any driver — measured on
+    # gemini-3.6-flash via the pi wire with a tag-only swap in one captured
+    # request body: 6/10 replays came back HTTP 503 with ``<think>``, 0/10 with
+    # ``<aside>`` in the same window (replay only; no delivery path exercised).
+    # The provider set is shared with Runtime V2 (self_thinking.ASIDE_TAG_PROVIDERS);
+    # every other provider and driver keeps ``think`` byte for byte.
+    return _self_thinking_v1.tag_for_provider(AGENT_RUNTIME_METADATA.get("provider"))
 
 
 def _foreground_self_thinking_instruction() -> str:
@@ -17564,6 +17577,32 @@ def _capture_memory_terms_context() -> tuple[str, str]:
     )
 
 
+def _capture_existing_cards() -> list[dict] | None:
+    """Capture 的「现有卡」：交给组件挑索引、校验 merge/supersede 的 target_id。
+
+    V1 以前从来没有这份索引（提示词里是 ``(none)``），模型只能 add，
+    同一件事说两次就是两张卡。V2 用的是同一个构造点和同一个判据。
+
+    读不全返回 ``None``（组件退回无索引、不校验 target，服务端所有权闸照旧兜底），
+    **绝不拿空列表冒充**：空列表 = 确认一张卡都没有，任何 supersede 都会被判成编造。
+    200 + 空 items 只有 ``user_card_count == 0`` 才算真空花园（与 Dream 同一判据）。
+    """
+    body = _capture_post_json("/v1/memory/index", payload={"limit": 0}, timeout=30)
+    items = body.get("items")
+    if not isinstance(items, list):
+        return None
+    if not items and not (
+        type(body.get("user_card_count")) is int and body.get("user_card_count") == 0
+    ):
+        return None
+    if body.get("truncated") is not False:
+        # 现有卡超过读侧硬上限（FEEDLING_MEMORY_READSIDE_HARD_MAX）时只回前一截、标
+        # truncated（老后端同样带这个字段）。半截当全集交出去，上限之后的真卡被引用时
+        # 会被判成编造丢掉 —— 读不全就不交，缺字段同样按读不全处理。
+        return None
+    return garden_component.capture_existing_cards(items)
+
+
 def _capture_message_text(msg: dict) -> str:
     text = (
         msg.get("content")
@@ -17629,8 +17668,191 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
     return out
 
 
-def _capture_window_messages(job: dict) -> list[dict]:
+CAPTURE_BATCH_PAGE_LIMIT = 200  # backend /v1/chat/history 单页上限
+
+#: 按批次发的窗口里，哪些行进落卡提示词。必须和后端切批的判据一模一样：
+#: ``capture_scheduler.CAPTURE_LIVE_SOURCES`` + 角色 user/openclaw
+#: （``db.chat_capture_messages_oldest_after_seq``），也就是 V2 worker 的
+#: ``capture_eligible``（``_CAPTURE_PROMPT_RAW_ROLES`` × ``_CAPTURE_PROMPT_SOURCES``）。
+#: 这里不 import 后端模块（自建 VPS 上 consumer 不带数据库依赖），抄一份，
+#: tests/test_v1_capture_backlog_batches.py 锁住三处一致。
+#:
+#: 以前批次窗口按角色放行、不看来源：两批聊天之间夹着的导入历史、维护提示之类的行
+#: 后端没数进这一批，却被整段喂进落卡 → 重复落卡；窗口超过字数上限时从头截断，
+#: 真正的聊天反而被挤掉。老后端发的窗口（没有 through_seq）不走这里，行为不变。
+CAPTURE_BATCH_ROLES = frozenset({"user", "openclaw"})
+CAPTURE_BATCH_SOURCES = frozenset({
+    "chat", "model_api", "live_activity", "agent_initiated_proactive",
+    "voice_call_transcript",
+})
+
+
+def _capture_batch_row_eligible(msg: Any) -> bool:
+    if not isinstance(msg, dict):
+        return False
+    return (
+        str(msg.get("role") or "") in CAPTURE_BATCH_ROLES
+        and str(msg.get("source") or "") in CAPTURE_BATCH_SOURCES
+    )
+
+
+#: 一次落卡任务翻页最多占多久。不另起数：翻页和后台模型回合一样跑在聊天线程上、
+#: 不可抢占，用同一个上限 AGENT_TURN_TIMEOUT_SEC —— 「后台活一次最多卡住前台多久」
+#: 这件事只有一个数。用户消息在等时根本等不到这个上限（每页之间都会先看一眼）。
+CAPTURE_BATCH_PAGING_BUDGET_SEC = float(AGENT_TURN_TIMEOUT_SEC)
+
+#: 让出之后保存的翻页进度，最多保留多久。不另起数：和「维护任务为聊天最多让多久」
+#: 共用 MAINTENANCE_MAX_DEFER_SEC —— 超过这个时间才回来的已经不算「接着刚才那次」，
+#: 从头翻一遍，不拿太旧的内存快照冒充当前记录。
+CAPTURE_BATCH_RESUME_MAX_AGE_SEC = float(MAINTENANCE_MAX_DEFER_SEC)
+
+CAPTURE_DEFERRED_USER_CHAT = "capture_deferred_user_chat"
+CAPTURE_DEFERRED_PAGING_BUDGET = "capture_deferred_paging_budget"
+
+
+class _CaptureWindowDeferred(Exception):
+    """翻页中途让出（用户有消息在等 / 翻页时间用完）。不是失败：任务报 skipped、游标不动。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+#: 让出时的翻页进度（本进程、单用户）。键是批次边界，下一个同一批次的任务从这里接着翻，
+#: 这样「翻不完就让出」也一定在前进，不会每次从头翻、永远翻不完。
+_capture_batch_resume: dict[str, Any] | None = None
+
+
+def _capture_seq_or_none(value: Any) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _capture_batch_window_messages(
+    after_seq: int,
+    through_seq: int,
+    *,
+    should_yield: Callable[[], bool] | None = None,
+) -> list[dict]:
+    """按 seq 精确取 ``(after_seq, through_seq]`` 这一批（后端按批次发的窗口）。
+
+    老逻辑拿「最新 160 行」再从里面找起点：积压超过这 160 行时起点根本不在里面，
+    只能退回按时间截尾 —— 更早的消息永远记不上。这里从起点往后翻页，直到越过终点，
+    一条不多、一条不少；不按 message_count 截尾（区间里夹着的非落卡来源行不能挤掉
+    这批最早的消息）。
+
+    🔴 **不设页数上限。** 后端切批只数会触发落卡的行（user/openclaw + 实时来源），
+    而这里翻的是全部行；两者之间没有稳定比例 —— 一段感知/维护/导入之类的行可以
+    在两条聊天之间堆上几千行。以前限 10 页（2000 行），堆得更多时每次都「页数用完」
+    → 任务失败 → 同一批反复失败到逃生阀阈值 → 这 60 条从没取到过的消息被当成毒窗口
+    **跳过、永久丢掉**（Codex review 2026-09-15）。
+
+    循环一定会结束：每页都要求 seq 严格前进（否则按「没有进展」失败），遇到超过
+    ``through_seq`` 的行或翻到末尾就返回，而 ``(after_seq, through_seq]`` 里的行数有限
+    （新消息的 seq 都大于终点，不会让它变长）。代价只是这种罕见批次多翻几页。
+
+    内存：每页先过 ``_capture_live_history``（原来是攒完再过，同一个逐行过滤器，
+    结果一样），被角色过滤掉的行不会整段攒在内存里。
+
+    取不全（解密源失败 / 行没有 seq / 翻页没有进展）返回 []，
+    由调用方把任务标失败、游标不动 —— 绝不拿半批冒充整批。
+
+    🔴 **翻页跑在聊天线程上、不可抢占**（Codex review 2026-09-15 第 5 轮）。不设页数上限
+    之后，最坏几百页、每页可能逐行走 enclave 解密，用户的回复一直排在后面。所以：
+
+    - 每翻完一页、翻下一页之前，``should_yield()`` 为真（用户有消息在等）就让出；
+    - 这次任务翻页超过 ``CAPTURE_BATCH_PAGING_BUDGET_SEC`` 也让出；
+    - 让出抛 ``_CaptureWindowDeferred``：调用方报 skipped（不算失败、不计逃生阀）、游标不动。
+      已翻到的进度存进 ``_capture_batch_resume``，同一批次的下一个任务从那里接着翻 ——
+      每个任务至少翻一页，所以「时间用完就让出」也一定会翻完，不会原地打转。
+
+    中途某一页取不到（解密源抖动）照旧返回 []、按失败处理：那是现有的「其它失败」档，
+    带退避、6 次才跳过（和 V2 读窗口失败同一档），不是解析失败的 3 次快跳。
+    """
+    global _capture_batch_resume
+    key = f"{int(after_seq)}:{int(through_seq)}"
+    out: list[dict] = []
+    cursor = int(after_seq)
+    resume = _capture_batch_resume
+    _capture_batch_resume = None
+    if (
+        isinstance(resume, dict)
+        and resume.get("key") == key
+        and time.time() - float(resume.get("saved_at") or 0) <= CAPTURE_BATCH_RESUME_MAX_AGE_SEC
+    ):
+        out = list(resume.get("out") or [])
+        cursor = int(resume.get("cursor") or after_seq)
+    started = time.monotonic()
+    first_page = True
+    while True:
+        if not first_page:
+            defer_reason = ""
+            if should_yield is not None and should_yield():
+                defer_reason = CAPTURE_DEFERRED_USER_CHAT
+            elif time.monotonic() - started >= CAPTURE_BATCH_PAGING_BUDGET_SEC:
+                defer_reason = CAPTURE_DEFERRED_PAGING_BUDGET
+            if defer_reason:
+                _capture_batch_resume = {
+                    "key": key, "cursor": cursor, "out": out, "saved_at": time.time(),
+                }
+                raise _CaptureWindowDeferred(defer_reason)
+        first_page = False
+        page = get_decrypted_history(
+            since=0,
+            limit=CAPTURE_BATCH_PAGE_LIMIT,
+            include_image_body=False,
+            after_seq=cursor,
+        )
+        if page is None:
+            return []
+        if not page:
+            # 翻到对话末尾：终点那条可能被删了（Chat Clear 之类），区间里现存的就是全部。
+            return out
+        page_max = cursor
+        in_range: list[dict] = []
+        reached_end = False
+        for msg in page:
+            seq = _capture_seq_or_none(msg.get("seq") if isinstance(msg, dict) else None)
+            if seq is None:
+                log.warning("capture batch window: history row without seq; refusing a partial batch")
+                return []
+            page_max = max(page_max, seq)
+            if seq <= after_seq:
+                continue
+            if seq > through_seq:
+                reached_end = True
+                break
+            in_range.append(msg)
+            if seq == through_seq:
+                reached_end = True
+                break
+        out.extend(_capture_live_history(
+            [msg for msg in in_range if _capture_batch_row_eligible(msg)]
+        ))
+        if reached_end:
+            return out
+        if page_max <= cursor:
+            log.warning("capture batch window: history paging made no progress at seq=%s", cursor)
+            return []
+        cursor = page_max
+
+
+def _capture_window_messages(
+    job: dict, *, should_yield: Callable[[], bool] | None = None
+) -> list[dict]:
     window = job.get("window") if isinstance(job.get("window"), dict) else {}
+    batch_after_seq = _capture_seq_or_none(window.get("after_seq"))
+    batch_through_seq = _capture_seq_or_none(window.get("through_seq"))
+    if (batch_after_seq is not None and batch_through_seq is not None
+            and batch_through_seq > batch_after_seq >= 0):
+        return _capture_batch_window_messages(
+            batch_after_seq, batch_through_seq, should_yield=should_yield
+        )
+    # 老后端发的窗口（没有 through_seq）：原样走老逻辑。
     after_id = str(window.get("after_message_id") or "").strip()
     until_id = str(window.get("until_message_id") or "").strip()
     try:
@@ -17797,58 +18019,6 @@ def _capture_reply_shape(reply_text: str) -> dict[str, Any]:
         "reply_has_fence": "```" in text,
         "reply_looks_truncated": bool(stack or in_string),
     }
-
-
-def _memory_agent_parse_with_bounce(
-    prompt: str,
-    *,
-    parse,
-    build_retry_prompt,
-    lane: str,
-    job_id: str,
-) -> tuple[tuple, str]:
-    """跑一次记忆抽取,内容不合格就原样打回去重问一次。
-
-    弱模型(实测 minimax-M3)会把输出示例的骨架抄回来:JSON 合法、字段非空,
-    但 summary/content 是 ``...`` 或 ``[thickened summary]``。这类回复以前
-    静默落库,用户在花园里就看到空白卡。现在第一次严格判、不合格就带着
-    「哪个字段没填」重问一次;第二次放宽为「只丢脏卡、保留干净的」。
-
-    返回 ``(parsed, bounce)``:``parsed`` 是 parse 的原始元组,``bounce`` 是
-    ``""``/``bounced_ok``/``bounced_empty``/``bounced_failed``,只用于观测。
-    调用方仍然只看 parse 元组末位的 err 决定成败 —— 打回是内部实现,不改判成败的口径。
-    注意第二问全脏时 parse 会给 ``invalid_card_content_after_retry:*``,
-    调用方据此把 job 判失败:报成 noop 会推进 frontier 把这段窗口永久丢掉。
-    """
-    reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
-    _note_agent_turn_success()
-    parsed = parse(reply_text, strict=True)
-    err = parsed[-1]
-    # 谓词与 V2 的 ParseRetry.should_retry 是同一个(memgarden.text.card_text)。两条 lane
-    # 必须共用一份判据,否则同一个模型在托管和自建上会得到不同的重问行为 ——
-    # json_decode_error 以前不在重问范围,注释说它「各有自己的退避路径」,实测那条
-    # 路是空的:usr_450ee421e16a3b5a 连续 6 次失败,reask_count 全是 0。
-    if not is_retryable_parse_error(err):
-        return parsed, ""
-    log.warning(
-        "%s content gate bounced id=%s reason=%s — re-asking once", lane, job_id, err
-    )
-    retry_text = _capture_agent_reply_text(
-        call_agent(build_retry_prompt(prompt, err), raw_text=True)
-    )
-    _note_agent_turn_success()
-    # 第二次放宽:脏行丢掉、干净的照收,不让一行占位符把整晚整理清零;
-    # 但一张干净的都没剩下时 parse 会报 *_after_retry,不伪装成成功。
-    retried = parse(retry_text, strict=False)
-    if retried[-1]:
-        log.warning("%s content gate retry still bad id=%s reason=%s", lane, job_id, retried[-1])
-        return retried, "bounced_failed"
-    if not retried[0]:
-        # 模型接受了「宁可留空」这条出路 —— 这是 prompt 想要的结果,不是失败。
-        log.info("%s content gate retry returned a clean empty result id=%s", lane, job_id)
-        return retried, "bounced_empty"
-    log.info("%s content gate retry recovered id=%s cards=%d", lane, job_id, len(retried[0]))
-    return retried, "bounced_ok"
 
 
 RETRIEVAL_CUES_MAX = 5
@@ -18027,12 +18197,17 @@ def _capture_semantic_retry_reasons(
     return reasons
 
 
-def _process_capture_jobs(jobs: list) -> float:
+def _process_capture_jobs(jobs: list, chat_since: float | None = None) -> float:
     """Realize memory_capture jobs through the native resident agent.
 
     Capture is background memory maintenance: it never writes chat, never uses
     delivery gates, and never runs the V2 tool loop.
+
+    ``chat_since`` (from ``_process_resident_jobs``) lets a long batch-window
+    read yield to a waiting user message between history pages; ``None`` keeps
+    the no-gate behavior.
     """
+    global _resident_jobs_deferred_for_user
     latest = 0.0
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
@@ -18053,7 +18228,36 @@ def _process_capture_jobs(jobs: list) -> float:
             continue
         window = job.get("window") if isinstance(job.get("window"), dict) else {}
         update_proactive_job_status(job_id, "realizing")
-        messages = _capture_window_messages(job)
+        try:
+            if chat_since is None:
+                messages = _capture_window_messages(job)
+            else:
+                messages = _capture_window_messages(
+                    job, should_yield=lambda: _user_chat_pending(chat_since)
+                )
+        except _CaptureWindowDeferred as deferred:
+            # 翻页中途让出：用户有消息在等，或这次翻页时间用完。报 skipped —— 后端对
+            # V1 落卡的 skipped 既不累计失败、不退避、不算逃生阀，也不推游标
+            # （capture_scheduler.record_capture_job_status），同一批之后重新入队，
+            # 从 _capture_batch_resume 接着翻。只带原因码，不带任何内容。
+            log.info("capture window paging deferred id=%s reason=%s", job_id, deferred.reason)
+            update_proactive_job_status(
+                job_id,
+                "skipped",
+                deferred.reason,
+                extra={
+                    "capture_result": {"status": "skipped", "reason": deferred.reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": deferred.reason,
+                },
+            )
+            if deferred.reason == CAPTURE_DEFERRED_USER_CHAT:
+                # 和 _process_resident_jobs 的让出同一个语义：保留旧 checkpoint、这批剩下的不跑。
+                _resident_jobs_deferred_for_user = True
+                break
+            continue
         window_text = ""
         if messages:
             # Names before rendering: the transcript labels use them (never a
@@ -18117,6 +18321,7 @@ def _process_capture_jobs(jobs: list) -> float:
             )
             continue
         buckets_text, threads_text = _capture_memory_terms_context()
+        existing_cards = _capture_existing_cards()
         # 花园的分类语言 —— **看这个人用什么语言，不看桶名**。
         #
         # 桶名曾经是这里的首要判据，2026-08-24 因此出过线上事故（旧 bug 留下的英文
@@ -18165,17 +18370,21 @@ def _process_capture_jobs(jobs: list) -> float:
             garden_component.CallableModel(_capture_model_call),
             on_step=_bounce_tracker,
         )
+        # 请求只在 garden_component.capture_request 里拼（V2 同一个）：现有卡索引、
+        # io 的称呼规则、洗过的名字、档位。服务端打回后的重问复用同一个请求，
+        # 模型看到的索引和校验的 target 集合前后一致。
+        _capture_req = garden_component.capture_request(
+            window=window_text,
+            locale=capture_locale,
+            buckets=buckets_text,
+            threads=threads_text,
+            identity=identity_text,
+            ai_name=ai_name,
+            user_name=user_name,
+            existing_cards=existing_cards,
+        )
         try:
-            _captured = _garden.capture(mg_contracts.CaptureRequest(
-                window=window_text,
-                locale=capture_locale,
-                buckets=buckets_text,
-                threads=threads_text,
-                identity=identity_text,
-                ai_name=ai_name,
-                user_name=user_name,
-                policy=IO_CONVERSATION_CAPTURE_POLICY,
-            ))
+            _captured = _garden.capture(_capture_req)
             _emit_agent_turn_success(
                 foreground=False,
                 lane="capture",
@@ -18187,6 +18396,30 @@ def _process_capture_jobs(jobs: list) -> float:
             bounce = _bounce_tracker.bounce(cards=cards, error=err)
             if bounce:
                 log.warning("capture content gate bounced id=%s outcome=%s", job_id, bounce)
+            # 已有记忆索引的规模，内容无关。「这轮为什么没并进旧卡」先看这条：
+            # unavailable = 现有卡没读到，模型这轮看不到可并的卡。
+            _index_detail = _bounce_tracker.index_detail()
+            _index_outcome = (
+                "kernel_outdated"
+                if not garden_component.capture_kernel_selects_index()
+                else "unavailable"
+                if existing_cards is None
+                else "ready"
+            )
+            _emit_debug_trace(
+                "memory", "memory.capture.index",
+                status="ok" if _index_outcome == "ready" else "degraded",
+                summary=(
+                    f"落卡索引 {_index_detail.get('index_cards', 0)}"
+                    f"/{_index_detail.get('index_candidates', 0)} 张"
+                    if _index_outcome == "ready"
+                    else f"落卡索引不可用（{_index_outcome}）"
+                ),
+                explain="落卡时模型看到的已有记忆索引有多大；只有计数，没有卡片内容。",
+                detail={"outcome": _index_outcome, **_index_detail},
+                trace_id=job_id,
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
@@ -18219,6 +18452,7 @@ def _process_capture_jobs(jobs: list) -> float:
             # 别的好卡活了下来。只看 bounce 的话它会显示成 recovered。
             "failed"
             if _bounce_tracker.dropped_semantic
+            or _bounce_tracker.dropped_unknown_target
             else "recovered"
             if bounce == "bounced_ok"
             else "failed"
@@ -18271,11 +18505,15 @@ def _process_capture_jobs(jobs: list) -> float:
             # 两者在 admin 上长得一模一样,混在一起等于这类失败永远查不出来。
             # 同一条道理见下面 content_gate 那句注释。
             _dropped = _bounce_tracker.dropped_semantic
+            # 「说了要覆盖一张不存在的卡」同理是模型失败，单独一类（见 BounceTracker）。
+            _unknown = _bounce_tracker.dropped_unknown_target
             _noop_reason = (
                 "empty_after_reask"
                 if reask_count > 0 and reask_outcome == "empty"
                 else "supersede_without_target"
                 if _dropped
+                else "supersede_target_unknown"
+                if _unknown
                 else "nothing_worth_keeping"
             )
             _capture_result = {
@@ -18285,9 +18523,17 @@ def _process_capture_jobs(jobs: list) -> float:
                 "reask_trigger": reask_trigger or None,
                 "reask_outcome": reask_outcome,
             }
-            if _dropped:
-                _capture_result["skipped"] = {"supersede_without_target": _dropped}
-                _capture_result["skipped_count"] = _dropped
+            _skipped = {
+                key: count
+                for key, count in (
+                    ("supersede_without_target", _dropped),
+                    ("supersede_target_unknown", _unknown),
+                )
+                if count
+            }
+            if _skipped:
+                _capture_result["skipped"] = _skipped
+                _capture_result["skipped_count"] = sum(_skipped.values())
             update_proactive_job_status(
                 job_id,
                 "completed",
@@ -18346,16 +18592,7 @@ def _process_capture_jobs(jobs: list) -> float:
                     # 在两边各写一份,然后慢慢漂开(这个文件里刚删掉一段就是
                     # 这么来的)。
                     _retried = _garden.recapture_with_feedback(
-                        mg_contracts.CaptureRequest(
-                            window=window_text,
-                            locale=capture_locale,
-                            buckets=buckets_text,
-                            threads=threads_text,
-                            identity=identity_text,
-                            ai_name=ai_name,
-                            user_name=user_name,
-                            policy=IO_CONVERSATION_CAPTURE_POLICY,
-                        ),
+                        _capture_req,
                         server_semantic_reasons,
                     )
                     _note_agent_turn_success()
@@ -18434,6 +18671,12 @@ def _process_capture_jobs(jobs: list) -> float:
                 + rejected_without_target
             )
             observation["skipped_count"] += rejected_without_target
+        if _bounce_tracker.dropped_unknown_target:
+            observation["skipped"]["supersede_target_unknown"] = (
+                observation["skipped"].get("supersede_target_unknown", 0)
+                + _bounce_tracker.dropped_unknown_target
+            )
+            observation["skipped_count"] += _bounce_tracker.dropped_unknown_target
         applied_added = observation["applied"].get("added", 0)
         applied_superseded = observation["applied"].get("superseded", 0)
         capture_status = observation["status"] if actions else "noop"
@@ -18517,97 +18760,206 @@ def _process_capture_jobs(jobs: list) -> float:
     return latest
 
 
+class DreamContextUnavailable(RuntimeError):
+    """Dream's card read failed; content-free (the message is only the code).
+
+    ``_capture_post_json`` answers every failure with ``{}``, which is right for
+    its best-effort callers but made a timed-out card read look exactly like an
+    empty garden: the job completed as ``dream_no_cards_available`` and the
+    backend advanced the Dream ledger, silencing Dream until enough new cards
+    arrived (prod, 09-10 / 09-13 enclave decrypt timeouts).
+    """
+
+    code = "dream_context_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def _dream_post_json(path: str, *, payload: dict[str, Any], timeout: int) -> dict:
+    """Strict readside POST for Dream: transport error, timeout, non-2xx or a
+    non-JSON/non-object body raise ``DreamContextUnavailable``; only a real,
+    readable JSON object is returned. The exception text is deliberately not
+    carried — an upstream body may echo private card content."""
+    _refresh_auth_header()
+    root = FEEDLING_API_URL.rstrip("/")
+    try:
+        resp = _client_for(root).post(
+            f"{root}{path}",
+            json=payload,
+            headers=_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:
+        log.warning(
+            "dream context read failed path=%s error_class=%s", path, type(e).__name__
+        )
+        raise DreamContextUnavailable() from e
+    if not isinstance(body, dict):
+        log.warning("dream context read malformed path=%s check=body", path)
+        raise DreamContextUnavailable()
+    return body
+
+
+def _dream_read_rejected(path: str, check: str, **counts: int) -> DreamContextUnavailable:
+    """Log a content-free reason (check name + counts only) and build the error."""
+    log.warning(
+        "dream context read incomplete path=%s check=%s %s",
+        path,
+        check,
+        " ".join(f"{key}={value}" for key, value in sorted(counts.items())),
+    )
+    return DreamContextUnavailable()
+
+
 def _dream_index_items() -> list[dict]:
-    body = _capture_post_json(
-        "/v1/memory/index",
+    """The Dream card window, or ``DreamContextUnavailable``.
+
+    HTTP 200 is not proof of a readable garden: the backend drops cards it
+    cannot decrypt, so an enclave that fails every card still answers
+    ``{"items": []}``. ``user_card_count`` (the live card total, reported since
+    the endpoint was introduced — before Dream existed) is what separates an
+    empty garden from an unreadable one. A malformed item is a broken contract,
+    not a card to skip.
+    """
+    path = "/v1/memory/index"
+    body = _dream_post_json(
+        path,
         payload={"limit": max(0, DREAM_MEMORY_INDEX_LIMIT)},
         timeout=30,
     )
-    items = body.get("items") if isinstance(body.get("items"), list) else []
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise _dream_read_rejected(path, "items_missing")
     out: list[dict] = []
     seen: set[str] = set()
+    malformed = 0
     for item in items:
-        if not isinstance(item, dict):
+        memory_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+        if not memory_id:
+            malformed += 1
             continue
-        memory_id = str(item.get("id") or "").strip()
-        if not memory_id or memory_id in seen:
+        if memory_id in seen or len(out) >= max(1, DREAM_MEMORY_MAX_CARDS):
             continue
         seen.add(memory_id)
         out.append(dict(item))
-        if len(out) >= max(1, DREAM_MEMORY_MAX_CARDS):
-            break
+    if malformed:
+        raise _dream_read_rejected(
+            path, "item_malformed", items=len(items), malformed=malformed
+        )
+    user_card_count = body.get("user_card_count")
+    if not out and not (type(user_card_count) is int and user_card_count == 0):
+        # Absent/invalid count included: every backend that schedules Dream
+        # reports it, so its absence is not evidence of an empty garden.
+        raise _dream_read_rejected(
+            path,
+            "empty_unverified",
+            items=len(items),
+            user_card_count=user_card_count if type(user_card_count) is int else -1,
+        )
     return out
 
 
 def _dream_fetch_items(ids: list[str]) -> dict[str, dict]:
+    """Full bodies for exactly ``ids``, or ``DreamContextUnavailable``.
+
+    Anything short of every requested card coming back — a failed batch,
+    ``missing_ids`` / ``unavailable_ids``, a truncated request, an omitted or
+    extra id — fails the whole read. A card without its full body would be
+    shown to the model as an index summary and could be superseded from that
+    summary alone (same contract as V2's ``dream_cards_fetch_incomplete``).
+    """
     if not ids:
         return {}
+    path = "/v1/memory/fetch"
     by_id: dict[str, dict] = {}
     batch_size = max(1, min(DREAM_FETCH_BATCH_SIZE, 200))
     for offset in range(0, len(ids), batch_size):
         batch = ids[offset : offset + batch_size]
-        body = _capture_post_json(
-            "/v1/memory/fetch",
+        body = _dream_post_json(
+            path,
             payload={"ids": batch, "limit": len(batch)},
             timeout=30,
         )
-        for item in body.get("items") if isinstance(body.get("items"), list) else []:
-            if isinstance(item, dict) and str(item.get("id") or "").strip():
-                by_id[str(item.get("id") or "").strip()] = dict(item)
+        items = body.get("items")
+        if not isinstance(items, list):
+            raise _dream_read_rejected(path, "items_missing", requested=len(batch))
+        for key in ("missing_ids", "unavailable_ids"):
+            value = body.get(key, [])
+            if not isinstance(value, list) or value:
+                raise _dream_read_rejected(
+                    path,
+                    key,
+                    requested=len(batch),
+                    count=len(value) if isinstance(value, list) else -1,
+                )
+        truncation = body.get("truncation")
+        if isinstance(truncation, dict) and truncation.get("truncated"):
+            raise _dream_read_rejected(path, "truncated", requested=len(batch))
+        wanted = set(batch)
+        returned: dict[str, dict] = {}
+        for item in items:
+            memory_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
+            if not memory_id:
+                raise _dream_read_rejected(
+                    path, "item_malformed", requested=len(batch), items=len(items)
+                )
+            returned[memory_id] = dict(item)
+        if set(returned) != wanted:
+            raise _dream_read_rejected(
+                path, "ids_incomplete", requested=len(wanted), returned=len(returned)
+            )
+        by_id.update(returned)
     return by_id
 
 
-def _dream_card_field(card: dict, *names: str) -> str:
-    for name in names:
-        value = card.get(name)
-        if isinstance(value, str) and value.strip():
-            return re.sub(r"\s+", " ", value.strip())
-    return ""
+def _dream_read_cards() -> list[dict]:
+    """The Dream card window with full bodies, or ``DreamContextUnavailable``.
 
-
-def _dream_card_threads(card: dict) -> list[str]:
-    raw = card.get("threads") or card.get("thread") or []
-    values = raw if isinstance(raw, list) else [raw]
-    out: list[str] = []
-    for item in values:
-        text = str(item or "").strip()
-        if text and text not in out:
-            out.append(text[:80])
-    return out[:8]
-
-
-def _dream_cards_context() -> tuple[str, dict[str, dict]]:
+    Index order is kept; each card is its index item overlaid with the fetched
+    body. Nothing is rendered or trimmed here: the Garden component renders the
+    cards with their bodies and applies the prompt budget (see
+    ``memory.garden_component.open_dream_session``), and maps legacy field
+    names (title/body/category …) on the way in.
+    """
     index_items = _dream_index_items()
     ids = [str(item.get("id") or "").strip() for item in index_items if str(item.get("id") or "").strip()]
     fetched = _dream_fetch_items(ids)
-    merged: list[dict] = []
-    by_id: dict[str, dict] = {}
+    cards: list[dict] = []
     for item in index_items:
         memory_id = str(item.get("id") or "").strip()
         if not memory_id:
             continue
-        card = {**item, **fetched.get(memory_id, {})}
-        merged.append(card)
-        by_id[memory_id] = card
-    lines: list[str] = []
-    for card in merged:
-        memory_id = str(card.get("id") or "").strip()
-        bucket = _dream_card_field(card, "bucket", "category")
-        threads = _dream_card_threads(card)
-        summary = _dream_card_field(card, "summary", "title", "description")
-        content = _dream_card_field(card, "content", "body", "text", "plaintext")
-        parts = [f"- id={memory_id}"]
-        if bucket:
-            parts.append(f"bucket={bucket}")
-        if threads:
-            parts.append("threads=" + ",".join(threads))
-        if summary:
-            parts.append(f"summary={summary[:500]}")
-        if content and content != summary:
-            parts.append(f"content={content[:900]}")
-        lines.append(" | ".join(parts))
-    text = "\n".join(lines).strip()
-    return (text or "（暂无卡）")[:20000], by_id
+        # ``_dream_fetch_items`` guarantees every indexed id has its full body.
+        cards.append({**item, **fetched[memory_id]})
+    return cards
+
+
+def _run_dream_session(session, tracker, *, job_id: str) -> tuple[list[dict], str | None, str, int]:
+    """Drive a Dream component session through the resident agent.
+
+    The component decides what to ask and whether to re-ask (content gate,
+    format re-ask once); the resident only calls the model — ``raw_text`` so
+    the chat-bubble sanitizer never touches the JSON. Returns
+    ``(consolidations, err, bounce, model_calls)``; ``bounce`` keeps the
+    established ``""``/``bounced_ok``/``bounced_empty``/``bounced_failed``
+    observation vocabulary.
+    """
+    calls = 0
+    while (prompt := session.next_prompt()) is not None:
+        reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+        _note_agent_turn_success()
+        calls += 1
+        session.feed(reply_text)
+    outcome = session.result()
+    consolidations = list(outcome.consolidations or [])
+    err = str(outcome.error) if outcome.error else None
+    bounce = tracker.bounce(cards=consolidations, error=err)
+    if bounce:
+        log.warning("dream content gate bounced id=%s outcome=%s", job_id, bounce)
+    return consolidations, err, bounce, calls
 
 
 def _dream_recent_conversations_context(
@@ -18651,6 +19003,7 @@ def _dream_actions_from_consolidations(
     *,
     card_map: dict[str, dict],
     occurred_at: str,
+    disclosed_count: int | None = None,
 ) -> tuple[list[dict], int, int, int, int, int]:
     # 2026-08-05 复盘只保留结构性判据(rationale 非空、目标卡真实存在、不重复退休)。
     # 语义审查员与 15% 增量栅栏(内容质量判断)已拆除;出口硬闸移到 parse 层
@@ -18712,7 +19065,9 @@ def _dream_actions_from_consolidations(
         cards_superseded += len(card_ids)
     if consolidations and not actions:
         raise ValueError("dream_no_memory_actions")
-    if memory_dream_gates.blast_radius_exceeded(cards_superseded, len(card_map)):
+    if memory_dream_gates.blast_radius_exceeded(
+        cards_superseded, len(card_map) if disclosed_count is None else disclosed_count
+    ):
         # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显不对
         # (834→1 事故的最后防线)。整个 job 失败等人查,不部分执行。
         raise ValueError("dream_blast_radius_exceeded")
@@ -18748,7 +19103,9 @@ def _emit_resident_dream_lifecycle(
     )
 
 
-def _emit_resident_dream_context_error(job_id: str) -> None:
+def _emit_resident_dream_context_error(
+    job_id: str, *, component: str = "memory_context", outcome: str = "unavailable"
+) -> None:
     _emit_debug_trace(
         "memory",
         memory_dream_trace.CONTEXT_TRACE_TYPE,
@@ -18757,8 +19114,8 @@ def _emit_resident_dream_context_error(job_id: str) -> None:
         explain="",
         detail=memory_dream_trace.context_detail(
             runtime="resident_v1",
-            component="memory_context",
-            outcome="unavailable",
+            component=component,
+            outcome=outcome,
         ),
         trace_id=job_id,
         job_id=job_id,
@@ -18801,7 +19158,37 @@ def _process_dream_jobs(jobs: list) -> float:
         )
         update_proactive_job_status(job_id, "realizing")
         try:
-            cards_text, card_map = _dream_cards_context()
+            dream_cards = _dream_read_cards()
+        except DreamContextUnavailable:
+            # A failed read is not an empty garden: fail the job so the backend
+            # applies the Dream failure backoff and leaves the ledger alone.
+            _emit_resident_dream_context_error(job_id)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "dream_context_unavailable",
+                extra={
+                    "dream_result": {
+                        "status": "failed",
+                        "reason": "dream_context_unavailable",
+                        "job_kind": "memory_dream",
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": "dream_context_unavailable",
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="context_unavailable",
+                started_at=dream_started,
+                degraded_context=True,
+                counts=dream_counts,
+            )
+            continue
         except Exception:
             _emit_resident_dream_context_error(job_id)
             _emit_resident_dream_lifecycle(
@@ -18814,14 +19201,24 @@ def _process_dream_jobs(jobs: list) -> float:
                 counts=dream_counts,
             )
             raise
-        dream_counts["active_cards"] = len(card_map)
-        if not card_map:
+        dream_counts["active_cards"] = len(dream_cards)
+        if not dream_cards:
             update_proactive_job_status(
                 job_id,
                 "completed",
                 "dream_no_cards_available",
                 extra={
-                    "dream_result": {"status": "noop", "reason": "dream_no_cards_available", "job_kind": "memory_dream"},
+                    # ``cards_read: "empty"`` = the index read succeeded and
+                    # the backend reported zero live cards (``user_card_count
+                    # == 0``). The backend only trusts a no-cards completion
+                    # that carries it; older consumers sent the same completion
+                    # after a failed read (see proactive_core).
+                    "dream_result": {
+                        "status": "noop",
+                        "reason": "dream_no_cards_available",
+                        "job_kind": "memory_dream",
+                        "cards_read": "empty",
+                    },
                     "cards_merged": 0,
                     "cards_superseded": 0,
                     "questions": [],
@@ -18842,40 +19239,111 @@ def _process_dream_jobs(jobs: list) -> float:
             user_label=user_name, agent_label=ai_name
         )
         _dream_buckets, _dream_threads = _capture_memory_terms_context()
-        prompt = build_dream_prompt(
-            ai_name=ai_name,
-            user_name=user_name,
-            cards=cards_text,
-            recent_conversations=recent_text,
-            # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
-            # 证据也要同一套 —— 光同源不同证据，一样会判出两个结果。
-            locale=infer_garden_language(
-                _identity,
-                written=_dream_written,
-                existing_buckets=_dream_buckets,
-                archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
-            ),
-        )
-        # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个即
-        # 「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
-        dream_known_ids = frozenset(card_map)
+        # 整理走 GardenComponent 的会话：提示词（带正文的卡片区、预算截断、TRUNCATED
+        # 标记）、解析、内容闸与重问都在组件里；resident 只负责调模型。
+        # known_ids（墓碑卡守卫）覆盖读到的全部卡，由组件的解析同路打回重问。
+        _dream_tracker = garden_component.BounceTracker()
+        try:
+            dream_session, dream_disclosure = garden_component.open_dream_session(
+                garden_component.build_garden(
+                    garden_component.CallableModel(lambda _prompt: ""),
+                    on_step=_dream_tracker,
+                ),
+                cards=dream_cards,
+                # 与 capture 同源：整理的是同一个花园，不能夜里换一种语言的桶。
+                # 证据也要同一套 —— 光同源不同证据，一样会判出两个结果。
+                locale=infer_garden_language(
+                    _identity,
+                    written=_dream_written,
+                    existing_buckets=_dream_buckets,
+                    archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
+                ),
+                ai_name=ai_name,
+                user_name=user_name,
+                recent_conversations=recent_text,
+            )
+        except garden_component.DreamKernelOutdated:
+            # The installed memgarden cannot render card bodies (a self-update
+            # that switched code but did not finish installing dependencies).
+            # Its titles-only prompt would let the model rewrite bodies it never
+            # saw: fail this run (backoff, ledger untouched) instead.
+            reason = garden_component.DREAM_KERNEL_OUTDATED
+            log.error("dream job id=%s: installed memgarden cannot render card bodies", job_id)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": reason,
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="failed",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
+            continue
+        if dream_disclosure.skip_reason:
+            # The component judged the garden too small to consolidate (same
+            # verdict V2 records as a skip). Not a completion — the Dream ledger
+            # must not advance as if a consolidation ran — and not a failure.
+            update_proactive_job_status(
+                job_id,
+                "skipped",
+                dream_disclosure.skip_reason,
+                extra={
+                    "wake_result": "skipped",
+                    "dream_skip_reason": dream_disclosure.skip_reason,
+                    "dream_result": {
+                        "status": "skipped",
+                        "reason": dream_disclosure.skip_reason,
+                        "job_kind": "memory_dream",
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": dream_disclosure.skip_reason,
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.done",
+                job_id=job_id,
+                status="ok",
+                outcome="skipped",
+                started_at=dream_started,
+                counts=dream_counts,
+            )
+            continue
+        dream_degraded_context = dream_disclosure.partial
+        if dream_degraded_context:
+            # Cards beyond the component's prompt budget wait for a later night:
+            # an intentional partial context, visible as ``truncated``.
+            _emit_resident_dream_context_error(
+                job_id, component="cards", outcome="truncated"
+            )
+        dream_counts["active_cards"] = len(dream_disclosure.rendered_ids)
         _emit_resident_dream_lifecycle(
             "memory.dream.model.start",
             job_id=job_id,
             status="ok",
             outcome="started",
             started_at=dream_started,
+            degraded_context=dream_degraded_context,
             counts=dream_counts,
         )
+        # The component does not return the model's "questions_to_ask"; Dream
+        # questions were only ever stored on the job, never asked (V2 drops them).
+        questions: list = []
         try:
-            (consolidations, questions, err), bounce = _memory_agent_parse_with_bounce(
-                prompt,
-                parse=lambda raw, strict=True: parse_dream_consolidations(
-                    raw, strict=strict, known_ids=dream_known_ids
-                ),
-                build_retry_prompt=build_dream_retry_prompt,
-                lane="dream",
-                job_id=job_id,
+            consolidations, err, bounce, dream_calls = _run_dream_session(
+                dream_session, _dream_tracker, job_id=job_id
             )
             _emit_agent_turn_success(
                 foreground=False,
@@ -18912,6 +19380,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome="provider_failed",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             _emit_resident_dream_lifecycle(
@@ -18920,11 +19389,19 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome="provider_failed",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
-        dream_counts["model_attempts"] = 2 if bounce else 1
-        dream_counts["proposals"] = len(consolidations or [])
+        dream_counts["model_attempts"] = max(1, dream_calls)
+        # Proposals = what the model returned, including the ones the component
+        # dropped at its exit for touching a TRUNCATED / unrendered card.
+        kernel_truncated_dropped = _dream_tracker.dropped_truncated_target
+        dream_counts["proposals"] = (
+            len(consolidations or [])
+            + kernel_truncated_dropped
+            + _dream_tracker.dropped_unrendered_target
+        )
         if err:
             update_proactive_job_status(
                 job_id,
@@ -18945,6 +19422,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome=model_outcome,
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             _emit_resident_dream_lifecycle(
@@ -18953,6 +19431,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome=model_outcome,
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -18961,10 +19440,58 @@ def _process_dream_jobs(jobs: list) -> float:
             "memory.dream.model.done",
             job_id=job_id,
             status="ok",
-            outcome=("accepted" if consolidations else "no_proposals"),
+            outcome=("accepted" if dream_counts["proposals"] else "no_proposals"),
             started_at=dream_started,
+            degraded_context=dream_degraded_context,
             counts=dream_counts,
         )
+
+        # Host-side hard block: the prompt forbids rewriting a card the model
+        # only saw part of (TRUNCATED), but a prompt is not a guarantee. Drop
+        # those proposals; if every proposal was one, fail (ledger untouched)
+        # rather than complete as "nothing to consolidate".
+        # A memgarden that already drops these at the component exit leaves
+        # nothing for the host check; count its drops as the same guard so an
+        # all-forbidden run still fails instead of completing as a noop.
+        consolidations, host_truncated_rejected = garden_component.reject_truncated_consolidations(
+            consolidations, dream_disclosure.truncated_ids
+        )
+        truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
+        if truncated_rejected:
+            log.warning(
+                "dream truncated-card guard id=%s rejected=%d (component=%d host=%d) kept=%d",
+                job_id, truncated_rejected, kernel_truncated_dropped,
+                host_truncated_rejected, len(consolidations),
+            )
+        if truncated_rejected and not consolidations:
+            reason = garden_component.DREAM_TRUNCATED_CARD_REJECTED
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {
+                        "status": "failed",
+                        "reason": reason,
+                        "job_kind": "memory_dream",
+                        "truncated_rejected": truncated_rejected,
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": reason,
+                },
+            )
+            _emit_resident_dream_lifecycle(
+                "memory.dream.error",
+                job_id=job_id,
+                status="error",
+                outcome="guard_rejected",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            continue
 
         user_token_residual = sum(
             count_user_token_residuals(row.get("result") or {})
@@ -18996,9 +19523,10 @@ def _process_dream_jobs(jobs: list) -> float:
             _emit_resident_dream_lifecycle(
                 "memory.dream.done",
                 job_id=job_id,
-                status="ok",
+                status="warning" if dream_degraded_context else "ok",
                 outcome="noop",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19017,8 +19545,15 @@ def _process_dream_jobs(jobs: list) -> float:
                 merged_count,
             ) = _dream_actions_from_consolidations(
                 consolidations,
-                card_map=card_map,
+                # Retirable = cards the model saw in full this run; the fuse
+                # denominator = every card it saw (same meaning as before the
+                # component took over the prompt budget).
+                card_map={
+                    str(card.get("id") or "").strip(): card
+                    for card in dream_disclosure.editable_cards()
+                },
                 occurred_at=occurred_at,
+                disclosed_count=len(dream_disclosure.rendered_ids),
             )
             dream_counts.update({
                 "actions": len(actions),
@@ -19055,6 +19590,7 @@ def _process_dream_jobs(jobs: list) -> float:
                     else "mapping_rejected"
                 ),
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19080,6 +19616,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome=("write_failed" if dream_stage == "write" else "failed"),
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19121,6 +19658,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 status="error",
                 outcome="write_rejected",
                 started_at=dream_started,
+                degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
             continue
@@ -19141,7 +19679,8 @@ def _process_dream_jobs(jobs: list) -> float:
                     "job_kind": "memory_dream",
                     "consolidations": len(consolidations),
                     "actions": len(actions),
-                    "active_cards": len(card_map),
+                    "active_cards": len(dream_disclosure.rendered_ids),
+                    "truncated_rejected": truncated_rejected,
                     "questions": len(questions),
                     "cards_thickened": cards_thickened,
                     "organized_count": organized_count,
@@ -19181,6 +19720,7 @@ def _process_dream_jobs(jobs: list) -> float:
             status=("warning" if observation["failed_count"] else "ok"),
             outcome=("partial" if observation["failed_count"] else "applied"),
             started_at=dream_started,
+            degraded_context=dream_degraded_context,
             counts=dream_counts,
         )
     return latest
@@ -20040,7 +20580,14 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
                     now - _last_user_message_wall, job.get("job_kind") or job.get("source"),
                 )
                 continue
-        latest = max(latest, processor([job]))
+        if class_idx == 0:
+            # Capture's batch-window read can page many times; it checks the same
+            # pending-user peek between pages (see _capture_batch_window_messages).
+            latest = max(latest, processor([job], chat_since=chat_since))
+            if _resident_jobs_deferred_for_user:
+                break
+        else:
+            latest = max(latest, processor([job]))
     return latest
 
 
@@ -22585,10 +23132,9 @@ def _resident_floor_note() -> str:
     return ""
 
 
-def _resident_memory_index_summaries() -> list[str]:
-    """Best-effort /v1/memory/index read → per-card summary strings for known_memories
-    (semantic dedup guidance to fact_write). Cap 200 entries x 160 chars — a prompt-sized
-    digest, not a full dump. Any failure/empty garden → [] (zero impact)."""
+def _resident_memory_index_items() -> list[dict]:
+    """Best-effort /v1/memory/index read (id / summary / bucket / status …, no content).
+    Any failure → [] (zero impact)."""
     try:
         body = _capture_post_json(
             "/v1/memory/index",
@@ -22596,53 +23142,9 @@ def _resident_memory_index_summaries() -> list[str]:
             timeout=20,
         )
         items = body.get("items") if isinstance(body.get("items"), list) else []
-        out: list[str] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            summary = str(item.get("summary") or "").strip()
-            if summary:
-                out.append(summary[:160])
-            if len(out) >= 200:
-                break
-        return out
+        return [item for item in items if isinstance(item, dict)]
     except Exception:
         return []
-
-
-def _resident_memory_snapshot() -> tuple[str, list[str]]:
-    """One-shot read of the memory garden before a resident distill job: existing bucket/
-    thread names (so fact_write reuses instead of inventing near-synonym or bilingual
-    duplicate buckets) + known-memory summaries (so fact_write can semantically dedup via
-    known_memories). Fetch ONCE per job, reuse across the whole window loop — not once per
-    window. Empty garden or any error → ("", []), zero impact (parallels _resident_floor_note)."""
-    try:
-        buckets_body = _capture_get_json("/v1/memory/buckets")
-        threads_body = _capture_get_json("/v1/memory/threads")
-        bucket_names = [
-            str(b.get("name") or "").strip()
-            for b in (buckets_body.get("buckets") or [])
-            if isinstance(b, dict) and str(b.get("name") or "").strip()
-        ]
-        thread_names = [
-            str(t.get("name") or "").strip()
-            for t in (threads_body.get("threads") or [])
-            if isinstance(t, dict) and str(t.get("name") or "").strip()
-        ]
-        known = _resident_memory_index_summaries()
-        if not bucket_names and not thread_names:
-            return "", known
-        terms = (
-            "现有记忆桶/线索(先复用现有桶/线索,别造近义或中英重复桶——"
-            "例:已有「工作」别再造「Work」):\n"
-        )
-        if bucket_names:
-            terms += "buckets: " + "、".join(bucket_names) + "\n"
-        if thread_names:
-            terms += "threads: " + "、".join(thread_names) + "\n"
-        return terms.strip(), known
-    except Exception:
-        return "", []
 
 
 def _distill_user_waiting(chat_since: float | None) -> bool:
@@ -22653,142 +23155,185 @@ def _distill_user_waiting(chat_since: float | None) -> bool:
     return chat_since is not None and _user_chat_pending(chat_since)
 
 
+def _resident_guard_distill_card(card: dict) -> dict | None:
+    """Pre-seal guard for distill cards that did NOT come through memgarden's parser
+    (the closing recheck pass). 硬字段脏 → 跳整卡;桶脏 → 按语言默认桶;threads 逐项滤脏。
+    memgarden 的导入会话自己带同一套闸(signals=IO_LEAK_SIGNALS),那条路不需要再过一遍。"""
+    if not card_guard.guard_enabled():
+        return card
+    _summary = str(card.get("summary") or "")
+    _content = str(card.get("content") or "")
+    if card_guard.hard_field_pollution_reason(_summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(_content, IO_LEAK_SIGNALS):
+        return None
+    _bucket = str(card.get("bucket") or "").strip()
+    if _bucket and card_guard.bucket_pollution_reason(_bucket, IO_LEAK_SIGNALS):
+        card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
+    elif _bucket:
+        card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
+    _threads = card.get("threads")
+    if isinstance(_threads, list):
+        card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
+    return card
+
+
+def _resident_import_action(card: dict, *, now_iso: str, supersedes: str = "") -> dict:
+    """One import card → client-sealed memory action (same envelope shape capture uses)."""
+    occurred_at = str(card.get("occurred_at") or "").strip()[:80] or now_iso
+    action = {
+        "type": "memory.add",
+        "envelope": _capture_build_envelope(
+            card, occurred_at=occurred_at, source="genesis_resident_distill"
+        ),
+        "reason": "Distilled from material the user uploaded.",
+        "capture_mode": "genesis_resident_distill",
+        "source_chat_message_ids": [],
+    }
+    if supersedes:
+        action["type"] = "memory.supersede"
+        action["supersedes"] = supersedes
+    return action
+
+
+def _resident_import_rows(actions: list[dict]) -> list:
+    """execute_memory_actions → per-action result rows. A 4xx whose body still carries
+    per-item results (every card rejected) is card-level, not transport — hand the rows
+    back so the engine can tell "this card is bad" from "writing is broken"."""
+    try:
+        body = execute_memory_actions(actions)
+    except ActionsHTTPError as e:
+        body = e.body if isinstance(e.body, dict) else None
+        if not body or not isinstance(body.get("results"), list):
+            raise
+    if not isinstance(body, dict) or not isinstance(body.get("results"), list):
+        # Compatibility for old injected resident writers during rolling updates.
+        return [{"status": "error", "error": "memory_action_results_missing"} for _ in actions]
+    return list(body.get("results") or [])
+
+
+def _resident_import_locale(document: str) -> str:
+    from hosted import history_import  # lazy: heavy import only when a job runs
+
+    return history_import.import_language_with_archive(
+        [{"content": document}], str(_whoami_cache.get("archive_language") or "")
+    )
+
+
 def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> str:
-    """Advance one memory-mode distill job through the CLOUD genesis engine, one model
-    turn at a time: window → fact_map (per window) → fact_write → recheck → memory.add.
-    Same code + prompts as cloud's add_memory path (persist_output=False = no backend DB),
-    so the two stay in lockstep; returns cloud-shaped memory dicts.
+    """Advance one memory-mode distill job through memgarden's import session
+    (``memory.garden_import`` — the SAME engine the cloud import uses): windows →
+    per-batch judgement → client-sealed memory writes → closing recheck → complete.
 
-    Resumable: all progress (windows, next window index, accumulated candidates, the
-    one-shot garden snapshot, written memories, phase) lives in ``state`` — when a user
-    message is pending we return "yielded" BETWEEN turns and the caller re-enters here
-    on a later loop iteration, continuing exactly where we stopped: no chunk re-runs,
-    no lost candidates, no duplicate memory writes. Returns "yielded" | "done"; raises
-    on hard errors (caller keeps the legacy leave-to-reaper semantics).
+    之前 vs 之后:之前是 io 自己的 fact_map → fact_write(genesis/prompts.py 那份判断标准);
+    之后「每批问什么、怎么去重、怎么归桶」全在 memgarden,和托管导入同一份。
 
-    keep_all (A): long-term-memory archive uploads keep facts thoroughly; chat logs stay
-    selective. The app entry passes material_kind → we translate it to keep_all here."""
+    Resumable in memory: the import state (per-batch progress, the pending write, the
+    known-card index) lives in ``state`` — when a user message is pending we return
+    "yielded" BETWEEN model turns and the caller re-enters here later, continuing at the
+    next batch: no batch re-runs, no duplicate writes. Nothing touches disk (the state
+    holds user content). A consumer crash drops it; the backend reaper re-queues the job
+    and the retry's known-card index already contains what was written. Returns
+    "yielded" | "done"; raises on hard errors (caller keeps leave-to-reaper semantics).
+
+    material_kind == "memory_summary" (long-term-memory archive) uses memgarden's
+    curated_archive rubric (keep nearly everything); chat logs use history_import."""
     from datetime import datetime, timezone as _tzmod
     from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
     from genesis.llm_client import GenesisLLMClient
+    from memory import garden_import
     import provider_client
 
-    llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
-    runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")
     job_id = state["job_id"]
-    keep_all = state["material_kind"] == "memory_summary"
+    family = "memory_summary" if state["material_kind"] == "memory_summary" else "history"
 
     if state["phase"] == "start":
-        # one-shot: garden snapshot + deterministic windowing (HTTP only, no model turn).
-        # Snapshotted into state so a resumed job reuses the SAME dedup context the
-        # first pass saw — not once per window, and not re-fetched after yielding.
-        state["terms_note"], state["known_memories"] = _resident_memory_snapshot()
+        # one-shot, HTTP only: known-card index + deterministic windowing + locale.
+        # Snapshotted into state so a resumed job keeps the SAME import parameters
+        # (memgarden refuses to resume progress under a different locale/name).
+        state["known"] = garden_import.index_cards(_resident_memory_index_items())
         state["windows"] = _window_document(state["document"])
-        state["phase"] = "map"
+        existing_identity = _resident_existing_identity()
+        state["garden"] = garden_import.new_state(
+            locale=_resident_import_locale(state["document"]),
+            user_name=str(existing_identity.get("user_preferred_name") or ""),
+            # 张数引导(Seven 763b0b03,切换前传给 fact_write 的 floor_note,仅 VPS):
+            # 每个 job 算一次、存进导入参数,让路/续跑沿用同一份。取不到状态 → 空串 → 不传。
+            host_note=_resident_floor_note(),
+        )
+        state["phase"] = "import"
 
-    if state["phase"] == "map":
-        while state["next_window_idx"] <= len(state["windows"]):
-            if _distill_user_waiting(chat_since):
-                return "yielded"
-            idx = state["next_window_idx"]
-            out = genesis_worker.build_foreground_output_from_texts(
-                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
-                runtime=runtime, chunk_texts=[state["windows"][idx - 1]],
-                write_core=False, llm=llm, keep_all=keep_all,
-            )
-            state["candidates"].extend(
-                [c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)]
-            )
-            # Cursor advances ONLY after the window's candidates are safely accumulated,
-            # so a yield/resume boundary can never skip or double-map a window.
-            state["next_window_idx"] = idx + 1
-            genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
-        state["phase"] = "write"
+    if state["phase"] == "import":
+        sources = [garden_import.ImportSource(
+            key=f"1:{family}", family=family, windows=list(state["windows"]))]
 
-    if state["phase"] == "write":
-        if not state["candidates"]:
-            # Nothing mapped → nothing to write/recheck (legacy: early return []).
-            state["memories"] = []
-            state["phase"] = "actions"
-        else:
-            if _distill_user_waiting(chat_since):
-                return "yielded"
-            mem_out = genesis_worker.build_memory_output_from_fact_candidates(
-                user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
-                runtime=runtime, fact_candidates=state["candidates"], llm=llm, keep_all=keep_all,
-                floor_note=_resident_floor_note(),
-                known_memories=state["known_memories"], terms_note=state["terms_note"],
-            )
-            state["memories"] = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
-            genesis_resident_heartbeat(job_id)
-            state["phase"] = "recheck"
+        def complete(prompt: str, _purpose: str) -> tuple[str, bool]:
+            reply = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            genesis_resident_heartbeat(job_id)  # each batch is one agent call — keep the lease alive
+            # The CLI/HTTP agent path returns only text (no provider stop_reason), so the
+            # truncation signal comes from the reply itself: a JSON reply whose brackets or
+            # string never close was cut off. memgarden then re-asks once with its
+            # "be more compact" prompt instead of a generic format retry.
+            # Previously this was always False, so that re-ask never fired on the VPS.
+            shape = _capture_reply_shape(reply)
+            truncated = bool(shape["reply_looks_truncated"]) and shape["reply_head"] in {"{", "[", "```"}
+            return reply, truncated
 
+        def write(mutations: list[dict], _key: str) -> list[str]:
+            now_iso = datetime.now(_tzmod.utc).isoformat()
+            return garden_import.write_with_executor(
+                mutations,
+                build_action=lambda m: _resident_import_action(
+                    garden_import.mutation_item(m), now_iso=now_iso,
+                    supersedes=garden_import.supersede_target(m)),
+                execute=_resident_import_rows,
+            )
+
+        result = garden_import.run_import(
+            sources=sources, state=state["garden"], job_key=job_id, owner_key=uid,
+            existing_cards=state["known"], complete=complete, write=write,
+            save=lambda _s: None,  # in memory only, by design
+            should_yield=lambda: _distill_user_waiting(chat_since),
+        )
+        state["known"] = result.known
+        if result.yielded:
+            return "yielded"
+        state["phase"] = "recheck"
+
+    written_total = int((state["garden"].get("totals") or {}).get("cards_written") or 0)
     if state["phase"] == "recheck":
         if _distill_user_waiting(chat_since):
             return "yielded"
-        # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
-        # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+        # 收口二次 pass(仅 VPS resident,切换前就有的行为,保持不变):原始素材 + 这次写进去的卡
+        # 再给 agent,只补真实遗漏、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+        # 一轮模型调用 + 紧接着写库,中间不让路,所以不会重复写。
+        # 失败口径同切换前(6972427d):复查那次**模型调用**失败不致命(保留第一遍的卡);
+        # 复查卡**写库**整批失败要抛(交给后端回收重跑,受重试次数上限约束),部分失败只记张数。
+        state["phase"] = "complete"
+        extra: list[dict] = []
         try:
+            llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
+            runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
+            written_cards = [
+                {k: v for k, v in card.items() if k not in {"id", "_source_family"}}
+                for card in (state["garden"].get("written") or [])
+            ]
             recheck = genesis_worker.build_memory_recheck_from_material(
                 user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
-                runtime=runtime, material=state["document"], written_memories=state["memories"], llm=llm,
+                runtime=runtime, material=state["document"], written_memories=written_cards, llm=llm,
             )
-            genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
-            state["memories"].extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
+            genesis_resident_heartbeat(job_id)
+            extra = [
+                guarded for guarded in (
+                    _resident_guard_distill_card(dict(m))
+                    for m in (recheck.get("memories") or []) if isinstance(m, dict)
+                ) if guarded is not None
+            ]
         except Exception:
             log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
-        state["phase"] = "actions"
-
-    # actions: envelope + memory.add + complete — HTTP writes only, no model turn, so
-    # this tail never yields (yielding here would risk double memory.add on resume).
-    now_iso = datetime.now(_tzmod.utc).isoformat()
-    actions: list[dict] = []
-    _guard_on = card_guard.guard_enabled()
-    for card in state["memories"]:
-        # genesis-resident 蒸馏卡直接来自 build_memory_output_from_fact_candidates(不过
-        # parse_capture_cards/actions),会在下面 _capture_build_envelope 提前封信封、绕过所有
-        # guard —— 这是 codex code_review 抓到的活跃 pre-seal 缺口。在封之前套同一套判据:
-        # 硬字段脏 → 跳整卡;桶脏 → 按语言默认桶;threads 逐项滤脏。
-        if _guard_on:
-            _summary = str(card.get("summary") or "")
-            _content = str(card.get("content") or "")
-            if card_guard.hard_field_pollution_reason(_summary, IO_LEAK_SIGNALS) or card_guard.hard_field_pollution_reason(_content, IO_LEAK_SIGNALS):
-                continue
-            _bucket = str(card.get("bucket") or "").strip()
-            if _bucket and card_guard.bucket_pollution_reason(_bucket, IO_LEAK_SIGNALS):
-                card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
-            elif _bucket:
-                # Q3:干净桶按卡片语言归一(与 capture/dream/migrate/history 一致;此前漏了这条路)。
-                card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
-            _threads = card.get("threads")
-            if isinstance(_threads, list):
-                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""), IO_LEAK_SIGNALS)]
-        # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
-        # user's original per-card date through fact_write. Preserve it so decades of uploaded
-        # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;
-        # an LTM card the model couldn't date also falls back to now() — resident has no
-        # server-side relationship anchor to borrow (cloud path uses one; divergence is documented).
-        card_date = str(card.get("occurred_at") or card.get("date") or "").strip()[:80] if keep_all else ""
-        occurred_at = card_date or now_iso
-        envelope = _capture_build_envelope(
-            card, occurred_at=occurred_at, source="genesis_resident_distill"
-        )
-        actions.append({
-            "type": "memory.add",
-            "envelope": envelope,
-            "reason": "Distilled from material the user uploaded.",
-            "capture_mode": "genesis_resident_distill",
-            "source_chat_message_ids": [],
-        })
-    applied_count = 0
-    if actions:
-        memory_result = execute_memory_actions(actions)
-        if isinstance(memory_result, dict) and isinstance(
-            memory_result.get("results"), list
-        ):
-            observation = _memory_batch_observation(actions, memory_result)
-            applied_count = observation["applied_count"]
+        if extra:
+            now_iso = datetime.now(_tzmod.utc).isoformat()
+            actions = [_resident_import_action(card, now_iso=now_iso) for card in extra]
+            observation = _memory_batch_observation(actions, {"results": _resident_import_rows(actions)})
             if observation["status"] == "failed":
                 raise RuntimeError("genesis_resident_memory_actions_failed")
             if observation["failed_count"]:
@@ -22800,16 +23345,14 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
                     observation["skipped_count"],
                     observation["failed_count"],
                 )
-        else:
-            # Compatibility for old injected resident writers during rolling
-            # updates; the shipped execute_memory_actions always returns rows.
-            applied_count = len(actions)
+            written_total += observation["applied_count"]
+
     genesis_resident_complete(
-        job_id, memory_action_count=applied_count, identity_status="skipped"
+        job_id, memory_action_count=written_total, identity_status="skipped"
     )
     log.info(
         "resident distill done job=%s mode=%s memories=%d identity=%s",
-        job_id, state["mode"], applied_count, "skipped",
+        job_id, state["mode"], written_total, "skipped",
     )
     return "done"
 
@@ -22986,11 +23529,8 @@ def _distill_state_for_job(job: dict) -> dict | None:
         # memory-mode pipeline progress (see _resident_distill_advance_memory)
         "phase": "start",
         "windows": [],
-        "next_window_idx": 1,
-        "candidates": [],
-        "terms_note": "",
-        "known_memories": [],
-        "memories": [],
+        "known": [],
+        "garden": None,
     }
 
 

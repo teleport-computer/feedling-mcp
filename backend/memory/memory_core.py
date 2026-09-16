@@ -199,7 +199,7 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
-        if response.get("ranking") in (search_contract.VERSION, search_contract.LEGACY):
+        if response.get("ranking") in search_contract.ACCEPTED:
             detail["ranking"] = response["ranking"]
             detail["counts"]["unavailable"] = response.get("unavailable_count", 0)
         detail["query_fingerprint"] = query_fingerprint
@@ -666,10 +666,14 @@ def add(store, payload: dict) -> tuple[dict, int]:
         moment["anchor_memory_ids"] = list(anchor_ids)
     # Re-read + append + save under one memory_lock hold so a concurrent
     # same-user write can't lost-update (the load above was for validation only).
-    with memory_service.mutation_lock(store):
-        moments = memory_service._load_moments(store)
-        moments.append(moment)
-        memory_service._save_moments(store, moments)
+    # A supplied id that is already stored is never overwritten: the exact same
+    # sealed card again is a retry and returns the stored card unchanged (200);
+    # any other card under that id is refused without echoing either card.
+    outcome, existing = memory_service.insert_new_moment(store, moment)
+    if outcome == "replay":
+        return {"status": "exists", "moment": existing, "v": 1, "replayed": True}, 200
+    if outcome == "conflict":
+        return {"error": "memory_id_conflict"}, 409
     boot_gates._log_bootstrap_event(store, "memory_moment_added_v1", success=True)
     print(f"[memory:{store.user_id}] added v1 type={mem_type} id={moment['id']} "
           f"visibility={envelope['visibility']} anchors={len(anchor_ids)}")

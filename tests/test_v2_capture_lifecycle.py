@@ -623,7 +623,9 @@ def test_v2_capture_coalesce_does_not_notify_or_count(monkeypatch):
 
     monkeypatch.setattr(capture_scheduler, "tick_quiet_capture", _tick)
     monkeypatch.setattr(
-        jobs_store, "enqueue_job", lambda *_args, **_kwargs: ("job-1", True)
+        jobs_store,
+        "enqueue_capture",
+        lambda *_args, **_kwargs: jobs_store.CaptureEnqueueResult(1, "coalesced_active"),
     )
     notifications = []
     monkeypatch.setattr(
@@ -1064,3 +1066,44 @@ def test_capture_database_pool_timeout_records_distinct_terminal_code():
             "window": {},
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("disposition", "reason"),
+    [("expired_deferred", "v2_expired_deferred"), ("backoff_deferred", "failure_backoff")],
+)
+def test_v2_capture_tick_deferred_round_does_not_notify_count_or_fake_a_job(
+    monkeypatch, disposition, reason
+):
+    """第 13 轮 M1：这一轮没有任务时不唤醒 worker、不计数，也不回一个假的 pending 任务。"""
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: object())
+    seen: dict = {}
+
+    def _tick(store, *, submit):
+        seen["result"] = submit(
+            store,
+            trigger="quiet_timeout",
+            now=10.0,
+            window={"until_message_id": "m1"},
+            capture_key="capture:k",
+        )
+        return seen["result"]
+
+    monkeypatch.setattr(capture_scheduler, "tick_quiet_capture", _tick)
+    job_id = 7 if disposition == "expired_deferred" else None
+    captured: dict = {}
+
+    def _enqueue_capture(user_id, **kwargs):
+        captured.update(kwargs)
+        return jobs_store.CaptureEnqueueResult(job_id, disposition)
+
+    monkeypatch.setattr(jobs_store, "enqueue_capture", _enqueue_capture)
+    notifications = []
+    monkeypatch.setattr(
+        serve_worker.core_wake_bus, "notify", lambda *_args: notifications.append(True)
+    )
+
+    assert serve_worker._tick_capture_for_user("u1") == 0
+    assert notifications == []
+    assert seen["result"] == {"enqueued": False, "reason": reason, "job": None}
+    assert captured["backoff_now"] == 10.0

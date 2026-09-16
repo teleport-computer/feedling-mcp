@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import time
 from urllib.parse import quote
 
@@ -16,9 +17,14 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import memory_search_contract as search_contract
 from memgarden import observability as mg_observability
+from memgarden import retrieval as mg_retrieval
+# Deprecated in memgarden; imported only for the automatic-recall kill switch
+# below. Delete together with that switch.
 from memgarden.scoring import relevance as memory_relevance
 from memory import card_shape
+from memory import jieba_tokenizer
 from memory import recall_metadata
 from core import chat_images, envelope as core_envelope
 from enclave import auth, backend_client, envelope, readside
@@ -27,6 +33,43 @@ from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
 _QUOTED_MEMORY_MAX = 8
+_CONTEXT_MEMORY_CAP = 8
+
+#: Kill switch for automatic recall, default ON. ON: memgarden
+#: ``retrieval.select_context`` with io's jieba tokenizer, the ranker
+#: memory_search uses (recall has a looser gate, see
+#: ``memory_search_contract.RECALL_RANK_OPTIONS``). OFF ("0"/"false"/"no"/"off"): the previous
+#: ``scoring.relevance`` selector, unchanged. Turn it off when zero-injection
+#: turns jump or users report the companion suddenly "forgot" things; active
+#: memory_search keeps the new ranker either way. Read per request.
+RECALL_RANKER_ENV = "FEEDLING_MEMORY_RECALL_UNIFIED_RANKER"
+
+
+def _unified_recall_enabled() -> bool:
+    raw = str(os.environ.get(RECALL_RANKER_ENV, "1") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _unified_selection(garden_cards: list[dict], query: str) -> tuple[list[dict], dict]:
+    """``select_context`` shaped like the legacy selector's result for io consumers.
+
+    Consumers (V1 ``_stash_auto_memories``, V2 ``memory_context.render``) read
+    ``selected[].{id, bucket, reason, score, matched_phrases}``. ``matched_phrases``
+    are the query tokens the card matched (longest first, the most specific one is
+    the one shown). They only travel in the response trace to the caller, which
+    already holds the conversation; the persisted ``injection_record`` drops them.
+    """
+    picked, trace = mg_retrieval.select_context(
+        query, garden_cards, tokenizer=jieba_tokenizer.TOKENIZER, cap=_CONTEXT_MEMORY_CAP,
+        **search_contract.RECALL_RANK_OPTIONS)
+    matched = {}
+    for card in picked:
+        units = list((card.get("selection") or {}).get("matched_units") or [])
+        matched[str(card.get("id") or "")] = sorted(units, key=lambda u: (-len(u), u))[:6]
+    trace = dict(trace)
+    trace["selected"] = [{**item, "matched_phrases": matched.get(str(item.get("id") or ""), [])}
+                         for item in trace.get("selected") or []]
+    return picked, trace
 
 
 def _attach_chat_metadata(source: dict, target: dict) -> None:
@@ -337,26 +380,33 @@ def _build_context_memories(moments, decrypted, query_args):
     # Resident 与 Hosted Runtime V2 固定走同一套分桶策略，确保用户切换
     # runtime 时召回不漂移。context_mode/context_strict 仍作为兼容参数接收，
     # 但不再选择不同 policy。
-    # PR-1 is independently releasable. Keep the published 0.19.0 pin working;
-    # adopt its opt-in relevance gate only after the released package has it.
-    selector = getattr(memory_relevance, "select_relevant_context_memories_with_trace", None)
-    mode = "relevant:unified" if selector is not None else "bucketed:unified"
-    selector = selector or memory_relevance.select_context_memories_with_trace
-    picked, selection_trace = selector(
-        garden_cards,
-        latest_user_text,
-    )
+    if _unified_recall_enabled():
+        picked, selection_trace = _unified_selection(garden_cards, latest_user_text)
+        # The mode label carries the ranking version, so a stored record says
+        # which ruler picked the cards (the same string memory_search reports).
+        mode = f"relevant:unified:{selection_trace.get('version') or search_contract.RECALL_VERSION}"
+    else:
+        picked, selection_trace = memory_relevance.select_relevant_context_memories_with_trace(
+            garden_cards,
+            latest_user_text,
+        )
+        mode = "relevant:unified"
     context_memories = _back_to_original(picked)
     if query_args.get("context_recent"):
         fresh = recall_metadata.recent_cards(selectable)
         fresh_ids = {c["id"] for c in fresh}
         context_memories = fresh + [c for c in context_memories if c.get("id") not in fresh_ids]
-        context_memories = context_memories[:8]
+        context_memories = context_memories[:_CONTEXT_MEMORY_CAP]
         selection_trace = dict(selection_trace or {})
         selected = selection_trace.get("selected") or []
+        # Renderers order by score: fresh cards must stay ahead of relevance
+        # picks. BM25 scores are unbounded (the legacy scorer's were <= 1), so
+        # the fixed 2.0 becomes "above every relevance score in this trace".
+        fresh_score = max([2.0, *(float(item.get("score") or 0) + 1.0 for item in selected
+                                  if isinstance(item, dict))])
         # Distinguish recency from relevance; it is not a claim of a query hit.
         selection_trace["selected"] = [
-            {"id": c["id"], "bucket": "fresh_recent", "score": 2.0,
+            {"id": c["id"], "bucket": "fresh_recent", "score": fresh_score,
              "reason": "created_within_7_days"} for c in fresh
         ] + [s for s in selected if s.get("id") not in fresh_ids
              and s.get("id") in {c.get("id") for c in context_memories}]
@@ -369,7 +419,7 @@ def _build_context_memories(moments, decrypted, query_args):
         candidate_pool=len(cards),
         selection_trace=selection_trace,
         injected_ids=[str(c.get("id") or "") for c in context_memories],
-        cap=8,
+        cap=_CONTEXT_MEMORY_CAP,
         duration_ms=(time.monotonic() - started) * 1000.0,
     )
     return context_memories, context_memory_trace, context_memory_log

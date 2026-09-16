@@ -33,8 +33,14 @@ canonical_owner: self
 | `agent_body_agent_unavailable` | 409 | — | official_import 接入未运行 agent | ✅ |
 | `agent_body_provider_config_failed` | 409 | user_provider | provider 鉴权、额度、权限或配置错误 | ✅ |
 | `agent_body_generation_timeout` | 504 | system | 85 秒截止或不足 25 秒进行修复重试 | ✅ |
-| `agent_body_generation_failed` | 429/502；内部 409/410/503 | provider_transient/system | provider 限流、失败/空回复或任务冲突；内部 reason=consumer_mismatch/expired/state_unavailable 标识绑定、过期、CAS 失败；不返回 rows | ✅ |
+| `agent_body_generation_failed` | 429/502/409/410/503 | provider_transient/system | 429=provider 限流(retryable)、502=provider 失败/空回复或 resident 任务冲突；409/410/503 只出现在 consumer 专用的内部结果口 `/v1/internal/agent-body/generate/result`(reason=consumer_mismatch/expired/state_unavailable 标识绑定、过期、CAS 失败);不返回 rows | ✅ |
 | `agent_body_generation_invalid_output` | 502 | system | 一次修复重试后仍不符合网格硬规则；不返回 rows | ✅ |
+
+## 用户偏好
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `content_encryption_on_not_supported` | 400 | — | 新内容统一明文，设置口不再接受 on；off 或 null/空值清除仍支持，请求拒绝前不写入任何偏好 | |
 
 ## 通用
 
@@ -194,6 +200,7 @@ canonical_owner: self
 | `summary_required` | 400 | — | | |
 | `supersedes_required` | 400 | — | | |
 | `envelope_id_mismatch` | 400 | — | envelope.id 必须等于目标 memory_id（AEAD-bound） | |
+| `memory_id_conflict` | 409 | — | `memory.add`（actions）与 `/v1/memory/add` 带的 id 已被另一张卡占用；原卡不动、不回显任何卡内容。同一张密文卡原样重发是重放，返回成功不重写 | |
 | `action_must_be_object` | 400 | — | | |
 | `actions_required` | 400 | — | | |
 | `unsupported_memory_action` | 400 | — | | |
@@ -367,6 +374,8 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `export_too_large` | 413 | — | 一次性导出超 80MiB 预算 | |
 | `archive_cleanup_failed` | 503 | system | 账号重置：R2 归档清理失败，reset 中止（可安全重试） | |
 | `confirmation_mismatch` | 400 | — | admin 删除用户端点专用：`confirm` 字段 ≠ `user_id` | |
+| `invalid_dream_ledger_request` | 400 | — | admin 假「没有卡」做梦账本审计/修复端点专用：窗口/用户/指纹/`dry_run` 等参数不合法（`detail` 为不含内容的原因码，如 `users_required`、`invalid_ledger_fingerprint`、`invalid_job_id`、`invalid_rewound_job_ids`） | |
+| `dream_ledger_query_timeout` | 503 | system | 同上两端点：有界读取超过 HTTP 或 PostgreSQL 时限；重跑即可（修复端点幂等） | |
 
 ## 通知中继（notify_relay）
 
@@ -460,7 +469,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `genesis_partial` | — | system | warning | genesis：蒸馏跑完但有记忆卡片被丢弃（`apply_reducer_output` / `plaintext.py` 直传路径统计 dropped>0） |
 | `import_failed` | — | system | error | history_import：聊天记录导入失败 |
 | `import_stale` | — | system | error | history_import：导入 job 卡在 queued/processing 超过阈值，判定超时失败 |
-| `memory_backoff` | — | system | warning | memory：capture/migrate/dream 三条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避 |
+| `memory_backoff` | — | system；capture 失败原因可识别为账号/模型服务问题时为 user_provider / provider_transient | warning | memory：capture/migrate/dream 三条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避。capture 的 `user_text` 会带上错误对照表里的原因（如额度不足）；capture 跳过一批或成功后 resolve |
 | `runner_spawn_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 拉起 per-user 子进程失败 |
 | `runner_key_decrypt_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 为 per-user 子进程解密 provider key 失败 |
 | `runner_degraded` | — | system | warning | **历史兼容，不再产生**：旧 resident 子进程 runtime-token 刷新失败 |

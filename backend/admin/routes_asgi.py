@@ -38,6 +38,7 @@ from psycopg.errors import QueryCanceled
 
 import db
 from admin import admin_core
+from admin import dream_ledger_repair
 from admin import memory_metadata
 from admin import tee_replication as admin_tee_replication
 from admin import plaintext_shadow as admin_plaintext_shadow
@@ -430,6 +431,60 @@ async def memory_dream_jobs(request: Request):
         user_id=(request.query_params.get("user_id") or "").strip(),
         status=(request.query_params.get("status") or "").strip(),
     )
+    return JSONResponse(payload)
+
+
+DREAM_LEDGER_AUDIT_REQUEST_TIMEOUT_SEC = 55.0
+DREAM_LEDGER_REPAIR_REQUEST_TIMEOUT_SEC = 55.0
+
+
+@router.get("/v1/admin/memory/dream-false-no-cards")
+async def dream_false_no_cards_audit(request: Request):
+    """Read-only, content-free list of Dream ledgers advanced by a false
+    "no cards" completion (09-10 / 09-13). Selector: proactive.dream_ledger_audit."""
+    _require_admin(request)
+    try:
+        params = dream_ledger_repair.parse_audit_query(request.query_params.multi_items())
+    except dream_ledger_repair.BadRequest as exc:
+        return JSONResponse(
+            {"error": "invalid_dream_ledger_request", "detail": exc.detail},
+            status_code=400,
+        )
+    try:
+        payload = await threadpool.run_db_bounded(
+            dream_ledger_repair.audit_payload,
+            params,
+            timeout_seconds=DREAM_LEDGER_AUDIT_REQUEST_TIMEOUT_SEC,
+        )
+    except (TimeoutError, QueryCanceled):
+        return responses.json_error(503, {"error": "dream_ledger_query_timeout"})
+    return JSONResponse(payload)
+
+
+@router.post("/v1/admin/memory/dream-false-no-cards/repair")
+async def dream_false_no_cards_repair(request: Request):
+    """Per-user compare-and-set rewind of the Dream ledger fields only.
+
+    Dry run unless the body says ``"dry_run": false``; only the listed
+    ``user_id``s, each with the ``ledger_fingerprint``, ``job_id`` and
+    ``rewound_job_ids`` its audit row reported.
+    """
+    _require_admin(request)
+    try:
+        params = dream_ledger_repair.parse_repair_body(await read_json_silent(request))
+    except dream_ledger_repair.BadRequest as exc:
+        return JSONResponse(
+            {"error": "invalid_dream_ledger_request", "detail": exc.detail},
+            status_code=400,
+        )
+    try:
+        payload = await threadpool.run_db_bounded(
+            dream_ledger_repair.repair_payload,
+            params,
+            timeout_seconds=DREAM_LEDGER_REPAIR_REQUEST_TIMEOUT_SEC,
+        )
+    except (TimeoutError, QueryCanceled):
+        return responses.json_error(503, {"error": "dream_ledger_query_timeout"})
     return JSONResponse(payload)
 
 

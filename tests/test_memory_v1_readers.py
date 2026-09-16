@@ -60,51 +60,6 @@ class _CoreClient:
         raise AssertionError(f"unrouted path: {p}")
 
 
-def test_history_import_persists_v1_memory_body(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_import", memory_lock=threading.RLock())
-    saved: list[dict] = []
-    monkeypatch.setattr(history_import.memory_service, "_load_moments", lambda _store: [])
-    monkeypatch.setattr(history_import.memory_service, "_save_moments", lambda _store, moments: saved.extend(moments))
-    monkeypatch.setattr(history_import.boot_gates, "_log_bootstrap_event", lambda *args, **kwargs: None)
-
-    def fake_envelope(store_arg, payload, *, item_id=None):
-        return {
-            "id": item_id or "mem_import",
-            "body_ct": payload.decode("utf-8"),
-            "nonce": "nonce",
-            "K_user": "ku",
-            "K_enclave": "ke",
-            "enclave_pk_fpr": "fpr",
-            "visibility": "shared",
-            "owner_user_id": store_arg.user_id,
-        }, ""
-
-    monkeypatch.setattr(history_import.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
-
-    created = history_import._append_import_memory_cards(store, [{
-        "summary": "用户喜欢先看地图。",
-        "content": "记忆: 用户喜欢先看地图。\n上下文: 导入材料。\n使用提示: 解释时先给结构。",
-        "bucket": "协作方式",
-        "threads": ["解释偏好"],
-        "importance": 0.7,
-        "pulse": 0.4,
-        "occurred_at": "2026-06-20",
-    }])
-
-    assert len(created) == 1
-    moment = created[0]
-    inner = json.loads(moment["body_ct"])
-    assert inner == {
-        "summary": "用户喜欢先看地图。",
-        "content": "记忆: 用户喜欢先看地图。\n上下文: 导入材料。\n使用提示: 解释时先给结构。",
-        "bucket": "协作方式",
-        "threads": ["解释偏好"],
-    }
-    assert "type" not in moment
-    assert moment["importance"] == 0.7
-    assert moment["pulse"] == 0.4
-
-
 def test_v1_memory_count_does_not_require_legacy_type_tabs():
     counts = memory_service._count_by_tab([
         {"id": "a", "status": "active", "bucket": "宠物"},

@@ -2226,14 +2226,24 @@ def apply_reducer_output(
     if raw_items is None:
         raw_items = output.get("facts")
     raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as memory_attempt:
-        memory_count, memory_results = apply_memory_outputs(store, api_key, output)
-        dropped = raw_count - memory_count
-        memory_attempt.finish(
-            "not_provided" if raw_count == 0
-            else "partial" if dropped > 0
-            else "written"
-        )
+    garden_written = output.pop("garden_import", None)
+    if isinstance(garden_written, dict):
+        # 记忆卡已经由 memgarden 导入会话一批一批写过了（分块 worker 那边，带自己的
+        # memory 台账）。这里只记数，不再写、不再开第二条 memory 台账；输出里不许夹带卡。
+        if raw_count:
+            raise ValueError("garden_import_output_must_not_carry_memories")
+        memory_count = max(0, int(garden_written.get("cards_written") or 0))
+        dropped = max(0, int(garden_written.get("dropped") or 0))
+        memory_results = []
+    else:
+        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as memory_attempt:
+            memory_count, memory_results = apply_memory_outputs(store, api_key, output)
+            dropped = raw_count - memory_count
+            memory_attempt.finish(
+                "not_provided" if raw_count == 0
+                else "partial" if dropped > 0
+                else "written"
+            )
     if dropped > 0:
         notices.emit(store, source="genesis", error_class="genesis_partial",
                      blame="system", severity="warning",

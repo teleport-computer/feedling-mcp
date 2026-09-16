@@ -197,18 +197,28 @@ to requested/returned card-ID bindings, joined by turn/job/attempt. The terminal
 `memory.recall.completed` event contains aggregate counts. These are content-free operational fields,
 not proof of semantic relevance or provider-token usage. The full provider-request
 messages remain in the encrypted trajectory under its existing access controls.
-On the pinned memgarden 0.19.0 release, selection still uses its historical buckets;
-the opt-in relevance-gated soft-quota policy is used only when a reviewed, released
-dependency upgrade supplies it. A missing or failed selection remains unknown,
-not a measured empty Garden.
+Automatic selection (V1 resident and V2 chat/wake alike) ranks candidates with the
+same BM25 ranker and tokenizer as `memory_search` (memgarden
+`retrieval.select_context`, jieba 0.42.1), then applies soft quotas for turning
+points and recent cards; every selected card must pass the relevance gate. Its
+gate is looser than search's: the four-message query is mostly everyday chat the
+Garden never recorded, so one strongly matching anchor is enough to recall a
+card. Selection records carry the ranking version in `mode` (for example
+`relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`). Operators can
+restore the previous selector with `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0` on
+the enclave (default on); search keeps the new ranker either way. A missing or
+failed selection remains unknown, not a measured empty Garden.
 
 `memory_search` uses request-local BM25 token ranking over the complete authorized
 readable Garden. Chinese segmentation uses pinned jieba 0.42.1 (precise mode,
 HMM disabled); ASCII words and whole identifiers such as `NP-4286` and `CR2450`
 are case-insensitive tokens, not substring prefixes. Query terms need not be
-adjacent; any matching term can contribute. No synonyms, translation, stemming,
-time interpretation, embedding or model is involved. A nonblank query with no
-searchable tokens returns no matches. Empty results do not prove memory absence;
+adjacent. Very common function words (我, 什么, the, what …) are dropped from the
+query, and a card is returned only when its matched terms cover at least a quarter
+of the query's weight or it carries strong evidence such as a rare identifier; a
+query nothing matches returns no items rather than loosely related filler. No
+synonyms, translation, stemming, time interpretation, embedding or model is
+involved. A nonblank query with no searchable tokens returns no matches. Empty results do not prove memory absence;
 try different wording or browse a bucket/thread. Only identical repeated
 arguments are refused within a turn. The V2 compact result preserves `ranking`
 and `unavailable_count`, including the explicit `substring-legacy` mode during
@@ -220,9 +230,18 @@ across Capture runs. Clients subtract the total saved when the user last
 dismissed the banner to show the unconfirmed count. A Capture run that adds no
 cards does not change the total or refresh the timestamp.
 
-Hosted Dream maintenance reads complete decrypted candidate cards, stopping
-before the next whole card when the configured prompt budget is reached. Every
-proposed consolidation must explain its rationale. Text overlap is not
+Dream maintenance, in both Runtime V2 and resident V1 (hosted and
+self-hosted), reads complete decrypted candidate cards and shows the model each
+card's summary and body. The prompt holds at most 60 cards and 60,000
+characters of card text, stopping before the next whole card; a body longer
+than 5,000 characters (or a summary longer than 2,000) is shown truncated and
+marked `TRUNCATED`. Cards that did not fit wait for a later run and can never be
+retired by this one, and a proposal that touches a truncated card is dropped
+before anything is written — if every proposal in a run does, the run fails
+with `dream_truncated_card_rejected` and the Dream ledger does not advance. A
+garden below the consolidation minimum is recorded as skipped, not as a
+completed Dream, in both runtimes. Every proposed consolidation must explain
+its rationale. Text overlap is not
 required: cards may be consolidated when they describe the same event or the
 evolution of one plan, while cards that merely share a broad topic remain
 separate. The model's consolidation judgment is not second-guessed by another
@@ -230,8 +249,9 @@ model call: Dream applies only deterministic exit gates. A proposal is rejected
 when its result text contains an internal card id or a tombstone-style note
 (for example "superseded by \<id\>") instead of real memory content — those
 rejections are bounced back to the model once for a rewrite. A run that would
-retire more than 80% of the active garden (and at least 10 cards) fails as a
-whole without applying anything; both thresholds are deployment-configurable.
+retire more than 80% of the cards shown to the model (and at least 10 cards)
+fails as a whole without applying anything; both thresholds are
+deployment-configurable.
 
 Dream does not impose a per-run consolidation count, a per-proposal retired-card
 count, a cross-run cooldown, or any content-quality judgment on rewrites. It
@@ -254,10 +274,32 @@ run as using degraded context, so it cannot be mistaken for a model choosing to
 make no changes from a complete input. Card ids, prompts, replies, summaries,
 raw errors, and other memory text are never part of this diagnostic shape.
 
+Automatic Dream runs are spread across the night window (02:00–05:00 in the
+user's timezone by default) instead of all becoming due when it opens. Each
+account gets an offset derived from its user id and the night's local date,
+within the first part of the window: it is the same for every tick of one night
+and changes from night to night, so when the ceiling below is saturated the
+accounts left waiting in late slots rotate rather than being the same ones every
+night. The last 90 minutes (at most half the window) are kept free so a failed
+first attempt still has room for its retry backoff. Until the offset arrives,
+`POST /v1/dream/tick` answers `enqueued: false` with reason
+`dream_stagger_not_due`. Separately, no automatic Dream is enqueued while the
+deployment already has its concurrency ceiling of Dream jobs queued or running
+(resident V1 jobs queued or running, Runtime V2 jobs claimed or running or
+waiting in the queue for less than an hour, counted together because both read
+cards through the same enclave); the tick answers `dream_concurrency_cap` and
+the next tick re-evaluates. The count and the enqueue are decided under one
+deployment-wide lock; a tick that meets another admission in progress answers
+`dream_admission_busy` and also re-evaluates next tick. All three are scheduling
+delays, not failures: they do not start backoff or advance the Dream ledger. An
+account whose last decision in the window was still `dream_concurrency_cap` or
+`dream_admission_busy` when the window closes records a content-free
+`memory.dream.window_missed` diagnostic event.
+
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their
-memories. It bypasses the automatic scheduler's night window, minimum interval,
-and new-material gates, but not Dream's deterministic exit gates and
+memories. It bypasses the automatic scheduler's night window, stagger offset,
+concurrency ceiling, minimum interval, and new-material gates, but not Dream's deterministic exit gates and
 soft-deletion safeguards.
 Repeated requests coalesce with an active Dream job. If the deployment-wide or
 user-level Dream switch is off, the tool returns an explainable disabled result.
@@ -315,9 +357,12 @@ not a generic service-wide rate limit.
 
 For new cards, datetime-valued `occurred_at` metadata is normalized to the same
 instant in UTC with a `Z` suffix. A date-only `YYYY-MM-DD` value remains
-date-only. The server stamps `created_at` in UTC with a `Z` suffix. Existing
-cards keep their stored timestamp strings when they are retyped, rewrapped, or
-otherwise updated; this does not backfill historical records.
+date-only. The server stamps `created_at` in UTC with a `Z` suffix, and memory
+actions stamp `updated_at` the same way (a new card's two stamps are the same
+instant). Existing cards keep their stored `occurred_at` and `created_at` strings
+when they are retyped, rewrapped, or otherwise updated; this does not backfill
+historical records, so older `updated_at` values may still lack an offset and are
+read as UTC.
 
 ```http
 HTTP/1.1 201 Created
@@ -346,8 +391,15 @@ Content-Type: application/json
 
 The server can generate `moment.id` if it is absent, but a stable unique
 client-generated ID is easier to reconcile after an ambiguous network failure.
-It is not an idempotency guarantee: posting the same payload again can append
-another record, and clients must not rely on the ID to deduplicate requests.
+An add never overwrites a stored card. Re-sending the exact same sealed envelope
+(same id, ciphertext, nonce and wrapped keys) returns `200` with the stored card
+and `replayed: true` and writes nothing. Any other envelope under an ID that is
+already stored — including the ID of a superseded or archived card — fails with
+`409 memory_id_conflict`, leaves the stored card unchanged, and echoes neither
+card. Sealing again produces a new nonce, so a retry must re-send the envelope it
+already built rather than re-encrypting. `memory.add` in `/v1/memory/actions`
+follows the same rule per item. Only the envelope is compared, so the ID is not a
+general request idempotency key.
 
 ## 2. Discover cards with the lightweight index
 
@@ -407,11 +459,16 @@ ID ascending. The existing per-item `score` remains importance/recency, **not**
 BM25. Full content, tokens, postings and BM25 scores are not added to the response.
 Final evidence selection still belongs to your client or agent.
 
-Query responses additionally carry `ranking: "bm25-jieba-0.42.1-v1"` and
-`unavailable_count` (candidate cards that could not be read, excluded from
-statistics). A recognized older enclave response instead reports
-`ranking: "substring-legacy"`: this temporary rolling-upgrade mode uses the old
-case-insensitive whole-query substring match and importance order. Authentication
+Query responses additionally carry `ranking: "memgarden-bm25-v2+tok:jieba-0.42.1"`
+and `unavailable_count` (candidate cards that could not be read, excluded from
+statistics). The relevance gate's coverage check counts term rarity over at least
+20 cards, so a Garden with only a few cards still finds its answer. During a
+rolling upgrade a response may instead report
+`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"` (the same ranker with the coverage
+check over the real card count, which could return nothing in Gardens under ~20
+cards), `ranking: "bm25-jieba-0.42.1-v1"` (the previous enclave BM25 without
+stopwords or relevance gate) or `ranking: "substring-legacy"` (the old case-insensitive
+whole-query substring match and importance order). Authentication
 errors, timeouts, and unknown protocols do not silently fall back. Blank or
 omitted `query` retains the existing index browsing path; fetch is unchanged.
 
@@ -472,6 +529,10 @@ known records that cannot be returned under some archive, supersession, or
 encryption rules. Compare requested IDs with returned item IDs and treat any
 unaccounted-for ID as not available.
 
+Fetching a card records the read in its `last_referenced_at` (UTC, `Z` suffix).
+A fetch does not change `updated_at`, so reading cards never makes the profile
+refresh witness look like a Garden change.
+
 ## 4. Apply a batch of memory actions
 
 After selecting with `index` and reading the necessary cards with `fetch`, use
@@ -508,9 +569,12 @@ replaced is unaffected: the rejection requires an internal-id-like hex string
 next to the phrase.
 
 A `memory.supersede` action accepts one source ID or an array of at most 20
-source IDs. An oversized array fails that action with
-`too_many_supersedes` before any card is changed; it is never truncated to a
-successful prefix. On success, `superseded_ids` lists the cards the mutation
+source IDs. A plaintext `memory` successor that omits `occurred_at` (or sends
+it empty) keeps the first source card's `occurred_at`, the same way it inherits
+bucket, threads, importance, and pulse; an explicit `occurred_at` still wins.
+An envelope successor must carry `occurred_at` itself. An oversized array fails
+that action with `too_many_supersedes` before any card is changed; it is never
+truncated to a successful prefix. On success, `superseded_ids` lists the cards the mutation
 actually retired rather than echoing the requested IDs. Every requested source
 must still be active when the mutation commits. If a source is already
 unavailable, the action fails with `supersede_targets_unavailable`; if one

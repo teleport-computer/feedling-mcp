@@ -22,6 +22,8 @@ dream 判定 seed card 不够。
 """
 from __future__ import annotations
 
+import pytest
+
 import os
 import sys
 import tempfile
@@ -299,3 +301,237 @@ def test_one_parse_failure_cannot_inherit_earlier_write_failures():
     assert _run_reasons([write, parse, parse, parse]) == 4
     # 总失败数到 6 次兜底，不管混成什么样。
     assert _run_reasons([write, parse, write, parse, write, parse]) == 6
+
+
+@pytest.mark.parametrize("reason,expected", [
+    # V1：CLI 原始错误文本（prod 上真实出现过的形状）
+    ('capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to authenticate. '
+     'API Error: 401 {"error":"Insufficient balance"} (api_status=401)', "account"),
+    ("capture_agent_call_failed:RuntimeError: Failed to authenticate: OAuth session expired "
+     "and could not be refreshed", "account"),
+    # V2：extraction 的公开 provider 分类
+    ("extraction_failed:auth_invalid", "account"),
+    ("extraction_failed:quota_insufficient", "account"),
+    ("extraction_failed:rate_limited", "account"),
+    ("extraction_failed:upstream_unavailable", "account"),
+    # V1 仓库错误对照表里已有的形状（Codex 第 5 轮：上一版关键词漏了它们，第 6 次照样跳）
+    ("capture_agent_call_failed:RuntimeError: Not logged in · Please run /login", "account"),
+    ("capture_agent_call_failed:RuntimeError: cli agent exited 1: invalid key", "account"),
+    # 🔴 provider_config 混着 400/415/422，含「消息太长」这种内容引起的 —— 不能算账号
+    ("extraction_failed:provider_config", "other"),
+    ("capture_agent_call_failed:RuntimeError: Provider API error 400: maximum context length exceeded",
+     "other"),
+    # 可能真是内容引起的 —— 不能归到账号类
+    ("extraction_failed:content_filtered", "other"),
+    ("extraction_failed:unknown", "other"),
+    ("capture_agent_call_failed:RuntimeError: openai-compatible response carried no assistant text",
+     "other"),
+    ("capture_memory_write_failed", "other"),
+    # 对照表的「服务不可用」对裸三位 5 开头数字也算 —— 逃生阀要求强证据（Codex 第 6 轮）
+    ("capture_agent_call_failed:RuntimeError: invalid max_tokens: must be <= 500", "other"),
+    ("capture_agent_call_failed:RuntimeError: request rejected at byte 512", "other"),
+    ("capture_agent_call_failed:RuntimeError: upstream returned HTTP 502 Bad Gateway", "account"),
+    # 🔴 本机 agent 调用自己超时（CLI 子进程 / agent call / pi 请求超时）不是「用户的模型服务
+    # 不可用」：以前按账号类等 7 天、还提示「你的模型服务暂时不可用」（09-15 审查）。按 6 次兜底。
+    ("capture_agent_call_failed:RuntimeError: request timed out after 120s", "other"),
+    ("capture_agent_call_failed:TimeoutExpired: Command '['claude', '-p']' timed out after 300 seconds",
+     "other"),
+    ("capture_agent_call_failed:TimeoutError: agent call timed out", "other"),
+    ("capture_agent_call_failed:RuntimeError: pi agent produced no reply: request timed out", "other"),
+    ("capture_agent_call_failed:turn_timeout", "other"),
+    # 有上游证据的超时仍是服务不可用
+    ("capture_agent_call_failed:RuntimeError: HTTP 504 Gateway Timeout", "account"),
+    ("capture_agent_call_failed:RuntimeError: provider_http_503: upstream request timed out", "account"),
+    # 对照表已认定的其他上游瞬时故障形状（Codex 第 7 轮：漏了会在第 6 次被跳过）
+    ("capture_agent_call_failed:RuntimeError: stream disconnected before completion", "account"),
+    ("capture_agent_call_failed:RuntimeError: response ended without finish_reason", "account"),
+    ("capture_agent_call_failed:RuntimeError: provider unreachable", "account"),
+    ("capture_agent_call_failed:RuntimeError: provider_http_403: Request failed. Please try again later.",
+     "account"),
+    ("json_decode_error:JSONDecodeError", "parse"),
+    ("extraction_failed:json_decode_error", "parse"),
+    # 🔴 状态接口（proactive_core._job_status_patch）存之前就把 V1 原因归一成
+    # ``<lane>_agent_call_failed:<类别>``，调度器读到的是这个。以前这里拿对照表去认这串码，
+    # auth_invalid / 登录过期 / 服务不可用全认不出来，V1 账号类失败 6 次就跳（统一分类器前的回归）。
+    ("capture_agent_call_failed:auth_invalid", "account"),
+    ("capture_agent_call_failed:provider_account_expired", "account"),
+    ("capture_agent_call_failed:resident_agent_cli_logged_out", "account"),
+    ("capture_agent_call_failed:upstream_unavailable", "account"),
+    ("capture_agent_call_failed:quota_insufficient", "account"),
+    ("capture_agent_call_failed:unknown", "other"),
+    ("capture_agent_call_failed:content_filtered", "other"),
+    ("capture_agent_call_failed:context_overflow", "other"),
+    # 中文中转站把鉴权失败写在 JSON 错误字段里（统一后新认出来的）
+    ('capture_agent_call_failed:RuntimeError: {"code":"invalid_token","msg":"鉴权失败，请检查令牌"}',
+     "account"),
+    # 请求回显里的关键词不是账号问题（统一分类器的强证据门槛；以前这些会等 7 天）
+    ("capture_agent_call_failed:RuntimeError: agent failed; prompt text says insufficient balance",
+     "other"),
+    ("capture_agent_call_failed:KeyError: invalid key 'mood' in payload", "other"),
+    ("capture_agent_call_failed:RuntimeError: prompt mentioned 403 items", "other"),
+    ("capture_agent_call_failed:RuntimeError: 日记：今天额度不足", "other"),
+    # 图片/视觉能力的码不是落卡模型的账号问题
+    ("extraction_failed:vision_model_quota_insufficient", "other"),
+])
+def test_failure_class(reason, expected):
+    assert cf.failure_class(reason) == expected
+
+
+def test_account_failures_do_not_skip_within_seven_days_and_do_not_count():
+    """🔴 余额不足失败再多次也不跳（7 天内）；充值后偶发的别的失败也不能继承这些次数立刻跳。"""
+    balance = "extraction_failed:quota_insufficient"
+    other = "capture_memory_write_failed"
+    assert _run_reasons([balance] * 30) is None
+    # 8 次余额不足 + 5 次别的失败：别的失败只有 5 次，不到 6
+    assert _run_reasons([balance] * 8 + [other] * 5) is None
+    assert _run_reasons([balance] * 8 + [other] * 6) == 14
+    # 账号失败夹在中间会打断「连续解析失败」
+    parse = "extraction_failed:json_decode_error"
+    assert _run_reasons([parse, parse, balance, parse]) is None
+
+
+def test_frontier_seq_takes_the_later_of_seq_and_message_id():
+    """两份进度记法取靠后的；数字不可信（未初始化）时只看 id；id 查不到时只看数字。"""
+    seq_of = {"m3": 120, "m9": 300}.get
+    # prod 上旧逃生阀留下的：数字 0 + 已初始化 + id 记着真实位置
+    assert cf.frontier_seq({"last_captured_until_message_id": "m3",
+                            "last_captured_until_seq": 0,
+                            "capture_seq_initialized": True}, seq_of) == 120
+    # V1 完成只更新 id、数字停在旧值
+    assert cf.frontier_seq({"last_captured_until_message_id": "m9",
+                            "last_captured_until_seq": 120,
+                            "capture_seq_initialized": True}, seq_of) == 300
+    # 正常 V2：两份一致
+    assert cf.frontier_seq({"last_captured_until_message_id": "m3",
+                            "last_captured_until_seq": 120,
+                            "capture_seq_initialized": True}, seq_of) == 120
+    # 数字未初始化：不信数字
+    assert cf.frontier_seq({"last_captured_until_message_id": "m3",
+                            "last_captured_until_seq": 999,
+                            "capture_seq_initialized": False}, seq_of) == 120
+    # id 被清理查不到：只看可信的数字
+    assert cf.frontier_seq({"last_captured_until_message_id": "gone",
+                            "last_captured_until_seq": 150,
+                            "capture_seq_initialized": True}, seq_of) == 150
+    # 老数据只有数字、没有标志位：数字可信
+    assert cf.frontier_seq({"last_captured_until_seq": 77}, seq_of) == 77
+    assert cf.frontier_seq({}, seq_of) == 0
+
+
+def test_account_failures_skip_only_after_persisting_seven_days():
+    """账号类失败按**持续时间**兜底：同一批从第一次账号类失败起满 7 天仍失败才跳。
+
+    防的是 403「内容被拒」被误判成「密钥无效」—— 永不跳过会把真正的毒消息永久卡住。
+    """
+    w = {"after_message_id": "msg_a", "until_message_id": "msg_c",
+         "until_ts": 1.0, "through_seq": 120}
+    balance = "extraction_failed:quota_insufficient"
+    day = 86400.0
+    state: dict = {}
+    t0 = 1_000_000.0
+    # 正常退避下每 6 小时重试一次（中断超过 24 小时会重新计时，见 long_gap 那条测试）
+    t = t0
+    while t < t0 + 7 * day - 6 * 3600:
+        patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t, reason=balance)
+        state.update(patch)
+        assert not skipped, f"第 {(t - t0) / day:.1f} 天就跳了"
+        t += 6 * 3600
+    assert state["capture_account_fail_since"] == t0
+    patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0 + 7 * day, reason=balance)
+    assert skipped, "账号类失败持续 7 天仍没跳"
+    assert patch["capture_account_fail_since"] == 0.0
+
+    # 换了一批（游标变了）重新计时
+    state = {}
+    patch, _s, _ = cf.capture_failure_patch(state, w, now_ts=t0, reason=balance)
+    state.update(patch)
+    w2 = {**w, "after_message_id": "msg_z"}
+    patch, _s, skipped = cf.capture_failure_patch(state, w2, now_ts=t0 + 8 * day, reason=balance)
+    assert not skipped and patch["capture_account_fail_since"] == t0 + 8 * day
+
+
+def test_account_clock_restarts_after_a_long_gap_without_retries():
+    """「429 一次 → 关掉落卡 8 天 → 重开又 429 一次」不能立刻跳过：那 8 天没在重试。"""
+    w = {"after_message_id": "msg_a", "until_message_id": "msg_c", "until_ts": 1.0, "through_seq": 120}
+    day = 24 * 3600
+    t0 = 1_000_000.0
+    state: dict = {}
+    patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0, reason="extraction_failed:rate_limited")
+    state.update(patch)
+    patch, _s, skipped = cf.capture_failure_patch(state, w, now_ts=t0 + 8 * day,
+                                                  reason="extraction_failed:rate_limited")
+    assert not skipped
+    assert patch["capture_account_fail_since"] == t0 + 8 * day
+
+
+def test_our_own_database_failures_are_not_account_problems():
+    for reason in ("extraction_failed:database_pool_timeout",
+                   "capture_memory_write_failed:TimeoutError: timed out"):
+        assert cf.failure_class(reason) == "other", reason
+        assert cf.account_error_code(reason) == "", reason
+
+
+# 统一分类器（notices.agent_call_failure）之后的契约 ------------------------------------------
+
+_V1_RAW_TAILS = (
+    'RuntimeError: cli agent exited 1: Failed to authenticate. API Error: 401 '
+    '{"error":"Insufficient balance"} (api_status=401)',
+    "RuntimeError: Failed to authenticate: OAuth session expired and could not be refreshed",
+    "RuntimeError: Not logged in · Please run /login",
+    "RuntimeError: 403 Your request was blocked",
+    "RuntimeError: provider_http_403: Request failed. Please try again later.",
+    "RuntimeError: cli agent exited 1: invalid key",
+    "RuntimeError: stream disconnected before completion",
+    "RuntimeError: response ended without finish_reason",
+    "TimeoutExpired: Command '['claude', '-p']' timed out after 300 seconds",
+    "TimeoutError: agent call timed out",
+    "RuntimeError: invalid max_tokens: must be <= 500",
+    "RuntimeError: 错误码 401：API 密钥无效",
+    "RuntimeError: 状态码 429：额度不足，请充值",
+    "RuntimeError: agent failed; prompt text says insufficient balance between goals",
+    "RuntimeError: HTTP 400: context_length_exceeded",
+    "ValueError: something odd",
+)
+
+
+@pytest.mark.parametrize("tail", _V1_RAW_TAILS)
+def test_v1_raw_and_stored_reasons_get_the_same_escape_valve_class(tail):
+    """🔴 同一次失败，原始尾巴和状态接口存下的归一码必须走同一档。
+
+    调度器读的是**存下来的**原因（已归一）；老任务、测试、没经过状态接口的路径是原始文本。
+    两边分类不一致，就是「同一个用户的同一个错误，今天 7 天、明天 6 次」。
+    """
+    from notices import agent_call_failure
+    from proactive import proactive_core
+
+    raw = f"capture_agent_call_failed:{tail}"
+    stored = proactive_core._job_status_patch({"status": "failed", "reason": raw})["status_reason"]
+    assert stored == agent_call_failure.normalize_reason(raw)
+    assert cf.failure_class(stored) == cf.failure_class(raw)
+    assert cf.account_error_code(stored) == cf.account_error_code(raw)
+    # 账号类的具体原因就是分类器的类别（提示文案按它查），不是另起一套名字
+    code = agent_call_failure.classify_failure_text(tail)
+    assert cf.account_error_code(raw) == (code if code in cf.ACCOUNT_ERROR_CONTRACT_CODES else "")
+
+
+def test_stored_v1_account_failure_waits_seven_days_not_six_attempts():
+    """V1 存下来的 ``capture_agent_call_failed:auth_invalid`` 失败 30 次也不跳（7 天兜底不变）。"""
+    assert _run_reasons(["capture_agent_call_failed:auth_invalid"] * 30) is None
+    assert _run_reasons(["capture_agent_call_failed:resident_agent_cli_logged_out"] * 30) is None
+    # 非账号类仍是 6 次兜底，解析仍是 3 次
+    assert _run_reasons(["capture_agent_call_failed:unknown"] * 10) == 6
+    assert _run_reasons(["json_decode_error:JSONDecodeError"] * 10) == 3
+    assert cf.CAPTURE_POISON_SKIP_AFTER == 3
+    assert cf.CAPTURE_TRANSIENT_SKIP_AFTER == 6
+    assert cf.CAPTURE_ACCOUNT_SKIP_AFTER_SEC == 7 * 86400
+
+
+def test_capture_failure_has_no_second_free_text_classifier():
+    """自由文本只在 notices.agent_call_failure 里认；这里不许再长出一份关键词/正则。"""
+    import inspect
+
+    src = inspect.getsource(cf)
+    assert "error_contract" not in src
+    assert "_STRONG_UPSTREAM_EVIDENCE" not in src
+    assert '"insufficient balance" in' not in src
+    assert '"invalid key" in' not in src

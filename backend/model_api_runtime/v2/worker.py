@@ -98,7 +98,6 @@ from core import wake_bus as core_wake_bus
 from memory import capture_failure
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
-from memgarden import contracts as mg_contracts
 from memgarden import timestamps as memory_timestamps
 from core.downloadable_reply import sanitize_downloadable_reply
 from perception.glance import (
@@ -142,29 +141,14 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
-from memory.capture_prompt_v1 import (
-    IO_CONVERSATION_CAPTURE_POLICY,
-    build_capture_prompt,
-    build_capture_retry_prompt,
-    build_capture_semantic_retry_prompt,
-    capture_semantic_retry_reasons,
-    parse_capture_cards,
-)
 from identity.user_naming import transcript_speaker_label
 from memgarden.text.card_text import (
-    build_truncation_retry_prompt,
     card_text_rejection,
     count_user_token_residuals,
-    is_retryable_parse_error,
     sanitize_card_labels,
 )
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
-from memory.dream_prompt_v1 import (
-    build_dream_prompt,
-    build_dream_retry_prompt,
-    parse_dream_consolidations,
-)
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 log = logging.getLogger("feedling.runtime_v2.worker")
@@ -253,6 +237,16 @@ async def _record_provider_failure_class(
         user_id,
         error_class=normalized,
     )
+
+
+def _session_only_parse(_reply: str) -> tuple[None, str]:
+    """Placeholder ``parse`` for lanes driven by a Garden component session.
+
+    ``extraction.extract`` ignores ``prompt`` / ``parse`` / ``parse_retry`` when
+    a session is given; this makes an accidental non-session call fail loudly
+    instead of parsing with a builder the component no longer uses.
+    """
+    return None, "component_session_required"
 
 
 async def _extract_with_provider_health(
@@ -474,10 +468,21 @@ MAX_TERMINAL_TOOL_CALL_RETRIES = _positive_int_env(
 # final-reply rewrite path.  Keep this as a named hard bound instead of growing
 # a second provider-call budget beside ``max_calls``.
 MAX_SELF_THINKING_ABSENT_RETRIES = 1
+def _self_thinking_absent_correction_instruction(tag: str = self_thinking.TAG_THINK) -> str:
+    """Correction prompt for a final reply that skipped the aside block, rendered
+    for the same protocol tag the turn's system prompt used (T591: gemini runs
+    the ``aside`` rendering; a ``<think>`` correction would re-trigger the very
+    failure the tag swap avoids)."""
+    return (
+        f"上一轮最终回复缺少规定的 <{tag}>…</{tag}> 结构。"
+        "请重新输出最终回复，严格遵守以下既有契约：\n\n"
+        + self_thinking.instruction(tag).strip()
+    )
+
+
+# Historical ``think`` rendering kept as a module constant for existing readers.
 _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION = (
-    "上一轮最终回复缺少规定的 <think>…</think> 结构。"
-    "请重新输出最终回复，严格遵守以下既有契约：\n\n"
-    + self_thinking.INSTRUCTION.strip()
+    _self_thinking_absent_correction_instruction(self_thinking.TAG_THINK)
 )
 TOOL_RESULT_CHAR_CAP = _positive_int_env("FEEDLING_V2_TOOL_RESULT_CHAR_CAP", "2000")
 TOOL_BATCH_RESULT_CHAR_CAP = _positive_int_env(
@@ -1043,13 +1048,18 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 )
 
 
-def _wake_system_prompt_for_lane(lane: str, base_prompt: str) -> str:
-    """Attach the shared thinking contract and lane-specific suffixes."""
+def _wake_system_prompt_for_lane(
+    lane: str, base_prompt: str, *, tag: str = self_thinking.TAG_THINK,
+) -> str:
+    """Attach the shared thinking contract and lane-specific suffixes.
+
+    ``tag`` selects the mandatory instruction rendering for the scheduled lane
+    (``context.self_thinking_tag(provider_config)``; gemini → ``aside``, T591)."""
     if not self_thinking.enabled():
         return base_prompt
     blocks = [base_prompt]
     if lane == "scheduled":
-        blocks.append(self_thinking.INSTRUCTION)
+        blocks.append(self_thinking.instruction(tag))
     else:
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
     if lane == "screen_watch":
@@ -1877,8 +1887,11 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_fence_incomplete",
         "capture_provider_result_invalid",
         "dream_blast_radius_exceeded",
+        "dream_context_unavailable",
+        "dream_kernel_outdated",
         "dream_no_memory_actions",
         "dream_source_occurred_at_unavailable",
+        "dream_truncated_card_rejected",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",
@@ -1917,6 +1930,13 @@ PUBLIC_FAILURE_CODES = frozenset(
         f"extraction_failed:{kind}"
         for kind in _EXTRACTION_FAILURE_KINDS
     }
+    # 落卡 provider 前置失败里用户要去设置里修的那几种（封闭集合，见 capture_failure）。
+    # 不登记的话 admin 时间线会把它遮掉、rollup 按未知码归类（Codex 第 11 轮）。
+    | {
+        f"{capture_failure.PROVIDER_SETUP_ACCOUNT_CODE}:{slug}"
+        for slug in capture_failure.PROVIDER_SETUP_USER_ERRORS
+    }
+    | {"provider_unavailable"}
 )
 
 
@@ -7071,6 +7091,10 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             # 不接受模型自报(schema 里也没有这个字段)。
             "occurred_at": memory_timestamps.now_iso(),
         }
+        if op in ("update", "supersede", "merge", "patch"):
+            # 改卡不改「事情什么时候发生」:不带 occurred_at,由 supersede 继承旧卡的日期
+            # (同 bucket/threads)。否则每次修正都把 2024 年的卡挪到今天。
+            del inner["occurred_at"]
         # ⚠️ 只在模型**真的传了**的时候才放这两个键。
         #
         # update 走的是 supersede(新写一张替换旧的),`actions._memory_supersede_action`
@@ -11155,7 +11179,9 @@ async def _run_wake(
             # Same as the chat lane's context.chat_system_prompt(): ask the model to
             # open its reply with a <think> block so proactive turns show a clean
             # self-authored thought instead of raw native reasoning.
-            _wake_sys = _wake_system_prompt_for_lane(lane, _wake_sys)
+            _wake_sys = _wake_system_prompt_for_lane(
+                lane, _wake_sys, tag=context.self_thinking_tag(provider_config),
+            )
             reply_language = infer_reply_language(
                 locale=str(temporal_snapshot.get("locale") or ""),
                 archive_language=str(
@@ -12060,6 +12086,9 @@ async def _run_profile(
                     f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
                 ),
             )
+            # Profile shares heavy-0 with Capture/Dream: same 120s stall budget,
+            # so each wire needs the same true wall-clock ceiling.
+            kwargs.setdefault("wire_deadline_sec", v2_extraction.WIRE_DEADLINE_SEC)
             result = await provider_client.reliable_chat_completion_async(
                 *args, **kwargs
             )
@@ -12303,7 +12332,13 @@ async def _run_extraction(
     dream_terminal_outcome = "failed"
     dream_model_attempts = 0
     dream_context_reader_failed = False
+    # Kernel verdict reason when Dream legitimately had nothing to consolidate
+    # (the garden is below memgarden's minimum). "" = a real run.
+    dream_skip_reason = ""
     dream_terminal_emitted = False
+    # What the Garden component actually showed the model this run (ids and
+    # counts only). Set when the Dream session opens.
+    dream_disclosure = garden_component.DreamDisclosure()
     # call_id -> 该通电话的全文明文。只在 capture lane 填充（见 enclave_sem 闸内）。
     voice_transcripts: dict[str, str] = {}
 
@@ -12337,7 +12372,9 @@ async def _run_extraction(
         except (TypeError, ValueError):
             return 0.0
 
-    async def _record_extraction_status(status: str, *, item_count: int = 0) -> None:
+    async def _record_extraction_status(
+        status: str, *, item_count: int = 0, skip_reason: str = ""
+    ) -> None:
         nonlocal extraction_status_recorded
         # Production Capture terminal state is committed by the durable batch
         # protocol below.  This callback remains only for the disabled Dream
@@ -12352,13 +12389,24 @@ async def _run_extraction(
             {
                 "window": dict(capture_window),
                 "item_count": max(0, int(item_count)),
+                **({"skip_reason": skip_reason} if skip_reason else {}),
             },
         )
         extraction_status_recorded = True
 
-    async def _complete_extraction(*, item_count: int) -> None:
+    async def _complete_extraction(*, item_count: int, skip_reason: str = "") -> None:
+        # A skip is still a clean terminal (no retry, no backoff), but it is
+        # tagged so the job row, admin dream view and Dream ledger never count
+        # it as a consolidation that actually ran.
         landed = await asyncio.to_thread(
-            jobs_store.mark_completed, job_id, claimed_by=claimed_by
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+            **(
+                {"wake_result": "skipped", "wake_result_reason": skip_reason}
+                if skip_reason
+                else {}
+            ),
         )
         if claimed_by and not landed:
             raise LostJobLease("extraction lease lost before terminalization")
@@ -12369,7 +12417,9 @@ async def _run_extraction(
         # after a lost lease, which is not recoverable.
         try:
             await _record_extraction_status(
-                "completed", item_count=item_count
+                "skipped" if skip_reason else "completed",
+                item_count=item_count,
+                skip_reason=skip_reason,
             )
         except Exception as status_exc:  # noqa: BLE001 — conservative retry repairs it
             log.warning(
@@ -12392,23 +12442,14 @@ async def _run_extraction(
             after_id = str(
                 capture_state.get("last_captured_until_message_id") or ""
             )
-            raw_seq = capture_state.get("last_captured_until_seq")
-            if capture_state.get("capture_seq_initialized") or raw_seq is not None and (
-                "capture_seq_initialized" not in capture_state
-                and "last_captured_until_seq" in capture_state
-            ):
-                try:
-                    capture_after_seq = max(0, int(raw_seq))
-                except (TypeError, ValueError):
-                    capture_after_seq = 0
-            elif after_id:
-                # One-time legacy upgrade.  A missing/pruned boundary is not
-                # evidence that any later timestamp was covered: restart from
-                # zero rather than risk skipping out-of-order rows.
-                exact_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, after_id
-                )
-                capture_after_seq = int(exact_seq or 0)
+            # 数字和消息 id 两份进度取靠后的；提交那一步（jobs_store）用同一个函数，
+            # 两边算出来的起点必须一致，否则提交会被当成「游标被别人推进了」反复拒绝。
+            # id 被清理时只看数字；两者都没有才从 0 开始（不会越过没处理的消息）。
+            capture_after_seq = await asyncio.to_thread(
+                capture_failure.frontier_seq,
+                capture_state,
+                lambda message_id: db.chat_seq_for_msg_id(user_id, message_id),
+            )
             capture_snapshot_through_seq = await asyncio.to_thread(
                 db.chat_max_seq, user_id
             )
@@ -12495,6 +12536,27 @@ async def _run_extraction(
                     _CAPTURE_BATCH_LIMIT,
                     through_seq=capture_snapshot_through_seq,
                 )
+                if tail:
+                    # 🔴 读到这批就立刻定下窗口终点，**先于**后面任何可能失败的步骤（通话转写、
+                    # 渲染…）。以前终点在转写循环之后才填，转写取不到时失败带出去的窗口没有终点，
+                    # 逃生阀永远不跳 —— 一张转写丢失的通话卡就能让用户永久卡死（独立审查复现）。
+                    last = tail[-1]
+                    last_id = str(last.get("id") or "")
+                    last_seq = last.get("seq")
+                    if last_seq is None and last_id:
+                        last_seq = await asyncio.to_thread(
+                            db.chat_seq_for_msg_id, user_id, last_id
+                        )
+                    if last_seq is None or not last_id:
+                        raise RuntimeError("capture_batch_frontier_unavailable")
+                    capture_window.update(
+                        {
+                            "until_message_id": last_id,
+                            "until_ts": _float_or_zero(last.get("ts")),
+                            "through_seq": int(last_seq),
+                            "message_count": len(tail),
+                        }
+                    )
             elif deps.read_tail_after_seq is not None:
                 through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
                 tail = await asyncio.to_thread(
@@ -12551,7 +12613,7 @@ async def _run_extraction(
                 cards_outcome = (
                     "ready" if dream_counts["active_cards"] else "empty"
                 )
-            if cards_outcome in {"unavailable", "truncated"}:
+            if cards_outcome == "unavailable":
                 dream_degraded_context = True
                 await _emit_v2_dream_context_error(
                     deps,
@@ -12561,24 +12623,19 @@ async def _run_extraction(
                     component="cards",
                     outcome=cards_outcome,
                 )
+                # The card read failed (enclave/readside timeout, non-200,
+                # incomplete fetch). Dreaming on nothing would complete as a
+                # no-op and advance the Dream ledger, so the scheduler reports
+                # ``already_dreamed`` until enough NEW cards arrive — an
+                # inactive user is silenced for good (prod, 09-10 / 09-13).
+                # Fail instead: the job goes through the Dream failure backoff
+                # and the ledger stays put. A prompt that cannot fit every card
+                # (the component's budget) stays an intentional partial
+                # context — reported as ``truncated`` once the session is open
+                # — and the other context items (buckets/threads/identity)
+                # keep degrading.
+                raise RuntimeError("dream_context_unavailable")
         if lane == "capture" and deps.read_capture_state is not None and tail:
-            last = tail[-1]
-            last_id = str(last.get("id") or "")
-            last_seq = last.get("seq")
-            if last_seq is None and last_id:
-                last_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, last_id
-                )
-            if last_seq is None or not last_id:
-                raise RuntimeError("capture_batch_frontier_unavailable")
-            capture_window.update(
-                {
-                    "until_message_id": last_id,
-                    "until_ts": _float_or_zero(last.get("ts")),
-                    "through_seq": int(last_seq),
-                    "message_count": len(tail),
-                }
-            )
             # 🔴 窗口指纹：**只有计数和白名单枚举，没有任何对话原文**。
             # 用来定位「模型为什么吐出坏 JSON」——见 memory/window_fingerprint。
             # 窗口文本此刻还没渲染，所以这里只取 role/source；
@@ -12594,11 +12651,20 @@ async def _run_extraction(
             # advances the frontier and releases single-flight. The successor
             # owns a valid job but has no raw seq left; settle it as no-work so
             # it cannot arm failure backoff against the next real message.
-            landed = await asyncio.to_thread(
-                jobs_store.mark_completed,
-                job_id,
-                claimed_by=claimed_by,
-            )
+            # 同时清掉残留的失败子状态（旧退避/提示），见 complete_capture_no_work。
+            if claimed_by and deps.read_capture_state is not None:
+                landed = await asyncio.to_thread(
+                    jobs_store.complete_capture_no_work,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                )
+            else:
+                landed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
             if claimed_by and not landed:
                 raise LostJobLease("capture lease lost before no-work completion")
             if tm is not None:
@@ -12648,94 +12714,73 @@ async def _run_extraction(
             _sole_call_id = ""
             if len(voice_transcripts) == 1 and len(prompt_tail) == 1:
                 _sole_call_id = next(iter(voice_transcripts))
-            parse = lambda reply: parse_capture_cards(
-                reply, policy=IO_CONVERSATION_CAPTURE_POLICY
-            )
+            # 提示词、解析、内容闸/语义闸的重问（第二问放宽成「只丢脏卡、干净的
+            # 照收」）都由组件的会话决定，见下面建 _capture_session 那段；
+            # extract() 在会话模式下不看 prompt/parse/parse_retry。
+            prompt = ""
+            parse = _session_only_parse
+            parse_retry = None
 
             def to_actions(*args, _call_id=_sole_call_id, **kwargs):
                 return v2_extraction.cards_to_actions(
                     *args, voice_call_id=_call_id, **kwargs
                 )
-            # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
-            # 不让一张脏卡把整个窗口的落卡清零。
-            parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_retryable_parse_error,
-                build_prompt=build_capture_retry_prompt,
-                parse=lambda reply: parse_capture_cards(
-                    reply,
-                    strict=False,
-                    policy=IO_CONVERSATION_CAPTURE_POLICY,
-                ),
-                semantic_reasons=capture_semantic_retry_reasons,
-                build_semantic_prompt=build_capture_semantic_retry_prompt,
-                build_truncation_prompt=build_truncation_retry_prompt,
-            )
         else:
-            prompt = build_dream_prompt(
-                ai_name=ctx.get("ai_name", ""),
-                user_name=ctx.get("user_name", ""),
-                cards=ctx.get("cards", ""),
-                recent_conversations=window,
-                # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
-                # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
-                # 光同源不同证据一样会判出两个结果。
-                locale=infer_garden_language(
-                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
-                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
-                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
-                    ctx.get("identity"),
-                    written=user_written_text(prompt_tail),
-                    existing_buckets=str(ctx.get("buckets") or ""),
-                ),
-            )
-            # parse_dream_consolidations 返回 (consolidations, questions, err)。
-            # questions 属于「主动提问」= wake 语义，本轮明确丢弃（spec §5.3）。
-            # known_ids = 喂进 prompt 的那批卡的 id:result 字段里出现任何一个
-            # 即「把整理注记当成内容」(usr_a40e 墓碑卡),与内容闸同路打回重问。
-            dream_known_ids = frozenset(
-                str(card.get("id") or "").strip()
-                for card in (ctx.get("card_items") or [])
-                if isinstance(card, dict) and str(card.get("id") or "").strip()
-            )
-            parse, to_actions = (
-                lambda reply: parse_dream_consolidations(
-                    reply, known_ids=dream_known_ids
-                ),
-                v2_extraction.consolidations_to_actions,
-            )
-            parse_retry = v2_extraction.ParseRetry(
-                should_retry=is_retryable_parse_error,
-                build_prompt=build_dream_retry_prompt,
-                parse=lambda reply: parse_dream_consolidations(
-                    reply, strict=False, known_ids=dream_known_ids
-                ),
-                build_truncation_prompt=build_truncation_retry_prompt,
-            )
-            # 整理也走组件的会话。和 capture 同构 —— provider 那步仍归
-            # extract()，组件只决定问什么、怎么重问。
+            # 整理走组件的会话：提示词、带正文的卡片区、预算截断、解析与重问都在组件里；
+            # provider 那步仍归 extract()（截断检测、用量、失败分类、退避、轨迹）。
             #
-            # known_ids 是墓碑卡守卫：整理结果里不许出现喂进去的卡 id，
-            # 出现了就是模型把整理注记当成了内容本身（usr_a40e 事故）。
+            # 交给组件的是读到的**整张卡**（serve_worker 不再预先按字数挑卡）。
+            # 组件实际给模型看了哪些、截断了哪些，从 disclosure 读 —— 下面的
+            # mapper 目标集、截断硬闸、爆炸半径分母都以它为准。
+            #
+            # 墓碑卡守卫（known_ids）覆盖读到的全部卡：整理结果里出现任何一个 id
+            # 即「把整理注记当成内容」(usr_a40e)，由组件的解析同路打回重问。
+            prompt = ""
+            parse = _session_only_parse
+            parse_retry = None
+            to_actions = v2_extraction.consolidations_to_actions
             _step_sink = garden_component.BounceTracker()
-            _capture_session = garden_component.build_garden(
-                garden_component.CallableModel(lambda _p: ""),
-                on_step=_step_sink,
-            ).maintenance_session(mg_contracts.MaintenanceRequest(
-                cards=list(ctx.get("card_items") or []),
-                all_cards=list(ctx.get("card_items") or []),
-                locale=infer_garden_language(
-                    # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
-                    # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
-                    # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
-                    ctx.get("identity"),
-                    written=user_written_text(prompt_tail),
-                    existing_buckets=str(ctx.get("buckets") or ""),
-                ),
-                ai_name=ctx.get("ai_name", ""),
-                user_name=ctx.get("user_name", ""),
-                recent_conversations=window,
-                known_ids=tuple(dream_known_ids),
-            ))
+            dream_stage = "prompt"
+            try:
+                _capture_session, dream_disclosure = garden_component.open_dream_session(
+                    garden_component.build_garden(
+                        garden_component.CallableModel(lambda _p: ""),
+                        on_step=_step_sink,
+                    ),
+                    cards=list(ctx.get("card_items") or []),
+                    # 做梦整理的是同一个花园，语言判据必须跟 capture 同源，
+                    # 否则夜里整理一遍会把桶换成另一种语言 —— 也要喂同样的证据，
+                    # 光同源不同证据一样会判出两个结果。
+                    locale=infer_garden_language(
+                        # ctx["identity"] 是**字符串**(已渲染的身份卡正文),不是 dict ——
+                        # 原来这里有个 isinstance(...) dict 的守卫,永远走 None,
+                        # 等于把身份卡这份语言证据整个丢了。见 _identity_texts。
+                        ctx.get("identity"),
+                        written=user_written_text(prompt_tail),
+                        existing_buckets=str(ctx.get("buckets") or ""),
+                    ),
+                    ai_name=ctx.get("ai_name", ""),
+                    user_name=ctx.get("user_name", ""),
+                    recent_conversations=window,
+                )
+            except garden_component.DreamKernelOutdated as outdated:
+                raise RuntimeError(garden_component.DREAM_KERNEL_OUTDATED) from outdated
+            dream_stage = "context"
+            if dream_disclosure.needed:
+                dream_counts["active_cards"] = len(dream_disclosure.rendered_ids)
+            if dream_disclosure.partial:
+                # Some fetched cards did not fit the component's prompt budget.
+                # Intentional partial context (those cards wait for a later
+                # night), but visible: same content-free event as before.
+                dream_degraded_context = True
+                await _emit_v2_dream_context_error(
+                    deps,
+                    user_id,
+                    job_id=str(job_id),
+                    trace_id=trace_id,
+                    component="cards",
+                    outcome="truncated",
+                )
 
         async def _extraction_trajectory(kind: str, payload: dict) -> None:
             nonlocal dream_model_attempts
@@ -12836,26 +12881,22 @@ async def _run_extraction(
                 _capture_session = garden_component.build_garden(
                     garden_component.CallableModel(lambda _p: ""),
                     on_step=_step_sink,
-                ).capture_session(mg_contracts.CaptureRequest(
+                ).capture_session(garden_component.capture_request(
                     window=window,
                     locale=capture_locale,
                     buckets=str(ctx.get("buckets") or ""),
                     threads=str(ctx.get("threads") or ""),
                     identity=str(ctx.get("identity") or ""),
-                    ai_name=ctx.get("ai_name", ""),
-                    user_name=ctx.get("user_name", ""),
-                    policy=IO_CONVERSATION_CAPTURE_POLICY,
+                    ai_name=str(ctx.get("ai_name") or ""),
+                    user_name=str(ctx.get("user_name") or ""),
+                    # 现有卡 → 组件挑索引、校验 target_id。读不全时 serve_worker
+                    # 不放这个键（None），绝不当成空花园。V1 与这里共用同一个构造点。
+                    existing_cards=(
+                        ctx.get("capture_cards")
+                        if isinstance(ctx.get("capture_cards"), list)
+                        else None
+                    ),
                 ))
-                prompt = build_capture_prompt(
-                    ai_name=ctx.get("ai_name", ""),
-                    user_name=ctx.get("user_name", ""),
-                    buckets=ctx.get("buckets", ""),
-                    threads=ctx.get("threads", ""),
-                    identity=ctx.get("identity", ""),
-                    window=window,
-                    cards=ctx.get("cards", ""),
-                    locale=capture_locale,
-                )
                 # 引号压力：失败窗口 >0 而成功窗口 =0 就坐实了引号假说。
                 # 只出个数和每千字符密度，不出位置、不出上下文。
                 try:
@@ -12885,9 +12926,6 @@ async def _run_extraction(
                 #
                 # 不直接调 garden.acapture() 的原因：那个自带循环，会把 provider
                 # 调用抢过去 —— 等于放弃上面那些能力，是净退步。
-                #
-                # dream lane 仍走原路径（它的 session API 还没做），所以下面两个
-                # 分支的 prompt/parse/parse_retry 仍然保留。
                 result = await _extract_with_provider_health(
                     user_id,
                     provider_config=provider_config,
@@ -13029,9 +13067,8 @@ async def _run_extraction(
                 counts=dream_counts,
             )
             _report_turn_progress("extraction_provider_start")
-            # dream 也走组件的会话（见上面建 _capture_session 那段）。
-            # prompt/parse/parse_retry 仍传着 —— 会话模式下 extract() 忽略它们，
-            # 但保留意味着「去掉 session 就退回原路径」随时可做。
+            # dream 也走组件的会话（见上面 open_dream_session 那段）；
+            # prompt/parse/parse_retry 只是占位，会话模式下 extract() 不看它们。
             items, reason = await _extract_with_provider_health(
                 user_id,
                 provider_config=provider_config,
@@ -13041,6 +13078,9 @@ async def _run_extraction(
                 session=_capture_session,
                 step_sink=_step_sink,
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                truncation_retry_max_tokens=(
+                    v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
+                ),
                 failure_detail_out=extraction_failure_detail.update,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
@@ -13049,8 +13089,41 @@ async def _run_extraction(
                 trajectory_out=extraction_trajectory_out,
             )
             _report_turn_progress("extraction_provider_complete")
-            dream_counts["model_attempts"] = max(1, dream_model_attempts)
-            dream_counts["proposals"] = len(items or [])
+            if not reason and not items and dream_model_attempts == 0:
+                # No provider request and no result: the component declined to
+                # ask the model at all. Only a small-garden verdict becomes a
+                # skip; an empty/unreadable card read keeps its old noop path.
+                dream_skip_reason = garden_component.maintenance_skip_reason(
+                    _capture_session
+                )
+            dream_counts["model_attempts"] = (
+                0 if dream_skip_reason else max(1, dream_model_attempts)
+            )
+            # Proposals = what the model returned, including the ones the
+            # component dropped at its exit (TRUNCATED / unrendered targets).
+            dream_counts["proposals"] = (
+                len(items or [])
+                + _step_sink.dropped_truncated_target
+                + _step_sink.dropped_unrendered_target
+            )
+        if lane == "dream" and dream_skip_reason:
+            await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
+            await _emit_v2_dream_lifecycle(
+                deps,
+                user_id,
+                "memory.dream.done",
+                job_id=str(job_id),
+                trace_id=trace_id,
+                status="ok",
+                outcome="skipped",
+                started_at=dream_started,
+                degraded_context=dream_degraded_context,
+                counts=dream_counts,
+            )
+            dream_terminal_emitted = True
+            if tm is not None:
+                tm.flush(failed=False, status="dream_skipped")
+            return "completed"
         if reason:
             if lane == "dream":
                 dream_terminal_outcome = memory_dream_trace.reason_outcome(reason)
@@ -13075,11 +13148,48 @@ async def _run_extraction(
                 job_id=str(job_id),
                 trace_id=trace_id,
                 status="ok",
-                outcome=("accepted" if items else "no_proposals"),
+                outcome=("accepted" if dream_counts.get("proposals") else "no_proposals"),
                 started_at=dream_started,
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
+        kernel_truncated_dropped = (
+            _step_sink.dropped_truncated_target if lane == "dream" else 0
+        )
+        if lane == "dream" and (
+            (items and dream_disclosure.truncated_ids) or kernel_truncated_dropped
+        ):
+            # Host-side hard block: the prompt forbids rewriting a card the
+            # model only saw part of, but a prompt is not a guarantee. Drop
+            # every consolidation that touches one before mapping; if that
+            # leaves nothing, fail (ledger stays put) rather than report a
+            # no-op for a run whose every proposal was forbidden. A memgarden
+            # that already drops these at the component exit leaves nothing
+            # for this check; its drops count as the same guard.
+            items, host_truncated_rejected = (
+                garden_component.reject_truncated_consolidations(
+                    items or [], dream_disclosure.truncated_ids
+                )
+            )
+            truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
+            if truncated_rejected:
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "dream_truncated_card_guard",
+                    {
+                        "rejected": truncated_rejected,
+                        "component_rejected": kernel_truncated_dropped,
+                        "host_rejected": host_truncated_rejected,
+                        "kept": len(items),
+                        "truncated_cards": len(dream_disclosure.truncated_ids),
+                    },
+                    best_effort=True,
+                )
+                if not items:
+                    dream_terminal_outcome = "guard_rejected"
+                    raise RuntimeError(
+                        garden_component.DREAM_TRUNCATED_CARD_REJECTED
+                    )
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
@@ -13180,24 +13290,41 @@ async def _run_extraction(
             # 回调在 extraction 里是**同步**调用的,所以这里只收集事实,
             # 等 to_actions 返回后再统一 await —— 不在同步回调里造未 await 的协程。
             source_time_degraded: list[tuple[int, int, bool]] = []
+            capture_skipped: dict[str, int] = {}
             action_kwargs = {
                 "occurred_at": occurred_at,
                 "source_ids": source_ids,
                 "build_envelope": _build_extraction_envelope,
             }
             if lane == "dream" and "card_items" in ctx:
-                # Bind every destructive result to the exact full-text cards
-                # disclosed for this run.  Unknown and overlapping targets are
+                # Bind every destructive result to the cards the component
+                # showed the model in full this run (not the omitted ones, not
+                # the truncated ones). Unknown and overlapping targets are
                 # rejected deterministically by the pure mapper before any
                 # write reaches Memory Garden.
-                action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+                action_kwargs["existing_cards"] = dream_disclosure.editable_cards()
             if lane == "dream":
                 action_kwargs["on_source_time_degraded"] = (
                     lambda known, missing, fb: source_time_degraded.append(
                         (int(known), int(missing), bool(fb))
                     )
                 )
+            else:
+                action_kwargs["on_skipped"] = (
+                    lambda why, count: capture_skipped.__setitem__(
+                        str(why), capture_skipped.get(str(why), 0) + int(count)
+                    )
+                )
             actions, _added, _superseded = to_actions(items, **action_kwargs)
+            if capture_skipped.get("supersede_target_duplicate"):
+                # 同一轮两张卡覆盖同一张旧卡，第二张被映射层丢掉（见 _to_actions）。
+                # 只记张数，与 unknown_target_dropped 同形。
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "supersede_target_duplicate_dropped",
+                    {"cards": int(capture_skipped["supersede_target_duplicate"])},
+                    best_effort=True,
+                )
             if lane == "dream":
                 dream_counts.update({
                     "actions": len(actions),
@@ -13223,7 +13350,10 @@ async def _run_extraction(
             if lane == "dream":
                 # 爆炸半径保险丝:单晚要退休的卡超过花园的绝大部分 = 规模明显
                 # 不对(834→1 事故的最后防线),整个 job 失败等人查,不部分执行。
-                active_count = len(ctx.get("card_items") or [])
+                # Denominator = the cards the model saw this run (what one
+                # night can rewrite), same as before the component took over
+                # the prompt budget.
+                active_count = len(dream_disclosure.rendered_ids)
                 if memory_dream_gates.blast_radius_exceeded(
                     _superseded, active_count
                 ):
@@ -15708,7 +15838,9 @@ async def process_job(
                     self_thinking_absent_retry_requests += 1
                     self_thinking_absent_retry_pending = True
                     correction_instruction = (
-                        _SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION
+                        _self_thinking_absent_correction_instruction(
+                            context.self_thinking_tag(provider_config)
+                        )
                     )
                     return v2_tool_loop.FinalReplyCorrectionRequest(
                         instruction=correction_instruction,
@@ -17102,7 +17234,61 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     # the honest signal that a terminal state was reached.
     dur_ms = max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000)
     await _emit_job_terminal_trace(deps, job, outcome, dur_ms=dur_ms)
+    await _notify_capture_backoff(deps, job, outcome)
     return outcome
+
+
+async def _notify_capture_backoff(deps: TurnDeps, job: dict, outcome: str) -> None:
+    """V2 落卡结束后给用户发/清「记忆整理受阻」提示，和 V1 用同一个函数、同一套文案。
+
+    以前 V2 落卡失败**完全没有提示**：提示只在 V1 的两个状态记录函数里发，
+    V2 的失败走 jobs_store 的持久批次协议、从不经过那里。用户账号余额不足，
+    记忆一直停着，App 里什么都看不到。
+
+    挂在 _run_turn 这个统一出口，而不是散落在各个 return 前（prepared 恢复、门禁、
+    主流程各有几处出口，漏一处就是一个无声的洞）。纯旁路：读失败/发失败都吞掉。
+    """
+    if str(job.get("lane") or "") != "capture" or deps.read_capture_state is None:
+        return
+    if outcome not in ("completed", "failed"):
+        return
+    user_id = str(job.get("user_id") or "")
+    if not user_id:
+        return
+    try:
+        from types import SimpleNamespace
+
+        from proactive import capture_jobs
+
+        state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
+        job_id = str(job.get("id") or "")
+        streak = int(state.get("capture_fail_streak") or 0)
+        skipped = False
+        if outcome == "failed":
+            # 只认本任务亲手累计的失败。关闭落卡/停机走取消、不累计，却同样返回 "failed"；
+            # 失租的旧 worker 也返回 "failed"。它们读到的是共享状态里的旧次数，拿去发
+            # 「正在自动重试」会误导（Codex 第 6 轮）。
+            if not job_id or str(state.get("last_capture_failed_job_id") or "") != job_id:
+                return
+            last_skip = float(state.get("last_capture_skipped_at") or 0.0)
+            skipped = last_skip > 0 and last_skip == float(state.get("last_capture_failed_at") or 0.0)
+        elif streak > 0:
+            # completed 却还带着失败次数：不是这次推进的（例如延迟回调），不清提示。
+            return
+        await asyncio.to_thread(
+            capture_jobs.notify_backoff,
+            SimpleNamespace(user_id=user_id),
+            lane="capture",
+            status=outcome,
+            streak=streak,
+            account_code=str(state.get("capture_account_error_code") or ""),
+            skipped=skipped,
+        )
+    except Exception as exc:  # noqa: BLE001 — 提示是旁路，绝不影响任务结果
+        log.warning(
+            "[v2.worker] capture backoff notice failed user=%s err=%s",
+            user_id, type(exc).__name__,
+        )
 
 
 async def _emit_job_terminal_trace(
@@ -17289,23 +17475,12 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             prepared = None
             try:
                 state = await asyncio.to_thread(deps.read_capture_state, user_id) or {}
-                raw_seq = state.get("last_captured_until_seq")
-                if state.get("capture_seq_initialized") or (
-                    raw_seq is not None
-                    and "capture_seq_initialized" not in state
-                    and "last_captured_until_seq" in state
-                ):
-                    after_seq = max(0, int(raw_seq or 0))
-                else:
-                    legacy_id = str(
-                        state.get("last_captured_until_message_id") or ""
-                    )
-                    after_seq = int(
-                        await asyncio.to_thread(
-                            db.chat_seq_for_msg_id, user_id, legacy_id
-                        )
-                        or 0
-                    )
+                # 同 _run_extraction：读进度只走 capture_failure.frontier_seq。
+                after_seq = await asyncio.to_thread(
+                    capture_failure.frontier_seq,
+                    state,
+                    lambda message_id: db.chat_seq_for_msg_id(user_id, message_id),
+                )
                 prepared = await asyncio.to_thread(
                     deps.get_prepared_capture_batch,
                     job_id=job_id,
@@ -17506,9 +17681,10 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                 best_effort=True,
             )
             return outcome
+        provider_meta: dict = {}
         try:
             async with enclave_sem:
-                provider_config, _meta = await _resolve_provider_for_current_job(
+                provider_config, provider_meta = await _resolve_provider_for_current_job(
                     deps, user_id, job_id
                 )
         except Exception as provider_exc:
@@ -17532,9 +17708,29 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
                     {"stage": "provider_resolution", "error_code": err},
                     best_effort=True,
                 )
-                owned = await asyncio.to_thread(
-                    jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+                resolver_error = str(
+                    (provider_meta or {}).get("error") if isinstance(provider_meta, dict) else ""
                 )
+                if lane == "capture" and resolver_error in capture_failure.PROVIDER_SETUP_USER_ERRORS:
+                    # 用户自己的模型配置问题（未配置/未测试/信封缺失/配置无效）：带上具体原因，
+                    # 提示才能告诉他去设置里修，而不是笼统的「系统正在重试」（Codex 第 10 轮）。
+                    # 解密失败、token 签发失败是我们的问题，仍是 provider_unavailable。
+                    err = f"provider_setup:{resolver_error}"
+                if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+                    # 落卡的 provider 前置失败（未配置/未测试/信封缺失/解密失败）也走落卡失败框架：
+                    # 累计退避（否则调度器每轮都重建同一个任务）、记本任务 id（提示才发得出来）。
+                    # 不带窗口 → 不跳过：模型用不了时跳过一批毫无用处，修好后从原处继续（Codex 第 8 轮）。
+                    owned = await asyncio.to_thread(
+                        deps.fail_capture_job,
+                        job_id=job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                        error=err,
+                    )
+                else:
+                    owned = await asyncio.to_thread(
+                        jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+                    )
                 if owned and lane in {"chat", "scheduled"}:
                     if lane == "chat":
                         await _settle_legacy_traced_chat_failure(err)
@@ -17593,13 +17789,28 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             best_effort=True,
         )
         log.warning("[v2.worker] job %s outer turn failure code=%s", job_id, message)
-        owned = await asyncio.to_thread(
-            jobs_store.mark_failed,
-            job_id,
-            message,
-            claimed_by=claimed_by,
-            error_class=_turn_failure_error_class(e),
-        )
+        owned = False
+        if lane == "capture" and deps.fail_capture_job is not None and claimed_by:
+            # 落卡在外层就挂了（mint token / provider 解析抛异常等）：同样要累计退避、
+            # 记本任务 id，否则调度器每轮重建同一个任务、用户也看不到提示。不带窗口 → 不跳过。
+            try:
+                owned = bool(await asyncio.to_thread(
+                    deps.fail_capture_job,
+                    job_id=job_id,
+                    user_id=user_id,
+                    claimed_by=claimed_by,
+                    error=message,
+                ))
+            except Exception:  # noqa: BLE001 — 退回通用终态，绝不留下未终结的任务
+                owned = False
+        if not owned:
+            owned = await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                message,
+                claimed_by=claimed_by,
+                error_class=_turn_failure_error_class(e),
+            )
         if owned and lane in {"chat", "scheduled"}:
             if lane == "chat":
                 await _settle_legacy_traced_chat_failure(message)

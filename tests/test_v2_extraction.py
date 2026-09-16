@@ -10,12 +10,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import pytest
 from psycopg_pool import PoolTimeout as PsycopgPoolTimeout
 
-from memory.capture_prompt_v1 import (
+from _memgarden_prompt_bindings import (
     build_capture_retry_prompt,
     parse_capture_cards,
 )
 from memgarden.text.card_text import is_retryable_parse_error
-from memory.dream_prompt_v1 import build_dream_prompt
+from _memgarden_prompt_bindings import build_dream_prompt
 from model_api_runtime.v2 import extraction, worker
 
 
@@ -307,6 +307,107 @@ def test_extract_retries_truncated_output_once_with_same_budget_and_recovers(
     ]
 
 
+def test_dream_output_budget_leaves_room_and_retry_escalates_under_wire_ceiling():
+    """prod 09-07..09-13: 5 users failed every night with output_truncated at 4000."""
+    ceiling = extraction.provider_client.CHAT_OUTPUT_MAX_TOKENS
+    first = extraction.max_output_tokens_for_lane("dream")
+    retry = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    assert first >= 12000
+    assert retry == min(first * 2, ceiling)
+    assert first < retry <= ceiling
+    # Capture keeps its historical same-budget retry.
+    assert extraction.truncation_retry_max_output_tokens_for_lane("capture") is None
+
+
+def test_dream_retry_budget_is_clamped_to_the_shared_wire_ceiling(monkeypatch):
+    ceiling = extraction.provider_client.CHAT_OUTPUT_MAX_TOKENS
+    monkeypatch.setattr(extraction, "DREAM_MAX_OUTPUT_TOKENS", ceiling * 3)
+    assert extraction.max_output_tokens_for_lane("dream") == ceiling
+    assert extraction.truncation_retry_max_output_tokens_for_lane("dream") == ceiling
+
+
+def test_extract_truncation_retry_uses_the_larger_budget_without_session(monkeypatch):
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append((messages[0]["content"], kwargs["max_tokens"]))
+        if len(calls) == 1:
+            return {"reply": '{"consolidations":[{"result', "stop_reason": "length",
+                    "usage": {"completion_tokens": 100}}
+        return {"reply": '{"consolidations":[]}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _responses
+    )
+    events = []
+
+    async def _record(kind, payload):
+        if kind == "extraction_output_truncation_retry":
+            events.append(payload)
+
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(),
+        prompt="P",
+        parse=lambda _raw: (["ok"], None),
+        max_tokens=100,
+        truncation_retry_max_tokens=250,
+        trajectory_out=_record,
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda _err: False,
+            build_prompt=lambda prompt, _err: prompt,
+            parse=lambda _raw: (["ok"], None),
+            build_truncation_prompt=lambda prompt: prompt + "|concise",
+        ),
+    ))
+
+    assert parsed == ["ok"] and err is None
+    assert calls == [("P", 100), ("P|concise", 250)]
+    assert events == [{"attempt": 2, "strategy": "concise_prompt", "max_tokens": 250}]
+
+
+def test_extract_session_truncation_retry_uses_the_larger_budget(monkeypatch):
+    """The production Dream path is session-driven; the escalation must reach it."""
+    from memgarden import contracts as mg_contracts
+    from memory import garden_component
+
+    calls = []
+
+    async def _responses(_cfg, messages, **kwargs):
+        calls.append(kwargs["max_tokens"])
+        if len(calls) == 1:
+            return {"reply": '{"consolidations":[{"op":"merge","card_ids":["c',
+                    "stop_reason": "length", "usage": {"completion_tokens": 100}}
+        return {"reply": '{"consolidations":[]}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _responses
+    )
+    cards = [{"id": f"card-{i}", "summary": f"S{i}"} for i in range(12)]
+    sink = garden_component.BounceTracker()
+    session = garden_component.build_garden(
+        garden_component.CallableModel(lambda _p: ""), on_step=sink,
+    ).maintenance_session(mg_contracts.MaintenanceRequest(
+        cards=cards, all_cards=cards, locale="zh-Hans",
+        known_ids=tuple(c["id"] for c in cards),
+    ))
+    details = []
+
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(),
+        prompt="unused",
+        parse=lambda _raw: (None, "unused"),
+        max_tokens=100,
+        truncation_retry_max_tokens=250,
+        failure_detail_out=details.append,
+        session=session,
+        step_sink=sink,
+    ))
+
+    assert (parsed, err) == ([], None)
+    assert calls == [100, 250]
+    assert details == []
+
+
 def test_extract_stops_after_second_truncation(monkeypatch):
     limit = extraction.CAPTURE_MAX_OUTPUT_TOKENS
     calls = 0
@@ -492,8 +593,15 @@ def test_extract_reasks_once_after_json_decode_error(monkeypatch):
     assert len(prompts) == 2
 
 
-def test_v2_worker_uses_the_shared_retryable_parse_predicate():
-    assert worker.is_retryable_parse_error is is_retryable_parse_error
+def test_v2_worker_leaves_parsing_and_re_asks_to_the_component():
+    """The retry predicate, parsers and prompt builders live in the Garden
+    component; the worker only hands extract() a placeholder that refuses to
+    parse, so a call that forgot its session fails loudly."""
+    assert worker._session_only_parse("{}") == (None, "component_session_required")
+    for name in ("is_retryable_parse_error", "parse_capture_cards",
+                 "parse_dream_consolidations", "build_capture_prompt",
+                 "build_dream_prompt"):
+        assert not hasattr(worker, name), name
 
 
 def test_extract_bounces_at_most_once(monkeypatch):

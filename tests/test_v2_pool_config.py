@@ -113,3 +113,32 @@ def test_retired_switches_cannot_change_the_topology(monkeypatch):
     assert [slot.pool for slot in config.slots].count("foreground") == 4
     assert [slot.pool for slot in config.slots].count("wake") == 2
     assert [slot.pool for slot in config.slots].count("heavy") == 2
+
+
+def test_heavy_extraction_slots_outlast_one_provider_wire(monkeypatch):
+    """Pool-specific stall invariant for Capture/Dream/Profile.
+
+    ``serve_worker`` validates its *default* stall clock (>= 210s) but pool
+    slots carry their own budgets, and the Heavy pool runs Capture/Dream at
+    120s. That is only safe because the provider retry wrapper reports a
+    progress boundary before every HTTP wire (compatibility fallbacks
+    included) AND each wire has a true wall-clock ceiling
+    (``extraction.WIRE_DEADLINE_SEC``; httpx's 90s ``timeout`` is per phase and
+    a trickling relay outlives it): the longest silence is then one bounded
+    wire, not an attempt of several. Keep a 30s margin for parse/progress
+    overhead (the same margin ``serve_worker`` requires between an MCP call
+    and the stall clock).
+    """
+    from model_api_runtime.v2 import extraction
+
+    for name in ("FEEDLING_V2_FOREGROUND_SLOTS", "FEEDLING_V2_WAKE_SLOTS", "FEEDLING_V2_HEAVY_SLOTS"):
+        monkeypatch.delenv(name, raising=False)
+    extraction_slots = [
+        slot for slot in RuntimePoolConfig.from_env().slots
+        if slot.lanes & {"capture", "dream"}
+    ]
+
+    assert extraction_slots
+    for slot in extraction_slots:
+        assert slot.stall_budget_sec >= extraction.WIRE_DEADLINE_SEC + 30.0, slot.slot_id
+        assert slot.absolute_budget_sec > slot.stall_budget_sec, slot.slot_id

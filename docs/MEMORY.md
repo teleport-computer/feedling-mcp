@@ -128,11 +128,13 @@ SELECT doc FROM memory_moments WHERE user_id = %s ORDER BY occurred_at, moment_i
 ### 4.2 上下文记忆选择与注入（聊天补记忆，重点）
 
 **选卡**入口在 `/v1/chat/history`（`backend/enclave/routes/chat.py::_build_context_memories`），
-调用外部包 `memgarden.scoring.relevance` 的选卡器：已发布的 0.19.0 走
-`select_context_memories_with_trace`（转折卡 ≤3 / 最新 ≤2 / 相关 ≤3，去重 ≤8，mode
-`bucketed:unified`）；当依赖升级到带 `select_relevant_context_memories_with_trace`
-的版本时，按特性探测切到相关性阈值 + 软配额策略（mode `relevant:unified`），
-io 不依赖未发布行为。选卡 query 是**最近四条对话**（含上一条 AI 回复）拼接，
+调用 memgarden 公开的 `retrieval.select_context`：和 `memory_search` 同一个 BM25 排序器、
+同一个 jieba 分词器（`backend/memory/jieba_tokenizer.py`），每张卡先过相关性门槛，
+再按软配额留转折卡 ≤3 / 最近 ≤2，≤8 张。自动想起的强证据门槛比搜索松
+（`memory_search_contract.RECALL_RANK_OPTIONS`，理由和评测数字在那里的注释与
+docs-site changelog），mode 形如 `relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`。
+回滚闸 `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0`（enclave 环境变量，默认开）
+退回旧的 `scoring.relevance.select_relevant_context_memories_with_trace`（mode `relevant:unified`）。选卡 query 是**最近四条对话**（含上一条 AI 回复）拼接，
 不再只看最后一句。转折角色只认卡片显式 `roles`（`backend/memory/card_shape.py::roles_of`），
 不再从标题前缀猜。`context_trace=1` 返回不含卡片正文的逐卡选择原因（bucket / reason /
 matched_phrases / score）。

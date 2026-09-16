@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
-from memory.capture_prompt_v1 import parse_capture_cards  # noqa: E402
-from memory.dream_prompt_v1 import parse_dream_consolidations  # noqa: E402
+from _memgarden_prompt_bindings import parse_capture_cards  # noqa: E402
+from _memgarden_prompt_bindings import parse_dream_consolidations  # noqa: E402
 
 TORN_TAILS = [
     'active.sleep","reason":"4:34 了她睡得很沉 早上再说"}]}',

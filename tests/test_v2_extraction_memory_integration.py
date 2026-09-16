@@ -17,8 +17,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from memory import actions as memory_actions  # noqa: E402
-from memory.capture_prompt_v1 import parse_capture_cards  # noqa: E402
-from memory.dream_prompt_v1 import (  # noqa: E402
+from _memgarden_prompt_bindings import parse_capture_cards  # noqa: E402
+from _memgarden_prompt_bindings import (  # noqa: E402
     build_dream_prompt,
     parse_dream_consolidations,
 )

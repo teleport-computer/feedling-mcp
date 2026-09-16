@@ -4193,7 +4193,7 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     fragment -> no_json_object / json_decode_error, and every claimed dream job
     failed. call_agent(..., raw_text=True) must bypass the chat sanitizer.
     """
-    from memory.dream_prompt_v1 import parse_dream_consolidations
+    from _memgarden_prompt_bindings import parse_dream_consolidations
 
     dream_json = (
         "Here is the consolidation result:\n"
@@ -4293,14 +4293,34 @@ def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
     ) % (card_id, json.dumps(summary, ensure_ascii=False), json.dumps(content, ensure_ascii=False))
 
 
+def _dream_gate_session():
+    """A real Dream component session (the resident only drives the model)."""
+    from memory import garden_component
+
+    tracker = garden_component.BounceTracker()
+    cards = [{"id": "m_1", "summary": "他在加班", "content": "他说最近总加班。", "bucket": "工作"}] + [
+        {"id": f"m_{i}", "summary": f"别的记忆 {i}", "content": f"别的正文 {i}。"}
+        for i in range(2, 11)
+    ]
+    session, _disclosure = garden_component.open_dream_session(
+        garden_component.build_garden(
+            garden_component.CallableModel(lambda _prompt: ""), on_step=tracker
+        ),
+        cards=cards,
+        locale="zh-Hans",
+        ai_name="小柒",
+        user_name="小雨",
+        recent_conversations="",
+    )
+    return session, tracker
+
+
 def test_memory_content_gate_bounces_placeholder_reply_once(monkeypatch):
     """弱模型抄回占位符 → 带着「哪个字段没填」重问一次,而不是静默落库。
 
     现场(usr_ed21…,minimax-M3):花园里出现 `[thickened summary]` / 正文只有 `...`
     的卡。JSON 合法、字段非空,老路径直接封信封写进去,用户能亲眼看到空白卡。
     """
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
     replies = [
         _dream_reply("[thickened summary]", "[thickened content combining work + incident]"),
@@ -4314,24 +4334,17 @@ def test_memory_content_gate_bounces_placeholder_reply_once(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, questions, err), bounce = crc._memory_agent_parse_with_bounce(
-        "原始 dream prompt",
-        parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt,
-        lane="dream",
-        job_id="job_1",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, calls = crc._run_dream_session(session, tracker, job_id="job_1")
     assert err is None and bounce == "bounced_ok"
     assert len(cons) == 1 and cons[0]["result"]["summary"] == "他最近一直在加班"
     # 只问两次(第一问 + 一次打回),且第二问带着原 prompt 的上下文和具体问题
-    assert len(prompts) == 2
-    assert prompts[1].startswith("原始 dream prompt")
+    assert len(prompts) == 2 and calls == 2
+    assert prompts[1].startswith(prompts[0])
     assert "content 还是方括号占位" in prompts[1] or "summary 还是方括号占位" in prompts[1]
 
 
 def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
 
     def _fake_call_agent(prompt, **kw):
@@ -4341,10 +4354,8 @@ def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_2",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_2")
     assert err is None and bounce == "" and len(cons) == 1
     assert len(prompts) == 1  # 正常回复不额外烧一次调用
 
@@ -4355,8 +4366,6 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
     报成 noop 会让这轮以「没什么要整理」完成 —— V2 那侧还会推进 capture frontier,
     窗口就永久丢了,而且 data-track 上完全看不见(codex review P1-3)。
     """
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
 
     def _fake_call_agent(prompt, **kw):
@@ -4366,10 +4375,8 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_3",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_3")
     assert cons == [] and bounce == "bounced_failed"
     assert err.startswith("invalid_card_content_after_retry:")
     assert len(prompts) == 2
@@ -4377,8 +4384,6 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
 
 def test_memory_content_gate_accepts_the_clean_empty_answer(monkeypatch):
     """第二问选择「宁可留空」→ 这是 prompt 想要的结果,算干净 noop 不算失败。"""
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     replies = [
         _dream_reply("[thickened summary]", "..."),
         '{"consolidations": [], "questions_to_ask": []}',
@@ -4392,17 +4397,13 @@ def test_memory_content_gate_accepts_the_clean_empty_answer(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_5",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_5")
     assert cons == [] and err is None and bounce == "bounced_empty"
 
 
 def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):
     """JSON 根本没出来是另一条路(provider/流被截),重问同一段 prompt 没意义。"""
-    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
-
     prompts: list[str] = []
 
     def _fake_call_agent(prompt, **kw):
@@ -4412,10 +4413,8 @@ def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):
     monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
     monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
 
-    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
-        "P", parse=parse_dream_consolidations,
-        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_4",
-    )
+    session, tracker = _dream_gate_session()
+    cons, err, bounce, _calls = crc._run_dream_session(session, tracker, job_id="job_4")
     assert cons == [] and err == "no_json_object" and bounce == ""
     assert len(prompts) == 1
 
@@ -4589,7 +4588,10 @@ def test_proactive_http_text_chain_without_af_unix(monkeypatch, response_status)
         assert "failed" in statuses
 
 
-def _install_capture_job_harness(monkeypatch, agent_reply):
+def _install_capture_job_harness(monkeypatch, agent_reply, *, index_body=None):
+    """``index_body``：``/v1/memory/index`` 的回包（现有卡）。不给 = 读不到现有卡
+    （``_capture_existing_cards`` 返回 None：无索引、不校验 target），
+    这样既有用例不碰网络、行为确定。"""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     captured = {
@@ -4684,6 +4686,15 @@ def _install_capture_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
     monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
     monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    if index_body is None:
+        monkeypatch.setattr(crc, "_capture_existing_cards", lambda: None)
+    else:
+        def _post_json(path, *, payload=None, **_kwargs):
+            captured.setdefault("post_json", []).append((path, payload))
+            assert path == "/v1/memory/index"
+            return index_body
+
+        monkeypatch.setattr(crc, "_capture_post_json", _post_json)
     return captured, job
 
 
@@ -4691,7 +4702,13 @@ def _capture_final_status(captured):
     return captured["statuses"][-1]
 
 
-def _install_dream_job_harness(monkeypatch, agent_reply):
+_DREAM_FILLER_INDEX = [
+    {"id": f"mem_fill_{i}", "summary": f"Seven's other memory {i}.", "bucket": "life"}
+    for i in range(7)
+]
+
+
+def _install_dream_job_harness(monkeypatch, agent_reply, *, cards=None):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     captured = {
@@ -4713,11 +4730,18 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
         {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life", "threads": ["coffee"]},
         {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life", "threads": ["coffee"]},
         {"id": "mem_c", "summary": "Seven drinks coffee in the morning.", "bucket": "routine", "threads": ["coffee"]},
+        # The Dream component only consolidates a garden of at least 10 cards.
+        *_DREAM_FILLER_INDEX,
     ]
     fetch_items = [
         {**item, "content": item["summary"] + " Full card."}
         for item in index_items
     ]
+    if cards is not None:
+        # Full cards as the backend returns them: index carries the summary,
+        # fetch carries the whole card.
+        index_items = [{"id": card["id"], "summary": card.get("summary", "")} for card in cards]
+        fetch_items = [dict(card) for card in cards]
     job = {
         "job_id": "dream_dispatch",
         "job_kind": "memory_dream",
@@ -4788,6 +4812,22 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
     monkeypatch.setattr(crc, "_capture_post_json", _post_json)
+    # Dream's card read goes through the real strict helper (a failed read must
+    # not look like an empty garden); only the pooled HTTP client is replaced,
+    # and it answers with the backend's real envelopes built from the fixtures.
+    monkeypatch.setattr(
+        crc,
+        "_client_for",
+        lambda _root: _DreamReadsideClient({
+            "/v1/memory/index": _json_response(200, {
+                "items": index_items,
+                "limit": 1000,
+                "truncated": False,
+                "user_card_count": len(index_items),
+            }),
+            "/v1/memory/fetch": _fetch_response(fetch_items),
+        }),
+    )
     monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(
         crc,
@@ -5111,6 +5151,129 @@ def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
     extra = _capture_final_status(captured)[3]["extra"]
     assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 1
+
+
+_CAPTURE_INDEX_BODY = {
+    "items": [
+        {"id": "mem_meeting", "summary": "Seven's weekly meeting always stresses him out.",
+         "bucket": "work", "importance": 0.6, "status": "active"},
+        {"id": "mem_oat", "summary": "Seven only drinks oat milk.", "bucket": "food",
+         "importance": 0.4, "status": "active"},
+        {"id": "mem_retired", "summary": "An old retired card.", "bucket": "work",
+         "status": "superseded"},
+    ],
+    "user_card_count": 3,
+    "truncated": False,
+}
+
+
+def _capture_supersede_reply(target):
+    return json.dumps({"cards": [{
+        "action": "supersede",
+        "target_id": target,
+        "type": "event",
+        "bucket": "work",
+        "threads": ["meeting"],
+        "summary": "The weekly meeting stress is really about boundaries.",
+        "content": "Seven clarified the weekly meeting stress is mostly about a boundary issue.",
+        "importance": 0.8,
+        "pulse": 0.6,
+    }]}, ensure_ascii=False)
+
+
+def test_capture_prompt_carries_existing_card_index_and_io_naming(monkeypatch):
+    """V1 从来没有这份索引（提示词里是 (none)），模型只能 add。现在经同一个构造点
+    带上现有卡索引、io 的称呼规则，照抄索引里的 id 就落成 supersede。"""
+    captured, job = _install_capture_job_harness(
+        monkeypatch, _capture_supersede_reply("mem_meeting"),
+        index_body=_CAPTURE_INDEX_BODY,
+    )
+    # 英文花园：io 和内核的英文称呼规则不同，才分得出用的是哪一版。
+    monkeypatch.setattr(
+        crc, "garden_language_decision",
+        lambda *_a, **_k: {"locale": "en", "basis": "test"},
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["post_json"] == [("/v1/memory/index", {"limit": 0})]
+    prompt = captured["prompts"][0]
+    index = prompt.split("target_id from here)]", 1)[1].split("\n[", 1)[0]
+    assert "- mem_meeting: [work] Seven's weekly meeting always stresses him out." in index
+    assert "- mem_oat: [food] Seven only drinks oat milk." in index
+    assert "mem_retired" not in index
+    from identity.user_naming import _naming_rule
+
+    assert _naming_rule("Seven", locale="en") in prompt
+    assert len(captured["prompts"]) == 1
+    action = captured["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == "mem_meeting"
+
+
+def test_capture_made_up_target_is_reasked_then_dropped(monkeypatch):
+    captured, job = _install_capture_job_harness(
+        monkeypatch,
+        [_capture_supersede_reply("mem_made_up"), _capture_supersede_reply("mem_made_up")],
+        index_body=_CAPTURE_INDEX_BODY,
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert "你给的 target_id 不是现有的卡" in captured["prompts"][1]
+    assert captured["actions"] == []
+    status = _capture_final_status(captured)
+    assert status[:3] == ("cap_dispatch", "completed", "supersede_target_unknown")
+    result = status[3]["extra"]["capture_result"]
+    assert result["reask_outcome"] == "failed"
+    assert result["skipped"] == {"supersede_target_unknown": 1}
+
+
+def test_capture_made_up_target_reask_recovers(monkeypatch):
+    captured, job = _install_capture_job_harness(
+        monkeypatch,
+        [_capture_supersede_reply("mem_made_up"), _capture_supersede_reply("mem_meeting")],
+        index_body=_CAPTURE_INDEX_BODY,
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert [a["supersedes"] for a in captured["actions"]] == ["mem_meeting"]
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_outcome"] == "recovered"
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ({"items": [], "user_card_count": 0, "truncated": False}, []),
+        ({"items": []}, None),
+        ({"items": [], "user_card_count": 4}, None),
+        ({}, None),
+        ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
+          "user_card_count": 1, "truncated": False},
+         [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}]),
+        # 超过读侧硬上限（1000 张）只回前一截：当全集用会把之后的真卡判成编造。
+        ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
+          "user_card_count": 1001, "truncated": True}, None),
+        # 缺 truncated 同样说不清读全没有。
+        ({"items": [{"id": "m1", "summary": "s", "bucket": "b", "importance": 0.2}],
+          "user_card_count": 1}, None),
+    ],
+)
+def test_capture_existing_cards_unreadable_is_none_not_empty(monkeypatch, body, expected):
+    monkeypatch.setattr(crc, "_capture_post_json", lambda path, **_k: body)
+    assert crc._capture_existing_cards() == expected
+
+
+def test_capture_unreadable_index_leaves_target_to_the_server(monkeypatch):
+    """读不到现有卡（None）时不校验 target —— 交给服务端所有权闸，别把好卡丢了。"""
+    captured, job = _install_capture_job_harness(
+        monkeypatch, _capture_supersede_reply("mem_meeting"),
+        index_body={"items": []},
+    )
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert "target_id from here)](none)" in captured["prompts"][0]
+    assert [a["supersedes"] for a in captured["actions"]] == ["mem_meeting"]
 
 
 def test_capture_job_supersede_without_target_is_noop(monkeypatch):
@@ -5540,7 +5703,8 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
     assert extra["merged_count"] == 1
     assert extra["dream_result"]["organized_count"] == 2
     assert extra["dream_result"]["merged_count"] == 1
-    assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+    # The component does not surface questions_to_ask (V2 never did either).
+    assert extra["questions"] == []
     assert [row["type"] for row in captured["traces"]] == [
         "memory.dream.start",
         "memory.dream.model.start",
@@ -5562,7 +5726,7 @@ def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeyp
         "degraded_context": False,
         "counts": {
             "actions": 1,
-            "active_cards": 3,
+            "active_cards": 10,
             "applied": 1,
             "failed": 0,
             "merged": 1,
@@ -5677,7 +5841,7 @@ def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_c
     )
     extra = _dream_final_status(captured)[3]["extra"]
     assert extra["dream_result"]["status"] == "noop"
-    assert extra["questions"] == ["下次问 TA 是否还喝拿铁"]
+    assert extra["questions"] == []
     assert extra["noop_reason"] == "dream_nothing_to_consolidate"
     assert extra.get("organized_count", 0) == 0
     assert extra.get("merged_count", 0) == 0
@@ -5696,6 +5860,384 @@ def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
         "memory.dream.error",
     ]
     assert captured["traces"][-1]["detail"]["outcome"] == "parse_rejected"
+
+
+def _dream_cards(n, *, body="正文。"):
+    return [{"id": f"mem_{i}", "summary": f"记忆 {i}", "content": f"{body}{i}",
+             "bucket": "life"} for i in range(n)]
+
+
+def test_dream_job_small_garden_is_a_skip_not_a_consolidation(monkeypatch):
+    """Below the component's minimum there is nothing to consolidate: no model
+    call, and the job says so (skipped + reason) instead of completing and
+    advancing the Dream ledger as if a consolidation ran."""
+    captured, job = _install_dream_job_harness(
+        monkeypatch, '{"consolidations": []}', cards=_dream_cards(3)
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert captured["prompts"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (job_id, status, reason) == ("dream_dispatch", "skipped", "not_enough_new_cards")
+    extra = kwargs["extra"]
+    assert extra["dream_skip_reason"] == "not_enough_new_cards"
+    assert extra["wake_result"] == "skipped"
+    assert all(row[1] != "completed" for row in captured["statuses"])
+    terminal = captured["traces"][-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["detail"]["outcome"] == "skipped"
+    assert "memory.dream.model.start" not in [row["type"] for row in captured["traces"]]
+
+
+def test_dream_job_cards_beyond_the_budget_are_partial_context_and_never_targets(monkeypatch):
+    # 20 cards of ~4,000 chars: the component renders the first 14.
+    reply = json.dumps({"consolidations": [{
+        "op": "supersede", "card_ids": ["mem_19"], "rationale": "更新",
+        "result": {"summary": "新摘要", "content": "新正文。"},
+    }]}, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(
+        monkeypatch, reply, cards=_dream_cards(20, body="正文" * 2000)
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    prompt = captured["prompts"][0]
+    assert "- id=mem_13 | bucket=life" in prompt and "- id=mem_14 |" not in prompt
+    assert captured["actions"] == []
+    types = [row["type"] for row in captured["traces"]]
+    context = next(row for row in captured["traces"]
+                   if row["type"] == "memory.extraction.context.error")
+    assert context["detail"]["component"] == "cards"
+    assert context["detail"]["outcome"] == "truncated"
+    assert types.index("memory.extraction.context.error") < types.index("memory.dream.model.start")
+    assert captured["traces"][-1]["detail"]["degraded_context"] is True
+    assert captured["traces"][-1]["detail"]["counts"]["active_cards"] == 14
+
+
+def _truncated_garden():
+    cards = _dream_cards(12)
+    cards[3]["content"] = "长" * 6000   # over the 5,000-char body cap -> TRUNCATED
+    return cards
+
+
+def test_dream_job_host_blocks_consolidations_touching_a_truncated_card(monkeypatch):
+    reply = json.dumps({"consolidations": [
+        {"op": "thicken", "card_ids": ["mem_3"], "rationale": "补充",
+         "result": {"summary": "只看了一半", "content": "重写的正文。"}},
+        {"op": "merge", "card_ids": ["mem_5", "mem_6"], "rationale": "同一件事",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+    ]}, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply, cards=_truncated_garden())
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    head = next(line for line in captured["prompts"][0].splitlines()
+                if line.startswith("- id=mem_3 |"))
+    assert head.endswith("| TRUNCATED")
+    assert [action["supersedes"] for action in captured["actions"]] == [["mem_5", "mem_6"]]
+    job_id, status, _reason, kwargs = _dream_final_status(captured)
+    assert status == "completed"
+    assert kwargs["extra"]["dream_result"]["truncated_rejected"] == 1
+
+
+def test_dream_job_fails_when_every_consolidation_touches_a_truncated_card(monkeypatch):
+    reply = json.dumps({"consolidations": [
+        {"op": "merge", "card_ids": ["mem_3", "mem_4"], "rationale": "同一件事",
+         "result": {"summary": "合并", "content": "合并正文。"}},
+    ]}, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply, cards=_truncated_garden())
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert captured["actions"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (status, reason) == ("failed", "dream_truncated_card_rejected")
+    assert kwargs["extra"]["dream_result"]["truncated_rejected"] == 1
+    assert captured["traces"][-1]["type"] == "memory.dream.error"
+    assert captured["traces"][-1]["detail"]["outcome"] == "guard_rejected"
+    assert captured["traces"][-1]["detail"]["counts"]["proposals"] == 1
+
+
+def test_dream_job_fails_closed_on_a_memgarden_without_card_body_rendering(monkeypatch):
+    """Self-update switched code but the dependency install did not land: the
+    old component would give the model titles only. Fail before any model call."""
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    monkeypatch.setattr(crc.garden_component, "dream_kernel_renders_card_bodies", lambda: False)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    assert captured["prompts"] == []
+    job_id, status, reason, _kwargs = _dream_final_status(captured)
+    assert (status, reason) == ("failed", "dream_kernel_outdated")
+    assert captured["traces"][-1]["detail"]["outcome"] == "failed"
+
+
+def test_v1_dream_fuse_denominator_is_the_cards_the_model_saw(monkeypatch):
+    """Retiring 10 of the 12 cards the model saw trips the fuse even though the
+    garden read had more cards (they were never shown, so never at risk)."""
+    _patch_dream_envelope(monkeypatch)
+    card_map = {f"m{i}": {"id": f"m{i}", "content": f"卡{i}"} for i in range(12)}
+    rows = [
+        {"op": "merge", "card_ids": [f"m{i}", f"m{i + 1}"], "rationale": "同一线索",
+         "result": {"summary": "合并", "content": "合并正文。"}}
+        for i in range(0, 10, 2)
+    ]
+    with pytest.raises(ValueError, match="dream_blast_radius_exceeded"):
+        crc._dream_actions_from_consolidations(
+            rows, card_map=card_map, occurred_at="2026-09-15T00:00:00Z",
+            disclosed_count=12,
+        )
+    actions, *_rest = crc._dream_actions_from_consolidations(
+        rows, card_map=card_map, occurred_at="2026-09-15T00:00:00Z",
+        disclosed_count=60,
+    )
+    assert len(actions) == 5
+
+
+class _DreamReadsideClient:
+    """Stands in for the pooled httpx client under the real strict Dream read.
+
+    ``answers`` maps a path suffix to an ``httpx.Response`` factory or an
+    exception instance; the request/response objects are real httpx ones so
+    ``raise_for_status`` / ``json`` behave exactly as in production.
+    """
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.paths = []
+
+    def post(self, url, *, json=None, headers=None, timeout=None):
+        import httpx
+
+        path = next((p for p in self.answers if url.endswith(p)), None)
+        self.paths.append(path or url)
+        if path is None:
+            # Recorded so a test can assert on it: production swallows the
+            # exception into "context unavailable", which would hide the miss.
+            raise AssertionError(f"unexpected readside path {url}")
+        answer = self.answers[path]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer(httpx.Request("POST", url), json)
+
+
+def _json_response(status, body):
+    import httpx
+
+    def _make(request, _payload):
+        return httpx.Response(status, json=body, request=request)
+
+    return _make
+
+
+def _fetch_response(cards, *, drop=(), unavailable=(), missing=(), keep_flagged=False):
+    """A ``/v1/memory/fetch`` answer in the backend's real envelope.
+
+    Requested ids listed in ``drop`` are silently omitted from ``items``; ids in
+    ``unavailable`` / ``missing`` are reported the way ``memory_fetch_core``
+    reports undecryptable and unknown cards (and omitted from ``items`` unless
+    ``keep_flagged`` builds a self-contradicting answer).
+    """
+    import httpx
+
+    by_id = {card["id"]: card for card in cards}
+
+    def _make(request, payload):
+        ids = list((payload or {}).get("ids") or [])
+        skipped = set(drop) | (
+            set() if keep_flagged else set(unavailable) | set(missing)
+        )
+        return httpx.Response(200, request=request, json={
+            "items": [by_id[mid] for mid in ids if mid in by_id and mid not in skipped],
+            "related_items": [],
+            "related_status": "not_needed",
+            "missing_ids": [mid for mid in ids if mid in set(missing)],
+            "unavailable_ids": [mid for mid in ids if mid in set(unavailable)],
+            "truncation": {"truncated": False, "requested_count": len(ids),
+                           "processed_count": len(ids), "omitted_count": 0},
+        })
+
+    return _make
+
+
+def _raw_response(status, content):
+    import httpx
+
+    def _make(request, _payload):
+        return httpx.Response(status, content=content, request=request)
+
+    return _make
+
+
+def _install_real_dream_read(monkeypatch, client):
+    """Answer the job's real strict card read with ``client`` (through the real
+    ``_client_for`` seam) and forbid the lenient best-effort helper."""
+    monkeypatch.setattr(crc, "_client_for", lambda _root: client)
+
+    def _no_lenient_read(path, **_kwargs):
+        raise AssertionError(f"Dream must not read {path} through the lenient helper")
+
+    monkeypatch.setattr(crc, "_capture_post_json", _no_lenient_read)
+
+
+_DREAM_INDEX_OK = {"items": [
+    {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life"},
+    {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life"},
+    *_DREAM_FILLER_INDEX,
+    {"id": "mem_z", "title": "Legacy title only.", "category": "old"},
+], "limit": 1000, "truncated": False, "user_card_count": 10}
+_DREAM_FULL_CARDS = [
+    {"id": "mem_a", "content": "Full card A body."},
+    {"id": "mem_b", "content": "Full card B body."},
+    *({"id": item["id"], "content": f"Body of {item['id']}."} for item in _DREAM_FILLER_INDEX),
+    {"id": "mem_z", "body": "Legacy body field."},
+]
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        pytest.param({"/v1/memory/index": "timeout"}, id="index-timeout"),
+        pytest.param({"/v1/memory/index": _json_response(503, {"error": "enclave"})}, id="index-503"),
+        pytest.param({"/v1/memory/index": _raw_response(200, b"<html>gateway</html>")}, id="index-not-json"),
+        pytest.param({"/v1/memory/index": _json_response(200, {"error": "x"})}, id="index-no-items"),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK), "/v1/memory/fetch": "timeout"},
+            id="fetch-timeout",
+        ),
+        # HTTP 200 is not a readable garden: the backend drops every card it
+        # cannot decrypt and still answers with an empty ``items`` list.
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {
+                "items": [], "limit": 1000, "truncated": False, "user_card_count": 12,
+            })},
+            id="index-200-empty-but-garden-has-cards",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {"items": [], "limit": 1000})},
+            id="index-200-without-card-count",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {
+                **_DREAM_INDEX_OK,
+                "items": [_DREAM_INDEX_OK["items"][0], {"summary": "no id"}, "junk"],
+             }),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS)},
+            id="index-200-partially-malformed",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, {
+                **_DREAM_INDEX_OK, "items": [{"summary": "no id"}, None],
+            })},
+            id="index-200-all-malformed",
+        ),
+        # A partial fetch must not fall back to index summaries: the model
+        # could supersede a real card knowing only its one-line summary.
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS, drop=("mem_b",))},
+            id="fetch-200-omits-a-card",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS, unavailable=("mem_b",))},
+            id="fetch-200-unavailable-ids",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS, missing=("mem_a",))},
+            id="fetch-200-missing-ids",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _fetch_response(
+                 _DREAM_FULL_CARDS, unavailable=("mem_b",), keep_flagged=True)},
+            id="fetch-200-body-but-flagged-unavailable",
+        ),
+        pytest.param(
+            {"/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+             "/v1/memory/fetch": _json_response(200, {
+                 "items": [*_DREAM_FULL_CARDS, {"id": "mem_other", "content": "x"}],
+                 "missing_ids": [], "unavailable_ids": [],
+             })},
+            id="fetch-200-unrequested-card",
+        ),
+    ],
+)
+def test_dream_job_failed_card_read_fails_instead_of_completing_as_no_cards(monkeypatch, answers):
+    """Prod 09-10 / 09-13: the index read timed out, the lenient helper returned
+    {}, and the job completed as ``dream_no_cards_available`` — the backend then
+    advanced the Dream ledger and silenced Dream. A failed read must fail."""
+    import httpx
+
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    answers = {
+        path: (httpx.ReadTimeout("timed out") if answer == "timeout" else answer)
+        for path, answer in answers.items()
+    }
+    client = _DreamReadsideClient(answers)
+    _install_real_dream_read(monkeypatch, client)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+
+    # Every read the job made was an expected one, in order (a stopped read
+    # need not reach the later paths).
+    assert client.paths == list(answers)[: len(client.paths)]
+    assert captured["prompts"] == []  # no model call on an unreadable garden
+    assert captured["actions"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (job_id, status, reason) == ("dream_dispatch", "failed", "dream_context_unavailable")
+    extra = kwargs["extra"]
+    assert extra["dream_result"] == {
+        "status": "failed",
+        "reason": "dream_context_unavailable",
+        "job_kind": "memory_dream",
+    }
+    assert extra["noop_reason"] == "dream_context_unavailable"
+    assert all(row[1] != "completed" for row in captured["statuses"])
+    assert [row["type"] for row in captured["traces"]][-2:] == [
+        "memory.extraction.context.error",
+        "memory.dream.error",
+    ]
+    assert captured["traces"][-1]["detail"]["outcome"] == "context_unavailable"
+
+
+def test_dream_job_genuinely_empty_garden_still_completes_as_verified_no_cards(monkeypatch):
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    client = _DreamReadsideClient({"/v1/memory/index": _json_response(200, {
+        "items": [], "limit": 1000, "truncated": False, "user_card_count": 0,
+    })})
+    _install_real_dream_read(monkeypatch, client)
+
+    crc._process_resident_jobs([job])
+
+    assert captured["prompts"] == []
+    job_id, status, reason, kwargs = _dream_final_status(captured)
+    assert (job_id, status, reason) == ("dream_dispatch", "completed", "dream_no_cards_available")
+    assert kwargs["extra"]["dream_result"]["cards_read"] == "empty"
+    assert captured["traces"][-1]["detail"]["outcome"] == "noop"
+
+
+def test_dream_job_reads_full_cards_through_the_strict_read(monkeypatch):
+    captured, job = _install_dream_job_harness(monkeypatch, '{"consolidations": []}')
+    client = _DreamReadsideClient({
+        "/v1/memory/index": _json_response(200, _DREAM_INDEX_OK),
+        "/v1/memory/fetch": _fetch_response(_DREAM_FULL_CARDS),
+    })
+    _install_real_dream_read(monkeypatch, client)
+
+    crc._process_resident_jobs([job])
+
+    assert client.paths == ["/v1/memory/index", "/v1/memory/fetch"]
+    # Bodies reach the model, legacy field names included (title/body/category).
+    assert "Full card A body." in captured["prompts"][0]
+    assert "- id=mem_z | bucket=old" in captured["prompts"][0]
+    assert "summary: Legacy title only." in captured["prompts"][0]
+    assert "Legacy body field." in captured["prompts"][0]
+    assert _dream_final_status(captured)[:3] == (
+        "dream_dispatch", "completed", "dream_nothing_to_consolidate",
+    )
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
@@ -6564,6 +7106,7 @@ def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatc
     )
     monkeypatch.setattr(crc, "_capture_window_text", lambda *_a, **_kw: "窗口")
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
+    monkeypatch.setattr(crc, "_capture_existing_cards", lambda: None)
     monkeypatch.setattr(crc, "_emit_debug_trace", lambda *_a, **_kw: None)
     monkeypatch.setattr(
         crc.garden_component, "build_garden", lambda *_a, **_kw: _Recorder()
@@ -6578,6 +7121,16 @@ def test_resident_capture_ignores_content_block_metadata_for_language(monkeypatc
 
     assert crc._process_capture_jobs([job]) == pytest.approx(322.0)
     assert seen == {"locale": "zh-Hans"}
+
+
+class _EmptyDreamSession:
+    def next_prompt(self):
+        return None
+
+    def result(self):
+        from memgarden import MaintenanceResult
+
+        return MaintenanceResult(needed=True)
 
 
 def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch):
@@ -6599,14 +7152,14 @@ def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch)
     }]
     seen = {}
 
-    def _fake_dream_prompt(**kwargs):
+    def _fake_open_dream_session(_garden, **kwargs):
         seen["locale"] = kwargs["locale"]
-        return "prompt"
+        return _EmptyDreamSession(), crc.garden_component.DreamDisclosure(needed=True)
 
     monkeypatch.setattr(crc, "claim_proactive_job", lambda _job_id: True)
     monkeypatch.setattr(crc, "update_proactive_job_status", lambda *_a, **_kw: None)
     monkeypatch.setattr(crc, "_emit_resident_dream_lifecycle", lambda *_a, **_kw: None)
-    monkeypatch.setattr(crc, "_dream_cards_context", lambda: ("cards", {"c1": {}}))
+    monkeypatch.setattr(crc, "_dream_read_cards", lambda: [{"id": "c1", "summary": "s"}])
     monkeypatch.setattr(
         crc,
         "_capture_identity_context",
@@ -6615,14 +7168,7 @@ def test_resident_dream_ignores_content_block_metadata_for_language(monkeypatch)
     monkeypatch.setattr(crc, "get_decrypted_history", lambda **_kw: history)
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("", ""))
     monkeypatch.setattr(
-        crc,
-        "build_dream_prompt",
-        _fake_dream_prompt,
-    )
-    monkeypatch.setattr(
-        crc,
-        "_memory_agent_parse_with_bounce",
-        lambda *_a, **_kw: (([], [], None), ""),
+        crc.garden_component, "open_dream_session", _fake_open_dream_session
     )
     job = {
         "schema_version": 2,
@@ -11359,18 +11905,54 @@ def test_maintenance_runs_after_lull_and_on_fresh_process(monkeypatch):
     assert ran == [("dream", "d1"), ("capture", "c1")]
 
 
-# --- resident distill: chat preemption + resumable in-memory progress --------
+# --- resident distill: memgarden import session, chat preemption, in-memory progress ---
+#
+# VPS 记忆导入跑的是和托管同一个 memgarden 导入引擎（backend/memory/garden_import.py）。
+# 这里用真引擎 + 假 agent/假写库，守 consumer 这一层：让路/续跑、写库形状、日期、收口复查。
 
-def _patch_memory_distill(monkeypatch, *, windows=3):
-    """Memory-mode distill harness: fake genesis worker/LLM modules injected into
-    sys.modules (so the lazy imports never pull real backend code), fake transport
-    helpers, REAL state machine under test. Returns the call ledger."""
+def _import_card(summary: str, *, occurred_at=None, action="add", target=None) -> dict:
+    card = {"action": action, "type": "fact", "target_id": target, "bucket": "爱好",
+            "threads": [], "summary": summary,
+            "content": f"{summary}。这是一段足够长、有实质内容的正文。",
+            "importance": 0.5, "pulse": 0.2}
+    if occurred_at is not None:
+        card["occurred_at"] = occurred_at
+    return card
+
+
+def _import_material(prompt: str) -> str:
+    end = prompt.find("[Output]")
+    start = max(prompt.rfind("[The material", 0, end), prompt.rfind("[The entries", 0, end))
+    return prompt[start:end] if start >= 0 else ""
+
+
+def _patch_memory_distill(monkeypatch, *, windows=3, cards_by_window=None, material_kind="",
+                          status=None, strategy="single_pass"):
+    """Memory-mode distill harness: REAL import engine + consumer state machine; fake
+    agent, fake memory writer, fake recheck module (sys.modules, so the lazy genesis
+    imports never pull the real worker). Returns the call ledger.
+
+    ``status``: what ``/v1/bootstrap/status`` returns (the floor-note input). Default {}
+    (floor 0 → no note); an Exception instance is raised instead."""
     import types as _types
 
-    calls = {"pending": 0, "map": [], "write": [], "recheck": 0,
-             "actions": [], "complete": [], "heartbeat": [], "lease": []}
-    job = {"job_id": "jobm", "mode": "add_memory", "material_kind": "",
+    monkeypatch.setenv("FEEDLING_GARDEN_IMPORT_STRATEGY", strategy)
+    calls = {"pending": 0, "agent": [], "recheck": 0, "actions": [], "complete": [],
+             "heartbeat": [], "lease": [], "envelopes": [], "status_reads": 0}
+
+    def fake_get_json(path, **kw):
+        if path == "/v1/bootstrap/status":
+            calls["status_reads"] += 1
+            if isinstance(status, Exception):
+                raise status
+            return dict(status or {})
+        return {}
+
+    monkeypatch.setattr(crc, "_capture_get_json", fake_get_json)
+    job = {"job_id": "jobm", "mode": "add_memory", "material_kind": material_kind,
            "sealed": {"envelope": {"body_ct": "x"}}}
+    cards_by_window = cards_by_window or {
+        i: [_import_card(f"第{i}段里提到的一件具体的事情")] for i in range(1, windows + 1)}
 
     def fake_pending():
         calls["pending"] += 1
@@ -11381,10 +11963,11 @@ def _patch_memory_distill(monkeypatch, *, windows=3):
     monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"doc")
     monkeypatch.setattr(
         crc, "_window_document",
-        lambda text, **kw: [f"w{i}" for i in range(1, windows + 1)],
+        lambda text, **kw: [f"〔窗{i}〕这一段材料\n" for i in range(1, windows + 1)],
     )
-    monkeypatch.setattr(crc, "_resident_memory_snapshot", lambda: ("terms", ["known"]))
-    monkeypatch.setattr(crc, "_resident_floor_note", lambda: "")
+    monkeypatch.setattr(crc, "_resident_memory_index_items", lambda: [])
+    monkeypatch.setattr(crc, "_resident_existing_identity", lambda: {})
+    monkeypatch.setattr(crc, "_resident_import_locale", lambda document: "zh-Hans")
     monkeypatch.setattr(
         crc, "genesis_resident_heartbeat", lambda jid: calls["heartbeat"].append(jid)
     )
@@ -11392,37 +11975,45 @@ def _patch_memory_distill(monkeypatch, *, windows=3):
         crc, "_genesis_resident_lease_alive",
         lambda jid: calls["lease"].append(jid) or True,
     )
-    monkeypatch.setattr(
-        crc, "_capture_build_envelope",
-        lambda card, *, occurred_at, source: {"card": card},
-    )
-    monkeypatch.setattr(
-        crc, "execute_memory_actions", lambda actions: calls["actions"].append(len(actions))
-    )
+
+    def fake_envelope(card, *, occurred_at, source):
+        calls["envelopes"].append((card["summary"], occurred_at, source))
+        return {"card": card, "occurred_at": occurred_at}
+
+    monkeypatch.setattr(crc, "_capture_build_envelope", fake_envelope)
+
+    def fake_execute(actions):
+        calls["actions"].append([a["type"] for a in actions])
+        base = sum(len(x) for x in calls["actions"][:-1])
+        return {"status": "ok", "results": [
+            {"status": "ok", "http_status": 201, "memory": {"id": f"mom_{base + i + 1}"}}
+            for i in range(len(actions))]}
+
+    monkeypatch.setattr(crc, "execute_memory_actions", fake_execute)
     monkeypatch.setattr(
         crc, "genesis_resident_complete",
         lambda jid, *, memory_action_count, identity_status:
             calls["complete"].append((jid, memory_action_count, identity_status)),
     )
 
-    def fake_map(**kw):
-        calls["map"].append(kw["key_prefix"])
-        return {"all_fact_candidates": [{"summary": kw["key_prefix"]}]}
+    def fake_call_agent(prompt, raw_text=True, **kw):
+        calls["agent"].append(prompt)
+        material = _import_material(prompt)
+        for i, cards in cards_by_window.items():
+            if f"〔窗{i}〕" in material:
+                return json.dumps({"cards": cards}, ensure_ascii=False)
+        return '{"cards": []}'
 
-    def fake_write(**kw):
-        calls["write"].append(len(kw["fact_candidates"]))
-        return {"memories": [{"summary": "m1"}, {"summary": "m2"}]}
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    monkeypatch.setattr(crc, "_capture_agent_reply_text", lambda x: x)
 
     def fake_recheck(**kw):
         calls["recheck"] += 1
+        calls["recheck_written"] = [c["summary"] for c in kw["written_memories"]]
         return {"memories": []}
 
     fake_genesis = _types.ModuleType("genesis")
-    fake_genesis.worker = _types.SimpleNamespace(
-        build_foreground_output_from_texts=fake_map,
-        build_memory_output_from_fact_candidates=fake_write,
-        build_memory_recheck_from_material=fake_recheck,
-    )
+    fake_genesis.worker = _types.SimpleNamespace(build_memory_recheck_from_material=fake_recheck)
     fake_llm_mod = _types.ModuleType("genesis.llm_client")
 
     class _FakeLLM:
@@ -11443,37 +12034,42 @@ def _patch_memory_distill(monkeypatch, *, windows=3):
     return calls
 
 
-def test_distill_yields_to_user_between_chunks_and_resumes_without_rerun(monkeypatch):
+def _agent_windows(calls) -> list[int]:
+    out = []
+    for prompt in calls["agent"]:
+        material = _import_material(prompt)
+        out.extend(i for i in range(1, 10) if f"〔窗{i}〕" in material)
+    return out
+
+
+def test_distill_yields_to_user_between_batches_and_resumes_without_rerun(monkeypatch):
     calls = _patch_memory_distill(monkeypatch, windows=3)
     pending = {"flag": False}
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
-    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+    real_agent = crc.call_agent
 
-    def map_then_user_arrives(**kw):
-        out = real_map(**kw)
-        pending["flag"] = True          # user message lands DURING chunk 1's turn
+    def agent_then_user_arrives(prompt, **kw):
+        out = real_agent(prompt, **kw)
+        pending["flag"] = True          # user message lands DURING batch 1's turn
         return out
 
-    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
-
+    monkeypatch.setattr(crc, "call_agent", agent_then_user_arrives)
     crc._process_resident_distill_once(chat_since=1.0)
-    # yielded after chunk 1: progress held, nothing written, job NOT completed
-    assert calls["map"] == ["jobm:resident:map:1"]
-    assert calls["write"] == [] and calls["actions"] == [] and calls["complete"] == []
+    # yielded after batch 1 was judged AND written (a batch never splits across a yield)
+    assert _agent_windows(calls) == [1]
+    assert calls["actions"] == [["memory.add"]] and calls["complete"] == []
     held = crc._distill_in_progress
-    assert held is not None and held["active"]["next_window_idx"] == 2
-    assert held["active"]["phase"] == "map"
+    assert held is not None and held["active"]["phase"] == "import"
+    assert held["active"]["known"][0]["id"] == "mom_1"   # written card enters the index
 
-    # user handled → resume: chunk 1 NOT re-run, pipeline finishes end-to-end
     pending["flag"] = False
-    sys.modules["genesis"].worker.build_foreground_output_from_texts = real_map
+    monkeypatch.setattr(crc, "call_agent", real_agent)
     crc._process_resident_distill_once(chat_since=1.0)
     assert calls["lease"] == ["jobm"]              # held lease re-checked on resume
-    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2, 3)]
-    assert calls["write"] == [3]                   # all 3 windows' candidates, once
+    assert _agent_windows(calls) == [1, 2, 3]      # batch 1 NOT re-judged
+    assert calls["actions"] == [["memory.add"]] * 3
     assert calls["recheck"] == 1
-    assert calls["actions"] == [2]                 # one batched memory.add
-    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert calls["complete"] == [("jobm", 3, "skipped")]
     assert crc._distill_in_progress is None
     assert calls["pending"] == 1                   # resume never re-claims
 
@@ -11482,38 +12078,39 @@ def test_distill_drops_progress_when_lease_lost_while_yielded(monkeypatch):
     calls = _patch_memory_distill(monkeypatch, windows=2)
     pending = {"flag": False}
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
-    real_map = sys.modules["genesis"].worker.build_foreground_output_from_texts
+    real_agent = crc.call_agent
 
-    def map_then_user_arrives(**kw):
-        out = real_map(**kw)
+    def agent_then_user_arrives(prompt, **kw):
+        out = real_agent(prompt, **kw)
         pending["flag"] = True
         return out
 
-    sys.modules["genesis"].worker.build_foreground_output_from_texts = map_then_user_arrives
+    monkeypatch.setattr(crc, "call_agent", agent_then_user_arrives)
     crc._process_resident_distill_once(chat_since=1.0)
     assert crc._distill_in_progress is not None
 
-    # while the user kept chatting, the backend reaper re-queued the job
     monkeypatch.setattr(crc, "_genesis_resident_lease_alive", lambda jid: False)
     pending["flag"] = False
     crc._process_resident_distill_once(chat_since=1.0)
     assert crc._distill_in_progress is None        # local progress dropped
     assert calls["complete"] == []                 # never completes a lost job
-    assert calls["map"] == ["jobm:resident:map:1"]  # and never touched chunk 2
+    assert _agent_windows(calls) == [1]            # and never touched batch 2
 
 
-def test_distill_yields_before_write_phase_and_resumes(monkeypatch):
+def test_distill_yields_before_recheck_and_resumes(monkeypatch):
     calls = _patch_memory_distill(monkeypatch, windows=1)
-    seq = iter([False, True])                       # map peek ok → write peek yields
+    seq = iter([False, False, True])      # batch 1 peek, end-of-batches peek, recheck peek yields
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: next(seq, False))
     crc._process_resident_distill_once(chat_since=1.0)
     held = crc._distill_in_progress
-    assert calls["map"] == ["jobm:resident:map:1"] and calls["write"] == []
-    assert held is not None and held["active"]["phase"] == "write"
+    assert _agent_windows(calls) == [1] and calls["recheck"] == 0
+    assert held is not None and held["active"]["phase"] == "recheck"
 
-    crc._process_resident_distill_once(chat_since=1.0)  # peek now False
-    assert calls["write"] == [1] and calls["recheck"] == 1
-    assert calls["complete"] == [("jobm", 2, "skipped")]
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert calls["recheck"] == 1
+    assert calls["recheck_written"] == ["第1段里提到的一件具体的事情"]
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+    assert _agent_windows(calls) == [1]
     assert crc._distill_in_progress is None
 
 
@@ -11570,78 +12167,224 @@ def test_distill_lease_alive_only_4xx_means_lost(monkeypatch):
 
 
 def test_distill_without_chat_since_never_peeks_and_runs_to_completion(monkeypatch):
-    # legacy call shape (no gate): must run the whole pipeline in one call and
-    # never touch the chat-peek path at all.
     calls = _patch_memory_distill(monkeypatch, windows=2)
     monkeypatch.setattr(
         crc, "_user_chat_pending",
         lambda since: (_ for _ in ()).throw(AssertionError("peeked without chat_since")),
     )
     crc._process_resident_distill_once()
-    assert calls["map"] == [f"jobm:resident:map:{i}" for i in (1, 2)]
+    assert _agent_windows(calls) == [1, 2]
     assert calls["complete"] == [("jobm", 2, "skipped")]
     assert crc._distill_in_progress is None
 
 
-def test_distill_preserves_dates_for_long_term_memory_material(monkeypatch):
-    # LTM archive (material_kind == "memory_summary" → keep_all) carries each card's
-    # original date into the envelope, so decades of uploaded memories keep their dates
-    # instead of collapsing onto today. A card the model couldn't date falls back to a
-    # real now() stamp — never empty (resident has no server-side relationship anchor).
-    _patch_memory_distill(monkeypatch, windows=1)
+def test_distill_card_dates_come_from_the_material_undated_cards_get_now(monkeypatch):
+    # memgarden's import rubrics keep the date the material states (never guessed);
+    # the envelope carries it so imported history keeps its timeline. A card the
+    # material gave no date to gets a real now() stamp — never empty.
+    calls = _patch_memory_distill(monkeypatch, windows=1, cards_by_window={1: [
+        _import_card("生日那天去看了一场演唱会", occurred_at="2019-06-01"),
+        _import_card("每周六早上去爬山的习惯"),
+    ]})
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
-
-    once = {"n": 0}
-
-    def ltm_pending():
-        once["n"] += 1
-        return [{"job_id": "jobm", "mode": "add_memory",
-                 "material_kind": "memory_summary",
-                 "sealed": {"envelope": {"body_ct": "x"}}}] if once["n"] == 1 else []
-
-    monkeypatch.setattr(crc, "genesis_resident_pending", ltm_pending)
-    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
-        "memories": [
-            {"summary": "birthday", "occurred_at": "2019-06-01"},
-            {"summary": "graduation", "date": "2020-02-02"},   # alternate key also honored
-            {"summary": "no_date"},
-        ],
-    }
-    seen = {}
-    monkeypatch.setattr(
-        crc, "_capture_build_envelope",
-        lambda card, *, occurred_at, source:
-            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
-    )
-
     crc._process_resident_distill_once()
+    dates = {summary: when for summary, when, _src in calls["envelopes"]}
+    assert dates["生日那天去看了一场演唱会"] == "2019-06-01"
+    assert dates["每周六早上去爬山的习惯"] and "T" in dates["每周六早上去爬山的习惯"]
+    assert {src for *_x, src in calls["envelopes"]} == {"genesis_resident_distill"}
 
-    assert seen["birthday"] == "2019-06-01"
-    assert seen["graduation"] == "2020-02-02"
-    assert seen["no_date"] and "T" in seen["no_date"]   # undated → real now() ISO, not empty
 
-
-def test_distill_ignores_dates_for_chat_history_material(monkeypatch):
-    # Chat-history distill (material_kind != memory_summary → keep_all False) is the
-    # normal path: even if a card happens to carry a date, the write stamps now(). Date
-    # preservation is scoped strictly to long-term-memory uploads.
-    _patch_memory_distill(monkeypatch, windows=1)   # base job material_kind is ""
+def test_distill_long_term_memory_uses_curated_archive_rubric(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=1, material_kind="memory_summary")
     monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
-
-    sys.modules["genesis"].worker.build_memory_output_from_fact_candidates = lambda **kw: {
-        "memories": [{"summary": "chatty", "occurred_at": "2019-06-01"}],
-    }
-    seen = {}
-    monkeypatch.setattr(
-        crc, "_capture_build_envelope",
-        lambda card, *, occurred_at, source:
-            seen.__setitem__(card["summary"], occurred_at) or {"card": card},
-    )
-
     crc._process_resident_distill_once()
+    assert "[The entries they wrote]" in calls["agent"][0]       # curated_archive
+    calls2 = _patch_memory_distill(monkeypatch, windows=1)
+    crc._process_resident_distill_once()
+    assert "[The material they handed you]" in calls2["agent"][0]  # history_import
 
-    assert seen["chatty"] != "2019-06-01"   # date ignored off the LTM path
-    assert "T" in seen["chatty"]            # now() stamp
+
+# --- VPS 张数引导（floor note）：切换前传给 fact_write，切换后走 memgarden host_note ---
+#
+# 之前(34cd8164):VPS 导入写卡提示词里带「花园现有 N 张卡…参考 floor–asp 张…绝不编造」;
+# 切到 memgarden 导入后丢了。现在恢复:同样的算法和措辞,作为 ImportRequest.host_note
+# 进每个写卡批次;托管导入一直没有这段,仍然没有。
+
+_HOST_GUIDANCE = "[Host guidance]"
+
+
+def _write_prompts(calls) -> list[str]:
+    return [p for p in calls["agent"] if "[The material]" not in p]
+
+
+def test_distill_floor_note_reaches_every_vps_write_prompt_with_the_numbers(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=2,
+                                  status={"memory_floor": 38, "memories_count": 2})
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    note = crc._resident_floor_note()
+    assert "花园现有 2 张卡" in note and "38–87 张之间" in note and "绝不编造" in note
+    assert len(calls["agent"]) == 2
+    for prompt in calls["agent"]:
+        assert f"\n{_HOST_GUIDANCE}\n{note}\n" in prompt
+        assert prompt.index(_HOST_GUIDANCE) < prompt.index("[Output]")
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+
+
+def test_distill_floor_note_uses_exposed_aspiration_and_two_pass_write_stage_only(monkeypatch):
+    calls = _patch_memory_distill(
+        monkeypatch, windows=1, strategy="two_pass",
+        status={"memory_floor": 38, "memories_count": 40, "memory_aspiration": 60})
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    monkeypatch.setattr(crc, "call_agent", lambda prompt, **kw: (
+        calls["agent"].append(prompt) or (
+            json.dumps({"candidates": [{"about": "person", "summary": "周末爬山",
+                                        "evidence": "这一段材料", "occurred_at": None}]},
+                       ensure_ascii=False)
+            if "[The material]" in prompt
+            else json.dumps({"cards": [_import_card("周末常去爬山")]}, ensure_ascii=False))))
+    crc._process_resident_distill_once()
+    candidates = [p for p in calls["agent"] if "[The material]" in p]
+    writes = _write_prompts(calls)
+    assert len(candidates) == 1 and len(writes) == 1
+    assert _HOST_GUIDANCE not in candidates[0]
+    assert "花园现有 40 张卡" in writes[0] and "38–60 张之间" in writes[0]
+
+
+@pytest.mark.parametrize("status", [
+    {"memory_floor": 0, "memories_count": 0},
+    {"memory_floor": 38, "memories_count": 87},
+    {"memory_floor": 38, "memories_count": 90, "memory_aspiration": 60},
+    RuntimeError("api down"),
+])
+def test_distill_no_floor_note_when_floor_zero_or_reached_or_status_fails(monkeypatch, status):
+    calls = _patch_memory_distill(monkeypatch, windows=1, status=status)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["agent"] and all(_HOST_GUIDANCE not in p for p in calls["agent"])
+    assert calls["complete"] == [("jobm", 1, "skipped")]    # zero impact on the import
+
+
+def test_distill_floor_note_computed_once_per_job_across_yield_and_resume(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=3,
+                                  status={"memory_floor": 38, "memories_count": 2})
+    pending = {"flag": False}
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: pending["flag"])
+    real_agent = crc.call_agent
+
+    def agent_then_user_arrives(prompt, **kw):
+        pending["flag"] = True
+        return real_agent(prompt, **kw)
+
+    monkeypatch.setattr(crc, "call_agent", agent_then_user_arrives)
+    crc._process_resident_distill_once(chat_since=1.0)
+    pending["flag"] = False
+    monkeypatch.setattr(crc, "call_agent", real_agent)
+    crc._process_resident_distill_once(chat_since=1.0)
+    assert _agent_windows(calls) == [1, 2, 3]
+    assert calls["status_reads"] == 1
+    assert all("花园现有 2 张卡" in p for p in calls["agent"])
+
+
+def test_distill_on_old_memgarden_skips_the_note_instead_of_failing(monkeypatch):
+    from memory import garden_import
+
+    calls = _patch_memory_distill(monkeypatch, windows=1,
+                                  status={"memory_floor": 38, "memories_count": 2})
+    monkeypatch.setattr(garden_import, "import_request_accepts_host_note", lambda: False)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["agent"] and _HOST_GUIDANCE not in calls["agent"][0]
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+
+
+def test_distill_supersede_goes_out_as_supersede_action(monkeypatch):
+    calls = _patch_memory_distill(monkeypatch, windows=2, cards_by_window={
+        1: [_import_card("养了一只叫年糕的三花猫")],
+        2: [_import_card("三花猫年糕今年五岁了", action="merge", target="mom_1")],
+    })
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["actions"] == [["memory.add"], ["memory.supersede"]]
+    batch2 = [p for p in calls["agent"] if "〔窗2〕" in _import_material(p)][0]
+    assert "mom_1" in batch2       # batch 1's real id is in batch 2's existing-memory index
+
+
+def test_distill_rewrites_user_placeholder_to_the_name_before_sealing(monkeypatch):
+    # 之前(d72e74c4 / 67bf4b96,经 genesis fact_write):VPS 导入卡封信封前「用户喜欢…」
+    # 确定性换成称呼。换引擎后只剩提示词规则;改写在引擎里(consumer 自己不调改写器)。
+    calls = _patch_memory_distill(monkeypatch, windows=1, cards_by_window={1: [
+        _import_card("用户喜欢周末去西湖边骑车")]})
+    monkeypatch.setattr(crc, "_resident_existing_identity",
+                        lambda: {"user_preferred_name": "小雨"})
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert [summary for summary, *_x in calls["envelopes"]] == ["小雨喜欢周末去西湖边骑车"]
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+
+
+def _reject_all(actions):
+    return {"status": "failed", "results": [
+        {"status": "error", "error": "memory_card_polluted", "http_status": 422} for _ in actions]}
+
+
+def test_distill_batch_with_every_card_rejected_fails_instead_of_completing(monkeypatch):
+    # 之前(6972427d):整批写卡全被拒 → 抛,job 留给后端回收重跑(受 attempt 上限约束),
+    # 不是「完成、0 张卡」。
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.setattr(crc, "execute_memory_actions",
+                        lambda actions: calls["actions"].append(len(actions)) or _reject_all(actions))
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["actions"] == [1]
+    assert calls["complete"] == []
+    assert calls["recheck"] == 0
+    assert crc._distill_in_progress is None
+
+
+def _recheck_returns(monkeypatch, memories):
+    fake_genesis = sys.modules["genesis"]
+    fake_genesis.worker = types.SimpleNamespace(
+        build_memory_recheck_from_material=lambda **kw: {"memories": memories})
+
+
+def test_distill_closing_recheck_write_failure_raises_instead_of_being_swallowed(monkeypatch):
+    # 之前:复查补的卡和第一遍一起写,整批失败就抛。换引擎后一度被 try/except 吞成「完成」。
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    _recheck_returns(monkeypatch, [{"summary": "复查补的一张卡", "content": "复查补的一张卡,有正文。",
+                                    "bucket": "爱好", "threads": []}])
+    real_execute = crc.execute_memory_actions
+    monkeypatch.setattr(crc, "execute_memory_actions",
+                        lambda actions: _reject_all(actions) if calls["actions"] else real_execute(actions))
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["complete"] == [], "复查卡整批写不进去 → job 不能以完成收尾"
+    assert crc._distill_in_progress is None
+
+
+def test_distill_closing_recheck_partial_write_logs_counts_only(monkeypatch, caplog):
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    _recheck_returns(monkeypatch, [
+        {"summary": "复查补的好卡", "content": "复查补的好卡,有正文。", "bucket": "爱好", "threads": []},
+        {"summary": "复查补的秘密坏卡", "content": "秘密内容。", "bucket": "爱好", "threads": []},
+    ])
+    real_execute = crc.execute_memory_actions
+
+    def execute(actions):
+        if not calls["actions"]:
+            return real_execute(actions)
+        calls["actions"].append(["recheck"])
+        return {"status": "partial", "results": [
+            {"status": "ok", "http_status": 201, "memory": {"id": "mom_r1"}},
+            {"status": "error", "error": "memory_card_polluted", "http_status": 422}]}
+
+    monkeypatch.setattr(crc, "execute_memory_actions", execute)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    with caplog.at_level("WARNING"):
+        crc._process_resident_distill_once()
+    assert calls["complete"] == [("jobm", 2, "skipped")]
+    assert "resident distill memory batch partial job=jobm applied=1 skipped=0 failed=1" in caplog.text
+    assert "秘密" not in caplog.text
 
 
 def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
@@ -12218,7 +12961,7 @@ def _install_resident_job_gate_harness(monkeypatch):
     ran = []
 
     def _fake(kind):
-        def proc(jobs):
+        def proc(jobs, chat_since=None):
             assert len(jobs) == 1            # per-job dispatch, never a batch
             ran.append((kind, jobs[0].get("job_id")))
             return float(jobs[0].get("ts") or 0)
@@ -15640,3 +16383,55 @@ def test_hidden_body_logs_content_free_completion(monkeypatch, caplog, outcome, 
     records = [r.getMessage() for r in caplog.records if r.name == crc.log.name]
     assert records == [f"agent_body job_id=body-job-1 status={expected_status} error_code={expected_error} attempts={attempts} dur_ms={250 * attempts}"]
     assert crc._AGENT_BODY_PRIVATE.get() is False
+
+
+# --- resident distill: import review fixes (import6) ---
+
+def test_distill_region_tagged_archive_language_completes_with_english_prompts(monkeypatch):
+    """C1 之前：whoami 的档案语言 ``en-US`` 原样进导入 → memgarden UnknownBucketLocaleError，
+    job 留给回收、重试同处炸。之后：导入引擎入口归一成 ``en``。"""
+    calls = _patch_memory_distill(monkeypatch, windows=1, cards_by_window={
+        1: [_import_card("Rides a bike around the lake every Saturday")]})
+    monkeypatch.setattr(crc, "_resident_import_locale", lambda document: "en-US")
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert calls["complete"] == [("jobm", 1, "skipped")]
+    assert "简体中文" not in calls["agent"][0] and "Health" in calls["agent"][0]
+
+
+def test_distill_on_memgarden_without_batched_import_logs_the_named_code(monkeypatch, caplog):
+    """C1' 之前：旧 memgarden 上是裸 ImportError（cannot import name 'ImportBatchResult'）。"""
+    import memgarden
+
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    monkeypatch.delattr(memgarden, "ImportBatchResult")
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    with caplog.at_level("ERROR"):
+        crc._process_resident_distill_once()
+    assert calls["agent"] == [] and calls["complete"] == []
+    failed = [r.getMessage() for r in caplog.records if "resident distill failed" in r.getMessage()]
+    assert failed == ["resident distill failed job=jobm: garden_import_kernel_outdated"]
+    assert crc._distill_in_progress is None
+
+
+def test_distill_cut_off_agent_reply_triggers_memgarden_truncation_reask(monkeypatch):
+    """M3 之前：VPS 的 complete 恒报「没截断」，半截 JSON 只会走通用格式重问。
+    之后：回复里 JSON 没闭合就报截断，memgarden 用「更紧凑地重做」重问一次。"""
+    calls = _patch_memory_distill(monkeypatch, windows=1)
+    real_agent = crc.call_agent
+    replies = iter(['{"cards": [{"action": "add", "summary": "第1段里提到的一件具'])
+
+    def cut_off_once(prompt, **kw):
+        try:
+            reply = next(replies)
+        except StopIteration:
+            return real_agent(prompt, **kw)
+        calls["agent"].append(prompt)
+        return reply
+
+    monkeypatch.setattr(crc, "call_agent", cut_off_once)
+    monkeypatch.setattr(crc, "_user_chat_pending", lambda since: False)
+    crc._process_resident_distill_once()
+    assert len(calls["agent"]) == 2
+    assert "因长度上限被截断" in calls["agent"][1]
+    assert calls["complete"] == [("jobm", 1, "skipped")]

@@ -900,6 +900,122 @@ def test_resident_freeze_logs_discarded_reason_without_leaking_cell(
     assert "count=2" in caplog.text
 
 
+def test_resident_dream_agent_failures_keep_their_class_in_frozen_codes(
+        clean_rollup):
+    """Bug 20: legacy raw ``dream_agent_call_failed:<text>`` rows (written
+    before the status endpoint classified them) must not all become
+    ``runtime_failed``; new, already-classified rows pass unchanged."""
+    uid = "usr_rollup_res_dream_agent_codes"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    secret = "PRIVATE-PROVIDER-ECHO-9d1e"
+    for reason in (
+        f"dream_agent_call_failed:RuntimeError: 401 Unauthorized {secret}",
+        f"dream_agent_call_failed:RuntimeError: HTTP 401: Insufficient balance {secret}",
+        "dream_agent_call_failed:model_not_found",
+    ):
+        _log_job(uid, ts=t, status="failed", job_kind="memory_dream",
+                 terminal_at=t, status_reason=reason)
+
+    _freeze_resident_lane_days(now_epoch=_NOW_EPOCH)
+
+    (cell,) = [r for r in _cells(user_id=uid) if r["lane"] == "dream"]
+    assert cell["failed"] == 3
+    assert cell["failure_codes"] == {
+        "dream_agent_call_failed:auth_invalid": 1,
+        "dream_agent_call_failed:quota_insufficient": 1,
+        "dream_agent_call_failed:model_not_found": 1,
+    }
+    assert secret not in repr(cell)
+
+
+def test_daily_report_fixture_matches_real_rollup_projection(
+        clean_rollup):
+    """tools/memory_pipeline_daily_report.py is tested from a saved fixture.
+    Lock that fixture to what the producers really return, so a renamed or
+    dropped column fails here instead of silently zeroing the daily report."""
+    import json as _json
+    from pathlib import Path as _P
+
+    sys.path.insert(0, str(_P(__file__).parent.parent))
+    from tools import memory_pipeline_daily_report as report_tool
+
+    fixture = _json.loads(
+        (_P(__file__).parent / "fixtures" / "memory_pipeline_daily_report"
+         / "sources_2026-09-14.json").read_text(encoding="utf-8"))
+
+    v2_uid, v1_uid = "usr_rollup_report_v2", "usr_rollup_report_v1"
+    seed_user(v2_uid)
+    fin = datetime(2030, 6, 1, 2, 0, tzinfo=timezone.utc)
+    _insert_job(v2_uid, "capture", "failed", finished=fin,
+                last_error="extraction_failed:auth_invalid")
+    _insert_job(v2_uid, "capture", "expired", finished=fin)
+    _insert_job(v2_uid, "capture", "failed", finished=fin,
+                last_error="capture_disabled")
+    _insert_job(v2_uid, "capture", "failed", finished=fin,
+                last_error="lease_timeout")
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+    _seed_resident(v1_uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _log_job(v1_uid, ts=t, status="completed", job_kind="memory_capture",
+             terminal_at=t)
+    # A scheduler skip (control) and a user's own empty balance: neither may
+    # count as our failure in the report.
+    _log_job(v1_uid, ts=t, status="skipped", job_kind="memory_capture",
+             terminal_at=t, status_reason="capture_window_unavailable")
+    _log_job(v1_uid, ts=t, status="failed", job_kind="memory_capture",
+             terminal_at=t,
+             status_reason="capture_agent_call_failed:quota_insufficient")
+    _log_job(v1_uid, ts=t, status="failed", job_kind="memory_capture",
+             terminal_at=t, status_reason="capture_memory_write_failed")
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+
+    payload = db.admin_lane_rollup(lane="capture", since_day="2030-05-31",
+                                   until_day="2030-06-01")
+    fixture_payload = fixture["lane_rollup"]["capture"]
+    assert set(payload) == set(fixture_payload)
+    assert set(payload["stuck"]) == set(fixture_payload["stuck"])
+    real_rows = payload["rows"]
+    assert {r["route"] for r in real_rows} == {"model_api", "resident"}
+    fixture_keys = {frozenset(r) for r in fixture_payload["rows"]}
+    assert fixture_keys == {frozenset(r) for r in real_rows}
+    for route in ("model_api", "resident"):
+        assert set(payload["coverage"][route]) >= set(
+            fixture_payload["coverage"][route])
+
+    v2 = report_tool.aggregate_day(real_rows, lane="capture", route="model_api",
+                                   day="2030-06-01")
+    assert (v2.failed_raw, v2.operational, v2.control, v2.user_unavailable) == (4, 2, 1, 1)
+    assert v2.stuck_users == 1
+    assert v2.user_unavailable_codes == {"extraction_failed:auth_invalid": 1}
+    assert v2.causes["our_side"].codes == {"lease_timeout": 1}
+    assert v2.causes["unknown"].codes == {"no_code": 1}
+    v1 = report_tool.aggregate_day(real_rows, lane="capture", route="resident",
+                                   day="2030-06-01")
+    assert (v1.completed, v1.failed_raw) == (1, 3)
+    assert (v1.operational, v1.control, v1.user_unavailable) == (1, 1, 1)
+    assert not v1.unclassified
+    assert v1.stuck_users == 0
+
+    # V1 stuck rows carry the recent count the report bounds itself to.
+    stuck_uid = "usr_rollup_report_stuck"
+    _seed_resident(stuck_uid)
+    now = datetime.now(timezone.utc)
+    for age_h in (8, 30, 30 * 24):
+        created = now - timedelta(hours=age_h)
+        db.log_append(stuck_uid, "proactive_jobs", {
+            "status": "claimed", "job_kind": "memory_capture",
+            "created_at": created.isoformat()}, ts=created.timestamp())
+    stuck = db.admin_lane_rollup(user_id=stuck_uid)["stuck"]
+    (row,) = [r for r in stuck["rows"] if r["user_id"] == stuck_uid]
+    assert (row["count"], row["recent_count"]) == (3, 1)
+    assert stuck["resident_recent_hours"] == 24.0
+    assert report_tool.live_stuck_total(stuck) == 1
+    fixture_stuck_row = next(r for r in fixture_payload["stuck"]["rows"]
+                             if r["route"] == "resident")
+    assert set(fixture_stuck_row) == set(row)
+
+
 def test_discarded_reason_operational_log_is_bounded(caplog):
     raw_reason = "Provider Error " + ("x" * 600) + "END_SENTINEL"
     assert not db._LANE_ROLLUP_CODE_RE.match(raw_reason)
@@ -1458,7 +1574,7 @@ def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
     assert windows["7d"]["routes"]["resident"]["lanes"]["heartbeat"] == {
         "completed": 8, "failed": 1, "expired": 0, "superseded": 0,
         "operational_failures": 0, "control_outcomes": 0,
-        "user_unavailable": 0,
+        "user_unavailable": 0, "skipped": 0,
         "failure_codes": {"unknown": 1},
         "concentration": {
             "users_active": 1,
@@ -1469,7 +1585,7 @@ def test_event_path_windows_use_closed_days_and_declare_partial_coverage(
     assert windows["24h"]["routes"]["model_api"]["lanes"]["chat"] == {
         "completed": 6, "failed": 4, "expired": 0, "superseded": 2,
         "operational_failures": 0, "control_outcomes": 0,
-        "user_unavailable": 0,
+        "user_unavailable": 0, "skipped": 0,
         "failure_codes": {
             "extraction_failed:quota_insufficient": 1,
             "extraction_failed:upstream_unavailable": 3,
@@ -2767,3 +2883,267 @@ def test_the_resident_anchor_has_an_index_to_stand_on():
         # CONCURRENTLY cannot run inside the migration's transaction.
         assert "autocommit_block()" in (_P(__file__).parent.parent
                                         / source).read_text()
+
+
+# --- 2026-09-15: memory-lane user-account failures leave the numerator ------ #
+#
+# hx-approved additions to the notices catalog's user-unavailable sets (pending
+# Seven's review). Real rows through both freezers and the event×path master
+# payload: a proven account problem is user_unavailable, a provider outage or a
+# legacy raw tail stays an operational failure.
+
+def test_v1_memory_lane_account_failures_freeze_as_user_unavailable(clean_rollup):
+    from proactive import proactive_core
+
+    uid = "usr_rollup_mem_v1_account"
+    _seed_resident(uid)
+    t = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+
+    def stored(raw: str) -> str:
+        # The value the status endpoint actually persists.
+        return proactive_core._job_status_patch(
+            {"status": "failed", "reason": raw}
+        )["status_reason"]
+
+    capture_auth = stored(
+        "capture_agent_call_failed:RuntimeError: cli agent exited 1: Failed to "
+        'authenticate. API Error: 401 {"error":"Insufficient balance"} (api_status=401)'
+    )
+    assert capture_auth == "capture_agent_call_failed:quota_insufficient"
+    capture_outage = stored(
+        "capture_agent_call_failed:RuntimeError: status 503 Service Unavailable"
+    )
+    assert capture_outage == "capture_agent_call_failed:upstream_unavailable"
+    # CLI logged out stays operational: on hosted V1 it can be a platform
+    # key-injection bug (review 09-15; Seven's chat set excludes it too).
+    dream_logged_out = stored(
+        "dream_agent_call_failed:RuntimeError: Not logged in · Please run /login"
+    )
+    assert dream_logged_out == "dream_agent_call_failed:resident_agent_cli_logged_out"
+    migrate_model = stored(
+        "migrate_agent_call_failed:RuntimeError: Error code: 404 - model_not_found: gpt-9"
+    )
+    for job_kind, reason in (
+        ("memory_capture", capture_auth),
+        ("memory_capture", capture_outage),
+        ("memory_capture", None),
+        ("memory_dream", dream_logged_out),
+        # Written before status-endpoint normalization: raw tail, stays operational.
+        ("memory_dream", "dream_agent_call_failed:RuntimeError: HTTP 401 invalid api key"),
+        ("memory_migrate", migrate_model),
+    ):
+        _log_job(uid, ts=t, status="failed" if reason else "completed",
+                 job_kind=job_kind, terminal_at=t, status_reason=reason)
+
+    _freeze_resident_lane_days(now_epoch=_PATH_NOW_EPOCH)
+    cells = {r["lane"]: r for r in _cells(user_id=uid)}
+    capture, dream, migrate = cells["capture"], cells["dream"], cells["migrate"]
+    assert (capture["failed"], capture["user_unavailable"],
+            capture["operational_failures"]) == (2, 1, 1)
+    assert (dream["failed"], dream["user_unavailable"],
+            dream["operational_failures"]) == (2, 0, 2)
+    assert (migrate["failed"], migrate["user_unavailable"],
+            migrate["operational_failures"]) == (1, 1, 0)
+    for cell in (capture, dream, migrate):
+        assert (cell["operational_failures"] + cell["control_outcomes"]
+                + cell["user_unavailable"]) == cell["failed"]
+
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-01")
+    master = data_track._event_path_master_payload(frozen)
+    runtime_24h = next(w for w in master["runtime_windows"] if w["key"] == "24h")
+    capture_cell = next(
+        row for row in runtime_24h["rows"] if row["key"] == "capture"
+    )["cells"]["runtime_v1"]
+    assert capture_cell["state"] == "metric", capture_cell
+    assert capture_cell["user_unavailable"] == 1
+    assert capture_cell["failure"] == 1
+    assert capture_cell["denominator"] == 2  # 1 completed + 1 operational
+
+
+def test_v2_memory_lane_account_failures_are_user_unavailable_after_freeze(
+        clean_rollup):
+    uid = "usr_rollup_mem_v2_account"
+    seed_user(uid)
+    fin = datetime(2030, 6, 1, 3, 0, tzinfo=timezone.utc)
+    _insert_job(uid, "capture", "completed", finished=fin)
+    _insert_job(uid, "capture", "failed", finished=fin,
+                last_error="provider_setup:model_api_not_configured")
+    _insert_job(uid, "capture", "failed", finished=fin,
+                last_error="extraction_failed:upstream_unavailable")
+    _insert_job(uid, "capture", "failed", finished=fin,
+                last_error="extraction_failed:database_pool_timeout")
+    _insert_job(uid, "dream", "failed", finished=fin,
+                last_error="extraction_failed:auth_invalid")
+    _insert_job(uid, "dream", "failed", finished=fin,
+                last_error="extraction_failed:model_not_found")
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+
+    frozen = db.admin_event_path_rollup_windows(through_day="2030-06-01")
+    master = data_track._event_path_master_payload(frozen)
+    runtime_24h = next(w for w in master["runtime_windows"] if w["key"] == "24h")
+    cells = {
+        row["key"]: row["cells"].get("runtime_v2")
+        for row in runtime_24h["rows"] if row["key"] in {"capture", "dream"}
+    }
+    assert cells["capture"]["state"] == "metric", cells["capture"]
+    assert cells["capture"]["user_unavailable"] == 1
+    assert cells["capture"]["failure"] == 2
+    assert cells["capture"]["denominator"] == 3
+    assert cells["dream"]["user_unavailable"] == 2
+    assert cells["dream"]["failure"] == 0
+
+
+def test_v2_runtime_health_excludes_memory_lane_account_failures():
+    from model_api_runtime.v2 import jobs_store
+
+    uid = "usr_health_mem_v2_account"
+    seed_user(uid)
+    lane = "capture"
+
+    def lane_row():
+        report = jobs_store.recent_runtime_health(within_hours=1)
+        return next((r for r in report["lanes"] if r["lane"] == lane),
+                    {"user_unavailable": 0, "operational_failures": 0})
+
+    before = lane_row()
+    now = datetime.now(timezone.utc)
+    _insert_job(uid, lane, "failed", finished=now,
+                last_error="provider_setup:model_api_key_envelope_missing")
+    _insert_job(uid, lane, "failed", finished=now,
+                last_error="extraction_failed:auth_invalid")
+    _insert_job(uid, lane, "failed", finished=now,
+                last_error="extraction_failed:rate_limited")
+    after = lane_row()
+    assert after["user_unavailable"] - before["user_unavailable"] == 2
+    assert after["operational_failures"] - before["operational_failures"] == 1
+
+# --- dream skip rides silent_declared (2026-09-15, no schema change) -------- #
+#
+# A V2 Dream on a too-small garden terminates ``completed`` with
+# ``wake_result='skipped'`` without asking the model. The frozen cell keeps it
+# in ``completed`` but files it under ``silent_declared``; every reader that
+# shows a Dream success rate must count only completions that actually ran.
+
+
+def test_dream_skip_freezes_as_declared_silence_and_is_not_a_success(
+        clean_rollup):
+    t = datetime(2030, 6, 3, 2, 0, tzinfo=timezone.utc)  # Beijing 06-03 10:00
+    ran = "usr_rollup_dream_ran"
+    only_skips = "usr_rollup_dream_only_skips"
+    seed_user(ran)
+    seed_user(only_skips)
+    for _ in range(2):
+        _insert_job(ran, "dream", "completed", finished=t)
+    for _ in range(3):
+        _insert_job(ran, "dream", "completed", finished=t,
+                    wake_result="skipped")
+    _insert_job(ran, "dream", "failed", finished=t,
+                last_error="extraction_failed:upstream_unavailable")
+    # This user never had a Dream that really ran: skip + failure only.
+    _insert_job(only_skips, "dream", "completed", finished=t,
+                wake_result="skipped")
+    _insert_job(only_skips, "dream", "failed", finished=t,
+                last_error="extraction_failed:upstream_unavailable")
+    # Wake lanes keep their meaning: sleep is declared, and the word 'skipped'
+    # on a non-dream lane is NOT silently absorbed as a declaration.
+    _insert_job(ran, "heartbeat", "completed", finished=t, wake_result="sleep")
+    _insert_job(ran, "heartbeat", "completed", finished=t,
+                wake_result="skipped")
+    _insert_job(ran, "heartbeat", "completed", finished=t)
+    # An older job starts the watermark early enough for a green 7d window.
+    _insert_job(ran, "heartbeat", "completed",
+                finished=datetime(2030, 5, 28, 2, 0, tzinfo=timezone.utc))
+
+    db.freeze_completed_lane_days(now_epoch=_NOW_EPOCH)
+
+    cells = {(r["user_id"], r["lane"]): r for r in _cells(since_day="2030-06-03")}
+    dream = cells[(ran, "dream")]
+    assert dream["completed"] == 5
+    assert dream["spoke"] == 0 and dream["spoke_completed"] == 0
+    assert dream["silent_declared"] == 3
+    assert dream["silent_undeclared"] == 2
+    heartbeat = cells[(ran, "heartbeat")]
+    assert heartbeat["silent_declared"] == 1
+    assert heartbeat["silent_undeclared"] == 2
+    for cell in cells.values():
+        assert cell["completed"] == (
+            cell["spoke_completed"]
+            + cell["silent_declared"] + cell["silent_undeclared"]
+        ), cell
+
+    payload = db.admin_event_path_rollup_windows(through_day="2030-06-03")
+    day = next(w for w in payload["windows"] if w["key"] == "24h")
+    route_dream = day["routes"]["model_api"]["lanes"]["dream"]
+    assert route_dream["completed"] == 6
+    assert route_dream["skipped"] == 4
+    assert day["routes"]["model_api"]["lanes"]["heartbeat"]["skipped"] == 0
+    # Zero-success concentration counts real runs: skip + failure is zero.
+    assert route_dream["concentration"]["users_zero_success"] == 1
+    week = next(w for w in payload["windows"] if w["key"] == "7d")
+    assert week["routes"]["model_api"]["coverage"]["level"] == "green"
+    assert (week["routes"]["model_api"]["lanes"]["dream"]["concentration"]
+            ["users_zero_success"]) == 1
+    assert day["paths"]["apikey_v2"]["lanes"]["dream"]["skipped"] == 4
+    assert (day["paths"]["apikey_v2"]["lanes"]["dream"]["concentration"]
+            ["users_zero_success"]) == 1
+
+    master = data_track._event_path_master_payload(payload)
+    runtime_24h = next(w for w in master["runtime_windows"]
+                       if w["key"] == "24h")
+    rows = {r["key"]: r for r in runtime_24h["rows"]}
+    v2_dream = rows["dream"]["cells"]["runtime_v2"]
+    assert v2_dream["state"] == "metric"
+    assert (v2_dream["success"], v2_dream["failure"],
+            v2_dream["denominator"], v2_dream["skipped"]) == (2, 2, 4, 4)
+    path_24h = next(w for w in master["windows"] if w["key"] == "24h")
+    path_dream = next(r for r in path_24h["rows"] if r["key"] == "dream")
+    assert path_dream["cells"]["apikey_v2"]["success"] == 2
+    v2_heartbeat = rows["heartbeat"]["cells"]["runtime_v2"]
+    assert v2_heartbeat["success"] == 3 and v2_heartbeat["skipped"] == 0
+    rendered = data_track._render_event_master_tables(master)
+    assert "skip 4（没真跑，剔除）" in rendered
+    assert "50.0% 成功" in rendered
+
+
+def test_dream_skip_on_the_open_day_is_declared_in_the_live_tail(clean_rollup):
+    """The live top-up shares the freezer's voice expressions, so today's
+    not-yet-frozen Dream skip is declared too."""
+    uid = "usr_rollup_dream_live_skip"
+    seed_user(uid)
+    now = datetime.now(timezone.utc)
+    _insert_job(uid, "dream", "completed", finished=now,
+                wake_result="skipped")
+    _insert_job(uid, "dream", "completed", finished=now)
+    payload = db.admin_lane_rollup(user_id=uid, route="model_api")
+    (live,) = [r for r in payload["today_partial"] if r["lane"] == "dream"]
+    assert live["frozen"] is False
+    assert (live["completed"], live["silent_declared"],
+            live["silent_undeclared"]) == (2, 1, 1)
+
+
+def test_lane_rollup_pages_have_a_total_order_across_routes(clean_rollup):
+    """Offset paging needs an ORDER BY that reaches the cell key: one user can
+    hold a resident and a model_api cell for the same day/lane (runtime switch),
+    and without ``route`` in the order the tied pair may come back in a
+    different order on each page read — the daily report then double-counts one
+    cell and misses the other."""
+    users = [f"usr_rollup_page_order_{i:02d}" for i in range(20)]
+    with db.get_pool().connection() as conn:
+        for uid in users:
+            seed_user(uid)
+        for route in ("resident", "model_api"):
+            for uid in reversed(users):
+                conn.execute(
+                    "INSERT INTO lane_daily_rollup (user_id, day, route, lane,"
+                    " completed, failed, expired, superseded, failure_codes)"
+                    " VALUES (%s, '2030-06-01', %s, 'capture', 1, 0, 0, 0,"
+                    " '{}'::jsonb)", (uid, route))
+    seen = []
+    for offset in range(0, 2 * len(users), 3):
+        seen.extend(
+            (row["user_id"], row["route"])
+            for row in db.admin_lane_rollup(
+                since_day="2030-06-01", until_day="2030-06-01",
+                limit=3, offset=offset)["rows"]
+        )
+    assert seen == [(uid, route) for uid in users for route in ("model_api", "resident")]

@@ -267,9 +267,19 @@ if not _provisioned:
         "test_no_global_mirror_patching.py",
         "test_mirror_group_capture.py",
         "test_resident_wake_memory.py",
+        # 纯函数：记忆 lane 的 agent 调用失败归类（Bug 20），零 DB / 零网络。
+        "test_agent_call_failure_codes.py",
+        # 记忆管线日报：fixture + 假 opener，零 DB / 零网络 / 不发飞书。
+        "test_memory_pipeline_daily_report.py",
+        # 纯函数：provider 解析层给「思考吃光输出预算」打标 + 抽取截断重问，MockTransport、零 DB。
+        "test_extraction_output_truncation.py",
         "test_resident_decrypt_probe_startup.py",
-        "test_memory_bm25.py",
-        "test_memory_bm25_readside.py",
+        "test_memory_search_rank.py",
+        "test_memory_search_readside.py",
+        # memgarden 公开 API 收口（2026-09-15）：纯函数对拍 / 假解密 / AST 扫描，零 DB。
+        "test_memory_related_read.py",
+        "test_enclave_recall_unified.py",
+        "test_memgarden_public_api_only.py",
         "test_memory_result_budget.py",
         # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
         # 零 DB / 零网络 / 不调用 claude。**它最需要能跑的时刻正是本地无 PG 时**——
@@ -293,6 +303,11 @@ if not _provisioned:
         # 会被静默跳过，本地「全绿」就是假的。
         "test_orchestration_is_not_reimplemented.py",
         "test_garden_component_parity.py",
+        "test_garden_io_capture_policy.py",
+        # 落卡请求唯一构造点：真组件 + 假 provider，不碰 DB。
+        "test_capture_request_index_and_naming.py",
+        # Dream 共用入口（open_dream_session）：假模型 + 真组件，不碰 DB。
+        "test_garden_dream_session.py",
         "test_memgarden_dream_migrate_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",
@@ -354,6 +369,7 @@ if not _provisioned:
         "test_perceptkit_trend_read.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
+        "test_provider_tools_local_markers.py",
         "test_provider_catalog_unit.py",
         "test_provider_health_unit.py",
         # T504 provider-403 boundary: pure classifiers and monkeypatched sinks;

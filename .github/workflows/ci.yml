@@ -416,13 +416,28 @@ jobs:
             tests/test_runtime_v2_default_flag.py \
             tests/test_screen_vision_verdict_runtime.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_garden_io_capture_policy.py \
+            tests/test_capture_request_index_and_naming.py \
+            tests/test_garden_dream_session.py \
             tests/test_dream_prompt_v1.py \
             tests/test_capture_poison_window_escape.py \
             tests/test_capture_window_cursor_diagnostics.py \
             tests/test_window_fingerprint.py \
             tests/test_v2_capture_poison_window_escape.py \
+            tests/test_agent_call_failure_codes.py \
+            tests/test_memory_lane_user_unavailable.py \
+            tests/test_extraction_output_truncation.py \
+            tests/test_audit_dream_false_no_cards.py \
+            tests/test_admin_dream_false_no_cards.py \
+            tests/test_memory_store_conformance.py \
+            tests/test_dream_stagger_admission.py \
+            tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_v1_capture_backlog_batches.py \
+            tests/test_garden_import_engine.py \
+            tests/test_genesis_plaintext_garden.py \
+            tests/test_genesis_garden_import_host.py \
             tests/test_card_text_gate.py \
             tests/test_card_user_referent.py \
             tests/test_garden_language_flip.py \
@@ -483,6 +498,7 @@ jobs:
             tests/test_self_thinking_prompt_probe.py \
             tests/test_self_thinking_instruction.py \
             tests/test_self_thinking_aside_tag.py \
+            tests/test_self_thinking_gemini_aside.py \
             tests/test_aup_gate_probe.py \
             -v
 
@@ -834,7 +850,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (77 files)
+      - name: Run CI security tier 3 (78 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -882,6 +898,7 @@ jobs:
             tests/test_tee_replicate_conn_retry.py \
             tests/test_tee_replicator_frames.py \
             tests/test_tee_replicator_main.py \
+            tests/test_tee_replicator_policy.py \
             tests/test_tee_replicator_transforms.py \
             tests/test_tee_replicator_worker.py \
             tests/test_tee_reflow.py \
@@ -954,11 +971,15 @@ jobs:
             tests/test_provider_client.py \
             tests/test_provider_assistant_prefill.py \
             tests/test_provider_tools_gemini.py \
+            tests/test_provider_tools_local_markers.py \
             tests/test_capability_web.py \
             tests/test_web_fetch_result_budget.py \
             tests/test_memory_result_budget.py \
-            tests/test_memory_bm25.py \
-            tests/test_memory_bm25_readside.py \
+            tests/test_memory_search_rank.py \
+            tests/test_memory_search_readside.py \
+            tests/test_memory_related_read.py \
+            tests/test_enclave_recall_unified.py \
+            tests/test_memgarden_public_api_only.py \
             tests/test_web_search_duckduckgo.py \
             tests/test_image_generation_model.py \
             tests/test_t534_caption_hop_trace.py \
@@ -1021,12 +1042,27 @@ jobs:
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
             tests/test_capture_prompt_v1.py \
+            tests/test_garden_io_capture_policy.py \
+            tests/test_capture_request_index_and_naming.py \
+            tests/test_garden_dream_session.py \
             tests/test_capture_poison_window_escape.py \
             tests/test_capture_window_cursor_diagnostics.py \
             tests/test_window_fingerprint.py \
             tests/test_v2_capture_poison_window_escape.py \
+            tests/test_agent_call_failure_codes.py \
+            tests/test_memory_lane_user_unavailable.py \
+            tests/test_extraction_output_truncation.py \
+            tests/test_audit_dream_false_no_cards.py \
+            tests/test_admin_dream_false_no_cards.py \
+            tests/test_memory_store_conformance.py \
+            tests/test_dream_stagger_admission.py \
+            tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_v1_capture_backlog_batches.py \
+            tests/test_garden_import_engine.py \
+            tests/test_genesis_plaintext_garden.py \
+            tests/test_genesis_garden_import_host.py \
             tests/test_contract_rejection_stats.py \
             tests/test_admin_data_quality_status.py \
             tests/test_data_track_runtime_view.py \
@@ -1072,9 +1108,11 @@ jobs:
             tests/test_garden_component_parity.py \
             tests/test_orchestration_is_not_reimplemented.py \
             tests/test_backfill_chat_bodies_to_plaintext.py \
+            tests/test_effective_off_content_repair.py \
             tests/test_user_content_plaintext_migration.py \
             tests/test_byok_plaintext_read_routing.py \
             tests/test_content_encryption_preference.py \
+            tests/test_asgi_accounts_remaining.py \
             tests/test_encryption_surface_frozen.py \
             tests/test_envelope_storage_fields.py \
             tests/test_no_fake_envelope_shapes.py \

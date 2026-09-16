@@ -49,6 +49,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
+from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
 
 log = logging.getLogger("feedling.db")
@@ -5102,10 +5103,20 @@ def content_free_failure_code(
 
     Freezers call this after grouping by raw reason, so ``count`` preserves the
     number of affected attempts without logging hundreds of identical lines.
+
+    Resident memory-lane agent-call failures written before the status
+    endpoint started classifying them (``<lane>_agent_call_failed:<raw text>``)
+    keep their prefix plus a registry class instead of ``runtime_failed``; the
+    raw tail is still discarded and logged exactly like any other free text.
     """
     reason = str(raw_reason or "")
     if _LANE_ROLLUP_CODE_RE.match(reason):
         return reason
+    replacement = "runtime_failed"
+    if notices_agent_call_failure.is_agent_call_failed_reason(reason):
+        classified = notices_agent_call_failure.normalize_reason(reason)
+        if _LANE_ROLLUP_CODE_RE.match(classified):
+            replacement = classified
     bounded = reason[:_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS]
     try:
         affected = max(1, int(count))
@@ -5114,7 +5125,7 @@ def content_free_failure_code(
     log.warning(
         "[failure-code] discarded non-allowlisted reason "
         "source=%s user_id=%r lane=%r day=%s count=%d "
-        "reason=%r truncated=%s",
+        "reason=%r truncated=%s replacement=%s",
         str(source or "unknown")[:80],
         str(user_id or "")[:200],
         str(lane or "")[:120],
@@ -5122,8 +5133,9 @@ def content_free_failure_code(
         affected,
         bounded,
         len(reason) > len(bounded),
+        replacement,
     )
-    return "runtime_failed"
+    return replacement
 
 _LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
 
@@ -5280,6 +5292,10 @@ _LANE_ROLLUP_LIVE_MAX_DAYS = 3
 _LANE_ROLLUP_NONTERMINAL = ("pending", "claimed", "running")
 _LANE_ROLLUP_V1_NONTERMINAL = ("pending", "active", "claimed", "realizing")
 _LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
+# resident stuck 没有下界：consumer 早已离开留下的 claimed/pending 孤儿会永远算 stuck。
+# 每行额外给出「创建于最近这么多小时内」的计数（``recent_count``），读的人要看
+# 「最近卡住的」而不是「历史孤儿」时用它；``count`` 口径不变。
+_LANE_ROLLUP_V1_STUCK_RECENT_HOURS = 24.0
 
 # --- 说话率与沉默分解（Seven 2026-08-18 拍板：主动侧要两个数） ---------------- #
 #
@@ -5335,13 +5351,56 @@ _LANE_ROLLUP_V2_SPOKE_JOIN = """
 # PG head 上实证过减法的洞:一次尝试可以先投出中间气泡、随后因租约超时终结成
 # expired(或 superseded),只扣 failed 的减法盖不住,恒等式当场不闭合。直接数
 # completed 那一侧结构上不会长出这类洞——除 completed 外的终态根本不在这个和里。
-_LANE_ROLLUP_V2_VOICE_SELECT = """
+#
+# 「显式声明的沉默」谓词只写**一份**，declared 用它、undeclared 用它的 NOT——
+# 两边各写一份时，改了一边忘了另一边，恒等式就会悄悄不闭合。谓词刻意写成
+# 永不为 NULL 的形态（IS NOT DISTINCT FROM），NOT 之后才是严格的补集。
+#
+# dream 的「花园太小、这次不整理」（2026-09-15 hx 拍板，不加列）：V2 worker 把它
+# 记成 status='completed' + wake_result='skipped'——一次模型都没问。它仍算
+# completed（终态口径不变），但落进 silent_declared 而不是 silent_undeclared：
+# 这是内核**明确声明**「没活可干」，与 sleep 同性质，而不是「不知道为什么没产出」
+# 的盲区。于是 dream 格子的三分解读作：
+#     spoke_completed   = 0（dream 结构上不说话，spoke 锚产出，这个 0 是真的）
+#     silent_declared   = skip（没真跑）
+#     silent_undeclared = 真跑过的完成
+# dream 的「真成功」= completed - silent_declared，读侧据此算成功率。
+# 不能把真跑的完成塞进 spoke_completed：0093 的 CHECK 要求 spoke_completed <= spoke，
+# 而 spoke 锚的是用户可见产出，为 dream 伪造 spoke 等于污染说话率。
+# 只认 lane='dream'：wake_result='skipped' 目前只有 dream 会写；别的 lane 将来若
+# 写了同一个词，语义要另行拍板，不能被这里静默吸收成「声明沉默」。
+_LANE_ROLLUP_V2_DECLARED_SILENCE = (
+    "(j.wake_result IS NOT DISTINCT FROM 'sleep' "
+    "OR (j.lane = 'dream' AND j.wake_result IS NOT DISTINCT FROM 'skipped'))"
+)
+# 读侧用：哪些 lane 的 silent_declared 是「没真跑的完成」（要从成功里剔掉）。
+# 心跳等唤醒 lane 的 sleep 是一次真跑过、模型选择闭嘴的完成，**仍算成功**，
+# 所以这里只放 dream。Python 与 SQL 两份表达都从这个集合出，别手抄 lane 名。
+LANE_ROLLUP_SKIP_DECLARED_LANES = frozenset({"dream"})
+_LANE_ROLLUP_ATTEMPTED_COMPLETED_SQL = (
+    "(completed - CASE WHEN lane IN ("
+    + ",".join(f"'{name}'" for name in sorted(LANE_ROLLUP_SKIP_DECLARED_LANES))
+    + ") THEN silent_declared ELSE 0 END)"
+)
+
+
+def lane_rollup_skipped(lane: object, silent_declared: object) -> int:
+    """How many of a frozen cell's completions never actually ran (dream skip)."""
+    if str(lane or "") not in LANE_ROLLUP_SKIP_DECLARED_LANES:
+        return 0
+    try:
+        return max(0, int(silent_declared or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+_LANE_ROLLUP_V2_VOICE_SELECT = f"""
                COUNT(*) FILTER (WHERE spoke.hit)::int,
                COUNT(*) FILTER (WHERE spoke.hit AND j.status = 'completed')::int,
                COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
-                                  AND j.wake_result = 'sleep')::int,
+                                  AND {_LANE_ROLLUP_V2_DECLARED_SILENCE})::int,
                COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
-                                  AND j.wake_result IS DISTINCT FROM 'sleep')::int"""
+                                  AND NOT {_LANE_ROLLUP_V2_DECLARED_SILENCE})::int"""
 
 # resident 的送达锚：聊天行自带 proactive_job_id，能落到具体那一次尝试。
 #
@@ -6555,7 +6614,8 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                    operational_failures, control_outcomes, user_unavailable,
                    spoke, spoke_completed, silent_declared, silent_undeclared
             FROM lane_daily_rollup{clause}
-            ORDER BY day DESC, user_id, lane, enqueue_source
+            ORDER BY day DESC, user_id, route, lane, enqueue_source,
+                     access_path, mode_source
             LIMIT %s OFFSET %s
             """,
             params + [int(limit), int(offset)],
@@ -6774,11 +6834,13 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
         if not route or route == "resident":
             cutoff = (datetime.now(zone)
                       - timedelta(hours=_LANE_ROLLUP_STUCK_AFTER_HOURS))
+            recent_cutoff = (datetime.now(zone)
+                             - timedelta(hours=_LANE_ROLLUP_V1_STUCK_RECENT_HOURS))
             v1_where = ["l.stream IN ('proactive_jobs','memory_capture_jobs')",
                         "COALESCE(r.route,'resident') = 'resident'",
                         "COALESCE(l.doc->>'status','') = ANY(%s)",
                         f"{_LANE_ROLLUP_V1_CREATED_TS} < %s"]
-            v1_params: list = [list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
+            v1_params: list = [recent_cutoff, list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
             if user_id:
                 v1_where.append("l.user_id = %s")
                 v1_params.append(user_id)
@@ -6790,7 +6852,9 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                     FROM user_blobs WHERE kind = 'onboarding_route'
                 )
                 SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, COUNT(*)::int,
-                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5]  -- noqa
+                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5],  -- noqa
+                       COUNT(*) FILTER (
+                         WHERE {_LANE_ROLLUP_V1_CREATED_TS} >= %s)::int
                 FROM user_logs l
                 LEFT JOIN routes r ON r.user_id = l.user_id,
                 LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
@@ -6809,6 +6873,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                      "oldest_at": (datetime.fromtimestamp(float(r[3]), timezone.utc)
                                    .isoformat() if r[3] else None),
                      "job_seqs": [int(x) for x in (r[4] or [])],
+                     "recent_count": int(r[5] or 0),
                      "basis": "older_than_threshold"})
     return {
         "rows": out_rows,
@@ -6817,6 +6882,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
             "rows": stuck_rows,
             "total": sum(r["count"] for r in stuck_rows),
             "stuck_after_hours": _LANE_ROLLUP_STUCK_AFTER_HOURS,
+            "resident_recent_hours": _LANE_ROLLUP_V1_STUCK_RECENT_HOURS,
             "note": ("非终态尝试不进失败率的分子或分母（Seven 2026-08-18 定 A）；"
                      "它们只出现在这里，必须与失败率并排读"),
         },
@@ -6944,6 +7010,91 @@ def admin_data_track_proactive_kinds(*, since_epoch: float = 0.0, days: int = 30
     except Exception as e:
         log.error("[db] admin_data_track_proactive_kinds failed: %s", e)
         return {}
+
+
+def memory_dream_active_job_count(
+    *,
+    legacy_since_epoch: float,
+    legacy_active_statuses: list[str],
+    v2_active_statuses: list[str],
+    v2_pending_horizon_sec: float | None = None,
+) -> int:
+    """Fleet-wide count of Dream jobs that are queued or running, both runtimes.
+
+    Dream admission uses this as its concurrency ceiling (``dream_scheduler``).
+    Both runtimes read cards through the same enclave, so one ceiling covers:
+
+    - resident V1 (hosted runner and self-hosted consumers): ``memory_dream``
+      rows in the per-user ``proactive_jobs`` log whose status is still active.
+      Only rows created since ``legacy_since_epoch`` count — a consumer that went
+      away leaves its job ``pending``/``claimed`` forever (hosted claims are never
+      reclaimed), and such an orphan must not hold a slot night after night.
+      Served by ``ix_user_logs_proactive_jobs_ts`` (partial index on ts).
+    - Runtime V2: ``agent_jobs`` rows in the ``dream`` lane whose status is in
+      ``v2_active_statuses`` (claimed/running; stale leases are retired by the
+      V2 reaper), plus — when ``v2_pending_horizon_sec`` is given — ``pending``
+      dream rows created within that many seconds of database time. Pending
+      rows must count: the pool claims every pending row the moment it has
+      capacity, so admitting while they are invisible lets the claimed total
+      exceed the ceiling. A V2 Dream has no queue deadline, so without the
+      horizon a stalled queue's pending rows would hold slots forever.
+
+    Status vocabularies are passed in by the caller so they cannot drift from
+    the job modules that own them. Raises on DB failure; the caller decides.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM user_logs
+                WHERE stream = 'proactive_jobs'
+                  AND ts >= %s
+                  AND (doc->>'job_kind' = 'memory_dream' OR doc->>'source' = 'memory_dream')
+                  AND lower(COALESCE(NULLIF(btrim(doc->>'status'), ''), 'pending')) = ANY(%s))
+              +
+              (SELECT count(*) FROM agent_jobs
+                WHERE lane = 'dream'
+                  AND (status = ANY(%s)
+                       OR (%s::double precision IS NOT NULL
+                           AND status = 'pending'
+                           AND created_at >= now() - make_interval(secs => %s::double precision))))
+            """,
+            (
+                float(legacy_since_epoch),
+                list(legacy_active_statuses),
+                list(v2_active_statuses),
+                None if v2_pending_horizon_sec is None else float(v2_pending_horizon_sec),
+                0.0 if v2_pending_horizon_sec is None else float(v2_pending_horizon_sec),
+            ),
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+@contextmanager
+def memory_dream_admission_lock():
+    """Serialize fleet Dream admission (count + enqueue) across every process.
+
+    Yields ``True`` while this caller holds the admission lock, ``False`` when
+    another admission holds it right now. The lock is a transaction-scoped
+    advisory lock on a dedicated connection, held until the ``with`` body
+    returns — the caller counts and enqueues inside the body (on their own
+    connections; the enqueue commits before this transaction ends, so the next
+    holder's count sees it). Commit or rollback releases it, including when the
+    body raises or the process dies.
+
+    ``pg_try_advisory_xact_lock`` (never the blocking form) on purpose: a
+    waiter would sit on a pool connection while the holder needs a second one
+    to enqueue, so a burst of waiters could exhaust the pool under the holder.
+    A caller that does not get the lock just re-evaluates on its next tick.
+    Raises on DB failure; the caller decides.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("feedling.memory_dream_admission",),
+            ).fetchone()
+            yield bool(row and row[0])
 
 
 def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int = 7,
@@ -7260,7 +7411,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
         return {
             "completed": 0, "failed": 0, "expired": 0, "superseded": 0,
             "operational_failures": 0, "control_outcomes": 0,
-            "user_unavailable": 0, "failure_codes": {},
+            "user_unavailable": 0, "skipped": 0, "failure_codes": {},
         }
 
     output: dict[str, dict] = {}
@@ -7338,6 +7489,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                 "operational_failures": int(row[11] or 0),
                 "control_outcomes": int(row[12] or 0),
                 "user_unavailable": int(row[13] or 0),
+                "skipped": lane_rollup_skipped(lane, row[14]),
             }
             for bucket in (
                 lanes.setdefault(lane, empty_counts()),
@@ -7348,7 +7500,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -7358,7 +7510,9 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
             per_user = per_user_lane.setdefault(
                 (lane, user_id), {"completed": 0, "failed": 0}
             )
-            per_user["completed"] += counts["completed"]
+            # 集中度的「零成功」按真跑过的完成算：只有 skip + 失败的 dream 用户
+            # 就是零成功，不能被 skip 充当成功。
+            per_user["completed"] += counts["completed"] - counts["skipped"]
             per_user["failed"] += counts["failed"]
 
         if coverage_level == "green":
@@ -7458,7 +7612,8 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                   SELECT user_id, day, route, lane, enqueue_source,
                          completed, failed, expired, superseded, failure_codes,
                          operational_failures, control_outcomes,
-                         user_unavailable
+                         user_unavailable, silent_declared,
+                         {attempted_completed} AS attempted_completed
                   FROM lane_daily_rollup
                   WHERE day >= %s AND day <= %s
                     AND route IN ('resident', 'model_api')
@@ -7473,7 +7628,9 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          coalesce(sum(control_outcomes), 0)::bigint
                            AS control_outcomes,
                          coalesce(sum(user_unavailable), 0)::bigint
-                           AS user_unavailable
+                           AS user_unavailable,
+                         coalesce(sum(silent_declared), 0)::bigint
+                           AS silent_declared
                   FROM filtered
                   GROUP BY day, route, lane, enqueue_source
                 ), code_counts AS (
@@ -7501,11 +7658,12 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                 ), per_user_lane AS (
                   SELECT route, lane, user_id,
                          bool_or(day = %s) AS active_24h,
-                         coalesce(sum(completed)
+                         coalesce(sum(attempted_completed)
                            FILTER (WHERE day = %s), 0)::bigint AS completed_24h,
                          coalesce(sum(failed)
                            FILTER (WHERE day = %s), 0)::bigint AS failed_24h,
-                         coalesce(sum(completed), 0)::bigint AS completed_7d,
+                         coalesce(sum(attempted_completed), 0)::bigint
+                           AS completed_7d,
                          coalesce(sum(failed), 0)::bigint AS failed_7d
                   FROM filtered
                   GROUP BY route, lane, user_id
@@ -7548,13 +7706,17 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          'users_zero_success', lc.users_zero_success_7d,
                          'top_user_failure_share',
                            lc.top_user_failure_share_7d
-                       ) AS concentration_7d
+                       ) AS concentration_7d,
+                       c.silent_declared
                 FROM cells c
                 LEFT JOIN codes x USING (day, route, lane, enqueue_source)
                 JOIN route_users u USING (route)
                 JOIN lane_concentration lc USING (route, lane)
                 ORDER BY c.day, c.route, c.lane, c.enqueue_source
-                """,
+                """.replace(
+                    "{attempted_completed}",
+                    _LANE_ROLLUP_ATTEMPTED_COMPLETED_SQL,
+                ),
                 (
                     earliest.isoformat(), end_day.isoformat(),
                     end_day.isoformat(), end_day.isoformat(),
@@ -7570,7 +7732,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                 SELECT day, access_path, mode_source, user_id, lane,
                        enqueue_source, completed, failed, expired, superseded,
                        failure_codes, operational_failures, control_outcomes,
-                       user_unavailable
+                       user_unavailable, silent_declared
                 FROM lane_daily_rollup
                 WHERE day >= %s AND day <= %s
                   AND access_path <> 'unavailable'
@@ -7663,6 +7825,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
             "operational_failures": int(row[8] or 0),
             "control_outcomes": int(row[9] or 0),
             "user_unavailable": int(row[10] or 0),
+            "skipped": lane_rollup_skipped(row[2], row[16]),
             "failure_codes": {
                 str(code): int(count or 0)
                 for code, count in dict(row[11] or {}).items()
@@ -7720,13 +7883,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     {"completed": 0, "failed": 0,
                      "expired": 0, "superseded": 0,
                      "operational_failures": 0, "control_outcomes": 0,
-                     "user_unavailable": 0,
+                     "user_unavailable": 0, "skipped": 0,
                      "failure_codes": {}},
                 )
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -7738,13 +7901,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     {"completed": 0, "failed": 0,
                      "expired": 0, "superseded": 0,
                      "operational_failures": 0, "control_outcomes": 0,
-                     "user_unavailable": 0,
+                     "user_unavailable": 0, "skipped": 0,
                      "failure_codes": {}},
                 )
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     source_bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -10065,6 +10228,62 @@ def patch_blob_strict(
     persisted_doc = row[0]
     _mirror_persisted_blob(user_id, kind, persisted_doc)
     return persisted_doc
+
+
+def patch_blob_if_match_strict(
+    user_id: str,
+    kind: str,
+    patch: dict,
+    *,
+    precondition,
+    statement_timeout_ms: int | None = None,
+) -> tuple[bool, dict | None]:
+    """Compare-and-merge one existing blob: the operator-repair write path.
+
+    Locks the row, evaluates ``precondition(current_doc, conn)`` on the locked
+    document — ``conn`` is this transaction's connection, so the precondition
+    can also check related rows in the same transaction — and only then merges
+    ``patch``'s top-level keys, so a writer that commits after this read cannot
+    be overwritten by a merge computed from a stale view. A missing row is never
+    created (``(False, None)``); a failed precondition returns
+    ``(False, current_doc)``; a merge returns ``(True, persisted_doc)`` after
+    mirroring the committed document to the TEE shadow exactly as
+    :func:`patch_blob_strict` does.
+
+    The lock only fences writers that also lock or merge atomically. A
+    read/modify/full-write writer (``set_blob``) that read before this commit
+    can still overwrite the merge afterwards, so the patched keys must not be
+    full-written by such a writer. Revisioned kinds are refused: their mirror
+    ordering needs the revision bump this merge does not perform. DB failures
+    propagate.
+    """
+    if kind in _REVISIONED_BLOB_KINDS:
+        raise ValueError("compare-and-merge does not support revisioned blob kinds")
+    clean_patch = dict(patch or {})
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            if statement_timeout_ms is not None:
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{int(statement_timeout_ms)}ms",),
+                )
+            current = conn.execute(
+                "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                (user_id, kind),
+            ).fetchone()
+            if current is None:
+                return False, None
+            current_doc = dict(current[0]) if isinstance(current[0], dict) else {}
+            if not precondition(dict(current_doc), conn):
+                return False, current_doc
+            row = conn.execute(
+                "UPDATE user_blobs SET doc = doc || %s "
+                "WHERE user_id=%s AND kind=%s RETURNING doc",
+                (Jsonb(clean_patch), user_id, kind),
+            ).fetchone()
+    persisted_doc = row[0]
+    _mirror_persisted_blob(user_id, kind, persisted_doc)
+    return True, persisted_doc
 
 
 def advance_blob_int_strict(user_id: str, kind: str, key: str, new_value: int):
@@ -12819,6 +13038,52 @@ def chat_capture_messages_after_seq(
     ]
 
 
+def chat_capture_messages_oldest_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    sources: list[str] | tuple[str, ...],
+    limit: int,
+) -> list[dict]:
+    """Return the OLDEST bounded Capture-eligible metadata after an exact seq.
+
+    Counterpart of :func:`chat_capture_messages_after_seq` (which returns the
+    newest rows for trigger heuristics). Resident V1 capture uses this to cut
+    one exact contiguous batch starting right after the capture cursor, so a
+    backlog larger than one batch is drained oldest-first instead of the
+    cursor jumping to the newest message. Same eligibility predicate, same
+    metadata-only shape; ``ORDER BY seq ASC LIMIT`` reads one small index
+    range, never the whole uncaptured transcript.
+    """
+    cursor_seq = int(after_seq)
+    bounded = max(1, min(int(limit), 1000))
+    allowed = [str(source) for source in sources if str(source)]
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    if not allowed:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc->>'role' AS role,"
+            " COALESCE(doc->>'source','') AS source FROM chat_messages "
+            " WHERE user_id=%s AND seq>%s "
+            " AND doc->>'role' IN ('user','openclaw') "
+            " AND COALESCE(doc->>'source','')=ANY(%s::text[]) "
+            " ORDER BY seq ASC LIMIT %s",
+            (str(user_id), cursor_seq, allowed, bounded),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[1]),
+            "ts": float(row[2]),
+            "seq": int(row[0]),
+            "role": str(row[3] or ""),
+            "source": str(row[4] or ""),
+        }
+        for row in rows
+    ]
+
+
 def chat_user_turn_count_strict(user_id: str) -> int:
     """Return the durable count of chat rows whose role is exactly ``user``.
 
@@ -14094,7 +14359,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     return False
                 cur.execute(
                     "SELECT 1 FROM users WHERE user_id=%s "
-                    "AND doc->>'content_encryption'='off'",
+                    "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                    "<> 'on'",
                     (user_id,),
                 )
                 if cur.fetchone() is None:
@@ -14146,7 +14412,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     guard_exists = cur.fetchone() is not None
                     cur.execute(
                         "SELECT 1 FROM users WHERE user_id=%s "
-                        "AND doc->>'content_encryption'='off'",
+                        "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                        "<> 'on'",
                         (user_id,),
                     )
                     tier_allows = cur.fetchone() is not None
@@ -14183,7 +14450,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     guard_exists = cur.fetchone() is not None
                     cur.execute(
                         "SELECT 1 FROM users WHERE user_id=%s "
-                        "AND doc->>'content_encryption'='off'",
+                        "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                        "<> 'on'",
                         (user_id,),
                     )
                     tier_allows = cur.fetchone() is not None
@@ -15726,6 +15994,15 @@ def chat_append_and_enqueue(
                     "requeue",
                 )
         for preempted in _preempted_jobs:
+            if preempted.capture_failure_state is not None:
+                # 抢占时终结了一个租约已过期的落卡任务并记了失败：提交后镜像状态 + 同步提示。
+                # 纯旁路，放到后台线程做，不拖慢这次发送的返回（Codex 第 13 轮 M2）。
+                jobs_store.after_capture_crash_recorded_in_background(
+                    user_id,
+                    preempted.job_id,
+                    source="chat_preempt",
+                    failed_state=preempted.capture_failure_state,
+                )
             if preempted.claimed_by is None:
                 continue
             core_wake_bus.notify_job_cancel(
@@ -18172,7 +18449,10 @@ def migrate_frame_to_plaintext(
             (user_id,),
         )
         preference = cur.fetchone()
-        if preference is None or str(preference[0] or "").strip().lower() != "off":
+        if (
+            preference is None
+            or str(preference[0] or "").strip().lower() == "on"
+        ):
             return False
         cur.execute(
             "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND frame_id=%s "
@@ -18289,7 +18569,7 @@ def retry_frame_plaintext_cleanup(user_id: str, frame_id: str) -> bool:
                 preference = cur.fetchone()
                 if (
                     preference is None
-                    or str(preference[0] or "").strip().lower() != "off"
+                    or str(preference[0] or "").strip().lower() == "on"
                 ):
                     return False
                 cur.execute(

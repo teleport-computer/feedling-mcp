@@ -222,16 +222,17 @@ result = chat_completion(runtime, messages)
 - ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
 - ❌ 不准新建 `backend/app.py`。
 
-**关于 `memgarden` 搬迁期的兼容壳**（2026-08-14 已收尾，仅存两个）：
+**关于 `memgarden` 搬迁期的兼容壳**（2026-09-15 全部收尾）：
 
 内核提取时，被搬走的模块曾在原路径保留一层 re-export，让调用方不必一次性全改。
-**这些纯转发壳已全部删除**，调用方现在直接 `import memgarden.*`。
+纯转发壳 2026-08-14 已删；最后两个 `import *` 壳 —— `memory/capture_prompt_v1.py`
+与 `memory/dream_prompt_v1.py` —— 随两条 runtime 的落卡 / 整理换成组件会话一起删除：
+`dream_prompt_v1.py` 不复存在，`capture_prompt_v1.py` 只剩 io 的落卡档位
+`IO_CONVERSATION_CAPTURE_POLICY`。
 
-仍保留的两个 —— `memory/capture_prompt_v1.py` 与 `memory/dream_prompt_v1.py` ——
-**不是 re-export 门面，是适配层**：内核不 import `identity`（那是宿主的身份体系），
-所以称呼规则的装配放在这两个文件里，它们有实际逻辑，不只是转发。
-
-新代码一律直接 import `memgarden.*`。需要称呼装配时走上面这两个适配层。
+记忆 runtime 的入口文件只 import memgarden 的**公开 API**（顶层 `__all__`，或
+`memgarden.STABLE_MODULES` 中模块的 `__all__`）；`prompts.capture` / `prompts.dream`
+这类内部零件不许直接 import，要用就经 `memory/garden_component.py` 调组件方法。
 
 ---
 

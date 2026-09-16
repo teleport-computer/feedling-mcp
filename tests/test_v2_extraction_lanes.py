@@ -37,6 +37,16 @@ def _job_row(job_id):
             "SELECT status, last_error FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
 
 
+# A Dream session only asks the model once the garden reaches the kernel's
+# minimum (10 cards); below that the component skips. Fake-extract tests that
+# exercise the post-model path therefore carry a garden that size.
+_DREAM_FILLER_CARDS = [
+    {"id": f"old-fill-{i}", "summary": f"别的旧卡 {i}", "content": f"别的正文 {i}。",
+     "occurred_at": "2026-01-01T00:00:00Z"}
+    for i in range(10)
+]
+
+
 def _deps(**over):
     def _envelope(uid, inner, item_id=None):
         return {
@@ -85,6 +95,7 @@ def _deps(**over):
                  "occurred_at": "2026-03-01T00:00:00Z"},
                 {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。",
                  "occurred_at": "2026-05-01T00:00:00Z"},
+                *_DREAM_FILLER_CARDS,
             ]},
         build_memory_envelope=_envelope,
         apply_memory_actions=lambda uid, actions: {
@@ -131,9 +142,15 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     seen = []
 
     async def _fake_extract(**kwargs):
-        retry_prompt = kwargs["parse_retry"].build_truncation_prompt("P")
+        # Both lanes are session-only: the component decides the truncation
+        # re-ask wording, extract() only owns the wire budgets.
+        assert kwargs["parse_retry"] is None and kwargs["session"] is not None
+        retry_prompt = "截断重问由组件决定"
         seen.append((kwargs["max_tokens"], retry_prompt))
+        retry_budgets.append(kwargs.get("truncation_retry_max_tokens"))
         return [], None
+
+    retry_budgets = []
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     status = asyncio.run(
@@ -152,6 +169,9 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
     assert budget == extraction.max_output_tokens_for_lane(lane)
     assert "截断" in retry_prompt
     assert retry_prompt != "P"
+    assert retry_budgets == [
+        extraction.truncation_retry_max_output_tokens_for_lane(lane)
+    ]
 
 
 def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):
@@ -172,17 +192,15 @@ def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):
     seen = {}
 
     async def _fake_extract(**kwargs):
-        direct_cards, direct_err = kwargs["parse"](reply)
-        retry_cards, retry_err = kwargs["parse_retry"].parse(reply)
+        # The component session is the only parse route the worker has; the
+        # legacy direct/retry parsers are placeholders that refuse to run.
+        assert kwargs["parse"](reply) == (None, "component_session_required")
+        assert kwargs["parse_retry"] is None
         session = kwargs["session"]
         assert session.next_prompt()
         session.feed(reply)
         outcome = session.result()
-        seen.update(
-            direct=(len(direct_cards), direct_err),
-            retry=(len(retry_cards), retry_err),
-            session=(len(outcome.cards), outcome.error),
-        )
+        seen.update(session=(len(outcome.cards), outcome.error))
         return outcome.cards, outcome.error
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
@@ -195,11 +213,7 @@ def test_capture_lane_accepts_eight_cards_in_all_real_parse_routes(monkeypatch):
     ))
 
     assert status == "completed"
-    assert seen == {
-        "direct": (8, None),
-        "retry": (8, None),
-        "session": (8, None),
-    }
+    assert seen == {"session": (8, None)}
 
 
 @pytest.mark.parametrize("lane", ["capture", "dream"])
@@ -292,11 +306,22 @@ def test_extraction_lane_ignores_content_block_metadata_for_language(monkeypatch
     async def _fake_extract(**_kwargs):
         return [], None
 
-    monkeypatch.setattr(
-        worker,
-        "build_capture_prompt" if lane == "capture" else "build_dream_prompt",
-        _fake_prompt,
-    )
+    if lane == "capture":
+        real_request = worker.garden_component.capture_request
+
+        def _spy_request(**kwargs):
+            _fake_prompt(**kwargs)
+            return real_request(**kwargs)
+
+        monkeypatch.setattr(worker.garden_component, "capture_request", _spy_request)
+    else:
+        real_open = worker.garden_component.open_dream_session
+
+        def _spy_open(garden, **kwargs):
+            _fake_prompt(**kwargs)
+            return real_open(garden, **kwargs)
+
+        monkeypatch.setattr(worker.garden_component, "open_dream_session", _spy_open)
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     deps = _deps(
         read_tail=lambda _uid, _after, _limit: [row],
@@ -367,7 +392,7 @@ def test_dream_lifecycle_trace_correlates_model_and_write_outcome(monkeypatch):
         "degraded_context": False,
         "counts": {
             "actions": 1,
-            "active_cards": 2,
+            "active_cards": 12,
             "applied": 1,
             "failed": 0,
             "merged": 1,
@@ -525,26 +550,840 @@ def test_dream_metric_failure_does_not_emit_a_second_overall_terminal(monkeypatc
     assert metrics.flush_calls == 2
 
 
-def test_dream_context_degradation_is_not_indistinguishable_from_model_noop(
+def _stub_dream_readside(monkeypatch, *, index, fetch=None):
+    """Drive the production Dream context reader with a stubbed readside.
+
+    ``serve_worker._read_dream_memory_context`` runs for real; only the
+    enclave-bound ``memory_core`` calls and the token/identity helpers are
+    replaced, so the reader's own outcome classification is what is tested.
+    """
+    from model_api_runtime.v2 import serve_worker
+
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker, "_load_identity_card_view", lambda _store, *, runtime_token: {}
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    monkeypatch.setattr("memory.memory_core.index", index)
+    if fetch is not None:
+        monkeypatch.setattr("memory.memory_core.fetch", fetch)
+    return serve_worker
+
+
+def _raise(exc):
+    def _call(*_a, **_k):
+        raise exc
+
+    return _call
+
+
+@pytest.mark.parametrize(
+    "index, fetch",
+    [
+        pytest.param(lambda *a, **k: ({"error": "readside_unavailable"}, 503), None, id="index-503"),
+        pytest.param(_raise(RuntimeError("enclave_error:ReadTimeout")), None, id="index-timeout"),
+        pytest.param(
+            lambda *a, **k: ({"items": [{"id": f"mem_{i}"} for i in range(12)]}, 200),
+            lambda *a, **k: ({"error": "readside_unavailable"}, 503),
+            id="fetch-503",
+        ),
+    ],
+)
+def test_dream_failed_card_read_fails_with_backoff_instead_of_advancing_ledger(
+    monkeypatch, index, fetch,
+):
+    """Prod 09-10 / 09-13: a failed card read used to complete as a no-op and
+    advance the Dream ledger (``already_dreamed`` forever after)."""
+    from proactive import dream_scheduler
+
+    uid = "u_x_dream_card_read_failed"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(12)])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    serve_worker = _stub_dream_readside(monkeypatch, index=index, fetch=fetch)
+    provider_calls = []
+
+    async def _provider(*_a, **_k):
+        provider_calls.append(1)
+        raise AssertionError("an unreadable garden must not reach the provider")
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    traces, emit_trace = _trace_collector()
+    recorded = []
+
+    def _record(user_id, lane, status, detail):
+        recorded.append((lane, status))
+        serve_worker._record_extraction_status(user_id, lane, status, detail)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=serve_worker._read_dream_memory_context,
+            emit_debug_trace=emit_trace,
+            record_extraction_status=_record,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_context_unavailable")
+    assert recorded == [("dream", "failed")]
+    context_error = next(
+        row for row in traces if row["type"] == "memory.extraction.context.error"
+    )
+    assert context_error["detail"]["outcome"] == "unavailable"
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.error"
+    assert terminal["detail"]["outcome"] == "context_unavailable"
+    assert terminal["detail"]["degraded_context"] is True
+
+    store = core_store.get_store_per_load_mode(uid, reason="test dream ledger")
+    state = dream_scheduler.load_dream_state(store)
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["last_dreamed_seed_card_count"] == 0
+    assert state["dream_fail_streak"] == 1
+    assert state["last_dream_failed_at"] > 0.0
+    # The next tick backs off instead of saying ``already_dreamed``.
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    tick = dream_scheduler.tick_memory_dream(
+        store, submit=lambda *_a, **_k: {"enqueued": True}
+    )
+    assert tick["reason"] == "failure_backoff"
+
+
+def _stub_dream_enclave(monkeypatch, *, index_drop=(), fetch_drop=(), fetch_flag=()):
+    """Drive the real Dream reader AND the real ``memory_core`` index/fetch
+    (lifecycle filter, owner scoping, ``user_card_count``, fetch envelope) over
+    the user's real DB cards; only the enclave decrypt round-trip is faked.
+
+    ``index_drop`` / ``fetch_drop`` are card ids the fake enclave cannot
+    decrypt (reported in ``unavailable_ids`` exactly like the enclave route);
+    ``fetch_flag`` are ids it returns a body for AND reports unavailable.
+    """
+    import memory_readside_core
+    from model_api_runtime.v2 import serve_worker
+
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker, "_load_identity_card_view", lambda _store, *, runtime_token: {}
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    calls = []
+
+    def _enclave(_api_key, candidates, *, operation, payload=None, runtime_token=None):
+        calls.append(operation)
+        drop = set(index_drop if operation == "index" else fetch_drop)
+        items, unavailable = [], []
+        for card in candidates:
+            mid = card["id"]
+            if mid in drop:
+                unavailable.append(mid)
+                continue
+            items.append({
+                "id": mid, "bucket": "life", "summary": f"summary {mid}",
+                "content": f"body {mid}", "occurred_at": card.get("occurred_at"),
+            })
+            if operation == "fetch" and mid in fetch_flag:
+                unavailable.append(mid)
+        return {"user_id": card.get("owner_user_id") if candidates else "",
+                "items": items, "unavailable_ids": unavailable}
+
+    monkeypatch.setattr(memory_readside_core, "post_enclave_readside", _enclave)
+    return serve_worker, calls
+
+
+@pytest.mark.parametrize(
+    "stub",
+    [
+        # Prod shape: every card fails to decrypt, the readside still answers
+        # HTTP 200 with ``items=[]`` — but ``user_card_count`` is 12.
+        pytest.param({"index_drop": [f"mem_{i}" for i in range(12)]}, id="index-200-all-undecryptable"),
+        pytest.param({"fetch_drop": ["mem_3"]}, id="fetch-200-card-unavailable"),
+        pytest.param({"fetch_flag": ["mem_3"]}, id="fetch-200-body-but-flagged-unavailable"),
+    ],
+)
+def test_dream_200_read_that_is_not_the_whole_garden_fails_instead_of_noop(
+    monkeypatch, stub,
+):
+    """A 200 answer is not proof of a readable garden. An enclave that cannot
+    decrypt any card answers ``items=[]``; treating that as an empty garden
+    completed Dream as a no-op and advanced the ledger."""
+    uid = "u_x_dream_200_incomplete"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(12)])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    serve_worker, enclave_calls = _stub_dream_enclave(monkeypatch, **stub)
+    provider_calls = _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=serve_worker._read_dream_memory_context,
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert enclave_calls[0] == "index"
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_context_unavailable")
+    assert traces[-1]["type"] == "memory.dream.error"
+    assert traces[-1]["detail"]["outcome"] == "context_unavailable"
+
+
+def test_dream_fully_readable_garden_reaches_the_provider_through_the_same_fakes(
     monkeypatch,
 ):
-    uid = "u_x_dream_degraded_trace"
+    """Control for the failure cases above: same real reader, same fake enclave,
+    nothing dropped -> every card reaches the provider."""
+    uid = "u_x_dream_200_complete"
     _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(12)])
     jobs_store.enqueue_job(uid, "dream")
     job = jobs_store.claim_next_job("w")
+    serve_worker, enclave_calls = _stub_dream_enclave(monkeypatch)
+    prompts = []
 
-    async def _empty(**_kwargs):
-        return [], None
+    async def _provider(_cfg, messages, **_kwargs):
+        prompts.append(messages[0]["content"])
+        return {"reply": '{"consolidations": []}', "stop_reason": "end_turn"}
 
-    monkeypatch.setattr(extraction, "extract", _empty)
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=serve_worker._read_dream_memory_context),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert enclave_calls[:2] == ["index", "fetch"]
+    assert len(prompts) == 1
+    # Cards reach the model with their bodies, not as a one-line summary.
+    assert "- id=mem_3 | bucket=life" in prompts[0]
+    assert "summary: summary mem_3" in prompts[0]
+    assert "body mem_3" in prompts[0]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"items": [], "limit": 60, "truncated": False}, id="no-user-card-count"),
+        pytest.param(
+            {"items": [{"id": "mem_0", "summary": "S"}, {"summary": "no id"}],
+             "limit": 60, "truncated": False, "user_card_count": 2},
+            id="partially-malformed",
+        ),
+        pytest.param(
+            {"items": ["junk"], "limit": 60, "truncated": False, "user_card_count": 1},
+            id="all-malformed",
+        ),
+    ],
+)
+def test_dream_malformed_index_envelope_fails_instead_of_noop(monkeypatch, body):
+    uid = "u_x_dream_index_malformed"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    fetches = []
+    serve_worker = _stub_dream_readside(
+        monkeypatch,
+        index=lambda *a, **k: (body, 200),
+        fetch=lambda _store, _key, payload, **k: (
+            fetches.append(payload) or ({
+                "items": [{"id": mid, "summary": "S", "content": "C"} for mid in payload["ids"]],
+                "missing_ids": [], "unavailable_ids": [],
+            }, 200)
+        ),
+    )
+    provider_calls = _no_provider_call(monkeypatch)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=serve_worker._read_dream_memory_context),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert fetches == []
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_context_unavailable")
+
+
+def test_dream_empty_successful_card_read_keeps_the_noop_completion(monkeypatch):
+    uid = "u_x_dream_empty_read"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    # Real memory_core over a garden with no live cards: ``user_card_count`` 0.
+    serve_worker, enclave_calls = _stub_dream_enclave(monkeypatch)
+    assert enclave_calls == []
+    _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=serve_worker._read_dream_memory_context,
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert _job_row(job_id) == ("completed", None)
+    assert "memory.extraction.context.error" not in [row["type"] for row in traces]
+    assert traces[-1]["type"] == "memory.dream.done"
+    assert traces[-1]["detail"]["outcome"] == "noop"
+    assert traces[-1]["detail"]["degraded_context"] is False
+
+
+def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_context(
+    monkeypatch,
+):
+    """Cards beyond the component's prompt budget are a deliberate partial
+    context, not a read failure: the run proceeds, the omitted cards are not
+    shown (and cannot be retired), and the partial context stays visible."""
+    uid = "u_x_dream_truncated_context"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    prompts = []
+
+    async def _provider(_cfg, messages, **_kwargs):
+        prompts.append(messages[0]["content"])
+        # Targets one card the model never saw (omitted by the budget).
+        return {"reply": json.dumps({"consolidations": [{
+            "op": "supersede", "card_ids": ["card-19"], "rationale": "更新",
+            "result": {"summary": "新摘要", "content": "新正文。"},
+        }]}), "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    # 20 cards x ~4,000 chars: only the first 14 fit the 60,000-char budget.
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": "正文" * 2000,
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(20)
+    ]
+    traces, emit_trace = _trace_collector()
+    applied = []
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=lambda _uid: {
+                "card_items": cards, "_diagnostic_cards_outcome": "ready",
+            },
+            emit_debug_trace=emit_trace,
+            apply_memory_actions=lambda _uid, actions: (
+                applied.extend(actions) or {"status": "ok"}
+            ),
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert len(prompts) == 1
+    assert "- id=card-13" in prompts[0] and "- id=card-14" not in prompts[0]
+    assert applied == []                      # an unseen card is never a target
+    types = [row["type"] for row in traces]
+    context_error = next(
+        row for row in traces if row["type"] == "memory.extraction.context.error"
+    )
+    assert context_error["detail"]["outcome"] == "truncated"
+    assert types.index("memory.extraction.context.error") < types.index(
+        "memory.dream.model.start"
+    )
+    assert _job_row(job_id) == ("completed", None)
+    assert traces[-1]["detail"]["degraded_context"] is True
+    assert traces[-1]["detail"]["counts"]["active_cards"] == 14
+
+
+def _dream_reply(*consolidations):
+    return {"reply": json.dumps({"consolidations": list(consolidations)}),
+            "stop_reason": "end_turn"}
+
+
+def _dream_garden_with_one_oversized_card():
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"正文 {i}。",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    # Longer than the 5,000-char body cap: shown to the model marked TRUNCATED.
+    cards[3] = {**cards[3], "content": "长" * 6000}
+    return cards
+
+
+class _Recorder:
+    def __init__(self):
+        self.events = []
+
+    async def record(self, kind, payload):
+        self.events.append((kind, payload))
+
+    async def record_best_effort(self, kind, payload):
+        await self.record(kind, payload)
+        return True
+
+
+def test_dream_host_blocks_consolidations_touching_a_truncated_card(monkeypatch):
+    """The prompt forbids rewriting a TRUNCATED card; the host enforces it.
+    Only the offending proposal is dropped, the clean one still applies."""
+    uid = "u_x_dream_truncated_guard"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    prompts = []
+
+    async def _provider(_cfg, messages, **_kwargs):
+        prompts.append(messages[0]["content"])
+        return _dream_reply(
+            {"op": "thicken", "card_ids": ["card-3"], "rationale": "补充",
+             "result": {"summary": "只看了一半", "content": "重写的正文。"}},
+            {"op": "merge", "card_ids": ["card-5", "card-6"], "rationale": "同一件事",
+             "result": {"summary": "合并", "content": "合并正文。"}},
+        )
+
+    async def _profile_enqueue(*_a, **_k):
+        return True
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    monkeypatch.setattr(worker, "_enqueue_profile_if_due", _profile_enqueue)
+    applied = []
+    recorder = _Recorder()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=lambda _uid: {
+                "card_items": _dream_garden_with_one_oversized_card(),
+                "_diagnostic_cards_outcome": "ready",
+            },
+            apply_memory_actions=lambda _uid, actions: (
+                applied.extend(actions) or {"status": "ok"}
+            ),
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+        trajectory_recorder=recorder,
+    ))
+
+    card_3_head = next(
+        line for line in prompts[0].splitlines() if line.startswith("- id=card-3 |")
+    )
+    assert card_3_head.endswith("| TRUNCATED")
+    assert status == "completed"
+    assert [action["supersedes"] for action in applied] == [["card-5", "card-6"]]
+    guard = [payload for kind, payload in recorder.events
+             if kind == "dream_truncated_card_guard"]
+    # memgarden drops it at the component exit first; the host check then sees
+    # nothing, and the guard still reports it (not as a smaller proposal count).
+    assert guard == [{"rejected": 1, "component_rejected": 1, "host_rejected": 0,
+                      "kept": 1, "truncated_cards": 1}]
+    assert "card-3" not in json.dumps(guard)
+
+
+def test_dream_fails_when_every_consolidation_touches_a_truncated_card(monkeypatch):
+    """A run whose every proposal was forbidden fails (ledger stays put) with a
+    content-free code instead of completing as a no-op."""
+    uid = "u_x_dream_truncated_guard_all"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+
+    async def _provider(_cfg, _messages, **_kwargs):
+        return _dream_reply(
+            {"op": "merge", "card_ids": ["card-3", "card-4"], "rationale": "同一件事",
+             "result": {"summary": "合并", "content": "合并正文。"}},
+        )
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    applied = []
     traces, emit_trace = _trace_collector()
     status = asyncio.run(worker.process_job(
         job,
         _deps(
             read_dream_memory_context=lambda _uid: {
-                "cards": "",
-                "card_items": [],
-                "_diagnostic_cards_outcome": "unavailable",
+                "card_items": _dream_garden_with_one_oversized_card(),
+                "_diagnostic_cards_outcome": "ready",
+            },
+            apply_memory_actions=lambda _uid, actions: (
+                applied.extend(actions) or {"status": "ok"}
+            ),
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert applied == []
+    assert _job_row(job_id) == (
+        "failed", "extraction_failed:dream_truncated_card_rejected"
+    )
+    assert traces[-1]["type"] == "memory.dream.error"
+    assert traces[-1]["detail"]["outcome"] == "guard_rejected"
+    assert traces[-1]["detail"]["counts"]["proposals"] == 1
+
+
+def test_dream_fails_closed_on_a_memgarden_without_card_body_rendering(monkeypatch):
+    """A consumer/worker running against an older memgarden would build a
+    titles-only Dream prompt. Fail the run before any provider call instead."""
+    from memory import garden_component
+
+    uid = "u_x_dream_kernel_outdated"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    monkeypatch.setattr(garden_component, "dream_kernel_renders_card_bodies", lambda: False)
+    provider_calls = _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_dream_memory_context=lambda _uid: {
+                "card_items": _dream_garden_with_one_oversized_card(),
+                "_diagnostic_cards_outcome": "ready",
+            },
+            emit_debug_trace=emit_trace,
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "failed"
+    assert provider_calls == []
+    assert _job_row(job_id) == ("failed", "extraction_failed:dream_kernel_outdated")
+    assert traces[-1]["type"] == "memory.dream.error"
+    assert traces[-1]["detail"]["outcome"] == "failed"
+
+
+@pytest.mark.parametrize("second_reply_truncated", [False, True])
+def test_dream_thinking_model_spending_the_budget_gets_the_truncation_retry(
+    monkeypatch, second_reply_truncated,
+):
+    """Prod: thinking models answered HTTP 200 with only a thinking block and
+    stop_reason=max_tokens. Dream re-sent the same prompt three times at the
+    same budget and failed as ``upstream_unavailable``. Real transport + real
+    Anthropic parser + real retry wrapper + real extract + real worker."""
+    import httpx
+
+    uid = "u_x_dream_thinking_budget"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    requests = []
+    thinking_only = {
+        "id": "msg_t", "type": "message", "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "...", "signature": "s"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 9000, "output_tokens": 12000},
+    }
+    answered = {
+        "id": "msg_a", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": '{"consolidations": []}'}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 9000, "output_tokens": 40},
+    }
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        body = thinking_only if len(requests) == 1 or second_reply_truncated else answered
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_async_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(provider_client.asyncio, "sleep", _no_sleep)
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C", "card_items": cards,
+        }),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    budget = extraction.max_output_tokens_for_lane("dream")
+    retry_budget = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    assert [row["max_tokens"] for row in requests] == [budget, retry_budget]
+    if second_reply_truncated:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    else:
+        assert status == "completed"
+        assert _job_row(job_id) == ("completed", None)
+
+
+@pytest.mark.parametrize("fallback_reply_truncated", [False, True])
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        pytest.param((400, {"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": "max_tokens: 24000 > 16000, which is the maximum allowed "
+                       "number of output tokens for claude-sonnet-4-test",
+        }}), id="anthropic-400"),
+        pytest.param((422, {"error": {
+            "message": "max_tokens is too large: 24000. This model supports at most "
+                       "16384 completion tokens, whereas you provided 24000.",
+        }}), id="relay-422"),
+    ],
+)
+def test_dream_escalated_truncation_retry_rejected_as_too_large_falls_back_to_the_accepted_budget(
+    monkeypatch, rejection, fallback_reply_truncated,
+):
+    """A model that accepts Dream's 12k budget but rejects the doubled 24k retry
+    budget must not turn a recoverable concise retry into ``provider_config``.
+    Real transport + parser + retry wrapper + extract + worker (session mode)."""
+    import httpx
+
+    uid = "u_x_dream_budget_rejected"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    budget = extraction.max_output_tokens_for_lane("dream")
+    retry_budget = extraction.truncation_retry_max_output_tokens_for_lane("dream")
+    requests = []
+    thinking_only = {
+        "id": "msg_t", "type": "message", "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "...", "signature": "s"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 9000, "output_tokens": budget},
+    }
+    answered = {
+        "id": "msg_a", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": '{"consolidations": []}'}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 9000, "output_tokens": 40},
+    }
+
+    def handler(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload["max_tokens"] > 16000:
+            return httpx.Response(rejection[0], json=rejection[1])
+        first_call = len(requests) == 1
+        return httpx.Response(
+            200,
+            json=thinking_only if first_call or fallback_reply_truncated else answered,
+        )
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_async_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def _no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(provider_client.asyncio, "sleep", _no_sleep)
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(read_dream_memory_context=lambda _uid: {
+            "ai_name": "小克", "user_name": "Z", "cards": "C", "card_items": cards,
+        }),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    budgets = [row["max_tokens"] for row in requests]
+    # The rejected 24k wire may be re-sent once by a provider compatibility
+    # fallback; what matters is that it is followed by the accepted budget.
+    assert budgets[0] == budget
+    assert budgets[-1] == budget
+    assert set(budgets[1:-1]) == {retry_budget}
+    first_prompt = requests[0]["messages"][-1]["content"]
+    concise_prompts = {json.dumps(row["messages"]) for row in requests[1:]}
+    assert len(concise_prompts) == 1  # the fallback re-asks the same concise prompt
+    assert json.loads(next(iter(concise_prompts)))[-1]["content"] != first_prompt
+    if fallback_reply_truncated:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    else:
+        assert status == "completed"
+        assert _job_row(job_id) == ("completed", None)
+
+
+def _dream_job_outcome(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, last_error, wake_result, wake_result_reason "
+            "FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+
+def _dream_db_card(user_id: str, memory_id: str) -> dict:
+    ts = "2026-06-20T00:00:00Z"
+    return {
+        "v": 1, "id": memory_id, "type": "fact", "owner_user_id": user_id,
+        "visibility": "shared", "body_ct": f"ct_{memory_id}",
+        "nonce": f"n_{memory_id}", "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}", "occurred_at": ts, "created_at": ts,
+        "updated_at": ts, "status": "active",
+    }
+
+
+def _no_provider_call(monkeypatch):
+    calls = []
+
+    async def _provider(*_args, **_kwargs):
+        calls.append(1)
+        raise AssertionError("a too-small garden must not reach the provider")
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _provider
+    )
+    return calls
+
+
+def test_dream_on_too_small_garden_is_recorded_as_skipped_not_consolidated(
+    monkeypatch,
+):
+    """Bug 17: memgarden declines to consolidate < its minimum; io used to call it
+    ``completed`` and advance the Dream ledger as if a real dream had run."""
+    from model_api_runtime.v2 import serve_worker
+    from proactive import dream_scheduler
+
+    uid = "u_x_dream_small_garden"
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [_dream_db_card(uid, f"mem_{i}") for i in range(2)])
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    provider_calls = _no_provider_call(monkeypatch)
+    traces, emit_trace = _trace_collector()
+    recorded = []
+
+    def _record(user_id, lane, status, detail):
+        recorded.append((lane, status, dict(detail)))
+        serve_worker._record_extraction_status(user_id, lane, status, detail)
+
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            emit_debug_trace=emit_trace,
+            record_extraction_status=_record,
+            read_memory_context=lambda _uid: {"card_items": [
+                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。"},
+                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。"},
+            ]},
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert provider_calls == []
+    assert _dream_job_outcome(job_id) == (
+        "completed", None, "skipped", "not_enough_new_cards",
+    )
+    assert [row[:2] for row in recorded] == [("dream", "skipped")]
+    assert recorded[0][2]["skip_reason"] == "not_enough_new_cards"
+    terminal = traces[-1]
+    assert terminal["type"] == "memory.dream.done"
+    assert terminal["status"] == "ok"
+    assert terminal["detail"]["outcome"] == "skipped"
+    assert terminal["detail"]["counts"]["model_attempts"] == 0
+    assert "memory.dream.model.done" not in [row["type"] for row in traces]
+
+    store = core_store.get_store_per_load_mode(uid, reason="test dream ledger")
+    state = dream_scheduler.load_dream_state(store)
+    # Not a success: the consolidation ledger does not move ...
+    assert state["last_dream_completed_at"] == 0.0
+    assert state["last_dream_signature"] == ""
+    assert state["last_dreamed_seed_card_count"] == 0
+    # ... and not a failure: no backoff streak.
+    assert state["dream_fail_streak"] == 0
+    assert state["last_dream_skip_reason"] == "not_enough_new_cards"
+    assert state["last_dream_skipped_at"] > 0.0
+
+    # The next scheduler tick does not re-enqueue the same no-op right away.
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    submitted = []
+    tick = dream_scheduler.tick_memory_dream(
+        store,
+        submit=lambda *_a, **_k: submitted.append(1) or {"enqueued": True},
+    )
+    assert tick["enqueued"] is False
+    assert tick["reason"] == "not_enough_new_cards"
+    assert submitted == []
+
+
+def test_dream_with_enough_cards_still_reaches_the_model_and_is_not_skipped(
+    monkeypatch,
+):
+    uid = "u_x_dream_big_enough_garden"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "dream")
+    job = jobs_store.claim_next_job("w")
+    calls = []
+
+    async def _provider(_cfg, _messages, **_kwargs):
+        calls.append(1)
+        return {"reply": '{"consolidations": []}', "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _provider
+    )
+    cards = [
+        {"id": f"card-{i}", "summary": f"S{i}", "content": f"C{i}",
+         "occurred_at": "2026-07-01T00:00:00Z"}
+        for i in range(12)
+    ]
+    traces, emit_trace = _trace_collector()
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_memory_context=lambda _uid: {
+                "ai_name": "小克", "user_name": "Z", "cards": "C",
+                "card_items": cards,
             },
             emit_debug_trace=emit_trace,
         ),
@@ -554,21 +1393,9 @@ def test_dream_context_degradation_is_not_indistinguishable_from_model_noop(
     ))
 
     assert status == "completed"
-    context_error = next(
-        row for row in traces
-        if row["type"] == "memory.extraction.context.error"
-    )
-    assert context_error["detail"] == {
-        "runtime": "hosted_v2",
-        "lane": "dream",
-        "component": "cards",
-        "outcome": "unavailable",
-    }
-    terminal = traces[-1]
-    assert terminal["type"] == "memory.dream.done"
-    assert terminal["status"] == "warning"
-    assert terminal["detail"]["outcome"] == "noop"
-    assert terminal["detail"]["degraded_context"] is True
+    assert calls == [1]
+    assert _dream_job_outcome(job_id) == ("completed", None, None, None)
+    assert traces[-1]["detail"]["outcome"] == "noop"
 
 
 def test_dream_blast_radius_fuse_fails_whole_job(monkeypatch):
@@ -703,8 +1530,9 @@ def test_dream_missing_source_time_degrades_and_still_writes(monkeypatch):
         read_memory_context=lambda _uid: {
             "ai_name": "小克", "user_name": "Z", "cards": "C",
             "card_items": [
-                {"id": "old-a", "occurred_at": "2026-03-01T00:00:00Z"},
-                {"id": "old-b", "occurred_at": ""},
+                {"id": "old-a", "summary": "a", "occurred_at": "2026-03-01T00:00:00Z"},
+                {"id": "old-b", "summary": "b", "occurred_at": ""},
+                *_DREAM_FILLER_CARDS,
             ],
         },
         # 夹具必须返回 {"status": "ok"} —— 返回 None 会被 _memory_write_result_counts
@@ -983,8 +1811,9 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
 
     seen = {}
 
-    async def _cap(*, provider_config, prompt, parse, **kw):
-        seen["prompt"] = prompt
+    async def _cap(*, provider_config, session, **kw):
+        # The prompt the model would actually receive is the session's.
+        seen["prompt"] = session.next_prompt()
         return ([], None)
 
     monkeypatch.setattr(extraction, "extract", _cap)
@@ -992,24 +1821,32 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
         job, _deps(read_memory_context=None), provider_config=_BYOK,
         api_key=None, runtime_token="rt"))
     assert status == "completed"
+    assert "我换工作了" in seen["prompt"]
     assert "(none)" in seen["prompt"]           # prompt builder's own fallback kicked in
 
 
 def test_capture_prompt_includes_existing_card_ids(monkeypatch):
+    """fd963bf9 (08-30) 起组件请求不带索引，模型抄不到 target_id —— 这条曾是 strict xfail。
+
+    同时守名字：身份卡里存成「用户」的名字不许原样进提示词，称呼规则是 io 那版。
+    """
     uid = "u_x_cards_context"
     _seed_v2(uid)
     jobs_store.enqueue_job(uid, "capture")
     job = jobs_store.claim_next_job("w")
     seen = {}
 
-    async def _capture(*, prompt, **_kwargs):
-        seen["prompt"] = prompt
+    async def _capture(*, session, **_kwargs):
+        seen["prompt"] = session.next_prompt()
         return [], None
 
     monkeypatch.setattr(extraction, "extract", _capture)
     deps = _deps(
         read_memory_context=lambda _uid: {
-            "cards": "- [mom_existing] （桶：工作）之前的工作记忆"
+            "ai_name": " 小克 ", "user_name": "用户", "buckets": "工作",
+            "capture_cards": [
+                {"id": "mom_existing", "summary": "之前的工作记忆", "bucket": "工作"}
+            ],
         }
     )
     status = asyncio.run(
@@ -1022,8 +1859,185 @@ def test_capture_prompt_includes_existing_card_ids(monkeypatch):
         )
     )
     assert status == "completed"
-    assert "[mom_existing]" in seen["prompt"]
+    assert "- mom_existing: [工作] 之前的工作记忆" in seen["prompt"]
     assert "target_id" in seen["prompt"]
+    assert "用户's companion" not in seen["prompt"]
+    from identity.user_naming import _naming_rule
+
+    assert _naming_rule("用户", locale="zh-Hans") in seen["prompt"]
+
+
+def _capture_db_card(user_id: str, memory_id: str) -> dict:
+    ts = "2026-06-20T00:00:00Z"
+    return {
+        "v": 1, "id": memory_id, "type": "fact", "owner_user_id": user_id,
+        "visibility": "shared", "body_ct": f"ct_{memory_id}",
+        "nonce": f"n_{memory_id}", "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}", "occurred_at": ts, "created_at": ts,
+        "updated_at": ts, "status": "active", "source": "memory_capture",
+        "importance": 0.5,
+    }
+
+
+_CAPTURE_SUMMARIES = {
+    "mom_job": ("工作", "Z 在字节跳动做产品经理，负责电商"),
+    **{f"mom_fill_{i}": ("日常", f"第{i}次闲聊提到的天气和午饭") for i in range(80)},
+}
+
+
+def _stub_capture_readside(monkeypatch):
+    """真 serve_worker 读侧 + 真 memory_core.index（生命周期过滤、owner、user_card_count），
+    只把 enclave 解密那一跳换成按 id 给摘要。"""
+    import memory_readside_core
+    from model_api_runtime.v2 import serve_worker
+
+    serve_worker.wire_assembly()
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
+    monkeypatch.setattr(
+        serve_worker, "_load_identity_card_view",
+        lambda _store, *, runtime_token: {"agent_name": "小克", "user_preferred_name": "Z"},
+    )
+    monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": ["工作"]}, 200))
+    monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
+    calls = []
+
+    def _enclave(_api_key, candidates, *, operation, payload=None, runtime_token=None):
+        calls.append((operation, dict(payload or {})))
+        items = []
+        for card in candidates:
+            bucket, summary = _CAPTURE_SUMMARIES[card["id"]]
+            items.append({"id": card["id"], "bucket": bucket, "summary": summary,
+                          "importance": 0.5, "status": "active"})
+        return {"items": items, "unavailable_ids": []}
+
+    monkeypatch.setattr(memory_readside_core, "post_enclave_readside", _enclave)
+    return serve_worker, calls
+
+
+def _supersede_reply(target: str) -> str:
+    return json.dumps({"cards": [{
+        "action": "supersede", "type": "fact", "target_id": target, "bucket": "工作",
+        "threads": ["换工作"], "summary": "Z 下个月去腾讯做产品经理",
+        "content": "Z 上周从字节跳动离职，下个月去腾讯继续做产品经理。",
+        "importance": 0.7, "pulse": 0.4,
+    }]}, ensure_ascii=False)
+
+
+def _run_capture_e2e(monkeypatch, uid, replies):
+    _seed_v2(uid)
+    db.memory_replace_all(uid, [
+        _capture_db_card(uid, mid) for mid in _CAPTURE_SUMMARIES
+    ])
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    serve_worker, enclave_calls = _stub_capture_readside(monkeypatch)
+    prompts = []
+
+    async def _provider(_cfg, messages, **_kwargs):
+        prompts.append(messages[0]["content"])
+        return {"reply": replies[min(len(prompts) - 1, len(replies) - 1)],
+                "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
+    row = {
+        "id": "m1", "seq": 1, "ts": 1.0, "role": "user", "raw_role": "user",
+        "source": "chat", "capture_eligible": True,
+        "content": "我上周从字节跳动离职了，下个月去腾讯做产品经理",
+    }
+    status = asyncio.run(worker.process_job(
+        job,
+        _deps(
+            read_memory_context=serve_worker._read_memory_context,
+            read_compaction_tail_after_seq=lambda *_a, **_k: [row],
+        ),
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+    with db.get_pool().connection() as conn:
+        docs = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT moment_id, doc FROM memory_moments WHERE user_id=%s", (uid,)
+            ).fetchall()
+        }
+    return status, job_id, prompts, docs, enclave_calls
+
+
+def test_capture_supersedes_an_indexed_card_end_to_end(monkeypatch):
+    """模型照抄索引里的 id → 过 jobs_store 的所有权/存在校验 → 旧卡被取代，而不是多一张。"""
+    status, job_id, prompts, docs, enclave_calls = _run_capture_e2e(
+        monkeypatch, "u_x_capture_index_e2e", [_supersede_reply("mom_job")]
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    # 读侧一次全量 index（limit=0 → 硬上限），不是只读 60 张。
+    assert ("index", {"ambient": False, "bucket": "", "thread": "", "limit": 1000, "query": ""}) in enclave_calls
+    assert len(prompts) == 1
+    index = prompts[0].split("target_id from here)]", 1)[1].split("\n[", 1)[0]
+    index_rows = index.splitlines()
+    assert index_rows[0] == "- mom_job: [工作] Z 在字节跳动做产品经理，负责电商"
+    assert len(index_rows) == 60
+    new_ids = set(docs) - set(_CAPTURE_SUMMARIES)
+    assert len(new_ids) == 1
+    new_id = new_ids.pop()
+    assert docs["mom_job"]["status"] == "superseded"
+    assert docs["mom_job"]["superseded_by"] == new_id
+
+
+def test_capture_made_up_target_is_reasked_instead_of_rejecting_the_batch(monkeypatch):
+    """编造的 id 以前会让 jobs_store 整批拒掉（capture_supersede_target_missing），
+    同窗口的好卡一起丢、job 进失败退避。现在组件先重问，改对了照常落库。"""
+    status, job_id, prompts, docs, _ = _run_capture_e2e(
+        monkeypatch, "u_x_capture_index_reask",
+        [_supersede_reply("mom_made_up"), _supersede_reply("mom_job")],
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    assert len(prompts) == 2
+    assert "你给的 target_id 不是现有的卡" in prompts[1]
+    assert docs["mom_job"]["status"] == "superseded"
+
+
+def test_capture_made_up_target_twice_drops_only_that_card(monkeypatch):
+    status, job_id, prompts, docs, _ = _run_capture_e2e(
+        monkeypatch, "u_x_capture_index_drop",
+        [_supersede_reply("mom_made_up")],
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    assert len(prompts) == 2
+    assert set(docs) == set(_CAPTURE_SUMMARIES)
+    assert docs["mom_job"]["status"] == "active"
+
+
+def test_capture_two_cards_superseding_one_card_land_the_batch_end_to_end(monkeypatch):
+    """之前：模型一轮里两张卡都覆盖 mom_job → commit 整批按 target_inactive 拒掉，同窗口
+    反复失败到逃生阀跳过，同批的新卡也丢了。之后：第二张被映射层丢掉（只记张数），
+    其余照常落库，任务完成。"""
+    events: list[tuple[str, dict]] = []
+
+    async def _record(_recorder, kind, payload, *, best_effort=False):
+        events.append((kind, dict(payload)))
+        return True
+
+    monkeypatch.setattr(worker, "_record_trajectory", _record)
+    first = json.loads(_supersede_reply("mom_job"))["cards"][0]
+    second = {**first, "action": "merge", "summary": "Z 换工作去了腾讯",
+              "content": "Z 从字节跳动跳槽到腾讯。"}
+    added = {**first, "action": "add", "target_id": "", "summary": "Z 下个月入职",
+             "content": "Z 下个月一号入职腾讯。"}
+    status, job_id, _prompts, docs, _ = _run_capture_e2e(
+        monkeypatch, "u_x_capture_dup_target_e2e",
+        [json.dumps({"cards": [first, second, added]}, ensure_ascii=False)],
+    )
+    assert status == "completed"
+    assert _job_row(job_id)[0] == "completed"
+    new_ids = set(docs) - set(_CAPTURE_SUMMARIES)
+    assert len(new_ids) == 2
+    assert docs["mom_job"]["status"] == "superseded"
+    assert docs["mom_job"]["superseded_by"] in new_ids
+    assert ("supersede_target_duplicate_dropped", {"cards": 1}) in events
 
 
 def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
@@ -1155,8 +2169,9 @@ def test_capture_mixed_batch_discloses_only_live_rows(monkeypatch):
     job = jobs_store.claim_next_job("w")
     prompts = []
 
-    async def _capture(*, prompt, **_kwargs):
-        prompts.append(prompt)
+    async def _capture(*, session, **_kwargs):
+        # What is disclosed is what the component session would send.
+        prompts.append(session.next_prompt())
         return [], None
 
     monkeypatch.setattr(extraction, "extract", _capture)
@@ -1349,3 +2364,36 @@ def test_capture_live_halt_after_context_read_prevents_provider_call(monkeypatch
     assert (status, last_error) == ("failed", "turns_halted")
     state = db.get_blob_strict(uid, "capture_state") or {}
     assert int(state.get("capture_fail_streak") or 0) == 0
+
+
+def test_empty_capture_successor_clears_stale_failure_state_and_notice(monkeypatch):
+    """没有待处理消息的落卡任务完成时，清掉残留的失败子状态和「受阻」提示（Codex 第 10 轮）。"""
+    from notices import core as notices_core
+    from model_api_runtime.v2 import serve_worker
+
+    uid = "u_x_empty_successor_stale"
+    _seed_v2(uid)
+    db.set_blob(uid, "capture_state", {
+        "capture_fail_streak": 4,
+        "last_capture_failed_at": 100.0,
+        "capture_account_error_code": "quota_insufficient",
+        "capture_account_fail_since": 50.0,
+        "capture_window_fail_count": 2,
+        "capture_fail_window_key": "after_seq:0",
+    })
+    from proactive import capture_jobs
+    capture_jobs.notify_backoff(type("S", (), {"user_id": uid})(), lane="capture", status="failed",
+                                streak=4, account_code="quota_insufficient")
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    deps = _deps(read_compaction_tail_after_seq=lambda *_a, **_k: [],
+                 read_capture_state=serve_worker._read_capture_state)
+    assert asyncio.run(worker.process_job(job, deps, provider_config=_BYOK, api_key=None,
+                                          runtime_token="rt")) == "completed"
+    state = db.get_blob_strict(uid, "capture_state")
+    assert int(state["capture_fail_streak"]) == 0
+    assert state["capture_account_error_code"] == ""
+    assert float(state["capture_account_fail_since"]) == 0.0
+    asyncio.run(worker._notify_capture_backoff(deps, job, "completed"))
+    rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+    assert rows["memory_backoff:capture"]["resolved"] is True

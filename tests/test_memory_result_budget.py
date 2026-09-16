@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from capabilities import memory, memory_results, result_budget
 from memory import memory_core, service
 from model_api_runtime.v2 import executor, tool_loop
+import memory_search_contract
 import provider_client
 from provider_types import ToolCall, ToolResult
 
@@ -44,7 +45,7 @@ def test_cues_flow_from_encrypted_inner_to_search_index_and_garden():
 def test_recall_cues_skip_non_strings_without_stringifying():
     from memory import recall_metadata
     raw = [{"k": "v"}, ["x"], 7, True, " 只留 字符串 "]
-    assert recall_metadata.cues(raw) == ["只留 字符串"]
+    assert recall_metadata.fields({"retrieval_cues": raw}, {}) == {"retrieval_cues": ["只留 字符串"]}
 
 
 def test_extraction_cues_skip_non_strings_without_stringifying():
@@ -62,10 +63,17 @@ def test_garden_match_cues_skip_non_strings_without_stringifying():
     assert card_shape.to_garden_card(card)["search_text"] == "原摘要 只留 字符串"
 
 
+def _one_hop(sources, candidates, **kw):
+    """The production related-read call: io cards translated, memgarden decides."""
+    from memgarden.related import one_hop
+    from memory import card_shape
+    return one_hop([card_shape.to_related_card(c) for c in sources],
+                   [card_shape.to_related_card(c) for c in candidates], **kw)
+
+
 @pytest.mark.parametrize("status", ["archived", "superseded"])
 @pytest.mark.parametrize("relation", ["thread", "anchor", "supersedes"])
 def test_one_hop_retired_cards_require_explicit_superseded_link(status, relation):
-    from memory import recall_metadata
     source = {"id": "source", "threads": ["t"]}
     if relation != "thread":
         key = "anchor_memory_ids" if relation == "anchor" else "supersedes"
@@ -73,7 +81,7 @@ def test_one_hop_retired_cards_require_explicit_superseded_link(status, relation
     # Exercise one_hop directly, without memory_available prefiltering archives.
     candidates = [{"id": "retired", "summary": "历史摘要", "status": status, "threads": ["t"]},
                   {"id": "current", "summary": "当前摘要", "status": "active", "threads": ["t"]}]
-    result = recall_metadata.one_hop([source], candidates)
+    result = _one_hop([source], candidates)
     expected = [{"id": "current", "summary": "当前摘要", "source_id": "source",
                  "relation": "thread", "status": "active"}]
     if status == "superseded" and relation != "thread":
@@ -108,13 +116,12 @@ def test_fetch_one_hop_actual_core_excludes_foreign_private_archived_and_transit
 
 
 def test_one_hop_explicit_link_wins_across_sources_and_cap_is_stable():
-    from memory import recall_metadata
     sources = [{"id": "s1", "threads": ["t"]}, {"id": "s2", "anchor_memory_ids": ["z"]}]
     cards = [{"id": mid, "summary": mid, "threads": ["t"]} for mid in "abcdefghz"]
-    picked = recall_metadata.one_hop(sources, cards)
+    picked = _one_hop(sources, cards)
     assert len(picked) == 6 and len({item["id"] for item in picked}) == 6
     assert picked[0] == {"id": "z", "summary": "z", "source_id": "s2", "relation": "anchor", "status": "active"}
-    assert recall_metadata.one_hop(list(reversed(sources)), list(reversed(cards))) == picked
+    assert _one_hop(list(reversed(sources)), list(reversed(cards))) == picked
 
 
 def test_recent_supplement_is_created_time_bounded_not_updated_time(monkeypatch):
@@ -131,7 +138,7 @@ def test_recent_supplement_is_created_time_bounded_not_updated_time(monkeypatch)
     original = recall_metadata.recent_cards
     monkeypatch.setattr(recall_metadata, "recent_cards", lambda cards: original(cards, now=now))
     monkeypatch.setattr(chat.readside, "moments_to_cards", lambda *a: cards)
-    monkeypatch.setattr(chat.memory_relevance, "select_context_memories_with_trace", lambda *a: ([], {"selected": []}))
+    monkeypatch.setattr(chat, "_unified_selection", lambda *a: ([], {"selected": []}))
     args = {"authorized_user_id": "u", "content_sk": None, "want_trace": True}
     assert chat._build_context_memories([], [], args)[0] == []
     picked, trace, log = chat._build_context_memories([], [], {**args, "context_recent": True})
@@ -257,7 +264,7 @@ def test_94_cards_survive_real_pipeline_with_seven_siblings(garden, name, args):
     assert status == 200 and len(http["items"]) == 94
     assert "score" in http["items"][0] and "threads" in http["items"][0]
     if name == "memory_search":
-        assert payload["ranking"] == "bm25-jieba-0.42.1-v1"
+        assert payload["ranking"] == memory_search_contract.VERSION == "memgarden-bm25-v2+tok:jieba-0.42.1"
         assert payload["unavailable_count"] == 0
         search_event = next(e for e in events if e["type"] == "memory.search.called")
         assert len(search_event["detail"]["ids"]) == 20

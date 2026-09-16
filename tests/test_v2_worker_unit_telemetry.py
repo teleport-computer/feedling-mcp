@@ -201,6 +201,9 @@ def test_user_unavailable_outcomes_are_exact_and_producer_registered():
         "turn_failed:model_not_found",
         "turn_failed:image_generation_model_not_found",
     })
+    # 2026-09-15: Seven's exact set plus the separately reviewed, hx-approved
+    # memory-lane block (pinned in tests/test_memory_lane_user_unavailable.py).
+    expected = expected | notices_catalog.MEMORY_LANE_USER_UNAVAILABLE_V2_OUTCOME_CODES
     assert notices_catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES == expected
     assert jobs_store.USER_UNAVAILABLE_OUTCOME_CODES == expected
     assert expected <= worker.PUBLIC_FAILURE_CODES

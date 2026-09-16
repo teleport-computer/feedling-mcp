@@ -13,7 +13,9 @@ import memory_search_contract as search_contract
 from core import envelope as core_envelope
 from enclave import readside as enclave_readside
 from memory import service as memory_service
+from memory import card_shape
 from memory import recall_metadata
+from memgarden import related as mg_related
 from memgarden import timestamps as memory_timestamps
 
 
@@ -63,7 +65,7 @@ def _time_ts(moment: dict) -> float:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return memory_timestamps.now_iso()
 
 
 def _now_ts() -> float:
@@ -110,7 +112,14 @@ def memory_available(
         return False
     if status in _INACTIVE_STATUSES and status not in {"archived", "superseded"}:
         return False
-    if memory_service._memory_is_archived(moment) and not include_archived:
+    # Every io supersede writer (memory/actions.py, V2 commit_capture_batch)
+    # also stamps is_archived/archived_at/archive_reason="superseded_by:<id>" on
+    # the retired card. Those markers are part of the supersede, not a separate
+    # archive: once include_superseded admitted the card, the legacy archive
+    # check must not take it away again, or fetch(include_superseded) and the
+    # related read's explicit supersedes link never return any history.
+    if (memory_service._memory_is_archived(moment) and not include_archived
+            and status != "superseded"):
         return False
     return True
 
@@ -427,7 +436,21 @@ def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict
               if str(row.get("id") or "") in by_id]
     request = {**payload, "search_protocol": search_contract.VERSION}
     search_contract.check_request({**request, "moments": corpus})
-    response = post(api_key, corpus, operation="index", payload=request)
+    fallbacks = iter(search_contract.FALLBACKS)
+    while True:
+        try:
+            response = post(api_key, corpus, operation="index", payload=request)
+            break
+        except RuntimeError as exc:
+            # Rolling restart: an enclave that predates this ranker rejects the
+            # protocol with this exact 400. Step down once per older protocol
+            # (memgarden v1, then the pre-memgarden BM25); every other failure
+            # (auth, timeout, 5xx) still propagates.
+            older = next(fallbacks, None)
+            if older is None or not (str(exc).startswith("enclave_http_400:")
+                                     and "memory_search_protocol_unsupported" in str(exc)):
+                raise
+            request = {**payload, "search_protocol": older}
     # A successful previous-protocol response has this exact envelope. Missing
     # ranking on that known shape is rolling compatibility, not permission to
     # swallow HTTP/auth/timeouts or unknown/malformed future protocols.
@@ -436,7 +459,7 @@ def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict
             or not isinstance(response.get("unavailable_ids"), list)):
         raise RuntimeError("enclave_invalid_readside_response")
     ranking = response.get("ranking", search_contract.LEGACY)
-    if ranking not in (search_contract.VERSION, search_contract.LEGACY):
+    if ranking not in search_contract.ACCEPTED:
         raise RuntimeError("enclave_invalid_readside_response")
     items = []
     for item in response["items"]:
@@ -550,7 +573,11 @@ def memory_fetch_core(
             neighbor_items = _memory_index_partition(
                 api_key, neighbors[:bound], store.user_id, {"limit": bound},
                 post=post_enclave or post_enclave_readside)
-            related_items = recall_metadata.one_hop(source_items, neighbor_items, cap=7)
+            # memgarden reads canonical lifecycle/summary only; translate io's
+            # legacy archive markers and title-style summaries first.
+            related_items = mg_related.one_hop(
+                [card_shape.to_related_card(item) for item in source_items],
+                [card_shape.to_related_card(item) for item in neighbor_items], cap=7)
             complete_window = {m.get("id") for m in neighbors[:bound]} <= {i.get("id") for i in neighbor_items}
             related_status = "bounded" if (len(neighbors) > bound or len(related_items) > 6
                                              or not complete_window) else "ok"
@@ -574,8 +601,9 @@ def memory_fetch_core(
                 fresh = memory_service._load_moments(store)
                 for m in fresh:
                     if isinstance(m, dict) and str(m.get("id") or "") in referenced_ids:
+                        # Only the reference stamp: updated_at means "the card
+                        # changed" (profile refresh witness), and a read is not a change.
                         m["last_referenced_at"] = now
-                        m["updated_at"] = now
                 memory_service._save_moments(store, fresh)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],

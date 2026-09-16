@@ -905,6 +905,25 @@ def test_stash_auto_memories_joins_cards_with_selection_reasons():
     assert all("正文" not in c["text"] for c in picked)
 
 
+def test_v1_block_renders_the_unified_enclave_selection(monkeypatch):
+    """V1 resident path on the real enclave output (memgarden select_context + jieba)."""
+    sys.path.insert(0, str(ROOT / "backend"))
+    from enclave.routes import chat
+    monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+    cards = [{"id": "lamp", "summary": "露营灯保修码 NP-4286", "status": "active"},
+             *[{"id": f"f{i}", "summary": f"第{i}次整理工作周报", "status": "active"} for i in range(20)]]
+    monkeypatch.setattr(chat.readside, "moments_to_cards", lambda *a: cards)
+    rows = [{"role": "user", "content": "今天又下雨了"}, {"role": "assistant", "content": "记得带伞呀"},
+            {"role": "user", "content": "那个露营灯的保修码是多少来着"}]
+    picked_cards, trace, log = chat._build_context_memories(
+        [], rows, {"context_mode": "", "want_trace": True, "authorized_user_id": "u", "content_sk": None})
+    picked = resident._stash_auto_memories(picked_cards, trace)
+    assert [c["id"] for c in picked] == ["lamp"] and picked[0]["score"] > 0
+    text, ids = resident._auto_memory_context(picked, [])
+    assert ids == ["lamp"] and "匹配「" in text and "露营灯" in text
+    assert log["mode"].startswith("relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1")
+
+
 def test_auto_memory_context_orders_by_score_skips_quoted_and_keeps_ids_only():
     picked = _picked(("low", "低分卡", "recent", [], 0.1), ("hi", "高分卡 保修码", "query", ["保修码"], 0.9),
                      ("q", "用户已引用的卡", "query", [], 0.8))

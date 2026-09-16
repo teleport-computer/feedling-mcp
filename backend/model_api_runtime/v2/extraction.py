@@ -16,12 +16,20 @@ from datetime import datetime, timezone
 import os
 from typing import Any, Awaitable, Callable, NamedTuple
 
+from memgarden.prompts.recall_fields import retrieval_cues
+
 import provider_client
 from notices import error_contract
 
+# Dream renders up to 60 full cards / 60k chars (serve_worker
+# ``_MEMORY_CARDS_LIMIT`` / ``_DREAM_CARDS_MAX_CHARS``) and
+# answers with complete rewritten card bodies, so its reply scales with the
+# garden; thinking models also bill hidden reasoning against this same cap.
+# 4,000 made the largest gardens truncate deterministically every night. The
+# cap is a ceiling, not a spend: a reply that fits costs the same as before.
 _MAX_OUTPUT_TOKEN_SETTINGS = {
     "capture": ("FEEDLING_V2_CAPTURE_MAX_OUTPUT_TOKENS", 1500),
-    "dream": ("FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS", 4000),
+    "dream": ("FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS", 12000),
 }
 
 
@@ -50,12 +58,41 @@ def max_output_tokens_for_lane(lane: str) -> int:
     if lane == "capture":
         return CAPTURE_MAX_OUTPUT_TOKENS
     if lane == "dream":
-        return DREAM_MAX_OUTPUT_TOKENS
+        # Every provider payload builder clamps to this shared wire ceiling
+        # anyway; clamping here keeps the recorded ``max_tokens`` truthful.
+        return min(DREAM_MAX_OUTPUT_TOKENS, provider_client.CHAT_OUTPUT_MAX_TOKENS)
+    raise ValueError(f"unsupported extraction lane: {lane}")
+
+
+def truncation_retry_max_output_tokens_for_lane(lane: str) -> int | None:
+    """Budget for the one retry that follows a length-stopped reply.
+
+    Dream doubles its budget (the same escalation genesis' JSON repair uses),
+    clamped to ``provider_client.CHAT_OUTPUT_MAX_TOKENS`` — the one audited
+    ceiling every provider wire already accepts from foreground file-capable
+    Chat. Retrying at the budget that just truncated only asks for a shorter
+    answer; a garden whose consolidation genuinely needs more room fails the
+    same way every night. Capture keeps its historical same-budget retry
+    (``None``).
+    """
+    if lane == "capture":
+        return None
+    if lane == "dream":
+        base = max_output_tokens_for_lane("dream")
+        return min(base * 2, provider_client.CHAT_OUTPUT_MAX_TOKENS)
     raise ValueError(f"unsupported extraction lane: {lane}")
 
 
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
+# Wall-clock ceiling of ONE provider wire. ``_TIMEOUT_SEC`` is handed to httpx,
+# which applies it per phase (a read timeout is the gap between two bytes), so a
+# relay trickling keep-alive bytes could hold one wire past the Heavy pool's
+# 120s stall budget and get a healthy Capture/Dream slot killed and requeued
+# (duplicate model calls). The retry wrapper reports progress before every wire,
+# so the longest silence is this value; tests/test_v2_pool_config.py keeps it
+# 30s below every extraction slot's stall budget.
+WIRE_DEADLINE_SEC = 90.0
 
 class ParseRetry(NamedTuple):
     """「截断/解析/语义结果不合格 → 原样打回去重问一次」的注入点。
@@ -146,6 +183,37 @@ def _provider_failure_code(exc: BaseException) -> str:
     return "unknown"
 
 
+# Internal to ``extract``: the escalated truncation-retry budget was rejected as
+# too large. Never returned to callers (``_call_escalated`` falls back first).
+_OUTPUT_BUDGET_REJECTED = "output_budget_rejected"
+
+
+def _response_shape(stop_reason: Any, usage: Any, budget: int) -> dict[str, Any]:
+    """Content-free shape of one provider answer, used for truncation handling.
+
+    Every wire's output-cap marker (OpenAI ``length``, Anthropic/Bedrock/Gemini
+    ``max_tokens``, Responses ``max_output_tokens``) is recorded as ``length``.
+    """
+    raw_stop_reason = str(stop_reason or "").strip()
+    raw_completion_tokens = (
+        usage.get("completion_tokens") if isinstance(usage, dict) else None
+    )
+    return {
+        "stop_reason": (
+            "length"
+            if provider_client.is_token_limit_stop_reason(raw_stop_reason)
+            else ("other" if raw_stop_reason else "")
+        ),
+        "completion_tokens": (
+            max(0, int(raw_completion_tokens))
+            if isinstance(raw_completion_tokens, (int, float))
+            and not isinstance(raw_completion_tokens, bool)
+            else None
+        ),
+        "max_tokens": budget,
+    }
+
+
 async def extract(
     *,
     provider_config: Any,
@@ -159,6 +227,7 @@ async def extract(
     parse_retry: ParseRetry | None = None,
     session: Any = None,
     step_sink: Any = None,
+    truncation_retry_max_tokens: int | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -166,8 +235,10 @@ async def extract(
     (value, questions, err)；我们只取首项与末项（末项恒为 err）。
 
     给了 `parse_retry` 时，截断、内容闸或语义闸可带原因重问一次；三条路径共享
-    **最多一次**的 provider 预算。provider 报错 / 空回复不走这条路，它们各有
-    自己的重试与退避。
+    **最多一次**的 provider 预算。provider 报错不走这条路，它有自己的重试与退避。
+    空回复分两种：停在输出上限（``length`` / ``max_tokens`` 等，典型是思考模型把
+    预算花在隐藏推理上）的**算截断**、走截断重问；没有上限标记的空回复仍按
+    provider 故障处理（``upstream_unavailable``）。
 
     ## ``session``：让 GardenComponent 决定问什么
 
@@ -180,10 +251,29 @@ async def extract(
     会把 provider 调用抢过去，等于放弃这些能力，那是净退步。
 
     两种模式共用一个 ``_call``，所以 provider 那一侧的行为不可能分家。
+
+    ## ``truncation_retry_max_tokens``
+
+    截断之后的那一次重问用的输出预算。``None`` = 沿用 ``max_tokens``（capture
+    的历史行为）。dream 传一个更大的值：若只换「更简洁」的提示词而预算不变，
+    真的需要更多输出空间的花园会原样再截断一次（prod 上有用户连续多晚
+    ``output_truncated``）。只作用于截断之后的调用，首问预算不变。
+
+    没有逐模型的输出上限元数据：若这条路由接受 ``max_tokens`` 却以 400/422
+    拒绝更大的重问预算（"max_tokens too large"），同一个简洁提示词会退回
+    ``max_tokens`` 再问一次（轨迹 ``extraction_output_budget_fallback``），
+    而不是把可恢复的截断变成 ``provider_config`` 失败。
     """
+    retry_budget = max(
+        int(max_tokens),
+        int(truncation_retry_max_tokens)
+        if truncation_retry_max_tokens is not None
+        else int(max_tokens),
+    )
 
     async def _call(
         attempt_prompt: str,
+        budget: int = max_tokens,
     ) -> tuple[str | None, str | None, dict[str, Any]]:
         """跑一次 provider，返回 reply、error 与 content-free 响应形状。"""
         messages = [{"role": "user", "content": attempt_prompt}]
@@ -195,13 +285,49 @@ async def extract(
             result = await provider_client.reliable_chat_completion_async(
                 provider_config,
                 messages,
-                max_tokens=max_tokens,
+                max_tokens=budget,
                 temperature=_TEMPERATURE,
                 timeout=_TIMEOUT_SEC,
+                wire_deadline_sec=WIRE_DEADLINE_SEC,
                 progress_cb=progress_cb,
+                # An empty reply that stopped at the token cap is this lane's
+                # truncation (handled below), not a transport blip to re-send
+                # three times at the budget that just ran out.
+                retry_output_truncation=False,
             )
         except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
-            error_code = _provider_failure_code(e)
+            if provider_client.is_output_truncation_error(e):
+                # HTTP 200, success shape, no usable text, stop marker = output
+                # cap: typically a thinking model that spent the whole budget on
+                # hidden reasoning. The route answered, so this is recorded as a
+                # response (usage, route liveness), and the empty reply carries
+                # the length shape so the truncation retry below owns it.
+                truncated_usage = getattr(e, "truncation_usage", None)
+                if usage_out is not None:
+                    usage_out(truncated_usage)
+                if trajectory_out is not None:
+                    await trajectory_out(
+                        "provider_response",
+                        {
+                            "response": {
+                                "reply": "",
+                                "stop_reason": str(getattr(e, "stop_reason", "") or ""),
+                                "usage": truncated_usage,
+                                "provider_attempt_trace": (
+                                    provider_client.runtime_provider_attempt_trace(e)
+                                ),
+                            }
+                        },
+                    )
+                return None, "empty_reply", _response_shape(
+                    "length", truncated_usage, budget
+                )
+            budget_rejected = budget > max_tokens and (
+                provider_client.is_output_budget_rejection(e)
+            )
+            error_code = (
+                _OUTPUT_BUDGET_REJECTED if budget_rejected else _provider_failure_code(e)
+            )
             if trajectory_out is not None:
                 await trajectory_out(
                     "provider_error",
@@ -214,34 +340,41 @@ async def extract(
                 )
             if usage_out is not None:
                 usage_out(None)
+            if budget_rejected:
+                return None, _OUTPUT_BUDGET_REJECTED, {}
             return None, f"provider_call_failed:{error_code}", {}
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if trajectory_out is not None:
             await trajectory_out("provider_response", {"response": result})
-        raw_stop_reason = str((result or {}).get("stop_reason") or "").strip().lower()
-        usage = (result or {}).get("usage")
-        raw_completion_tokens = (
-            usage.get("completion_tokens") if isinstance(usage, dict) else None
+        response_shape = _response_shape(
+            (result or {}).get("stop_reason"), (result or {}).get("usage"), budget
         )
-        response_shape = {
-            "stop_reason": (
-                "length"
-                if raw_stop_reason == "length"
-                else ("other" if raw_stop_reason else "")
-            ),
-            "completion_tokens": (
-                max(0, int(raw_completion_tokens))
-                if isinstance(raw_completion_tokens, (int, float))
-                and not isinstance(raw_completion_tokens, bool)
-                else None
-            ),
-            "max_tokens": max_tokens,
-        }
         reply = str((result or {}).get("reply") or "").strip()
         if not reply:
             return None, "empty_reply", response_shape
         return reply, None, response_shape
+
+    async def _call_escalated(
+        attempt_prompt: str,
+    ) -> tuple[str | None, str | None, dict[str, Any]]:
+        """The truncation retry at ``retry_budget``, with a fallback.
+
+        There is no per-model output-cap metadata, so a model that accepted
+        ``max_tokens`` but rejects the doubled budget (400/422 "max_tokens too
+        large") would otherwise turn a recoverable concise retry into a
+        ``provider_config`` failure. Re-ask the same concise prompt once at the
+        budget this route already accepted.
+        """
+        reply, call_error, shape = await _call(attempt_prompt, retry_budget)
+        if call_error != _OUTPUT_BUDGET_REJECTED:
+            return reply, call_error, shape
+        if trajectory_out is not None:
+            await trajectory_out(
+                "extraction_output_budget_fallback",
+                {"rejected_max_tokens": retry_budget, "max_tokens": max_tokens},
+            )
+        return await _call(attempt_prompt, max_tokens)
 
     async def _report_truncated(
         response_shape: dict[str, Any], *, attempt: int
@@ -269,7 +402,18 @@ async def extract(
         if trajectory_out is None or step_sink is None:
             return
         for step in step_sink.drain():
-            if step.kind == "parsed" and step.detail.get("error"):
+            if step.kind == "prompt_built" and "index_candidates" in step.detail:
+                # 已有记忆索引的规模（内容无关）。「这轮为什么没并进旧卡」先看这里：
+                # index_cards=0 就是模型根本没看到可并的卡。
+                await trajectory_out("capture_index", {
+                    key: int(step.detail[key])
+                    for key in ("index_candidates", "index_cards", "index_chars")
+                    if isinstance(step.detail.get(key), int)
+                })
+            elif step.kind == "dropped" and step.detail.get("why") == "unknown_target":
+                await trajectory_out("unknown_target_dropped",
+                                     {"cards": int(step.detail.get("cards") or 0)})
+            elif step.kind == "parsed" and step.detail.get("error"):
                 await trajectory_out("parse_bounced",
                                      {"reason": str(step.detail.get("error"))})
             elif step.kind == "retrying":
@@ -287,23 +431,42 @@ async def extract(
         # provider 那一步走的是上面同一个 _call —— 截断、用量、失败分类、
         # 轨迹全部照旧，不因为换了驱动方式而分家。
         seen_truncation = False
+        last_truncated_shape: dict[str, Any] | None = None
         while True:
             attempt_prompt = session.next_prompt()
             if attempt_prompt is None:
                 break
-            reply, call_error, shape = await _call(attempt_prompt)
-            if call_error is not None:
+            reply, call_error, shape = (
+                await _call_escalated(attempt_prompt)
+                if seen_truncation
+                else await _call(attempt_prompt, max_tokens)
+            )
+            truncated = (
+                call_error is None or call_error == "empty_reply"
+            ) and await _report_truncated(
+                shape, attempt=2 if seen_truncation else 1
+            )
+            if call_error is not None and not truncated:
                 return None, call_error
-            truncated = await _report_truncated(shape, attempt=2 if seen_truncation else 1)
             if truncated:
                 if seen_truncation:
                     # 换过一版更简短的提示词还是被截 —— 不再试，如实报。
                     _record_truncation_failure(shape)
                     return None, "output_truncated"
                 seen_truncation = True
+            # An empty reply cut at the output cap (thinking spent the budget)
+            # is still a truncation: the component decides whether to re-ask.
+            last_truncated_shape = shape if truncated and not reply else None
             session.feed(reply or "", truncated=truncated)
             await _emit_component_steps()
         outcome = session.result()
+        # 收尾那一步（丢掉仍不合格的卡）发生在 result() 里，要再翻一次才看得见。
+        await _emit_component_steps()
+        if outcome.error and last_truncated_shape is not None:
+            # The component had no retry left for that empty, cut-off reply, so
+            # it parsed "" — report the real cause, not a bogus format error.
+            _record_truncation_failure(last_truncated_shape)
+            return None, "output_truncated"
         if outcome.error:
             return None, str(outcome.error)
         # 两条 lane 的「原始产物」字段名不同 —— capture 是卡，dream 是合并方案。
@@ -326,10 +489,10 @@ async def extract(
                 {
                     "attempt": 2,
                     "strategy": "concise_prompt",
-                    "max_tokens": max_tokens,
+                    "max_tokens": retry_budget,
                 },
             )
-        reply, call_error, response_shape = await _call(
+        reply, call_error, response_shape = await _call_escalated(
             parse_retry.build_truncation_prompt(prompt)
         )
         retried_once = True
@@ -402,12 +565,9 @@ def _inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
         "bucket": str(card.get("bucket") or "").strip(),
         "threads": list(card.get("threads") or []),
     }
-    # Optional future-package field: keep it inside the encrypted body. Old
-    # parsers omit it; no dependency on an unpublished memgarden API.
-    raw_cues = card.get("retrieval_cues")
-    cues = list(dict.fromkeys(" ".join(c.split())[:120] for c in
-                             (raw_cues if isinstance(raw_cues, list) else [])
-                             if isinstance(c, str) and c.strip()))[:5]
+    # Optional field: keep it inside the encrypted body. Normalized by the
+    # same memgarden rule every reader uses.
+    cues = retrieval_cues(card.get("retrieval_cues"))
     if cues:
         inner["retrieval_cues"] = cues
     # 溯源提示:这张卡来自一个含该通电话的 capture 窗口,agent 可据此调
@@ -464,10 +624,13 @@ def _to_actions(
     capture_mode: str,
     reason: str,
     voice_call_id: str = "",
+    on_skipped: Callable[[str, int], None] | None = None,
 ) -> tuple[list[dict], int, int]:
     actions: list[dict] = []
     added = 0
     superseded = 0
+    claimed_targets: set[str] = set()
+    duplicate_targets = 0
     for card in cards or []:
         action = str(card.get("action") or "").strip().lower()
         target_id = str(card.get("target_id") or "").strip()
@@ -475,6 +638,18 @@ def _to_actions(
         # cards are discarded so valid cards in the same batch can still land.
         if action in {"merge", "supersede"} and not target_id:
             continue
+        if action in {"merge", "supersede"}:
+            # 同一轮里两张卡都说「覆盖这张旧卡」：只留第一张。
+            # 放行的话 commit 会把整批按 capture_supersede_target_inactive 拒掉
+            # （一张旧卡只能有一个后继），同一窗口反复失败直到逃生阀跳过，
+            # 这批里其余的好卡也一起丢了。V1 逐条写，第二张拿到 409
+            # supersede_targets_changed 被单独丢掉 —— 这里对齐成「只丢第二张」。
+            # 在封装之前判，丢掉的卡不做加密。commit 那道重查保留，
+            # 管的是 prepare 之后花园被并发改掉的情况。
+            if target_id in claimed_targets:
+                duplicate_targets += 1
+                continue
+            claimed_targets.add(target_id)
         base = {
             "envelope": _memory_envelope_from_card(
                 card,
@@ -503,6 +678,9 @@ def _to_actions(
         if str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
         and not str(card.get("target_id") or "").strip()
     )
+    if duplicate_targets and on_skipped is not None:
+        # 只报计数，不带卡内容也不带目标 id。
+        on_skipped("supersede_target_duplicate", duplicate_targets)
     if cards and not actions and rejected_without_target != len(cards):
         # 模型给了卡但一张都没映射成 action —— 说明它返回了我们不认识的 action 名。
         # 静默写零条会把这件事藏起来，所以硬失败（与 resident 同口径）。
@@ -511,13 +689,14 @@ def _to_actions(
 
 
 def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope,
-                     voice_call_id: str = ""):
+                     voice_call_id: str = "", on_skipped=None):
     return _to_actions(
         cards,
         occurred_at=occurred_at,
         source_ids=source_ids,
         build_envelope=build_envelope,
         voice_call_id=voice_call_id,
+        on_skipped=on_skipped,
         capture_mode="memory_capture",
         reason="Memory captured from a completed chat window.",
     )

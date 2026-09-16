@@ -28,6 +28,8 @@ OUTCOMES = frozenset({
     "accepted",
     "no_proposals",
     "noop",
+    # The garden is below the kernel's consolidation minimum: nothing ran.
+    "skipped",
     "applied",
     "partial",
     "context_unavailable",

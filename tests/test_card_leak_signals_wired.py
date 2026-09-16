@@ -153,31 +153,16 @@ def test_every_guard_call_site_passes_io_signals():
 
 
 # --------------------------------------------------------------------------- #
-# parser：两条 runtime 拿到的必须是绑了 io 识别器的那个
+# parser：两条 runtime 走的组件必须绑了 io 识别器
 # --------------------------------------------------------------------------- #
-
-
-def test_shell_parsers_are_wrapped_not_the_raw_kernel_ones():
-    """两条 runtime 都从 memory.*_prompt_v1 取 parser，那层必须已经绑好识别器。
-
-    **这条是 codex 2026-08-23 抓到的洞。** 内核 parser 内部会调文本闸，signals
-    不传就退回通用集 —— io 的残片一个都拦不住，而且不报错。宿主侧扫自己的调用点
-    发现不了，因为漏传发生在包里面。
-
-    绑在壳这一层（而不是让每个 runtime 调用点自己传）是结构性保证：调用点会增加，
-    漏一个就是一条无声失防的路。
-    """
-    import memgarden.prompts.capture as kernel_capture
-    import memgarden.prompts.dream as kernel_dream
-    from memory.capture_prompt_v1 import parse_capture_cards
-    from memory.dream_prompt_v1 import parse_dream_consolidations
-
-    assert parse_capture_cards is not kernel_capture.parse_capture_cards, (
-        "壳没有包装 parse_capture_cards —— runtime 拿到的是裸内核版本"
-    )
-    assert parse_dream_consolidations is not kernel_dream.parse_dream_consolidations, (
-        "壳没有包装 parse_dream_consolidations"
-    )
+#
+# **这是 codex 2026-08-23 抓到的洞。** 内核 parser 内部会调文本闸，signals 不传
+# 就退回通用集 —— io 的残片一个都拦不住，而且不报错。宿主侧扫自己的调用点发现
+# 不了，因为漏传发生在包里面。
+#
+# 以前这层绑定在 ``memory/*_prompt_v1.py`` 壳里；两条 runtime 换成组件会话后，
+# 绑定的唯一入口是 ``garden_component.build_garden(signals=IO_LEAK_SIGNALS)``。
+# 下面几条走的就是 runtime 真正用的那个入口，不是内核函数本身。
 
 
 ACCIDENT_CARD = (
@@ -188,31 +173,67 @@ ACCIDENT_CARD = (
 )
 
 
+def _io_capture(reply):
+    from memgarden import CaptureRequest
+    from memory import garden_component
+    from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
+
+    garden = garden_component.build_garden(garden_component.CallableModel(lambda _p: reply))
+    return garden.capture(CaptureRequest(
+        window="- 小雨: 今天又加班了", locale="zh-Hans",
+        policy=IO_CONVERSATION_CAPTURE_POLICY,
+    ))
+
+
+def test_runtime_component_binds_io_signals():
+    from memory import garden_component
+
+    garden = garden_component.build_garden(garden_component.CallableModel(lambda _p: ""))
+    assert garden._signals is IO_LEAK_SIGNALS, (
+        "build_garden 没有绑 IO_LEAK_SIGNALS —— 两条 runtime 拿到的是通用识别器"
+    )
+
+
 def test_capture_parser_rejects_the_accident_string_end_to_end():
-    """走 runtime 真正用的那个 parser —— 事故串必须在这里就被拒。
+    """走 runtime 真正用的那个组件 —— 事故串必须在这里就被拒。
 
     拦不住的后果不是「多一张脏卡」：解析完立刻封加密信封，下游看不到明文，
     再也没有第二道闸。
     """
-    from memory.capture_prompt_v1 import parse_capture_cards
+    result = _io_capture(ACCIDENT_CARD)
+    assert not result.cards, f"事故串落成卡了：{result.cards}"
+    assert result.error and "protocol_leak" in result.error, f"拒了但理由不对：{result.error}"
 
-    cards, err = parse_capture_cards(ACCIDENT_CARD, policy="conversation_capture",
-                                     strict=False)
-    assert not cards, f"事故串落成卡了：{cards}"
-    assert err and "protocol_leak" in err, f"拒了但理由不对：{err}"
+
+def test_dream_session_rejects_the_accident_string_end_to_end():
+    from memory import garden_component
+
+    cards = [{"id": f"m{i}", "summary": f"卡 {i}", "content": f"正文 {i}。"} for i in range(10)]
+    reply = (
+        '{"consolidations":[{"op":"thicken","card_ids":["m1"],"rationale":"补充",'
+        '"result":{"summary":"' + HARMONY_ROUTE + '","content":"正常正文内容写在这里，长度足够",'
+        '"bucket":"工作","threads":[]}}]}'
+    )
+    session, _ = garden_component.open_dream_session(
+        garden_component.build_garden(garden_component.CallableModel(lambda _p: "")),
+        cards=cards, locale="zh-Hans", ai_name="", user_name="", recent_conversations="",
+    )
+    while session.next_prompt() is not None:
+        session.feed(reply)
+    outcome = session.result()
+    assert not outcome.consolidations, f"事故串进了整理结果：{outcome.consolidations}"
+    assert outcome.error and "protocol_leak" in outcome.error, outcome.error
 
 
 def test_clean_card_still_passes_the_same_parser():
     """闸要拦得住脏的，也要放得过干净的 —— 只测前者会掩盖误杀。"""
-    from memory.capture_prompt_v1 import parse_capture_cards
-
     clean = (
         '{"cards":[{"action":"add","type":"fact","summary":"老王不吃辣",'
         '"content":"吃辣就胃疼，点菜时要避开辣菜，这是他反复提过的偏好",'
         '"bucket":"健康","threads":["饮食"],"importance":0.6,"pulse":0.3}]}'
     )
-    cards, err = parse_capture_cards(clean, policy="conversation_capture", strict=False)
-    assert len(cards) == 1 and err is None, f"干净的卡被误杀了：{err}"
+    result = _io_capture(clean)
+    assert len(result.cards) == 1 and result.error is None, f"干净的卡被误杀了：{result.error}"
 
 
 # --------------------------------------------------------------------------- #

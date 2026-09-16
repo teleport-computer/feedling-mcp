@@ -45,10 +45,6 @@ ORCHESTRATION = {
 EXEMPT = {
     # 挂载点本身，import 组件是它的职责
     "backend/memory/garden_component.py",
-    # 兼容外壳：为了不动一大批老调用点而保留的 re-export，
-    # 它们不做编排，只把名字转出去
-    "backend/memory/capture_prompt_v1.py",
-    "backend/memory/dream_prompt_v1.py",
     # e2e 探针要复用线上同一把尺子来断言，不是产品路径
     "tools/e2e/",
 }

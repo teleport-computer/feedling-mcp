@@ -483,3 +483,28 @@ def test_onboarding_route_requires_auth(user):
     assert _asgi_get("/v1/onboarding/route") == (401, {"error": "unauthorized"})
     assert _asgi_post("/v1/onboarding/route", {"route": "model_api"}) == (
         401, {"error": "unauthorized"})
+
+
+@pytest.mark.parametrize("requested,status", [("on", 400), ("off", 200), (None, 200)])
+def test_plaintext_preferences_and_whoami_over_http(user, monkeypatch, requested, status):
+    from core import envelope as core_envelope
+    from core import enclave
+
+    uid, api_key = user
+    registry._set_user_content_encryption(uid, "on")
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(enclave, "_get_enclave_info", lambda: None)
+    h = {"X-API-Key": api_key}
+    actual_status, body = _asgi_post(
+        "/v1/users/preferences", {"content_encryption": requested}, h)
+    assert actual_status == status, body
+    if status == 400:
+        assert body == {"error": "content_encryption_on_not_supported"}
+        assert registry._get_user_content_encryption(uid) == "on"
+    else:
+        assert body["content_encryption"] == "off"
+        assert registry._get_user_content_encryption(uid) == "off"
+    who_status, who = _asgi("GET", "/v1/users/whoami", headers=h)
+    assert who_status == 200, who
+    assert who["content_encryption"] == "off"
+    assert who["content_encryption_effective"] == "off"

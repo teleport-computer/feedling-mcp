@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 import uuid
 from pathlib import Path
 
@@ -41,24 +42,23 @@ def _setup_plaintext_job(monkeypatch, *, job_id: str):
     monkeypatch.setattr(service, "load_genesis_checkpoint", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "write_genesis_checkpoint", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "delete_genesis_checkpoint", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        plaintext.worker,
-        "build_foreground_output_from_texts",
-        lambda **_kwargs: {"all_fact_candidates": [{"summary": "用户喜欢手冲咖啡"}]},
-    )
-    monkeypatch.setattr(
-        plaintext.worker,
-        "build_memory_output_from_fact_candidates",
-        lambda **_kwargs: {
-            "memories": [{
-                "type": "fact",
-                "summary": "用户喜欢手冲咖啡",
-                "content": "用户明确说自己喜欢手冲咖啡。",
-                "bucket": "偏好",
-                "threads": ["咖啡"],
-            }],
-        },
-    )
+    # 新 job 走 memgarden 导入会话：模型端给出包的回复形状（长期记忆档案 → curated_archive
+    # 单段式写卡），其余（动作校验、执行器、PostgreSQL）全是真的。
+    monkeypatch.setenv("FEEDLING_GARDEN_IMPORT_STRATEGY", "single_pass")
+
+    class _FakeLLM:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, **_kwargs):
+            reply = json.dumps({"cards": [{
+                "action": "add", "type": "fact", "bucket": "饮食", "threads": ["咖啡"],
+                "summary": "喜欢手冲咖啡", "content": "明确说过自己喜欢手冲咖啡。",
+                "importance": 0.6, "pulse": 0.3, "occurred_at": None,
+            }]}, ensure_ascii=False)
+            return types.SimpleNamespace(text=reply, stop_reason="stop")
+
+    monkeypatch.setattr(plaintext, "GenesisLLMClient", _FakeLLM)
     return user_id, store
 
 
@@ -108,7 +108,7 @@ def test_plaintext_genesis_import_persists_memory_card_in_postgres(monkeypatch):
     moments = db.memory_load(user_id)
     assert len(moments) == 1
     assert moments[0]["source"] == "genesis_import"
-    assert json.loads(moments[0]["body_ct"])["summary"] == "用户喜欢手冲咖啡"
+    assert json.loads(moments[0]["body_ct"])["summary"] == "喜欢手冲咖啡"
 
 
 def test_plaintext_genesis_all_rejected_batch_fails_job_instead_of_done_zero(monkeypatch):
@@ -117,6 +117,8 @@ def test_plaintext_genesis_all_rejected_batch_fails_job_instead_of_done_zero(mon
 
     # Reproduce the legacy/malformed executor shape that previously slipped
     # through as success: HTTP 200 and a rejected row, without aggregate counts.
+    # capture_mode_invalid is a host bug (not a bad card), so the batch must fail
+    # the job — never commit as "written, 0 cards".
     monkeypatch.setattr(
         service.memory_actions,
         "_execute_memory_actions",

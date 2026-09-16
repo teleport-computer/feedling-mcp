@@ -6,9 +6,12 @@ agent, write chat, or consult proactive reach-out gates.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -19,8 +22,15 @@ from memgarden import dreaming as mg_dreaming
 from memory import service as memory_service
 from proactive import capture_jobs
 
+log = logging.getLogger(__name__)
+
 DREAM_STATE_KIND = "dream_state"
 DREAM_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
+# Worker-side "nothing to consolidate" verdicts that may arm the skip ledger.
+# Same content-free vocabulary as the tick reasons below (the kernel's
+# ``needs_dream``); anything else a status patch calls "skipped" leaves the
+# ledger untouched so it can never silence Dream for a day by accident.
+DREAM_SKIP_REASONS = frozenset({"not_enough_new_cards"})
 # One hour keeps a stalled scheduler visible within a bounded diagnostic window
 # while collapsing a stable 45-second client poll to at most 24 traces/user/day.
 DREAM_TRACE_HEARTBEAT_SEC = 3600.0
@@ -69,6 +79,167 @@ def night_end_hour() -> int:
     return _env_int("FEEDLING_DREAM_NIGHT_END_HOUR", 5, lo=0, hi=23)
 
 
+# ---------------------------------------------------------------------------
+# Night-burst protection (prod 09-10 / 09-13): every user's Dream used to become
+# due at the same second (window start), and the burst of whole-garden card
+# reads coincided with fleet-wide enclave decrypt timeouts. Two independent
+# guards, both kill switches rather than feature gates:
+#
+# 1. Stagger — each user gets an offset into the night window, derived from the
+#    user id and tonight's local date (same value every tick, process and restart
+#    within one night; a different slot next night, so under saturation the users
+#    stuck in late slots rotate instead of the same ones losing every night).
+# 2. Admission ceiling — no new Dream is enqueued while the fleet already has
+#    ``dream_max_concurrent()`` Dream jobs queued or running (V1 queued/running +
+#    V2 recently pending/claimed/running; see ``active_dream_job_count``), counted
+#    and enqueued under one fleet-wide lock (``_admission_slot``).
+#
+# ``force`` (a user-requested organize) bypasses both, like every other gate.
+# ---------------------------------------------------------------------------
+
+#: The tail of the window kept free of first attempts, so a first run that
+#: fails still has room for the failure-backoff retries (600s base, doubling:
+#: 10 + 20 + 40 min = 70 min) plus a run, before the window closes. Never more
+#: than half the window, so short custom windows still stagger.
+DREAM_STAGGER_TAIL_MARGIN_SEC = 5400
+#: A V1 Dream job created longer ago than this no longer counts toward the
+#: admission ceiling. A resident Dream is at most a couple of 300s agent turns;
+#: an hour-old active row is an orphan (consumer gone), not load.
+#: It also bounds a *pending* V2 Dream's slot: V2 has no pending expiry for this
+#: lane (no queue deadline; the reaper's pending TTL is chat-only). Trade-off: a
+#: stalled V2 queue blocks admission for up to this long.
+DREAM_ADMISSION_LEGACY_HORIZON_SEC = 3600.0
+#: Default ceiling. The enclave serves decrypts from 4 GIL-bound worker
+#: processes (FEEDLING_ENCLAVE_WORKERS=4 in the prod compose), and a Dream's
+#: card read decrypts the whole garden in one burst; Runtime V2 likewise bounds
+#: one worker instance's enclave requests at 4. More than 4 simultaneous Dreams
+#: can therefore occupy every decrypt worker at once and starve foreground reads.
+DREAM_MAX_CONCURRENT_DEFAULT = 4
+#: Plus ``pending`` V2 Dreams within the horizon: the pool claims them as soon as
+#: it has room, so leaving them out let a burst far past the ceiling (Codex review
+#: 2026-09-15); counting them forever let a stalled queue block Dream fleet-wide.
+_V2_ADMISSION_JOB_STATUSES = ("claimed", "running")
+
+
+def stagger_enabled() -> bool:
+    return _env_bool("FEEDLING_DREAM_STAGGER", True)
+
+
+def dream_max_concurrent() -> int:
+    """0 disables the admission ceiling (kill switch)."""
+    return _env_int("FEEDLING_DREAM_MAX_CONCURRENT", DREAM_MAX_CONCURRENT_DEFAULT, lo=0, hi=10000)
+
+
+def _night_window_len_sec() -> int:
+    start = night_start_hour()
+    end = night_end_hour()
+    if start == end:
+        return 0
+    return ((end - start) % 24) * 3600
+
+
+def dream_stagger_span_sec() -> int:
+    """Seconds from window start over which first attempts are spread."""
+    window = _night_window_len_sec()
+    return max(0, window - min(DREAM_STAGGER_TAIL_MARGIN_SEC, window // 2))
+
+
+def dream_stagger_offset_sec(user_id: str, night: str = "") -> int:
+    """Per-user offset into the night window, in ``[0, span)``.
+
+    A hash of the user id and the night's local date (``night``, ``YYYY-MM-DD``
+    of the evening the window opened) — never the clock within a night or a
+    random draw — so every tick, process and restart agrees on tonight's slot,
+    while the slot rotates from night to night. A fixed per-user slot would let
+    the same late-slot users lose to the admission ceiling every night.
+    """
+    span = dream_stagger_span_sec()
+    if span <= 0:
+        return 0
+    digest = hashlib.sha256(f"feedling-dream-stagger:{user_id}:{night}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % span
+
+
+def _seconds_into_night_window(store, *, now: float) -> int:
+    """Local wall-clock seconds since tonight's window opened (caller has
+    already established that ``now`` is inside the window)."""
+    local_dt = datetime.fromtimestamp(now, timezone.utc).astimezone(_timezone_for_store(store))
+    since_midnight = local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+    return (since_midnight - night_start_hour() * 3600) % 86400
+
+
+def _night_key(store, *, now: float) -> str:
+    """Local date on which tonight's window opened (``now`` inside the window).
+
+    A 23:00–02:00 window keeps one key across midnight.
+    """
+    local_dt = datetime.fromtimestamp(now, timezone.utc).astimezone(_timezone_for_store(store))
+    opened = local_dt - timedelta(seconds=_seconds_into_night_window(store, now=now))
+    return opened.date().isoformat()
+
+
+def _stagger_not_due(store, *, now: float) -> bool:
+    if not stagger_enabled():
+        return False
+    offset = dream_stagger_offset_sec(str(store.user_id), _night_key(store, now=now))
+    return _seconds_into_night_window(store, now=now) < offset
+
+
+def active_dream_job_count() -> int:
+    """Fleet Dream jobs that hold an admission slot.
+
+    - V1: active ``memory_dream`` rows created within the orphan horizon. A V1
+      job is only ever claimed by a live consumer shortly after it is queued, so
+      pending and claimed both count; the horizon retires orphans.
+    - V2: claimed/running + in-horizon pending — see ``_V2_ADMISSION_JOB_STATUSES``.
+
+    The orphan horizon is measured on server time, and scheduler-enqueued V1
+    rows carry server time too (``_tick_memory_dream``): the decision ``now`` of
+    a tick may come from a client and must not be able to hide or pin load.
+    """
+    return db.memory_dream_active_job_count(
+        legacy_since_epoch=time.time() - DREAM_ADMISSION_LEGACY_HORIZON_SEC,
+        legacy_active_statuses=sorted(capture_jobs.CAPTURE_ACTIVE_STATUSES),
+        v2_active_statuses=list(_V2_ADMISSION_JOB_STATUSES),
+        v2_pending_horizon_sec=DREAM_ADMISSION_LEGACY_HORIZON_SEC,
+    )
+
+
+def _admission_ceiling_reached() -> bool:
+    cap = dream_max_concurrent()
+    if cap <= 0:
+        return False
+    try:
+        active = active_dream_job_count()
+    except Exception as exc:  # noqa: BLE001 — a failed count must not stop Dream
+        log.warning("dream admission count failed; admitting: %s", type(exc).__name__)
+        return False
+    return active >= cap
+
+
+@contextlib.contextmanager
+def _admission_slot(*, force: bool):
+    """Yield ``None`` (may enqueue, body runs under the fleet lock — see
+    ``db.memory_dream_admission_lock``) or the skip reason. ``force`` / the ``0``
+    kill switch take no lock; a DB error on the lock admits (like a failed count);
+    a lock held elsewhere answers ``dream_admission_busy`` (retry next tick)."""
+    if force or dream_max_concurrent() <= 0:
+        yield None
+        return
+    with contextlib.ExitStack() as stack:
+        try:
+            held = stack.enter_context(db.memory_dream_admission_lock())
+        except Exception as exc:  # noqa: BLE001 — a failed lock must not stop Dream
+            log.warning("dream admission lock unavailable; admitting: %s", type(exc).__name__)
+            held = None
+        if held is False:
+            yield "dream_admission_busy"
+        elif _admission_ceiling_reached():
+            yield "dream_concurrency_cap"
+        else:
+            yield None
+
+
 def _now_iso(now: float | None = None) -> str:
     ts = time.time() if now is None else float(now)
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -114,6 +285,15 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "pending_dream_key": str(doc.get("pending_dream_key") or "")[:240],
         "dream_fail_streak": max(0, _safe_int(doc.get("dream_fail_streak"), 0)),
         "last_dream_failed_at": _safe_float(doc.get("last_dream_failed_at"), 0.0),
+        # A Dream job that ran but had nothing to consolidate (garden below the
+        # kernel minimum). Neither a success (the consolidation ledger above is
+        # untouched) nor a failure (no backoff streak); it only spaces retries.
+        "last_dream_skipped_at": _safe_float(doc.get("last_dream_skipped_at"), 0.0),
+        "last_dream_skip_reason": (
+            str(doc.get("last_dream_skip_reason") or "")
+            if str(doc.get("last_dream_skip_reason") or "") in DREAM_SKIP_REASONS
+            else ""
+        ),
         "last_dream_trace_reason": str(doc.get("last_dream_trace_reason") or "")[:120],
         "last_dream_trace_at": _safe_float(doc.get("last_dream_trace_at"), 0.0),
         "updated_at": str(doc.get("updated_at") or "")[:80],
@@ -124,10 +304,39 @@ def load_dream_state(store) -> dict[str, Any]:
     return _state_doc(db.get_blob(store.user_id, DREAM_STATE_KIND))
 
 
-def save_dream_state(store, state: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
+#: The consolidation ledger: only a completed Dream sets these
+#: (``record_dream_job_status``). ``proactive/dream_ledger_audit.LEDGER_FIELDS``
+#: must name the same keys (pinned by a test).
+DREAM_LEDGER_FIELDS = (
+    "last_dream_completed_at",
+    "last_dream_organized_count",
+    "last_dream_merged_count",
+    "last_dreamed_card_count",
+    "last_dreamed_seed_card_count",
+    "last_dreamed_turn_count",
+    "last_dream_signature",
+    "last_dreamed_until",
+)
+
+
+def save_dream_state(
+    store, state: Mapping[str, Any], *, now: float | None = None, ledger: bool = False,
+) -> dict[str, Any]:
+    """Persist ``state`` as one atomic top-level merge; returns the normalised doc.
+
+    Every caller reads the blob, edits a few keys and saves. A full write would
+    put back everything that read saw — including ledger fields an operator
+    repair (``admin/dream_ledger_repair.py``) rewound in between, while a Dream
+    job's status was being recorded. So the ledger is only written by a writer
+    that sets it (``ledger=True``: a completion); every other key is written as
+    before.
+    """
     doc = _state_doc(state)
     doc["updated_at"] = _now_iso(now)
-    db.set_blob(store.user_id, DREAM_STATE_KIND, doc)
+    patch = doc if ledger else {
+        key: value for key, value in doc.items() if key not in DREAM_LEDGER_FIELDS
+    }
+    db.patch_blob_strict(store.user_id, DREAM_STATE_KIND, patch)
     return doc
 
 
@@ -232,11 +441,51 @@ def tick_memory_dream(
     outcome = _tick_memory_dream(store, now=now_ts, force=force, submit=submit)
     trace_now = _trace_now()
     try:
+        _emit_window_missed_at_cap(store, outcome)
+    except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
+        pass
+    try:
         _emit_dream_trace(store, outcome, duration_ms=(time.monotonic() - started) * 1000.0,
                           forced=bool(force), now=trace_now)
     except Exception:  # noqa: BLE001 — 观测失败绝不能挡住做梦
         pass
     return outcome
+
+
+def _emit_window_missed_at_cap(store, outcome: Mapping[str, Any]) -> None:
+    """A due user was still held by the admission ceiling when the window closed.
+
+    The trace cursor always holds the previous tick's reason (a reason change is
+    always traced), so ``dream_concurrency_cap`` → ``night_not_due`` means the
+    user was due and capped until the window ended. ``dream_admission_busy``
+    (the fleet admission lock held by another tick) is the same "due but not
+    admitted" outcome, so it counts too: a user whose last in-window decision
+    was busy also went without Dream tonight. Fires once per such transition;
+    content-free (reason codes only).
+    """
+    if str(outcome.get("reason") or "") != "night_not_due":
+        return
+    state = _state_doc(outcome.get("state"))
+    last_reason = str(state.get("last_dream_trace_reason") or "")
+    if last_reason not in _ADMISSION_HELD_REASONS:
+        return
+    log.warning(
+        "dream window closed while user was still not admitted: user=%s reason=%s",
+        store.user_id, last_reason,
+    )
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.dream.window_missed", actor="backend",
+        status="warning",
+        summary="夜间窗口结束时仍被做梦准入挡住，今晚未做梦",
+        explain=(f"上一次判定是 {last_reason}、这一次窗口已关。"
+                 "只记理由码，不含卡片内容。"),
+        detail={"reason": f"{last_reason}_at_window_end",
+                "max_concurrent": dream_max_concurrent()},
+    )
+
+
+#: 「到点了但没被准入」的两种判定：并发上限满了 / 准入锁被别的 tick 占着。
+_ADMISSION_HELD_REASONS = frozenset({"dream_concurrency_cap", "dream_admission_busy"})
 
 
 def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
@@ -300,6 +549,7 @@ def _emit_dream_trace(store, outcome: Mapping[str, Any], *, duration_ms: float,
 _EXPECTED_SKIP_REASONS = frozenset({
     "dream_disabled", "no_memory_cards", "dream_already_pending",
     "night_not_due", "min_interval", "not_enough_new_cards", "already_dreamed",
+    "dream_stagger_not_due", "dream_concurrency_cap", "dream_admission_busy",
 })
 
 
@@ -325,6 +575,10 @@ def _tick_memory_dream(
         state = save_dream_state(store, state, now=now_ts)
     if not force and night_only() and not _within_night_window(store, now=now_ts):
         return {"enqueued": False, "reason": "night_not_due", "state": state, "job": None, "snapshot": snapshot}
+    # Stagger refines the night window (it has no meaning without one): inside the
+    # window, this user's first attempt waits for its stable per-user offset.
+    if not force and night_only() and _stagger_not_due(store, now=now_ts):
+        return {"enqueued": False, "reason": "dream_stagger_not_due", "state": state, "job": None, "snapshot": snapshot}
     # 失败退避（同 capture）：min_interval 只看上次成功，对永远失败的 dream
     # （坏 BYOK key）不生效，会退化成每 tick 重试。force 绕过。
     if not force and capture_jobs.in_failure_backoff(
@@ -333,6 +587,19 @@ def _tick_memory_dream(
         now_ts,
     ):
         return {"enqueued": False, "reason": "failure_backoff", "state": state, "job": None, "snapshot": snapshot}
+    # A recent worker skip ("garden too small to consolidate") spaces the next
+    # attempt like a completion would, without pretending a dream happened:
+    # the consolidation ledger stays untouched, so once the garden grows the
+    # next night's run is a real one. force bypasses.
+    skip_reason = str(state.get("last_dream_skip_reason") or "")
+    last_skipped = _safe_float(state.get("last_dream_skipped_at"), 0.0)
+    if (
+        not force
+        and skip_reason
+        and last_skipped
+        and now_ts - last_skipped < min_interval_sec()
+    ):
+        return {"enqueued": False, "reason": skip_reason, "state": state, "job": None, "snapshot": snapshot}
     last_turn_count = max(0, int(state.get("last_dreamed_turn_count") or 0))
 
     # 「值不值得整理」的判据在内核 —— 只数种子卡、比指纹，不看时间不看内容。
@@ -377,51 +644,68 @@ def _tick_memory_dream(
             "new_turns": 0,
         }
 
-    # Chat turns do not decide whether a dream is needed. Count them only for
-    # a real enqueue candidate, where they remain part of the legacy job stats
-    # and idempotency material without creating a periodic history-sized read.
-    turn_count = max(0, _live_user_turn_count(store))
-    snapshot = dict(snapshot)
-    snapshot["turn_count"] = turn_count
-    new_turns = max(0, turn_count - last_turn_count)
-    key = dream_key_for_snapshot(state, snapshot)
-    trigger = "force_dream" if force else "nightly_dream"
-    # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为
-    # （append 进 legacy proactive_jobs 流）。V2 的 scheduler 传入一个把 job 塞进
-    # agent_jobs 的 submitter —— 上面的所有早退（disabled / no_memory_cards /
-    # dream_already_pending / night_not_due / failure_backoff / already_dreamed /
-    # min_interval / not_enough_new_cards）原样复用，零漂移。submit 的返回值
-    # 直接就是这个函数的 enqueue 结果，形状与 legacy 分支一致。
-    if submit is not None:
-        submitted = submit(store, trigger=trigger, now=now_ts)
-        job = submitted.get("job")
-        enqueued = bool(submitted.get("enqueued"))
-        reason = submitted.get("reason")
-    else:
-        stats = {
-            "card_count": card_count,
-            "new_cards": new_cards,
-            "new_turns": new_turns,
-            "last_dreamed_card_count": max(0, int(state.get("last_dreamed_card_count") or 0)),
-            "last_dreamed_seed_card_count": max(
-                0, int(state.get("last_dreamed_seed_card_count") or 0)
-            ),
-            "seed_card_count": max(0, int(snapshot.get("seed_card_count") or 0)),
-            "last_dreamed_turn_count": last_turn_count,
-            "turn_count": turn_count,
-            "signature": snapshot.get("signature") or "",
-        }
-        job, enqueued, reason = capture_jobs.enqueue_memory_dream_job(
-            store,
-            trigger=trigger,
-            dream_key=key,
-            dream_until={
+    # Fleet admission ceiling — last, so only genuine enqueue candidates pay for
+    # the count. Count + enqueue are one decision under a fleet-wide lock, else
+    # concurrent producers (V1 ticks, the V2 scheduler) all take one free slot.
+    with _admission_slot(force=force) as admission_skip:
+        if admission_skip is not None:
+            return {
+                "enqueued": False,
+                "reason": admission_skip,
+                "state": state,
+                "job": None,
+                "snapshot": snapshot,
+                "new_cards": new_cards,
+                "new_turns": 0,
+            }
+
+        # Chat turns do not decide whether a dream is needed. Count them only for
+        # a real enqueue candidate, where they remain part of the legacy job stats
+        # and idempotency material without creating a periodic history-sized read.
+        turn_count = max(0, _live_user_turn_count(store))
+        snapshot = dict(snapshot)
+        snapshot["turn_count"] = turn_count
+        new_turns = max(0, turn_count - last_turn_count)
+        key = dream_key_for_snapshot(state, snapshot)
+        trigger = "force_dream" if force else "nightly_dream"
+        # V2 seam（同 capture_scheduler.tick_quiet_capture）：默认 None = 今天的行为
+        # （append 进 legacy proactive_jobs 流）。V2 的 scheduler 传入一个把 job 塞进
+        # agent_jobs 的 submitter —— 上面的所有早退（disabled / no_memory_cards /
+        # dream_already_pending / night_not_due / failure_backoff / already_dreamed /
+        # min_interval / not_enough_new_cards）原样复用，零漂移。submit 的返回值
+        # 直接就是这个函数的 enqueue 结果，形状与 legacy 分支一致。
+        if submit is not None:
+            submitted = submit(store, trigger=trigger, now=now_ts)
+            job = submitted.get("job")
+            enqueued = bool(submitted.get("enqueued"))
+            reason = submitted.get("reason")
+        else:
+            stats = {
+                "card_count": card_count,
+                "new_cards": new_cards,
+                "new_turns": new_turns,
+                "last_dreamed_card_count": max(0, int(state.get("last_dreamed_card_count") or 0)),
+                "last_dreamed_seed_card_count": max(
+                    0, int(state.get("last_dreamed_seed_card_count") or 0)
+                ),
+                "seed_card_count": max(0, int(snapshot.get("seed_card_count") or 0)),
+                "last_dreamed_turn_count": last_turn_count,
+                "turn_count": turn_count,
                 "signature": snapshot.get("signature") or "",
-                "last_until": snapshot.get("last_until") or "",
-            },
-            dream_stats=stats,
-            now=now_ts,
-        )
+            }
+            job, enqueued, reason = capture_jobs.enqueue_memory_dream_job(
+                store,
+                trigger=trigger,
+                dream_key=key,
+                dream_until={
+                    "signature": snapshot.get("signature") or "",
+                    "last_until": snapshot.get("last_until") or "",
+                },
+                dream_stats=stats,
+                # Server time, not the (possibly client-supplied) decision ``now``:
+                # the row's ts is what the admission ceiling's orphan horizon reads.
+                now=_trace_now(),
+            )
     # Only arm pending for a genuinely in-flight job (mirror capture fix): arming on
     # a terminal duplicate is what caused the permanent dream_already_pending lock.
     if job is not None and (enqueued or capture_jobs._active_dream_job(job)):
@@ -436,6 +720,63 @@ def _tick_memory_dream(
         "new_cards": new_cards,
         "new_turns": new_turns,
     }
+
+
+#: Resident "no cards" completion. Consumers before the strict Dream read also
+#: sent it when the card read itself failed (timeout/5xx swallowed into ``{}``).
+LEGACY_NO_CARDS_REASON = "dream_no_cards_available"
+#: Content-free failure code for a Dream whose card read failed (V1 and V2).
+CONTEXT_UNAVAILABLE_REASON = "dream_context_unavailable"
+
+
+def reclassify_unverified_no_cards_completion(
+    store, job: Mapping[str, Any] | None, patch: dict[str, Any]
+) -> dict[str, Any]:
+    """Turn an old consumer's "no cards" completion into a read failure when the
+    garden provably has cards.
+
+    Before the strict read, a resident consumer answered a timed-out card read
+    with ``completed`` + ``dream_no_cards_available``. Recording that as a
+    completion advances the Dream ledger, and the scheduler then answers
+    ``already_dreamed`` until enough new cards arrive (prod, 09-10 / 09-13).
+    Current consumers mark a genuinely empty read with
+    ``dream_result.cards_read == "empty"``; only unmarked reports are checked,
+    against the same live, owner-scoped card count the scheduler enqueues on
+    (a Dream is only ever enqueued with ``card_count > 0``). Any doubt — marker
+    present, zero live cards, or the count itself failing — keeps the patch
+    exactly as sent.
+    """
+    if not capture_jobs.is_memory_dream_job(job):
+        return patch
+    if str(patch.get("status") or "") != "completed":
+        return patch
+    dream_result = patch.get("dream_result") if isinstance(patch.get("dream_result"), Mapping) else {}
+    reasons = {
+        str(patch.get("status_reason") or ""),
+        str(patch.get("noop_reason") or ""),
+        str(dream_result.get("reason") or ""),
+    }
+    if LEGACY_NO_CARDS_REASON not in reasons or dream_result.get("cards_read") == "empty":
+        return patch
+    try:
+        card_count = int(_dream_snapshot(store).get("card_count") or 0)
+    except Exception:  # noqa: BLE001 — a failed count must not change what the consumer said
+        return patch
+    if card_count <= 0:
+        return patch
+    rewritten = {
+        key: value for key, value in patch.items() if key != "completed_at"
+    }
+    rewritten["status"] = "failed"
+    rewritten["failed_at"] = patch.get("completed_at") or datetime.now().isoformat()
+    rewritten["status_reason"] = CONTEXT_UNAVAILABLE_REASON
+    rewritten["noop_reason"] = CONTEXT_UNAVAILABLE_REASON
+    rewritten["dream_result"] = {
+        **dict(dream_result),
+        "status": "failed",
+        "reason": CONTEXT_UNAVAILABLE_REASON,
+    }
+    return rewritten
 
 
 def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
@@ -483,11 +824,18 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         state["last_dreamed_until"] = str(until.get("last_until") or "")[:240]
         state["dream_fail_streak"] = 0
         state["last_dream_failed_at"] = 0.0
+        state["last_dream_skipped_at"] = 0.0
+        state["last_dream_skip_reason"] = ""
+    elif status_text == "skipped":
+        skip_reason = str(job.get("dream_skip_reason") or "").strip()
+        if skip_reason in DREAM_SKIP_REASONS:
+            state["last_dream_skipped_at"] = now_ts
+            state["last_dream_skip_reason"] = skip_reason
     elif status_text == "failed":
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         state["dream_fail_streak"] = int(state.get("dream_fail_streak") or 0) + 1
         state["last_dream_failed_at"] = now_ts
-    state = save_dream_state(store, state, now=now_ts)
+    state = save_dream_state(store, state, now=now_ts, ledger=status_text == "completed")
     capture_jobs.notify_backoff(store, lane="dream", status=status_text,
                                 streak=int(state.get("dream_fail_streak") or 0))
     return state

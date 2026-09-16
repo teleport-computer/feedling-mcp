@@ -37,7 +37,17 @@ BOX_SEAL_INFO = b"feedling-box-seal-v1"
 DEFAULT_TRACE_QUERY = "我不是服务端，我想看流程和例子，知道这次 memory 改动真实发生了什么，数据怎么流动。"
 
 sys.path.insert(0, str(ROOT / "backend"))
-from memgarden.scoring.selector import select_memory_index_items  # noqa: E402
+from memgarden import retrieval  # noqa: E402
+
+
+def _select_for_trace(query: str, items: list[dict], *, cap: int) -> dict:
+    """Pick ids to fetch with memgarden's ranker (default tokenizer; the enclave uses jieba)."""
+    result = retrieval.rank(query, items, limit=cap)
+    return {"selected_ids": result.ids, "trace": {
+        "selected": [{"id": hit.id, "score": round(hit.score, 4), "confidence": f"coverage={hit.coverage}",
+                      "reason": "bm25_match"} for hit in result.hits],
+        "skipped_sample": [],
+    }}
 
 
 def _run(cmd: list[str], *, env: dict[str, str], check: bool = True) -> subprocess.CompletedProcess:
@@ -209,7 +219,7 @@ def main() -> int:
         _seed_memories(args.backend_url, api_key, user_id, enclave_pk)
 
         index = _post(f"{args.backend_url}/v1/memory/index", api_key, {"limit": 10})
-        selection = select_memory_index_items(args.trace_query, index.get("items", []), cap=3)
+        selection = _select_for_trace(args.trace_query, index.get("items", []), cap=3)
         fetch_ids = selection["selected_ids"]
         fetch = _post(f"{args.backend_url}/v1/memory/fetch", api_key, {"ids": fetch_ids})
 

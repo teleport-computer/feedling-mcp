@@ -1077,16 +1077,15 @@ def test_wire_assembly_injects_envelope_pubkey_getter():
     )
 
 
-def test_wire_assembly_makes_off_account_v2_writes_plaintext(monkeypatch):
+@pytest.mark.parametrize("stored", ["off", "on"])
+def test_wire_assembly_makes_known_account_v2_writes_plaintext(backend_env, monkeypatch, stored):
     from accounts import registry as accounts_registry
     from core import envelope as core_envelope
 
+    from conftest import seed_user
+
+    seed_user("u_v2_plain", content_encryption=stored)
     monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
-    monkeypatch.setattr(
-        accounts_registry,
-        "_get_user_content_encryption",
-        lambda user_id: "off" if user_id == "u_v2_plain" else None,
-    )
     serve_worker.wire_assembly()
 
     envelope, error = core_envelope._build_shared_envelope_for_store(
@@ -1102,6 +1101,10 @@ def test_wire_assembly_makes_off_account_v2_writes_plaintext(monkeypatch):
         "owner_user_id": "u_v2_plain",
         "visibility": "shared",
     }
+    trajectory = serve_worker._seal_trajectory_payload("u_v2_plain", b"\x00\xff", "trajectory")
+    assert trajectory["body"] == jobs_store.TRAJECTORY_PLAINTEXT_B64_PREFIX + "AP8="
+    assert "body_ct" not in trajectory
+    assert accounts_registry._get_user_content_encryption("u_v2_plain") == stored
 
 
 def test_plaintext_trajectory_round_trips_compressed_binary(monkeypatch):

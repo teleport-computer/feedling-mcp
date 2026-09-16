@@ -1735,7 +1735,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     "MemoryIndexRequest": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "maxLength": 500, "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Blank/omitted: existing index browsing."},
+            "query": {"type": "string", "maxLength": 500, "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Very common words (stopwords) are ignored, and a card is returned only when it covers enough of the query (or has strong evidence such as a rare identifier); a query nothing matches returns no items, never filler. Blank/omitted: existing index browsing."},
             "limit": {"type": "integer", "minimum": 0, "description": "0 or omitted requests the deployment hard cap."},
             "bucket": {"type": "string", "maxLength": 120},
             "thread": {"type": "string", "maxLength": 120},
@@ -1754,8 +1754,8 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "limit": {"type": "integer", "minimum": 1},
             "truncated": {"type": "boolean", "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."},
             "user_card_count": {"type": "integer", "minimum": 0},
-            "ranking": {"type": "string", "enum": ["bm25-jieba-0.42.1-v1", "substring-legacy"],
-                        "description": "Present for nonblank query. substring-legacy explicitly marks a recognized older enclave response during rolling upgrades."},
+            "ranking": {"type": "string", "enum": ["memgarden-bm25-v2+tok:jieba-0.42.1", "memgarden-bm25-v1+tok:jieba-0.42.1", "bm25-jieba-0.42.1-v1", "substring-legacy"],
+                        "description": "Present for nonblank query. memgarden-bm25-v2+tok:jieba-0.42.1 is the current ranker (shared with automatic recall). memgarden-bm25-v1+tok:jieba-0.42.1, bm25-jieba-0.42.1-v1 and substring-legacy explicitly mark older rankers answered during rolling upgrades."},
             "unavailable_count": {"type": "integer", "minimum": 0,
                                   "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."},
         },
@@ -2701,13 +2701,13 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "readable one-hop id/summary pointers; related_status distinguishes complete, "
         "bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
     ),
-    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
+    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409).",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
     ("post", "/v1/users/register"): "Create a Feedling user and issue its first API key. The key is returned once and this operation is not idempotent.",
-    ("get", "/v1/users/whoami"): "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference.",
-    ("post", "/v1/users/preferences"): "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes.",
+    ("get", "/v1/users/whoami"): 'Return the authenticated user\'s identifiers, registered content public key, attested decrypt-service material, and preferences. content_encryption is a compatibility field reporting "off" for known users, including accounts with a legacy stored "on" preference. content_encryption_effective is the write shape: "off" for every known user when plaintext writes are enabled, otherwise "on". Unknown users remain fail-safe "on". Treat an absent, empty, or unrecognized effective value as "on". Legacy preferences and existing ciphertext are not rewritten; local_only still requires encryption.',
+    ("post", "/v1/users/preferences"): 'Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption ("off", or null/empty to clear). Requesting "on" returns HTTP 400 content_encryption_on_not_supported before any preferences are written; other invalid values also return 400. The response content_encryption is always "off". Legacy stored "on" does not control new writes and is not rewritten by reads or unrelated preference updates. Existing ciphertext is not converted. Use content_encryption_effective from /v1/users/whoami for the deployment-gated write shape; local_only still requires encryption.',
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",
@@ -3196,10 +3196,25 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         }
     },
     ("post", "/v1/memory/add"): {
+        "200": {
+            "description": (
+                "Replay: a card with this envelope id is already stored with exactly "
+                "this ciphertext. Nothing is written; the stored card is returned with "
+                "replayed: true."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
         "201": {
             "description": "Encrypted memory created.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        }
+        },
+        "409": {
+            "description": (
+                "memory_id_conflict: the envelope id already belongs to a different "
+                "stored card. The stored card is unchanged and neither card is echoed."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
     ("post", "/v1/onboarding/archive"): {
         "201": {
@@ -3477,7 +3492,6 @@ def apply_public_contracts(schema: dict[str, Any]) -> dict[str, Any]:
                     ("post", "/v1/users/register"),
                     ("post", "/v1/access/link-token"),
                     ("post", "/v1/access/claim-token"),
-                    ("post", "/v1/memory/add"),
                     ("post", "/v1/onboarding/archive"),
                     ("post", "/v1/diagnostics/logs"),
                     ("post", "/v1/identity/init"),
