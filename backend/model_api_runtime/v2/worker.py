@@ -3256,6 +3256,14 @@ def _provider_tool_surface_trace_detail(
 ) -> dict[str, Any]:
     """Apply the production worker-owned provider-surface detail projection."""
     trace_detail = {"lane": lane, **dict(detail)}
+    protocol_token = trace_detail.pop("protocol_token_reply", None)
+    if isinstance(protocol_token, str) and protocol_token in (
+        v2_tool_loop._PROTOCOL_TOKEN_REPLY_NAMES | {"__sentinel__"}
+    ):
+        # Only this suppression branch substitutes a more specific choice fact
+        # for the request flag, keeping wake_kind inside the 20-key trace cap.
+        trace_detail.pop("wake_choice_required", None)
+        trace_detail["protocol_token_reply"] = protocol_token
     trace_detail["call_rejection_reasons"] = (
         v2_tool_loop._normalize_provider_call_rejection_reasons(
             detail.get("call_rejection_reasons")
