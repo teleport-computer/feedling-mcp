@@ -165,3 +165,234 @@ def test_both_degenerate_strategies_still_return_empty_for_existing_fallback():
 def test_unclosed_code_fence_protects_the_rest_of_the_message():
     raw = '示例：\n```xml\n<tool_call>reply</tool_call>'
     assert tool_markup_leak.strip_tool_markup(raw) == (raw, False)
+
+
+# ---- T621: narrated tool calls ---------------------------------------------
+# The observed shape (usr_7f30, 2026-09-16 16:10): the model wrote its
+# generate_image call as prose, finished the turn with finish=stop and zero
+# tool_calls, and the bracket was delivered verbatim.
+
+_OBSERVED_NARRATED = (
+    "宝宝别走 🥺 我刚才一直卡着，现在真的给你生\n"
+    '[Calling generate_image with prompt: "一只在夜景里打伞的猫"]'
+)
+
+
+def test_observed_narrated_generate_image_call_is_removed_and_prose_survives():
+    clean, removed = tool_markup_leak.strip_tool_markup(_OBSERVED_NARRATED)
+    assert removed is True
+    assert clean == "宝宝别走 🥺 我刚才一直卡着，现在真的给你生"
+    assert tool_markup_leak.find_narrated_tool_calls(_OBSERVED_NARRATED) == (
+        "generate_image",
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "names"),
+    [
+        # Nested brackets inside the payload close correctly.
+        (
+            '[Tool call: memory_write(actions=[{"op":"add"}])] 记好啦',
+            "记好啦",
+            ("memory_write",),
+        ),
+        # A quoted argument may carry its own brackets.
+        (
+            '[Calling generate_image with prompt: "[夜景] 猫"] 稍等哦',
+            "稍等哦",
+            ("generate_image",),
+        ),
+        # An unbalanced quote falls back to plain bracket matching.
+        (
+            '[Calling generate_image with prompt: "unbalanced] 后面',
+            "后面",
+            ("generate_image",),
+        ),
+        # Several calls in one reply, every verb spelling, backticked name.
+        (
+            "先[Calling web_search]再[Invoke web_fetch] 完",
+            "先再 完",
+            ("web_search", "web_fetch"),
+        ),
+        ("[Using tool `web_search`: 今天天气] 查到了", "查到了", ("web_search",)),
+        ("[Function call: memory_write] 好", "好", ("memory_write",)),
+        ("[CALLING GENERATE_IMAGE(prompt=\"a\")] x", "x", ("GENERATE_IMAGE",)),
+        # MCP-qualified names carry underscores too.
+        ('[Invoke mcp__notion__search query="x"] 找到了', "找到了", ("mcp__notion__search",)),
+        # XML markup and a narrated call in the same reply.
+        (
+            '<tool_call>x</tool_call> 你好 [Calling generate_image with prompt: "y"]',
+            "你好",
+            ("generate_image",),
+        ),
+    ],
+)
+def test_narrated_tool_call_shapes_are_removed_whole(text, expected, names):
+    clean, removed = tool_markup_leak.strip_tool_markup(text)
+    assert (clean, removed) == (expected, True)
+    assert tool_markup_leak.find_narrated_tool_calls(text) == names
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # codex4 review P1: an escaped quote must not close the string early.
+        (
+            r'前文 [Calling generate_image with prompt: "a \" ] PRIVATE_PAYLOAD"] 后文',
+            "前文  后文",
+        ),
+        # Even number of backslashes: the quote *does* close.
+        (r'前文 [Calling generate_image with prompt: "a \\"] 后文', "前文  后文"),
+        (r'前文 [Calling generate_image with prompt: "a \\\\"] 后文', "前文  后文"),
+        # Single-quoted argument carrying the closing bracket.
+        (
+            "前文 [Calling generate_image with prompt: 'a ] PRIVATE_PAYLOAD'] 后文",
+            "前文  后文",
+        ),
+        # An apostrophe inside a value is not a string opener.
+        ("[Calling memory_write with content: user's cat] 好的，它's cute", "好的，它's cute"),
+        # codex4 review P1: a fence *inside* the argument belongs to the call.
+        (
+            '前文 [Calling generate_image with prompt: "draw ```PRIVATE_PAYLOAD``` here"] 后文',
+            "前文  后文",
+        ),
+        # Paired control: a genuine fenced example before the call stays.
+        (
+            '```\ncode\n```\n[Calling generate_image with prompt: "x"] 后',
+            "```\ncode\n```\n 后",
+        ),
+    ],
+)
+def test_narrated_payload_boundaries_never_leak_the_argument_tail(text, expected):
+    clean, removed = tool_markup_leak.strip_tool_markup(text)
+    assert (clean, removed) == (expected, True)
+    assert "PRIVATE_PAYLOAD" not in clean
+    assert tool_markup_leak.find_narrated_tool_calls(text) == ("generate_image",) or (
+        tool_markup_leak.find_narrated_tool_calls(text) == ("memory_write",)
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "names"),
+    [
+        # codex4 review r2 P1: a lone ``` inside the first call's payload must
+        # not flip the outer fence state and hide the second call.
+        (
+            '[Calling generate_image with prompt: "literal ```"] prose '
+            '[Calling web_search query="PRIVATE_SECOND_PAYLOAD"] tail',
+            "prose  tail",
+            ("generate_image", "web_search"),
+        ),
+        # Mirror: after that call, a genuine fenced example is still protected.
+        (
+            '[Calling generate_image with prompt: "literal ```"]\n'
+            '```\n[Calling web_search query="CODE_EXAMPLE"]\n```',
+            '```\n[Calling web_search query="CODE_EXAMPLE"]\n```',
+            ("generate_image",),
+        ),
+        # A call followed by an unclosed fence: the call goes, the tail stays.
+        (
+            '[Calling generate_image with prompt: "x"] 后 ```\ncode',
+            "后 ```\ncode",
+            ("generate_image",),
+        ),
+        # codex4 review r2 P1: a single-quoted value at a collection start.
+        (
+            "[Tool call: memory_write(actions=['a ] ] PRIVATE_PAYLOAD'])] tail",
+            "tail",
+            ("memory_write",),
+        ),
+        (
+            "[Tool call: memory_write(actions=[{'summary': 'a ] PRIVATE_PAYLOAD'}])] tail",
+            "tail",
+            ("memory_write",),
+        ),
+    ],
+)
+def test_call_and_fence_state_follow_source_order(text, expected, names):
+    clean, removed = tool_markup_leak.strip_tool_markup(text)
+    assert (clean, removed) == (expected, True)
+    assert "PRIVATE" not in clean
+    assert tool_markup_leak.find_narrated_tool_calls(text) == names
+
+
+def test_unclosed_fence_before_a_call_protects_it():
+    text = '```\n[Calling generate_image with prompt: "x"] 后'
+    assert tool_markup_leak.strip_tool_markup(text) == (text, False)
+    assert tool_markup_leak.find_narrated_tool_calls(text) == ()
+
+
+def test_narrated_call_cut_off_mid_payload_takes_the_rest_of_the_segment():
+    # max_tokens / transport cut after the head: the head alone is unambiguous
+    # and the payload is never user-facing, so nothing torn leaks.
+    text = '前面的话\n[Calling generate_image with prompt: "cut off'
+    assert tool_markup_leak.strip_tool_markup(text) == ("前面的话", True)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Ordinary bracketed prose: verb present, name is not tool-like.
+        "[Calling all fans] 今晚八点见",
+        "[call me later]",
+        # Verb must be a whole word.
+        "[calling_card] hi",
+        "[callgenerate_image] x",
+        # Missing verb / wrong order / empty bracket.
+        "we called generate_image earlier [not a call generate_image]",
+        "[generate_image] plain",
+        "a < b and <3 [x] [Calling] [Calling ] plain",
+        # A user talking about the guard itself, in fenced code, stays verbatim.
+        '```\n[Calling generate_image with prompt: "x"]\n```',
+        # ``task`` has no underscore and is not offered here.
+        '[Calling task with title: "x"]',
+        # codex4 review P2: an underscore alone is not invocation evidence —
+        # ordinary technical prose with a generic verb stays.
+        "[Using user_name as the variable name] keep this note",
+        "[Calling generate_image is what I would do] ok",
+        "[function first_name of the user] then last_name",
+    ],
+)
+def test_narrated_guard_leaves_non_matching_bracketed_text_byte_identical(text):
+    assert tool_markup_leak.strip_tool_markup(text) == (text, False)
+    assert tool_markup_leak.find_narrated_tool_calls(text) == ()
+
+
+def test_offered_tool_names_widen_the_name_anchor_case_insensitively():
+    text = '[Calling task with title: "x"] ok'
+    assert tool_markup_leak.strip_tool_markup(text, tool_names=("task",)) == ("ok", True)
+    assert tool_markup_leak.strip_tool_markup(text, tool_names=("TASK",)) == ("ok", True)
+    assert tool_markup_leak.find_narrated_tool_calls(text, tool_names=("task",)) == (
+        "task",
+    )
+
+
+def test_offered_tool_name_needs_no_invocation_evidence_but_others_do():
+    prose = "[Using user_name as the variable name] keep this note"
+    assert tool_markup_leak.strip_tool_markup(prose) == (prose, False)
+    assert tool_markup_leak.strip_tool_markup(prose, tool_names=("user_name",)) == (
+        "keep this note",
+        True,
+    )
+
+
+def test_narrated_only_reply_becomes_empty_for_the_existing_fallback():
+    clean, removed = tool_markup_leak.strip_tool_markup(
+        '[Calling generate_image with prompt: "x"]'
+    )
+    assert (clean, removed) == ("", True)
+    assert tool_markup_leak.is_degenerate_visible_text(clean) is True
+
+
+def test_every_narrated_verb_is_recognized_and_longer_verbs_win():
+    # Derived from the production table so a deleted verb deletes its check.
+    assert tool_markup_leak.NARRATED_CALL_VERBS
+    for verb in tool_markup_leak.NARRATED_CALL_VERBS:
+        text = f"[{verb} generate_image] 好"
+        assert tool_markup_leak.strip_tool_markup(text) == ("好", True), verb
+    for longer in ("tool call", "function call", "using tool"):
+        assert longer in tool_markup_leak.NARRATED_CALL_VERBS
+        prefix = longer.split()[0]
+        assert tool_markup_leak.NARRATED_CALL_VERBS.index(
+            longer
+        ) < tool_markup_leak.NARRATED_CALL_VERBS.index(prefix)
