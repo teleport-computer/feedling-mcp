@@ -286,6 +286,15 @@ persona, user profile, memory summary, then chat history. Material status uses
 `queued`, `processing`, `failed`, or `done`; `cards` reports the durable mapped
 candidate count instead of a placeholder.
 
+Hosted Resident supervisors open a crash-loop circuit after five failures within
+30 minutes. While open, restart attempts use a fixed five-minute interval;
+ordinary restart backoff and the five-minute healthy reset remain unchanged.
+The consumer records only a closed startup reason and timestamp in its per-user
+`startup_exit.json`; the supervisor ignores missing, malformed or older records.
+Successful startup removes that file. Current startup exits belong to the
+system, so their spawn-failure notice does not blame the user's model settings.
+An unreachable decrypt source continues retrying within the live consumer.
+
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new
