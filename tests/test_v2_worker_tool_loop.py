@@ -1472,7 +1472,114 @@ def test_foreground_real_chain_strips_tool_markup_and_emits_content_free_trace(
         "final": True,
         "error_class": "upstream_unavailable",
         "reason": "tool_markup_leak_sanitized",
+        "narrated_tool_calls": 0,
     }
+
+
+def test_foreground_narrated_tool_call_is_stripped_before_delivery(monkeypatch):
+    """T621 (usr_7f30 2026-09-16 16:10): the model wrote its generate_image call
+    as prose — finish=stop, zero tool_calls — and the bracket reached the user
+    verbatim.  Same production chain as the markup test above: provider text ->
+    worker._on_reply -> durable bubble; the prose survives, the bracket does not,
+    and the trace counts the narrated call without carrying its payload."""
+    uid = "u_toolloop_narrated_tool_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-narrated-call")
+    _patch_real_write(monkeypatch)
+    prompt = "一只在夜景里打伞的猫"
+    narrated = (
+        "宝宝别走 🥺 我刚才一直卡着，现在真的给你生\n"
+        f'[Calling generate_image with prompt: "{prompt}"]'
+    )
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    traces = []
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "画一只猫"}]
+    )
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "宝宝别走 🥺 我刚才一直卡着，现在真的给你生"
+    ]
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"] == {
+        "lane": "chat",
+        "final": True,
+        "error_class": "upstream_unavailable",
+        "reason": "tool_markup_leak_sanitized",
+        "narrated_tool_calls": 1,
+    }
+    assert prompt not in repr(sanitized[0][1])
+
+
+def test_foreground_narrated_payload_with_bracket_inside_quotes_is_fully_removed(
+    monkeypatch,
+):
+    """codex4 review P1 on the delivery chain: an argument whose quoted value
+    carries ``]`` (escaped quote / fence inside) must not leave its tail in the
+    bubble; the prose on both sides survives."""
+    uid = "u_toolloop_narrated_payload_tail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-narrated-tail")
+    _patch_real_write(monkeypatch)
+    narrated = (
+        "前文 [Calling generate_image with prompt: "
+        '"draw \\" ] ```PRIVATE_PAYLOAD``` here"] 后文'
+    )
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "画一只猫"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == ["前文  后文"]
+    assert "PRIVATE_PAYLOAD" not in bodies[0]
+
+
+def test_foreground_offered_task_tool_widens_the_narrated_anchor(monkeypatch):
+    """``task`` is the one platform tool without an underscore; the worker feeds
+    the offered catalogue into the guard so ``[Calling task ...]`` is covered."""
+    uid = "u_toolloop_narrated_task_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-narrated-task")
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [_text_round('好，我来安排\n[Calling task with title: "提醒喝水"]')],
+    )
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "提醒我喝水"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["好，我来安排"]
 
 
 @pytest.mark.parametrize(
