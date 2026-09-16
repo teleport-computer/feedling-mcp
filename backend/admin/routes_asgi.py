@@ -63,7 +63,7 @@ class DataTrackQueryTimeout(RuntimeError):
     """A bounded data-track DB read exceeded its HTTP or PostgreSQL budget."""
 
 
-async def _run_data_track_db(fn, *args, timeout_seconds: float | None = None):
+async def _run_data_track_db(fn, *args, timeout_seconds: float | None = None, **kwargs):
     try:
         return await threadpool.run_db_bounded(
             fn,
@@ -73,6 +73,7 @@ async def _run_data_track_db(fn, *args, timeout_seconds: float | None = None):
                 if timeout_seconds is None
                 else timeout_seconds
             ),
+            **kwargs,
         )
     except (TimeoutError, QueryCanceled) as exc:
         raise DataTrackQueryTimeout from exc
@@ -805,6 +806,39 @@ async def lane_rollup(request: Request):
         until_day=(request.query_params.get("until_day") or "").strip(),
         limit=limit,
         offset=offset,
+    )
+    return JSONResponse(payload)
+
+
+_ENCLAVE_HEALTH_PARAMS = frozenset({"window_minutes", "end_epoch", "admin_key"})
+
+
+@router.get("/v1/admin/enclave-decrypt-health")
+async def enclave_decrypt_health(request: Request):
+    """Admin-only, content-free counts of recorded enclave terminal events."""
+    _require_admin(request)
+    unknown = sorted(set(request.query_params) - _ENCLAVE_HEALTH_PARAMS)
+    if unknown:
+        return JSONResponse({"error": "unknown_query_params", "params": unknown,
+                             "supported": ["end_epoch", "window_minutes"]}, status_code=400)
+    raw = request.query_params.get("window_minutes", "15").strip()
+    try:
+        window_minutes = int(raw)
+    except ValueError:
+        return JSONResponse({"error": "invalid_window_minutes"}, status_code=400)
+    if not 1 <= window_minutes <= 1440 or len(request.query_params.getlist("window_minutes")) > 1:
+        return JSONResponse({"error": "invalid_window_minutes"}, status_code=400)
+    now = None
+    if "end_epoch" in request.query_params:
+        try:
+            epoch = float(request.query_params["end_epoch"])
+            if not math.isfinite(epoch) or epoch < 0 or len(request.query_params.getlist("end_epoch")) > 1:
+                raise ValueError("invalid_end_epoch")
+            now = datetime.fromtimestamp(epoch, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return JSONResponse({"error": "invalid_end_epoch"}, status_code=400)
+    payload = await _run_data_track_db(
+        db.admin_enclave_decrypt_health, window_minutes, now=now,
     )
     return JSONResponse(payload)
 
