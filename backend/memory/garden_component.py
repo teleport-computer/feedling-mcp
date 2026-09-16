@@ -34,9 +34,9 @@ from typing import Any, Callable, Iterable, Mapping
 
 from memgarden import CaptureRequest, GardenComponent, MaintenanceRequest
 from memgarden.contracts import Step
+from memgarden.policies import CONVERSATION_CAPTURE
 
 from identity.user_naming import _naming_rule, sanitize_user_name
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 # io 的落卡档位（``IO_CONVERSATION_CAPTURE_POLICY``，max_cards=50）由调用点经
@@ -45,6 +45,9 @@ from memory.card_leak_signals import IO_LEAK_SIGNALS
 # （0.16.0 按对象 identity 选模板，replace 出来的同档 policy 会被误认）；
 # 0.20.1 起模板按 ``policy.name`` / 标志位渲染，垫片已删。
 # tests/test_garden_io_capture_policy.py 守着「上限真生效 + 不许再打补丁」。
+# 提示词继续要求「少而厚」；io 的日常落卡硬上限为 50 张，只防失控批次。
+# 从钉版 policy replace，确保 rubric 与其余行为逐字段保持原样。
+IO_CONVERSATION_CAPTURE_POLICY = dataclasses.replace(CONVERSATION_CAPTURE, max_cards=50)
 
 #: 打回重问最多一次。两条 runtime 共用 —— 各给各的次数，
 #: 同一个模型在托管和自建上会得到不同的重问行为。

@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from identity.user_naming import _naming_rule, sanitize_user_name  # noqa: E402,F401
 from memgarden.prompts import capture as kernel_capture  # noqa: E402
 from memgarden.prompts import dream as kernel_dream  # noqa: E402
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402,F401
+from memory.garden_component import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402,F401
 from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
 
 CAPTURE_TYPES = kernel_capture.CAPTURE_TYPES

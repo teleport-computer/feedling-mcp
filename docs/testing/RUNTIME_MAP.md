@@ -107,11 +107,12 @@ resident 侧才是 HTTP 客户端,POST `/v1/memory/*`。
 
 | prompt | 唯一实现 | 谁在用 |
 |---|---|---|
-| capture | `memgarden/prompts/capture.py`（外部包） | V2 + resident(都经 `GardenComponent` 的 capture / capture_session;请求只在 `memory/garden_component.capture_request` 构造:现有卡索引、io 称呼规则、档位 `memory/capture_prompt_v1.py`;生产提示词快照 `tests/test_capture_request_index_and_naming.py`) |
+| capture | `memgarden/prompts/capture.py`（外部包） | V2 + resident(都经 `GardenComponent` 的 capture / capture_session;请求只在 `memory/garden_component.capture_request` 构造:现有卡索引、io 称呼规则、同模块的档位常量 `IO_CONVERSATION_CAPTURE_POLICY`（50 张）;生产提示词快照 `tests/test_capture_request_index_and_naming.py`) |
 | dream | `memgarden/prompts/dream.py`（外部包） | V2 + resident(都经 `memory/garden_component.open_dream_session` → `maintenance_session`,整张卡带正文渲染) |
 | migrate | `memgarden/prompts/migrate.py`（外部包） | **只有 resident**;V2 侧无调用方,老壳 `memory/migrate_prompt_v1.py` 已在 `5e50e79e` 删除 |
 
-2026-09-15 起 `memory/dream_prompt_v1.py` 已删、`memory/capture_prompt_v1.py` 只剩 io 的落卡档位:
+截至 2026-09-16，`memory/dream_prompt_v1.py` 与 `memory/capture_prompt_v1.py` 均已删除，
+io 的落卡档位常量在 `memory/garden_component.py`：
 两条 runtime 不再直接调内核的提示词/解析函数,只 import memgarden 公开 API
 (守卫:`tests/test_memgarden_public_api_only.py`)。
 

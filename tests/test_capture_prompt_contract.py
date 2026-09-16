@@ -1,7 +1,7 @@
 """Unit tests for the 落卡 capture prompt + parser (A-full PR C, no DB).
 
-Pure-function coverage of capture_prompt_v1: prompt rendering and the agent
-reply parser (parse_capture_cards). DB-free so it runs anywhere.
+Prompt rendering and reply parsing with io policy and signals supplied by
+_memgarden_prompt_bindings. DB-free so it runs anywhere.
 """
 import json
 import sys
