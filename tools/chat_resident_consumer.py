@@ -49,6 +49,9 @@ CLI mode:
                         auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
+  FEEDLING_CLI_MAX_OUTPUT_BYTES
+                        Combined CLI stdout/stderr limit (default 67108864);
+                        positive bytes, invalid values keep the default.
   FEEDLING_AGENT_IMAGE_GENERATION
                         Set true only when the configured resident agent exposes
                         a callable native image-generation capability.
@@ -7079,6 +7082,24 @@ def _runtime_stream_observer(
     return None
 
 
+class CliOutputTooLarge(RuntimeError):
+    """A local capture limit; never retain the captured output on the exception."""
+
+    def __init__(self, limit: int, observed: int):
+        super().__init__("cli_output_too_large")
+        self.limit_bytes = limit
+        self.observed_bytes = observed
+
+
+def _cli_max_output_bytes() -> int:
+    default = 64 * 1024 * 1024
+    try:
+        value = int(os.environ.get("FEEDLING_CLI_MAX_OUTPUT_BYTES", str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _run_cli_subprocess(
     cmd: list[str],
     run_kwargs: dict,
@@ -7086,95 +7107,154 @@ def _run_cli_subprocess(
     stdout_line: Callable[[str], None] | None = None,
     cancellation: "_VoiceTurnCancellation | None" = None,
 ) -> subprocess.CompletedProcess:
-    if stdout_line is None and cancellation is None:
-        return subprocess.run(cmd, **run_kwargs)
+    import codecs
 
+    # Both streaming and non-streaming calls use bounded binary reads. readline
+    # alone can allocate an arbitrarily long JSONL record before we count it.
     kwargs = dict(run_kwargs)
     input_text = kwargs.pop("input", None)
     timeout = kwargs.pop("timeout", None)
     kwargs.pop("capture_output", None)
+    text_mode = kwargs.pop("text", False)
+    text_mode = kwargs.pop("universal_newlines", False) or text_mode
+    encoding = kwargs.pop("encoding", None)
+    errors = kwargs.pop("errors", None)
+    text_mode = bool(text_mode or encoding or errors)
+    encoding = encoding or "utf-8"
+    errors = errors or "strict"
+    limit = _cli_max_output_bytes()
     process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-        **kwargs,
+        cmd, stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs,
     )
-    stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
+    buffers = (bytearray(), bytearray())
+    output_lock = threading.Lock()
+    too_large = threading.Event()
+    reader_errors: list[Exception] = []
+    observed = 0
 
-    def _drain(stream, sink: list[str], callback=None) -> None:
-        if stream is None:
-            return
-        for line in iter(stream.readline, ""):
-            sink.append(line)
-            if callback is not None:
-                callback(line)
-        stream.close()
-
-    stdout_thread = threading.Thread(
-        target=_drain,
-        args=(process.stdout, stdout_parts, stdout_line),
-        name="feedling-agent-stdout",
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_drain,
-        args=(process.stderr, stderr_parts),
-        name="feedling-agent-stderr",
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    if process.stdin is not None:
+    def _drain(stream, sink: bytearray, callback=None) -> None:
+        nonlocal observed
+        pending: list[str] = []
+        decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder(encoding)(errors=errors), translate=True,
+        ) if callback is not None else None
         try:
-            process.stdin.write(str(input_text or ""))
+            while True:
+                chunk = stream.read1(64 * 1024)
+                with output_lock:
+                    if too_large.is_set():
+                        return
+                    observed += len(chunk)
+                    if observed > limit:
+                        too_large.set()
+                        for buffer in buffers:
+                            buffer.clear()
+                        pending.clear()
+                        process.kill()
+                        return
+                    sink.extend(chunk)
+                if callback is not None:
+                    text = decoder.decode(chunk, final=not chunk)
+                    pieces = text.split("\n")
+                    for piece in pieces[:-1]:
+                        pending.append(piece)
+                        callback("".join(pending) + "\n")
+                        pending.clear()
+                    if pieces[-1]:
+                        pending.append(pieces[-1])
+                    if not chunk and pending:
+                        callback("".join(pending))
+                if not chunk:
+                    return
+        except Exception as exc:
+            with output_lock:
+                reader_errors.append(exc)
+            process.kill()
         finally:
-            process.stdin.close()
+            pending.clear()
+            stream.close()
+
+    threads = [
+        threading.Thread(target=_drain, args=(process.stdout, buffers[0], stdout_line),
+                         name="feedling-agent-stdout", daemon=True),
+        threading.Thread(target=_drain, args=(process.stderr, buffers[1]),
+                         name="feedling-agent-stderr", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    def _captured(buffer):
+        if not text_mode:
+            return bytes(buffer)
+        return buffer.decode(encoding, errors=errors).replace("\r\n", "\n").replace("\r", "\n")
+
+    def _feed_input():
+        try:
+            data = input_text.encode(encoding, errors=errors) if isinstance(input_text, str) else input_text
+            process.stdin.write(data)
+        except BrokenPipeError:
+            pass  # A cap-triggered kill may race prompt delivery.
+        except Exception as exc:
+            with output_lock:
+                reader_errors.append(exc)
+            process.kill()
+        finally:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    if process.stdin is not None:
+        writer = threading.Thread(target=_feed_input, name="feedling-agent-stdin", daemon=True)
+        threads.append(writer)
+        writer.start()
     try:
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
+            if too_large.is_set():
+                raise CliOutputTooLarge(limit, observed)
+            if reader_errors:
+                raise reader_errors[0]
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             if remaining == 0.0:
                 raise subprocess.TimeoutExpired(cmd, timeout)
             try:
-                returncode = process.wait(
-                    timeout=0.1 if remaining is None else min(0.1, remaining)
-                )
-                break
+                returncode = process.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
             except subprocess.TimeoutExpired:
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-    except VoiceTurnSuperseded:
-        process.terminate()
-        try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
+                continue
+            # A child can exit before its pipes are drained. Never return a
+            # partial capture (or miss a late cap crossing) as success.
+            if not any(thread.is_alive() for thread in threads):
+                break
+            for thread in threads:
+                thread.join(timeout=0.05)
+        if too_large.is_set():
+            raise CliOutputTooLarge(limit, observed)
+        if reader_errors:
+            raise reader_errors[0]
+    except BaseException as exc:
+        if isinstance(exc, VoiceTurnSuperseded) and not too_large.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        else:
             process.kill()
-            process.wait()
-        stdout_thread.join(timeout=1.0)
-        stderr_thread.join(timeout=1.0)
-        raise
-    except subprocess.TimeoutExpired as exc:
-        process.kill()
         process.wait()
-        stdout_thread.join(timeout=1.0)
-        stderr_thread.join(timeout=1.0)
-        exc.stdout = "".join(stdout_parts)
-        exc.stderr = "".join(stderr_parts)
+        for thread in threads:
+            thread.join(timeout=1.0)
+        if too_large.is_set():
+            # Discard, do not join/copy the oversized stdout/stderr into an error.
+            raise CliOutputTooLarge(limit, observed) from None
+        if isinstance(exc, subprocess.TimeoutExpired):
+            exc.stdout, exc.stderr = (_captured(buffer) for buffer in buffers)
         raise
-    stdout_thread.join(timeout=1.0)
-    stderr_thread.join(timeout=1.0)
     return subprocess.CompletedProcess(
-        cmd,
-        returncode,
-        stdout="".join(stdout_parts),
-        stderr="".join(stderr_parts),
+        cmd, returncode, stdout=_captured(buffers[0]), stderr=_captured(buffers[1]),
     )
 
 
@@ -13070,7 +13150,10 @@ def _required_outbound_file_suffixes(text: str) -> tuple[str, ...] | None:
 
 
 def _outbound_name_matches_suffix(name: str, suffix: str) -> bool:
-    return str(name or "").casefold().endswith(str(suffix or "").casefold())
+    required = str(suffix or "").casefold()
+    if required == ".io.html":
+        required = ".html"
+    return str(name or "").casefold().endswith(required)
 
 
 def _missing_outbound_file_suffixes(
@@ -22334,8 +22417,8 @@ def _outbound_file_mime(name: str) -> str:
 # (usr_1baf: 20 err / 46 ok in a week) and the rejection reason was returned to
 # io_cli but never persisted — the agent.tool.call error carried no reason, so
 # a blank Canvas ("有过程无内容") could not be attributed. Emit a content-free
-# reason (closed-set enum) whenever staging is rejected. Numbers/enums only:
-# never the path, name, title, or document bytes.
+# reason (closed-set enum) whenever staging is rejected. Only reason, Canvas
+# flag and bounded suffix metadata; never the path, name, title or document bytes.
 # Every reject exit of ``_stage_file_ipc_impl`` (+ ``_safe_outbound_file_name``)
 # as a stable, actionable enum. The source-scan guard in the tests fails if the
 # implementation grows an ``"error": "x"`` / ``ValueError("x")`` exit not listed
@@ -22347,6 +22430,7 @@ _SEND_FILE_REJECTION_REASONS = frozenset({
     "chat_turn_finished",
     "too_many_staged_files",
     "path_outside_allowed_file_roots",
+    "file_not_found",
     "file_name_required",
     "unsupported_file_suffix",
     "wrong_file_suffix",
@@ -22378,6 +22462,12 @@ def _classify_send_file_rejection(error: object) -> str:
     return mapped if mapped is not None else "other"
 
 
+def _stage_file_suffix(msg: dict) -> str:
+    name = str(msg.get("name") or "").strip() or Path(str(msg.get("path") or "").strip()).name
+    name = name.lower()
+    return ".io.html" if name.endswith(".io.html") else Path(name).suffix[:12]
+
+
 def _stage_file_is_canvas(msg: dict) -> bool:
     """Decide Canvas-ness through the SAME normalization the impl applies, so a
     reject is never mis-flagged non-Canvas over surrounding whitespace/control
@@ -22403,6 +22493,7 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
     # runs, which would otherwise hang this rejection off the wrong (new) turn.
     with _outbound_file_lock:
         origin_turn_id = _active_outbound_file_turn_id
+        required_suffixes = list(_active_outbound_file_suffixes or ())
     result = _stage_file_ipc_impl(msg)
     if isinstance(result, dict) and result.get("ok") is False:
         _emit_debug_trace(
@@ -22414,6 +22505,8 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
             detail={
                 "reason": _classify_send_file_rejection(result.get("error")),
                 "is_canvas": _stage_file_is_canvas(msg),
+                "suffix": _stage_file_suffix(msg),
+                "required_suffixes": required_suffixes,
             },
         )
     return result
@@ -22445,6 +22538,9 @@ def _stage_file_ipc_impl(msg: dict) -> dict:
     try:
         resolved_dir = OUTBOUND_FILE_DIR.resolve()
         resolved_path = source_path.resolve(strict=True)
+    except OSError:
+        return {"ok": False, "error": "file_not_found", "request_id": request_id}
+    try:
         try:
             resolved_path.relative_to(resolved_dir)
         except ValueError:
@@ -22503,6 +22599,9 @@ def _stage_file_ipc_impl(msg: dict) -> dict:
 
     try:
         source_bytes = resolved_path.read_bytes()
+    except OSError:
+        return {"ok": False, "error": "file_not_found", "request_id": request_id}
+    try:
         if not source_bytes or len(source_bytes) > _OUTBOUND_FILE_MAX_BYTES:
             raise ValueError("file_source_empty_or_too_large")
         if (

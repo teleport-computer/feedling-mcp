@@ -90,6 +90,7 @@ _SAFE_ATTACHMENT_REJECTION_CODES = frozenset({
     "path_required",
     "no_active_chat_turn",
     "path_outside_allowed_file_roots",
+    "file_not_found",
     "wrong_file_suffix",
     "file_source_must_be_utf8",
     "chat_turn_finished",

@@ -3867,6 +3867,18 @@ def _debug_event_public_json(
         trace_public_fields=trace_public_fields,
     )
     if isinstance(raw_detail, dict) and isinstance(public_detail, dict):
+        if ev.get("type") == "resident.send_file.rejected":
+            # Only extension-shaped metadata is exposed, never a full filename.
+            def valid_suffix(value):
+                return isinstance(value, str) and (
+                    value == "" or re.fullmatch(r"\.[a-z0-9.]{1,11}", value) is not None
+                )
+            suffix = raw_detail.get("suffix")
+            if valid_suffix(suffix):
+                public_detail["suffix"] = suffix
+            required = raw_detail.get("required_suffixes")
+            if isinstance(required, list) and all(valid_suffix(item) for item in required):
+                public_detail["required_suffixes"] = required
         if ev.get("type") in {"agent.turn.failure", "agent.model.call.error", "agent.reply"}:
             reason = raw_detail.get("sanitizer_reason")
             if isinstance(reason, str) and reason in notices_error_contract.RESIDENT_SANITIZER_REASONS:
