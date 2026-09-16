@@ -183,16 +183,29 @@ _ASIDE_SUBSTITUTIONS = (
 #   - the full aside rendering below (tag plus two wording substitutions) was
 #     separately confirmed on the V2 shape: 8/8 and 8/8 STOP with an
 #     ``<aside>`` opener.
-# Keyed by provider, not model name, like the resident's Claude Code rule.
+# Official Gemini routes use this rendering regardless of the model name.
 ASIDE_TAG_PROVIDERS = frozenset({"gemini"})
+_GEMINI_RELAY_PROVIDERS = frozenset({"openai_compatible", "openrouter"})
+
+
+def tag_for_route(provider: str | None, model: str | None) -> str:
+    """Select the shared tag for an official Gemini or named Gemini relay route.
+
+    Only the two relay providers admit model-name matching. Aliases without
+    ``gemini`` and all other providers retain the historical ``think`` tag.
+    """
+    provider_name = str(provider or "").strip().lower()
+    if provider_name in ASIDE_TAG_PROVIDERS or (
+        provider_name in _GEMINI_RELAY_PROVIDERS
+        and "gemini" in str(model or "").lower()
+    ):
+        return TAG_ASIDE
+    return TAG_THINK
 
 
 def tag_for_provider(provider: str | None) -> str:
-    """Protocol tag for one provider id: ``aside`` for ``ASIDE_TAG_PROVIDERS``,
-    the historical ``think`` for everything else (including unknown/empty)."""
-    if str(provider or "").strip().lower() in ASIDE_TAG_PROVIDERS:
-        return TAG_ASIDE
-    return TAG_THINK
+    """Compatibility for callers without model metadata."""
+    return tag_for_route(provider, "")
 
 
 def _retag(text: str, tag: str) -> str:

@@ -353,14 +353,17 @@ def _supports_mandatory_self_thinking(provider_config: Any) -> bool:
     return model.rsplit("/", 1)[-1] != "claude-fable-5"
 
 
-# Provider → protocol tag lives in agent_protocol_core.self_thinking (shared
+# Route → protocol tag lives in agent_protocol_core.self_thinking (shared
 # with the resident V1 consumer and the V2 tool loop) so all three cannot drift.
 _ASIDE_TAG_PROVIDERS = self_thinking.ASIDE_TAG_PROVIDERS
 
 
 def self_thinking_tag(provider_config: Any = None) -> str:
     """Protocol tag for the self-authored aside block of one V2 provider config."""
-    return self_thinking.tag_for_provider(getattr(provider_config, "provider", ""))
+    return self_thinking.tag_for_route(
+        getattr(provider_config, "provider", ""),
+        getattr(provider_config, "model", ""),
+    )
 
 
 def chat_system_prompt(provider_config: Any = None) -> str:

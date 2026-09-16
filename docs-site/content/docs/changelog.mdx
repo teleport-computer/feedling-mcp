@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Gemini models routed through `openai_compatible` or `openrouter` now use
+  the same `<aside>` rendering as direct Gemini on Runtime V2 and resident V1.
+  Selection uses a case-insensitive `gemini` match in the configured model name
+  only for those two relay providers, addressing the tool-follow-up response
+  failures observed with the previous `<think>` rendering on some relays.
+  Other routes retain their existing rendering, including the resident Claude
+  Code driver rule. Model aliases without `gemini` are outside this rule.
+
 - Runtime V2 no longer delivers a *narrated* tool call. When a model writes a
   call as prose instead of emitting a structured one — for example
   `[Calling generate_image with prompt: "…"]` at the end of a reply with no
