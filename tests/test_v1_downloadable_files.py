@@ -771,9 +771,7 @@ def test_v1_completion_guard_maps_canvas_html_to_io_html(text):
             data=b"<html></html>",
         )
     ]
-    assert resident._missing_outbound_file_suffixes(requirement, staged) == (
-        ".io.html",
-    )
+    assert resident._missing_outbound_file_suffixes(requirement, staged) is None
 
 
 @pytest.mark.parametrize(
@@ -1509,3 +1507,64 @@ def test_v1_sealed_shared_image_followup_requires_k_enclave_keeps_legacy_error(s
         store, monkeypatch,
         _sealed_variant(store.user_id, "v1_seal_ke", visibility="shared", K_enclave=_DROP))
     assert status == 400 and err == "shared image_followup requires K_enclave"
+
+
+@pytest.mark.parametrize('kind,expected', [
+    ('missing', 'file_not_found'), ('unreadable', 'file_not_found'),
+    ('outside', 'path_outside_allowed_file_roots'),
+])
+def test_send_file_filesystem_rejection_is_precise(monkeypatch, tmp_path, kind, expected):
+    outbox = tmp_path / 'outbox'
+    outbox.mkdir()
+    source = (tmp_path if kind == 'outside' else outbox) / 'secret.HTML'
+    if kind != 'missing':
+        source.write_text('<html>hello</html>')
+    monkeypatch.setattr(resident, 'OUTBOUND_FILE_DIR', outbox)
+    monkeypatch.setattr(resident, '_active_outbound_file_turn_id', 't625')
+    monkeypatch.setattr(resident, '_active_outbound_file_suffixes', ('.io.html',))
+    monkeypatch.setattr(resident, '_agent_can_use_local_io_cli', lambda: False)
+    if kind == 'unreadable':
+        def unreadable(path):
+            raise PermissionError('SECRET PATH')
+        monkeypatch.setattr(Path, 'read_bytes', unreadable)
+    events = []
+    monkeypatch.setattr(resident, '_emit_debug_trace', lambda *a, **kw: events.append(kw))
+    result = resident._handle_stage_file_ipc({'request_id': 'r', 'path': str(source)})
+    assert result['ok'] is False and result['error'] == expected
+    assert events[-1]['detail'] == {
+        'reason': expected, 'is_canvas': False, 'suffix': '.html',
+        'required_suffixes': ['.io.html'],
+    }
+    from tools import io_cli
+    assert expected in io_cli._SAFE_ATTACHMENT_REJECTION_CODES
+    from admin import data_track
+    from debug_trace import _safe_detail
+    public = data_track._debug_event_public_json({'type': 'resident.send_file.rejected', 'detail': _safe_detail(events[-1]['detail'])}, trace_public_fields={})['detail']
+    assert public['suffix'] == '.html' and public['required_suffixes'] == ['.io.html']
+
+
+@pytest.mark.parametrize('name,suffix', [('SECRET.IO.HTML', '.io.html'), ('a.HTML', '.html'), ('a', ''), ('a.abcdefghijklmnop', '.abcdefghijk')])
+def test_send_file_suffix_is_bounded_name_metadata(name, suffix):
+    assert resident._stage_file_suffix({'path': '/private/a.txt', 'name': name}) == suffix
+    assert resident._stage_file_suffix({'path': '/private/' + name}) == suffix
+
+
+@pytest.mark.parametrize('name,error', [('foo.html', None), ('foo.HTML', None), ('foo.txt', 'wrong_file_suffix'), ('foo.htm', 'unsupported_file_suffix')])
+def test_canvas_requirement_accepts_html_at_stage_and_completion(monkeypatch, tmp_path, name, error):
+    monkeypatch.setattr(resident, 'OUTBOUND_FILE_DIR', tmp_path)
+    monkeypatch.setattr(resident, '_emit_debug_trace', lambda *a, **kw: None)
+    source = tmp_path / name
+    source.write_text('<html>Canvas</html>')
+    resident._begin_outbound_file_turn('canvas-t625', ('.io.html',))
+    try:
+        result = resident._handle_stage_file_ipc({'request_id': 'r', 'path': str(source)})
+        if error:
+            assert result['ok'] is False and result['error'] == error
+            assert not resident._outbound_name_matches_suffix(name, '.io.html')
+        else:
+            assert result['ok'] is True
+            staged = resident._staged_outbound_file_snapshot('canvas-t625')
+            assert [item.name for item in staged] == [name]
+            assert resident._missing_outbound_file_suffixes(('.io.html',), staged) is None
+    finally:
+        resident._finish_outbound_file_turn('canvas-t625')

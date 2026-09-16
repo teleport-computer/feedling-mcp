@@ -20,6 +20,18 @@ change must not be interpreted as an API guarantee.
   Other routes retain their existing rendering, including the resident Claude
   Code driver rule. Model aliases without `gemini` are outside this rule.
 
+- Resident Canvas requests now accept both `.html` and `.io.html` files at the
+  required-suffix gate and completion check; `.io.html` remains the preferred
+  extension in generation guidance.
+
+- Resident `send-file` diagnostics now distinguish missing or unreadable files
+  (`file_not_found`) from paths outside allowed roots, and record the attempted
+  suffix and required suffixes without recording filenames.
+- Resident CLI subprocesses now cap combined stdout and stderr at 64 MiB per
+  invocation. Exceeding the limit kills the process, discards captured output,
+  and reports `cli_output_too_large`; `FEEDLING_CLI_MAX_OUTPUT_BYTES` overrides
+  the limit with a positive byte count.
+
 - Runtime V2 no longer delivers a *narrated* tool call. When a model writes a
   call as prose instead of emitting a structured one — for example
   `[Calling generate_image with prompt: "…"]` at the end of a reply with no

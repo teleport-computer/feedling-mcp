@@ -53,6 +53,12 @@ except ModuleNotFoundError:
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 
+def _mock_cli_run(monkeypatch, consumer, run):
+    # Mock the CLI invocation boundary; production capture now uses Popen.
+    monkeypatch.setattr(consumer, "_run_cli_subprocess",
+                        lambda cmd, kwargs, **extra: run(cmd, **kwargs))
+
+
 @pytest.fixture(autouse=True)
 def _reset_proactive_guard_state_between_tests():
     """The proactive self-wake loop guard + failure backoff are module-global
@@ -3559,7 +3565,7 @@ def _setup_hermes_session_cli(monkeypatch, tmp_path, *, session_id: str, session
         stdout = f"在。\nsession_id: {session_id}\n"
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
 
 def test_call_agent_cli_hermes_reads_native_reasoning_from_session_json(monkeypatch, tmp_path):
@@ -4099,7 +4105,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
         crc.call_agent_cli("hi")
@@ -4116,7 +4122,7 @@ def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["claude", "-p", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
         crc.call_agent_cli("hi")
@@ -4138,7 +4144,7 @@ def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", "--json", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
         crc.call_agent_cli("hi")
@@ -8626,7 +8632,7 @@ def test_call_agent_cli_allows_claude_family_model_fallback(monkeypatch, caplog)
         })
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     assert crc.call_agent_cli("请调用工具读取我喜欢的颜色") == "我记得你喜欢蓝色。"
     assert cleared == []
@@ -8651,7 +8657,7 @@ def test_call_agent_cli_allows_claude_success_without_model_metadata(monkeypatch
         })
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     assert crc.call_agent_cli("我喜欢的颜色是什么？") == "蓝色。"
     assert "no structured actual-model metadata" in caplog.text
@@ -8692,7 +8698,7 @@ def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch)
         ])
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     raw = crc.call_agent_cli("查 useEffect")
     turn = crc._agent_turn_from_raw(raw)
@@ -9114,7 +9120,7 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _Result())
 
     result = crc.call_agent_cli("hi")
     turn = crc._agent_turn_from_raw(result)
@@ -9140,7 +9146,7 @@ def test_call_agent_cli_codex_extracts_agent_message_not_handshake(monkeypatch):
         )
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     result = crc.call_agent_cli("hi")
     assert result == "Hello from codex!"
@@ -9400,7 +9406,7 @@ def test_call_agent_cli_codex_0142_routes_reasoning_to_thinking_not_bubble(monke
         )
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     raw = crc.call_agent_cli("hi")
     turn = crc._agent_turn_from_raw(raw)
@@ -9433,7 +9439,7 @@ def test_call_agent_cli_codex_actions_reply_preserved_with_reasoning(monkeypatch
         )
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     raw = crc.call_agent_cli("hi")
     turn = crc._agent_turn_from_raw(raw)
@@ -9463,7 +9469,7 @@ def test_call_agent_cli_codex_raw_text_lane_returns_literal_reply(monkeypatch):
         )
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     out = crc.call_agent_cli("hi", raw_text=True)
     assert out == cards_json
@@ -9488,7 +9494,7 @@ def test_call_agent_cli_claude_raw_text_lane_returns_literal_cards_json(monkeypa
         })
         stderr = ""
 
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: _R())
 
     out = crc.call_agent_cli("hi", raw_text=True)
     assert out == cards_json
@@ -10547,7 +10553,7 @@ def test_call_agent_cli_pi_charges_session_content_not_transport(monkeypatch, tm
     raw = _pi_chatty_stream("好的")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    monkeypatch.setattr(crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
 
     assert crc.call_agent_cli("你好") == "好的"
@@ -10570,7 +10576,7 @@ def test_call_agent_cli_pi_session_survives_many_turns(monkeypatch, tmp_path):
     raw = _pi_chatty_stream("嗯")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    monkeypatch.setattr(crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
 
     first_sid = None
@@ -10597,7 +10603,7 @@ def test_call_agent_cli_claude_session_survives_many_turns(monkeypatch, tmp_path
         crc, "AGENT_CLI_CMD",
         "claude -p \"{message}\" --output-format stream-json --include-partial-messages --session-id {session_id}")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    monkeypatch.setattr(crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
                         lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr=""))
 
     transport_len = len(raw.encode("utf-8"))
@@ -10626,7 +10632,7 @@ def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, t
     monkeypatch.setattr(crc, "_prepare_cli_command",
                         lambda message, image_paths=None, lane="background": (["pi", "--mode", "json",
                                                            "--session-id", "sid-cmd-1", message], None))
-    monkeypatch.setattr(crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
@@ -10662,7 +10668,7 @@ def test_call_agent_cli_pi_error_turn_does_not_echo_user_message(monkeypatch, tm
     monkeypatch.setattr(crc, "_prepare_cli_command",
                         lambda message, image_paths=None, lane="background": (["pi", "--mode", "json",
                                                            "--session-id", "smoke-1", message], None))
-    monkeypatch.setattr(crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
@@ -10937,7 +10943,7 @@ def test_call_agent_cli_claude_wires_message_to_stdin(monkeypatch):
             stdout='{"type":"result","is_error":false,"result":"OK"}', stderr="",
         )
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
 
     msg = "[10:30]\n\nReply in English.\n\nhello world"
     crc.call_agent_cli(msg)
@@ -10966,7 +10972,7 @@ def test_call_agent_cli_pi_feeds_message_via_stdin_not_argv(monkeypatch, tmp_pat
         "pi --mode json -t bash --session-id {session_id}")   # managed default: no {message}
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
     msg = "@someone -look at this"
@@ -10989,8 +10995,7 @@ def _pi_cli_env(monkeypatch, tmp_path, user_id, *, returncode=0, stdout=_PI_OK_T
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    monkeypatch.setattr(
-        crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
         lambda cmd, **kw: subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=""),
     )
 
@@ -11073,7 +11078,7 @@ def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp
         out = _PI_STREAM_CUT_TURN if len(runs) == 1 else _PI_OK_TURN
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     assert crc.call_agent_cli("hello") == "ok"
     assert len(runs) == 2                      # exactly one retry
     assert runs[0] == runs[1]                  # same turn, same command
@@ -11089,7 +11094,7 @@ def test_call_agent_cli_ledgers_stream_cut_retry_separately(monkeypatch, tmp_pat
         out = _PI_STREAM_CUT_TURN if len(runs) == 1 else _PI_OK_TURN
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     monkeypatch.setattr(
         crc,
         "_queue_provider_attempt_ledger",
@@ -11130,7 +11135,7 @@ def test_call_agent_cli_timeout_ledgers_completed_pi_rounds(monkeypatch, tmp_pat
     def fake_run(cmd, **kw):
         raise subprocess.TimeoutExpired(cmd, 300, output=partial, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     monkeypatch.setattr(
         crc,
         "_queue_provider_attempt_ledger",
@@ -11156,7 +11161,7 @@ def test_call_agent_cli_pi_stream_cut_twice_raises_no_loop(monkeypatch, tmp_path
         runs.append(list(cmd))
         return real(cmd, 0, stdout=_PI_STREAM_CUT_TURN, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError, match="pi agent produced no reply"):
         crc.call_agent_cli("hello")
     assert len(runs) == 2                      # one retry, then surface the error
@@ -11177,7 +11182,7 @@ def test_call_agent_cli_pi_stream_cut_retry_nonzero_exit_raises_even_with_reply(
             return subprocess.CompletedProcess(cmd, 0, stdout=_PI_STREAM_CUT_TURN, stderr="")
         return subprocess.CompletedProcess(cmd, 1, stdout=_PI_OK_TURN, stderr="pi crashed")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError, match="cli agent exited 1"):
         crc.call_agent_cli(injected)
     assert len(runs) == 2
@@ -11199,7 +11204,7 @@ def test_call_agent_cli_pi_non_stream_cut_no_reply_does_not_retry(monkeypatch, t
         runs.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout=quota_turn, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError, match="pi agent produced no reply"):
         crc.call_agent_cli("hello")
     assert len(runs) == 1                      # no retry for non-transient shapes
@@ -11243,7 +11248,7 @@ def test_call_agent_cli_pi_failed_turn_does_not_mark_bridged(monkeypatch, tmp_pa
         captured["input"] = kwargs.get("input")
         return subprocess.CompletedProcess(cmd, 0, stdout=_PI_OK_TURN, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     assert crc.call_agent_cli(injected) == "ok"
     assert crc.FOREGROUND_CHAT_CONTEXT_HEADER in captured["input"]
     assert crc._agent_session_is_bridged() is True
@@ -11685,7 +11690,7 @@ def test_call_agent_cli_heals_stale_claude_resume_once(monkeypatch, tmp_path):
         assert "--resume" not in cmd            # retry must be a fresh session
         return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     assert crc.call_agent_cli("hello") == "ok"
     assert len(runs) == 2
     # the fresh session from the retry is persisted for the NEXT turn's --resume
@@ -11728,7 +11733,7 @@ def test_call_agent_cli_heals_stale_codex_resume_once(monkeypatch, tmp_path):
         assert "--sandbox" in cmd
         return subprocess.CompletedProcess(cmd, 0, stdout=ok_stream, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
 
     assert crc.call_agent_cli("hello") == "ok"
     assert len(runs) == 2
@@ -11766,7 +11771,7 @@ def test_mcp_postflight_follows_the_retry_not_the_discarded_first_attempt(
         return subprocess.CompletedProcess(
             cmd, 0, stdout=init + "\n" + _CLAUDE_OK_TURN, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     monkeypatch.setattr(crc, "_user_mcp_applied",
                         {"servers": [{"name": "tavily", "enabled": True}]})
     monkeypatch.setattr(crc, "_emit_debug_trace",
@@ -11798,7 +11803,7 @@ def test_call_agent_cli_stale_resume_retry_fails_raises_no_loop(monkeypatch, tmp
             stderr=f"No conversation found with session ID: {_STALE_SID}",
         )
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError):
         crc.call_agent_cli("hello")
     assert len(runs) == 2                        # single retry, never a loop
@@ -11826,7 +11831,7 @@ def test_call_agent_cli_failed_retry_with_sid_in_error_does_not_repersist(monkey
             )
         return subprocess.CompletedProcess(cmd, 1, stdout=failed_with_sid, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError):
         crc.call_agent_cli("hello")
     assert len(runs) == 2
@@ -11844,7 +11849,7 @@ def test_call_agent_cli_non_session_error_does_not_heal(monkeypatch, tmp_path):
             cmd, 1, stdout="", stderr="API Error: 401 unauthorized",
         )
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError):
         crc.call_agent_cli("hello")
     assert len(runs) == 1
@@ -12409,7 +12414,7 @@ def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
             stderr="No conversation found with session ID: 99999999-9999-9999-9999-999999999999",
         )
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     with pytest.raises(RuntimeError):
         crc.call_agent_cli("hello")
     assert len(runs) == 1
@@ -13153,7 +13158,7 @@ def _generic_cli_env(monkeypatch, *, returncode=0, stdout="ok", stderr=""):
         r.stderr = stderr
         return r
 
-    monkeypatch.setattr(crc.subprocess, "run", _run)
+    _mock_cli_run(monkeypatch, crc, _run)
     return captured
 
 
@@ -13198,7 +13203,7 @@ def test_call_agent_cli_pi_stdin_is_utf8(monkeypatch, tmp_path):
         captured["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, stdout=_PI_OK_TURN, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", _run)
+    _mock_cli_run(monkeypatch, crc, _run)
 
     assert crc.call_agent_cli("你好🌙") == "ok"
 
@@ -13621,8 +13626,9 @@ def test_backoff_skips_idle_proactive(monkeypatch):
     assert any(s == "skipped" and "backoff" in r for s, r in cap["statuses"])
 
 
-def test_generic_failure_sets_backoff(monkeypatch):
-    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("cli agent exited 1"))
+@pytest.mark.parametrize("failure", [RuntimeError("cli agent exited 1"), crc.CliOutputTooLarge(64, 65)])
+def test_generic_failure_sets_backoff(monkeypatch, failure):
+    cap = _proactive_guard_harness(monkeypatch, raise_exc=failure)
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
     crc._process_proactive_jobs([_idle_proactive_job()])
@@ -13765,7 +13771,7 @@ def test_cli_cmd_without_message_placeholder_fails_loud(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "python3 my_wrapper.py")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     ran = []
-    monkeypatch.setattr(crc.subprocess, "run",
+    _mock_cli_run(monkeypatch, crc,
                         lambda cmd, **kw: ran.append(cmd))
     with pytest.raises(RuntimeError, match=r"missing the \{message\} placeholder"):
         crc.call_agent_cli("hello")
@@ -13801,7 +13807,7 @@ def test_turn_timeout_is_env_tunable(monkeypatch, tmp_path):
         seen["timeout"] = kw.get("timeout")
         return subprocess.CompletedProcess(cmd, 0, stdout=_CLAUDE_OK_TURN, stderr="")
 
-    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    _mock_cli_run(monkeypatch, crc, fake_run)
     assert crc.call_agent_cli("hello") == "ok"
     assert seen["timeout"] == 300
 
@@ -15322,7 +15328,7 @@ def test_pixel_turn_child_env_carries_both_lane_and_fence(monkeypatch, tmp_path)
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude --print {mcp} "{message}"')
     monkeypatch.setattr(crc, "_strip_missing_mcp_config", lambda cmd: (cmd, ""))
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    _mock_cli_run(monkeypatch, crc, _fake_run)
 
     with pytest.raises(Exception):
         crc.call_agent_cli("hi", lane="proactive", outbound_fence=True)
@@ -15957,6 +15963,7 @@ _SEND_FILE_REJECTION_CASES = [
     ("chat_turn_finished", "chat_turn_finished"),
     ("too_many_staged_files", "too_many_staged_files"),
     ("path_outside_allowed_file_roots", "path_outside_allowed_file_roots"),
+    ("file_not_found", "file_not_found"),
     ("file_name_required", "file_name_required"),
     ("unsupported_file_suffix", "unsupported_file_suffix"),
     ("wrong_file_suffix", "wrong_file_suffix"),
@@ -16017,7 +16024,7 @@ def test_stage_file_rejection_emits_content_free_reason(monkeypatch):
     assert args[:2] == ("agent", "resident.send_file.rejected")
     assert kwargs["status"] == "error"
     assert kwargs["trace_id"] == "turn_t526"
-    assert kwargs["detail"] == {"reason": "canvas_title_subtitle_required", "is_canvas": True}
+    assert kwargs["detail"] == {"reason": "canvas_title_subtitle_required", "is_canvas": True, "suffix": ".io.html", "required_suffixes": []}
     dumped = json.dumps({"a": [str(x) for x in args], "k": {kk: str(vv) for kk, vv in kwargs.items()}}, ensure_ascii=False)
     assert "哄猫猫" not in dumped and "secret" not in dumped and "usr_leak" not in dumped
 
@@ -16037,7 +16044,7 @@ def test_stage_file_non_canvas_rejection_flags_is_canvas_false(monkeypatch):
     monkeypatch.setattr(crc, "_active_outbound_file_turn_id", "t")
     monkeypatch.setattr(crc, "_stage_file_ipc_impl", lambda _msg: {"ok": False, "error": "wrong_file_suffix"})
     crc._handle_stage_file_ipc({"path": "/x", "name": "report.pdf"})
-    assert events[0][1]["detail"] == {"reason": "wrong_file_suffix", "is_canvas": False}
+    assert events[0][1]["detail"] == {"reason": "wrong_file_suffix", "is_canvas": False, "suffix": ".pdf", "required_suffixes": []}
 
 
 def test_stage_file_rejection_uses_turn_id_captured_before_impl(monkeypatch):
