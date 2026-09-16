@@ -13,7 +13,7 @@
   生产落卡的称呼装配与此一致（``memory.garden_component.capture_request``），但还带
   组件挑的现有卡索引。断言「运行时真实提示词」的用例应走组件（见
   test_capture_request_index_and_naming.py / test_garden_dream_session.py /
-  test_memgarden_dream_migrate_golden.py），不要用这里的构造函数。
+  test_memgarden_dream_golden.py），不要用这里的构造函数。
 """
 from __future__ import annotations
 

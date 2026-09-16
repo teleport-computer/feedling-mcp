@@ -12,6 +12,8 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Retired legacy-card migration endpoints (`/v1/memory/legacy_batch` and `/v1/memory/migration_state`) and the `memory.upgrade` action. Existing legacy cards remain readable and recallable through read-side adapters, without rewriting stored data.
+
 - **Regular V2 wakes let the agent decide whether it wants to reach out.**
   The instructions remove the fixed recent-contact exception list. Silence is
   appropriate when the agent has nothing it wants to say or speaking would

@@ -315,7 +315,6 @@ def test_blob_write_callers_keep_strict_and_best_effort_contracts_explicit():
         ("hosted/history_import.py", "_save_history_job"),
         ("hosted/mcp_core.py", "_save"),
         ("identity/service.py", "_save_identity"),
-        ("memory/memory_core.py", "migration_state_post"),
         ("proactive/capture_scheduler.py", "save_capture_state"),
         ("proactive/store_v2.py", "save"),
     }

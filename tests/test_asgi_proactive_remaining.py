@@ -265,7 +265,7 @@ def test_capture_tick_parity(env):
     a = _asgi("POST", "/v1/capture/tick", headers=_key(ak), json_body={"now": 1000.0})
     assert f[0] == a[0] == 200
     assert _norm(f[1]) == _norm(a[1])
-    assert "dream" in f[1] and "migrate" in f[1]
+    assert "dream" in f[1] and "migrate" not in f[1]
 
 
 def test_capture_tick_invalid_now_parity(env):

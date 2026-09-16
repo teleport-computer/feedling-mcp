@@ -7,8 +7,7 @@ responses.
 
 E2E boundary (unchanged): memory ``body_ct`` fields are v1 E2E envelopes. The
 server NEVER decrypts them here. Read/write store operations stay plaintext-free;
-the readside (index/fetch/buckets/threads) and the migration decrypt
-(legacy_batch) forward the caller's credential (api key OR runtime token) to the
+the readside (index/fetch/buckets/threads) forwards the caller's credential (api key OR runtime token) to the
 enclave, which owns decryption. These functions take already-parsed params + the
 store + the credential (or a pre-bound ``post_enclave`` callable) as arguments —
 they never read ``flask.request`` — so no new server-side plaintext is ever
@@ -27,14 +26,12 @@ import json
 import uuid
 from datetime import datetime
 
-import db
 import debug_trace
 from accounts import registry
 from core import envelope as core_envelope
 from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
-from memory import migration as memory_migration
 from memory import service as memory_service
 from memgarden import timestamps as memory_timestamps
 import memory_readside_core
@@ -323,59 +320,6 @@ def actions(
         },
     )
     return body, status
-
-
-# --------------------------------------------------------------------------- #
-# migration state + legacy batch
-# --------------------------------------------------------------------------- #
-
-def migration_state_get(store) -> tuple[dict, int]:
-    state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    return {"state": state or memory_migration.initial_state()}, 200
-
-
-def migration_state_post(store, payload: dict) -> tuple[dict, int]:
-    try:
-        migrated = int(payload.get("migrated") or 0)
-        legacy_remaining = int(payload.get("legacy_remaining") or 0)
-    except (TypeError, ValueError):
-        return {"error": "migrated/legacy_remaining must be ints"}, 400
-    failed_raw = payload.get("failed_ids")
-    failed_ids = [str(i) for i in failed_raw if str(i or "").strip()] if isinstance(failed_raw, list) else []
-    current = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    # A11: count this round's failures per card BEFORE advancing the state machine, so a
-    # card that just hit the cap is already 'skipped' and won't keep 'pending' alive.
-    if failed_ids:
-        current = memory_migration.bump_attempts(current, failed_ids)
-    new_state = memory_migration.next_state(current, migrated=migrated, legacy_remaining=legacy_remaining)
-    db.set_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB, new_state)
-    return {"state": new_state}, 200
-
-
-def legacy_batch(store, api_key, runtime_token: str, payload: dict) -> tuple[dict, int]:
-    try:
-        batch_size = max(1, min(int(payload.get("batch_size") or memory_migration.DEFAULT_MIGRATE_BATCH), 50))
-    except (TypeError, ValueError):
-        batch_size = memory_migration.DEFAULT_MIGRATE_BATCH
-    moments = memory_service._active_memory_moments(memory_service._load_moments(store))
-    decrypted: list[tuple[dict, dict]] = []
-    for m in moments:
-        if not isinstance(m, dict) or m.get("visibility") == "local_only":
-            continue
-        inner, _err = memory_actions_mod._memory_plain_from_envelope(
-            str(store.user_id),
-            m,
-            api_key,
-            runtime_token=runtime_token,
-        )
-        if isinstance(inner, dict):
-            decrypted.append((m, inner))
-    # A11: drop cards that hit the per-card attempt cap so they're never re-selected
-    # and legacy_remaining can reach 0 (status → done). They stay legacy + readable.
-    state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    skip = memory_migration.capped_ids(state)
-    batch = memory_migration.select_legacy_batch(decrypted, batch_size=batch_size, exclude_ids=skip)
-    return {"batch": batch, "legacy_remaining": memory_migration.count_legacy(decrypted, exclude_ids=skip)}, 200
 
 
 # --------------------------------------------------------------------------- #

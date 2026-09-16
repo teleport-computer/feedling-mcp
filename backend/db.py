@@ -5597,6 +5597,7 @@ _LANE_ROLLUP_V1_FAIL_PRED = (
     "OR ({mem} AND COALESCE(l.doc->>'status','') IN ('failed','error','skipped')))"
 )
 
+# memory_migrate 是历史 job_kind，机制已删；以下统计仍按原 lane 分桶。
 # lane 推断与 admin_events_overview 同一 CASE；memory 三种 job_kind 在这里拆成
 # 独立 lane（capture/dream/migrate）——events 页的合并 category 等于三者之和，
 # 互核仍然成立，粒度更高。
@@ -17295,7 +17296,7 @@ def memory_load(user_id: str) -> list[dict]:
 
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
     """Single-row upsert. Returns True iff the write committed — callers that
-    advance state on success (e.g. memory.upgrade / migration) MUST check it."""
+    advance state on success MUST check it."""
     try:
         context = _memory_mutation_context(user_id)
         if context is None:

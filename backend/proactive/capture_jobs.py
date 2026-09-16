@@ -20,11 +20,6 @@ CAPTURE_JOB_ID_PREFIX = "cap"
 CAPTURE_JOB_KIND_DREAM = "memory_dream"
 DREAM_JOB_SOURCE = "memory_dream"
 DREAM_JOB_ID_PREFIX = "dream"
-# Legacy-card migration lane (old card → v1). Same substrate as dream: a quiet-window
-# maintenance job, never a reach-out wake. The handler picks the batch at run time.
-CAPTURE_JOB_KIND_MIGRATE = "memory_migrate"
-MIGRATE_JOB_SOURCE = "memory_migrate"
-MIGRATE_JOB_ID_PREFIX = "migr"
 CAPTURE_ACTIVE_STATUSES = frozenset({"pending", "claimed", "realizing"})
 # Same-key terminal states that should NOT block a fresh enqueue: the window was
 # not successfully captured, so re-enqueuing the same window is correct (failed =
@@ -37,8 +32,8 @@ def failure_backoff_sec(streak: int) -> float:
 
     没有退避时，永远失败的窗口（典型：坏掉的 BYOK key，agent 调用必败）每个
     调度 tick 都会重建 job——min_interval 只看「上次成功完成」，对纯失败流
-    不生效。指数退避 base × 2^(streak-1)，封顶 max；三条 lane
-    （capture/dream/migrate）共用。"""
+    不生效。指数退避 base × 2^(streak-1)，封顶 max；两条 lane
+    （capture/dream）共用。"""
     n = int(streak or 0)
     if n <= 0:
         return 0.0
@@ -66,7 +61,7 @@ _BACKOFF_NOTICE_STREAK = 3   # 前两次退避噪音价值低，第 3 次才打�
 
 def notify_backoff(store, *, lane: str, status: str, streak: int,
                    account_code: str = "", skipped: bool = False) -> None:
-    """三条 maintenance lane（capture/migrate/dream）共用的退避通知钩子。
+    """两条 maintenance lane（capture/dream）共用的退避通知钩子。
 
     streak>=3 的失败 emit warning（occurrences 天然吸收后续 +1，不刷屏）；
     completed 恢复 resolve（同 lane 精确 dedupe_key，不跨 lane 清）。两支
@@ -129,17 +124,8 @@ def is_memory_dream_job(job: Mapping[str, Any] | None) -> bool:
     )
 
 
-def is_memory_migrate_job(job: Mapping[str, Any] | None) -> bool:
-    if not isinstance(job, Mapping):
-        return False
-    return (
-        str(job.get("job_kind") or "").strip() == CAPTURE_JOB_KIND_MIGRATE
-        or str(job.get("source") or "").strip() == MIGRATE_JOB_SOURCE
-    )
-
-
 def is_memory_maintenance_job(job: Mapping[str, Any] | None) -> bool:
-    return is_memory_capture_job(job) or is_memory_dream_job(job) or is_memory_migrate_job(job)
+    return is_memory_capture_job(job) or is_memory_dream_job(job)
 
 
 def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -225,53 +211,6 @@ def _find_active_capture(store: UserStore) -> dict | None:
 def _find_active_dream(store: UserStore) -> dict | None:
     for job in store.list_proactive_jobs(since_epoch=0, limit=0):
         if _active_dream_job(job):
-            return dict(job)
-    return None
-
-
-def _active_migrate_job(job: Mapping[str, Any]) -> bool:
-    return is_memory_migrate_job(job) and str(job.get("status") or "pending").strip().lower() in CAPTURE_ACTIVE_STATUSES
-
-
-def _find_migrate_by_key(store: UserStore, migrate_key: str) -> dict | None:
-    matches = [
-        dict(job)
-        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
-        if is_memory_migrate_job(job) and str(job.get("migrate_key") or "") == migrate_key
-    ]
-    if not matches:
-        return None
-    return max(matches, key=lambda j: float(j.get("ts") or 0))
-
-
-def _migrate_same_key_blocks_retry(job: Mapping[str, Any]) -> bool:
-    """Whether a same-window migrate job should suppress another enqueue.
-
-    Migration can legitimately need another job in the same quiet window: a prior
-    no-op may have raced card seeding, and a finished batch can still leave legacy
-    cards. Only active jobs and terminal jobs that settled the window should block.
-    """
-    status = str(job.get("status") or "pending").strip().lower()
-    if status in CAPTURE_ACTIVE_STATUSES:
-        return True
-    if status in CAPTURE_RETRYABLE_TERMINAL:
-        return False
-    if status != "completed":
-        return True
-    reason = str(job.get("status_reason") or "").strip().lower()
-    result = job.get("migrate_result") if isinstance(job.get("migrate_result"), Mapping) else {}
-    if reason == "migrate_no_legacy" or str(result.get("reason") or "").strip().lower() == "no_legacy":
-        return False
-    try:
-        remaining = int(result.get("remaining"))
-    except (TypeError, ValueError):
-        remaining = 0
-    return remaining <= 0
-
-
-def _find_active_migrate(store: UserStore) -> dict | None:
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if _active_migrate_job(job):
             return dict(job)
     return None
 
@@ -407,69 +346,6 @@ def enqueue_memory_dream_job(
         dream_key=key,
         dream_until=dream_until,
         dream_stats=dream_stats,
-        not_before=not_before,
-        now=now,
-    )
-    return store.append_proactive_job(job), True, "enqueued"
-
-
-def make_memory_migrate_job(
-    *,
-    trigger: str,
-    migrate_key: str,
-    migrate_stats: Mapping[str, Any] | None = None,
-    not_before: float | None = None,
-    now: float | None = None,
-) -> dict[str, Any]:
-    now_ts = time.time() if now is None else float(now)
-    not_before_ts = now_ts if not_before is None else float(not_before)
-    return {
-        "job_id": util._new_public_id(MIGRATE_JOB_ID_PREFIX),
-        "job_kind": CAPTURE_JOB_KIND_MIGRATE,
-        "source": MIGRATE_JOB_SOURCE,
-        "status": "pending",
-        "trigger": str(trigger or "quiet_window_migrate")[:120],
-        "migrate_key": str(migrate_key or "")[:240],
-        "migrate_stats": dict(migrate_stats or {}),
-        "not_before": not_before_ts,
-        "ts": now_ts,
-        "created_at": datetime.fromtimestamp(now_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-
-
-def enqueue_memory_migrate_job(
-    store: UserStore,
-    *,
-    trigger: str,
-    migrate_key: str,
-    migrate_stats: Mapping[str, Any] | None = None,
-    not_before: float | None = None,
-    now: float | None = None,
-) -> tuple[dict | None, bool, str]:
-    """Enqueue one legacy→v1 migration batch job if none equivalent/active exists.
-
-    Single-flight per user (one active migrate at a time) so batches run serially
-    and never race each other; the handler picks the next batch of legacy cards at
-    run time. Idempotent by migrate_key (e.g. the quiet-window day/window id)."""
-    from memory import migration as _migration  # local import avoids load-order cycle
-    if not _migration.migration_enabled():
-        return None, False, "migration_disabled"
-    key = str(migrate_key or "").strip()
-    if not key:
-        return None, False, "migrate_key_required"
-    existing_same_key = _find_migrate_by_key(store, key)
-    if existing_same_key is not None and _migrate_same_key_blocks_retry(existing_same_key):
-        return existing_same_key, False, "duplicate_migrate_key"
-    # Plan §2: migration must not run alongside capture/dream (shared memory_lock +
-    # overlapping read→derive→write windows). Block at enqueue on ANY active
-    # maintenance job, not just another migrate — simplest, single source of truth.
-    active = _find_active_capture(store) or _find_active_dream(store) or _find_active_migrate(store)
-    if active is not None:
-        return active, False, "maintenance_already_pending"
-    job = make_memory_migrate_job(
-        trigger=trigger,
-        migrate_key=key,
-        migrate_stats=migrate_stats,
         not_before=not_before,
         now=now,
     )

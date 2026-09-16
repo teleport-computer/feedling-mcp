@@ -43,20 +43,6 @@ def test_capture_completed_resolves():
     assert _rows(uid)["memory_backoff:capture"]["resolved"] is True
 
 
-def test_migrate_backoff_emits_only_at_streak_3_and_resolves():
-    uid = _uid(); seed_user(uid); store = get_store(uid)
-    job = {"job_id": "m", "migrate_key": "mk", "source": capture_jobs.MIGRATE_JOB_SOURCE}
-    capture_scheduler.record_migrate_job_status(store, job, status="failed")  # 1
-    capture_scheduler.record_migrate_job_status(store, job, status="failed")  # 2
-    assert "memory_backoff:migrate" not in _rows(uid)
-    capture_scheduler.record_migrate_job_status(store, job, status="failed")  # 3
-    n = _rows(uid)["memory_backoff:migrate"]
-    assert n["source"] == "memory" and n["severity"] == "warning"
-    assert "migrate" in n["user_text"] and "3" in n["user_text"]
-    capture_scheduler.record_migrate_job_status(store, job, status="completed")
-    assert _rows(uid)["memory_backoff:migrate"]["resolved"] is True
-
-
 def test_dream_backoff_emits_only_at_streak_3_and_resolves():
     uid = _uid(); seed_user(uid); store = get_store(uid)
     job = {"job_id": "d", "dream_key": "dk", "source": capture_jobs.DREAM_JOB_SOURCE}
