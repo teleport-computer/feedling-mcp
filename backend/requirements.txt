@@ -185,4 +185,18 @@ jieba==0.42.1  # deterministic Chinese BM25 tokenization; hash in requirements.l
 # 于是下游又只剩"回来了"可说。
 # 同批还有：EventDefinition 动态装配、Workout 三投影（当日求和而不是取 max）、
 # 累计型允许向下修订（counter_epoch_id）。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.5.0/perceptkit-0.5.0-py3-none-any.whl
+#
+# 0.5.0 → 0.7.0（2026-09-16，跨过 0.6.0）。两个线上唤醒缺陷：
+#
+#   同一个跳变第二次发生被当成重复吞掉  周一 家→公司 叫醒，周二起永远不叫；
+#                                      录屏开/关只在第一次开、第一次关时叫。
+#                                      事件 id 改按触发它的那条观测算。
+#   规则只能看一个字段                  新增 EventDefinition.when（前置条件），
+#                                      锚点规则配 is_connected=True。
+#
+# 配套改动在 perceptkit_adapter/wake_rules.py。无数据迁移，已存事件 id 不变。
+# 0.6.0 那条（manifest 里 SignalDefinition.capability 对 12 条拆分健康信号
+# 换值、catalog 新增 health_steps）顺带带进来。io 的快照字段筛选读的是
+# perceptkit.catalog.SIGNALS，升级前后逐项对比无变化；step_count 改挂
+# health_steps 是另一件事，不在这次。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.7.0/perceptkit-0.7.0-py3-none-any.whl
