@@ -309,3 +309,117 @@ def test_turning_the_kit_off_gives_the_live_path_back(monkeypatch):
     from perception import service
     monkeypatch.setenv("FEEDLING_PERCEPTKIT_WAKES", "0")
     assert service._perceptkit_owns_wakes() is False
+
+
+# --------------------------------------------------------------------------
+# 唤醒 job 的时间戳 = 收到的时刻，不是发生的时刻（2026-09-17）
+#
+# 照片带上拍摄时间以后，事件的 occurred_at 可以是几小时前。job 时间戳要是
+# 跟着它走：V1 consumer 按 job ts 推进读游标 → 这条落在游标后面被跳过；
+# V2 兼容投递按它算能力防抖 → now - last 变负数。所以只有观测拿拍摄时间，
+# 排队一律用收到时刻。
+# --------------------------------------------------------------------------
+
+CAPTURED = T0 - timedelta(hours=3)
+
+
+def _late_photo_event():
+    from perceptkit.contracts.event import PerceptionEvent
+    return PerceptionEvent(
+        event_id="late", definition_id="io.perception.photo_added", definition_version=1,
+        subject_id="u1", type="photo_added", signal="photo_library_added",
+        occurred_at=CAPTURED, received_at=T0, condition="occurrence",
+        field_name=None, previous=None, current=None, context={},
+    )
+
+
+def test_the_wake_is_stamped_with_receive_time_not_capture_time():
+    got = []
+    FeedlingWakePort(submit=lambda ev: got.append(ev) or True).wake(_late_photo_event(), None)
+    assert got[0].created_at == T0.timestamp()
+    assert got[0].created_at != CAPTURED.timestamp()
+
+
+def _drive_real_enqueue(monkeypatch, runtime_mode):
+    """kit 事件 → io WakePort → service._fire_wake_event_v2 → 真实的 job 形状。
+
+    只把最底下的存储换成记录，中间的字段传递全是生产代码。
+    """
+    import types
+    from core import store as core_store
+    from core import wake_bus as core_wake_bus
+    from hosted import config_store as hosted_config_store
+    from model_api_runtime.v2 import jobs_store
+    from perception import service
+
+    legacy_jobs, v2_jobs = [], []
+    user_store = types.SimpleNamespace(
+        proactive_activation_ready=lambda: True,
+        append_proactive_job=lambda job: legacy_jobs.append(job),
+    )
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(core_store, "get_store_per_load_mode",
+                        lambda _uid, **_kw: user_store)
+    monkeypatch.setattr(hosted_config_store, "get_hosted_runtime_mode_strict",
+                        lambda _store: runtime_mode)
+    monkeypatch.setattr(jobs_store, "enqueue_job_with_context_log",
+                        lambda uid, lane, **kw: (v2_jobs.append(kw), (1, False))[1])
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_a: None)
+    monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda uid: None)
+
+    port = FeedlingWakePort(
+        submit=lambda ev: service._fire_wake_event_v2(ev) or True)
+    port.wake(_late_photo_event(), None)
+    return legacy_jobs, v2_jobs
+
+
+def test_v1_job_timestamp_is_receive_time(monkeypatch):
+    """V1 consumer 用 job ts 推进游标、做 60 秒合并。"""
+    from hosted import config_store as hosted_config_store
+    legacy, v2 = _drive_real_enqueue(monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT)
+    assert v2 == []
+    assert len(legacy) == 1
+    assert legacy[0]["ts"] == T0.timestamp()
+
+
+def test_v2_job_timestamp_is_receive_time(monkeypatch):
+    from hosted import config_store as hosted_config_store
+    legacy, v2 = _drive_real_enqueue(monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2)
+    assert legacy == []
+    assert len(v2) == 1
+    assert v2[0]["context_ts"] == T0.timestamp()
+    assert v2[0]["context_doc"]["created_at"] == T0.timestamp()
+
+
+@_needs_pg
+def test_a_late_photo_keeps_its_capture_time_in_the_outbox_but_wakes_at_receive_time(kit_world):
+    from perception.perceptkit_adapter.events import photo_envelope
+    kit_world.ingest(photo_envelope("late-1", occurred_at=CAPTURED,
+                                    timezone_id="Asia/Shanghai"), T0)
+    rows = kit_world.outbox("photo_added")
+    assert len(rows) == 1
+    assert rows[0].occurred_at == CAPTURED
+    assert len(_wakes(kit_world, "photo_added")) == 1
+    assert _wakes(kit_world, "photo_added")[0].created_at == T0.timestamp()
+
+
+@_needs_pg
+def test_carrying_the_absence_duration_does_not_change_how_often_it_wakes(kit_world):
+    """修 bug A 只改观测里的值，不改唤醒次数：每次回来仍然叫一次、重传不叫。"""
+    from perception.perceptkit_adapter.events import device_event_envelope
+    from proactive import service as proactive_service
+
+    def unlock(event_id, at, **payload):
+        stored = proactive_service._make_device_event(
+            "ios", "unlock_after_absence", {"wake_trigger": "unlock_after_absence", **payload})
+        stored["event_id"] = event_id
+        return device_event_envelope(stored, occurred_at=at)
+
+    kit_world.ingest(unlock("u-old", T0), T0)
+    t1 = T0 + timedelta(hours=2)
+    with_fields = unlock("u-new", t1, idle_sec=2400, presence_evidence="app_became_active")
+    kit_world.ingest(with_fields, t1)
+    kit_world.ingest(with_fields, t1 + timedelta(seconds=5))      # 重传
+
+    assert len(kit_world.outbox("unlock_after_absence")) == 2
+    assert len(_wakes(kit_world, "unlock_after_absence")) == 2

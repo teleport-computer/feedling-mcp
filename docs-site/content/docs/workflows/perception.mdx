@@ -424,7 +424,9 @@ X-API-Key: YOUR_FEEDLING_API_KEY
     "is_burst": false,
     "is_indoor": true,
     "has_text_block": false,
-    "is_screenshot": false
+    "is_screenshot": false,
+    "source_event_id": "ph1_DEVICE_STABLE_PHOTO_ID",
+    "occurred_at": "2026-09-17T19:42:10+08:00"
   },
   "content_envelope": {
     "v": 1,
@@ -470,6 +472,14 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "status": "stored"
 }
 ```
+
+`occurred_at` is optional: when the photo was taken, as ISO 8601 with a UTC
+offset. Perception history counts the photo on the day it was taken. If it is
+missing, has no offset, is more than 60 seconds in the future, or is older than
+photo history retention (seven days), the server uses the upload time instead.
+The wake raised for the photo is always timestamped with the upload time.
+`source_event_id` is an optional stable device identity for the photo so that a
+re-upload is not counted twice.
 
 `scene_hint` and `is_screenshot` influence the returned `sensitive` metadata;
 they are not a storage-denial gate. The request parser still accepts

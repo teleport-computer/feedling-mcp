@@ -301,3 +301,175 @@ def test_retransmitting_one_photo_does_not_double_the_permanent_daily_count():
     send("envelope-id-a")
     send("envelope-id-b")                        # 同一张照片、两个信封 id
     assert count() == 4, "身份不稳时确实会重复累加 —— 这正是要避免的那个后果"
+
+
+# ---------------------------------------------------------------------------
+# 「离开后回来」的时长和证据（2026-09-17 修）
+#
+# 之前：iOS 发了 idle_sec 和 presence_evidence，设备事件白名单把两个都删了；
+#       适配层又读 absence_seconds —— iOS 从来不发这个名字。于是 kit 里每一条
+#       presence_recovery 的时长都是空、证据都是 unknown，唤醒照常。
+# 之后：两格过白名单（带类型和范围校验），适配层认 idle_sec。
+#
+# 断两处中任何一处，下面第一条都会红 —— 所以它走的是真实的两跳，
+# 不是分别喂两个函数。
+# ---------------------------------------------------------------------------
+
+def _ios_unlock_event(**payload):
+    """iOS FeedlingAPI.sendUnlockAfterAbsence 的原样 payload，过服务端白名单。"""
+    from proactive import service as proactive_service
+    raw = {"wake_trigger": "unlock_after_absence",
+           "broadcast_state": "off", **payload}
+    return proactive_service._make_device_event("ios", "unlock_after_absence", raw)
+
+
+def test_the_measured_absence_and_its_evidence_reach_the_kit():
+    stored = _ios_unlock_event(idle_sec=2400, presence_evidence="app_became_active")
+    env = events.device_event_envelope(stored, occurred_at=AT)
+    v = value(env, "presence_recovery")
+    assert v["absence_seconds"] == 2400.0
+    assert v["absence_quality"] == "measured"
+    assert v["evidence"] == "app_became_active"
+
+
+@pytest.mark.parametrize("bad", [True, -1, "2400", None, float("nan"),
+                                 366 * 24 * 3600 + 1, [2400]])
+def test_a_malformed_idle_sec_is_dropped_not_passed_as_a_duration(bad):
+    stored = _ios_unlock_event(idle_sec=bad, presence_evidence="app_became_active")
+    assert "idle_sec" not in stored["payload"]
+    v = value(events.device_event_envelope(stored, occurred_at=AT), "presence_recovery")
+    assert (v["absence_seconds"], v["absence_quality"]) == (None, "estimated")
+
+
+@pytest.mark.parametrize("bad", ["user_unlocked_phone", "foreground", 1, "", None])
+def test_evidence_outside_the_kit_enum_is_dropped_and_becomes_unknown(bad):
+    stored = _ios_unlock_event(idle_sec=2400, presence_evidence=bad)
+    assert "presence_evidence" not in stored["payload"]
+    v = value(events.device_event_envelope(stored, occurred_at=AT), "presence_recovery")
+    assert v["evidence"] == "unknown"
+
+
+def test_the_whitelisted_evidence_values_are_exactly_the_kit_enum():
+    """白名单手抄了一份枚举（proactive 不 import kit）。抄漂了就红。"""
+    from proactive import service as proactive_service
+    field = next(f for f in MINIMAL_SIGNALS["presence_recovery"].fields
+                 if f.key == "evidence")
+    assert proactive_service._PRESENCE_EVIDENCE_VALUES == set(field.enum)
+
+
+def test_the_manifest_name_wins_when_both_durations_are_present():
+    env = events.device_event_envelope(
+        {"event_id": "e9", "type": "unlock_after_absence",
+         "payload": {"absence_seconds": 100, "idle_sec": 2400}}, occurred_at=AT)
+    assert value(env, "presence_recovery")["absence_seconds"] == 100.0
+
+
+def test_the_duration_does_not_change_the_report_identity():
+    """重传落在同一个 report_id 与时长无关 —— 唤醒次数靠它。"""
+    a = events.device_event_envelope(
+        {"event_id": "e1", "type": "unlock_after_absence", "payload": {}}, occurred_at=AT)
+    b = events.device_event_envelope(
+        {"event_id": "e1", "type": "unlock_after_absence",
+         "payload": {"idle_sec": 2400, "presence_evidence": "app_became_active"}},
+        occurred_at=AT)
+    assert a["report_id"] == b["report_id"]
+
+
+# ---------------------------------------------------------------------------
+# 照片的拍摄时间（2026-09-17 修）
+#
+# 之前：observation 的 occurred_at 恒为服务器收到的时刻 —— 一小时前拍的照片
+#       在 kit 里是「刚拍的」，每日新增按上传那天算。
+# 之后：metadata.occurred_at 可用就用它；缺、坏、太离谱都退回收到时刻。
+# ---------------------------------------------------------------------------
+
+RECEIVED = 1788166800.0    # 2026-08-31T09:00:00Z
+
+
+def test_a_valid_capture_time_is_used():
+    got = events.photo_capture_time("2026-08-31T15:30:00+08:00", received=RECEIVED)
+    assert got is not None
+    assert got.timestamp() == RECEIVED - 5400      # 07:30Z
+
+
+def test_a_capture_time_with_z_suffix_is_accepted():
+    got = events.photo_capture_time("2026-08-31T08:00:00Z", received=RECEIVED)
+    assert got is not None and got.timestamp() == RECEIVED - 3600
+
+
+@pytest.mark.parametrize("bad", [
+    None, "", 1788166800, "yesterday", "2026-08-31T08:00:00",   # 无时区
+    "2026-08-31", "x" * 65, ["2026-08-31T08:00:00Z"],
+])
+def test_a_missing_or_unusable_capture_time_falls_back(bad):
+    assert events.photo_capture_time(bad, received=RECEIVED) is None
+
+
+def test_a_capture_time_in_the_future_beyond_the_skew_allowance_falls_back():
+    from datetime import datetime, timedelta, timezone
+    base = datetime.fromtimestamp(RECEIVED, timezone.utc)
+    ok = (base + timedelta(seconds=59)).isoformat()
+    bad = (base + timedelta(seconds=61)).isoformat()
+    assert events.photo_capture_time(ok, received=RECEIVED) is not None
+    assert events.photo_capture_time(bad, received=RECEIVED) is None
+
+
+def test_a_capture_time_older_than_the_kit_keeps_photo_history_falls_back():
+    from datetime import datetime, timedelta, timezone
+    days = MINIMAL_SIGNALS["photo_library_added"].history_retention_days
+    assert days > 0
+    base = datetime.fromtimestamp(RECEIVED, timezone.utc)
+    inside = (base - timedelta(days=days) + timedelta(minutes=1)).isoformat()
+    outside = (base - timedelta(days=days) - timedelta(minutes=1)).isoformat()
+    assert events.photo_capture_time(inside, received=RECEIVED) is not None
+    assert events.photo_capture_time(outside, received=RECEIVED) is None
+
+
+def test_the_skew_allowance_is_the_one_the_live_path_gives_client_times():
+    from perception import service
+    assert events.PHOTO_CAPTURE_FUTURE_TOLERANCE_SEC == service._FUTURE_TS_TOLERANCE_SEC
+
+
+def test_observe_photo_puts_the_capture_time_on_the_observation(monkeypatch):
+    from perception.perceptkit_adapter import shadow
+    seen = {}
+    monkeypatch.setattr(shadow, "enabled", lambda: True)
+    monkeypatch.setattr(shadow, "_live_timezone", lambda uid: "Asia/Shanghai")
+    monkeypatch.setattr(shadow, "_run", lambda uid, env, received: seen.update(
+        env=env, received=received) or {"ran": True})
+
+    shadow.observe_photo("u", "ph_1", occurred_at=RECEIVED,
+                         captured_at="2026-08-31T15:30:00+08:00")
+    obs = seen["env"]["observations"][0]
+    assert obs["occurred_at"] == "2026-08-31T07:30:00+00:00"
+    assert obs["value"]["added_at"] == "2026-08-31T07:30:00+00:00"
+
+    shadow.observe_photo("u", "ph_2", occurred_at=RECEIVED, captured_at="garbage")
+    assert seen["env"]["observations"][0]["occurred_at"] == "2026-08-31T09:00:00+00:00"
+
+    shadow.observe_photo("u", "ph_3", occurred_at=RECEIVED)   # 老版本 app
+    assert seen["env"]["observations"][0]["occurred_at"] == "2026-08-31T09:00:00+00:00"
+
+
+def test_a_photo_counts_toward_the_day_it_was_taken():
+    """上海时间 8/30 23:30 拍、8/31 09:00（UTC）才传上来：算 8/30 那天。"""
+    from datetime import date, datetime, timezone
+    from perceptkit import IngestContext, PerceptionKit
+    from perceptkit.conformance import InMemoryStorage
+
+    received = datetime.fromtimestamp(RECEIVED, timezone.utc)
+    captured = events.photo_capture_time("2026-08-30T23:30:00+08:00", received=RECEIVED)
+    assert captured is not None
+    storage = InMemoryStorage()
+    kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
+    kit.ingest(events.photo_envelope("late-photo", occurred_at=captured,
+                                     timezone_id="Asia/Shanghai"),
+               context=IngestContext("u", received))
+
+    def count(day):
+        rows = storage.get_aggregate(subject_id="u", signal="photo_library_added",
+                                     start_date=day, end_date=day)
+        return rows[0].typed_aggregate["count"]["total"] if rows else 0
+
+    assert count(date(2026, 8, 30)) == 1
+    assert count(date(2026, 8, 31)) == 0

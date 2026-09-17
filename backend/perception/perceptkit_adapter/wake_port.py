@@ -104,7 +104,12 @@ class FeedlingWakePort:
                 change_digest=event.event_id,
                 payload=dict(event.context or {}),
             ),
-            ts=event.occurred_at.timestamp(),
+            # 🔴 **收到的时刻，不是发生的时刻。** 这个 ts 会成为 job 的时间戳：
+            # V1 consumer 按它推进读游标、按它合并 60 秒内的唤醒，V2 兼容投递
+            # 按它算能力防抖。照片带上拍摄时间以后，occurred_at 可以是几小时
+            # 前 —— 用它排队，job 会落在游标后面被跳过，或者防抖永远算出负数。
+            # 发生时刻留在观测和事件本身里，不进队列。
+            ts=event.received_at.timestamp(),
             origin_refs=(f"perceptkit:{event.definition_id}",),
         )))
 

@@ -1380,3 +1380,78 @@ def test_photo_suppressed_when_photo_wake_disabled(env, monkeypatch):
     assert suppressed[0]["origin_refs"] == ["photo:p_dnd"]
     assert not any(e.get("cap") == "runtime_v2" and e.get("type") == "wake"
                    for e in events)
+
+
+# ---------------------------------------------------------------------------
+# V1 照片唤醒只排一次（2026-09-17）
+#
+# 之前：kit 接管唤醒后，V2 兼容投递会让位，V1 老路（_maybe_wake）却不查 ——
+#       V1 用户每张照片老路排一条（30 秒防抖）、kit 再排一条。
+# 之后：两条老路共用 _live_wake_yields_to_kit，kit 接管时都不投。
+# ---------------------------------------------------------------------------
+
+def _photo(uid, pid, meta=None):
+    out, code = service.photo_evaluate(
+        uid, dict(meta or {"scene_hint": "food"}), {"id": pid, "body_ct": "cipher"})
+    assert code == 200 and out["status"] == "stored"
+
+
+def _photo_wake_events(fake, uid):
+    return [e for e in fake.read_events(uid) if e.get("type") == "wake"]
+
+
+def test_v1_photo_does_not_enqueue_on_the_old_path_when_kit_owns_wakes(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_perceptkit_owns_wakes", lambda: True)
+    monkeypatch.setattr(service, "_perceptkit_shadow_call", lambda *a, **k: None)
+    _photo("u_v1_kit", "p1")
+    assert wakes == [], "kit 接管时 V1 老路又排了一条照片唤醒"
+    assert _photo_wake_events(fake, "u_v1_kit") == []
+    # 照片本身照存
+    assert fake.get_photo_envelope("u_v1_kit", "p1")
+
+
+def test_v1_photo_still_wakes_on_the_old_path_when_kit_is_off(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_perceptkit_owns_wakes", lambda: False)
+    monkeypatch.setattr(service, "_perceptkit_shadow_call", lambda *a, **k: None)
+    _photo("u_v1_live", "p1")
+    assert [w[0] for w in wakes] == ["photos"]
+    assert len(_photo_wake_events(fake, "u_v1_live")) == 1
+
+
+@pytest.mark.parametrize("kit_owns, expected", [(True, 0), (False, 1)])
+def test_v2_photo_takeover_behaviour_is_unchanged(env, monkeypatch, kit_owns, expected):
+    fake, wakes = env
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: True)
+    _stub_changed_v2_observation(monkeypatch)
+    monkeypatch.setattr(service, "_perceptkit_owns_wakes", lambda: kit_owns)
+    monkeypatch.setattr(service, "_perceptkit_shadow_call", lambda *a, **k: None)
+    _photo("u_v2", "p1")
+    assert len([w for w in wakes if w[0] == "photo_added"]) == expected
+
+
+def test_both_old_paths_ask_the_same_takeover_question():
+    """一个判断，两处调用 —— 不是两份拷贝。"""
+    assert "_live_wake_yields_to_kit" in inspect.getsource(service._maybe_wake)
+    assert "_live_wake_yields_to_kit" in inspect.getsource(
+        service._submit_wake_event_v2_compat)
+
+
+def test_photo_evaluate_hands_the_raw_capture_time_to_the_kit(env, monkeypatch):
+    """拍摄时间原样交给适配层校验；老版本 app 不带就是 None。"""
+    calls = []
+    monkeypatch.setattr(service, "_perceptkit_shadow_call",
+                        lambda entry, *a, **k: calls.append((entry, k)))
+    clock = {"t": 1788166800.0}
+    monkeypatch.setattr(service, "_now", lambda: clock["t"])
+
+    _photo("u_cap", "p1", {"scene_hint": "food",
+                           "occurred_at": "2026-08-31T15:30:00+08:00"})
+    _photo("u_cap", "p2", {"scene_hint": "food"})
+
+    photo_calls = [k for entry, k in calls if entry == "observe_photo"]
+    assert photo_calls[0] == {"occurred_at": 1788166800.0,
+                              "captured_at": "2026-08-31T15:30:00+08:00"}
+    assert photo_calls[1] == {"occurred_at": 1788166800.0, "captured_at": None}

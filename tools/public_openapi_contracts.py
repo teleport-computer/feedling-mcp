@@ -2079,6 +2079,16 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "is_indoor": {"oneOf": [{"type": "boolean"}, {"type": "string"}]},
                     "has_text_block": {"oneOf": [{"type": "boolean"}, {"type": "string"}]},
                     "is_screenshot": {"oneOf": [{"type": "boolean"}, {"type": "string"}]},
+                    "source_event_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Stable, non-reversible device identity for this photo, so a re-upload is not counted twice. Optional.",
+                    },
+                    "occurred_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the photo was taken, ISO 8601 with a UTC offset. Optional; when missing, lacking an offset, more than 60 seconds in the future, or older than photo history retention, the server uses the upload time instead.",
+                    },
                 },
                 "additionalProperties": False,
             },

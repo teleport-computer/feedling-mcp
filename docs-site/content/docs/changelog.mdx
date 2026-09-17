@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `POST /v1/perception/photo/evaluate` documents two optional metadata fields
+  that clients already send: `occurred_at` (when the photo was taken) and
+  `source_event_id` (stable device identity). A valid `occurred_at` now dates
+  the photo in perception history; invalid or missing values fall back to the
+  upload time. Wake timing is unchanged.
+
 - Sixteen resident and workflow error notices now have English copy, covering
   model-service and reply failures, onboarding and chat-history import failures,
   memory backoff, and companion process startup or degraded operation.

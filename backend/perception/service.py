@@ -970,6 +970,21 @@ def _perceptkit_owns_wakes() -> bool:
         return False
 
 
+def _live_wake_yields_to_kit(user_id: str, trigger: str) -> bool:
+    """老路这一次唤醒要不要让给 kit。True = 不投。
+
+    V1 老路（``_maybe_wake``）和 V2 兼容投递（``_submit_wake_event_v2_compat``）
+    共用这一个判断。以前只有 V2 那条查了：V1 用户拍一张照片，老路按 30 秒防抖
+    排一条 job、kit 再按照片排一条，同一张照片进队列两次（consumer 的合并窗口
+    兜住了，用户基本无感，但队列和统计里是两条）。
+    """
+    if not _perceptkit_owns_wakes():
+        return False
+    log.info("perceptkit owns wakes; live trigger=%s not delivered (user=%s)",
+             trigger or "?", user_id)
+    return True
+
+
 def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
     """Compatibility output: V2 differ event -> old proactive job queue.
 
@@ -984,9 +999,8 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
 
     挡在这里而不是挡在 differ：差异要继续算、继续记，只是不投递。
     """
-    if not from_kit and _perceptkit_owns_wakes():
-        log.info("perceptkit owns wakes; live trigger=%s not delivered",
-                 getattr(event, "trigger", "?"))
+    if not from_kit and _live_wake_yields_to_kit(
+            getattr(event, "user_id", ""), getattr(event, "trigger", "")):
         return False
 
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
@@ -1152,6 +1166,11 @@ def _fire_wake_event_v2(event) -> None:
 
 
 def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
+    # 和 V2 兼容投递同一道闸：kit 接管唤醒后，老路不再落地成 job。
+    # 挡在最前面、不记 suppressed/debounced 事件 —— 与 V2 那条一致，
+    # 这不是「被闸拦下」，是「这件事归 kit 投」。
+    if _live_wake_yields_to_kit(user_id, _legacy_wake_trigger(cap_key, new_v)):
+        return
     block = _wake_block_reason(user_id)
     if block:
         store.append_event(user_id, {
@@ -1725,9 +1744,13 @@ def photo_evaluate(user_id: str, metadata: dict,
     #
     # Falls back to photo_id for clients that do not send one yet. That is the
     # old behaviour, not a fix -- those clients still double-count on retry.
+    #
+    # The capture time rides along raw and is validated in the adapter; a
+    # missing or unusable one leaves the observation at receive time, which is
+    # what every client before it got.
     _perceptkit_shadow_call(
         "observe_photo", user_id, _photo_identity(metadata, photo_id),
-        occurred_at=now)
+        occurred_at=now, captured_at=metadata.get("occurred_at"))
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
             "sensitive": sensitive, "status": "stored"}, 200
 
