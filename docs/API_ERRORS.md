@@ -350,6 +350,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `app_required` | 400 | — | | |
 | `unknown_signals` | 400 | — | agent 感知信号名不识别 | |
 | `unknown_or_unhistorized_signal` | 400 | — | | |
+| `invalid_day` | 400 | — | admin lane-rollup summary 的 `day` 不是 YYYY-MM-DD 有效日期，或不存在前一天 | |
 | `invalid_days` | 400 | — | `days` 查询参数非数字 | |
 
 ## Web 能力（`POST /v1/agent/web/{search,fetch}`，CapabilityResult `error.code`）

@@ -29,7 +29,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
@@ -38,6 +38,7 @@ from psycopg.errors import QueryCanceled
 
 import db
 from admin import admin_core
+from admin import lane_rollup_summary
 from admin import memory_metadata
 from admin import tee_replication as admin_tee_replication
 from admin import plaintext_shadow as admin_plaintext_shadow
@@ -753,6 +754,28 @@ async def lane_rollup(request: Request):
         offset=offset,
     )
     return JSONResponse(payload)
+
+
+_LANE_ROLLUP_SUMMARY_PARAMS = frozenset({"day", "admin_key"})
+
+
+@router.get("/v1/admin/lane-rollup/summary")
+async def lane_rollup_daily_summary(request: Request):
+    """Two Beijing days of memory-lane counts, without user or job identities."""
+    _require_admin(request)
+    unknown = sorted(set(request.query_params) - _LANE_ROLLUP_SUMMARY_PARAMS)
+    if unknown:
+        return JSONResponse(
+            {"error": "unknown_query_params", "params": unknown, "supported": ["day"]},
+            status_code=400,
+        )
+    day = request.query_params.get("day", lane_rollup_summary.default_day())
+    try:
+        if not _LANE_ROLLUP_DAY_RE.fullmatch(day) or date.fromisoformat(day) == date.min:
+            raise ValueError
+    except ValueError:
+        return JSONResponse({"error": "invalid_day"}, status_code=400)
+    return JSONResponse(await threadpool.run_db(lane_rollup_summary.read_summary, day=day))
 
 
 _ENCLAVE_HEALTH_PARAMS = frozenset({"window_minutes", "end_epoch", "admin_key"})

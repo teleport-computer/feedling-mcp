@@ -1,0 +1,392 @@
+{
+  "day": "2026-09-14",
+  "previous_day": "2026-09-13",
+  "cells": {
+    "capture/resident": {
+      "day": {
+        "completed": 139,
+        "failed_raw": 47,
+        "operational": 14,
+        "control": 9,
+        "user_unavailable": 24,
+        "user_unavailable_users": 4,
+        "user_unavailable_codes": {
+          "capture_agent_call_failed:quota_insufficient": 24
+        },
+        "skipped": 0,
+        "stuck_users": 2,
+        "causes": {
+          "user_account": {
+            "attempts": 8,
+            "users": 2,
+            "codes": {
+              "capture_agent_call_failed:resident_agent_cli_logged_out": 8
+            }
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 3,
+            "users": 3,
+            "codes": {
+              "capture_memory_actions_failed": 3
+            }
+          },
+          "unknown": {
+            "attempts": 3,
+            "users": 3,
+            "codes": {
+              "runtime_failed": 3
+            }
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 26,
+        "attempts": 153,
+        "failure_rate": 0.0915032679738562
+      },
+      "previous": {
+        "completed": 150,
+        "failed_raw": 20,
+        "operational": 0,
+        "control": 0,
+        "user_unavailable": 20,
+        "user_unavailable_users": 4,
+        "user_unavailable_codes": {
+          "capture_agent_call_failed:quota_insufficient": 20
+        },
+        "skipped": 0,
+        "stuck_users": 0,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "unknown": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 23,
+        "attempts": 150,
+        "failure_rate": 0.0
+      }
+    },
+    "capture/model_api": {
+      "day": {
+        "completed": 172,
+        "failed_raw": 106,
+        "operational": 72,
+        "control": 10,
+        "user_unavailable": 24,
+        "user_unavailable_users": 4,
+        "user_unavailable_codes": {
+          "extraction_failed:auth_invalid": 24
+        },
+        "skipped": 0,
+        "stuck_users": 8,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 18,
+            "users": 6,
+            "codes": {
+              "extraction_failed:upstream_unavailable": 12,
+              "extraction_failed:rate_limited": 6
+            }
+          },
+          "our_side": {
+            "attempts": 48,
+            "users": 8,
+            "codes": {
+              "extraction_failed:json_decode_error": 24,
+              "lease_timeout": 24
+            }
+          },
+          "unknown": {
+            "attempts": 6,
+            "users": 6,
+            "codes": {
+              "no_code": 6
+            }
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 35,
+        "attempts": 244,
+        "failure_rate": 0.29508196721311475
+      },
+      "previous": {
+        "completed": 234,
+        "failed_raw": 12,
+        "operational": 8,
+        "control": 0,
+        "user_unavailable": 4,
+        "user_unavailable_users": 4,
+        "user_unavailable_codes": {
+          "extraction_failed:auth_invalid": 4
+        },
+        "skipped": 0,
+        "stuck_users": 0,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 8,
+            "users": 8,
+            "codes": {
+              "extraction_failed:json_decode_error": 4,
+              "lease_timeout": 4
+            }
+          },
+          "unknown": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 30,
+        "attempts": 242,
+        "failure_rate": 0.03305785123966942
+      }
+    },
+    "dream/resident": {
+      "day": {
+        "completed": 6,
+        "failed_raw": 2,
+        "operational": 0,
+        "control": 0,
+        "user_unavailable": 2,
+        "user_unavailable_users": 2,
+        "user_unavailable_codes": {
+          "dream_agent_call_failed:auth_invalid": 2
+        },
+        "skipped": 0,
+        "stuck_users": 0,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "unknown": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 8,
+        "attempts": 6,
+        "failure_rate": 0.0
+      },
+      "previous": {
+        "completed": 6,
+        "failed_raw": 2,
+        "operational": 0,
+        "control": 0,
+        "user_unavailable": 2,
+        "user_unavailable_users": 2,
+        "user_unavailable_codes": {
+          "dream_agent_call_failed:auth_invalid": 2
+        },
+        "skipped": 0,
+        "stuck_users": 0,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "unknown": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 8,
+        "attempts": 6,
+        "failure_rate": 0.0
+      }
+    },
+    "dream/model_api": {
+      "day": {
+        "completed": 3,
+        "failed_raw": 3,
+        "operational": 0,
+        "control": 0,
+        "user_unavailable": 3,
+        "user_unavailable_users": 3,
+        "user_unavailable_codes": {
+          "provider_setup:model_api_not_tested": 3
+        },
+        "skipped": 8,
+        "stuck_users": 0,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "unknown": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 14,
+        "attempts": 3,
+        "failure_rate": 0.0
+      },
+      "previous": {
+        "completed": 14,
+        "failed_raw": 0,
+        "operational": 0,
+        "control": 0,
+        "user_unavailable": 0,
+        "user_unavailable_users": 0,
+        "user_unavailable_codes": {},
+        "skipped": 0,
+        "stuck_users": 0,
+        "causes": {
+          "user_account": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "model_service": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "our_side": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          },
+          "unknown": {
+            "attempts": 0,
+            "users": 0,
+            "codes": {}
+          }
+        },
+        "partial": false,
+        "unclassified": false,
+        "active_users": 14,
+        "attempts": 14,
+        "failure_rate": 0.0
+      }
+    }
+  },
+  "live_stuck": {
+    "capture": 5,
+    "dream": 0
+  },
+  "incomplete": [],
+  "coverage": {
+    "capture": {
+      "resident": {
+        "backfill_from": "2026-08-01",
+        "through_day": "2026-09-14",
+        "partial_before": "2026-08-01",
+        "voice_from": "2026-08-20",
+        "outcomes_from": "2026-08-25",
+        "access_path_from": "2026-09-01"
+      },
+      "model_api": {
+        "backfill_from": "2026-07-10",
+        "through_day": "2026-09-14",
+        "partial_before": "2026-07-10",
+        "voice_from": "2026-08-20",
+        "outcomes_from": null,
+        "access_path_from": "2026-09-01"
+      }
+    },
+    "dream": {
+      "resident": {
+        "backfill_from": "2026-08-01",
+        "through_day": "2026-09-14",
+        "partial_before": "2026-08-01",
+        "voice_from": "2026-08-20",
+        "outcomes_from": "2026-08-25",
+        "access_path_from": "2026-09-01"
+      },
+      "model_api": {
+        "backfill_from": "2026-07-10",
+        "through_day": "2026-09-14",
+        "partial_before": "2026-07-10",
+        "voice_from": "2026-08-20",
+        "outcomes_from": null,
+        "access_path_from": "2026-09-01"
+      }
+    }
+  }
+}

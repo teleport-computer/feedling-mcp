@@ -18,7 +18,7 @@
 #
 # 本地核对（只打印、不发飞书）：
 #   python tools/memory_pipeline_daily_report.py \
-#     --fixture tests/fixtures/memory_pipeline_daily_report/sources_2026-09-14.json \
+#     --fixture tests/fixtures/memory_pipeline_daily_report/summary_2026-09-14.json \
 #     --day 2026-09-14 --dry-run
 #
 # 注意：schedule 只在默认分支（main）上生效；合进 test 不会开始发。
