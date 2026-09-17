@@ -1134,6 +1134,8 @@ jobs:
             tests/test_admin_data_track_detail_read_failure_html.py \
             tests/test_admin_data_track_status_label_tristate.py \
             tests/test_data_track_debug.py \
+            tests/test_api_errors_doc.py \
+            tests/test_chat_turn_failure_fields.py \
             tests/test_data_track.py \
             tests/test_provider_attempt_ledger.py \
             tests/test_tool_schema_rejection_probe.py \

@@ -15622,28 +15622,28 @@ def test_pi_stream_shape_text_only_message_end():
         _pi_assistant_end([{"type": "text", "text": _SECRET_TEXT}], stop_reason="stop"),
     ))
     assert shape["assistant_message_ends"] == 1
-    assert shape["blocks"] == {"text": 1, "thinking": 0, "toolCall": 0, "other": 0}
+    assert {key: shape[key] for key in ("text_blocks", "thinking_blocks", "tool_blocks", "other_blocks")} == {"text_blocks": 1, "thinking_blocks": 0, "tool_blocks": 0, "other_blocks": 0}
     assert shape["text_chars_total"] == len(_SECRET_TEXT)
     assert shape["update_text_seen"] is False
     assert shape["update_text_chars_max"] == 0
-    assert shape["stop_reasons"] == ["stop"]
+    assert shape["stop_reasons"] == "stop"
 
 
 def test_pi_stream_shape_thinking_only_is_shape_a():
     shape = crc._pi_stream_shape(_pi_events(
         _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"),
     ))
-    assert shape["blocks"]["thinking"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["thinking_blocks"] == 1 and shape["text_blocks"] == 0
     assert shape["text_chars_total"] == 0
-    assert shape["stop_reasons"] == ["length"]
+    assert shape["stop_reasons"] == "length"
 
 
 def test_pi_stream_shape_tool_call_only_is_shape_b():
     shape = crc._pi_stream_shape(_pi_events(
         _pi_assistant_end([{"type": "toolCall", "name": "memory_search", "args": {"q": _SECRET_TEXT}}]),
     ))
-    assert shape["blocks"]["toolCall"] == 1 and shape["blocks"]["text"] == 0
-    assert shape["blocks"]["other"] == 0
+    assert shape["tool_blocks"] == 1 and shape["text_blocks"] == 0
+    assert shape["other_blocks"] == 0
 
 
 def test_pi_stream_shape_update_only_text_is_shape_c():
@@ -15657,16 +15657,16 @@ def test_pi_stream_shape_update_only_text_is_shape_c():
     assert shape["update_text_seen"] is True
     assert shape["update_text_chars_max"] == len(_SECRET_TEXT)
     assert shape["assistant_message_ends"] == 1
-    assert shape["blocks"]["text"] == 0 and shape["text_chars_total"] == 0
+    assert shape["text_blocks"] == 0 and shape["text_chars_total"] == 0
 
 
 def test_pi_stream_shape_counts_unknown_blocks_and_keeps_stop_reasons_enumerated():
     ends = [_pi_assistant_end([{"type": "image", "x": 1}, "junk"], stop_reason=f"r{i}") for i in range(12)]
     shape = crc._pi_stream_shape(_pi_events(*ends))
     assert shape["assistant_message_ends"] == 12
-    assert shape["blocks"]["other"] == 24
+    assert shape["other_blocks"] == 24
     # Twelve distinct unknown reasons collapse to the single enum "other".
-    assert shape["stop_reasons"] == ["other"]
+    assert shape["stop_reasons"] == "other"
 
 
 def test_pi_stream_shape_stop_reason_is_whitelisted_enum_never_free_text():
@@ -15678,10 +15678,10 @@ def test_pi_stream_shape_stop_reason_is_whitelisted_enum_never_free_text():
         _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason="Length"),
         _pi_assistant_end([{"type": "text", "text": "ok"}], stop_reason=""),
     ))
-    assert shape["stop_reasons"] == ["other", "length"]
+    assert shape["stop_reasons"] == "other,length"
     dumped = json.dumps(shape, ensure_ascii=False)
     assert sentinel not in dumped and "leak-" not in dumped and _SECRET_TEXT not in dumped
-    assert set(shape["stop_reasons"]) <= (crc._PI_STREAM_STOP_REASONS | {"other"})
+    assert set(shape["stop_reasons"].split(",")) <= (crc._PI_STREAM_STOP_REASONS | {"other"})
 
 
 def test_pi_stream_shape_is_content_free_and_never_raises():
@@ -15720,8 +15720,8 @@ def test_pi_stream_shape_structural_oddity_keeps_partial_counts_but_flags():
         _pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="stop"),
     ))
     assert shape["assistant_message_ends"] == 3
-    assert shape["blocks"]["text"] == 1 and shape["blocks"]["thinking"] == 1
-    assert shape["stop_reasons"] == ["stop"]
+    assert shape["text_blocks"] == 1 and shape["thinking_blocks"] == 1
+    assert shape["stop_reasons"] == "stop"
     assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
 
 
@@ -15741,8 +15741,8 @@ def test_pi_turn_metrics_carries_stream_shape_into_terminal_detail():
     raw = _pi_events(_pi_assistant_end([{"type": "thinking", "thinking": _SECRET_THOUGHT}], stop_reason="length"))
     metrics = crc._pi_turn_metrics(raw)
     assert metrics["output_tokens"] == 7
-    assert metrics["pi_stream"]["blocks"]["thinking"] == 1
-    assert metrics["pi_stream"]["stop_reasons"] == ["length"]
+    assert metrics["pi_stream"]["thinking_blocks"] == 1
+    assert metrics["pi_stream"]["stop_reasons"] == "length"
     # The terminal trace merges _cli_turn_metrics into detail; the pi branch must
     # keep carrying the shape so agent.model.call.error can be read off the DB.
     completed = subprocess.CompletedProcess(args=["pi", "--mode", "json"], returncode=0, stdout=raw, stderr="")
@@ -15785,10 +15785,10 @@ def test_terminal_error_detail_carries_pi_stream_shape(monkeypatch):
     assert event["type"] == "agent.model.call.error"
     shape = event["detail"]["pi_stream"]
     assert shape["parse_failed"] is False and shape["parse_error_count"] == 0
-    assert shape["blocks"]["thinking"] == 1 and shape["blocks"]["text"] == 0
+    assert shape["thinking_blocks"] == 1 and shape["text_blocks"] == 0
     assert shape["update_text_seen"] is True
     assert shape["update_text_chars_max"] == len(_SECRET_TEXT)
-    assert shape["stop_reasons"] == ["length"]
+    assert shape["stop_reasons"] == "length"
     dumped = json.dumps(event["detail"], ensure_ascii=False)
     assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
 
@@ -15798,7 +15798,7 @@ def test_terminal_done_detail_carries_pi_stream_shape(monkeypatch):
     event = _terminal_detail(monkeypatch, raw=raw, succeeded=True)
     assert event["type"] == "agent.model.call.done"
     assert event["detail"]["pi_stream"]["text_chars_total"] == len(_SECRET_TEXT)
-    assert event["detail"]["pi_stream"]["stop_reasons"] == ["stop"]
+    assert event["detail"]["pi_stream"]["stop_reasons"] == "stop"
 
 
 def test_terminal_detail_has_no_pi_stream_for_other_drivers(monkeypatch):
@@ -15837,7 +15837,7 @@ def test_durable_pi_shape_four_candidates(monkeypatch, kind, succeeded):
     # Also survive a second application (forwarding/re-ingestion).
     durable = debug_trace._safe_detail(debug_trace._safe_detail(event["detail"]))
     shape = durable["pi_stream"]
-    assert shape["schema_version"] == 2
+    assert shape["schema_version"] == 3
     assert shape["parse_failed"] is False and shape["parse_error_count"] == 0
     assert shape["text_blocks"] == 0 and shape["other_blocks"] == 0
     assert shape["thinking_blocks"] == int(kind == "thinking")
@@ -15851,16 +15851,9 @@ def test_durable_pi_shape_four_candidates(monkeypatch, kind, succeeded):
     assert len(shape) <= debug_trace._DETAIL_MAX_KEYS
     dumped = json.dumps(durable, ensure_ascii=False)
     assert _SECRET_TEXT not in dumped and _SECRET_THOUGHT not in dumped
-    # The old projection really is unusable as nested JSON; no backfill or
-    # reinterpretation of old strings as new counters is part of this fix.
-    legacy = {k: v for k, v in event["detail"]["pi_stream"].items()
-              if k in {"assistant_message_ends", "blocks", "text_chars_total",
-                       "update_text_seen", "update_text_chars_max", "stop_reasons",
-                       "parse_error_count", "parse_failed"}}
-    old_shape = debug_trace._safe_detail({"pi_stream": legacy})["pi_stream"]
-    assert isinstance(old_shape["blocks"], str)
-    assert isinstance(old_shape["stop_reasons"], str)
-    assert "thinking_blocks" not in old_shape and "tool_blocks" not in old_shape
+    assert "blocks" not in shape
+    assert all(isinstance(value, (str, int, bool)) for value in shape.values())
+    assert shape["stop_reason_last"] == ("length" if kind == "length" else "")
 
 
 def test_durable_pi_shape_stop_flags_survive_reason_list_cap(monkeypatch):
@@ -15887,7 +15880,7 @@ def test_durable_pi_shape_partial_and_unknown_stay_distinguishable(monkeypatch):
         stop_reason=_SECRET_THOUGHT)) + '\n{"type":'
     shape = debug_trace._safe_detail(
         _terminal_detail(monkeypatch, raw=raw, succeeded=False)["detail"])["pi_stream"]
-    assert shape["schema_version"] == 2
+    assert shape["schema_version"] == 3
     assert shape["text_blocks"] == 1 and shape["other_blocks"] == 1
     assert shape["parse_failed"] is True and shape["parse_error_count"] == 1
     assert shape["stop_reason_first"] == "other"
@@ -15909,7 +15902,7 @@ def test_durable_pi_shape_overlaps_at_trace_enqueue_boundary(monkeypatch):
                             subsystem="agent", type=event["type"], detail=event["detail"])
     assert len(queued) == 1
     shape = queued[0]["detail"]["pi_stream"]
-    assert shape["schema_version"] == 2
+    assert shape["schema_version"] == 3
     assert shape["thinking_blocks"] == 1 and shape["tool_blocks"] == 0
     assert shape["stop_length_seen"] is True  # same stream, not exclusive diagnoses
     assert shape["parse_failed"] is False
@@ -16481,3 +16474,148 @@ def test_startup_exit_write_failure_preserves_exit(startup_home, monkeypatch):
 def test_startup_exit_cleanup_failure_preserves_startup(startup_home):
     startup_home.mkdir()
     crc.run()  # diagnostic cleanup failure must not abort startup
+
+
+# T638: exercise the real CLI return/raise wrapper, not a hand-minted marker.
+@pytest.mark.parametrize("stop_reason,error_message,expected,blame", [
+    ("error", "Unfamiliar provider response", "provider_error_unclassified", "provider_transient"),
+    ("error", "402 Payment Required", "quota_insufficient", "user_provider"),
+    ("error", "401 invalid API key", "auth_invalid", "user_provider"),
+    ("error", "HTTP 503", "upstream_unavailable", "provider_transient"),
+    ("stop", "", "provider_empty_reply", "provider_transient"),
+    ("error", "", "provider_error_unclassified", "provider_transient"),
+])
+def test_pi_provider_error_real_cli_classification(monkeypatch, tmp_path, stop_reason, error_message, expected, blame):
+    end = _pi_assistant_end([], stop_reason=stop_reason)
+    end["message"]["errorMessage"] = error_message
+    raw = _pi_events(_PI_HEADER, end)
+    _pi_cli_env(monkeypatch, tmp_path, "usr_t638_classify", stdout=raw)
+    with pytest.raises(RuntimeError) as raised:
+        crc.call_agent_cli("hello")
+    notice = crc.classify_agent_error(raised.value)
+    assert notice.error_class == expected
+    assert notice.blame == blame
+    spec = crc._error_contract.require_spec(expected)
+    assert notice.user_text == spec.safe_text_zh
+    if expected == "provider_error_unclassified":
+        assert notice.user_text == "你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。"
+    marker = crc.PI_PROVIDER_ERROR_MARK if stop_reason == "error" else crc.EMPTY_PROVIDER_REPLY_MARK
+    assert marker in str(raised.value)
+
+
+@pytest.mark.parametrize("trailing_tool_result", [False, True])
+def test_pi_provider_error_trace_survives_real_size_limits(monkeypatch, tmp_path, trailing_tool_result):
+    import debug_trace
+    from admin import data_track
+
+    message = "  " + "渠道返回未识别内容" * 50 + "  "
+    end = _pi_assistant_end([], stop_reason="error")
+    end["message"]["errorMessage"] = message
+    events_raw = [_PI_HEADER, end]
+    if trailing_tool_result:
+        events_raw.append({"type": "message_end", "message": {
+            "role": "user", "content": [{"type": "tool_result", "content": "tool output"}],
+        }})
+    _pi_cli_env(monkeypatch, tmp_path, "usr_t638_trace", stdout=_pi_events(*events_raw))
+    monkeypatch.setattr(crc, "AGENT_RUNTIME_METADATA", {"provider": "openrouter", "model": "gemini-test"})
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda sub, typ, **kw: events.append({"type": typ, **kw}))
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hello")
+    event, = [event for event in events if event["type"] == "agent.model.call.error"]
+    raw = event["detail"]
+    assert raw["error_class"] == "provider_error_unclassified"
+    assert raw["provider_status_class"] == "none"  # real failure diagnostics consume two slots
+    assert {"provider", "model", "lane", "pi_stream", "pi_error_head"} <= raw.keys()
+    assert len(raw) == 19
+    durable = debug_trace._safe_detail(debug_trace._safe_detail(raw))
+    assert set(durable) == set(raw)
+    assert len(durable) <= debug_trace._DETAIL_MAX_KEYS
+    assert durable["pi_error_head"] == message.strip()[:300]
+    assert len(durable["pi_error_head"]) == 300
+    shape = durable["pi_stream"]
+    assert type(shape["text_blocks"]) is int and shape["text_blocks"] == 0
+    assert shape["stop_reasons"] == "error"
+    assert shape["stop_reason_last"] == "error"
+    assert all(character not in shape["stop_reasons"] for character in "'\"{}[]")
+    assert "blocks" not in shape
+    assert set(shape) == set(raw["pi_stream"])
+    public = data_track._debug_event_public_json({**event, "detail": durable})
+    assert public["detail"]["pi_error_head"] == message.strip()[:300]
+
+
+@pytest.mark.parametrize("last", [
+    {"role": "assistant", "content": [], "stopReason": "stop"},
+    {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": ""},
+    {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": 123},
+])
+def test_pi_error_message_never_reuses_earlier_failure(last):
+    first = _pi_assistant_end([], stop_reason="error")
+    first["message"]["errorMessage"] = "402 from an earlier attempt"
+    raw = _pi_events(first, {"type": "message_end", "message": last})
+    assert crc._pi_error_message(raw) == ""
+    assert crc._pi_final_stop_reason(raw) == last["stopReason"]
+
+
+@pytest.mark.parametrize("cmd,succeeded,stop_reason,error_message", [
+    (("codex", "exec", "--json"), False, "error", "private provider error"),
+    (("claude", "--print"), False, "error", "private provider error"),
+    (("pi", "--mode", "json"), True, "error", "private provider error"),
+    (("pi", "--mode", "json"), False, "stop", "private provider error"),
+    (("pi", "--mode", "json"), False, "error", "   "),
+])
+def test_pi_error_head_absent_outside_final_pi_error(monkeypatch, cmd, succeeded, stop_reason, error_message):
+    end = _pi_assistant_end([], stop_reason=stop_reason)
+    end["message"]["errorMessage"] = error_message
+    event = _terminal_detail(monkeypatch, raw=_pi_events(end), succeeded=succeeded, cmd=cmd)
+    assert "pi_error_head" not in event["detail"]
+
+
+def test_pi_stream_scalar_reasons_are_bounded_whole_enums():
+    import debug_trace
+
+    reasons = sorted(crc._PI_STREAM_STOP_REASONS) * 2 + ["error"]
+    raw = _pi_events(*[_pi_assistant_end([], stop_reason=reason) for reason in reasons])
+    shape = crc._pi_stream_shape(raw)
+    durable = debug_trace._safe_detail({"pi_stream": shape})["pi_stream"]
+    assert durable == shape
+    values = shape["stop_reasons"].split(",")
+    assert values == sorted(set(values), key=reasons.index)
+    assert set(values) <= crc._PI_STREAM_STOP_REASONS
+    assert len(shape["stop_reasons"]) <= 80
+    assert shape["stop_reason_last"] == "error"
+
+
+def test_pi_stream_last_reason_survives_malformed_content():
+    raw = _pi_events(_pi_assistant_end([], stop_reason="stop"),
+                     _pi_assistant_end(7, stop_reason="error"))
+    shape = crc._pi_stream_shape(raw)
+    assert shape["parse_failed"] is True
+    assert shape["parse_error_count"] == 1
+    assert shape["stop_reasons"] == "stop,error"
+    assert shape["stop_reason_last"] == "error"
+
+
+@pytest.mark.parametrize("roles,selected_index", [
+    (["assistant", "user"], 0),
+    (["assistant", "toolResult"], 0),
+    (["assistant", "assistant", "user"], 1),
+    (["missing", "missing", "user"], 1),
+    (["assistant", "missing"], 0),
+    (["missing", "assistant"], 1),
+    (["user", "toolResult", ""], None),
+])
+def test_pi_final_end_role_selection_shared_by_stop_and_error(roles, selected_index):
+    events = []
+    for index, role in enumerate(roles):
+        message = {"stopReason": "error", "errorMessage": f"provider error {index}", "content": []}
+        if role != "missing":
+            message["role"] = role
+        events.append({"type": "message_end", "message": message})
+    raw = _pi_events(*events)
+    expected = {} if selected_index is None else events[selected_index]
+    assert crc._pi_final_message_end(raw) == expected
+    assert crc._pi_final_stop_reason(raw) == ("error" if expected else "")
+    assert crc._pi_error_message(raw) == (f"provider error {selected_index}" if expected else "")
+    if expected:
+        assert crc._cli_error_detail(raw, "") == f"provider error {selected_index}"

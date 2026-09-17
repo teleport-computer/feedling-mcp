@@ -466,6 +466,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
 | `provider_tool_history_rejected` | — | user_provider | error | chat：中转通道拒绝原生工具结果历史；Runtime V2 立即终止本轮而不移除工具重试，并引导用户换模型或稍后重试 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
+| `provider_error_unclassified` | — | provider_transient | error | resident pi：无可用回复且最终 message_end stopReason=error，详情未命中配额/鉴权/上游等既有规则；不同于无错误标记的 provider_empty_reply |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
 | `error_class_unregistered` | — | system | error | vision/image-generation 动态边界收到未注册分类；不透传或保存原始值，只写 content-free 拒绝计数 |

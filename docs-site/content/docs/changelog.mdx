@@ -12,6 +12,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident pi failures with a final `stopReason=error` now use
+  `provider_error_unclassified` when no specific provider-error rule matches,
+  instead of reporting an empty reply. The new provider-owned notice says:
+  “你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。”
+  Existing quota/authentication/upstream rules still take priority; retry
+  behavior is unchanged.
+- Failed pi model-call traces include a bounded `pi_error_head` (up to 300
+  characters of the provider's error message), also visible in admin traces.
+  `pi_stream.schema_version=3` uses scalar block counts and a bounded,
+  comma-separated `stop_reasons` enum string, adds `stop_reason_last`, and
+  retains the earlier scalar fields. Nested `blocks`
+  and list-shaped `stop_reasons` are no longer emitted; historical records
+  are not backfilled.
+
 - Restore account recovery on TEE-primary deployments by adding the missing
   recovery-challenge table. Recovery has been unavailable since the TEE-primary
   cutover; the table is created by the normal application-startup migration.

@@ -3867,6 +3867,11 @@ def _debug_event_public_json(
         trace_public_fields=trace_public_fields,
     )
     if isinstance(raw_detail, dict) and isinstance(public_detail, dict):
+        if ev.get("type") == "agent.model.call.error":
+            # T638 / Seven: only this bounded provider excerpt is public.
+            value = raw_detail.get("pi_error_head")
+            if isinstance(value, str) and len(value) <= 300:
+                public_detail["pi_error_head"] = value
         if ev.get("type") == "resident.send_file.rejected":
             # Only extension-shaped metadata is exposed, never a full filename.
             def valid_suffix(value):

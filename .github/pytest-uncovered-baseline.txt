@@ -9,7 +9,6 @@ tests/test_agent_runtime_genesis_gate.py
 tests/test_agent_runtime_leases.py
 tests/test_agent_runtime_resolve_cache.py
 tests/test_ai_msg_live_activity_gate.py
-tests/test_api_errors_doc.py
 tests/test_asgi_agent.py
 tests/test_asgi_bootstrap_post.py
 tests/test_asgi_client_disconnect.py
@@ -66,7 +65,6 @@ tests/test_chat_skipped_message_never_redelivered.py
 tests/test_chat_system_notice_role.py
 tests/test_chat_turn_activity_unit.py
 tests/test_chat_turn_activity_v2.py
-tests/test_chat_turn_failure_fields.py
 tests/test_consumer_state_cas.py
 tests/test_copytext.py
 tests/test_dau_snapshot_scheduler.py
