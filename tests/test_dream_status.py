@@ -77,6 +77,42 @@ def test_dream_completed_records_organized_and_merged_counts(monkeypatch):
     }
 
 
+def test_stale_state_save_preserves_concurrently_completed_dream_ledger(monkeypatch):
+    blob = _install_dream_blob(monkeypatch)
+    store = _Store()
+    stale = dream_scheduler.load_dream_state(store)
+
+    dream_scheduler.record_dream_job_status(store, {
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "dream_key": "dream:completed",
+        "dream_stats": {
+            "card_count": 8, "seed_card_count": 5,
+            "turn_count": 22, "signature": "completed-signature",
+        },
+        "dream_until": {"last_until": "2030-06-02T00:00:00Z"},
+        "organized_count": 4,
+        "merged_count": 2,
+    }, status="completed", now=1234.0)
+
+    # An ordinary writer resumes with a snapshot taken before that completion.
+    stale["pending_dream_key"] = "dream:next"
+    dream_scheduler.save_dream_state(store, stale, now=1235.0)
+
+    expected_ledger = {
+        "last_dream_completed_at": 1234.0,
+        "last_dream_organized_count": 4,
+        "last_dream_merged_count": 2,
+        "last_dreamed_card_count": 8,
+        "last_dreamed_seed_card_count": 5,
+        "last_dreamed_turn_count": 22,
+        "last_dream_signature": "completed-signature",
+        "last_dreamed_until": "2030-06-02T00:00:00Z",
+    }
+    assert {key: blob[key] for key in expected_ledger} == expected_ledger
+    assert blob["pending_dream_key"] == "dream:next"
+
+
 def test_dream_completed_without_consolidation_records_zero_counts(monkeypatch):
     _install_dream_blob(monkeypatch, {})
     store = _Store()
