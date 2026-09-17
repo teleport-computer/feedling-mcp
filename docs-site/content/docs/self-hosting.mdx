@@ -190,7 +190,20 @@ A functional deployment can include:
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
 | APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
 | Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
+| Enclave diagnostic log collector | Optional operational history | Only validated content-free request logs and fixed worker events from the two enclave containers; local volume 30 days, optional operator R2 with a 90-day bucket lifecycle. |
 | CPU history recorder | Optional private operational history | Provide a protected, path-allowlisted Docker socket proxy and a dedicated persistent volume; expose neither service publicly. |
+
+The production/test log collector uses a protected socket proxy, a dedicated
+persistent volume, and a separate outbound bridge for R2. It does not join the
+business-service network or mount the Docker socket. Compose bridges do not
+enforce a destination-domain firewall. Leaving `R2_LOGS_BUCKET` empty keeps logs
+in the local volume and disables external uploads. To enable delivery, provide
+that dedicated bucket and existing R2 credentials, grant bucket access, and set
+its **90-day lifecycle expiration** yourself. Content-free diagnostics, including
+route templates and truncated user prefixes, then leave the CVM for operator
+storage. Arbitrary container output is rejected, not exported. Docker logs lost
+before collection cannot be reconstructed; local retention also limits offline
+upload recovery to 30 days. See [the trust boundary](/docs/architecture#enclave-operational-logs-leave-the-vm-only-when-configured).
 
 The managed Phala CPU-history topology is optional operational infrastructure,
 not an application API. A self-hosted operator who adopts it must provide and

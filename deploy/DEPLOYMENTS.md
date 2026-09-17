@@ -237,7 +237,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.yaml`; recorded live service set: `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
-| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, `cpu-recorder`, and `log-shipper`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
@@ -277,7 +277,7 @@ python tools/verify_enclave_domain.py \
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.test.yaml`; recorded live service set matches prod: `ingress`, `backend`, `enclave`, with test domains + `_test` volumes |
-| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, `cpu-recorder`, and `log-shipper`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | **TEE primary is live since 2026-08-18**, promoted by test release [`82c4c019`](https://github.com/teleport-computer/feedling-mcp/commit/82c4c019da24e6bfbe47d05411c0f812bf519ae7). `TEST_DATABASE_URL` is the TEE `app`-role DSN shared by the main CVM and runner, `TEST_FEEDLING_DATABASE_SCHEMA=tee`, and the old dual-write secret is absent. CI verified the owner/app database fingerprint, `alembic_tee` head, and application startup contract before changing either CVM; subsequent normal TEE-primary processes run the independent Alembic chain before they become ready. The former RDS is a frozen pre-cutover snapshot only; after the first TEE-primary write it is not a lossless rollback target without reverse reconciliation. |
@@ -319,6 +319,74 @@ python tools/verify_enclave_domain.py \
   --expected-compose-hash "$TEST_COMPOSE_HASH" \
   --expected-content-pk "$TEST_ENCLAVE_CONTENT_PK_BASELINE" \
   --reference-measurements "$TEST_REFERENCE_MEASUREMENTS"
+```
+
+
+#### Enclave diagnostic log history (staged source topology)
+
+Production and test add `log-shipper` alongside CPU history. The existing
+socket proxy admits only GET container listing, stats and logs, from
+`cpu-recorder,log-shipper` ([proxy hostname list syntax](https://github.com/wollomatic/socket-proxy)).
+Only the proxy mounts docker.sock. The shipper is non-root, read-only apart
+from its named volume, drops all capabilities, and is capped at 0.10 CPU/128 MB.
+The image creates the volume mountpoint owned by UID 1000. Business services do
+not depend on either collector. A separate `log-egress` bridge is attached only
+to the shipper for R2; the Docker proxy remains on the internal network. Code
+calls only the proxy and configured R2 endpoint; Compose bridge networking does
+**not** impose a destination-domain firewall.
+
+Container Names are resolved through `/containers/json` every follow cycle:
+`feedling-enclave-enclave-1` / `feedling-enclave-enclave-domain-1` in production,
+`feedling-test-enclave-1` / `feedling-test-enclave-domain-1` in test. Output aliases
+are `enclave` and `enclave-domain`. The allowlist checks every T637 JSON field,
+including closed route templates and truncated user prefixes; gunicorn worker
+boot/exit/timeout messages become fixed event names and PIDs. Legacy free text,
+full user IDs, exceptions and unknown shapes are discarded and counted, with
+an additional PEM/envelope/ciphertext/plaintext_b64/long-hex deny filter. This
+is a filtered diagnostic stream, not a backup of raw container stdout/stderr.
+
+Files are `/var/lib/feedling-logs/<container>/YYYY-MM-DD/HH.log.part` while open,
+then `.log.gz` on UTC hour rollover, replacement or graceful shutdown. Late
+records append to an atomic replacement without losing prior gzip contents.
+Each append is fsynced before its durable per-container-ID cursor advances;
+reconnect uses an exact `seconds.nanoseconds` Docker timestamp and skips
+already acknowledged boundary records
+([Docker log timestamp semantics](https://docs.docker.com/reference/cli/docker/container/logs/)).
+The cursor also counts records at that exact timestamp so distinct same-time
+events remain intact. A new container ID starts from its retained beginning.
+Routine reconnects do not duplicate acknowledged records. Crashes between
+append and cursor persistence (or gzip replacement and part removal) can replay
+records; records already deleted/rotated by Docker
+before collection cannot be recovered. Interrupted unacknowledged tail records
+are replayed. Whole-hour files expire after all their records are at least
+`LOG_SHIPPER_RETENTION_DAYS=30` days old; unuploaded files also expire then.
+
+`feedling_log_history` (prod) / `feedling_log_history_test` (test) survive container
+replacement. Sealed files upload via `object_storage.client()` into the separate
+`R2_LOGS_BUCKET`, key `<env>/<cvm>/<container>/YYYY-MM-DD/HH.log.gz`. A content-digest
+receipt makes late updates pending again. Upload failures use bounded exponential
+retries, retain local files, and retry next UTC hour; uploads run separately so
+an R2 outage cannot stop collection or rotation. Empty bucket means local-only
+and one hourly status line with `R2 未配置`. Configured bucket without credentials
+reports `credentials_missing`; `configured` reports configuration, not a claim
+that a PUT succeeded. Counters expose dropped lines, storage/Docker/upload
+errors and uploaded files without log contents or exception messages.
+
+Before real external delivery, ops must create dedicated buckets, set an R2
+**90-day lifecycle expiration rule**, grant the existing R2 token access to the
+log bucket (or provision an appropriately scoped credential), and configure
+GitHub secrets `R2_LOGS_BUCKET` / `TEST_R2_LOGS_BUCKET`. Existing
+`R2_ENDPOINT/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY` wiring is reused. Empty secret
+is deliberately nonblocking and does not enable uploads. Code never deletes
+remote objects; an unconfigured lifecycle does not implement the 90-day limit.
+Compose changes alter measured compose_hash and require the normal reviewed
+release/attestation update; this source change is not deployment evidence.
+
+```bash
+# Local hour inventory (same aliases in test and prod)
+phala ssh feedling-enclave-v2 -- docker exec log-shipper ls /var/lib/feedling-logs/enclave/2026-09-17/
+# Read a sealed R2 hour with operator-provided credentials
+aws s3 cp --endpoint-url "$R2_ENDPOINT" "s3://$R2_LOGS_BUCKET/prod/feedling-enclave-v2/enclave/2026-09-17/12.log.gz" - | gzip -dc
 ```
 
 ### Runtime V2 worker CVM (test, `feedling-io-agents-test`)

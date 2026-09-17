@@ -467,13 +467,15 @@ jobs:
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
 
-      - name: Run Phala CPU recorder regression suite
+      - name: Run Phala CPU and log collector regression suite
         env:
           PYTHONPATH: backend
         run: |
           python -m pytest \
             tests/test_cpu_recorder.py \
             tests/test_cpu_recorder_compose.py \
+            tests/test_log_shipper.py \
+            tests/test_log_shipper_compose.py \
             tests/test_cpu_socket_proxy_integration.py \
             -v
 
@@ -2698,6 +2700,7 @@ jobs:
           R2_ACCESS_KEY_ID:             ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:         ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.R2_FRAMES_BUCKET }}
+          R2_LOGS_BUCKET:               ${{ secrets.R2_LOGS_BUCKET }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2717,6 +2720,7 @@ jobs:
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "R2_LOGS_BUCKET=$R2_LOGS_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
@@ -2967,6 +2971,7 @@ jobs:
           R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
+          R2_LOGS_BUCKET:               ${{ secrets.TEST_R2_LOGS_BUCKET }}
         run: |
           echo ">>> deploy-test-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2981,6 +2986,7 @@ jobs:
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "R2_LOGS_BUCKET=$R2_LOGS_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
