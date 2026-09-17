@@ -60,7 +60,7 @@ class FeedlingWakePort:
             return WakeReceipt(event_id=event.event_id, attempt_id=attempt_id,
                                status="duplicate", received_at=now)
         try:
-            accepted = self._deliver(event)
+            accepted = self._deliver(event, now)
         except Exception as exc:                   # noqa: BLE001
             # 真正的意外。让调用方安排重试 —— 但**不要**把它说成拒绝，
             # 那会让一次连接抖动看起来像用户设置的静音。
@@ -79,7 +79,7 @@ class FeedlingWakePort:
             reason=None if accepted else "host_gate",
         )
 
-    def _deliver(self, event: Any) -> bool:
+    def _deliver(self, event: Any, now: datetime) -> bool:
         """排进 io 的唤醒队列。返回 False = io 这边的闸把它挡下了。"""
         submit = self._submit
         if submit is None:
@@ -104,12 +104,16 @@ class FeedlingWakePort:
                 change_digest=event.event_id,
                 payload=dict(event.context or {}),
             ),
-            # 🔴 **收到的时刻，不是发生的时刻。** 这个 ts 会成为 job 的时间戳：
-            # V1 consumer 按它推进读游标、按它合并 60 秒内的唤醒，V2 兼容投递
-            # 按它算能力防抖。照片带上拍摄时间以后，occurred_at 可以是几小时
-            # 前 —— 用它排队，job 会落在游标后面被跳过，或者防抖永远算出负数。
-            # 发生时刻留在观测和事件本身里，不进队列。
-            ts=event.received_at.timestamp(),
+            # 🔴 **这一次投进 io 队列的时刻，不是事情发生的时刻。**
+            # 这个 ts 会成为 job 的时间戳：V1 consumer 按它推进读游标
+            # （只读 ts > 游标 的 job）、按它合并 60 秒内的唤醒，V2 兼容投递
+            # 按它算能力防抖。
+            #   · 照片带上拍摄时间后，occurred_at 可以是几小时前；
+            #   · 发件箱重投时，event.received_at 是**第一次**收到的时刻。
+            # 用哪个排队，job 都可能落在游标后面、永远不被读到，或让防抖算出
+            # 负数。同步投递时 now 与收到时刻只差毫秒。发生时刻留在观测和事件
+            # 本身里，不进队列。
+            ts=now.timestamp(),
             origin_refs=(f"perceptkit:{event.definition_id}",),
         )))
 

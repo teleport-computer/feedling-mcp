@@ -2087,7 +2087,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "occurred_at": {
                         "type": "string",
                         "format": "date-time",
-                        "description": "When the photo was taken, ISO 8601 with a UTC offset. Optional; when missing, lacking an offset, more than 60 seconds in the future, or older than photo history retention, the server uses the upload time instead.",
+                        "description": "When the photo was taken, ISO 8601 with a UTC offset. Optional; when missing, lacking an offset, or more than 60 seconds in the future, the server uses the upload time instead.",
                     },
                 },
                 "additionalProperties": False,

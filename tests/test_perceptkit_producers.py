@@ -414,15 +414,40 @@ def test_a_capture_time_in_the_future_beyond_the_skew_allowance_falls_back():
     assert events.photo_capture_time(bad, received=RECEIVED) is None
 
 
-def test_a_capture_time_older_than_the_kit_keeps_photo_history_falls_back():
+def test_an_old_capture_time_is_still_used():
+    """补传几周前的照片是正常的（游标停在上次扫描的位置，不管多久以前）。
+
+    不能拿 7 天的明细保留期当上限：每日新增数是**永久**聚合，超过上限的
+    照片会被永久记到上传那天。
+    """
     from datetime import datetime, timedelta, timezone
-    days = MINIMAL_SIGNALS["photo_library_added"].history_retention_days
-    assert days > 0
     base = datetime.fromtimestamp(RECEIVED, timezone.utc)
-    inside = (base - timedelta(days=days) + timedelta(minutes=1)).isoformat()
-    outside = (base - timedelta(days=days) - timedelta(minutes=1)).isoformat()
-    assert events.photo_capture_time(inside, received=RECEIVED) is not None
-    assert events.photo_capture_time(outside, received=RECEIVED) is None
+    detail_days = MINIMAL_SIGNALS["photo_library_added"].history_retention_days
+    for age in (timedelta(days=detail_days, minutes=1), timedelta(days=30),
+                timedelta(days=400)):
+        got = events.photo_capture_time((base - age).isoformat(), received=RECEIVED)
+        assert got is not None and got.timestamp() == RECEIVED - age.total_seconds()
+
+
+def test_a_photo_from_weeks_ago_is_counted_on_its_own_day_permanently():
+    from datetime import date, datetime, timezone
+    from perceptkit import IngestContext, PerceptionKit
+    from perceptkit.conformance import InMemoryStorage
+
+    received = datetime.fromtimestamp(RECEIVED, timezone.utc)
+    captured = events.photo_capture_time("2026-08-10T12:00:00+08:00", received=RECEIVED)
+    storage = InMemoryStorage()
+    kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
+    kit.ingest(events.photo_envelope("old-photo", occurred_at=captured,
+                                     timezone_id="Asia/Shanghai"),
+               context=IngestContext("u", received))
+    def count(day):
+        rows = storage.get_aggregate(subject_id="u", signal="photo_library_added",
+                                     start_date=day, end_date=day)
+        return rows[0].typed_aggregate["count"]["total"] if rows else 0
+
+    assert count(date(2026, 8, 10)) == 1
+    assert count(date(2026, 8, 31)) == 0
 
 
 def test_the_skew_allowance_is_the_one_the_live_path_gives_client_times():

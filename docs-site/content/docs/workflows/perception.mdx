@@ -474,10 +474,10 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 ```
 
 `occurred_at` is optional: when the photo was taken, as ISO 8601 with a UTC
-offset. Perception history counts the photo on the day it was taken. If it is
-missing, has no offset, is more than 60 seconds in the future, or is older than
-photo history retention (seven days), the server uses the upload time instead.
-The wake raised for the photo is always timestamped with the upload time.
+offset. Perception history counts the photo on the day it was taken, in the
+user's current timezone. If it is missing, has no offset, or is more than 60
+seconds in the future, the server uses the upload time instead. The wake raised
+for the photo is always timestamped with the time it is queued.
 `source_event_id` is an optional stable device identity for the photo so that a
 re-upload is not counted twice.
 

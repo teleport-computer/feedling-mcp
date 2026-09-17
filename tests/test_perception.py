@@ -1397,15 +1397,39 @@ def _photo(uid, pid, meta=None):
 
 
 def _photo_wake_events(fake, uid):
-    return [e for e in fake.read_events(uid) if e.get("type") == "wake"]
+    """老路（cap=photos）落下的 wake 记录；kit 那条记在 cap=runtime_v2。"""
+    return [e for e in fake.read_events(uid)
+            if e.get("type") == "wake" and e.get("cap") == "photos"]
 
 
-def test_v1_photo_does_not_enqueue_on_the_old_path_when_kit_owns_wakes(env, monkeypatch):
+def _route_shadow_to_in_memory_kit(monkeypatch):
+    """photo_evaluate → 真的 shadow.observe_photo → 真的 kit 规则 → 真的 io
+    WakePort → service._submit_wake_event_v2_compat(from_kit=True)。
+
+    只把 kit 的存储换成内存实现（FakeStore 环境没有 Postgres）。这样
+    「老路让位」和「kit 确实投了」在同一条链上一起被数。
+    """
+    from perceptkit import IngestContext
+    from perceptkit.conformance import InMemoryStorage
+    from perception.perceptkit_adapter import shadow
+
+    storage = InMemoryStorage()
+    monkeypatch.setattr(shadow, "enabled", lambda: True)
+    monkeypatch.setattr(shadow, "wakes_enabled", lambda: True)
+    monkeypatch.setattr(shadow, "_live_timezone", lambda uid: "Asia/Shanghai")
+    monkeypatch.setattr(shadow, "_run", lambda uid, envelope, received: (
+        shadow._kit(storage).ingest(
+            envelope, context=IngestContext(uid, received), dispatch=True),
+        {"ran": True})[1])
+
+
+def test_v1_photo_is_enqueued_exactly_once_when_kit_owns_wakes(env, monkeypatch):
     fake, wakes = env
     monkeypatch.setattr(service, "_perceptkit_owns_wakes", lambda: True)
-    monkeypatch.setattr(service, "_perceptkit_shadow_call", lambda *a, **k: None)
-    _photo("u_v1_kit", "p1")
-    assert wakes == [], "kit 接管时 V1 老路又排了一条照片唤醒"
+    _route_shadow_to_in_memory_kit(monkeypatch)
+    _photo("u_v1_kit", "p1", {"scene_hint": "food", "source_event_id": "ph1_a"})
+    assert [w[0] for w in wakes] == ["photo_added"], (
+        "期望只有 kit 那一条；多出 'photos' = V1 老路又排了一次，空 = kit 没投")
     assert _photo_wake_events(fake, "u_v1_kit") == []
     # 照片本身照存
     assert fake.get_photo_envelope("u_v1_kit", "p1")

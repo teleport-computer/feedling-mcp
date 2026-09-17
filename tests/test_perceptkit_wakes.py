@@ -312,18 +312,19 @@ def test_turning_the_kit_off_gives_the_live_path_back(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 唤醒 job 的时间戳 = 收到的时刻，不是发生的时刻（2026-09-17）
+# 唤醒 job 的时间戳 = 这一次投进 io 队列的时刻（2026-09-17）
 #
-# 照片带上拍摄时间以后，事件的 occurred_at 可以是几小时前。job 时间戳要是
-# 跟着它走：V1 consumer 按 job ts 推进读游标 → 这条落在游标后面被跳过；
-# V2 兼容投递按它算能力防抖 → now - last 变负数。所以只有观测拿拍摄时间，
-# 排队一律用收到时刻。
+# 照片带上拍摄时间以后，事件的 occurred_at 可以是几小时前；发件箱重投时，
+# 事件的 received_at 是第一次收到的时刻。job 时间戳要是跟着其中任何一个走：
+# V1 consumer 只读 ts > 游标 的 job → 这条落在游标后面被永远跳过；
+# V2 兼容投递按它算能力防抖 → now - last 变负数。
 # --------------------------------------------------------------------------
 
 CAPTURED = T0 - timedelta(hours=3)
 
 
 def _late_photo_event():
+    """拍摄于 T0-3h、第一次收到于 T0（过去）、现在才投递 —— 即一次延迟重投。"""
     from perceptkit.contracts.event import PerceptionEvent
     return PerceptionEvent(
         event_id="late", definition_id="io.perception.photo_added", definition_version=1,
@@ -333,11 +334,19 @@ def _late_photo_event():
     )
 
 
-def test_the_wake_is_stamped_with_receive_time_not_capture_time():
+def _between_now(fn):
+    import time
+    before = time.time()
+    out = fn()
+    return before, out, time.time()
+
+
+def test_the_wake_is_stamped_with_the_delivery_time():
     got = []
-    FeedlingWakePort(submit=lambda ev: got.append(ev) or True).wake(_late_photo_event(), None)
-    assert got[0].created_at == T0.timestamp()
-    assert got[0].created_at != CAPTURED.timestamp()
+    before, _, after = _between_now(lambda: FeedlingWakePort(
+        submit=lambda ev: got.append(ev) or True).wake(_late_photo_event(), None))
+    assert before <= got[0].created_at <= after
+    assert got[0].created_at not in (CAPTURED.timestamp(), T0.timestamp())
 
 
 def _drive_real_enqueue(monkeypatch, runtime_mode):
@@ -369,38 +378,44 @@ def _drive_real_enqueue(monkeypatch, runtime_mode):
 
     port = FeedlingWakePort(
         submit=lambda ev: service._fire_wake_event_v2(ev) or True)
-    port.wake(_late_photo_event(), None)
-    return legacy_jobs, v2_jobs
+    before, _, after = _between_now(lambda: port.wake(_late_photo_event(), None))
+    return legacy_jobs, v2_jobs, before, after
 
 
-def test_v1_job_timestamp_is_receive_time(monkeypatch):
-    """V1 consumer 用 job ts 推进游标、做 60 秒合并。"""
+def test_v1_job_is_visible_past_a_cursor_that_moved_on_after_first_receipt(monkeypatch):
+    """V1 consumer 只读 ts > 游标。事件 T0 第一次收到、投递失败；游标被别的
+    job 推到 T0 之后；现在重投 —— job 必须排在游标后面，不然永远读不到。"""
     from hosted import config_store as hosted_config_store
-    legacy, v2 = _drive_real_enqueue(monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT)
+    cursor = T0.timestamp() + 60
+    legacy, v2, before, after = _drive_real_enqueue(
+        monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT)
     assert v2 == []
     assert len(legacy) == 1
-    assert legacy[0]["ts"] == T0.timestamp()
+    assert before <= legacy[0]["ts"] <= after
+    assert legacy[0]["ts"] > cursor
 
 
-def test_v2_job_timestamp_is_receive_time(monkeypatch):
+def test_v2_job_timestamp_is_the_delivery_time(monkeypatch):
     from hosted import config_store as hosted_config_store
-    legacy, v2 = _drive_real_enqueue(monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2)
+    legacy, v2, before, after = _drive_real_enqueue(
+        monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2)
     assert legacy == []
     assert len(v2) == 1
-    assert v2[0]["context_ts"] == T0.timestamp()
-    assert v2[0]["context_doc"]["created_at"] == T0.timestamp()
+    assert before <= v2[0]["context_ts"] <= after
+    assert v2[0]["context_doc"]["created_at"] == v2[0]["context_ts"]
 
 
 @_needs_pg
-def test_a_late_photo_keeps_its_capture_time_in_the_outbox_but_wakes_at_receive_time(kit_world):
+def test_a_late_photo_keeps_its_capture_time_in_the_outbox_but_queues_at_delivery(kit_world):
     from perception.perceptkit_adapter.events import photo_envelope
-    kit_world.ingest(photo_envelope("late-1", occurred_at=CAPTURED,
-                                    timezone_id="Asia/Shanghai"), T0)
+    before, _, after = _between_now(lambda: kit_world.ingest(
+        photo_envelope("late-1", occurred_at=CAPTURED, timezone_id="Asia/Shanghai"), T0))
     rows = kit_world.outbox("photo_added")
     assert len(rows) == 1
     assert rows[0].occurred_at == CAPTURED
-    assert len(_wakes(kit_world, "photo_added")) == 1
-    assert _wakes(kit_world, "photo_added")[0].created_at == T0.timestamp()
+    wakes = _wakes(kit_world, "photo_added")
+    assert len(wakes) == 1
+    assert before <= wakes[0].created_at <= after
 
 
 @_needs_pg

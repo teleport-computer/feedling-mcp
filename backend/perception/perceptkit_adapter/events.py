@@ -114,21 +114,6 @@ PHOTO_CAPTURE_FUTURE_TOLERANCE_SEC = 60.0
 _CAPTURE_TIME_MAX_LEN = 64
 
 
-def photo_capture_max_age_sec() -> float:
-    """Oldest capture time still used as the observation time.
-
-    iOS has no fixed lookback: the first scan looks back one hour and every
-    later scan resumes from a stored cursor, so a user back after a week
-    legitimately uploads week-old photos. The bound that does exist is the
-    kit's own history retention for ``photo_library_added``: an observation
-    older than that is swept by the next retention run, and its day is outside
-    the window the history answers for. Read from the manifest so the two
-    cannot drift.
-    """
-    from perceptkit.manifest.minimal import MINIMAL_SIGNALS
-    return float(MINIMAL_SIGNALS["photo_library_added"].history_retention_days) * 86400.0
-
-
 def photo_capture_time(raw: Any, *, received: float | datetime) -> datetime | None:
     """The photo's capture time from its metadata, or None to use receive time.
 
@@ -140,7 +125,15 @@ def photo_capture_time(raw: Any, *, received: float | datetime) -> datetime | No
       * not a string, too long, or not parseable
       * no timezone -- a naive time is a guess about which day it was
       * later than receive time by more than the clock-skew allowance
-      * older than the kit keeps photo history (see photo_capture_max_age_sec)
+
+    🔴 **No lower bound on age, on purpose.** iOS only uploads photos newer
+    than its scan cursor (first scan: the last hour; afterwards: wherever the
+    last scan stopped, however long ago), so a user back after two weeks
+    legitimately sends two-week-old photos. The kit accepts past times without
+    limit for exactly this case. Capping at the 7-day *detail* retention would
+    look harmless but the daily photo count is kept **permanently** -- every
+    photo past the cap would be counted on the upload day forever. The detail
+    rows expire on their own; the count stays on the right day.
     """
     if not isinstance(raw, str) or not raw or len(raw) > _CAPTURE_TIME_MAX_LEN:
         return None
@@ -154,8 +147,6 @@ def photo_capture_time(raw: Any, *, received: float | datetime) -> datetime | No
                    else datetime.fromtimestamp(float(received), timezone.utc))
     delta = (received_dt - parsed).total_seconds()
     if delta < -PHOTO_CAPTURE_FUTURE_TOLERANCE_SEC:
-        return None
-    if delta > photo_capture_max_age_sec():
         return None
     return parsed
 
