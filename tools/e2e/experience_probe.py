@@ -239,29 +239,34 @@ def _error_attribution(c: E2EClient, cfg: dict):
     is an honest BLOCKED_EVIDENCE, not a faked PASS.
 
     We DO verify the one adjacent behavior that IS drivable: a send with the model
-    config removed is rejected CLEANLY and synchronously (a real 503
-    runtime_policy_not_ready, not a 500 and not a silent 202-then-nothing). Runs last
-    and teardown uses the account API key, so the removed model config is harmless."""
+    config removed is rejected CLEANLY and synchronously (a real 400
+    model_api_not_configured from the V2 send path — backend/hosted/chat_send_core.py
+    resolving the active route — not a 500 and not a silent 202-then-nothing).
+    Before the memory/runtime refactor (T603 era) the same send hit the runtime
+    policy gate first and read 503 runtime_policy_not_ready; deleting the model
+    config no longer flips the account's runtime tuple, so the route check is the
+    rejection now. Runs last and teardown uses the account API key, so the removed
+    model config is harmless."""
     if c._request("DELETE", "/v1/model_api/delete").status_code not in (200, 204):
         return BLOCKED_EVIDENCE, "could not remove model config; auth-fault attribution needs mock relay (§4.6)"
     r = c.post("/v1/model_api/chat/send",
                json={"message": "no-model send", "client_msg_id": str(uuid.uuid4())})
-    # the adjacent drivable assertion: exact 503 runtime_policy_not_ready (not a 500,
+    # the adjacent drivable assertion: exact 400 model_api_not_configured (not a 500,
     # not a 202-then-silence, not a wrong-route 404/401).
     ok_reject = False
-    if r.status_code == 503:
+    if r.status_code == 400:
         try:
-            ok_reject = r.json().get("error") == "runtime_policy_not_ready"
+            ok_reject = r.json().get("error") == "model_api_not_configured"
         except Exception:  # noqa: BLE001
             ok_reject = False
     if r.status_code == 202:
         return PRODUCT_FAIL, "no-model send was ACCEPTED (202) — should reject, not silently drop the turn"
-    if r.status_code >= 500 and r.status_code != 503:
-        return PRODUCT_FAIL, f"no-model send returned {r.status_code} (server error, not a clean 503)"
+    if r.status_code >= 500:
+        return PRODUCT_FAIL, f"no-model send returned {r.status_code} (server error, not a clean 400)"
     if not ok_reject:
-        return PRODUCT_FAIL, f"no-model send off-contract: {r.status_code} {r.text[:80]} (want 503 runtime_policy_not_ready)"
+        return PRODUCT_FAIL, f"no-model send off-contract: {r.status_code} {r.text[:80]} (want 400 model_api_not_configured)"
     return (BLOCKED_EVIDENCE,
-            "no-model send cleanly rejected 503 runtime_policy_not_ready; but the true "
+            "no-model send cleanly rejected 400 model_api_not_configured; but the true "
             "stopped-key attribution bubble needs the mock relay (§4.6) — not covered here")
 
 
