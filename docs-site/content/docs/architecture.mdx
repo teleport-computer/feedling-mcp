@@ -85,6 +85,7 @@ deployment topology.
 | Object storage | Offload enabled large-object flows | Screen and Chat objects use the effective write shape; plaintext media are raw bytes, while legacy ciphertext remains encrypted |
 | Hosted runner | Poll work, assemble authorized context, invoke an agent, and return a result in the effective write shape | Plaintext selected for an agent turn, the provider credential, and authenticated API traffic |
 | Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
+| Enclave log collector | Retain allowlisted enclave diagnostics on a 30-day local volume and optionally in operator R2 | Content-free request fields (including a truncated user prefix) and fixed worker lifecycle events; never raw container logs |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
 | ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
 | Provider-chosen image URL | Serve a generated image that the provider returned as a link instead of inline bytes | The URL the provider chose — including any path or query it encoded — plus ordinary request metadata such as the Host header and the deployment's outbound address. No Feedling-held credential, cookie, prompt, or request body is attached. Only the image endpoint's `data[].url` is eligible, it must resolve to a publicly routable address, redirects are not followed, and the bytes must decode as a PNG, JPEG or WebP within fixed size and time budgets |
@@ -94,6 +95,20 @@ can interpret its protected body. Conversely, “encrypted at rest” does not m
 that every identifier, status field, compatibility payload, normalized signal,
 or diagnostic upload is encrypted — nor that every protected body is encrypted,
 since [new shared content uses plaintext when the deployment gate is open](#new-shared-content-uses-plaintext).
+
+### Enclave operational logs leave the VM only when configured
+
+The production and test Compose sources include a log collector for only the
+`enclave` and `enclave-domain` containers. It validates a closed request-log
+schema and re-encodes worker lifecycle events; raw paths, credentials, content,
+full user IDs, exception text and unrecognized lines are not exported. These
+diagnostics include timestamps, route templates, timings, status, purpose and a
+truncated user prefix, so they remain operational metadata visible to the operator.
+They are retained in a local volume for 30 days. When `R2_LOGS_BUCKET` is configured,
+they leave the confidential VM for the operator's R2 bucket, whose lifecycle must
+be set to 90 days. This is a separate recipient and retention boundary from
+content storage. Without that bucket setting, the collector remains local-only;
+it does not create or configure the bucket or its lifecycle.
 
 ## Core data flows
 

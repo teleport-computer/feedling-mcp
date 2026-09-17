@@ -543,16 +543,17 @@ services:
 
   # --- Content-free CVM CPU history (no public endpoint or alerting). ---
   # Only this proxy holds the Docker socket. Its method/path allowlist exposes
-  # container enumeration and one-shot stats to cpu-recorder, nothing else.
+  # container enumeration/stats and enclave log reads to the two collectors.
   cpu-socket-proxy:
     image: ghcr.io/wollomatic/socket-proxy:1.13.0@sha256:be7a61fc50baf0add95d94442c3d40cddc4594925a564f22ba870eb017ceae9f
     container_name: cpu-socket-proxy
     command:
       - "-loglevel=INFO"
       - "-listenip=0.0.0.0"
-      - "-allowfrom=cpu-recorder"
+      - "-allowfrom=cpu-recorder,log-shipper"
       - '-allowGET=/containers/json'
       - '-allowGET=/containers/[0-9a-f]{64}/stats'
+      - '-allowGET=/containers/[0-9a-f]{64}/logs'
       - "-allowhealthcheck"
       - "-watchdoginterval=60"
       - "-stoponwatchdog"
@@ -608,6 +609,40 @@ services:
       cpu-socket-proxy:
         condition: service_healthy
 
+  log-shipper:
+    image: ghcr.io/teleport-computer/feedling:3678f7e
+    container_name: log-shipper
+    command: ["python", "-u", "ops/log_shipper.py"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    cpus: 0.10
+    mem_limit: 128m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      CPU_RECORDER_DOCKER_URL: "http://cpu-socket-proxy:2375"
+      LOG_SHIPPER_CONTAINERS: "feedling-enclave-enclave-1,feedling-enclave-enclave-domain-1"
+      LOG_SHIPPER_ENV: "prod"
+      LOG_SHIPPER_CVM_NAME: "feedling-enclave-v2"
+      LOG_SHIPPER_RETENTION_DAYS: "30"
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_LOGS_BUCKET: "${R2_LOGS_BUCKET:-}"
+    volumes:
+      - feedling_log_history:/var/lib/feedling-logs
+    networks:
+      - cpu-observability
+      # Dedicated outbound bridge for R2; no connection to business default net.
+      # Docker bridge is not a destination-domain firewall.
+      - log-egress
+    depends_on:
+      cpu-socket-proxy:
+        condition: service_healthy
+
 volumes:
   feedling_enclave_data:
     name: feedling_enclave_data
@@ -619,10 +654,14 @@ volumes:
     name: feedling_ingress_evidences
   feedling_cpu_history:
     name: feedling_cpu_history
+  feedling_log_history:
+    name: feedling_log_history
 
 networks:
   cpu-observability:
     internal: true
+  log-egress:
+    internal: false
 
 # Deploy trigger: this comment touches a path in the deploy-cvm paths-filter
 # (deploy/docker-compose.phala.yaml) so `detect-cvm-changes` sees a CVM change

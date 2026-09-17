@@ -30,21 +30,10 @@ from datetime import datetime, timezone
 
 import anyio.to_thread
 from enclave_health_contract import PURPOSE_LABELS
+from enclave_reqlog_contract import FIELDS, FAILURE_CLASSES, METHODS, AUTH_KINDS, WHOAMI_SOURCES
 from starlette.routing import Route
 
 
-FIELDS = (
-    "ts", "pid", "method", "route", "status", "dur_ms", "purpose", "auth_kind",
-    "whoami_source", "whoami_ms", "decrypt_queue_ms", "decrypt_ms",
-    "user_prefix", "failure_class", "req_bytes", "resp_bytes",
-)
-FAILURE_CLASSES = frozenset({
-    "none", "other", "not_found", "method_not_allowed", "internal_error", "response_incomplete",
-    "not_ready", "missing_api_key", "unauthorized", "cannot_resolve_user_id",
-    "envelope_required", "decrypt_failed", "backend_error", "backend_unreachable",
-    "key_derivation_unavailable", "memory_search_resource_limit",
-    "memory_search_protocol_unsupported", "invalid_request",
-})
 _ERROR_ALIASES = {
     "missing api_key": "missing_api_key",
     "cannot resolve user_id": "cannot_resolve_user_id",
@@ -59,7 +48,7 @@ _ERROR_PREFIXES = (
     "decrypt_failed", "backend_error", "backend_unreachable",
     "key_derivation_unavailable",
 )
-_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"})
+
 
 
 def _label(value, allowed, default):
@@ -161,12 +150,12 @@ class RequestLogMiddleware:
                 prefix = metrics.get("user_prefix")
                 record = {
                     "ts": ts, "pid": os.getpid(),
-                    "method": _label(scope.get("method"), _METHODS, "OTHER"),
+                    "method": _label(scope.get("method"), METHODS, "OTHER"),
                     "route": route, "status": status,
                     "dur_ms": round(((finished or time.perf_counter()) - started) * 1000, 3),
                     "purpose": _label(metrics.get("purpose"), PURPOSE_LABELS, "other"),
-                    "auth_kind": _label(metrics.get("auth_kind"), {"api_key", "runtime_token"}, "none"),
-                    "whoami_source": _label(metrics.get("whoami_source"), {"local_token", "backend", "cache"}, "none"),
+                    "auth_kind": _label(metrics.get("auth_kind"), AUTH_KINDS, "none"),
+                    "whoami_source": _label(metrics.get("whoami_source"), WHOAMI_SOURCES, "none"),
                     "whoami_ms": _ms(metrics.get("whoami_ms")),
                     "decrypt_queue_ms": _ms(metrics.get("decrypt_queue_ms")),
                     "decrypt_ms": _ms(metrics.get("decrypt_ms")),
