@@ -13,6 +13,7 @@ from pathlib import Path
 DOC = Path(__file__).parent.parent / "docs" / "API_ERRORS.md"
 
 MUST_HAVE = {
+    "provider_error_unclassified",
     "internal_error", "invalid_payload", "envelope_missing_fields",
     "thinking_envelope_missing_fields", "anchor_required",
     "unauthorized", "forbidden", "service_busy", "not_found",

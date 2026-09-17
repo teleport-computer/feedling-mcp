@@ -12,6 +12,7 @@ from starlette.requests import Request
 
 from asgi.http import read_json_silent
 import memory_search_contract as search_contract
+from enclave_health_contract import PURPOSE_LABELS
 
 
 async def read_json_payload(request: Request, *, max_bytes: int | None = None) -> dict:
@@ -31,4 +32,9 @@ async def read_json_payload(request: Request, *, max_bytes: int | None = None) -
 
         request = Request(original.scope, receive=bounded_receive)
     payload = await read_json_silent(request)
-    return payload if isinstance(payload, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    metrics = getattr(request.state, "reqlog", None)
+    if metrics is not None:
+        purpose = payload.get("purpose")
+        metrics["purpose"] = purpose if isinstance(purpose, str) and purpose in PURPOSE_LABELS else "other"
+    return payload

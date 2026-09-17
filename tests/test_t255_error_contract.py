@@ -746,3 +746,13 @@ def test_t504_shared_provider_auth_boundary_uses_original_body(
     assert error_contract.provider_response_is_auth_failure(
         status, raw_body
     ) is expected
+
+
+def test_pi_unclassified_provider_error_is_registered_without_text_matcher():
+    spec = error_contract.require_spec("provider_error_unclassified")
+    assert spec in error_contract.consumer_specs()
+    assert spec.blame == "provider_transient"
+    assert spec.safe_text_zh == "你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。"
+    assert spec.text("en") == "Your model provider returned an error. Try again later; if it keeps happening, check the provider channel or relay."
+    assert spec not in error_contract.matcher_specs()
+    assert error_contract.classify_text("feedling:pi_provider_error") is None

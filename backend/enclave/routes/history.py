@@ -18,13 +18,13 @@ from __future__ import annotations
 import time
 import unicodedata
 
-import anyio.to_thread
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from enclave import auth, envelope
 from enclave.routes._body import read_json_payload
+from enclave.routes import _reqlog
 from enclave.routes._errors import content_sk_or_503
 from model_api_runtime.v2.history_search import normalize_for_match
 
@@ -225,7 +225,7 @@ async def v1_history_leaf_hints(request: Request):
         return hits, legacy_hits, checked, unavailable, truncated
 
     hits, legacy_hits, checked, unavailable, truncated = (
-        await anyio.to_thread.run_sync(_work))
+        await _reqlog.decrypt_job(request, _work))
     return JSONResponse({
         "user_id": user_id,
         "hits": hits,
@@ -330,7 +330,7 @@ async def v1_history_scan(request: Request):
         return hits, checked, unavailable, last_checked_seq, stopped, truncated
 
     hits, checked, unavailable, last_checked_seq, stopped, truncated = (
-        await anyio.to_thread.run_sync(_work))
+        await _reqlog.decrypt_job(request, _work))
     return JSONResponse({
         "user_id": user_id,
         "hits": hits,
@@ -443,7 +443,7 @@ async def v1_history_fetch(request: Request):
     (
         anchor_item, before_items, after_items, unavailable, stopped,
         skipped_before, skipped_after,
-    ) = await anyio.to_thread.run_sync(_work)
+    ) = await _reqlog.decrypt_job(request, _work)
     return JSONResponse({
         "user_id": user_id,
         "anchor": anchor_item,

@@ -170,7 +170,7 @@ def test_tag_counts_derive_from_shared_vocabulary(tag):
     ('503 upstream unavailable', 503, 'upstream_unavailable'),
     ('provider_http_403: Forbidden', 403, 'auth_invalid'),
     ('402 insufficient credits', 402, 'quota_insufficient'),
-    ('no content', None, 'provider_empty_reply'),
+    ('no content', None, 'provider_error_unclassified'),
 ])
 def test_pi_jsonl_no_reply_to_both_real_trace_sinks(monkeypatch, traces, error, code, klass):
     raw = json.dumps({'type': 'message_end', 'message': {
