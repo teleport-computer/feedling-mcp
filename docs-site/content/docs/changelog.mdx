@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Sixteen resident and workflow error notices now have English copy, covering
+  model-service and reply failures, onboarding and chat-history import failures,
+  memory backoff, and companion process startup or degraded operation.
+  The notice catalog returns English copy when English is requested, instead
+  of falling back to Chinese. Chinese copy and error classification remain unchanged.
+
 - Hosted Resident crash-loop circuits now retry every five minutes at a fixed
   interval. Startup exits record bounded per-user reasons; current startup
   failures use the system-owned spawn-failure notice instead of asking users
