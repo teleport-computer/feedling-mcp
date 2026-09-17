@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import base64
 
-import anyio.to_thread
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from enclave import auth, envelope, state
 from enclave.routes._body import read_json_payload
+from enclave.routes import _reqlog
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 
 router = APIRouter()
@@ -52,8 +52,8 @@ async def v1_envelope_decrypt(request: Request):
         return err_response
 
     try:
-        plaintext = await anyio.to_thread.run_sync(
-            envelope.decrypt_envelope, env, authorized_user_id, content_sk)
+        plaintext = await _reqlog.decrypt_job(
+            request, envelope.decrypt_envelope, env, authorized_user_id, content_sk)
     except envelope.DecryptFailure as e:
         return JSONResponse({"error": f"decrypt_failed: {e.reason}"}, status_code=403)
 

@@ -801,6 +801,7 @@ jobs:
             tests/test_enclave_context_recall.py \
             tests/test_enclave_routes_chat.py \
             tests/test_enclave_routes_envelope.py \
+            tests/test_enclave_reqlog.py \
             tests/test_enclave_routes_frames.py \
             tests/test_enclave_routes_health.py \
             tests/test_enclave_routes_identity.py \

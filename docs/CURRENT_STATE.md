@@ -59,6 +59,7 @@ canonical_owner: self
 
 ## 排查入口
 
+- enclave 请求诊断：每请求 stdout JSON 行（`routes/_reqlog.py`），默认跳过 `/healthz`；`FEEDLING_ENCLAVE_REQLOG=0` 关闭，`FEEDLING_ENCLAVE_REQLOG_SKIP` 为逗号分隔的模板跳过列表。只记源码路由模板（未知为 `<unmatched>`）、闭集 purpose/错误码、截断用户前缀、实际鉴权来源及响应状态/字节数；whoami 往返、解密任务线程排队/执行分别计时，未测量为 `null`。不记路径参数、查询串、凭证、内容或异常消息；未接外送与告警消费。
 - enclave 解密告警：`GET /v1/admin/enclave-decrypt-health`（admin 鉴权、`window_minutes=15`、可选 `end_epoch`）读取最后两个墙钟对齐的完整 `(start, end]` 窗口，只返回已记录的终态 trace 计数和白名单 purpose 标签；不是全部调用成功率（成功 trace 可被静默/合批）。`tools/enclave_decrypt_alert.py` 经外部 `.github/workflows/enclave-decrypt-monitor.yml` 每 15 分钟读取，默认不可用事件 ≥20 且 `不可用/(done+不可用) ≥20%` 才触发；401/403/其他非传输错误不参与判定，无分母返回 `null`。开始/持续中/已恢复由两窗比较，持续提醒仅整点计划，取数失败发“量不到”并非零退出。阈值由 `ENCLAVE_ALERT_*` repository variables 覆盖；窗口改长时仍须考虑固定 15 分钟调度和无状态比较的重复/漏报边界，延迟/重跑不保证恰好一次。只用已有 admin/Lark secrets；schedule 仅在 main 生效，合入 test 不会启用告警。
 
 - 运行时名词与两侧符号映射：`docs/testing/RUNTIME_MAP.md`。
