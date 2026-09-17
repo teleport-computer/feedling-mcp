@@ -219,18 +219,36 @@ def _tee_conn():
     return psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True)
 
 
-def _shared_public_tables() -> set[str]:
-    """Shared-table denominator independent of any contract being compared."""
+def _public_tables(url: str) -> set[str]:
     query = (
         "SELECT tablename FROM pg_tables WHERE schemaname='public' "
         "ORDER BY tablename"
     )
+    with psycopg.connect(url) as conn:
+        return {row[0] for row in conn.execute(query).fetchall()}
 
-    def tables(url: str) -> set[str]:
-        with psycopg.connect(url) as conn:
-            return {row[0] for row in conn.execute(query).fetchall()}
 
-    return tables(os.environ["DATABASE_URL"]) & tables(os.environ["TEE_DATABASE_URL"])
+def _shared_public_tables() -> set[str]:
+    """Shared-table denominator independent of any contract being compared."""
+    return _public_tables(os.environ["DATABASE_URL"]) & _public_tables(
+        os.environ["TEE_DATABASE_URL"]
+    )
+
+
+# Exact exceptions: newly missing tables and stale exemptions must both fail.
+_INTENTIONAL_RDS_ONLY_TABLES = {
+    "alembic_version": "TEE owns a separate migration chain in alembic_tee_version",
+    "tee_sync_runs": "RDS-side shadow sync reports monitoring the destination TEE",
+    "tee_reconcile_state": "RDS-side shadow reconciliation control state",
+    "tee_reconcile_cursors": "RDS-side shadow reconciliation resume cursors",
+}
+
+
+def test_tee_primary_has_all_runtime_tables():
+    """Whole missing tables must not disappear from intersection-based parity."""
+    rds = _public_tables(os.environ["DATABASE_URL"])
+    tee = _public_tables(os.environ["TEE_DATABASE_URL"])
+    assert rds - tee == set(_INTENTIONAL_RDS_ONLY_TABLES)
 
 
 def test_tee_schema_has_all_tables():
@@ -247,7 +265,8 @@ def test_tee_schema_has_all_tables():
             "world_book_entries","frames","frame_envelopes","genesis_import_chunks",
             "voice_turn_results","voice_turn_streams","tee_replication_cursors",
             "tee_pending_device_migration","notify_relay_configs","notify_relay_logs",
-            "agent_runtime_instances","agent_runtime_supervisor_heartbeats"}
+            "agent_runtime_instances","agent_runtime_supervisor_heartbeats",
+            "account_recover_challenges"}
     with _tee_conn() as c:
         rows = c.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'").fetchall()
     assert want <= {r[0] for r in rows}

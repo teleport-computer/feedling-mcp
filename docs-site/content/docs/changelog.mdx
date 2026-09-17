@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Restore account recovery on TEE-primary deployments by adding the missing
+  recovery-challenge table. Recovery has been unavailable since the TEE-primary
+  cutover; the table is created by the normal application-startup migration.
+
 - Hosted Resident crash-loop circuits now retry every five minutes at a fixed
   interval. Startup exits record bounded per-user reasons; current startup
   failures use the system-owned spawn-failure notice instead of asking users
