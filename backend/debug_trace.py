@@ -41,6 +41,7 @@ _DETAIL_MAX_KEYS = 20
 _DETAIL_MAX_STR = 200
 _DETAIL_MAX_LIST = 20
 _DETAIL_MAX_ITEM = 80
+_WIDE_DETAIL_KEYS = {"raw_reply_head": {"reply_parse_failed"}, "pi_error_head": None}
 _FLAG_CACHE_TTL = 30.0
 _QUEUE_MAX = 5000
 _FLUSH_BATCH_MAX = 100
@@ -831,11 +832,14 @@ def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
         elif isinstance(v, (int, float, bool)):
             out[key] = v
         elif isinstance(v, str):
-            # T617: an explicitly authorized parse-failure excerpt needs 300
-            # characters. Keep the generic bound for every other field/event.
+            # Explicitly authorized excerpts; None allows every error class.
+            allowed_classes = _WIDE_DETAIL_KEYS.get(key)
             limit = (
-                300 if key == "raw_reply_head"
-                and detail.get("error_class") == "reply_parse_failed"
+                300 if key in _WIDE_DETAIL_KEYS
+                and (allowed_classes is None or (
+                    isinstance(detail.get("error_class"), str)
+                    and detail["error_class"] in allowed_classes
+                ))
                 else _DETAIL_MAX_STR
             )
             out[key] = v[:limit]

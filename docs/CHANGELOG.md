@@ -55,6 +55,14 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## 2026-09-17
+
+### [FIX] T638：resident pi 上游错误分型与可持久化诊断
+- pi 最终 message_end 为 error 且无可用回复时，未命中既有规则的错误归 provider_error_unclassified；quota/auth/5xx 等规则优先级与重试行为不变，V2 不变。Seven 已逐字批准新中文文案。
+- agent.model.call.error 增加 strip 后头 300 字的 pi_error_head；debug_trace 小表放宽长度，admin 仅在该事件放行。完整事件验证 20 键上限和二次截断。
+- pi_stream schema_version=3 删除 blocks，stop_reasons 改为≤80 字、去重保序的枚举字符串；新增 stop_reason_last，保留 T543 既有标量字段，历史数据不回填。
+- 同步公开 errors/changelog 与错误分类目录；派单限定现有 consumer/emitter/admin 写站点，未在本次拆分这些超大历史模块。
+
 ## 2026-09-15 — 历史导入换到 memgarden 导入会话（IO-6）
 
 **[DECISION] 托管 plaintext genesis、VPS resident 蒸馏、加密分块导入和旧 `/v1/history_import/upload` 的记忆卡，统一改走 memgarden `import_session`（`backend/memory/garden_import.py`）；默认 `two_pass`。**

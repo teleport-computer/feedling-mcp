@@ -60,15 +60,18 @@ retrying a failed write.
 ## Pi stream diagnostics
 
 For resident clients using the pi driver, `agent.model.call.done` and
-`agent.model.call.error` traces may include `detail.pi_stream.schema_version=2`.
-The projection adds scalar `text_blocks`, `thinking_blocks`, `tool_blocks`
-(pi `toolCall` blocks), and `other_blocks` counts from assistant `message_end`
-events. It also records `stop_reason_first` (the first nonempty, allowlisted
-reason, unknown reasons mapped to `other`, or an empty string if none),
-`stop_length_seen`, and `stop_max_tokens_seen`. The two booleans scan all parsed
-assistant end events, even after the legacy stop-reason list reaches its cap.
-These fields contain no reply text, reasoning text, tool arguments, or arbitrary
-upstream stop-reason strings.
+`agent.model.call.error` traces may include `detail.pi_stream.schema_version=3`.
+All fields in this projection are scalars. `text_blocks`, `thinking_blocks`,
+`tool_blocks` (pi `toolCall` blocks), and `other_blocks` count assistant
+`message_end` blocks.
+`stop_reasons` is a comma-separated string of distinct allowlisted reasons in
+encounter order, capped at eight reasons and 80 characters without splitting an
+enum. Unknown reasons become `other`. `stop_reason_first` is the first nonempty
+normalized reason; `stop_reason_last` is the last observed assistant end reason
+(or an empty string when that end has none). `stop_length_seen` and
+`stop_max_tokens_seen` scan all parsed assistant ends, including those beyond
+the summary cap. These shape fields contain no reply text, reasoning text,
+tool arguments, or arbitrary upstream stop-reason strings.
 
 Interpret these as observations, not mutually exclusive diagnoses. Check
 `parse_failed=false`, `parse_error_count=0`, and field types before classifying
@@ -77,11 +80,28 @@ thinking-only or tool-call-only output. `update_text_seen=true` with
 A length flag can coexist with another shape. A successful model-call trace is
 not proof that the reply was delivered to the user.
 
-Older traces lack the versioned scalar fields. Their nested `blocks` and
-`stop_reasons` can be truncated strings after size limiting; they are not JSON
-objects/arrays and are not backfilled. Keep those records outside the new-field
-denominator and report coverage separately during rolling upgrades. The shared
-trace limiter and its size bounds are unchanged.
+Version 3 no longer emits nested `blocks` or list-shaped `stop_reasons`.
+Version 2 includes scalar counts, but its old nested fields may have become
+Python-representation strings after size limiting. Older unversioned traces
+lack these scalar counts. Records are not backfilled: check version and field
+types, and report coverage separately during rolling upgrades.
+
+When a pi turn has no usable reply and the final assistant `message_end` reports
+`stopReason=error`, existing specific classifications (quota, authentication,
+rate limits, and upstream availability) take priority. An unmatched error uses
+`provider_error_unclassified` with `blame=provider_transient`; a turn with no
+error stop reason continues to use `provider_empty_reply`. Trailing user echoes
+or tool results cannot replace that assistant end. If no assistant end exists,
+legacy streams may fall back to the last end without a role field. This changes
+the failure classification, not retry behavior.
+
+For a failed pi model call whose selected end is an error, `detail.pi_error_head`
+contains the first 300 characters of the stripped provider `errorMessage`, if
+present. This field contains provider text and is visible in the trace and
+admin projection. It is separate from the content-free stream shape and does
+not replace the server-authored failure text shown to users. Other trace detail
+strings retain their existing limits (including the separately authorized
+parse-failure reply excerpt).
 
 
 ## Agent body generation
