@@ -26,6 +26,12 @@ change must not be interpreted as an API guarantee.
   and list-shaped `stop_reasons` are no longer emitted; historical records
   are not backfilled.
 
+- Sixteen resident and workflow error notices now have English copy, covering
+  model-service and reply failures, onboarding and chat-history import failures,
+  memory backoff, and companion process startup or degraded operation.
+  The notice catalog returns English copy when English is requested, instead
+  of falling back to Chinese. Chinese copy and error classification remain unchanged.
+
 - Restore account recovery on TEE-primary deployments by adding the missing
   recovery-challenge table. Recovery has been unavailable since the TEE-primary
   cutover; the table is created by the normal application-startup migration.
