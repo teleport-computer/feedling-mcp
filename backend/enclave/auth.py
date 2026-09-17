@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from starlette.requests import Request
@@ -28,6 +29,7 @@ from enclave import backend_client, config
 class AuthContext:
     api_key: str
     runtime_token: str
+    reqlog: dict | None = field(default=None, repr=False, compare=False)
 
     @property
     def forward_headers(self) -> dict:
@@ -48,7 +50,10 @@ def extract_auth(request: Request) -> AuthContext:
     if not api_key:
         api_key = (request.query_params.get("key") or "").strip()
     runtime_token = (request.headers.get("X-Feedling-Runtime-Token") or "").strip()
-    return AuthContext(api_key=api_key, runtime_token=runtime_token)
+    metrics = getattr(request.state, "reqlog", None)
+    if metrics is not None:
+        metrics["auth_kind"] = "runtime_token" if runtime_token else "api_key" if api_key else "none"
+    return AuthContext(api_key=api_key, runtime_token=runtime_token, reqlog=metrics)
 
 
 def local_user_id_from_token(runtime_token: str) -> str | None:
@@ -82,26 +87,48 @@ def _prune_whoami_cache(now: float) -> None:
         _whoami_cache.pop(h, None)
 
 
+def _observed_whoami(ctx: AuthContext, source: str, result: dict) -> dict:
+    if ctx.reqlog is not None:
+        ctx.reqlog["whoami_source"] = source
+        uid = result.get("user_id") if isinstance(result, dict) else None
+        # Never emit an entire short/irregular ID; only the approved prefix.
+        ctx.reqlog["user_prefix"] = (
+            uid[:12] if isinstance(uid, str) and re.fullmatch(r"usr_[A-Za-z0-9]{9,}", uid) else None)
+    return result
+
+
+async def _backend_whoami(ctx: AuthContext) -> dict:
+    started = time.perf_counter()
+    if ctx.reqlog is not None:
+        ctx.reqlog["whoami_source"] = "backend"
+    try:
+        result = await backend_client.backend_get("/v1/users/whoami", ctx.forward_headers)
+    finally:
+        if ctx.reqlog is not None:
+            ctx.reqlog["whoami_ms"] = (time.perf_counter() - started) * 1000
+    return _observed_whoami(ctx, "backend", result)
+
+
 async def whoami_live(ctx: AuthContext) -> dict:
     """每次实时解析（/v1/envelope/decrypt 专用——缓存会把刚吊销的 key 多放行
     最多 TTL 秒）。本地 token 校验允许：吊销延迟以 token TTL（≤15min）为界，
     与旧实现一致。"""
     local_uid = local_user_id_from_token(ctx.runtime_token)
     if local_uid:
-        return {"user_id": local_uid}
-    return await backend_client.backend_get("/v1/users/whoami", ctx.forward_headers)
+        return _observed_whoami(ctx, "local_token", {"user_id": local_uid})
+    return await _backend_whoami(ctx)
 
 
 async def whoami_cached(ctx: AuthContext) -> dict:
     local_uid = local_user_id_from_token(ctx.runtime_token)
     if local_uid:
-        return {"user_id": local_uid}
+        return _observed_whoami(ctx, "local_token", {"user_id": local_uid})
     cred = ("rt:" + ctx.runtime_token) if ctx.runtime_token else ("ak:" + ctx.api_key)
     h = hashlib.sha256(cred.encode("utf-8")).hexdigest()
 
     hit = _whoami_cache.get(h)
     if hit is not None and time.monotonic() - hit[0] < WHOAMI_CACHE_TTL:
-        return hit[1]
+        return _observed_whoami(ctx, "cache", hit[1])
 
     # inflight 注册表按 (当前事件循环, h) 隔离。asyncio.Future 绑定创建它的 loop，
     # 跨 loop `await` 会抛 RuntimeError（got Future attached to a different loop）。
@@ -122,18 +149,17 @@ async def whoami_cached(ctx: AuthContext) -> dict:
         # 哨兵而非异常，所以这里的 CancelledError 只可能是等待者自身被取消。
         outcome = await asyncio.shield(inflight)
         if outcome is not _FLIGHT_FAILED:
-            return outcome
+            return _observed_whoami(ctx, "cache", outcome)
         # 领跑者倒下 → 重查缓存后各自重试（旧线程版 waiter 在 per-key 锁上
         # 排队醒来的语义：串行地一个个重试，首个成功者回填缓存供其余复用）
         hit = _whoami_cache.get(h)
         if hit is not None and time.monotonic() - hit[0] < WHOAMI_CACHE_TTL:
-            return hit[1]
+            return _observed_whoami(ctx, "cache", hit[1])
 
     fut: asyncio.Future = loop.create_future()
     _whoami_inflight[key] = fut
     try:
-        whoami = await backend_client.backend_get(
-            "/v1/users/whoami", ctx.forward_headers)
+        whoami = await _backend_whoami(ctx)
         if isinstance(whoami, dict) and whoami.get("user_id"):
             now = time.monotonic()
             _whoami_cache[h] = (now, whoami)
