@@ -166,6 +166,8 @@ def run(
         if result.failures:
             failures += int(result.failures)
             break
+        if int(result.counts.get("not_attempted_limit", 0)) > 0:
+            break
         completed += 1
         last_completed = user_id
 

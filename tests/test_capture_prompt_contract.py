@@ -1,7 +1,7 @@
 """Unit tests for the 落卡 capture prompt + parser (A-full PR C, no DB).
 
-Pure-function coverage of capture_prompt_v1: prompt rendering and the agent
-reply parser (parse_capture_cards). DB-free so it runs anywhere.
+Prompt rendering and reply parsing with io policy and signals supplied by
+_memgarden_prompt_bindings. DB-free so it runs anywhere.
 """
 import json
 import sys
@@ -294,7 +294,7 @@ def test_capture_semantic_retry_requires_the_complete_batch():
 
 
 # --- A9 bucket convergence: one shared bilingual canonical vocabulary ----------
-# onboarding + capture + migration must steer toward the SAME reusable bucket set
+# onboarding + capture must steer toward the SAME reusable bucket set
 # instead of each card minting a fresh near-synonym (工作/职业/事业) or scattering.
 
 def test_capture_prompt_carries_canonical_buckets():
@@ -324,21 +324,9 @@ def test_capture_prompt_carries_canonical_buckets():
         assert pair in COMMON_BUCKETS_V1
 
 
-def test_migrate_and_genesis_share_the_same_canonical_buckets():
+def test_genesis_uses_the_same_canonical_buckets():
     from memgarden.prompts.buckets import _COMMON_BUCKETS_ZH
-    from memgarden.prompts.migrate import build_migrate_prompt
     from genesis.prompts import FACT_WRITE_PROMPT
-    mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）", locale="zh-Hans")
-    assert _COMMON_BUCKETS_ZH in mig
     # onboarding (genesis FACT_WRITE) had NO bucket guidance before A9 — now it converges too
     assert _COMMON_BUCKETS_ZH in FACT_WRITE_PROMPT
     assert "Bucket convergence" in FACT_WRITE_PROMPT
-
-
-def test_migrate_prompt_unknown_person_does_not_leak_ta_marker():
-    from memgarden.prompts.migrate import build_migrate_prompt
-
-    prompt = build_migrate_prompt(
-        ai_name="", user_name="TA", old_cards="", vocab=""
-, locale="zh-Hans")
-    assert prompt.startswith("You are 这个人, 这个人's companion.")

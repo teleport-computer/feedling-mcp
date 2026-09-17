@@ -142,6 +142,45 @@ def test_apply_stops_after_first_failed_user(monkeypatch):
     assert result.last_completed_user_id == ""
 
 
+def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair,
+        "eligible_user_ids",
+        lambda **_kwargs: ["usr_a", "usr_b", "usr_c"],
+    )
+    called = []
+
+    def migrate(user_id, **_kwargs):
+        called.append(user_id)
+        if user_id == "usr_a":
+            return SimpleNamespace(counts={"migrated": 2}, failures=0)
+        if user_id == "usr_b":
+            return SimpleNamespace(
+                counts={"migrated": 20, "not_attempted_limit": 80},
+                failures=0,
+            )
+        return SimpleNamespace(counts={"migrated": 3}, failures=0)
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        apply=True,
+        row_limit=20,
+        health_probe=lambda: True,
+        healthy_streak=1,
+    )
+
+    assert called == ["usr_a", "usr_b"]
+    assert result.public_dict() == {
+        "apply": True,
+        "failures": 0,
+        "item_counts": {"migrated": 22, "not_attempted_limit": 80},
+        "last_completed_user_id": "usr_a",
+        "users_completed": 1,
+        "users_selected": 3,
+    }
+
+
 def test_apply_stops_when_health_does_not_recover(monkeypatch):
     monkeypatch.setattr(
         plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]

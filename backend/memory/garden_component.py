@@ -34,9 +34,9 @@ from typing import Any, Callable, Iterable, Mapping
 
 from memgarden import CaptureRequest, GardenComponent, MaintenanceRequest
 from memgarden.contracts import Step
+from memgarden.policies import CONVERSATION_CAPTURE
 
 from identity.user_naming import _naming_rule, sanitize_user_name
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 # io 的落卡档位（``IO_CONVERSATION_CAPTURE_POLICY``，max_cards=50）由调用点经
@@ -45,6 +45,9 @@ from memory.card_leak_signals import IO_LEAK_SIGNALS
 # （0.16.0 按对象 identity 选模板，replace 出来的同档 policy 会被误认）；
 # 0.20.1 起模板按 ``policy.name`` / 标志位渲染，垫片已删。
 # tests/test_garden_io_capture_policy.py 守着「上限真生效 + 不许再打补丁」。
+# 提示词继续要求「少而厚」；io 的日常落卡硬上限为 50 张，只防失控批次。
+# 从钉版 policy replace，确保 rubric 与其余行为逐字段保持原样。
+IO_CONVERSATION_CAPTURE_POLICY = dataclasses.replace(CONVERSATION_CAPTURE, max_cards=50)
 
 #: 打回重问最多一次。两条 runtime 共用 —— 各给各的次数，
 #: 同一个模型在托管和自建上会得到不同的重问行为。
@@ -265,8 +268,6 @@ _DREAM_BUDGET_FIELDS = (
 #: 老版本会把整理提示词退化成「只有 id 和摘要」—— 模型看不到正文就重写整张卡，
 #: 旧正文随旧卡退休。宁可这一晚整理失败退避，也不能静默走那条路。
 DREAM_KERNEL_OUTDATED = "dream_kernel_outdated"
-#: 模型的整理方案**全部**碰了被截断的卡时的失败码（content-free）。
-DREAM_TRUNCATED_CARD_REJECTED = "dream_truncated_card_rejected"
 
 # 老卡的字段名。组件只认 summary / content / bucket / threads。
 _SUMMARY_KEYS = ("summary", "title", "description")
@@ -449,31 +450,6 @@ def open_dream_session(
     return session, disclosure
 
 
-def reject_truncated_consolidations(
-    consolidations: Iterable[Any],
-    truncated_ids: Iterable[str],
-) -> tuple[list[dict], int]:
-    """宿主侧硬闸：丢掉动了被截断卡的整理方案，返回 ``(留下的, 丢掉的条数)``。
-
-    提示词已经禁止模型把 TRUNCATED 卡放进 ``card_ids``，但提示词不是保证：
-    模型只看过前 5000 字就去重写整张卡，后半段正文会随旧卡一起退休，
-    而用户看不出发生了什么。这道闸是确定性的，不看内容。
-    """
-    blocked = {_one_line(mid) for mid in truncated_ids if _one_line(mid)}
-    kept: list[dict] = []
-    rejected = 0
-    for row in consolidations or []:
-        if not isinstance(row, dict):
-            continue
-        raw_ids = row.get("card_ids")
-        ids = {_one_line(mid) for mid in (raw_ids if isinstance(raw_ids, list) else [])}
-        if blocked and ids & blocked:
-            rejected += 1
-            continue
-        kept.append(row)
-    return kept, rejected
-
-
 # --------------------------------------------------------------------------- #
 # 观测：把组件汇报的步骤翻译成 io 原有的口径
 # --------------------------------------------------------------------------- #
@@ -508,9 +484,7 @@ class BounceTracker:
         #: Dream：组件在出口丢掉的整理建议条数（``why="unsafe_target"``）——
         #: 动了 TRUNCATED 卡的、动了没渲染进提示词的卡的，分开数。
         #:
-        #: 新内核自己先拦了，宿主 :func:`reject_truncated_consolidations` 就拦不到；
-        #: 不把这两个数接住，「全部建议都动了截断卡」会从 guard_rejected 失败
-        #: 变成「这晚没什么要整理」的 noop，提案数也会少算。
+        #: 内核负责过滤与失败语义，IO 只接住计数，保证原始提案数不被低估。
         self.dropped_truncated_target = 0
         self.dropped_unrendered_target = 0
         #: 组件建提示词时报的索引计数（``prompt_built`` 步骤里带的）。

@@ -16,10 +16,10 @@
 
 ## 进度为什么要带「写到一半」的记录
 
-``memory.add`` 没有幂等键。一批写库写到一半进程死了，续跑时再问一次模型、再写一次，
-就是两份卡。所以写库**之前**先把这批的指令（``pending``）存进进度，写完一小段就把拿到的
-id 记进去；续跑时发现 ``pending`` 就是当前这批，直接接着写剩下的，不再问模型。
-崩溃窗口缩小到「一小段（``WRITE_CHUNK`` 张）写完、id 还没存下」那一瞬。
+写库**之前**先保存这批指令（``pending``），写完一小段就保存返回的 id。
+每条指令携带稳定的 action 幂等键：卡片写入和无正文回执在同一数据库事务提交。
+因此写入成功但进度尚未保存时，续跑重放原指令会拿到原 id，不再生成第二张卡。
+需要客户端封装的调用方还要复用 ``prepared`` 中的原 action，不能在重试时重新封装。
 
 ⚠️ 进度里有用户内容（两段式的候选、``pending`` 里的卡、``written`` 摘要）。宿主必须按
 记忆正文的等级保存 —— 托管侧存进已加密的 genesis checkpoint，VPS 侧只放内存。
@@ -32,12 +32,13 @@ id 记进去；续跑时发现 ``pending`` 就是当前这批，直接接着写�
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
-from memory import garden_component
+from memory import action_receipts, content_policy, garden_component
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ STRATEGY_ENV = "FEEDLING_GARDEN_IMPORT_STRATEGY"
 DEFAULT_STRATEGY = "two_pass"
 _STRATEGIES = ("single_pass", "two_pass")
 
-#: 一次写库最多几条 —— 也是崩溃后可能重复的上限（见模块说明）。和执行器的批大小一致。
+#: 一次写库最多几条；和执行器的批大小一致，不限制导入总量。
 WRITE_CHUNK = 20
 
 #: 同一批判断失败（解析失败、重问后仍失败）时再整批重来几次，之后跳过这批继续。
@@ -298,12 +299,14 @@ def index_cards(items: Sequence[Mapping[str, Any]] | None) -> list[dict]:
 
 #: 这些是「这张卡本身不合格」—— 丢这一张、别的照写；但一整段全被这样拒掉（一张没写进去）
 #: 就抛 ``GardenImportCardsRejected``。其余错误（信封、存储、鉴权）说明写库这件事本身坏了：
-#: 一张都没写成时整段抛出去，进度里的 pending 还在，下次续跑补写。
+#: 即使其他卡已经成功也必须抛出，进度里的 pending 还在，下次幂等续跑补写。
 CARD_LEVEL_ERRORS = frozenset({
     "title_required",
     "description_required",
     "memory_card_polluted",
     "memory_card_tombstone",
+    content_policy.ContentTooLong.code,
+    action_receipts.IDEMPOTENCY_CONFLICT,
 })
 
 #: supersede 的目标已经不在了（被删、被别的写入先取代）—— 新卡内容仍然有效，改成新增，
@@ -337,6 +340,7 @@ def write_with_executor(
     *,
     build_action: Callable[[Mapping[str, Any]], dict | None],
     execute: Callable[[list[dict]], list[Any]],
+    idempotency_key: str = "",
 ) -> list[str]:
     """把一段写卡指令交给 io 的 memory action 执行器，拿回和指令一一对应的 id。
 
@@ -349,14 +353,17 @@ def write_with_executor(
     for idx, mutation in enumerate(mutations):
         action = build_action(mutation)
         if action is not None:
+            if idempotency_key:
+                action = {**action, "idempotency_key": "import:" + hashlib.sha256(
+                    f"{idempotency_key}:{idx}".encode()).hexdigest()}
             planned.append((idx, action))
     if not planned:
-        return ids
+        raise GardenImportCardsRejected("memory_actions_failed:invalid_cards")
     hard: list[str] = []
     rejected: list[str] = []
     retry: list[tuple[int, dict]] = []
     rows = list(execute([a for _i, a in planned]) or [])
-    if len(rows) < len(planned):
+    if len(rows) != len(planned):
         hard.append("memory_action_results_missing")
     for (idx, action), row in zip(planned, rows):
         rid = row_memory_id(row)
@@ -365,14 +372,19 @@ def write_with_executor(
             continue
         err = _row_error(row)
         if str(action.get("type") or "") == "memory.supersede" and err in STALE_TARGET_ERRORS:
-            retry.append((idx, {**{k: v for k, v in action.items() if k != "supersedes"},
-                                "type": "memory.add"}))
+            fallback = {**{k: v for k, v in action.items() if k != "supersedes"},
+                        "type": "memory.add"}
+            if fallback.get("idempotency_key"):
+                fallback["idempotency_key"] += ":fallback"
+            retry.append((idx, fallback))
         elif err in CARD_LEVEL_ERRORS:
             rejected.append(err)
         else:
             hard.append(err or "memory_action_failed")
     if retry:
         rows2 = list(execute([a for _i, a in retry]) or [])
+        if len(rows2) != len(retry):
+            hard.append("memory_action_results_missing")
         for (idx, _action), row in zip(retry, rows2):
             rid = row_memory_id(row)
             if rid:
@@ -381,9 +393,11 @@ def write_with_executor(
                 rejected.append(_row_error(row))
             else:
                 hard.append(_row_error(row) or "memory_action_failed")
+    if hard:
+        # Successful siblings are recoverable through their durable action
+        # identities; an infrastructure failure is never a content rejection.
+        raise RuntimeError(f"memory_actions_failed:{hard[0]}")
     if not any(ids):
-        if hard:
-            raise RuntimeError(f"memory_actions_failed:{hard[0]}")
         if rejected:
             raise GardenImportCardsRejected(f"memory_actions_failed:{rejected[0]}")
     return ids
@@ -600,6 +614,7 @@ def run_import(
     save: Callable[[dict], None],
     should_yield: Callable[[], bool] | None = None,
     on_batch: Callable[[ImportSource], None] | None = None,
+    prepare_write: Callable[[list[dict]], list[dict]] | None = None,
 ) -> ImportRunResult:
     """按顺序跑每个来源的导入会话，直到全部跑完（或调用方要求让路）。
 
@@ -731,18 +746,20 @@ def run_import(
                 "mutations": mutations, "cards": list(outcome.cards), "ids": ids,
                 "replays": replays,
             }
+            prepared = None
+            if prepare_write is not None:
+                prepared = (pending or {}).get("prepared") if replay else None
+                if prepared is None:
+                    prepared = prepare_write(mutations)
+                if len(prepared) != len(mutations):
+                    raise RuntimeError("garden_import_prepared_actions_mismatch")
+                state["pending"]["prepared"] = prepared
             save(state)
-            if replays >= BATCH_ATTEMPTS and len(ids) < len(mutations):
-                # 同一段写库已经原样重放过、还是没写完（持久的写库错误，每次重试都在同一张卡
-                # 上炸）：和「同一批反复判不出来」同一个次数口径，剩下的按丢弃处理，
-                # 别让整个导入永远卡在这一段。只记张数。
-                log.warning("garden import pending write gave up job=%s source=%s remaining=%d",
-                            job_key, source.family, len(mutations) - len(ids))
-                ids.extend([""] * (len(mutations) - len(ids)))
             while len(ids) < len(mutations):
-                chunk = mutations[len(ids):len(ids) + WRITE_CHUNK]
+                chunk = (prepared if prepared is not None else mutations)[len(ids):len(ids) + WRITE_CHUNK]
                 try:
-                    got = [str(x or "") for x in write(chunk, outcome.idempotency_key)]
+                    got = [str(x or "") for x in write(
+                        chunk, f"{outcome.idempotency_key}:write:{len(ids)}")]
                 except GardenImportCardsRejected:
                     if any(ids):
                         # 这批前面几段已经写进去了：整批不是「一张没写」，这一段按丢弃记

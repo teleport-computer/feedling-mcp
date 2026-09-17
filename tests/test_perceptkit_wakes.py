@@ -66,10 +66,165 @@ def test_the_debounces_are_the_ones_the_live_path_used():
     assert by_id["io.perception.photo_added"].lifecycle.cooldown_seconds == 0.0
 
 
-def test_anchors_are_deduped_per_anchor_not_globally():
-    """从家到公司再回家，是两件事。按 anchor_id 各自去重。"""
+def test_the_anchor_rule_only_counts_connected_reports():
+    """前置条件在规则上，不在调用方那里 —— 所以钉在定义本身。
+
+    版本号跟着加一：加前置条件是行为变了，状态键带版本，新版本从干净状态开始。
+    """
     by_id = {d.definition_id: d for d in wake_rules.wake_definitions()}
-    assert by_id["io.perception.anchor_changed"].dedupe_field == "anchor_id"
+    anchor = by_id["io.perception.anchor_changed"]
+    assert dict(anchor.when) == {"is_connected": True}
+    assert anchor.version == 2
+    # 其余规则没有前置条件
+    assert all(not d.when for d in by_id.values() if d is not anchor)
+
+
+# --------------------------------------------------------------------------
+# 真实唤醒次数：整条 kit 管线 + 真 Postgres 发件箱 + io 的 WakePort
+#
+# 上面那些只看定义字段。perceptkit 0.5.0 的定义字段完全正确，
+# 用户照样「周二起到公司不再被叫醒」—— 缺陷在事件 id 和发件箱去重合起来的
+# 地方，只有数真实唤醒才看得见。
+# --------------------------------------------------------------------------
+
+import os  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+_PG = os.environ.get("PERCEPTKIT_TEST_PG")
+_needs_pg = pytest.mark.skipif(
+    not _PG, reason="没有 PERCEPTKIT_TEST_PG，跳过数真实唤醒的几条（发件箱去重只有真库验得出）")
+
+
+@pytest.fixture
+def kit_world(monkeypatch):
+    """io 真实的 kit 装配（shadow._kit），只把最后一跳的排队换成记录。"""
+    psycopg = pytest.importorskip("psycopg")
+    from perception.perceptkit_adapter import schema, shadow
+    from perception.perceptkit_adapter import wake_port as _wake_port
+    from perception.perceptkit_adapter.storage import PostgresStorage
+
+    with psycopg.connect(_PG, autocommit=True) as c:
+        c.execute(schema.DDL)
+        c.execute(schema.TRUNCATE)
+
+    delivered: list = []
+    real_port = _wake_port.FeedlingWakePort
+    monkeypatch.setattr(
+        _wake_port, "FeedlingWakePort",
+        lambda: real_port(submit=lambda ev: delivered.append(ev) or True))
+    monkeypatch.setattr(shadow, "wakes_enabled", lambda: True)
+
+    conn = psycopg.connect(_PG, autocommit=True)
+    storage = PostgresStorage(conn)
+    kit = shadow._kit(storage)
+
+    def ingest(envelope, at):
+        from perceptkit.contracts import IngestContext
+        return kit.ingest(envelope, context=IngestContext("u1", at), dispatch=True)
+
+    def outbox(event_type):
+        return storage.list_events(subject_id="u1", event_type=event_type, limit=100)
+
+    try:
+        yield type("World", (), {"ingest": staticmethod(ingest),
+                                 "outbox": staticmethod(outbox),
+                                 "delivered": delivered})
+    finally:
+        conn.close()
+
+
+def _anchor(anchor_id, at):
+    """io 自己的 producer 产出的锚点上报（和 /location 入口同一份代码）。"""
+    from perception.perceptkit_adapter.events import location_envelope
+    return location_envelope({"wifi_anchor_id": anchor_id, "wifi_label": anchor_id},
+                             occurred_at=at, timezone_id="Asia/Shanghai")
+
+
+def _broadcast(active, at):
+    """io 自己的 iOS 快照转换产出的屏幕采集上报。"""
+    from perception.perceptkit_adapter.ios_report import to_envelope
+    return to_envelope({"context_snapshot": [{"key": "broadcast", "data": {"active": active}}],
+                        "client_ts": at.isoformat()},
+                       occurred_at=at.isoformat())
+
+
+def _wakes(world, trigger):
+    return [e for e in world.delivered if e.trigger == trigger]
+
+
+@_needs_pg
+def test_the_same_commute_wakes_every_day_not_only_the_first(kit_world):
+    """之前：周一 家→公司 叫醒，周二起 家→公司 永远不再叫（同一个 id 被发件箱当重复吞掉）。
+
+    A→B→A→B 跨天：第一条是基线不算，后面三次真实到达各叫一次。
+    """
+    trips = [("home", T0), ("office", T0 + timedelta(hours=1)),
+             ("home", T0 + timedelta(hours=10)),
+             ("office", T0 + timedelta(days=1, hours=1))]
+    for where, at in trips:
+        kit_world.ingest(_anchor(where, at), at)
+
+    assert len(kit_world.outbox("arrived_at_anchor")) == 3
+    assert len(_wakes(kit_world, "arrived_at_anchor")) == 3
+
+
+@_needs_pg
+def test_a_resent_report_does_not_wake_again(kit_world):
+    """修了「第二次跳变被吞」，不能反过来让客户端重传也叫一次。"""
+    home, office = T0, T0 + timedelta(hours=1)
+    kit_world.ingest(_anchor("home", home), home)
+    kit_world.ingest(_anchor("office", office), office)
+    kit_world.ingest(_anchor("office", office), office + timedelta(minutes=2))
+
+    assert len(kit_world.outbox("arrived_at_anchor")) == 1
+    assert len(_wakes(kit_world, "arrived_at_anchor")) == 1
+
+
+@_needs_pg
+def test_every_broadcast_toggle_wakes_once_the_cooldown_has_passed(kit_world):
+    """之前：录屏只在第一次开、第一次关时叫醒。
+
+    关→开→关→开→关→开，间隔都超过 60 秒冷却：3 次开 + 2 次关。
+    """
+    for i, active in enumerate([False, True, False, True, False, True]):
+        at = T0 + timedelta(minutes=5 * i)
+        kit_world.ingest(_broadcast(active, at), at)
+
+    assert len(kit_world.outbox("broadcast_opened")) == 3
+    assert len(kit_world.outbox("broadcast_closed")) == 2
+    assert len(_wakes(kit_world, "broadcast_opened")) == 3
+    assert len(_wakes(kit_world, "broadcast_closed")) == 2
+
+
+@_needs_pg
+def test_a_late_disconnect_neither_wakes_nor_swallows_the_real_arrival(kit_world):
+    """迟到的「家里 Wi-Fi 断开」既不能讲成「到家了」，也不能把前值推成 home。
+
+    家(连)→公司(连)→家(断开，迟到)→没有到达→家(连，稍后)→一次到达。
+    推成 home 的话，真正到家那一次会被当成「没变」吞掉。
+
+    io 的 producer 目前只在连着时才发锚点（is_connected 写死 True），所以
+    断开这条手工构造 —— 前置条件防的是 producer 以后开始发断开状态。
+    """
+    from perception.perceptkit_adapter.events import location_envelope
+
+    t_home, t_office = T0, T0 + timedelta(hours=1)
+    t_late, t_back = T0 + timedelta(hours=9), T0 + timedelta(hours=10)
+    kit_world.ingest(_anchor("home", t_home), t_home)
+    kit_world.ingest(_anchor("office", t_office), t_office)
+    assert len(_wakes(kit_world, "arrived_at_anchor")) == 1
+
+    late = location_envelope({"wifi_anchor_id": "home"}, occurred_at=t_late)
+    late["report_id"] = "late-disconnect"
+    for o in late["observations"]:
+        if o["signal"] == "proximity_anchor":
+            o["value"]["is_connected"] = False
+    kit_world.ingest(late, t_late)
+    assert len(_wakes(kit_world, "arrived_at_anchor")) == 1, "断开被讲成了到达"
+
+    kit_world.ingest(_anchor("home", t_back), t_back)
+    assert len(kit_world.outbox("arrived_at_anchor")) == 2
+    assert len(_wakes(kit_world, "arrived_at_anchor")) == 2, "真正到家那一次被吞了"
 
 
 # --------------------------------------------------------------------------

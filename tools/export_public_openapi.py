@@ -112,7 +112,7 @@ TAG_DESCRIPTIONS = {
     "Chat": "Encrypted chat messages and hosted-agent conversations.",
     "Model API": "Model provider credentials, routes, and runtime configuration.",
     "MCP": "User-configured MCP servers and connection management.",
-    "Memory": "Memory records, buckets, threads, and migration state.",
+    "Memory": "Memory records, buckets, and threads.",
     "Identity": "Agent identity and relationship state.",
     "Worldbook": "Worldbook entries and contextual matching.",
     "Perception": "Device perception reports, snapshots, and photos.",

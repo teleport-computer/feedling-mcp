@@ -1,6 +1,8 @@
 """Derived public views of the producer-owned ``error_class`` registry."""
 from __future__ import annotations
 
+# migrate 错误码仅用于识别历史 job 终态；老卡迁移机制已删。
+
 import re
 
 from notices import error_contract

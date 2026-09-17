@@ -348,15 +348,23 @@ python migrate_effective_off_content_to_plaintext.py \
   --user-limit 10 --row-limit 20 --rate 1 --json
 ```
 
-Record `last_completed_user_id` only after a zero-failure user. Resume strictly
-after that value:
+Record `last_completed_user_id` only after a zero-failure user with no
+`not_attempted_limit` rows. When `--row-limit` leaves rows deferred, the
+coordinator stops before the next user, does not count the partial user as
+completed, and leaves the cursor on the previous fully completed user. Resume
+strictly after that value with the same row limit; this selects the partial
+user again until it is complete:
 
 ```bash
 python migrate_effective_off_content_to_plaintext.py \
   --apply --allow-plaintext-rewrite \
   --confirm-all-effective-off ALL-EFFECTIVE-OFF \
-  --start-after usr_last_completed --rate 1 --json
+  --start-after usr_last_completed --row-limit 20 --rate 1 --json
 ```
+
+If `last_completed_user_id` is empty, omit `--start-after` on the next run.
+Once a run no longer reports `not_attempted_limit`, that user is complete and
+the returned cursor may advance normally.
 
 Before and after every batch, record content-shape counts split into explicit-on
 and effective-off users. Abort rather than raising QPS if the enclave health

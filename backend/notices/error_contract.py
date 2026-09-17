@@ -15,6 +15,10 @@ from typing import Callable, Iterable, Mapping
 
 
 REGISTRY_STATUS_VALUES = frozenset({"ok", "partial", "unavailable"})
+RESIDENT_SANITIZER_REASONS = frozenset({
+    "thinking_gate_failed", "protocol_leak", "file_citation", "unknown",
+})
+PROVIDER_STATUS_CLASSES = frozenset({"4xx", "5xx", "none"})
 REGISTRY_SOURCE_NAMES = frozenset({
     "chat",
     "platform",
@@ -281,6 +285,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
                 "We're looking into it — please send it again."
             ),
         ),
+        _spec("cli_output_too_large", "chat", "provider", "system", "连接模型服务时出了问题。", matcher=r"\bcli_output_too_large\b"),
         _spec("unknown", "chat", "provider", "system", "连接模型服务时出了问题。"),
         _spec(UNREGISTERED_ERROR_CLASS, "chat", "contract", "system", "系统返回了未注册的错误分类，我们已记录并会尽快排查。", en="The runtime returned an unregistered error classification. We recorded it for investigation."),
     )

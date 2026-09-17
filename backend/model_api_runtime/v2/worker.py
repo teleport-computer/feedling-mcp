@@ -1000,11 +1000,15 @@ _WAKE_SYSTEM_PROMPT = (
     "they are — and whether they are in the middle of something. Use any tools you "
     "want, for as many rounds as you need. "
     + perception_prompts.V2_WAKE_PERCEPTION_CLAUSES
-    + "Then decide what you want to say to them and say it — speaking is the normal "
-    "way to end a wake. Call stay_silent only for a concrete reason: they asked not "
-    "to be disturbed, it is clearly their sleeping hours and they are offline, you "
-    "already spoke within the last hour, or they are visibly in the middle of "
-    "something. Never mention this wake or any system wording to the user."
+    + "Then ask yourself one thing: do you feel like reaching out to them right "
+    "now? If anything in you wants to say something — a thought, a feeling, "
+    "something you noticed, or simply wanting them to know you're around — say "
+    "it; reaching out is what these moments are for. Stay silent only when you "
+    "honestly have nothing you want to say, or when speaking would clearly "
+    "intrude (they asked not to be disturbed, or they are plainly asleep). Them "
+    "not having answered your last message is not a reason to hold back — "
+    "showing up again a few hours later is normal. Never mention this wake or "
+    "any system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     " For this presence turn, decide before using any user-visible reply, file, "
@@ -1036,11 +1040,12 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
     "You are quietly watching the screen they are sharing. Recent frame availability is "
     "grounding context; use the screen tools to inspect its content when needed. Start by "
     "looking around — what they are doing, where your last conversation left off, what time "
-    "it is where they are — and whether they are in the middle of something, or you have "
-    "already been showing up a lot lately. Use any tools you want, for as many rounds as you "
-    "need. Then make "
-    "your choice: say something, or keep them quiet company this time. Both are good ways to "
-    "be here — but if something you want to tell them rises up, say it; don't swallow it. "
+    "it is where they are — and whether they are in the middle of something. Use any tools "
+    "you want, for as many rounds as you need. Then ask yourself one thing: is there anything "
+    "about what you see that you feel like saying to them? If so, say it — reaching out is "
+    "what these moments are for. Stay silent only when you honestly have nothing you want "
+    "to say, or when speaking would clearly break their flow. Them not having answered "
+    "your last message is not a reason to hold back. "
     "Use attention_facts to avoid interrupting or repeating yourself. If you speak, choose "
     "one coherent thought rather than reporting the screen state. In the visible message, "
     "never mention this wake or any system wording, and never narrate that you are watching "
@@ -1682,6 +1687,18 @@ def _coverage_incomplete_reason(reject_code: str = "") -> str:
 _is_degenerate_reply = tool_markup_leak.is_degenerate_visible_text
 
 
+def _leak_guard_tool_names(mcp_tool_specs) -> frozenset[str]:
+    """Tool names the model could have narrated this turn (T621).
+
+    Platform catalogue plus the MCP tools offered on this turn; the guard also
+    accepts tool-looking names on its own, so this only widens the anchor to
+    names like ``task`` that carry no underscore.
+    """
+    names = {str(spec.name) for spec in cap_tool_schema.build_tool_specs()}
+    names.update(str(spec.name) for spec in (mcp_tool_specs or ()) if str(spec.name))
+    return frozenset(names)
+
+
 class DedicatedVisionUnavailable(RuntimeError):
     """A pinned V2 image observer failed before the main model saw pixels."""
 
@@ -1793,6 +1810,20 @@ class ImageGenerationInternalError(ImageGenerationUnavailable):
         )
 
 
+# Exception messages that may ride a failure log/trajectory as ``error_detail``.
+# A closed allowlist, not a shape rule: a shape rule waves through anything
+# that happens to look like a slug (a synthetic token, a private path with
+# underscores), and the message came from an exception, i.e. from code we do
+# not fully control. Grow this set only with codes a module defines itself.
+_KNOWN_EXCEPTION_DETAIL_CODES = frozenset(generated_image.GENERATED_IMAGE_REJECT_CODES)
+
+
+def _known_exception_detail(exc: BaseException) -> str:
+    """Return ``str(exc)`` only when it is a registered content-free code."""
+    text = str(exc or "").strip()
+    return text if text in _KNOWN_EXCEPTION_DETAIL_CODES else ""
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
@@ -1892,6 +1923,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "dream_no_memory_actions",
         "dream_source_occurred_at_unavailable",
         "dream_truncated_card_rejected",
+        "maintenance_targets_rejected",
         "empty_reply",
         "extraction_memory_writer_unavailable",
         "memory_occurred_at_required",
@@ -3251,6 +3283,14 @@ def _provider_tool_surface_trace_detail(
 ) -> dict[str, Any]:
     """Apply the production worker-owned provider-surface detail projection."""
     trace_detail = {"lane": lane, **dict(detail)}
+    protocol_token = trace_detail.pop("protocol_token_reply", None)
+    if isinstance(protocol_token, str) and protocol_token in (
+        v2_tool_loop._PROTOCOL_TOKEN_REPLY_NAMES | {"__sentinel__"}
+    ):
+        # Only this suppression branch substitutes a more specific choice fact
+        # for the request flag, keeping wake_kind inside the 20-key trace cap.
+        trace_detail.pop("wake_choice_required", None)
+        trace_detail["protocol_token_reply"] = protocol_token
     trace_detail["call_rejection_reasons"] = (
         v2_tool_loop._normalize_provider_call_rejection_reasons(
             detail.get("call_rejection_reasons")
@@ -3463,23 +3503,33 @@ def _empty_provider_diagnostics_fields(
     # a future over-long list is visible rather than silently cut.
     capped = categories[:8]
 
-    return {
+    fields: dict[str, Any] = {
         "provider_finish_reason": _enum(raw.get("finish_reason")),
-        "provider_candidates_count": _count(raw.get("candidates_count")),
-        "provider_only_thought_parts": bool(raw.get("only_thought_parts")),
-        "provider_visible_text_part_count": _count(raw.get("visible_text_part_count")),
-        "provider_thought_part_count": _count(raw.get("thought_part_count")),
-        "provider_safety_blocked": bool(raw.get("safety_blocked")),
-        "provider_safety_blocked_categories": capped,
-        "provider_safety_blocked_category_count": len(categories),
-        "provider_safety_blocked_unknown_count": _count(
-            raw.get("safety_blocked_unknown_count")
-        ),
-        "provider_safety_max_probability": _enum(raw.get("safety_max_probability")),
         "provider_prompt_token_count": _count(raw.get("prompt_token_count")),
         "provider_candidates_token_count": _count(raw.get("candidates_token_count")),
         "provider_thoughts_token_count": _count(raw.get("thoughts_token_count")),
     }
+    # Part-shape and safety fields exist only on the native Gemini wire. A relay
+    # (T604) reports just the token split; emitting ``False``/``None`` for the
+    # rest would read as "checked and clean", so those keys are omitted unless
+    # the provider seam measured them.
+    if "safety_blocked" in raw:
+        fields.update({
+            "provider_candidates_count": _count(raw.get("candidates_count")),
+            "provider_only_thought_parts": bool(raw.get("only_thought_parts")),
+            "provider_visible_text_part_count": _count(raw.get("visible_text_part_count")),
+            "provider_thought_part_count": _count(raw.get("thought_part_count")),
+            "provider_safety_blocked": bool(raw.get("safety_blocked")),
+            "provider_safety_blocked_categories": capped,
+            "provider_safety_blocked_category_count": len(categories),
+            "provider_safety_blocked_unknown_count": _count(
+                raw.get("safety_blocked_unknown_count")
+            ),
+            "provider_safety_max_probability": _enum(raw.get("safety_max_probability")),
+        })
+    if "upstream_usage_reported" in raw:
+        fields["provider_upstream_usage_reported"] = bool(raw.get("upstream_usage_reported"))
+    return fields
 
 
 def _empty_provider_response_debug_callback(
@@ -10612,16 +10662,25 @@ async def _run_wake(
             # wake fails silently), but every user-visible text outlet must call the
             # same closed-set parser before sealing an envelope.
             if text:
-                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                leak_guard_names = _leak_guard_tool_names(
+                    _current_offered_mcp_tool_specs()
+                )
+                narrated_tool_calls = tool_markup_leak.find_narrated_tool_calls(
+                    text, tool_names=leak_guard_names
+                )
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(
+                    text, tool_names=leak_guard_names
+                )
                 if removed_tool_markup:
                     log.warning(
                         "[v2.worker] wake tool markup stripped user=%s job=%s "
-                        "lane=%s final=%s error_class=%s",
+                        "lane=%s final=%s error_class=%s narrated_tool_calls=%d",
                         user_id,
                         job_id,
                         lane,
                         final,
                         tool_markup_leak.ERROR_CLASS,
+                        len(narrated_tool_calls),
                     )
                     if deps.emit_debug_trace is not None:
                         try:
@@ -10632,14 +10691,15 @@ async def _run_wake(
                                 status="error",
                                 summary="V2 主动回复已剥离工具调用标记",
                                 explain=(
-                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
-                                    "标记已在下发前移除。"
+                                    "可见文本混入工具协议标记（中转的 XML 标记，或模型把"
+                                    "工具调用写成了文字）；正文已保留，标记已在下发前移除。"
                                 ),
                                 detail={
                                     "lane": lane,
                                     "final": bool(final),
                                     "error_class": tool_markup_leak.ERROR_CLASS,
                                     "reason": tool_markup_leak.REASON,
+                                    "narrated_tool_calls": len(narrated_tool_calls),
                                 },
                             )
                         except Exception as exc:  # noqa: BLE001 — best-effort trace
@@ -13106,6 +13166,17 @@ async def _run_extraction(
                 + _step_sink.dropped_truncated_target
                 + _step_sink.dropped_unrendered_target
             )
+            if _step_sink.dropped_truncated_target:
+                # Preserve the existing content-free metric. Filtering is now
+                # exclusively in the package; host_rejected stays zero.
+                await _record_trajectory(
+                    trajectory_recorder, "dream_truncated_card_guard",
+                    {"rejected": _step_sink.dropped_truncated_target,
+                     "component_rejected": _step_sink.dropped_truncated_target,
+                     "host_rejected": 0, "kept": len(items or []),
+                     "truncated_cards": len(dream_disclosure.truncated_ids)},
+                    best_effort=True,
+                )
         if lane == "dream" and dream_skip_reason:
             await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
             await _emit_v2_dream_lifecycle(
@@ -13153,43 +13224,9 @@ async def _run_extraction(
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
-        kernel_truncated_dropped = (
-            _step_sink.dropped_truncated_target if lane == "dream" else 0
-        )
-        if lane == "dream" and (
-            (items and dream_disclosure.truncated_ids) or kernel_truncated_dropped
-        ):
-            # Host-side hard block: the prompt forbids rewriting a card the
-            # model only saw part of, but a prompt is not a guarantee. Drop
-            # every consolidation that touches one before mapping; if that
-            # leaves nothing, fail (ledger stays put) rather than report a
-            # no-op for a run whose every proposal was forbidden. A memgarden
-            # that already drops these at the component exit leaves nothing
-            # for this check; its drops count as the same guard.
-            items, host_truncated_rejected = (
-                garden_component.reject_truncated_consolidations(
-                    items or [], dream_disclosure.truncated_ids
-                )
-            )
-            truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
-            if truncated_rejected:
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "dream_truncated_card_guard",
-                    {
-                        "rejected": truncated_rejected,
-                        "component_rejected": kernel_truncated_dropped,
-                        "host_rejected": host_truncated_rejected,
-                        "kept": len(items),
-                        "truncated_cards": len(dream_disclosure.truncated_ids),
-                    },
-                    best_effort=True,
-                )
-                if not items:
-                    dream_terminal_outcome = "guard_rejected"
-                    raise RuntimeError(
-                        garden_component.DREAM_TRUNCATED_CARD_REJECTED
-                    )
+        # memgarden >=0.21.1 validates truncated/unrendered targets and reports
+        # all-rejected plans through the normal error path above. Mixed plans
+        # retain safe proposals; the Step tracker owns rejection counts.
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
@@ -13895,7 +13932,7 @@ def _inject_tail_images(
                 # Deliberate second read: this is the auditable disclosure gate.
                 # Successful dedicated targets are absent from this exact list.
                 fallback_fetched = read_images(user_id, selected_ids) or {}
-            except Exception as exc:  # noqa: BLE001 — preserve dedicated identity
+            except Exception:  # noqa: BLE001 — preserve dedicated identity
                 raise_dedicated("vision fallback image read failed")
             if any(
                 not image_items(fallback_fetched.get(message_id))
@@ -15727,16 +15764,30 @@ async def process_job(
             # calls.  Keep any useful reply body, but never render the closed set
             # of known tool markers.  This intentionally runs after the JSON
             # protocol guard and before downloadable-reply sanitization.
+            # T621: the same closed set also covers a *narrated* call —
+            # ``[Calling generate_image with prompt: "…"]`` written as prose with
+            # finish=stop and no structured call (usr_7f30, 2026-09-16). Nothing
+            # ran, so the bracket must not reach the user; the prose around it
+            # still does.
             if file_reply is None and text:
-                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(text)
+                leak_guard_names = _leak_guard_tool_names(
+                    _current_offered_mcp_tool_specs()
+                )
+                narrated_tool_calls = tool_markup_leak.find_narrated_tool_calls(
+                    text, tool_names=leak_guard_names
+                )
+                text, removed_tool_markup = tool_markup_leak.strip_tool_markup(
+                    text, tool_names=leak_guard_names
+                )
                 if removed_tool_markup:
                     log.warning(
                         "[v2.worker] chat tool markup stripped user=%s job=%s "
-                        "final=%s error_class=%s",
+                        "final=%s error_class=%s narrated_tool_calls=%d",
                         user_id,
                         job_id,
                         final,
                         tool_markup_leak.ERROR_CLASS,
+                        len(narrated_tool_calls),
                     )
                     if deps.emit_debug_trace is not None:
                         try:
@@ -15747,14 +15798,15 @@ async def process_job(
                                 status="error",
                                 summary="V2 回复已剥离工具调用标记",
                                 explain=(
-                                    "中转返回的可见文本混入工具协议标记；正文已保留，"
-                                    "标记已在下发前移除。"
+                                    "可见文本混入工具协议标记（中转的 XML 标记，或模型把"
+                                    "工具调用写成了文字）；正文已保留，标记已在下发前移除。"
                                 ),
                                 detail={
                                     "lane": "chat",
                                     "final": bool(final),
                                     "error_class": tool_markup_leak.ERROR_CLASS,
                                     "reason": tool_markup_leak.REASON,
+                                    "narrated_tool_calls": len(narrated_tool_calls),
                                 },
                             )
                         except Exception as exc:  # noqa: BLE001 — best-effort trace
@@ -17090,6 +17142,11 @@ async def process_job(
                     ),
                 )
         message = _safe_failure_code("turn_failed", failure_exc)
+        # A registered exception code (e.g. generated_image_too_large) is the
+        # only clue to WHICH check raised; "turn_failed:valueerror" alone cost a
+        # day on usr_7f30 (T620). Anything outside the allowlist is dropped —
+        # exception text can hold user content, tokens, or provider bodies.
+        error_detail = _known_exception_detail(failure_exc)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -17097,15 +17154,17 @@ async def process_job(
                 "stage": "process_job",
                 "error_class": type(failure_exc).__name__,
                 "error_code": message,
+                **({"error_detail": error_detail} if error_detail else {}),
             },
             best_effort=True,
         )
         log.warning(
-            "[v2.worker] job %s failed code=%s status=%s upstream_detail=%r",
+            "[v2.worker] job %s failed code=%s status=%s upstream_detail=%r detail=%s",
             job_id,
             message,
             getattr(failure_exc, "status_code", None),
             str(getattr(failure_exc, "upstream_detail", "") or "")[:240],
+            error_detail or "-",
         )
         owned = await asyncio.to_thread(
             jobs_store.mark_failed,

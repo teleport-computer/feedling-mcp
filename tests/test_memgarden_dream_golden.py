@@ -1,4 +1,4 @@
-"""Dream / migrate prompt 的基线快照 —— 守「文本改动必须被看见」。
+"""Dream prompt 的基线快照 —— 守「文本改动必须被看见」。
 
 背景:2026-08-16 的内核提取(``ec660613``)把 capture / dream / migrate 三份 prompt
 都搬进了 ``memgarden/prompts/``。**只有 capture 配了逐字节 golden**
@@ -19,11 +19,9 @@
   第一问(Runtime V2 与 resident consumer 都经它;卡片以**整张卡**的形式传入,
   由组件带正文渲染、按预算截断、标 TRUNCATED)。旧入口
   ``memory.dream_prompt_v1.build_dream_prompt`` 已随 import * 壳删除(2026-09-15)
-- migrate → ``memgarden.prompts.migrate.build_migrate_prompt``
-  (**只有 resident consumer 在用**,V2 侧无调用方;老壳
-  ``memory/migrate_prompt_v1.py`` 已在 ``5e50e79e`` 删除)
 
 基线变更记录:
+- 2026-09-16 老卡迁移机制退役，删除 migrate 快照；dream 用例与文本原样保留。
 - 2026-09-15 dream 基线整体重生成:memgarden 的 Dream 带正文渲染(Step 1 措辞加
   "and its body"、新增 TRUNCATED 规则、卡片区改成 ``- id=… | bucket=…`` +
   summary/content 块);入口换成组件会话,所以 params 里的 ``cards`` 从渲染好的串
@@ -45,7 +43,6 @@ import pathlib
 
 import pytest
 
-from memgarden.prompts.migrate import build_migrate_prompt
 from memory import garden_component
 
 
@@ -63,7 +60,7 @@ _FIXTURE = (
     pathlib.Path(__file__).resolve().parent
     / "fixtures"
     / "memgarden"
-    / "dream_migrate_prompt_baseline.json"
+    / "dream_prompt_baseline.json"
 )
 
 
@@ -86,15 +83,6 @@ def test_dream_prompt_is_byte_identical_to_baseline(case_name: str) -> None:
     )
 
 
-@pytest.mark.parametrize("case_name", _case_names("migrate"))
-def test_migrate_prompt_is_byte_identical_to_baseline(case_name: str) -> None:
-    """migrate prompt 逐字节不变 —— 目前只有 resident consumer 在用。"""
-    case = _baseline()["migrate"][case_name]
-    actual = build_migrate_prompt(**case["params"])
-    assert actual == case["text"], (
-        f"migrate prompt 的 {case_name} 用例变了。若是有意改动:重新生成 fixture "
-        f"并在提交说明里写明原因;若不是,说明有改动无意中动了模板。"
-    )
 
 
 def test_fixture_covers_the_shapes_that_break_templates() -> None:
@@ -108,7 +96,7 @@ def test_fixture_covers_the_shapes_that_break_templates() -> None:
     参数里的 ``{}`` 原样进入产出(防未来有人加二次 format / 改拼装顺序时静默吃掉它)。
     """
     baseline = _baseline()
-    for kind in ("dream", "migrate"):
+    for kind in ("dream",):
         cases = baseline[kind]
 
         assert "all_empty" in cases, f"{kind} 基线缺全空用例"

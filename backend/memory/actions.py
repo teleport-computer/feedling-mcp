@@ -6,7 +6,6 @@ import re
 import uuid
 
 
-import db
 import debug_trace
 from core.store import UserStore
 
@@ -16,6 +15,8 @@ from identity import service as identity_service
 from memgarden.text import card_guard
 from memgarden.text import card_text
 from memory import service as memory_service
+from memory import content_policy
+from memory import action_receipts
 from memgarden import timestamps as memory_timestamps
 from memgarden.prompts.buckets import normalize_bucket_language
 from memgarden.prompts import recall_fields
@@ -151,54 +152,8 @@ def _memory_default_bucket(value) -> str:
     return "未分类"
 
 
-MEMORY_CONTENT_MAX_CHARS = 5000
-MEMORY_CONTENT_TRUNCATION_EVENT = "memory.content.truncation"
-
-
-def trace_memory_content_truncation(
-    store: UserStore,
-    value,
-    *,
-    route: str,
-) -> None:
-    """Record a content-free counter when the existing 5k slice will clip.
-
-    ``route`` is a closed caller-supplied label stored under an admin-redactor
-    allowlisted key. The body itself never enters the event, including through
-    summary/explain/content_excerpt.
-    """
-    original = str(value or "").strip()
-    original_chars = len(original)
-    truncated_chars = max(0, original_chars - MEMORY_CONTENT_MAX_CHARS)
-    if not truncated_chars:
-        return
-    try:
-        debug_trace.trace_event(
-            store,
-            subsystem="memory",
-            type=MEMORY_CONTENT_TRUNCATION_EVENT,
-            actor="backend",
-            status="warning",
-            summary="",
-            explain="",
-            detail={
-                "route": route,
-                "counts": {
-                    "original_chars": original_chars,
-                    "truncated_chars": truncated_chars,
-                },
-            },
-        )
-    except Exception as e:  # noqa: BLE001 — observability must never block a memory write
-        log.warning(
-            "[memory.actions] truncation trace failed route=%s error=%s",
-            route,
-            type(e).__name__,
-        )
-
-
 def _memory_content_from_action(data: dict, summary: str) -> str:
-    content = str(data.get("content") or "").strip()[:MEMORY_CONTENT_MAX_CHARS]
+    content = content_policy.validated_content(data.get("content"))
     if content:
         return content
     description = str(data.get("description") or summary or "").strip()[:2000]
@@ -255,22 +210,12 @@ def _memory_plain_from_envelope(
         return None, f"memory_decrypt_failed:{type(e).__name__}:{str(e)[:180]}"
 
 
-def _memory_inner_from_action(
-    data: dict,
-    *,
-    trace_store: UserStore | None = None,
-) -> dict:
+def _memory_inner_from_action(data: dict) -> dict:
     summary = str(data.get("summary") or data.get("description") or data.get("title") or "").strip()[:2000]
     threads = _memory_action_list(data.get("threads"), max_items=8, max_chars=80)
     if not threads:
         linked = _memory_action_list(data.get("linked_dimension"), max_items=1, max_chars=80)
         threads.extend(linked)
-    if trace_store is not None and data.get("content"):
-        trace_memory_content_truncation(
-            trace_store,
-            data.get("content"),
-            route="memory_actions",
-        )
     content = _memory_content_from_action(data, summary)
     bucket = _memory_action_text(data.get("bucket") or _memory_default_bucket(data.get("type")), 80)
     if card_guard.guard_enabled():
@@ -287,7 +232,7 @@ def _memory_inner_from_action(
         threads = [t for t in threads if not card_guard.field_pollution_reason(t, IO_LEAK_SIGNALS)]
     # Backstop: the model still labels a Chinese card with an English common bucket (and
     # vice versa) despite the guidance. Map it back to the card's own language here.
-    # ⚠️ 注意:这并非「所有写入路径的唯一关口」—— capture/dream/migrate/history-import 等
+    # ⚠️ 注意:这并非「所有写入路径的唯一关口」—— capture/dream/history-import 等
     # 后台路径提前封信封、绕过本函数(见 card_text/各 pre-seal 点的同源 guard)。
     bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
     inner = {
@@ -542,7 +487,6 @@ def _memory_add_action(
 
     inner = _memory_inner_from_action(
         {**raw, "type": mem_type, "title": title, "description": description},
-        trace_store=store,
     )
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
     if envelope is None:
@@ -623,135 +567,6 @@ def _memory_add_envelope_action(
         },
         "change": change,
     }, [_memory_action_effect("memory.add", moment["id"], ["created"])], 201
-
-
-def _memory_body_hash(moment: dict | None) -> str:
-    """Stable CAS token over the authoritative persisted content shape."""
-    return core_envelope.envelope_content_token(moment or {})
-
-
-def _memory_upgrade_apply(
-    store: UserStore,
-    *,
-    memory_id: str,
-    envelope: dict,
-    old_body_hash: str,
-) -> tuple[dict, list[dict], int]:
-    """In-place legacy→v1 upgrade writer (migration plan §3 / §5.5).
-
-    Re-reads the single card fresh INSIDE `memory_lock`, CAS-guards on
-    `old_body_hash` (skip if the user edited it during the out-of-lock LLM
-    derivation), then writes one row via `db.memory_upsert` — NOT
-    `_save_moments`/`memory_replace_all`, so a concurrent new card is never
-    clobbered. Preserves id/created_at/occurred_at/source; emits clean v1
-    (no `type`). The LLM/encryption happens in the caller, never under the lock."""
-    from memory import migration as _migration  # local import avoids load-order cycle
-    if not _migration.migration_enabled():
-        # FEEDLING_MIGRATE_ENABLE off → reject the write itself. Last gate, so even a
-        # hand-issued memory.upgrade can't slip a legacy card to v1 while migration is off.
-        return {"status": "ok", "action": "memory.upgrade", "skipped": "migration_disabled", "noop": True}, [], 200
-    # The card id is part of the AEAD AAD (owner|v|id), so the body was SEALED with
-    # this exact id. We must NOT rewrite envelope["id"] after the fact — that desyncs
-    # it from the AAD and writes a card that stores fine but can never be decrypted
-    # (regression: 92f6849 did this and broke real-deploy readside). The caller must
-    # seal with item_id=memory_id; reject a mismatch up front.
-    if str((envelope or {}).get("id") or "") != memory_id:
-        return {
-            "status": "error",
-            "error": "envelope_id_mismatch",
-            "action": "memory.upgrade",
-            "detail": "envelope.id must equal the target memory_id (id is AEAD-bound; seal with item_id=memory_id).",
-        }, [], 400
-    with memory_service.mutation_lock(store):
-        moments = memory_service._load_moments(store)
-        existing = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
-        if existing is None:
-            # Card deleted while we derived — don't resurrect it.
-            return {"status": "ok", "action": "memory.upgrade", "skipped": "not_found", "noop": True}, [], 200
-        if existing.get("owner_user_id") != store.user_id:
-            return {"status": "error", "error": "not_owned", "action": "memory.upgrade"}, [], 403
-        if old_body_hash and _memory_body_hash(existing) != old_body_hash:
-            # Changed under us during derivation — leave the user's write intact;
-            # the migrator re-detects this card by shape next quiet window.
-            return {"status": "ok", "action": "memory.upgrade", "skipped": "stale", "noop": True}, [], 200
-        envelope = dict(envelope)
-        envelope["occurred_at"] = str(
-            existing.get("occurred_at")
-            or envelope.get("occurred_at")
-            or memory_timestamps.now_iso()
-        )
-        envelope["source"] = str(existing.get("source") or envelope.get("source") or "live_conversation")
-        for key in ("status", "importance", "pulse", "last_referenced_at"):
-            if key not in envelope and key in existing:
-                envelope[key] = existing[key]
-        updated = _memory_record_from_envelope(store, envelope, existing=existing)
-        updated.pop("type", None)  # clean v1 inner carries no `type`
-        wrote = db.memory_upsert(store.user_id, memory_id, updated.get("occurred_at") or "", updated)
-    if not wrote:
-        # DB write didn't commit — do NOT report ok, so a migrator never advances
-        # state on a phantom success. The card stays legacy and re-migrates later.
-        return {"status": "error", "error": "db_write_failed", "action": "memory.upgrade"}, [], 500
-    change = memory_service._append_memory_change(store, {
-        "action": "upgrade",
-        "memory_id": memory_id,
-        "reason": "Legacy memory card upgraded to v1 in place.",
-    })
-    effect = _memory_action_effect("memory.upgrade", memory_id, ["body_ct", "bucket", "threads", "summary"])
-    return {
-        "status": "ok",
-        "action": "memory.upgrade",
-        "memory": {"id": memory_id, "occurred_at": updated.get("occurred_at", "")},
-        "change": change,
-    }, [effect], 200
-
-
-def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
-    """Plaintext upgrade entry: agent supplies the derived v1 fields
-    (summary/content/bucket/threads); the server seals them (it already holds
-    the shared public keys, same as content_patch) and writes in place."""
-    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
-    if not memory_id:
-        return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
-    v1 = action.get("v1") if isinstance(action.get("v1"), dict) else action
-    inner = _memory_inner_from_action(v1, trace_store=store)
-    if not inner.get("summary"):
-        return {"status": "error", "error": "summary_required", "action": "memory.upgrade"}, [], 400
-    if card_guard.guard_enabled() and (
-        card_guard.hard_field_pollution_reason(inner.get("summary"), IO_LEAK_SIGNALS)
-        or card_guard.hard_field_pollution_reason(inner.get("content"), IO_LEAK_SIGNALS)
-    ):
-        return {"status": "error", "error": "memory_card_polluted", "action": "memory.upgrade"}, [], 400
-    if _memory_tombstone_reason(inner.get("summary"), inner.get("content")):
-        # 无条件(不挂 guard_enabled,与 add 同理)。
-        return {"status": "error", "error": "memory_card_tombstone", "action": "memory.upgrade"}, [], 400
-    old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
-    envelope, env_err = _build_memory_envelope_for_store(store, inner, item_id=memory_id)
-    if envelope is None:
-        return {"status": "error", "error": env_err, "action": "memory.upgrade"}, [], 409
-    return _memory_upgrade_apply(store, memory_id=memory_id, envelope=envelope, old_body_hash=old_body_hash)
-
-
-def _memory_upgrade_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
-    """Prebuilt-envelope upgrade entry: the consumer (VPS io_cli, stdlib-only
-    crypto per D1) already sealed the v1 plaintext; the server just CAS-guards
-    and writes the single row in place."""
-    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
-    if not memory_id:
-        return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
-    envelope = dict(action.get("envelope") or {})
-    required, shape_err = core_envelope.upload_shape_gate(
-        envelope, user_id=store.user_id)
-    if shape_err is not None:
-        return {"status": "error", **shape_err, "action": "memory.upgrade"}, [], 400
-    missing = [f for f in required if not envelope.get(f)]
-    if missing:
-        return {"status": "error", "error": "envelope_missing_fields", "missing": missing, "action": "memory.upgrade"}, [], 400
-    if envelope["owner_user_id"] != store.user_id:
-        return {"status": "error", "error": "not_owned", "action": "memory.upgrade"}, [], 403
-    if core_envelope.requires_enclave_key(envelope):
-        return {"status": "error", "error": "envelope_shared_requires_K_enclave", "action": "memory.upgrade"}, [], 400
-    old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
-    return _memory_upgrade_apply(store, memory_id=memory_id, envelope=envelope, old_body_hash=old_body_hash)
 
 
 def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
@@ -919,7 +734,7 @@ def _memory_supersede_action(
     if "pulse" not in raw_for_inner and old_cards[0].get("pulse") is not None:
         raw_for_inner["pulse"] = old_cards[0].get("pulse")
 
-    inner = _memory_inner_from_action(raw_for_inner, trace_store=store)
+    inner = _memory_inner_from_action(raw_for_inner)
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.supersede"}, [], 409
@@ -1143,7 +958,7 @@ def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[di
     return {"status": "ok", "action": "memory.delete", "memory": {"id": memory_id}, "change": change}, [effect], 200
 
 
-def _execute_memory_action(
+def _dispatch_memory_action(
     store: UserStore,
     api_key: str | None,
     action: dict,
@@ -1190,20 +1005,40 @@ def _execute_memory_action(
     if action_type == "memory.supersede":
         return _memory_supersede_action(
             store, api_key, action, runtime_token=runtime_token)
-    if action_type == "memory.upgrade":
-        # In-place legacy→v1 upgrade (migration). Its OWN branch — must never be
-        # rewritten to supersede (that mints a new id; upgrade preserves id).
-        if isinstance(action.get("envelope"), dict):
-            return _memory_upgrade_envelope_action(store, action)
-        return _memory_upgrade_action(store, api_key, action)
     if action_type == "memory.delete":
         return _memory_delete_action(store, action)
     return {
         "status": "error",
         "error": "unsupported_memory_action",
         "action": action_type,
-        "supported": ["memory.add", "memory.supersede", "memory.upgrade", "memory.delete", "memory.retype"],
+        "supported": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"],
     }, [], 400
+
+
+def _execute_memory_action(
+    store: UserStore, api_key: str | None, action: dict, *, runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
+    try:
+        dispatch = lambda: _dispatch_memory_action(
+            store, api_key, action, runtime_token=runtime_token)
+        if not isinstance(action, dict):
+            return dispatch()
+        return action_receipts.execute(store, action, dispatch)
+    except content_policy.ContentTooLong as exc:
+        try:
+            debug_trace.trace_event(
+                store, subsystem="memory", type="memory.content.rejected",
+                actor="backend", status="warning", summary="", explain="",
+                detail={"route": "memory_actions", "counts": {
+                    "max_chars": content_policy.MAX_CONTENT_CHARS,
+                }},
+            )
+        except Exception as trace_error:  # noqa: BLE001 — do not mask the write rejection
+            log.warning("[memory.actions] rejection trace failed code=%s",
+                        type(trace_error).__name__)
+        return {"status": "error", "error": exc.code, "detail": {
+            "actual_chars": exc.actual, "max_chars": content_policy.MAX_CONTENT_CHARS,
+        }}, [], 400
 
 
 def _execute_memory_actions(

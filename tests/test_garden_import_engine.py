@@ -532,8 +532,8 @@ def test_later_batch_index_sees_the_rewritten_name_not_the_placeholder():
     assert "用户喜欢周末去西湖边骑车" not in second
 
 
-def test_pending_write_replay_gives_up_after_the_batch_attempt_budget(caplog):
-    """M2 之前：持久写库错误每次重试都把同一段 pending 原样重放，job 永远失败。"""
+def test_pending_write_failure_never_becomes_success_after_retry_budget():
+    """The scheduler may stop retrying; uncommitted content must stay pending."""
     sources = _sources("窗口：两件事\n")
     state = garden_import.new_state(locale="zh-Hans", strategy="single_pass")
     saves: list[dict] = []
@@ -547,8 +547,8 @@ def test_pending_write_replay_gives_up_after_the_batch_attempt_budget(caplog):
         _run(doc, sources, Model([], default="NO"), broken, saves=saves)
     doc = saves[-1]
     assert doc["pending"]["replays"] == 1
-    with caplog.at_level("WARNING", logger="memory.garden_import"):
-        result = _run(doc, sources, Model([], default="NO"), broken)
-    assert result.done and (result.cards_written, result.dropped) == (0, 2)
-    assert len(broken.calls) == 2, "第二次重放不再写"
-    assert "gave up" in caplog.text and "西湖" not in caplog.text
+    with pytest.raises(RuntimeError, match="store down"):
+        _run(doc, sources, Model([], default="NO"), broken)
+    assert doc["pending"] is not None
+    assert doc["totals"]["dropped"] == 0
+    assert len(broken.calls) == 3, "每次续跑仍尝试写入；不能把存储失败算作丢弃"

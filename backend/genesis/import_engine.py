@@ -101,10 +101,10 @@ def store_writer(
         body, _status = run(store, api_key, actions, runtime_token=runtime_token)
         return list((body or {}).get("results") or [])
 
-    def write(mutations: list[dict], _idempotency_key: str) -> list[str]:
+    def write(mutations: list[dict], idempotency_key: str) -> list[str]:
         return garden_import.write_with_executor(
             mutations, build_action=lambda m: memory_action(m, store=store, source=source),
-            execute=_rows)
+            execute=_rows, idempotency_key=idempotency_key)
 
     return write
 

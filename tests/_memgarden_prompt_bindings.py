@@ -13,7 +13,7 @@
   生产落卡的称呼装配与此一致（``memory.garden_component.capture_request``），但还带
   组件挑的现有卡索引。断言「运行时真实提示词」的用例应走组件（见
   test_capture_request_index_and_naming.py / test_garden_dream_session.py /
-  test_memgarden_dream_migrate_golden.py），不要用这里的构造函数。
+  test_memgarden_dream_golden.py），不要用这里的构造函数。
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from identity.user_naming import _naming_rule, sanitize_user_name  # noqa: E402,F401
 from memgarden.prompts import capture as kernel_capture  # noqa: E402
 from memgarden.prompts import dream as kernel_dream  # noqa: E402
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402,F401
+from memory.garden_component import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402,F401
 from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
 
 CAPTURE_TYPES = kernel_capture.CAPTURE_TYPES

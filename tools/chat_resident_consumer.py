@@ -49,6 +49,9 @@ CLI mode:
                         auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
+  FEEDLING_CLI_MAX_OUTPUT_BYTES
+                        Combined CLI stdout/stderr limit (default 67108864);
+                        positive bytes, invalid values keep the default.
   FEEDLING_AGENT_IMAGE_GENERATION
                         Set true only when the configured resident agent exposes
                         a callable native image-generation capability.
@@ -172,7 +175,6 @@ except ImportError:
 from perceptkit import prompts as perception_prompts
 
 import generated_image
-import provider_client as _provider_client
 import vision_policy as _vision_policy
 from hosted import visual_transport as _visual_transport
 from chat import file_display
@@ -195,7 +197,6 @@ from memory import dream_trace as memory_dream_trace
 from memgarden.text import card_guard
 from memgarden.guards import dream_gates as memory_dream_gates
 from memgarden.prompts.buckets import normalize_bucket_language
-from memgarden import contracts as mg_contracts
 from memory import garden_component
 from memgarden.text.card_text import (
     count_user_token_residuals,
@@ -247,7 +248,6 @@ class _AgentBodyLogFilter(logging.Filter):
 log.addFilter(_AgentBodyLogFilter())
 
 
-
 @dataclass
 class AgentTurn:
     """Canonical shape for one upstream agent turn.
@@ -274,6 +274,9 @@ class AgentTurn:
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
+    # Local observations only; never read these from provider JSON.
+    sanitizer_reason: str = ""
+    raw_reply_diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -553,7 +556,7 @@ PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", 
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
 PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
 PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
-# Maintenance soft-idle: memory maintenance jobs (capture/dream/migrate) wait for a
+# Maintenance soft-idle: memory maintenance jobs (capture/dream) wait for a
 # lull in the conversation — don't start a maintenance model turn within IDLE_SEC of
 # the user's last message ("the user just came back and wants to TALK"), but never
 # defer a job past MAX_DEFER_SEC (a heavy chatter must still get memory upkeep).
@@ -567,8 +570,6 @@ CAPTURE_AGENT_REASK_BUDGET = 1
 # 12000 装不下一通电话 + 同窗口的文字聊天，会把前面的文字**静默**砍掉。
 # 40000 = 转写预算 30000 + 文字聊天 10000。
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "40000"))
-
-
 
 
 # 单通电话展开进窗口的预算。**必须大于通话时长上限能产出的字数**，否则采样会
@@ -1041,6 +1042,87 @@ EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
 # 判据必须取在 **parse 之前**:_agent_turn_from_raw 内部就跑 sanitizer,
 # 拿它的输出回头判空,永远分不出这两种情况(codex2 gatekeep R3)。
 SANITIZED_TO_EMPTY_MARK = "feedling:sanitized_to_empty"
+SANITIZER_REASONS = _error_contract.RESIDENT_SANITIZER_REASONS
+PROVIDER_STATUS_CLASSES = _error_contract.PROVIDER_STATUS_CLASSES
+
+
+def _sanitizer_reason(value: object) -> str:
+    return value if isinstance(value, str) and value in SANITIZER_REASONS else "unknown"
+
+
+def _raw_reply_diagnostics(raw: str) -> dict[str, Any]:
+    from agent_protocol_core import self_thinking
+
+    tags = re.finditer(
+        rf"<\s*(?P<close>/?)\s*{self_thinking.tag_name_pattern()}\s*>",
+        raw, re.IGNORECASE,
+    )
+    opened = closed = 0
+    for tag in tags:
+        if tag.group("close"):
+            closed += 1
+        else:
+            opened += 1
+    return {
+        "raw_reply_head": raw[:300], "raw_reply_tail": raw[-120:],
+        "raw_reply_len": len(raw),
+        "think_open_count": opened, "think_close_count": closed,
+    }
+
+
+def _record_sanitizer(turn: AgentTurn, reason: str, raw: str) -> None:
+    turn.sanitizer_reason = _sanitizer_reason(reason)
+    turn.raw_reply_diagnostics = _raw_reply_diagnostics(raw)
+
+
+def _sanitized_reply_error(
+    message: str, turn: AgentTurn | None = None, *, raw_reply: str | None = None,
+) -> ValueError:
+    exc = ValueError(message)
+    exc.sanitizer_reason = _sanitizer_reason(getattr(turn, "sanitizer_reason", ""))
+    exc.raw_reply_diagnostics = dict(getattr(turn, "raw_reply_diagnostics", {}))
+    if raw_reply is not None:
+        exc.raw_reply_diagnostics = _raw_reply_diagnostics(raw_reply)
+    return exc
+
+
+def _parse_failure_raw_fields(exc: BaseException) -> dict:
+    # Legacy/unobserved failures must not pretend we measured an empty reply.
+    return {
+        "raw_reply_head": "", "raw_reply_tail": "", "raw_reply_len": None,
+        "think_open_count": None, "think_close_count": None,
+        **getattr(exc, "raw_reply_diagnostics", {}),
+    }
+
+
+def _pi_no_reply_error(detail: str) -> RuntimeError:
+    # Keep exception text (and therefore every existing matcher) unchanged.
+    exc = RuntimeError(f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: {detail}")
+    # Only status-shaped numbers, not arbitrary token counts/request IDs.
+    match = re.search(
+        r"(?:^\s*(?:Error:\s*)?|\bHTTP(?:/\d(?:\.\d)?)?\s+|"
+        r"\b(?:provider_http_|api_status\s*=|status(?:_code| code)?\s*[:=]?\s*))"
+        r"([45]\d{2})(?!\d)", detail, re.IGNORECASE,
+    )
+    exc.provider_status_code = int(match.group(1)) if match else None
+    exc.provider_status_class = (
+        f"{exc.provider_status_code // 100}xx" if match else "none"
+    )
+    return exc
+
+
+def _failure_diagnostics(exc: BaseException | None, *, error_class: str = "") -> dict:
+    fields: dict[str, Any] = {}
+    if exc is None:
+        return fields
+    if error_class == "reply_parse_failed" or hasattr(exc, "sanitizer_reason"):
+        fields["sanitizer_reason"] = _sanitizer_reason(getattr(exc, "sanitizer_reason", ""))
+    if hasattr(exc, "provider_status_class"):
+        code = getattr(exc, "provider_status_code", None)
+        code = code if type(code) is int and 400 <= code <= 599 else None
+        fields.update(provider_status_class=f"{code // 100}xx" if code else "none",
+                      provider_status_code=code)
+    return fields
 
 
 def _empty_reply_diagnostics(body: Any) -> str:
@@ -1214,11 +1296,25 @@ def _consume_reply_parse_failed() -> str:
     return was
 
 
+class _ReplyParseFailureCode(str):
+    """Existing consumable short code with call-local diagnostic metadata."""
+
+    def __new__(cls, code: str, turn: AgentTurn):
+        value = super().__new__(cls, code)
+        value.turn = AgentTurn(
+            sanitizer_reason=turn.sanitizer_reason,
+            raw_reply_diagnostics=dict(turn.raw_reply_diagnostics),
+        )
+        return value
+
+
 def _reply_parse_failure_exc(reason: str) -> ValueError:
     """把 _consume_reply_parse_failed 的短码铸成分类器认识的异常文本。"""
     if reason == "provider_empty_reply":
         return ValueError(f"agent received {EMPTY_PROVIDER_REPLY_MARK}")
-    return ValueError("agent produced no usable reply after sanitization")
+    return _sanitized_reply_error(
+        "agent produced no usable reply after sanitization", getattr(reason, "turn", None)
+    )
 
 
 def _reset_system_notice_state() -> None:
@@ -1283,6 +1379,11 @@ def _notify_agent_turn_failure(
                 "blame": notice.blame,
                 "foreground": bool(foreground),
                 "lane": lane,
+                **_failure_diagnostics(exc, error_class=notice.error_class),
+                **(
+                    _parse_failure_raw_fields(exc)
+                    if notice.error_class == "reply_parse_failed" else {}
+                ),
             },
         )
         _report_runtime_error(
@@ -1392,7 +1493,7 @@ def _note_agent_turn_success() -> None:
 def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:
     """Failure reason that keeps the underlying message, not just the exception
     type. The chat lane records the full error (``agent_call_failed: {e}``), but
-    the capture/dream/migrate lanes historically recorded only
+    the capture/dream lanes historically recorded only
     ``{prefix}:{type(e).__name__}`` — so a relay rejection (call_agent raises
     ``RuntimeError("pi agent produced no reply: 403 ...insufficient_user_quota")``)
     surfaced in job aggregations as an opaque ``RuntimeError``, indistinguishable
@@ -5125,7 +5226,7 @@ _TAGGED_THINKING_RE = re.compile(
 )
 
 
-def _split_tagged_thinking(text: str) -> tuple[str, str]:
+def _split_tagged_thinking(text: str, *, diagnostics: AgentTurn | None = None) -> tuple[str, str]:
     """Split leaked reasoning tags from visible reply text.
 
     Structured reasoning fields remain the preferred path. This only handles
@@ -5147,6 +5248,8 @@ def _split_tagged_thinking(text: str) -> tuple[str, str]:
         status, thinking, reply = _st.strip_all_thinking(raw, sanitize=False)
         if status == _st.FAILED:
             # 失败关闭：宁可这轮没有可发内容，也不把带标签的残文端给用户。
+            if diagnostics is not None:
+                _record_sanitizer(diagnostics, "thinking_gate_failed", raw)
             return "", thinking
         return reply, thinking
 
@@ -5795,6 +5898,9 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.tool_calls.extend(src.tool_calls)
     _prefer_thinking(dst, src)
     dst.runtime_debug.update(src.runtime_debug)
+    if src.sanitizer_reason and not dst.sanitizer_reason:
+        dst.sanitizer_reason = src.sanitizer_reason
+        dst.raw_reply_diagnostics = dict(src.raw_reply_diagnostics)
     return dst
 
 
@@ -6074,7 +6180,10 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         # LAYER 2 — visible reply. Strip thinking HERE (after transport, so a
         # legit `{"result":"<think>..</think>.."}` is not corrupted), truncate any
         # unclosed thinking, then scan for a text-top-level protocol root.
-        raw, tagged_thinking = _split_tagged_thinking(raw)
+        original_visible = obj
+        raw, tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
+        if turn.sanitizer_reason:
+            turn.raw_reply_diagnostics = _raw_reply_diagnostics(original_visible)
         raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
             # Our self-authored <think> block, parsed locally on THIS host. With the
@@ -6095,12 +6204,16 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             _merge_agent_turn(turn, _agent_turn_from_obj(payload))
             return turn
         if decision == "drop":
+            _record_sanitizer(turn, "protocol_leak", original_visible)
             return turn
         if _looks_like_agent_protocol_text(raw):
+            _record_sanitizer(turn, "protocol_leak", original_visible)
             return turn
         clean = _sanitize_reply_text(raw)
         if clean:
             turn.messages.append(clean)
+        else:
+            _record_sanitizer(turn, "unknown", original_visible)
         return turn
 
     if isinstance(obj, list):
@@ -6780,7 +6893,6 @@ def _visible_stream_text(text: str) -> str:
     """Project cumulative model text to speech-safe visible text."""
     raw = str(text or "")
     head = raw.lstrip()
-    from agent_protocol_core import self_thinking as _st_tags
 
     if head.startswith("<"):
         # 流式快照不可撤回：一旦把 `<n` / `<ns` 发出去，后面再干净的正文也接不回
@@ -6970,6 +7082,24 @@ def _runtime_stream_observer(
     return None
 
 
+class CliOutputTooLarge(RuntimeError):
+    """A local capture limit; never retain the captured output on the exception."""
+
+    def __init__(self, limit: int, observed: int):
+        super().__init__("cli_output_too_large")
+        self.limit_bytes = limit
+        self.observed_bytes = observed
+
+
+def _cli_max_output_bytes() -> int:
+    default = 64 * 1024 * 1024
+    try:
+        value = int(os.environ.get("FEEDLING_CLI_MAX_OUTPUT_BYTES", str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _run_cli_subprocess(
     cmd: list[str],
     run_kwargs: dict,
@@ -6977,95 +7107,154 @@ def _run_cli_subprocess(
     stdout_line: Callable[[str], None] | None = None,
     cancellation: "_VoiceTurnCancellation | None" = None,
 ) -> subprocess.CompletedProcess:
-    if stdout_line is None and cancellation is None:
-        return subprocess.run(cmd, **run_kwargs)
+    import codecs
 
+    # Both streaming and non-streaming calls use bounded binary reads. readline
+    # alone can allocate an arbitrarily long JSONL record before we count it.
     kwargs = dict(run_kwargs)
     input_text = kwargs.pop("input", None)
     timeout = kwargs.pop("timeout", None)
     kwargs.pop("capture_output", None)
+    text_mode = kwargs.pop("text", False)
+    text_mode = kwargs.pop("universal_newlines", False) or text_mode
+    encoding = kwargs.pop("encoding", None)
+    errors = kwargs.pop("errors", None)
+    text_mode = bool(text_mode or encoding or errors)
+    encoding = encoding or "utf-8"
+    errors = errors or "strict"
+    limit = _cli_max_output_bytes()
     process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-        **kwargs,
+        cmd, stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs,
     )
-    stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
+    buffers = (bytearray(), bytearray())
+    output_lock = threading.Lock()
+    too_large = threading.Event()
+    reader_errors: list[Exception] = []
+    observed = 0
 
-    def _drain(stream, sink: list[str], callback=None) -> None:
-        if stream is None:
-            return
-        for line in iter(stream.readline, ""):
-            sink.append(line)
-            if callback is not None:
-                callback(line)
-        stream.close()
-
-    stdout_thread = threading.Thread(
-        target=_drain,
-        args=(process.stdout, stdout_parts, stdout_line),
-        name="feedling-agent-stdout",
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_drain,
-        args=(process.stderr, stderr_parts),
-        name="feedling-agent-stderr",
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    if process.stdin is not None:
+    def _drain(stream, sink: bytearray, callback=None) -> None:
+        nonlocal observed
+        pending: list[str] = []
+        decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder(encoding)(errors=errors), translate=True,
+        ) if callback is not None else None
         try:
-            process.stdin.write(str(input_text or ""))
+            while True:
+                chunk = stream.read1(64 * 1024)
+                with output_lock:
+                    if too_large.is_set():
+                        return
+                    observed += len(chunk)
+                    if observed > limit:
+                        too_large.set()
+                        for buffer in buffers:
+                            buffer.clear()
+                        pending.clear()
+                        process.kill()
+                        return
+                    sink.extend(chunk)
+                if callback is not None:
+                    text = decoder.decode(chunk, final=not chunk)
+                    pieces = text.split("\n")
+                    for piece in pieces[:-1]:
+                        pending.append(piece)
+                        callback("".join(pending) + "\n")
+                        pending.clear()
+                    if pieces[-1]:
+                        pending.append(pieces[-1])
+                    if not chunk and pending:
+                        callback("".join(pending))
+                if not chunk:
+                    return
+        except Exception as exc:
+            with output_lock:
+                reader_errors.append(exc)
+            process.kill()
         finally:
-            process.stdin.close()
+            pending.clear()
+            stream.close()
+
+    threads = [
+        threading.Thread(target=_drain, args=(process.stdout, buffers[0], stdout_line),
+                         name="feedling-agent-stdout", daemon=True),
+        threading.Thread(target=_drain, args=(process.stderr, buffers[1]),
+                         name="feedling-agent-stderr", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    def _captured(buffer):
+        if not text_mode:
+            return bytes(buffer)
+        return buffer.decode(encoding, errors=errors).replace("\r\n", "\n").replace("\r", "\n")
+
+    def _feed_input():
+        try:
+            data = input_text.encode(encoding, errors=errors) if isinstance(input_text, str) else input_text
+            process.stdin.write(data)
+        except BrokenPipeError:
+            pass  # A cap-triggered kill may race prompt delivery.
+        except Exception as exc:
+            with output_lock:
+                reader_errors.append(exc)
+            process.kill()
+        finally:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    if process.stdin is not None:
+        writer = threading.Thread(target=_feed_input, name="feedling-agent-stdin", daemon=True)
+        threads.append(writer)
+        writer.start()
     try:
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
+            if too_large.is_set():
+                raise CliOutputTooLarge(limit, observed)
+            if reader_errors:
+                raise reader_errors[0]
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             if remaining == 0.0:
                 raise subprocess.TimeoutExpired(cmd, timeout)
             try:
-                returncode = process.wait(
-                    timeout=0.1 if remaining is None else min(0.1, remaining)
-                )
-                break
+                returncode = process.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
             except subprocess.TimeoutExpired:
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired(cmd, timeout)
-    except VoiceTurnSuperseded:
-        process.terminate()
-        try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
+                continue
+            # A child can exit before its pipes are drained. Never return a
+            # partial capture (or miss a late cap crossing) as success.
+            if not any(thread.is_alive() for thread in threads):
+                break
+            for thread in threads:
+                thread.join(timeout=0.05)
+        if too_large.is_set():
+            raise CliOutputTooLarge(limit, observed)
+        if reader_errors:
+            raise reader_errors[0]
+    except BaseException as exc:
+        if isinstance(exc, VoiceTurnSuperseded) and not too_large.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        else:
             process.kill()
-            process.wait()
-        stdout_thread.join(timeout=1.0)
-        stderr_thread.join(timeout=1.0)
-        raise
-    except subprocess.TimeoutExpired as exc:
-        process.kill()
         process.wait()
-        stdout_thread.join(timeout=1.0)
-        stderr_thread.join(timeout=1.0)
-        exc.stdout = "".join(stdout_parts)
-        exc.stderr = "".join(stderr_parts)
+        for thread in threads:
+            thread.join(timeout=1.0)
+        if too_large.is_set():
+            # Discard, do not join/copy the oversized stdout/stderr into an error.
+            raise CliOutputTooLarge(limit, observed) from None
+        if isinstance(exc, subprocess.TimeoutExpired):
+            exc.stdout, exc.stderr = (_captured(buffer) for buffer in buffers)
         raise
-    stdout_thread.join(timeout=1.0)
-    stderr_thread.join(timeout=1.0)
     return subprocess.CompletedProcess(
-        cmd,
-        returncode,
-        stdout="".join(stdout_parts),
-        stderr="".join(stderr_parts),
+        cmd, returncode, stdout=_captured(buffers[0]), stderr=_captured(buffers[1]),
     )
 
 
@@ -8539,9 +8728,10 @@ def _call_agent_http_simple(
             present = sorted(f for f in _JSON_REPLY_FIELDS if f in body)
             diagnostics = _empty_reply_diagnostics(body)
             if str(_raw_assistant_text(body) or "").strip():
-                raise ValueError(
+                raise _sanitized_reply_error(
                     f"{SANITIZED_TO_EMPTY_MARK}: reply field {present} was "
-                    f"emptied by our sanitizer {diagnostics}".strip()
+                    f"emptied by our sanitizer {diagnostics}".strip(), turn,
+                    raw_reply=_raw_assistant_text(body),
                 )
             raise ValueError(
                 f"{EMPTY_PROVIDER_REPLY_MARK}: reply field present but empty "
@@ -8684,9 +8874,10 @@ def _call_agent_http_openai(
     # 那里面已经跑过 sanitizer,拿它判等于把两种情况混成一种(codex2 gatekeep R3)。
     diagnostics = _empty_reply_diagnostics(body)
     if str(_raw_assistant_text(body) or "").strip():
-        raise ValueError(
+        raise _sanitized_reply_error(
             f"{SANITIZED_TO_EMPTY_MARK}: openai-compatible assistant text was "
-            f"emptied by our sanitizer {diagnostics}".strip()
+            f"emptied by our sanitizer {diagnostics}".strip(), turn,
+            raw_reply=_raw_assistant_text(body),
         )
     # 真的没给内容 —— 中转在配额紧张/上游抽风时的典型「假成功」形状。
     # 带上 body 的协议层诊断:200+{"error":insufficient_quota} 这种要让规则表先命中。
@@ -11522,6 +11713,7 @@ def _emit_cli_model_call_terminal(
                     )
                 },
                 "error_class": error_class,
+                **(_failure_diagnostics(failure) if not succeeded else {}),
                 "thinking_present": bool(trace_turn.thinking_summary),
                 "thinking_source": trace_turn.thinking_source or "",
                 "thinking_len": len(trace_turn.thinking_summary or ""),
@@ -12103,10 +12295,7 @@ def _call_agent_cli_impl(
         # 标记 + 原 detail 一起带上:pi 退出码永远是 0,API 错误(配额/鉴权/断流)
         # 只在 detail 里,而分类器把空回复判定排在规则表**之后** —— detail 有错误
         # 特征时仍然命中 quota_insufficient 等更具体的类,不会被空回复遮蔽。
-        raise RuntimeError(
-            f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: "
-            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
-        )
+        raise _pi_no_reply_error(_cli_error_detail(result.stdout or '', result.stderr or ''))
 
     # codex `exec --json` streams JSONL events; the assistant's text and its
     # reasoning summary live in dedicated events, NOT in any field the generic
@@ -12491,6 +12680,7 @@ def _suppress_torn_protocol_leaks(turn: "AgentTurn", *, lane: str) -> None:
             "torn protocol fragment dropped lane=%s evidence=%s frag=%r",
             lane, evidence, str(text)[:48],
         )
+        _record_sanitizer(turn, "protocol_leak", str(text))
         return True
 
     if turn.messages:
@@ -12669,6 +12859,10 @@ def call_agent(
     failure_class = (
         "reply_parse_failed" if model_said_something else "provider_empty_reply"
     )
+    if failure_class == "reply_parse_failed":
+        original_text = _raw_assistant_text(raw)
+        if original_text:
+            turn.raw_reply_diagnostics = _raw_reply_diagnostics(original_text)
     if failure_class == "reply_parse_failed" and cli_parse_failure_source:
         source_raw = str(cli_parse_failure_source.get("raw") or "")
         source_cmd = list(cli_parse_failure_source.get("cmd") or [])
@@ -12683,9 +12877,9 @@ def call_agent(
                 trace_id=trace_id,
             )
     if SEND_FALLBACK_ON_AGENT_ERROR:
-        _turn_reply_parse_failed = failure_class
+        _turn_reply_parse_failed = _ReplyParseFailureCode(failure_class, turn)
         return [FALLBACK_REPLY]
-    raise _reply_parse_failure_exc(failure_class)
+    raise _reply_parse_failure_exc(_ReplyParseFailureCode(failure_class, turn))
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
@@ -12743,16 +12937,16 @@ def _wake_self_thinking_allowed() -> bool:
 
 
 def _self_thinking_tag() -> str:
-    """协议标签按 driver / provider 选:Claude Code 用 ``aside``,gemini(任何 driver)
-    用 ``aside``(T591),其余 pi / codex 保持 ``think``。
+    """协议标签按 driver / route 选:Claude Code、官方 Gemini 与指定中转的
+    Gemini 模型用 ``aside``，其余 pi / codex 保持 ``think``。
 
     T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
     用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
     隐藏思维链,Opus 5 家族每轮拒答。标签按 driver 不按模型:矩阵里 sonnet-4-6 /
     opus-4-8 / opus-5 / opus-5[1m] 用 ``aside`` 全部正常,不用维护型号名单。
     只有 ``AGENT_MODE == "cli"`` 且 ``cmd[0]`` 是 ``claude`` 才算 Claude Code;
-    pi / codex / http 模式(哪怕留着一条 claude 命令)/ 其他 CLI 的指令渲染逐字节
-    不变(见 tests)。"""
+    其余 driver 再按共享 provider/model 规则选择标签；http 模式里残留的
+    claude 命令不参与判断(见 tests)。"""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
     # Only a turn that really runs the Claude Code CLI gets the aside tag: in
@@ -12763,9 +12957,11 @@ def _self_thinking_tag() -> str:
     # gemini-3.6-flash via the pi wire with a tag-only swap in one captured
     # request body: 6/10 replays came back HTTP 503 with ``<think>``, 0/10 with
     # ``<aside>`` in the same window (replay only; no delivery path exercised).
-    # The provider set is shared with Runtime V2 (self_thinking.ASIDE_TAG_PROVIDERS);
-    # every other provider and driver keeps ``think`` byte for byte.
-    return _self_thinking_v1.tag_for_provider(AGENT_RUNTIME_METADATA.get("provider"))
+    # T601: named Gemini routes on openai_compatible/openrouter share the same
+    # selector as V2; other routes keep ``think`` byte for byte.
+    return _self_thinking_v1.tag_for_route(
+        AGENT_RUNTIME_METADATA.get("provider"), AGENT_RUNTIME_METADATA.get("model")
+    )
 
 
 def _foreground_self_thinking_instruction() -> str:
@@ -12954,7 +13150,10 @@ def _required_outbound_file_suffixes(text: str) -> tuple[str, ...] | None:
 
 
 def _outbound_name_matches_suffix(name: str, suffix: str) -> bool:
-    return str(name or "").casefold().endswith(str(suffix or "").casefold())
+    required = str(suffix or "").casefold()
+    if required == ".io.html":
+        required = ".html"
+    return str(name or "").casefold().endswith(required)
 
 
 def _missing_outbound_file_suffixes(
@@ -13190,12 +13389,16 @@ def _sanitize_outbound_file_reply(
     text: str,
     *,
     attachment_staged: bool = False,
+    diagnostics: AgentTurn | None = None,
 ) -> tuple[str, bool]:
     """Remove runtime-local attachment references from visible reply text."""
-    return sanitize_downloadable_reply(
+    cleaned, removed = sanitize_downloadable_reply(
         text,
         attachment_staged=attachment_staged,
     )
+    if removed and text.strip() and not cleaned.strip() and diagnostics is not None:
+        _record_sanitizer(diagnostics, "file_citation", text)
+    return cleaned, removed
 
 
 # The tested wording. Changing it invalidates the cross-model evidence in
@@ -13318,7 +13521,6 @@ def _prepend_io_cli_capability_catalog(
     catalog for the rest of that session."""
     global _io_cli_catalog_cache, _io_cli_voice_catalog_cache
     global _io_cli_catalog_pending_session_id
-    global _web_advertised_session_id, _web_off_notice_session_id
     if not _agent_can_use_local_io_cli():
         return content
 
@@ -13737,15 +13939,15 @@ def canonicalize_action_type(action_type: str) -> str:
     return _ACTION_TYPE_ALIASES.get(str(action_type or ""), str(action_type or ""))
 
 
-# spec 3.4 十二类型(canonical 形态)。故意把别名字面量也留在集合里跟 spec 逐字
-# 对齐——canonicalize 之后真正会被查到的只有 7 个 canonical 值(其余 5 个别名
+# 当前十一类型(canonical 形态)。故意把别名字面量也留在集合里跟 spec 逐字
+# 对齐——canonicalize 之后真正会被查到的只有 6 个 canonical 值(其余 5 个别名
 # 经 canonicalize 后已经折叠掉,不会以别名形式出现在判定里),多留的条目是防御
 # 性的,无害。identity.replace 刻意不在清单里:写卡原则只有蒸馏任务可以整卡替
 # 换,其余一律走 profile_patch。
 _ACTION_ALLOWLIST: frozenset = frozenset({
     "memory.add", "memory.create", "memory.add_correction",
     "memory.patch", "memory.content_patch", "memory.supersede",
-    "memory.upgrade", "memory.delete",
+    "memory.delete",
     "identity.profile_patch", "identity.patch",
     "identity.dimension_nudge", "identity.relationship_days_set",
 })
@@ -13810,7 +14012,6 @@ def _memory_batch_observation(actions: list[dict], body: dict) -> dict:
     applied: dict[str, int] = {
         "added": 0,
         "superseded": 0,
-        "upgraded": 0,
         "deleted": 0,
         "retyped": 0,
     }
@@ -13826,7 +14027,6 @@ def _memory_batch_observation(actions: list[dict], body: dict) -> dict:
             key = {
                 "memory.add": "added",
                 "memory.supersede": "superseded",
-                "memory.upgrade": "upgraded",
                 "memory.delete": "deleted",
                 "memory.retype": "retyped",
             }.get(action_type, "other")
@@ -18069,7 +18269,7 @@ def _capture_inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
     return inner
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "", voice_call_id: str = "") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -18089,10 +18289,6 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         user_pk_bytes=user_pk,
         enclave_pk_bytes=enc_pk,
         visibility="shared",
-        # Migration must seal with the ORIGINAL card id so the AEAD AAD (owner|v|id)
-        # matches on decrypt and the upgraded card stays readable AND id-stable.
-        # capture/dream (new cards) pass "" -> build_envelope mints a random id.
-        item_id=item_id or None,
     )
     envelope.update({
         "type": str(card.get("type") or "event").strip().lower() or "event",
@@ -19446,52 +19642,9 @@ def _process_dream_jobs(jobs: list) -> float:
             counts=dream_counts,
         )
 
-        # Host-side hard block: the prompt forbids rewriting a card the model
-        # only saw part of (TRUNCATED), but a prompt is not a guarantee. Drop
-        # those proposals; if every proposal was one, fail (ledger untouched)
-        # rather than complete as "nothing to consolidate".
-        # A memgarden that already drops these at the component exit leaves
-        # nothing for the host check; count its drops as the same guard so an
-        # all-forbidden run still fails instead of completing as a noop.
-        consolidations, host_truncated_rejected = garden_component.reject_truncated_consolidations(
-            consolidations, dream_disclosure.truncated_ids
-        )
-        truncated_rejected = host_truncated_rejected + kernel_truncated_dropped
-        if truncated_rejected:
-            log.warning(
-                "dream truncated-card guard id=%s rejected=%d (component=%d host=%d) kept=%d",
-                job_id, truncated_rejected, kernel_truncated_dropped,
-                host_truncated_rejected, len(consolidations),
-            )
-        if truncated_rejected and not consolidations:
-            reason = garden_component.DREAM_TRUNCATED_CARD_REJECTED
-            update_proactive_job_status(
-                job_id,
-                "failed",
-                reason,
-                extra={
-                    "dream_result": {
-                        "status": "failed",
-                        "reason": reason,
-                        "job_kind": "memory_dream",
-                        "truncated_rejected": truncated_rejected,
-                    },
-                    "cards_merged": 0,
-                    "cards_superseded": 0,
-                    "questions": questions,
-                    "noop_reason": reason,
-                },
-            )
-            _emit_resident_dream_lifecycle(
-                "memory.dream.error",
-                job_id=job_id,
-                status="error",
-                outcome="guard_rejected",
-                started_at=dream_started,
-                degraded_context=dream_degraded_context,
-                counts=dream_counts,
-            )
-            continue
+        # Target safety is owned by memgarden >=0.21.1. Keep its observation,
+        # not a second host implementation of the same filtering algorithm.
+        truncated_rejected = kernel_truncated_dropped
 
         user_token_residual = sum(
             count_user_token_residuals(row.get("result") or {})
@@ -19729,7 +19882,7 @@ def _process_dream_jobs(jobs: list) -> float:
 def _process_proactive_jobs(jobs: list) -> float:
     """Realize hidden proactive jobs through the same configured agent entry.
     The user-turn priority gate lives in ``_process_resident_jobs`` (it must
-    cover capture/dream/migrate model turns too, not just proactive)."""
+    cover capture/dream model turns too, not just proactive)."""
     latest = 0.0
     # One moment, one turn: decide the folds before realizing anything, so a
     # burst of perception triggers becomes a single agent turn instead of one
@@ -20332,192 +20485,6 @@ def _process_proactive_jobs(jobs: list) -> float:
     return latest
 
 
-def _is_memory_migrate_job(job: dict) -> bool:
-    return (
-        str((job or {}).get("job_kind") or "").strip() == "memory_migrate"
-        or str((job or {}).get("source") or "").strip() == "memory_migrate"
-    )
-
-
-def _migrate_render_old_cards(batch: list[dict]) -> str:
-    """Render the legacy batch (raw old inner) for the migrate prompt — id + only
-    the old content fields that are present."""
-    lines: list[str] = []
-    for row in batch:
-        inner = row.get("inner") if isinstance(row.get("inner"), dict) else {}
-        fields = {
-            k: inner.get(k)
-            for k in ("title", "description", "her_quote", "context", "linked_dimension")
-            if inner.get(k)
-        }
-        lines.append(json.dumps({"id": row.get("id"), **fields}, ensure_ascii=False))
-    return "\n".join(lines) if lines else "（没有要升级的卡）"
-
-
-def _process_migrate_jobs(jobs: list) -> float:
-    """Realize memory_migrate jobs: upgrade a batch of legacy cards to v1 in place.
-
-    Server picks + raw-decrypts the legacy batch (/v1/memory/legacy_batch); the
-    agent derives v1; we write each back via memory.upgrade (in-place,保 id, CAS).
-    A card counts as migrated ONLY on upgrade status=ok; skipped(stale)/empty(db
-    write fail)/parser-dropped all stay for the next quiet window (self-heal);
-    skipped(not_found) just drops (card gone). Writes only memory actions + the
-    migration-state cache; never posts chat.
-    """
-    latest = 0.0
-    from memory.migration import migration_enabled
-    if not migration_enabled():
-        return latest  # FEEDLING_MIGRATE_ENABLE off → full stop, don't process queued migrate jobs
-    for job in jobs:
-        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
-        latest = max(latest, ts)
-        if not _is_memory_migrate_job(job):
-            continue
-        key = _proactive_job_key(job)
-        if not _mark_seen(key):
-            continue
-        job_id = str(job.get("job_id") or "")
-        try:
-            if not claim_proactive_job(job_id):
-                log.info("migrate job not claimed id=%s", job_id)
-                continue
-        except Exception as e:
-            log.error("migrate job claim failed id=%s: %s", job_id, e)
-            continue
-        update_proactive_job_status(job_id, "realizing")
-
-        try:
-            batch_size = max(1, min(int(os.environ.get("FEEDLING_MIGRATE_BATCH", "8")), 50))
-        except (TypeError, ValueError):
-            batch_size = 8
-        batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": batch_size})
-        if not isinstance(batch_body.get("batch"), list) or "legacy_remaining" not in batch_body:
-            reason = "legacy_batch_unavailable"
-            update_proactive_job_status(
-                job_id, "failed", reason,
-                extra={"migrate_result": {"status": "failed", "reason": reason}},
-            )
-            log.warning("migrate job failed id=%s reason=%s body_keys=%s",
-                        job_id, reason, sorted(batch_body.keys()) if isinstance(batch_body, dict) else [])
-            continue
-        batch = batch_body.get("batch") if isinstance(batch_body.get("batch"), list) else []
-        legacy_remaining = int(batch_body.get("legacy_remaining") or 0)
-        if not batch:
-            _capture_post_json("/v1/memory/migration_state", payload={"migrated": 0, "legacy_remaining": 0})
-            update_proactive_job_status(
-                job_id, "completed", "migrate_no_legacy",
-                extra={"migrate_result": {"status": "noop", "reason": "no_legacy", "migrated": 0}},
-            )
-            log.info("migrate job completed noop (no legacy) id=%s", job_id)
-            continue
-
-        allowed_ids = {str(r.get("id")) for r in batch if r.get("id")}
-        hash_by_id = {str(r.get("id")): str(r.get("old_body_hash") or "") for r in batch}
-        _identity, ai_name, user_name, _identity_text = _capture_identity_context()
-        buckets_text, threads_text = _capture_memory_terms_context()
-        # 迁移走 GardenComponent —— 拼提示词 / 调模型 / 解析在包里。
-        # 白名单必填是接口保证的：模型可能凭空造 id，那会把不存在的卡
-        # 「升级」成新内容或覆盖别的卡。
-        _migrate_garden = garden_component.build_garden(
-            garden_component.CallableModel(
-                lambda p: _capture_agent_reply_text(call_agent(p, raw_text=True))
-            ),
-        )
-        try:
-            _migrated = _migrate_garden.migrate(mg_contracts.MigrateRequest(
-                old_cards=_migrate_render_old_cards(batch),
-                allowed_ids=tuple(sorted(allowed_ids)),
-                vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
-                ai_name=ai_name,
-                user_name=user_name,
-                locale=infer_garden_language(
-                    _identity,
-                    existing_buckets=buckets_text,
-                    archive_language=str(_whoami_cache.get("archive_language") or "").strip(),
-                ),
-            ))
-        except Exception as e:
-            reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
-            log.error("migrate agent call failed id=%s: %s", job_id, e)
-            update_proactive_job_status(
-                job_id, "failed", reason,
-                extra={"migrate_result": {"status": "failed", "reason": reason}},
-            )
-            continue
-        upgrades, unmigrated_ids, err = (
-            _migrated.upgrades, _migrated.unmigrated_ids, _migrated.error
-        )
-        if err:
-            update_proactive_job_status(
-                job_id, "failed", err,
-                extra={"migrate_result": {"status": "failed", "reason": err}},
-            )
-            continue
-
-        occurred_at = _format_message_time(time.time())
-        migrated = 0
-        # A11: any batch card that did NOT migrate this round is a failed attempt — the
-        # agent dropped it (unmigrated_ids) OR envelope build / memory.upgrade failed.
-        # Seed with the parser's unmigrated set, then add per-card write failures and
-        # remove the ones that actually succeed. The server bumps each card's attempt
-        # count; after FEEDLING_MIGRATE_MAX_ATTEMPTS it marks the card skipped so it
-        # stops looping and legacy_remaining can reach 0.
-        failed_ids: set[str] = set(unmigrated_ids)
-        for up in upgrades:
-            mid = str(up.get("id") or "")
-            if not mid:
-                continue
-            try:
-                envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate", item_id=mid)
-            except Exception as e:
-                log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
-                failed_ids.add(mid)
-                continue  # retry next round (until cap)
-            # Let memory.upgrade carry the existing metadata (don't reset). Migration
-            # is not a "user just used this memory", so last_referenced_at must NOT be
-            # bumped to now — drop it (and importance/pulse) so existing values stay.
-            envelope.pop("importance", None)
-            envelope.pop("pulse", None)
-            envelope.pop("last_referenced_at", None)
-            body = _capture_post_json("/v1/memory/actions", payload={"action": {
-                "type": "memory.upgrade",
-                "id": mid,
-                "envelope": envelope,
-                "old_body_hash": hash_by_id.get(mid, ""),
-            }})
-            res = (body.get("results") or [{}])[0] if isinstance(body, dict) else {}
-            if res.get("status") == "ok" and not res.get("skipped"):
-                migrated += 1
-                failed_ids.discard(mid)
-            else:
-                # skipped(stale)/empty(db_write_failed,network)/dropped → not migrated → counts
-                # as a failed attempt → retry next window until the per-card cap is hit.
-                failed_ids.add(mid)
-
-        remaining = max(0, legacy_remaining - migrated)
-        _capture_post_json("/v1/memory/migration_state", payload={
-            "migrated": migrated,
-            "legacy_remaining": remaining,
-            "failed_ids": sorted(failed_ids),
-        })
-        update_proactive_job_status(
-            job_id, "completed", "migrate_batch_done",
-            extra={"migrate_result": {
-                "status": "ok",
-                "migrated": migrated,
-                "batch": len(batch),
-                "unmigrated": len(unmigrated_ids),
-                "failed": len(failed_ids),
-                "remaining": remaining,
-            }},
-        )
-        log.info(
-            "migrate job completed id=%s migrated=%d/%d unmigrated=%d failed=%d remaining=%d",
-            job_id, migrated, len(batch), len(unmigrated_ids), len(failed_ids), remaining,
-        )
-    return latest
-
-
 _resident_jobs_deferred_for_user = False
 
 # Wall-clock time of the last REAL user message this process routed to the agent
@@ -20527,12 +20494,12 @@ _last_user_message_wall = 0.0
 
 
 def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float:
-    """Dispatch background jobs (capture → dream → migrate → proactive) one at
+    """Dispatch background jobs (capture → dream → proactive) one at
     a time, each through its class processor as a single-element batch.
 
     ① user-turn priority: when ``chat_since`` is given, peek (claim-free,
     non-blocking) for a waiting user message BEFORE each job's model turn — ALL
-    four classes call the agent, so the gate must sit here, not inside any one
+    three classes call the agent, so the gate must sit here, not inside any one
     processor. If a user message is pending, stop and defer the remaining jobs:
     a waiting human then waits at most the current, non-preemptible model turn,
     never a whole batch. On defer, sets ``_resident_jobs_deferred_for_user`` so
@@ -20549,10 +20516,8 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
             ordered.append((0, _process_capture_jobs, job))
         elif isinstance(job, dict) and _is_memory_dream_job(job):
             ordered.append((1, _process_dream_jobs, job))
-        elif isinstance(job, dict) and _is_memory_migrate_job(job):
-            ordered.append((2, _process_migrate_jobs, job))
         else:
-            ordered.append((3, _process_proactive_jobs, job))
+            ordered.append((2, _process_proactive_jobs, job))
     ordered.sort(key=lambda entry: entry[0])  # stable: keeps arrival order within a class
     latest = 0.0
     now = time.time()
@@ -20570,7 +20535,7 @@ def _process_resident_jobs(jobs: list, chat_since: float | None = None) -> float
         # on the server, so they re-serve on a later poll — no defer flag, no break,
         # wake-class jobs after them still run this pass. The MAX_DEFER cap stops a
         # heavy chatter from starving memory maintenance forever.
-        if class_idx < 3 and _last_user_message_wall > 0:
+        if class_idx < 2 and _last_user_message_wall > 0:
             job_ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
             recently_chatting = (now - _last_user_message_wall) < MAINTENANCE_IDLE_SEC
             deferrable = not job_ts or (now - job_ts) < MAINTENANCE_MAX_DEFER_SEC
@@ -21831,6 +21796,7 @@ def _process_messages(messages: list) -> float:
                     attachment_staged=bool(
                         staged_outbound_files or staged_outbound_images
                     ),
+                    diagnostics=finalized,
                 )
                 stripped_file_citation = stripped_file_citation or removed
                 if sanitized.strip():
@@ -21954,7 +21920,8 @@ def _process_messages(messages: list) -> float:
             explain=("回复已解析：" + f"{len(turn.messages)} 段"
                      + ("，含思考摘要" if turn.thinking_summary else "，无思考摘要")),
             detail={"n_messages": len(turn.messages), "n_actions": len(turn.actions),
-                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or ""},
+                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or "",
+                    **({"sanitizer_reason": turn.sanitizer_reason} if turn.sanitizer_reason else {})},
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages
@@ -22450,8 +22417,8 @@ def _outbound_file_mime(name: str) -> str:
 # (usr_1baf: 20 err / 46 ok in a week) and the rejection reason was returned to
 # io_cli but never persisted — the agent.tool.call error carried no reason, so
 # a blank Canvas ("有过程无内容") could not be attributed. Emit a content-free
-# reason (closed-set enum) whenever staging is rejected. Numbers/enums only:
-# never the path, name, title, or document bytes.
+# reason (closed-set enum) whenever staging is rejected. Only reason, Canvas
+# flag and bounded suffix metadata; never the path, name, title or document bytes.
 # Every reject exit of ``_stage_file_ipc_impl`` (+ ``_safe_outbound_file_name``)
 # as a stable, actionable enum. The source-scan guard in the tests fails if the
 # implementation grows an ``"error": "x"`` / ``ValueError("x")`` exit not listed
@@ -22463,6 +22430,7 @@ _SEND_FILE_REJECTION_REASONS = frozenset({
     "chat_turn_finished",
     "too_many_staged_files",
     "path_outside_allowed_file_roots",
+    "file_not_found",
     "file_name_required",
     "unsupported_file_suffix",
     "wrong_file_suffix",
@@ -22494,6 +22462,12 @@ def _classify_send_file_rejection(error: object) -> str:
     return mapped if mapped is not None else "other"
 
 
+def _stage_file_suffix(msg: dict) -> str:
+    name = str(msg.get("name") or "").strip() or Path(str(msg.get("path") or "").strip()).name
+    name = name.lower()
+    return ".io.html" if name.endswith(".io.html") else Path(name).suffix[:12]
+
+
 def _stage_file_is_canvas(msg: dict) -> bool:
     """Decide Canvas-ness through the SAME normalization the impl applies, so a
     reject is never mis-flagged non-Canvas over surrounding whitespace/control
@@ -22519,6 +22493,7 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
     # runs, which would otherwise hang this rejection off the wrong (new) turn.
     with _outbound_file_lock:
         origin_turn_id = _active_outbound_file_turn_id
+        required_suffixes = list(_active_outbound_file_suffixes or ())
     result = _stage_file_ipc_impl(msg)
     if isinstance(result, dict) and result.get("ok") is False:
         _emit_debug_trace(
@@ -22530,6 +22505,8 @@ def _handle_stage_file_ipc(msg: dict) -> dict:
             detail={
                 "reason": _classify_send_file_rejection(result.get("error")),
                 "is_canvas": _stage_file_is_canvas(msg),
+                "suffix": _stage_file_suffix(msg),
+                "required_suffixes": required_suffixes,
             },
         )
     return result
@@ -22561,6 +22538,9 @@ def _stage_file_ipc_impl(msg: dict) -> dict:
     try:
         resolved_dir = OUTBOUND_FILE_DIR.resolve()
         resolved_path = source_path.resolve(strict=True)
+    except OSError:
+        return {"ok": False, "error": "file_not_found", "request_id": request_id}
+    try:
         try:
             resolved_path.relative_to(resolved_dir)
         except ValueError:
@@ -22619,6 +22599,9 @@ def _stage_file_ipc_impl(msg: dict) -> dict:
 
     try:
         source_bytes = resolved_path.read_bytes()
+    except OSError:
+        return {"ok": False, "error": "file_not_found", "request_id": request_id}
+    try:
         if not source_bytes or len(source_bytes) > _OUTBOUND_FILE_MAX_BYTES:
             raise ValueError("file_source_empty_or_too_large")
         if (
@@ -23278,13 +23261,15 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             truncated = bool(shape["reply_looks_truncated"]) and shape["reply_head"] in {"{", "[", "```"}
             return reply, truncated
 
-        def write(mutations: list[dict], _key: str) -> list[str]:
+        def prepare_write(mutations: list[dict]) -> list[dict]:
             now_iso = datetime.now(_tzmod.utc).isoformat()
+            return [_resident_import_action(
+                garden_import.mutation_item(m), now_iso=now_iso,
+                supersedes=garden_import.supersede_target(m)) for m in mutations]
+
+        def write(prepared: list[dict], key: str) -> list[str]:
             return garden_import.write_with_executor(
-                mutations,
-                build_action=lambda m: _resident_import_action(
-                    garden_import.mutation_item(m), now_iso=now_iso,
-                    supersedes=garden_import.supersede_target(m)),
+                prepared, build_action=dict, idempotency_key=key,
                 execute=_resident_import_rows,
             )
 
@@ -23292,6 +23277,7 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             sources=sources, state=state["garden"], job_key=job_id, owner_key=uid,
             existing_cards=state["known"], complete=complete, write=write,
             save=lambda _s: None,  # in memory only, by design
+            prepare_write=prepare_write,
             should_yield=lambda: _distill_user_waiting(chat_since),
         )
         state["known"] = result.known
@@ -23622,6 +23608,31 @@ def _process_resident_distill_once(chat_since: float | None = None) -> None:
         state["active"] = None  # done → next queued job (if any)
 
 
+_STARTUP_EXIT_REASONS = frozenset({
+    "content_encryption_missing", "whoami_failed", "api_key_invalid",
+})
+
+
+def _write_startup_exit(reason: str) -> None:
+    """Best-effort reason only, scoped to the resident's per-user home."""
+    if reason not in _STARTUP_EXIT_REASONS:
+        return
+    try:
+        FEEDLING_HOME.mkdir(parents=True, exist_ok=True)
+        (FEEDLING_HOME / "startup_exit.json").write_text(
+            json.dumps({"reason": reason, "ts": time.time()}), encoding="utf-8",
+        )
+    except OSError:
+        pass  # Diagnostics must not prevent the existing exit.
+
+
+def _clear_startup_exit() -> None:
+    try:
+        (FEEDLING_HOME / "startup_exit.json").unlink(missing_ok=True)
+    except OSError:
+        pass  # A stale file is also rejected by the supervisor's timestamp gate.
+
+
 def run() -> None:
     # Hard auth check before entering the poll loop.
     # A missing user_id or public_key means every encrypted reply will fail;
@@ -23631,6 +23642,7 @@ def run() -> None:
             "content_encryption module not found — v1 envelope posting disabled. "
             "Make sure the consumer runs from the feedling-mcp repo root."
         )
+        _write_startup_exit("content_encryption_missing")
         sys.exit(1)
 
     if not _load_whoami_with_retries():
@@ -23638,6 +23650,7 @@ def run() -> None:
             "whoami failed at startup — cannot obtain user_id or public_key. "
             "Check FEEDLING_API_URL and FEEDLING_API_KEY, then restart."
         )
+        _write_startup_exit("whoami_failed")
         sys.exit(1)
 
     _warn_if_agent_entry_may_drift()
@@ -23724,6 +23737,7 @@ def run() -> None:
         CAPTURE_TICK_INTERVAL_SEC,
     )
 
+    _clear_startup_exit()
     consecutive_errors = 0
 
     while _running:
@@ -23843,7 +23857,7 @@ def run() -> None:
                     jobs = job_result.get("jobs") or []
                     if jobs:
                         # ① user-turn priority: a waiting user must never queue behind
-                        # background job turns (capture/dream/migrate/proactive — each
+                        # background job turns (capture/dream/proactive — each
                         # a full model turn). Turns are single-flight per user, so a
                         # batch would otherwise hold the lock while the user's reply
                         # waits — the "typing… forever" the user sees.
@@ -24049,6 +24063,7 @@ def run() -> None:
                         "whoami returned 401 — API key is invalid. "
                         "Update FEEDLING_API_KEY and restart the service."
                     )
+                    _write_startup_exit("api_key_invalid")
                     sys.exit(1)
             consecutive_errors += 1
             time.sleep(min(2 ** consecutive_errors, 60))

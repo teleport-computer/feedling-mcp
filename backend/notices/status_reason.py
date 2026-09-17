@@ -13,6 +13,8 @@ reason it matches exactly.
 """
 from __future__ import annotations
 
+# migrate 错误码仅用于识别历史 job 终态；老卡迁移机制已删。
+
 from notices import catalog, error_contract
 
 REDACTED = "<redacted>"
@@ -22,7 +24,7 @@ REDACTED = "<redacted>"
 #   proactive/poll_core.py:73,165,214,298   lifecycle terminals
 #   proactive/poll_core.py:312              evaluate_wake_control_v2 rejections
 #   proactive/proactive_core.py:408         gate.HEARTBEAT_THROTTLED_REASON
-#   proactive/capture_jobs.py:215           migrate terminal read back by name
+#   Historical migrate terminals remain readable after the producer was retired.
 #   db.py content_free_failure_code         collapsed-failure placeholder
 PROACTIVE_LIFECYCLE_REASONS = frozenset({
     "agent_greeted",
@@ -82,6 +84,7 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     # TRUNCATED card, and the component's small-garden skip verdict.
     "dream_kernel_outdated",
     "dream_truncated_card_rejected",
+    "maintenance_targets_rejected",
     "not_enough_new_cards",
     "dream_memory_actions_applied",
     "dream_memory_actions_failed",

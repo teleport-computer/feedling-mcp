@@ -10,6 +10,7 @@ import json
 import posixpath
 import re
 import time
+import unicodedata
 from provider_types import (
     ProviderResponse,
     ToolCall,
@@ -48,6 +49,36 @@ def _without_tagged_image_messages(messages, tag_key: str) -> list:
 _CATALOG = None  # built lazily/once
 _SEARCH_RESULT_URL_RE = re.compile(r'"url"\s*:\s*("(?:\\.|[^"\\])*")')
 _WORKSPACE_REVISION_RE = re.compile(r"\brevision\s+(\d+)\b", re.IGNORECASE)
+_PROTOCOL_TOKEN_REPLY_NAMES = frozenset({
+    "stay_silent", "reply", "speak", "stay_quiet", "proactive_sleep", "sleep",
+})
+_PROTOCOL_TOKEN_REPLY_RE = re.compile(r"__\w+__")
+
+
+def _normalize_protocol_token_reply(text: str) -> str:
+    # Underscores belong to sentinel names. Strip only surrounding punctuation,
+    # then canonicalize the approved space/dot/hyphen spelling variants.
+    def is_wrapper(char: str) -> bool:
+        return char != "_" and (
+            char.isspace() or char == "`"
+            or unicodedata.category(char).startswith("P")
+        )
+
+    start, end = 0, len(text)
+    while start < end and is_wrapper(text[start]):
+        start += 1
+    while end > start and is_wrapper(text[end - 1]):
+        end -= 1
+    return " ".join(text[start:end].lower().split()).translate(
+        str.maketrans({" ": "_", ".": "_", "-": "_"})
+    )
+
+
+def _is_protocol_token_reply(text: str) -> bool:
+    token = _normalize_protocol_token_reply(text)
+    return token in _PROTOCOL_TOKEN_REPLY_NAMES or bool(
+        _PROTOCOL_TOKEN_REPLY_RE.fullmatch(token)
+    )
 
 # Provider output is untrusted even after its tool names/arguments validate.  These
 # defaults bound both fan-out and how much observation text one native exchange can
@@ -183,9 +214,9 @@ _WAKE_REPLY_TOOL_SPEC = ToolSpec(
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "When you are done looking around, end the wake by calling reply with what "
-    "you want to say. Call stay_silent only if you have a concrete reason not to "
-    "speak this time."
+    "When you are done looking around, end the wake by calling reply if there "
+    "is anything you want to say to them. Call stay_silent only if you honestly "
+    "have nothing to say, or speaking would clearly intrude."
 )
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
@@ -1233,10 +1264,13 @@ def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
         pr.raw.get("gemini_diagnostics"), dict
     ):
         shape["raw_stop_reason"] = str(pr.raw.get("stop_reason") or "").strip()
-    # Provider-owned content-free root-cause diagnostics (currently Gemini:
-    # finishReason / safety categories / thought-only shape / token split),
-    # projected at the provider seam so this never reaches back through content.
+    # Provider-owned content-free root-cause diagnostics (Gemini: finishReason /
+    # safety categories / thought-only shape / token split; OpenAI-compatible
+    # relays: the thinking-vs-visible token split they report, T604), projected
+    # at the provider seam so this never reaches back through content.
     diagnostics = pr.raw.get("gemini_diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = pr.raw.get("openai_compat_diagnostics")
     if isinstance(diagnostics, dict):
         shape["provider_diagnostics"] = dict(diagnostics)
     return shape
@@ -1626,11 +1660,12 @@ async def run_tool_loop(
             return re.search(r"[A-Za-z]", completion_message) is not None
         return False
 
-    # T591: the self-thinking rendering this turn's system prompt uses (gemini →
-    # ``aside``). Every place the loop restates or continues the contract must
+    # The self-thinking rendering this turn's system prompt uses (official or
+    # named relay Gemini → ``aside``). Every restatement or continuation must
     # use the same tag, or the model is asked for two different openers.
-    self_thinking_tag = self_thinking.tag_for_provider(
-        getattr(provider_config, "provider", "")
+    self_thinking_tag = self_thinking.tag_for_route(
+        getattr(provider_config, "provider", ""),
+        getattr(provider_config, "model", ""),
     )
 
     def _compact_delivery_system_prompt(
@@ -1899,6 +1934,19 @@ async def run_tool_loop(
     async def _tool_event(tc, event_kind: str, payload: dict) -> None:
         if on_tool_event is not None:
             await on_tool_event(tc, event_kind, payload)
+
+    async def _finish_stay_silent(tc: ToolCall, reason: str) -> LoopOutcome:
+        await _tool_event(tc, "tool_call_started", {})
+        await _trajectory(
+            "stay_silent_planned",
+            {"round": attempts, "call_id": tc.id, "reason": reason},
+        )
+        if on_stay_silent is None:
+            raise RuntimeError("stay_silent callback is unavailable")
+        await on_stay_silent(reason)
+        silent_result = ToolResult(call_id=tc.id, content="ok: staying silent")
+        await _tool_event(tc, "tool_call_result", {"result": silent_result})
+        return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
 
     while attempts < max_calls:
         _progress("round_boundary")
@@ -3264,10 +3312,11 @@ async def run_tool_loop(
                     "unavailable_tool_call_counts": unavailable_call_counts,
                 }
             )
-        await _emit_provider_tool_surface(
-            provider_surface_detail,
-            surface_rejection_reasons,
-        )
+        if not (wake_choice_required or wake_reply_call_present):
+            await _emit_provider_tool_surface(
+                provider_surface_detail,
+                surface_rejection_reasons,
+            )
 
         structured_wake_reply = False
         if wake_choice_required or wake_reply_call_present:
@@ -3313,7 +3362,7 @@ async def run_tool_loop(
                 and selected_call.args_ok
                 else ""
             )
-            valid_reply_choice = bool(
+            valid_reply_shape = bool(
                 selected_call is not None
                 and selected_call.id
                 and len(wake_reply_calls) == 1
@@ -3323,6 +3372,20 @@ async def run_tool_loop(
                 and len(reply_text) <= max_assistant_tool_text_chars
                 and tool_calls_used < max_tool_calls_per_turn
             )
+            valid_reply_choice = bool(
+                valid_reply_shape
+                and not _is_protocol_token_reply(reply_text)
+            )
+            silent_from_protocol_token = valid_reply_shape and not valid_reply_choice
+            if silent_from_protocol_token:
+                token = _normalize_protocol_token_reply(reply_text)
+                silent_reason = f"reply text was a bare protocol token: {token}"
+                if provider_surface_detail is not None:
+                    # Sentinel interiors are an open set of provider text, so
+                    # plaintext telemetry uses a fixed bucket for that family.
+                    provider_surface_detail["protocol_token_reply"] = (
+                        token if token in _PROTOCOL_TOKEN_REPLY_NAMES else "__sentinel__"
+                    )
             valid_silent_choice = bool(
                 selected_call is not None
                 and selected_call.id
@@ -3335,6 +3398,10 @@ async def run_tool_loop(
                 )
                 is None
             )
+            await _emit_provider_tool_surface(
+                provider_surface_detail,
+                surface_rejection_reasons,
+            )
             await _trajectory(
                 "wake_choice_response",
                 {
@@ -3343,9 +3410,13 @@ async def run_tool_loop(
                         _WAKE_REPLY_TOOL
                         if valid_reply_choice
                         else (
-                            tool_schema.STAY_SILENT_TOOL
-                            if valid_silent_choice
-                            else "invalid"
+                            "silent_from_protocol_token"
+                            if silent_from_protocol_token
+                            else (
+                                tool_schema.STAY_SILENT_TOOL
+                                if valid_silent_choice
+                                else "invalid"
+                            )
                         )
                     ),
                     "tool_call_count": len(pr.tool_calls),
@@ -3370,8 +3441,11 @@ async def run_tool_loop(
                 )
                 wake_choice_required = False
                 structured_wake_reply = True
-            elif valid_silent_choice:
+            elif valid_silent_choice or silent_from_protocol_token:
                 wake_choice_required = False
+                if silent_from_protocol_token:
+                    tool_calls_used += 1
+                    return await _finish_stay_silent(selected_call, silent_reason)
             else:
                 can_retry_wake_choice = (
                     not wake_choice_retry_used
@@ -4197,17 +4271,7 @@ async def run_tool_loop(
             )
         for tc in stay_silent_calls:
             reason = str(tc.args.get("reason") or "").strip()
-            await _tool_event(tc, "tool_call_started", {})
-            await _trajectory(
-                "stay_silent_planned",
-                {"round": attempts, "call_id": tc.id, "reason": reason},
-            )
-            if on_stay_silent is None:
-                raise RuntimeError("stay_silent callback is unavailable")
-            await on_stay_silent(reason)
-            silent_result = ToolResult(call_id=tc.id, content="ok: staying silent")
-            await _tool_event(tc, "tool_call_result", {"result": silent_result})
-            return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
+            return await _finish_stay_silent(tc, reason)
 
         file_completion_message = ""
         file_completion_validated = False

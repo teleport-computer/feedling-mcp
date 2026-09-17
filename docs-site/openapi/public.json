@@ -50,7 +50,7 @@
     },
     {
       "name": "Memory",
-      "description": "Memory records, buckets, threads, and migration state."
+      "description": "Memory records, buckets, and threads."
     },
     {
       "name": "Identity",
@@ -4245,7 +4245,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409)."
+        "description": "Apply up to 20 memory actions independently and in order. Retired memory.upgrade actions return unsupported_memory_action (400); legacy cards remain readable through read-side adapters. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409)."
       }
     },
     "/v1/memory/add": {
@@ -4578,48 +4578,6 @@
         "description": "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 in the enclave, then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking."
       }
     },
-    "/v1/memory/legacy_batch": {
-      "post": {
-        "summary": "Memory Legacy Batch",
-        "operationId": "memory_legacy_batch_v1_memory_legacy_batch_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Error response.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Memory"
-        ],
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
-              }
-            }
-          }
-        },
-        "x-feedling-contract-level": "compatibility"
-      }
-    },
     "/v1/memory/list": {
       "get": {
         "summary": "Memory List",
@@ -4708,78 +4666,6 @@
           }
         ],
         "x-feedling-contract-level": "documented"
-      }
-    },
-    "/v1/memory/migration_state": {
-      "get": {
-        "summary": "Memory Migration State Get",
-        "operationId": "memory_migration_state_get_v1_memory_migration_state_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Error response.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Memory"
-        ],
-        "x-feedling-contract-level": "documented"
-      },
-      "post": {
-        "summary": "Memory Migration State Post",
-        "operationId": "memory_migration_state_post_v1_memory_migration_state_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Error response.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Memory"
-        ],
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
-              }
-            }
-          }
-        },
-        "x-feedling-contract-level": "compatibility"
       }
     },
     "/v1/memory/retype": {
@@ -11654,14 +11540,20 @@
               "memory.delete",
               "memory.retype"
             ],
-            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
+            "description": "New memory.add requests create a new card; repeated content is not deduplicated. An identical idempotency_key replay returns the original receipt."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "Optional per-action, per-user replay key. Reuse only with identical JSON action fields (including an existing envelope); a changed payload fails with memory_idempotency_conflict. Replay returns a content-free receipt, replayed=true and no effects, even after card deletion. Not an HTTP header or whole-batch transaction."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"
           },
           "memory": {
             "$ref": "#/components/schemas/MemoryRecordInput",
-            "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content."
+            "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content. Content over 5000 Unicode code points after outer whitespace is stripped fails with memory_content_too_long (400), never truncates. Historical full fetch and opaque envelope bodies are not subject to this plaintext validation limit."
           },
           "memory_id": {
             "type": "string"

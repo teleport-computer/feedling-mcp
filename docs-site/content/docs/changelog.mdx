@@ -12,6 +12,102 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Resident crash-loop circuits now retry every five minutes at a fixed
+  interval. Startup exits record bounded per-user reasons; current startup
+  failures use the system-owned spawn-failure notice instead of asking users
+  to check their model API key or balance.
+
+- Retired legacy-card migration endpoints (`/v1/memory/legacy_batch` and `/v1/memory/migration_state`) and the `memory.upgrade` action. Existing legacy cards remain readable and recallable through read-side adapters, without rewriting stored data.
+
+- **Screen-watch wakes follow the same speaking default as regular V2 wakes.**
+  The agent is prompted to say something about what it sees when it wants to;
+  silence is appropriate when it has nothing to say or would break the user's
+  flow. An unanswered previous message alone is not a reason to hold back.
+  Screen-specific guidance to avoid interruptions and repetition, express one
+  coherent thought, and avoid narrating screen observation remains in place.
+
+- Gemini models routed through `openai_compatible` or `openrouter` now use
+  the same `<aside>` rendering as direct Gemini on Runtime V2 and resident V1.
+  Selection uses a case-insensitive `gemini` match in the configured model name
+  only for those two relay providers, addressing the tool-follow-up response
+  failures observed with the previous `<think>` rendering on some relays.
+  Other routes retain their existing rendering, including the resident Claude
+  Code driver rule. Model aliases without `gemini` are outside this rule.
+
+- Resident Canvas requests now accept both `.html` and `.io.html` files at the
+  required-suffix gate and completion check; `.io.html` remains the preferred
+  extension in generation guidance.
+
+- Resident `send-file` diagnostics now distinguish missing or unreadable files
+  (`file_not_found`) from paths outside allowed roots, and record the attempted
+  suffix and required suffixes without recording filenames.
+- Resident CLI subprocesses now cap combined stdout and stderr at 64 MiB per
+  invocation. Exceeding the limit kills the process, discards captured output,
+  and reports `cli_output_too_large`; `FEEDLING_CLI_MAX_OUTPUT_BYTES` overrides
+  the limit with a positive byte count.
+
+- Runtime V2 no longer delivers a *narrated* tool call. When a model writes a
+  call as prose instead of emitting a structured one — for example
+  `[Calling generate_image with prompt: "…"]` at the end of a reply with no
+  tool call attached — nothing ran, and that bracket used to reach the user
+  verbatim. It is now removed before delivery (the surrounding prose is kept),
+  on the chat and wake lanes alike; the existing `agent.reply.sanitized` trace
+  carries a `narrated_tool_calls` count. Only the closed bracketed-verb shape
+  with a tool-looking name is recognized; ordinary bracketed text and fenced
+  code are untouched.
+
+- **Regular V2 wakes suppress bare protocol tokens sent as reply text.**
+  An otherwise valid `reply` whose entire text is a token such as `stay_silent`,
+  `speak`, or `__verify_ack__` now ends silently without retrying or creating
+  a chat bubble. Ordinary sentences containing those words still pass through;
+  foreground chat and explicitly scheduled reminders retain their existing behavior.
+
+- Runtime V2 now validates a generated image inside the image-generation step
+  instead of while publishing the reply. When a provider or relay returns media
+  the runtime cannot decode or normalize, the agent receives an
+  `image_generation_invalid_output` tool error and may retry the generation or
+  reply in text; the turn no longer fails with the generic fallback message
+  after the image had already been generated. The specific reject reason is traced as
+  `agent.image.generate.invalid` (code only, never pixels), and worker failure
+  records may carry a registered `error_detail` code naming the check that raised.
+
+- **Regular V2 wakes let the agent decide whether it wants to reach out.**
+  The instructions remove the fixed recent-contact exception list. Silence is
+  appropriate when the agent has nothing it wants to say or speaking would
+  clearly intrude; an unanswered previous message is not by itself a reason
+  to hold back. The structured reply validation and output budgets are unchanged.
+
+- Long-running memory jobs now refresh a same-user runtime token and retry enclave decryption once after a 401, preventing expired tokens from failing the remaining decryptions when the enclave is slow.
+
+- Resident failure traces now distinguish thinking-tag, protocol-leak, file-reference,
+  and unclassified sanitizer failures. Parse failures include bounded assistant reply
+  excerpts and thinking-tag counts. Pi no-reply failures also report any recognized
+  upstream HTTP status code and class. Error classification, retries, and reply
+  delivery behavior are unchanged.
+
+- History imports now reject individual oversized or idempotency-conflicting cards while saving valid siblings, instead of failing the entire job; an entirely rejected batch still fails and asks the model again on retry.
+
+- Empty-response diagnostics on OpenAI-compatible relays now record the relay's
+  thinking-vs-visible output token split (`provider_thoughts_token_count`,
+  `provider_candidates_token_count`, `provider_prompt_token_count`, and whether
+  the upstream Gemini usage block was reported), on the same fields the native
+  Gemini wire uses. Counts and a closed finish-reason enum only; part-shape and
+  safety fields stay native-Gemini-only rather than being reported as clean.
+
+- **Memory writes no longer silently shorten plaintext card bodies at 5000
+  characters.** Oversize writes return `memory_content_too_long`; full fetch
+  preserves historical longer cards. Optional per-action `idempotency_key`
+  receipts let imports recover a committed write without creating duplicate
+  cards. Storage failures stay failures, even after another card succeeded or
+  multiple retries; they are not reported as completed imports with dropped
+  cards. These receipts do not make an entire batch transactional or provide a
+  persistent checkpoint to the existing in-memory VPS import lane.
+
+- **Dream target filtering now has one owner, MemGarden.** IO no longer
+  duplicates the truncated-target filter. An entirely rejected plan reports
+  `maintenance_targets_rejected` / `guard_rejected`, not a successful empty
+  maintenance run. IO still owns job status, observability and persistence.
+
 - **Users with fewer than about 20 memories now get search and automatic-recall
   hits that were previously filtered out.** The relevance gate's coverage check
   weighed query words the Garden never recorded by the real card count, so in a

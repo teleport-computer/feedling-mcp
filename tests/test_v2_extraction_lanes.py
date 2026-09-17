@@ -858,8 +858,9 @@ def test_dream_empty_successful_card_read_keeps_the_noop_completion(monkeypatch)
     assert traces[-1]["detail"]["degraded_context"] is False
 
 
+@pytest.mark.parametrize("unsafe_proposal", [False, True])
 def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_context(
-    monkeypatch,
+    monkeypatch, unsafe_proposal,
 ):
     """Cards beyond the component's prompt budget are a deliberate partial
     context, not a read failure: the run proceeds, the omitted cards are not
@@ -876,7 +877,7 @@ def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_conte
         return {"reply": json.dumps({"consolidations": [{
             "op": "supersede", "card_ids": ["card-19"], "rationale": "更新",
             "result": {"summary": "新摘要", "content": "新正文。"},
-        }]}), "stop_reason": "end_turn"}
+        }] if unsafe_proposal else []}), "stop_reason": "end_turn"}
 
     monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _provider)
     # 20 cards x ~4,000 chars: only the first 14 fit the 60,000-char budget.
@@ -903,7 +904,7 @@ def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_conte
         runtime_token="rt",
     ))
 
-    assert status == "completed"
+    assert status == ("failed" if unsafe_proposal else "completed")
     assert len(prompts) == 1
     assert "- id=card-13" in prompts[0] and "- id=card-14" not in prompts[0]
     assert applied == []                      # an unseen card is never a target
@@ -915,7 +916,9 @@ def test_dream_prompt_cap_truncated_cards_are_still_an_intentional_partial_conte
     assert types.index("memory.extraction.context.error") < types.index(
         "memory.dream.model.start"
     )
-    assert _job_row(job_id) == ("completed", None)
+    assert _job_row(job_id) == (
+        ("failed", "extraction_failed:maintenance_targets_rejected")
+        if unsafe_proposal else ("completed", None))
     assert traces[-1]["detail"]["degraded_context"] is True
     assert traces[-1]["detail"]["counts"]["active_cards"] == 14
 
@@ -1042,7 +1045,7 @@ def test_dream_fails_when_every_consolidation_touches_a_truncated_card(monkeypat
     assert status == "failed"
     assert applied == []
     assert _job_row(job_id) == (
-        "failed", "extraction_failed:dream_truncated_card_rejected"
+        "failed", "extraction_failed:maintenance_targets_rejected"
     )
     assert traces[-1]["type"] == "memory.dream.error"
     assert traces[-1]["detail"]["outcome"] == "guard_rejected"

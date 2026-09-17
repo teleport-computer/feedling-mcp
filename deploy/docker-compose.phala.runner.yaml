@@ -78,7 +78,6 @@ x-agent-runner-env: &agent-runner-env
   AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
   FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-  FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
   # Genesis import worker: this runner is the only place genesis import jobs get
   # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
   # SKIP LOCKED, so it stays correct if more runners are ever added back.
@@ -91,7 +90,7 @@ services:
   # + chat checkpoint always live in one place, so a lease that re-acquires here
   # resumes from a consistent cursor (no cross-runner stale-checkpoint wedge).
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:551aba2   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:6ad9e74   # CI pins the sha
     container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped

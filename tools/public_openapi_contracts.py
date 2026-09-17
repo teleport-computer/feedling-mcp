@@ -1856,12 +1856,16 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": {
                 "type": "string",
                 "enum": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"],
-                "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated.",
+                "description": "New memory.add requests create a new card; repeated content is not deduplicated. An identical idempotency_key replay returns the original receipt.",
+            },
+            "idempotency_key": {
+                "type": "string", "minLength": 1, "maxLength": 160,
+                "description": "Optional per-action, per-user replay key. Reuse only with identical JSON action fields (including an existing envelope); a changed payload fails with memory_idempotency_conflict. Replay returns a content-free receipt, replayed=true and no effects, even after card deletion. Not an HTTP header or whole-batch transaction.",
             },
             "envelope": {"$ref": "#/components/schemas/MemoryEnvelope"},
             "memory": {
                 "$ref": "#/components/schemas/MemoryRecordInput",
-                "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content.",
+                "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content. Content over 5000 Unicode code points after outer whitespace is stripped fails with memory_content_too_long (400), never truncates. Historical full fetch and opaque envelope bodies are not subject to this plaintext validation limit.",
             },
             "memory_id": {"type": "string"},
             "id": {"type": "string"},
@@ -2701,7 +2705,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "readable one-hop id/summary pointers; related_status distinguishes complete, "
         "bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
     ),
-    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409).",
+    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Retired memory.upgrade actions return unsupported_memory_action (400); legacy cards remain readable through read-side adapters. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409).",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",

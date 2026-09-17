@@ -33,7 +33,7 @@ if str(BACKEND) not in sys.path:
 from identity.user_naming import _naming_rule  # noqa: E402
 from memgarden.naming import naming_rule as kernel_naming_rule  # noqa: E402
 from memory import garden_component  # noqa: E402
-from memory.capture_prompt_v1 import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402
+from memory.garden_component import IO_CONVERSATION_CAPTURE_POLICY  # noqa: E402
 from model_api_runtime.v2 import extraction as v2_extraction  # noqa: E402
 
 _FIXTURE = ROOT / "tests" / "fixtures" / "memgarden" / "capture_prompt_production.json"

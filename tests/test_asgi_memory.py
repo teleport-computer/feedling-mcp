@@ -2,8 +2,8 @@
 
 Asserts the FastAPI routes (``memory.routes_asgi``) return the same status/body as
 the Flask oracle (``memory.routes``) for every route, plus auth-failure (401) and
-scope-failure (403) on the three scope-gated write surfaces (``/actions``,
-``/legacy_batch`` and the POST side of ``/migration_state``). Both sides call the
+scope-failure (403) on the scope-gated actions surface (``/actions``).
+Both sides call the
 same framework-neutral ``memory.memory_core``, so a single monkeypatch on the
 shared enclave / service module objects covers both paths — keeping the test
 fully offline and the E2E envelope handling identical across frameworks (the
@@ -33,7 +33,6 @@ from core import config as core_config  # noqa: E402
 from core import runtime_token  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from memory import actions as memory_actions_mod  # noqa: E402
 from memory import memory_core  # noqa: E402
 from memory import routes_asgi as memory_asgi  # noqa: E402
 from memory import service as memory_service  # noqa: E402
@@ -145,12 +144,9 @@ def _stub_enclave(monkeypatch, fn):
     ("GET", "/v1/memory/verify", None),
     ("GET", "/v1/memory/buckets", None),
     ("GET", "/v1/memory/threads", None),
-    ("GET", "/v1/memory/migration_state", None),
     ("POST", "/v1/memory/index", {}),
     ("POST", "/v1/memory/fetch", {"ids": []}),
     ("POST", "/v1/memory/actions", {}),
-    ("POST", "/v1/memory/migration_state", {}),
-    ("POST", "/v1/memory/legacy_batch", {}),
     ("POST", "/v1/memory/add", {}),
     ("POST", "/v1/memory/retype", {}),
     ("DELETE", "/v1/memory/delete?id=x", None),
@@ -161,7 +157,7 @@ def test_no_auth_is_401_parity(user, method, path, body):
 
 
 # --------------------------------------------------------------------------- #
-# scope-failure (403) on the three scope-gated write surfaces
+# scope-failure (403) on the scope-gated actions surface
 # --------------------------------------------------------------------------- #
 
 def _token(user_id: str, scope: list[str]) -> str:
@@ -176,8 +172,6 @@ def _token(user_id: str, scope: list[str]) -> str:
 
 @pytest.mark.parametrize("method,path,body", [
     ("POST", "/v1/memory/actions", {"actions": []}),
-    ("POST", "/v1/memory/migration_state", {"migrated": 0, "legacy_remaining": 0}),
-    ("POST", "/v1/memory/legacy_batch", {"batch_size": 8}),
 ])
 def test_scope_missing_is_403_parity(user, monkeypatch, method, path, body):
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", _SECRET)
@@ -187,18 +181,6 @@ def test_scope_missing_is_403_parity(user, monkeypatch, method, path, body):
     f = _flask(method, path, headers=headers, json_body=body)
     a = _asgi(method, path, headers=headers, json_body=body)
     assert f == a == (403, {"error": "forbidden"})
-
-
-def test_migration_state_get_allows_scopeless_token_parity(user, monkeypatch):
-    # GET side is auth-only (no scope) — a token without memory scope must pass.
-    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", _SECRET)
-    monkeypatch.setattr(db, "get_blob", lambda *_a, **_k: None)
-    uid, _api_key = user
-    headers = {"X-Feedling-Runtime-Token": _token(uid, ["identity"])}
-    f = _flask("GET", "/v1/memory/migration_state", headers=headers)
-    a = _asgi("GET", "/v1/memory/migration_state", headers=headers)
-    assert f == a
-    assert f[0] == 200 and "state" in f[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -939,9 +921,10 @@ def test_actions_required_400_parity(user):
     assert f == a == (400, {"error": "actions required"})
 
 
-def test_actions_unsupported_type_parity(user):
+@pytest.mark.parametrize("action_type", ["memory.bogus", "memory.upgrade"])
+def test_actions_unsupported_type_parity(user, action_type):
     _uid, api_key = user
-    body = {"actions": [{"type": "memory.bogus"}]}
+    body = {"actions": [{"type": action_type}]}
     f, a = _both("POST", "/v1/memory/actions", api_key=api_key, json_body=body)
     assert f == a
     # Both stacks preserve the complete per-item result, but a zero-applied
@@ -952,69 +935,7 @@ def test_actions_unsupported_type_parity(user):
     assert f[1]["failed_count"] == 1
     assert f[1]["results"][0]["http_status"] == 400
     assert f[1]["results"][0]["error"] == "unsupported_memory_action"
-
-
-# --------------------------------------------------------------------------- #
-# migration_state (db patched for determinism/isolation)
-# --------------------------------------------------------------------------- #
-
-def test_migration_state_get_parity(user, monkeypatch):
-    _uid, api_key = user
-    monkeypatch.setattr(db, "get_blob", lambda *_a, **_k: None)
-    f, a = _both("GET", "/v1/memory/migration_state", api_key=api_key)
-    assert f == a
-    assert f[0] == 200 and "state" in f[1]
-
-
-def test_migration_state_post_parity(user, monkeypatch):
-    _uid, api_key = user
-    monkeypatch.setattr(db, "get_blob", lambda *_a, **_k: None)
-    monkeypatch.setattr(db, "set_blob", lambda *_a, **_k: None)
-    body = {"migrated": 0, "legacy_remaining": 0}
-    f, a = _both("POST", "/v1/memory/migration_state", api_key=api_key, json_body=body)
-
-    def _blank_state(resp):
-        status, b = resp
-        state = {**(b or {}).get("state", {}), "updated_at": "<ts>"}
-        return status, {**(b or {}), "state": state}
-
-    # ``updated_at`` in the advanced state is stamped with time.time() per call.
-    assert _blank_state(f) == _blank_state(a)
-    assert f[0] == 200 and "state" in f[1]
-
-
-def test_migration_state_post_bad_ints_400_parity(user, monkeypatch):
-    _uid, api_key = user
-    monkeypatch.setattr(db, "get_blob", lambda *_a, **_k: None)
-    monkeypatch.setattr(db, "set_blob", lambda *_a, **_k: None)
-    body = {"migrated": "not-int"}
-    f, a = _both("POST", "/v1/memory/migration_state", api_key=api_key, json_body=body)
-    assert f == a == (400, {"error": "migrated/legacy_remaining must be ints"})
-
-
-# --------------------------------------------------------------------------- #
-# legacy_batch (enclave decrypt stubbed; forwards api key)
-# --------------------------------------------------------------------------- #
-
-def test_legacy_batch_parity(user, monkeypatch):
-    uid, api_key = user
-    monkeypatch.setattr(db, "get_blob", lambda *_a, **_k: None)
-    legacy = {
-        "id": "m1", "body_ct": "ct1", "nonce": "n", "K_user": "k", "K_enclave": "ke",
-        "visibility": "shared", "owner_user_id": uid, "status": "active",
-        "occurred_at": "2020-01-01",
-    }
-    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [dict(legacy)])
-    monkeypatch.setattr(
-        memory_actions_mod, "_memory_plain_from_envelope",
-        lambda _user_id, moment, key, runtime_token="": ({"title": "t", "description": "d"}, ""),
-    )
-    body = {"batch_size": 8}
-    f, a = _both("POST", "/v1/memory/legacy_batch", api_key=api_key, json_body=body)
-    assert f == a
-    assert f[0] == 200
-    assert [r["id"] for r in f[1]["batch"]] == ["m1"]
-    assert f[1]["legacy_remaining"] == 1
+    assert "memory.upgrade" not in f[1]["results"][0]["supported"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,8 +949,8 @@ def test_actions_forwards_runtime_token_to_core(user, monkeypatch):
     Stage D swaps ``X-API-Key`` for ``X-Feedling-Runtime-Token`` in the resident
     consumer, so ``auth.api_key`` is None on this path. ``/actions`` was the only
     route in this file that never extracted the token (its four readside siblings
-    and ``legacy_batch`` all did), so the enclave decrypt of the OLD card raised
-    ``api_key_unavailable`` and every supersede/patch/upgrade came back
+    all did), so the enclave decrypt of the OLD card raised
+    ``api_key_unavailable`` and every supersede/patch came back
     ``409 memory_decrypt_failed`` — for every hosted user, V1 and V2 alike.
     """
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", _SECRET)
@@ -1052,3 +973,17 @@ def test_actions_forwards_runtime_token_to_core(user, monkeypatch):
     assert status == 200 and body == {"applied": 1}
     assert seen["api_key"] is None      # hosted callers have no per-user api key
     assert seen["runtime_token"] == tok  # ...so the token is the ONLY usable credential
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/v1/memory/migration_state"),
+    ("POST", "/v1/memory/migration_state"),
+    ("POST", "/v1/memory/legacy_batch"),
+])
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_retired_memory_migration_routes_are_not_found(user, method, path, authenticated):
+    """Retired endpoints must not read/write migration state, even with auth."""
+    _uid, api_key = user
+    status, _body = _asgi(method, path, headers=_headers(api_key) if authenticated else None,
+                         json_body={} if method == "POST" else None)
+    assert status == 404

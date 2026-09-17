@@ -31,6 +31,7 @@ from memory import service as memory_service
 from notices import catalog as notices_catalog
 from notices import status_reason as notices_status_reason
 from notices import core as notices_core
+from notices import error_contract as notices_error_contract
 from proactive import service as proactive_service
 from screen import screen_read_core
 from bootstrap import gates as boot_gates
@@ -3865,6 +3866,34 @@ def _debug_event_public_json(
         public_detail,
         trace_public_fields=trace_public_fields,
     )
+    if isinstance(raw_detail, dict) and isinstance(public_detail, dict):
+        if ev.get("type") == "resident.send_file.rejected":
+            # Only extension-shaped metadata is exposed, never a full filename.
+            def valid_suffix(value):
+                return isinstance(value, str) and (
+                    value == "" or re.fullmatch(r"\.[a-z0-9.]{1,11}", value) is not None
+                )
+            suffix = raw_detail.get("suffix")
+            if valid_suffix(suffix):
+                public_detail["suffix"] = suffix
+            required = raw_detail.get("required_suffixes")
+            if isinstance(required, list) and all(valid_suffix(item) for item in required):
+                public_detail["required_suffixes"] = required
+        if ev.get("type") in {"agent.turn.failure", "agent.model.call.error", "agent.reply"}:
+            reason = raw_detail.get("sanitizer_reason")
+            if isinstance(reason, str) and reason in notices_error_contract.RESIDENT_SANITIZER_REASONS:
+                public_detail["sanitizer_reason"] = reason
+        if ev.get("type") in {"agent.turn.failure", "agent.model.call.error"}:
+            status_class = raw_detail.get("provider_status_class")
+            if isinstance(status_class, str) and status_class in notices_error_contract.PROVIDER_STATUS_CLASSES:
+                public_detail["provider_status_class"] = status_class
+        if ev.get("type") == "agent.turn.failure" and raw_detail.get("error_class") == "reply_parse_failed":
+            # T617 / explicit trace-content authorization: bounded assistant
+            # excerpts only for this failure, not a general string allowlist.
+            for key, limit in (("raw_reply_head", 300), ("raw_reply_tail", 120)):
+                value = raw_detail.get(key)
+                if isinstance(value, str) and len(value) <= limit:
+                    public_detail[key] = value
     if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail
@@ -10456,6 +10485,7 @@ _DEBUG_STEP_LABELS = {
     "vision.provider.completed": ("👁", "视觉模型 · 调用结束"),
     "agent.image.generate.start": ("🎨", "生图 · 开始"),
     "agent.image.generate.done": ("🎨", "生图 · 成功"),
+    "agent.image.generate.invalid": ("🎨", "生图 · 图片无法处理"),
     "agent.image.generate.failed": ("🎨", "生图 · 失败"),
     # 语音四个失败出口在页面上本来长得一模一样。标签里必须写出
     # 「仍返回 200」——那是这条道最反直觉、最容易被当成成功的地方:
@@ -10496,6 +10526,7 @@ _DEBUG_STEP_LABELS = {
     "memory.search.called": ("🔍", "搜索记忆"),
     "memory.fetch.called": ("📖", "读取记忆卡"),
     "memory.content.truncation": ("✂️", "记忆卡截断"),
+    "memory.content.rejected": ("⛔", "记忆卡超长拒绝"),
     "identity.dimensions_set": ("🪪", "身份维度重写"),
     "context.truncation": ("✂️", "上下文裁剪"),
 }
@@ -11096,6 +11127,7 @@ _EVENT_MASTER_ACTIONS = (
      "desc": "一次 dream job 的终态。",
      "runtime_metrics": {"runtime_v1": ("dream", None),
                          "runtime_v2": ("dream", None)}},
+    # 历史 job_kind，机制已删；保留历史终态统计口径。
     {"key": "migrate", "label": "记忆整理 · Migrate",
      "desc": "resident 有独立 migrate 终态；V2 maintenance 不是同一动作。",
      "runtime_metrics": {"runtime_v1": ("migrate", None)}},

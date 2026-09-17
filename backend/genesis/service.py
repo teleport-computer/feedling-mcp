@@ -1090,16 +1090,10 @@ def _memory_action_from_output(
     fallback_occurred_at: str = "",
 ) -> dict:
     mem_type = _coerce_memory_type(item.get("type"))
-    if store is not None and item.get("content"):
-        memory_actions.trace_memory_content_truncation(
-            store,
-            item.get("content"),
-            route="genesis_history_import",
-        )
     memory = {
         "type": mem_type,
         "summary": _text(item.get("summary") or item.get("title") or item.get("description"), 2000),
-        "content": str(item.get("content") or "").strip()[:memory_actions.MEMORY_CONTENT_MAX_CHARS],
+        "content": str(item.get("content") or "").strip(),
         "bucket": _text(item.get("bucket"), 80),
         "threads": _memory_threads_from_output(item, preserve_tags=preserve_dates),
         "occurred_at": _memory_occurred_at_from_output(
@@ -2065,8 +2059,7 @@ def render_genesis_profile_source(output: dict) -> tuple[str, int, bool]:
         if not isinstance(item, dict):
             continue
         try:
-            # This is a dry render before publication. The real writer records
-            # truncation observability once; do not double-count it here.
+            # Dry render only; the action executor owns write validation.
             action = _memory_action_from_output(item)
         except ValueError:
             continue

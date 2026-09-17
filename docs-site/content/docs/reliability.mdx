@@ -87,12 +87,16 @@ Applications should make them configurable for self-hosted deployments.
 ## Provider health and proactive retries
 
 Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
-choice. Speaking is the default; `stay_silent` needs a concrete reason, such as
-an explicit do-not-disturb request, sleeping hours while the user is offline,
-having spoken within the last hour, or the user being visibly busy. These are
-model instructions, not new scheduler gates. Missing or invalid choices still
+choice. Speaking is the default; silence is the agent's own call when it has
+nothing it wants to say or when speaking would clearly intrude. An unanswered
+previous message is not by itself a reason to stay silent. These are model
+instructions, not new scheduler gates. Missing or invalid choices still
 fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
+A regular wake's otherwise valid `reply` whose entire text is a bare protocol
+token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
+The screen-watch lane follows the same default while keeping its own guidance
+to avoid interrupting the user's flow.
 
 Regular wake provider calls, including choice-correction retries, now use the
 same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
@@ -281,6 +285,15 @@ Job status also exposes `identity_ready` and material entries ordered as AI
 persona, user profile, memory summary, then chat history. Material status uses
 `queued`, `processing`, `failed`, or `done`; `cards` reports the durable mapped
 candidate count instead of a placeholder.
+
+Hosted Resident supervisors open a crash-loop circuit after five failures within
+30 minutes. While open, restart attempts use a fixed five-minute interval;
+ordinary restart backoff and the five-minute healthy reset remain unchanged.
+The consumer records only a closed startup reason and timestamp in its per-user
+`startup_exit.json`; the supervisor ignores missing, malformed or older records.
+Successful startup removes that file. Current startup exits belong to the
+system, so their spawn-failure notice does not blame the user's model settings.
+An unreachable decrypt source continues retrying within the live consumer.
 
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds

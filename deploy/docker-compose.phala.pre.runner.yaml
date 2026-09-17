@@ -51,7 +51,6 @@ x-agent-runner-env: &agent-runner-env
   AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
   FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-  FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
   # Genesis import worker: dual-runtime routes V1-desired users' genesis jobs
   # here. Claim is FOR UPDATE SKIP LOCKED, so it stays correct alongside the
   # main CVM's own serve-worker genesis thread (both drain the same queue).

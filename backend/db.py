@@ -48,6 +48,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
@@ -3544,7 +3545,7 @@ def admin_data_track_growth_accounting(
     try:
         with get_pool().connection() as conn:
             act_rows = conn.execute(
-                f"""
+                """
                 SELECT DISTINCT user_id,
                        (timezone(%s, to_timestamp(ts)))::date AS d
                 FROM (
@@ -5597,6 +5598,7 @@ _LANE_ROLLUP_V1_FAIL_PRED = (
     "OR ({mem} AND COALESCE(l.doc->>'status','') IN ('failed','error','skipped')))"
 )
 
+# memory_migrate 是历史 job_kind，机制已删；以下统计仍按原 lane 分桶。
 # lane 推断与 admin_events_overview 同一 CASE；memory 三种 job_kind 在这里拆成
 # 独立 lane（capture/dream/migrate）——events 页的合并 category 等于三者之和，
 # 互核仍然成立，粒度更高。
@@ -9125,6 +9127,102 @@ def insert_trace_events_strict(
             if eligible:
                 cur.executemany(statement, eligible)
     return len(eligible)
+
+
+def enclave_decrypt_health_windows(window_minutes: int, *, now: datetime | None = None) -> tuple:
+    """UTC wall-clock aligned (start, end] windows, last complete bucket first.
+
+    An event exactly at a bucket's end belongs to that completed bucket.
+    """
+    if type(window_minutes) is not int or not 1 <= window_minutes <= 1440:
+        raise ValueError("invalid_window_minutes")
+    calculated_at = now if now is not None else datetime.now(timezone.utc)
+    if calculated_at.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    seconds = window_minutes * 60
+    end_epoch = (calculated_at.timestamp() // seconds) * seconds
+    end = datetime.fromtimestamp(end_epoch, timezone.utc)
+    start = end - timedelta(minutes=window_minutes)
+    return start - timedelta(minutes=window_minutes), start, end
+
+
+def admin_enclave_decrypt_health(window_minutes: int = 15, *, now: datetime | None = None) -> dict:
+    """Two complete adjacent (start, end] windows of recorded terminal events.
+
+    Calls counts all done/timeout/error rows, not starts, batches or suppressed
+    successes. The alert rate excludes HTTP errors from both numerator and
+    denominator: (timeout + transport_error) / (done + unavailable).
+    A zero denominator is unmeasured (None), never a measured zero rate.
+    User IDs and raw detail never leave PostgreSQL. Unknown purpose labels are
+    collapsed before grouping, including slug-shaped identifiers/secrets.
+    """
+    previous_start, current_start, calculated_at = enclave_decrypt_health_windows(
+        window_minutes, now=now,
+    )
+    with get_pool().connection(timeout=5) as conn:
+        with conn.transaction():
+            conn.execute("SELECT set_config('statement_timeout', %s, true)", ("5000ms",))
+            rows = conn.execute(
+                """
+                WITH events AS MATERIALIZED (
+                    SELECT CASE WHEN ts > %s THEN 'current' ELSE 'previous' END AS period,
+                           user_id,
+                           CASE WHEN type = 'enclave.call.done' THEN 'done'
+                                WHEN type = 'enclave.call.timeout' THEN 'timeout'
+                                WHEN detail->>'status_code' = '401' THEN 'http_401'
+                                WHEN detail->>'status_code' = '403' THEN 'http_403'
+                                WHEN detail->>'failure_class' = 'enclave_transport_error'
+                                    THEN 'transport_error'
+                                ELSE 'http_other' END AS kind,
+                           CASE WHEN detail->>'purpose' = ANY(%s)
+                                THEN detail->>'purpose' ELSE 'other' END AS purpose
+                    FROM trace_events
+                    WHERE ts > %s AND ts <= %s AND subsystem = 'enclave'
+                      AND type IN ('enclave.call.done', 'enclave.call.timeout', 'enclave.call.error')
+                ), totals AS (
+                    SELECT period,
+                           count(*) FILTER (WHERE kind = 'done') AS done,
+                           count(*) FILTER (WHERE kind = 'timeout') AS timeout,
+                           count(*) FILTER (WHERE kind = 'transport_error') AS transport_error,
+                           count(*) FILTER (WHERE kind = 'http_401') AS http_401,
+                           count(*) FILTER (WHERE kind = 'http_403') AS http_403,
+                           count(*) FILTER (WHERE kind = 'http_other') AS http_other,
+                           count(DISTINCT user_id) FILTER (WHERE kind <> 'done') AS users_affected
+                    FROM events GROUP BY period
+                ), purposes AS (
+                    SELECT period, purpose, count(*) AS count
+                    FROM events WHERE kind <> 'done' GROUP BY period, purpose
+                )
+                SELECT totals.*,
+                       (SELECT jsonb_agg(jsonb_build_object('purpose', p.purpose, 'count', p.count)
+                                         ORDER BY p.count DESC, p.purpose)
+                        FROM (SELECT purpose, count FROM purposes
+                              WHERE period = totals.period
+                              ORDER BY count DESC, purpose LIMIT 5) p) AS top_purposes
+                FROM totals
+                """,
+                (current_start, sorted(enclave_health_contract.PURPOSE_LABELS),
+                 previous_start, calculated_at),
+            ).fetchall()
+    windows = {}
+    for period, start, end in (("current", current_start, calculated_at),
+                               ("previous", previous_start, current_start)):
+        windows[period] = {key: 0 for key in enclave_health_contract.COUNT_KEYS}
+        windows[period].update(start_at=start.isoformat(), end_at=end.isoformat(),
+                               unavailable_rate=None, top_purposes=[])
+    for period, done, timeout, transport, http401, http403, other, users, purposes in rows:
+        unavailable = timeout + transport
+        denominator = done + unavailable
+        windows[period].update(
+            done=done, timeout=timeout, transport_error=transport,
+            http_401=http401, http_403=http403, http_other=other,
+            calls=denominator + http401 + http403 + other,
+            unavailable=unavailable,
+            unavailable_rate=unavailable / denominator if denominator else None,
+            users_affected=users, top_purposes=purposes or [],
+        )
+    return {"window_minutes": window_minutes, "calculated_at": calculated_at.isoformat(),
+            **windows}
 
 
 def query_trace_events(
@@ -13660,7 +13758,7 @@ def memory_user_mutation_fence(user_id: str):
     """
     normalized = str(user_id)
     if _memory_mutation_context(normalized) is not None:
-        yield
+        yield _memory_mutation_context(normalized)[0]
         return
 
     callbacks: list = []
@@ -13673,7 +13771,7 @@ def memory_user_mutation_fence(user_id: str):
             current[normalized] = (conn, callbacks)
             token = _memory_mutation_contexts.set(current)
             try:
-                yield
+                yield conn
             finally:
                 _memory_mutation_contexts.reset(token)
 
@@ -17295,7 +17393,7 @@ def memory_load(user_id: str) -> list[dict]:
 
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
     """Single-row upsert. Returns True iff the write committed — callers that
-    advance state on success (e.g. memory.upgrade / migration) MUST check it."""
+    advance state on success MUST check it."""
     try:
         context = _memory_mutation_context(user_id)
         if context is None:
@@ -18882,12 +18980,18 @@ def log_append(user_id: str, stream: str, doc: dict,
                ts: float | None = None, item_key: str | None = None) -> bool:
     sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
            "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
-    try:
-        with get_pool().connection() as conn:
-            row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
-    except Exception as e:
-        log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
-        return False
+    context = _memory_mutation_context(user_id)
+    if context is not None:
+        # A memory action and its change log must roll back together. Let a
+        # database failure abort the owning transaction, not look successful.
+        row = context[0].execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
+    else:
+        try:
+            with get_pool().connection() as conn:
+                row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
+        except Exception as e:
+            log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
+            return False
     if row is None:
         return False
     # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
@@ -18902,7 +19006,8 @@ def log_append(user_id: str, stream: str, doc: dict,
         "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
-    mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+    _defer_memory_post_commit(user_id, lambda: mirror.execute(
+        mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc))))
     return True
 
 

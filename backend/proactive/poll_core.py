@@ -93,7 +93,7 @@ def _is_ts_watermark_exempt_job(job: dict) -> bool:
     # Jobs that must be recovered by status, ignoring the consumer's ts
     # watermark. The resident / agent-runner consumer seeds its proactive
     # checkpoint to "now" on first boot, so any pending job created before that
-    # first poll (introduction posted at spawn; memory_capture/dream/migrate
+    # first poll (introduction posted at spawn; memory_capture/dream
     # enqueued while the user was chatting before the consumer came up) has a ts
     # below `since` and would otherwise be skipped forever (prod: a 17:58 capture
     # job stayed pending while later dream jobs were claimed).
@@ -174,8 +174,6 @@ def _cancel_introduction_job(store, job: dict) -> None:
 def _supersedable_maintenance_kind(job: dict) -> str:
     if capture_jobs.is_memory_dream_job(job):
         return capture_jobs.CAPTURE_JOB_KIND_DREAM
-    if capture_jobs.is_memory_migrate_job(job):
-        return capture_jobs.CAPTURE_JOB_KIND_MIGRATE
     return ""
 
 

@@ -1232,6 +1232,7 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
             "final": True,
             "error_class": "upstream_unavailable",
             "reason": "tool_markup_leak_sanitized",
+            "narrated_tool_calls": 0,
         }
     ]
 
@@ -1347,6 +1348,67 @@ def test_wake_prose_fragment_delivery_is_not_changed_by_cut_signal(
             "final": True,
         }
         assert prose not in json.dumps(cut_events, ensure_ascii=False)
+
+
+def test_wake_full_chain_strips_narrated_tool_call(monkeypatch):
+    """T621 on the wake outlet: a proactive message that narrates a call keeps
+    its prose and drops the bracket; the trace counts the narrated call."""
+    lane = "heartbeat"
+    uid = "u_wake_narrated_tool_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    prompt = "一只在夜景里打伞的猫"
+    narrated = f'想你了，给你画一张\n[Calling generate_image with prompt: "{prompt}"]'
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    decryptor = _patch_user_decryptable_envelopes(monkeypatch, uid)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "晚安"}]
+    )
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    try:
+        status = asyncio.run(
+            worker._run_wake(
+                job_id,
+                uid,
+                lane,
+                deps,
+                _BYOK,
+                asyncio.Semaphore(4),
+                claimed_by,
+            )
+        )
+        store = core_store.get_store(uid)
+        store.reload()
+        bubble = next(
+            row for row in store.chat_messages
+            if row.get("role") == "openclaw" and row.get("source") == "model_api"
+        )
+        plaintext = decryptor.decrypt_reply(bubble)
+    finally:
+        decryptor._http.close()
+
+    assert status == "completed"
+    assert plaintext == "想你了，给你画一张"
+    sanitized = [
+        trace for trace in traces if trace["event_type"] == "agent.reply.sanitized"
+    ]
+    assert [trace["detail"] for trace in sanitized] == [
+        {
+            "lane": lane,
+            "final": True,
+            "error_class": "upstream_unavailable",
+            "reason": "tool_markup_leak_sanitized",
+            "narrated_tool_calls": 1,
+        }
+    ]
+    assert prompt not in json.dumps(sanitized, ensure_ascii=False)
 
 
 def test_wake_markup_only_reply_sleeps_without_bubble(monkeypatch):
@@ -1878,22 +1940,31 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert _job_status(job_id)[0] == "completed"
 
 
-def test_proactive_policy_defaults_to_speaking_with_concrete_silence_reasons():
+def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
     prompt = worker._WAKE_SYSTEM_PROMPT
-    assert "speaking is the normal way to end a wake" in prompt
-    assert "concrete reason" in prompt
-    assert "sleeping hours and they are offline" in prompt
-    assert "within the last hour" in prompt
+    silent = cap_tool_schema.DESCRIPTIONS[cap_tool_schema.STAY_SILENT_TOOL]
+    choice = worker.v2_tool_loop._WAKE_CHOICE_INSTRUCTION
+    for text in (prompt, silent, choice):
+        assert "within the last hour" not in text
+        assert "concrete reason" not in text
+        assert "honestly have nothing" in text
+        assert "clearly intrude" in text
+    assert "do you feel like reaching out to them right now?" in prompt
+    assert "say it; reaching out is what these moments are for" in prompt
+    assert "not having answered your last message is not a reason to hold back" in prompt
+    assert "showing up again a few hours later is normal" in prompt
+    assert "not answering your last message is not a reason by itself" in silent
+    for text in (prompt, silent):
+        assert "they asked not to be disturbed, or they are plainly asleep" in text
+    assert "calling reply if there is anything you want to say to them" in choice
     assert "in the middle of something" in prompt
     assert "Never mention this wake or any system wording" in prompt
-    assert "showing up a lot lately" not in prompt
-    assert "Both are good ways" not in prompt
+    for wake_prompt in (prompt, worker._SCREEN_WATCH_SYSTEM_PROMPT):
+        assert "showing up a lot lately" not in wake_prompt
+        assert "Both are good ways" not in wake_prompt
     assert "Neither choice is preferred" not in worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
-    silent = cap_tool_schema.DESCRIPTIONS[cap_tool_schema.STAY_SILENT_TOOL]
-    assert "concrete reason" in silent
     assert "not an error" not in silent
     assert "normal way to end a wake" in worker.v2_tool_loop._WAKE_REPLY_TOOL_SPEC.description
-    assert "concrete reason" in worker.v2_tool_loop._WAKE_CHOICE_INSTRUCTION
 
 
 def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
@@ -2528,8 +2599,8 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
 @pytest.mark.parametrize(
     ("trigger", "expected_require_reply", "prompt_fragment"),
     [
-        ("broadcast_opened", False, "speaking is the normal way to end a wake"),
-        ("broadcast_closed", False, "speaking is the normal way to end a wake"),
+        ("broadcast_opened", False, "do you feel like reaching out to them right now?"),
+        ("broadcast_closed", False, "do you feel like reaching out to them right now?"),
     ],
 )
 def test_broadcast_edge_wake_reply_policy(
