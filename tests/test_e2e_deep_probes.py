@@ -578,3 +578,231 @@ def test_scheduled_must_deliver_watermark_captured_before_schedule_post(monkeypa
     assert post_times, "schedule POST was never issued"
     # The watermark must predate the schedule POST boundary.
     assert captured["since"] < post_times[0]
+
+
+# --------------------------------------------------------------------------- #
+# T635: three probe contracts that drifted behind the batch-actions / V2 dream /
+# V2 send behaviour. Each block has the current-contract shape (must accept),
+# the pre-T635 shape (must reject — reverting the probe change turns these red),
+# and broken shapes that a lenient check would let through.
+# --------------------------------------------------------------------------- #
+from tools.e2e import experience_probe, memory_probe  # noqa: E402
+
+
+def _batch_denial(**over):
+    body = {
+        "status": "failed", "error": "not_found",
+        "results": [{"status": "error", "error": "not_found", "http_status": 404,
+                     "action": "memory.supersede", "missing": ["x"]}],
+        "effects": [], "total_count": 1, "applied_count": 0, "skipped_count": 0, "failed_count": 1,
+    }
+    body.update(over)
+    return body
+
+
+def test_batch_denied_not_found_accepts_exact_contract():
+    assert memory_probe._batch_denied_not_found(400, _batch_denial()) is True
+
+
+@pytest.mark.parametrize("status,body", [
+    (404, {"error": "not_found"}),                                  # pre-T635 top-level shape
+    (200, _batch_denial()),                                         # success code with failed body
+    (400, _batch_denial(status="partial")),
+    (400, _batch_denial(error="memory_action_failed")),
+    (400, {**_batch_denial(), "results": []}),
+    (400, {**_batch_denial(), "results": [_batch_denial()["results"][0]] * 2}),
+    (400, {**_batch_denial(), "results": [{"status": "error", "error": "not_found", "http_status": 404.5}]}),
+    (400, {**_batch_denial(), "results": [{"status": "error", "error": "not_found", "http_status": "404"}]}),
+    (400, {**_batch_denial(), "results": [{"status": "error", "error": "not_found"}]}),
+    (400, _batch_denial(applied_count=None)),
+    (400, _batch_denial(applied_count=0.5)),
+    (400, _batch_denial(applied_count=False)),
+    (400, _batch_denial(failed_count="1")),
+    (400, {k: v for k, v in _batch_denial().items() if k != "applied_count"}),
+    (400, "not a dict"),
+])
+def test_batch_denied_not_found_rejects_old_and_broken_shapes(status, body):
+    assert memory_probe._batch_denied_not_found(status, body) is False
+
+
+def _v2_noop(**over):
+    # Wire shape from proactive_core._dream_response_doc: no ``job`` key when
+    # there is no job (measured on test, T635 r2).
+    tick = {"enqueued": False, "reason": "v2_scheduler_owned",
+            "state": {"last_dream_completed_at": 0}, "new_cards": 0, "new_turns": 0}
+    tick.update(over)
+    return tick
+
+
+def test_v2_dream_noop_shape_accepts_exact_contract():
+    assert proactive_probe._v2_dream_noop_shape(_v2_noop()) is True
+
+
+@pytest.mark.parametrize("tick", [
+    _v2_noop(job=None),                                     # job key present at all = off-wire
+    _v2_noop(job={"job_id": "1", "job_kind": "memory_dream"}),
+    _v2_noop(enqueued=True),
+    _v2_noop(reason="dream_already_pending"),
+    _v2_noop(state=None),
+    {"enqueued": True, "job": {"job_kind": "memory_dream"}},  # pre-T635 V1 shape
+    {},
+    "not a dict",
+])
+def test_v2_dream_noop_shape_rejects_broken_and_v1_shapes(tick):
+    assert proactive_probe._v2_dream_noop_shape(tick) is False
+
+
+def _dream_client(ticks, poll):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def _seal(self, plaintext):
+            return {"id": "seed", "body_ct": "x"}
+
+        def post(self, path, *, json):
+            self.calls.append(path)
+            if path == "/v1/memory/add":
+                return _Response(201, {"id": "seed"})
+            if path == "/v1/dream/tick":
+                return _Response(200, ticks.pop(0))
+            raise AssertionError(path)
+
+        def get(self, path, **_kw):
+            assert path == "/v1/proactive/jobs/poll"
+            return _Response(200, poll)
+    return Client()
+
+
+def test_dream_latest_only_v2_scheduler_owned_passes_on_exact_contract():
+    detail = proactive_probe._case_dream_latest_only(_dream_client([_v2_noop(), _v2_noop()], {"jobs": []}))
+    assert "V2 scheduler-owned" in detail
+
+
+@pytest.mark.parametrize("ticks,poll", [
+    ([_v2_noop(), _v2_noop()], {}),                                        # poll without jobs list
+    ([_v2_noop(), _v2_noop()], {"jobs": [{"job_kind": "memory_dream", "job_id": "9"}]}),
+    ([_v2_noop(), _v2_noop(job={"job_id": "1", "job_kind": "memory_dream"})], {"jobs": []}),
+    ([_v2_noop(), _v2_noop(reason="dream_already_pending")], {"jobs": []}),
+])
+def test_dream_latest_only_v2_rejects_off_contract(ticks, poll):
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._case_dream_latest_only(_dream_client(ticks, poll))
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+def test_dream_latest_only_v1_single_flight_path_is_unchanged():
+    ticks = [
+        {"enqueued": True, "job": {"job_kind": "memory_dream", "job_id": "7"}},
+        {"enqueued": False, "reason": "dream_already_pending"},
+    ]
+    poll = {"jobs": [{"job_kind": "memory_dream", "job_id": "7"}]}
+    detail = proactive_probe._case_dream_latest_only(_dream_client(ticks, poll))
+    assert "duplicate forced dream suppressed" in detail
+
+
+def _attribution_client(status, body):
+    class Client:
+        def _request(self, method, path, **_kw):
+            assert (method, path) == ("DELETE", "/v1/model_api/delete")
+            return _Response(200, {})
+
+        def post(self, path, *, json):
+            assert path == "/v1/model_api/chat/send"
+            return _Response(status, body)
+    return Client()
+
+
+def test_error_attribution_accepts_400_model_api_not_configured():
+    result, detail = experience_probe._error_attribution(
+        _attribution_client(400, {"error": "model_api_not_configured"}), {}
+    )
+    assert result == experience_probe.BLOCKED_EVIDENCE
+    assert "400 model_api_not_configured" in detail
+
+
+@pytest.mark.parametrize("status,body", [
+    (503, {"error": "runtime_policy_not_ready"}),   # pre-T635 contract
+    (400, {"error": "model_api_not_tested"}),
+    (202, {"job_id": "x"}),
+    (500, {"error": "boom"}),
+    (404, {"error": "not_found"}),
+])
+def test_error_attribution_rejects_old_and_wrong_shapes(status, body):
+    result, _detail = experience_probe._error_attribution(_attribution_client(status, body), {})
+    assert result == experience_probe.PRODUCT_FAIL
+
+
+# --- T635 (codex3 r3): drive the REAL _isolation with a fake pair of clients so
+# that reverting only the supersede branch (while keeping the helper) turns red.
+class _IsoResponse(_Response):
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=None, response=None)  # type: ignore[arg-type]
+
+
+class _IsoClient:
+    """Minimal E2EClient stand-in for memory_probe._isolation.
+
+    ``A`` owns one card whose summary carries the marker; ``B`` sees nothing in
+    its index, gets the exact missing shape on fetch, and receives the configured
+    (status, body) when it tries to supersede A's card."""
+
+    def __init__(self, *, supersede_status=None, supersede_body=None, a_cards=None):
+        self.api_url = "https://test-api.feedling.app"
+        self.user_id = "usr_fake"
+        self.calls: list[tuple[str, dict]] = []
+        self._supersede = (supersede_status, supersede_body)
+        self._a_cards = a_cards
+        self.torn_down = False
+
+        class _Http:
+            def close(self_inner):
+                pass
+        self._http = _Http()
+
+    def post(self, path, *, json):
+        self.calls.append((path, json))
+        if path == "/v1/memory/actions":
+            action = json["actions"][0]
+            if action["type"] == "memory.add":
+                self._a_cards = [{"id": "card_A", "summary": action["memory"]["summary"]}]
+                return _IsoResponse(200, {"status": "ok", "results": [{"status": "ok", "http_status": 200}]})
+            if action["type"] == "memory.supersede":
+                return _IsoResponse(*self._supersede)
+        if path == "/v1/memory/index":
+            return _IsoResponse(200, {"items": list(self._a_cards or [])})
+        if path == "/v1/memory/fetch":
+            return _IsoResponse(200, {"items": [], "missing_ids": list(json["ids"]), "unavailable_ids": []})
+        raise AssertionError(path)
+
+    def teardown(self):
+        self.torn_down = True
+
+
+def _run_isolation(monkeypatch, *, supersede_status, supersede_body):
+    a = _IsoClient()
+    b = _IsoClient(supersede_status=supersede_status, supersede_body=supersede_body, a_cards=[])
+    monkeypatch.setattr(memory_probe.E2EClient, "provision", classmethod(lambda cls, **_kw: b))
+    result, detail = memory_probe._isolation(a)
+    assert b.torn_down, "account B must always be torn down"
+    assert [p for p, _ in b.calls] == ["/v1/memory/index", "/v1/memory/fetch", "/v1/memory/actions"]
+    return result, detail
+
+
+def test_isolation_passes_on_exact_batch_denial(monkeypatch):
+    result, detail = _run_isolation(monkeypatch, supersede_status=400, supersede_body=_batch_denial())
+    assert result == memory_probe.PASS, detail
+
+
+@pytest.mark.parametrize("status,body", [
+    (404, {"error": "not_found"}),                 # pre-T635 top-level shape must no longer pass
+    (200, {"status": "ok"}),
+    (201, {"status": "ok"}),
+    (400, _batch_denial(applied_count=None)),
+    (400, {"status": "failed", "error": "not_found", "results": []}),
+    (403, {"error": "forbidden"}),
+])
+def test_isolation_fails_on_old_or_broken_denial(monkeypatch, status, body):
+    result, detail = _run_isolation(monkeypatch, supersede_status=status, supersede_body=body)
+    assert result == memory_probe.PRODUCT_FAIL, detail
