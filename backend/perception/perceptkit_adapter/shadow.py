@@ -332,8 +332,8 @@ def observe_photo(user_id: str, photo_id: str, *,
     ``occurred_at`` is the server receive time. ``captured_at`` is the raw
     ``metadata.occurred_at`` the client sent, if any; when it is a usable
     capture time it becomes the observation time, so the photo counts toward
-    the day it was taken. The wake the kit raises for it is still stamped with
-    receive time (see wake_port).
+    the day it was taken. The wake the kit raises for it is queued with the
+    delivery time, never the capture time (see wake_port).
     """
     def build():
         from .events import photo_capture_time, photo_envelope
