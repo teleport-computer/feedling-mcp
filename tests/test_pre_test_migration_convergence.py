@@ -123,7 +123,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0044_divergence_observed_at"]
+    assert script.get_heads() == ["0045_account_recover_challenges"]
+    assert (
+        script.get_revision("0045_account_recover_challenges").down_revision
+        == "0044_divergence_observed_at"
+    )
     assert (
         script.get_revision("0043_divergence_skew").down_revision
         == "0042_perceptkit_retraction"
