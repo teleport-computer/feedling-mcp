@@ -905,6 +905,12 @@ prod/pre 的 authority 与 selector 必须从各自 exact deployed release 和 l
 | Migration | 正常发布由应用启动前的 app-role Alembic 执行；`TEE migrate` workflow 的 `pre` lane（owner DSN + verify-full CA）仅用于初始化、诊断和人工恢复。 |
 | App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |
 
+TEE revision `0045_account_recover_challenges` adds the recovery-challenge table
+and its two indexes that existed only in the RDS chain. Normal application
+startup applies it before readiness; it also advances any existing prepared
+marker to the new head. No manual DDL or historical challenge copying is needed.
+This describes the release migration, not evidence that it is already deployed.
+
 Phase 4 is a stop-the-world release unit. After stopping backend, main
 `serve-worker`, and the independent runner, run the final replicate/reconcile
 and strict verify, then execute the offline bridge tool from the same release:

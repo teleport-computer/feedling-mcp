@@ -19,7 +19,7 @@ TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
-EXPECTED_TEE_HEAD = "0044_divergence_observed_at"
+EXPECTED_TEE_HEAD = "0045_account_recover_challenges"
 
 # The two inventory files that name the shared test CVMs.  Every job that
 # reaches one of those machines has to learn its target from here.
@@ -509,6 +509,10 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     assert runtime_head == EXPECTED_TEE_HEAD
     assert (
         script.get_revision(EXPECTED_TEE_HEAD).down_revision
+        == "0044_divergence_observed_at"
+    )
+    assert (
+        script.get_revision("0044_divergence_observed_at").down_revision
         == "0043_divergence_skew"
     )
     assert (
