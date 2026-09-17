@@ -430,6 +430,7 @@ jobs:
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
+            tests/test_admin_lane_rollup_summary.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
@@ -1058,6 +1059,7 @@ jobs:
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
+            tests/test_admin_lane_rollup_summary.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
