@@ -776,6 +776,21 @@ def _case_stale_wake_expiry(c) -> str:
     return f"stale wake hidden from poll; expired status count {before_expired}->{expired}"
 
 
+def _v2_dream_noop_shape(tick) -> bool:
+    """Exact V2 scheduler-owned no-op as it appears ON THE WIRE.
+
+    proactive_core._v2_dream_scheduler_noop carries job=None internally, but
+    _dream_response_doc only emits a ``job`` object when one exists — so the
+    public contract for "no job" is the key being ABSENT (measured on test,
+    T635 r2). A ``job`` key of any value, an ``enqueued`` that is not exactly
+    False, or a missing/non-dict ``state`` is off-contract."""
+    return (isinstance(tick, dict)
+            and tick.get("enqueued") is False
+            and tick.get("reason") == "v2_scheduler_owned"
+            and "job" not in tick
+            and isinstance(tick.get("state"), dict))
+
+
 def _case_dream_latest_only(c) -> str:
     envelope = c._seal(json.dumps({
         "summary": "Deep probe dream seed",
@@ -793,6 +808,31 @@ def _case_dream_latest_only(c) -> str:
     _body(c.post("/v1/memory/add", json={"envelope": envelope}), expected=(201,), action="seed dream memory")
     first = _body(c.post("/v1/dream/tick", json={"force": True}), expected=(200,), action="first dream tick")
     second = _body(c.post("/v1/dream/tick", json={"force": True}), expected=(200,), action="second dream tick")
+    if first.get("reason") == "v2_scheduler_owned":
+        # Runtime V2 accounts (the default for new hosted accounts): dreaming is
+        # owned by the V2 scheduler, so the public tick — even forced — is a
+        # structured no-op by contract (backend/proactive/proactive_core.py
+        # _v2_dream_scheduler_noop): enqueued=False, job=None, state carried,
+        # and it must stay idempotent. No legacy proactive_jobs dream may be
+        # created or become pollable. (The V1 single-flight assertions below
+        # still apply to resident_cli accounts.)
+        for label, tick in (("first", first), ("second", second)):
+            # Every field is checked explicitly against the wire shape (see
+            # _v2_dream_noop_shape); codex3 review of T635 asked for this.
+            if not _v2_dream_noop_shape(tick):
+                raise _ProbeIssue("PRODUCT_FAIL", f"{label} V2 dream tick off-contract: {tick}")
+        poll = _body(
+            c.get("/v1/proactive/jobs/poll", params={"since": 0, "timeout": 0, "limit": 100}),
+            expected=(200,),
+            action="poll dream jobs",
+        )
+        jobs = poll.get("jobs")
+        if not isinstance(jobs, list):
+            raise _ProbeIssue("PRODUCT_FAIL", f"poll response has no jobs list: {poll}")
+        legacy = [job for job in jobs if not isinstance(job, dict) or job.get("job_kind") == "memory_dream"]
+        if legacy:
+            raise _ProbeIssue("PRODUCT_FAIL", f"V2 account exposed {len(legacy)} legacy/malformed pollable dream job(s)")
+        return "V2 scheduler-owned dream: forced ticks are idempotent structured no-ops, no legacy job pollable"
     if first.get("enqueued") is not True or (first.get("job") or {}).get("job_kind") != "memory_dream":
         raise _ProbeIssue("PRODUCT_FAIL", f"first forced dream did not enqueue: {first}")
     if second.get("enqueued") is not False or second.get("reason") != "dream_already_pending":
