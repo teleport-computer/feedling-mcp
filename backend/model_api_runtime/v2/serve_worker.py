@@ -87,6 +87,7 @@ from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import visual_transport
 from hosted import vision_observer
+from memory.embedding import sweep as memory_embedding_sweep
 from memory import garden_component
 from memory import memory_core
 from screen import screen_read_core
@@ -3383,18 +3384,31 @@ def _tick_dream_for_user(user_id: str) -> int:
     return 1 if result.get("enqueued") else 0
 
 
+def _tick_embedding_for_user(user_id: str) -> int:
+    """Opt-in embedding maintenance; only serve-worker constructs the model."""
+    if not memory_embedding_sweep.enabled():
+        return 0
+    try:
+        store = core_store.get_store_per_load_mode(user_id, reason="memory embedding sweep")
+        return memory_embedding_sweep.tick(store)
+    except Exception:
+        log.warning("memory_embedding encoded=0 unavailable_reason=entry_failed")
+        return 0
+
+
 def _tick_extraction_for_user(user_id: str) -> int:
     """Run only the independently enabled memory-maintenance lanes.
 
     Capture is safe to soak without also turning on provider-backed Dream.
-    Keeping two explicit flags prevents a broad extraction switch from
-    silently enrolling users in both background token consumers.
+    Capture and Dream have independent flags; the separate default-off
+    embedding pass does not enqueue jobs or contribute to the enqueue count.
     """
     enqueued = 0
     if _CAPTURE_ENABLED:
         enqueued += _tick_capture_for_user(user_id)
     if _DREAM_ENABLED:
         enqueued += _tick_dream_for_user(user_id)
+    _tick_embedding_for_user(user_id)
     return enqueued
 
 
@@ -5363,7 +5377,7 @@ def _build_scheduler_deps():
             admin_core.list_runtime_modes().get(
                 hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
             )
-            if _CAPTURE_ENABLED or _DREAM_ENABLED
+            if _CAPTURE_ENABLED or _DREAM_ENABLED or memory_embedding_sweep.enabled()
             else []
         ),
         tick_extraction=_tick_extraction_for_user,

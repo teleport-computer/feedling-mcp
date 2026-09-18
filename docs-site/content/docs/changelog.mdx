@@ -21,6 +21,9 @@ change must not be interpreted as an API guarantee.
   to the operator-readable provider ledger. Retry deadlines and Dream write
   safeguards are unchanged.
 
+- Added disabled-by-default serve-worker preparation of local E5 ONNX vectors for plaintext memories, with versioned projections and bounded scans. Retrieval behavior is unchanged; model/dependency provisioning remains separate.
+  Rolling back the vector-table migration retains the table and its data; removal requires explicit cleanup.
+
 - `POST /v1/perception/photo/evaluate` documents two optional metadata fields
   that clients already send: `occurred_at` (when the photo was taken) and
   `source_event_id` (stable device identity). A valid `occurred_at` now dates

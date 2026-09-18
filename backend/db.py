@@ -34,8 +34,10 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import struct
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -958,6 +960,8 @@ def save_all_users(users: list[dict]) -> None:
                             cur, removed_id, advance_generation=True,
                         )
                         _delete_runtime_allowlist_on_cursor(cur, removed_id)
+                        cur.execute("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,))
+                        mirror_group.append(("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,)))
                         # Preserve the global lifecycle -> users/chat lock order.
                         # A bulk users FOR UPDATE before lifecycle would deadlock
                         # against append/clear, which take the lifecycle fence
@@ -1024,6 +1028,7 @@ def delete_user(user_id: str) -> bool:
                 )
                 _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
+                cur.execute("DELETE FROM memory_vectors WHERE user_id=%s", (user_id,))
             # Rollup anonymize-merge AFTER the users DELETE, inside the same
             # transaction (this is the AUTHORITATIVE site — delete_user_data
             # is only a swallowed best-effort belt and must not be the load
@@ -1036,7 +1041,8 @@ def delete_user(user_id: str) -> bool:
             chat_cells = chat_rollup_anonymize_user(conn, user_id)
             anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
-    group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    group: list[tuple[str, tuple]] = [
+        (sql, (user_id,)), ("DELETE FROM memory_vectors WHERE user_id=%s", (user_id,))]
     if chat_cells:
         group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized:
@@ -17458,6 +17464,69 @@ def memory_delete(user_id: str, moment_id: str) -> bool:
     return deleted
 
 
+def memory_vectors_load(user_id: str, model_id: str) -> dict:
+    """Read one model version; omit corrupt rows so the scanner rebuilds them.
+
+    Database errors still propagate. Only invalid derived values count as absent.
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT moment_id, projection_hash, dim, vector FROM memory_vectors "
+            "WHERE user_id=%s AND model_id=%s", (user_id, model_id),
+        ).fetchall()
+    result = {}
+    invalid = 0
+    for mid, digest, dim, blob in rows:
+        values = list(struct.unpack("<" + "f" * dim, blob))
+        if not any(values) or any(not math.isfinite(v) for v in values):
+            invalid += 1
+            continue
+        result[mid] = (digest, values)
+    if invalid:
+        log.warning("memory_embedding invalid_vectors=%d", invalid)
+    return result
+
+
+def memory_vectors_upsert(user_id: str, model_id: str, rows) -> None:
+    """Rows are (moment_id, projection_hash, float vector); one atomic batch.
+
+    Caller owns fresh-card projection checks. The shared account fence also
+    prevents an in-flight scanner from recreating rows after account deletion.
+    """
+    prepared = []
+    for mid, digest, vector in rows:
+        values = [float(v) for v in vector]
+        if (not mid or not model_id or not re.fullmatch(r"[0-9a-f]{16}", digest)
+                or not values or any(not math.isfinite(v) for v in values)
+                or not any(values)):
+            raise ValueError("memory_vector_invalid")
+        blob = struct.pack("<" + "f" * len(values), *values)
+        if not any(struct.unpack("<" + "f" * len(values), blob)):
+            raise ValueError("memory_vector_invalid")
+        prepared.append((user_id, mid, model_id, digest, len(values), blob,
+                         datetime.now(timezone.utc).isoformat()))
+    if not prepared:
+        return
+    with memory_user_mutation_fence(user_id) as conn:
+        if conn.execute("SELECT 1 FROM users WHERE user_id=%s FOR KEY SHARE", (user_id,)).fetchone() is None:
+            raise ValueError("memory_vector_user_missing")
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO memory_vectors(user_id,moment_id,model_id,projection_hash,dim,vector,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id,moment_id,model_id) "
+                "DO UPDATE SET projection_hash=EXCLUDED.projection_hash, dim=EXCLUDED.dim, "
+                "vector=EXCLUDED.vector, created_at=EXCLUDED.created_at", prepared)
+
+
+def memory_vectors_prune(user_id: str, model_id: str, keep_moment_ids: list[str]) -> int:
+    """Prune only this user/model; an empty keep set removes all its vectors."""
+    with memory_user_mutation_fence(user_id) as conn:
+        return conn.execute(
+            "DELETE FROM memory_vectors WHERE user_id=%s AND model_id=%s "
+            "AND NOT (moment_id = ANY(%s))", (user_id, model_id, keep_moment_ids),
+        ).rowcount
+
+
 def memory_replace_all(user_id: str, moments: list[dict]) -> None:
     """Atomically reconcile the stored moment set to `moments`. The final row
     set equals the input list (full-replace semantics preserved), but only rows
@@ -19247,6 +19316,7 @@ def delete_user_data(user_id: str) -> None:
         "chat_message_archive",
         "chat_messages",
         "memory_moments",
+        "memory_vectors",
         "world_book_entries",
         "frame_envelopes",
         "user_logs",
