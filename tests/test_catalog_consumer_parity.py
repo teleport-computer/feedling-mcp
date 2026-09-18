@@ -220,6 +220,7 @@ def _consumer_blame_map() -> dict[str, str]:
     out.setdefault("platform_execution_timeout", "system")
     out.setdefault("provider_timeout", "provider_transient")
     out.setdefault("provider_empty_reply", "provider_transient")
+    out.setdefault("provider_error_unclassified", "provider_transient")
     out.setdefault("reply_parse_failed", "system")
     out.setdefault("model_not_found", "user_provider")  # 裸 404+model 分支，和规则表一致
     out.setdefault("unknown", "system")

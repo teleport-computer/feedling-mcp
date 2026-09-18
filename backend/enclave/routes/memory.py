@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 
-import anyio.to_thread
 import memory_search_contract as search_contract
 from fastapi import APIRouter
 from starlette.requests import Request
@@ -14,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from enclave import auth, backend_client, envelope, readside, memory_search
 from enclave.routes._body import read_json_payload
+from enclave.routes import _reqlog
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 
 router = APIRouter()
@@ -47,8 +47,8 @@ async def v1_memory_index(request: Request):
         return JSONResponse({"error": "memory_search_protocol_unsupported"}, status_code=400)
     if query and served:
         try:
-            result = await anyio.to_thread.run_sync(
-                memory_search.search, moments, user_id or "", content_sk, payload)
+            result = await _reqlog.decrypt_job(
+                request, memory_search.search, moments, user_id or "", content_sk, payload)
         except search_contract.SearchLimitExceeded:
             return JSONResponse({"error": "memory_search_resource_limit"}, status_code=413)
         return JSONResponse(result)
@@ -68,7 +68,7 @@ async def v1_memory_index(request: Request):
             item.pop("_search_content", None)
         return items, unavailable_ids
 
-    items, unavailable_ids = await anyio.to_thread.run_sync(_work)
+    items, unavailable_ids = await _reqlog.decrypt_job(request, _work)
     return JSONResponse({
         "user_id": user_id,
         "items": items,
@@ -100,7 +100,7 @@ async def v1_memory_fetch(request: Request):
         items = [readside.memory_public_item(item) for item in items]
         return items, unavailable_ids
 
-    items, unavailable_ids = await anyio.to_thread.run_sync(_work)
+    items, unavailable_ids = await _reqlog.decrypt_job(request, _work)
     return JSONResponse({
         "user_id": user_id,
         "items": items,
@@ -178,7 +178,7 @@ async def v1_memory_list(request: Request):
             decrypted.append(base)
         return decrypted, errors
 
-    decrypted, errors = await anyio.to_thread.run_sync(_work)
+    decrypted, errors = await _reqlog.decrypt_job(request, _work)
     return JSONResponse({
         "user_id": user_id,
         "moments": decrypted,

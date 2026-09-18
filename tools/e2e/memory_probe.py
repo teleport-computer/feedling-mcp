@@ -62,6 +62,31 @@ def _capture_loop(c: E2EClient):
     return BLOCKED_EVIDENCE, f"no card with marker {mk} within {CAPTURE_POLL_SEC:.0f}s"
 
 
+def _exact_int(value, expected: int) -> bool:
+    """True only for a real int equal to ``expected`` (bool/float/str/None fail)."""
+    return type(value) is int and value == expected
+
+
+def _batch_denied_not_found(status: int, body) -> bool:
+    """Exact batch-actions denial shape for a card the caller does not own.
+
+    Every field is required and type-checked: a missing/null count, a float, a
+    bool, or a numeric string is a broken shape and must read as *not* the
+    contract (codex3 review of T635: ``int(x or 0)`` had let those pass)."""
+    if status != 400 or not isinstance(body, dict):
+        return False
+    if body.get("status") != "failed" or body.get("error") != "not_found":
+        return False
+    results = body.get("results")
+    if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+        return False
+    item = results[0]
+    return (item.get("status") == "error" and item.get("error") == "not_found"
+            and _exact_int(item.get("http_status"), 404)
+            and _exact_int(body.get("applied_count"), 0)
+            and _exact_int(body.get("failed_count"), 1))
+
+
 def _isolation(c: E2EClient):
     mk = new_marker()
     st, body = mem_add(c, summary=f"A 的私密事实 {mk}", content="only A owns this")
@@ -91,16 +116,23 @@ def _isolation(c: E2EClient):
                 result, detail = (PRODUCT_FAIL,
                                   f"B fetch of A's id not exactly missing: {fb}")
             else:
-                # 3) B mutating A's card must be EXACTLY denied 404 not_found (a 500 or
-                # any other code is not evidence of isolation).
+                # 3) B mutating A's card must be EXACTLY denied as not_found (a 500 or
+                # any other shape is not evidence of isolation). Contract since the
+                # batch actions API (backend/memory/actions.py): items execute
+                # independently and carry their own http_status; a batch with no
+                # applied write and >=1 failure is HTTP 400 with the outer body
+                # {"status": "failed", "error": <first failed item's error>}. So a
+                # cross-user supersede is 400 / status=failed / error=not_found with
+                # the single item at http_status 404. (Before T603 this was a bare
+                # top-level 404 not_found — that shape is gone, not a regression.)
                 st2, body2 = mem_supersede(b, a_id, summary="hijack")
                 if st2 in (200, 201):
                     result, detail = (PRODUCT_FAIL,
                                       f"account B superseded A's card {a_id} — write isolation broken")
-                elif not (st2 == 404 and "not_found" in str(body2)):
+                elif not _batch_denied_not_found(st2, body2):
                     result, detail = (PRODUCT_FAIL,
-                                      f"B mutation of A's card off-contract: {st2} {str(body2)[:80]} "
-                                      f"(expected 404 not_found)")
+                                      f"B mutation of A's card off-contract: {st2} {str(body2)[:120]} "
+                                      f"(expected 400 status=failed error=not_found, item http_status 404)")
     finally:
         try:
             b.teardown()          # a swallowed teardown = a leaked account

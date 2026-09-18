@@ -350,6 +350,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `app_required` | 400 | — | | |
 | `unknown_signals` | 400 | — | agent 感知信号名不识别 | |
 | `unknown_or_unhistorized_signal` | 400 | — | | |
+| `invalid_day` | 400 | — | admin lane-rollup summary 的 `day` 不是 YYYY-MM-DD 有效日期，或不存在前一天 | |
 | `invalid_days` | 400 | — | `days` 查询参数非数字 | |
 
 ## Web 能力（`POST /v1/agent/web/{search,fetch}`，CapabilityResult `error.code`）
@@ -378,8 +379,6 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `export_too_large` | 413 | — | 一次性导出超 80MiB 预算 | |
 | `archive_cleanup_failed` | 503 | system | 账号重置：R2 归档清理失败，reset 中止（可安全重试） | |
 | `confirmation_mismatch` | 400 | — | admin 删除用户端点专用：`confirm` 字段 ≠ `user_id` | |
-| `invalid_dream_ledger_request` | 400 | — | admin 假「没有卡」做梦账本审计/修复端点专用：窗口/用户/指纹/`dry_run` 等参数不合法（`detail` 为不含内容的原因码，如 `users_required`、`invalid_ledger_fingerprint`、`invalid_job_id`、`invalid_rewound_job_ids`） | |
-| `dream_ledger_query_timeout` | 503 | system | 同上两端点：有界读取超过 HTTP 或 PostgreSQL 时限；重跑即可（修复端点幂等） | |
 
 ## 通知中继（notify_relay）
 
@@ -466,6 +465,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
 | `provider_tool_history_rejected` | — | user_provider | error | chat：中转通道拒绝原生工具结果历史；Runtime V2 立即终止本轮而不移除工具重试，并引导用户换模型或稍后重试 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
+| `provider_error_unclassified` | — | provider_transient | error | resident pi：无可用回复且最终 message_end stopReason=error，详情未命中配额/鉴权/上游等既有规则；不同于无错误标记的 provider_empty_reply |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
 | `error_class_unregistered` | — | system | error | vision/image-generation 动态边界收到未注册分类；不透传或保存原始值，只写 content-free 拒绝计数 |

@@ -103,6 +103,117 @@ def test_registry_views_are_derived_from_error_specs():
     )
 
 
+def test_resident_chat_error_specs_have_english_copy():
+    specs = [spec for spec in error_contract.consumer_specs() if spec.domain == "chat"]
+    assert specs
+    assert [spec.code for spec in specs if not spec.safe_text_en.strip()] == []
+
+
+def test_public_error_specs_with_chinese_copy_have_english_copy():
+    specs = [spec for spec in error_contract.all_specs() if spec.public and spec.safe_text_zh.strip()]
+    assert specs
+    assert [spec.code for spec in specs if not spec.safe_text_en.strip()] == []
+
+
+@pytest.mark.parametrize(("code", "english", "chinese"), [
+    (
+        'model_mismatch',
+        'The runtime did not load the selected model. Pick the model again or try later.',
+        '当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。',
+    ),
+    (
+        'content_filtered',
+        "The model's content policy blocked this reply. Try rephrasing.",
+        '这次回复被模型的内容策略拦下了，换个说法再试。',
+    ),
+    (
+        'rate_limited',
+        'The model service is rate-limited. Wait a few minutes and try again.',
+        '模型服务限流了，稍等几分钟再试。',
+    ),
+    (
+        'upstream_unavailable',
+        'Your model service is temporarily unavailable. It will recover on its own shortly.',
+        '你的模型服务暂时不可用，稍后会自动恢复。',
+    ),
+    (
+        'turn_timeout',
+        'This reply timed out. Try again in a moment.',
+        '这轮回复超时了，稍后再试。',
+    ),
+    (
+        'provider_empty_reply',
+        'Your model service returned an empty reply. Try again later; if it keeps happening, check the stability of your model channel or relay.',
+        '你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。',
+    ),
+    (
+        'cli_output_too_large',
+        'Something went wrong while connecting to the model service.',
+        '连接模型服务时出了问题。',
+    ),
+    (
+        'unknown',
+        'Something went wrong while connecting to the model service.',
+        '连接模型服务时出了问题。',
+    ),
+    (
+        'genesis_failed',
+        'Reading your onboarding files did not finish. You can retry later in the Memory Garden.',
+        '入住材料的文件解读没能完成，可稍后在记忆花园重试。',
+    ),
+    (
+        'genesis_partial',
+        'Your onboarding files were read, but some memories could not be imported.',
+        '入住材料的文件解读完成了，但有部分记忆没能导入。',
+    ),
+    (
+        'import_failed',
+        'Importing the chat history failed. Please try again later.',
+        '聊天记录导入失败了，请稍后重试。',
+    ),
+    (
+        'import_stale',
+        'The chat history import stalled and timed out. Please start it again.',
+        '聊天记录导入卡住已超时，请重新发起。',
+    ),
+    (
+        'memory_backoff',
+        'Memory organizing is temporarily blocked and will retry automatically.',
+        '记忆整理暂时受阻，正在自动重试。',
+    ),
+    (
+        'runner_spawn_failed',
+        "Your AI companion's process failed to start. We are looking into it.",
+        '你的 AI 助手进程启动失败，我们正在处理。',
+    ),
+    (
+        'runner_key_decrypt_failed',
+        "Your AI companion can't start right now (key read failed). We are looking into it.",
+        '你的 AI 助手暂时无法启动（密钥读取失败），我们正在处理。',
+    ),
+    (
+        'runner_degraded',
+        "Some of your AI companion's abilities are temporarily limited and are recovering automatically.",
+        '你的 AI 助手部分能力暂时受限，正在自动恢复。',
+    ),
+])
+def test_error_copy_preserves_approved_english_and_chinese(code, english, chinese):
+    spec = error_contract.require_spec(code)
+    assert spec.safe_text_en == english
+    assert spec.safe_text_zh == chinese
+    assert english != chinese
+    for language in ("en", "en-US"):
+        assert spec.text(language) == english
+        assert catalog.user_text_for(code, language=language) == english
+        if spec.domain == "chat":
+            assert resident._notice_for_code(code, "test detail", language=language).user_text == english
+    for language in ("zh", "zh-CN", ""):
+        assert spec.text(language) == chinese
+        assert catalog.user_text_for(code, language=language) == chinese
+        if spec.domain == "chat":
+            assert resident._notice_for_code(code, "test detail", language=language).user_text == chinese
+
+
 def test_hosted_request_validation_codes_do_not_enter_resident_classifier():
     request_codes = {
         spec.code
@@ -635,3 +746,13 @@ def test_t504_shared_provider_auth_boundary_uses_original_body(
     assert error_contract.provider_response_is_auth_failure(
         status, raw_body
     ) is expected
+
+
+def test_pi_unclassified_provider_error_is_registered_without_text_matcher():
+    spec = error_contract.require_spec("provider_error_unclassified")
+    assert spec in error_contract.consumer_specs()
+    assert spec.blame == "provider_transient"
+    assert spec.safe_text_zh == "你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。"
+    assert spec.text("en") == "Your model provider returned an error. Try again later; if it keeps happening, check the provider channel or relay."
+    assert spec not in error_contract.matcher_specs()
+    assert error_contract.classify_text("feedling:pi_provider_error") is None

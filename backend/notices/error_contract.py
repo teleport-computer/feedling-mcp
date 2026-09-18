@@ -255,7 +255,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("image_payload_conflict", "chat", "request", "user_environment", "一次只能使用单图字段或多图字段，请勿同时发送。", en="Send either the single-image fields or images, not both."),
         _spec("image_list_empty", "chat", "request", "user_environment", "图片列表不能为空。", en="The images list must not be empty."),
         _spec("image_count_exceeds_limit", "chat", "request", "user_environment", "一次最多发送 9 张图片。", en="You can send at most 9 images in one message."),
-        _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", matcher=r"\bmodel_mismatch\b"),
+        _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", en="The runtime did not load the selected model. Pick the model again or try later.", matcher=r"\bmodel_mismatch\b"),
         _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
         _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
         _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|" + _AUTH_403 + r"|" + _AUTH_PROVIDER_HTTP_403 + r"|provider_http_401"),
@@ -265,13 +265,14 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("provider_tool_history_rejected", "chat", "provider", "user_provider", "模型似乎调用工具出错了，这个通道暂时无法使用工具，换个模型或稍后重试。", en="The model seems to have hit an error calling tools, so tools are temporarily unavailable on this channel. Switch models or try again later.", matcher=r"function_response\.name:\s*\[required_field_missing\]|function call is missing a thought_signature in functioncall parts|please ensure that function call turn comes immediately after a user turn or after a function response turn"),
         _spec("provider_incompatible", "chat", "provider", "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。", en="The current model does not support a capability used by this request. Choose another model or adjust it in Settings.", matcher=r"unknown variant|not supported|unsupported (parameter|tool)|invalid_request_error.*tool"),
         _spec("context_overflow", "chat", "provider", "user_provider", "这次对话太长超出了模型上限，可精简后再试。", en="This conversation is too long for the model's context window. Shorten it and try again.", matcher=r"context.{0,20}(length|window)|maximum context|too many tokens|prompt is too long"),
-        _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", matcher=r"content_filter|content policy|safety|blocked by"),
-        _spec("rate_limited", "chat", "provider", "provider_transient", "模型服务限流了，稍等几分钟再试。", matcher=r"\b429\b|provider_http_429|too many requests|rate.?limit"),
-        _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason|" + _GENERIC_UPSTREAM_403),
-        _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。"),
+        _spec("content_filtered", "chat", "provider", "provider_transient", "这次回复被模型的内容策略拦下了，换个说法再试。", en="The model's content policy blocked this reply. Try rephrasing.", matcher=r"content_filter|content policy|safety|blocked by"),
+        _spec("rate_limited", "chat", "provider", "provider_transient", "模型服务限流了，稍等几分钟再试。", en="The model service is rate-limited. Wait a few minutes and try again.", matcher=r"\b429\b|provider_http_429|too many requests|rate.?limit"),
+        _spec("upstream_unavailable", "chat", "provider", "provider_transient", "你的模型服务暂时不可用，稍后会自动恢复。", en="Your model service is temporarily unavailable. It will recover on its own shortly.", matcher=r"\b5\d{2}\b|provider_http_5\d{2}|overloaded|timed? ?out|connection (refused|reset|error)|unreachable|stream disconnected|ended without finish_reason|" + _GENERIC_UPSTREAM_403),
+        _spec("turn_timeout", "chat", "provider", "system", "这轮回复超时了，稍后再试。", en="This reply timed out. Try again in a moment."),
         _spec("provider_timeout", "chat", "provider", "provider_transient", "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。", en="Your model service did not respond in time. Check the provider's stability before trying again."),
         _spec("provider_output_truncated", "chat", "provider", "provider_transient", "模型在写完文件前达到了输出上限，未发送不完整的文件。可缩小内容后重试，或换用输出上限更高的模型。", en="The model reached its output limit before finishing the file, so the incomplete file was not sent. Try a smaller version or a model with a higher output limit.", matcher=r"\bprovider_output_truncated\b"),
-        _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。"),
+        _spec("provider_error_unclassified", "chat", "provider", "provider_transient", "你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。", en="Your model provider returned an error. Try again later; if it keeps happening, check the provider channel or relay."),
+        _spec("provider_empty_reply", "chat", "provider", "provider_transient", "你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。", en="Your model service returned an empty reply. Try again later; if it keeps happening, check the stability of your model channel or relay."),
         _spec("file_delivery_incomplete", "chat", "delivery", "system", "文件内容已经保存，但附件发送没有完成。请稍后再试。", en="The file was saved, but its attachment was not delivered. Please try again later.", matcher=r"\bfile_delivery_incomplete\b"),
         _spec("canvas_file_delivery_incomplete", "chat", "delivery", "system", "画布内容已经保存，但卡片更新没有完成。请稍后再试。", en="The Canvas content was saved, but its card update did not finish. Please try again later.", matcher=r"\bcanvas_file_delivery_incomplete\b"),
         _spec(
@@ -285,8 +286,8 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
                 "We're looking into it — please send it again."
             ),
         ),
-        _spec("cli_output_too_large", "chat", "provider", "system", "连接模型服务时出了问题。", matcher=r"\bcli_output_too_large\b"),
-        _spec("unknown", "chat", "provider", "system", "连接模型服务时出了问题。"),
+        _spec("cli_output_too_large", "chat", "provider", "system", "连接模型服务时出了问题。", en="Something went wrong while connecting to the model service.", matcher=r"\bcli_output_too_large\b"),
+        _spec("unknown", "chat", "provider", "system", "连接模型服务时出了问题。", en="Something went wrong while connecting to the model service."),
         _spec(UNREGISTERED_ERROR_CLASS, "chat", "contract", "system", "系统返回了未注册的错误分类，我们已记录并会尽快排查。", en="The runtime returned an unregistered error classification. We recorded it for investigation."),
     )
 
@@ -300,14 +301,14 @@ def _platform_specs() -> tuple[ErrorSpec, ...]:
 
 def _workflow_specs() -> tuple[ErrorSpec, ...]:
     return (
-        _spec("genesis_failed", "workflow", "genesis", "system", "入住材料的文件解读没能完成，可稍后在记忆花园重试。"),
-        _spec("genesis_partial", "workflow", "genesis", "system", "入住材料的文件解读完成了，但有部分记忆没能导入。"),
-        _spec("import_failed", "workflow", "import", "system", "聊天记录导入失败了，请稍后重试。"),
-        _spec("import_stale", "workflow", "import", "system", "聊天记录导入卡住已超时，请重新发起。"),
-        _spec("memory_backoff", "workflow", "memory", "system", "记忆整理暂时受阻，正在自动重试。"),
-        _spec("runner_spawn_failed", "workflow", "runner", "system", "你的 AI 助手进程启动失败，我们正在处理。"),
-        _spec("runner_key_decrypt_failed", "workflow", "runner", "system", "你的 AI 助手暂时无法启动（密钥读取失败），我们正在处理。"),
-        _spec("runner_degraded", "workflow", "runner", "system", "你的 AI 助手部分能力暂时受限，正在自动恢复。"),
+        _spec("genesis_failed", "workflow", "genesis", "system", "入住材料的文件解读没能完成，可稍后在记忆花园重试。", en="Reading your onboarding files did not finish. You can retry later in the Memory Garden."),
+        _spec("genesis_partial", "workflow", "genesis", "system", "入住材料的文件解读完成了，但有部分记忆没能导入。", en="Your onboarding files were read, but some memories could not be imported."),
+        _spec("import_failed", "workflow", "import", "system", "聊天记录导入失败了，请稍后重试。", en="Importing the chat history failed. Please try again later."),
+        _spec("import_stale", "workflow", "import", "system", "聊天记录导入卡住已超时，请重新发起。", en="The chat history import stalled and timed out. Please start it again."),
+        _spec("memory_backoff", "workflow", "memory", "system", "记忆整理暂时受阻，正在自动重试。", en="Memory organizing is temporarily blocked and will retry automatically."),
+        _spec("runner_spawn_failed", "workflow", "runner", "system", "你的 AI 助手进程启动失败，我们正在处理。", en="Your AI companion's process failed to start. We are looking into it."),
+        _spec("runner_key_decrypt_failed", "workflow", "runner", "system", "你的 AI 助手暂时无法启动（密钥读取失败），我们正在处理。", en="Your AI companion can't start right now (key read failed). We are looking into it."),
+        _spec("runner_degraded", "workflow", "runner", "system", "你的 AI 助手部分能力暂时受限，正在自动恢复。", en="Some of your AI companion's abilities are temporarily limited and are recovering automatically."),
     )
 
 

@@ -1036,6 +1036,9 @@ CONSUMER_ERROR_CLASSES = frozenset(
 # **provider 自己的文本**送进来 —— 裸英文短语("empty provider reply")可被上游
 # 报错原样命中而劫持归因(自审 2026-08-07)。
 EMPTY_PROVIDER_REPLY_MARK = "feedling:empty_provider_reply"
+# Same namespace protection: only the pi no-reply path mints this marker from
+# the final message_end's stopReason, never from a provider's prose.
+PI_PROVIDER_ERROR_MARK = "feedling:pi_provider_error"
 # 与上面成对:provider **给过**原始 assistant 文本,是我们自己的清洗规则
 # (_sanitize_reply_text:纯英文推理不当回复、协议残片压制等)把它清空的。
 # 归 system —— 这是本批唯一的归因边界,谁把内容弄没的谁背锅。
@@ -1095,9 +1098,10 @@ def _parse_failure_raw_fields(exc: BaseException) -> dict:
     }
 
 
-def _pi_no_reply_error(detail: str) -> RuntimeError:
-    # Keep exception text (and therefore every existing matcher) unchanged.
-    exc = RuntimeError(f"{EMPTY_PROVIDER_REPLY_MARK}: pi agent produced no reply: {detail}")
+def _pi_no_reply_error(detail: str, *, provider_error: bool = False) -> RuntimeError:
+    # Preserve the detail for specific quota/auth/upstream matchers.
+    marker = PI_PROVIDER_ERROR_MARK if provider_error else EMPTY_PROVIDER_REPLY_MARK
+    exc = RuntimeError(f"{marker}: pi agent produced no reply: {detail}")
     # Only status-shaped numbers, not arbitrary token counts/request IDs.
     match = re.search(
         r"(?:^\s*(?:Error:\s*)?|\bHTTP(?:/\d(?:\.\d)?)?\s+|"
@@ -1206,10 +1210,12 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     # 「空回复」判定**必须排在规则表之后**:pi 退出码永远是 0，API 错误(配额/鉴权/
     # 断流)只体现在 detail 里，那条异常同时带空回复标记和错误详情 —— 先判空会把
     # quota_insufficient 之类更具体的分类整个遮蔽掉(codex2 gatekeep 2026-08-06)。
-    # 规则表没命中 = 真的只是「成功但没内容」，那才归 provider 的瞬时问题。
+    # 未命中规则表时，仍须区分 pi 明确报错和无错误的空回复。
     if SANITIZED_TO_EMPTY_MARK in text:
         # provider 给过文本、我们清空的 —— 归 system,与下面成对。
         return _notice_for_code("reply_parse_failed", detail)
+    if PI_PROVIDER_ERROR_MARK in text:
+        return _notice_for_code("provider_error_unclassified", detail)
     if EMPTY_PROVIDER_REPLY_MARK in text:
         # 2026-08-07(usr_7f30d63f 分诊):模型/中转返回 200 但内容为空(断流、
         # 配额紧张时的假成功等)。这不是我们的解析问题 —— 归 provider,
@@ -6451,6 +6457,45 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
     return objects
 
 
+def _pi_final_message_end(stdout: str) -> dict:
+    """Last assistant end, falling back to a role-less legacy end if absent.
+
+    User echoes and tool results cannot replace the assistant's terminal state.
+    No-reply classification and error diagnostics share this selection.
+    """
+    final_assistant = {}
+    final_legacy = {}
+    for obj in _json_objects_from_cli_output(stdout or ""):
+        if not isinstance(obj, dict) or obj.get("type") != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            final_assistant = obj
+        elif "role" not in msg:
+            final_legacy = obj
+    return final_assistant or final_legacy
+
+
+def _pi_final_stop_reason(stdout: str) -> str:
+    final = _pi_final_message_end(stdout)
+    msg = final.get("message")
+    msg = msg if isinstance(msg, dict) else {}
+    return str(msg.get("stopReason") or final.get("stopReason") or "").strip().lower()
+
+
+def _pi_error_message(stdout: str) -> str:
+    """Provider text only from the final error turn; never an earlier failure."""
+    final = _pi_final_message_end(stdout)
+    msg = final.get("message")
+    msg = msg if isinstance(msg, dict) else {}
+    if str(msg.get("stopReason") or final.get("stopReason") or "").strip().lower() != "error":
+        return ""
+    value = msg.get("errorMessage", final.get("errorMessage"))
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _cli_error_detail(stdout: str, stderr: str) -> str:
     """Best error string for a non-zero CLI exit.
 
@@ -6488,7 +6533,6 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     claude_err = ""
     codex_err = ""
     codex_err_priority = 0
-    pi_err = ""
     for obj in _json_objects_from_cli_output(stdout or ""):
         if not isinstance(obj, dict):
             continue
@@ -6499,13 +6543,7 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
         if msg and priority >= codex_err_priority:
             codex_err = msg   # keep the last error event (the final one)
             codex_err_priority = priority
-        # pi surfaces API errors on the final message_end: stopReason=error + errorMessage.
-        if obj.get("type") == "message_end":
-            msg = obj.get("message")
-            if (isinstance(msg, dict) and msg.get("stopReason") == "error"
-                    and isinstance(msg.get("errorMessage"), str) and msg["errorMessage"].strip()):
-                pi_err = msg["errorMessage"].strip()   # keep the last error turn
-    detail = claude_err or codex_err or pi_err
+    detail = claude_err or codex_err or _pi_error_message(stdout)
     if detail:
         return detail[:300]
     if (stderr or "").strip():
@@ -7788,6 +7826,7 @@ def _pi_stream_shape(raw: str) -> dict:
     update_text_seen = False
     update_text_chars_max = 0
     stop_reasons: list[str] = []
+    stop_reason_last = ""
     stop_length_seen = False
     stop_max_tokens_seen = False
     parse_error_count = 0
@@ -7825,6 +7864,20 @@ def _pi_stream_shape(raw: str) -> dict:
                 if kind != "message_end":
                     continue
                 assistant_message_ends += 1
+                raw_stop = str(msg.get("stopReason") or obj.get("stopReason") or "").strip().lower()
+                stop_reason_last = (
+                    raw_stop if raw_stop in _PI_STREAM_STOP_REASONS else "other"
+                ) if raw_stop else ""
+                if raw_stop:
+                    stop_reason = stop_reason_last
+                    # Track truncation independently of the bounded reason summary:
+                    # a late stop reason must not disappear after its eighth item.
+                    stop_length_seen |= stop_reason == "length"
+                    stop_max_tokens_seen |= stop_reason == "max_tokens"
+                    if (stop_reason not in stop_reasons
+                            and len(stop_reasons) < _PI_STREAM_MAX_STOP_REASONS
+                            and len(",".join([*stop_reasons, stop_reason])) <= 80):
+                        stop_reasons.append(stop_reason)
                 # A structurally odd message (content not a list) raises below and
                 # is counted by the per-event except: partial counts kept, flagged.
                 for block in msg.get("content") or []:
@@ -7838,15 +7891,6 @@ def _pi_stream_shape(raw: str) -> dict:
                         block_counts["other"] += 1
                     if block_type == "text" and isinstance(block.get("text"), str):
                         text_chars_total += len(block["text"].strip())
-                raw_stop = str(msg.get("stopReason") or obj.get("stopReason") or "").strip().lower()
-                if raw_stop:
-                    stop_reason = raw_stop if raw_stop in _PI_STREAM_STOP_REASONS else "other"
-                    # Track truncation independently of the bounded legacy list:
-                    # a late stop reason must not disappear after its eighth item.
-                    stop_length_seen |= stop_reason == "length"
-                    stop_max_tokens_seen |= stop_reason == "max_tokens"
-                    if stop_reason not in stop_reasons and len(stop_reasons) < _PI_STREAM_MAX_STOP_REASONS:
-                        stop_reasons.append(stop_reason)
             except Exception:  # noqa: BLE001 — one bad event must not hide the rest
                 parse_error_count += 1
     except Exception:  # noqa: BLE001 — telemetry must stay fail-open
@@ -7855,18 +7899,17 @@ def _pi_stream_shape(raw: str) -> dict:
         parse_failed = True
     return {
         "assistant_message_ends": assistant_message_ends,
-        "blocks": block_counts,
         "text_chars_total": text_chars_total,
         "update_text_seen": update_text_seen,
         "update_text_chars_max": update_text_chars_max,
-        "stop_reasons": stop_reasons,
+        "stop_reasons": ",".join(stop_reasons),
+        "stop_reason_last": stop_reason_last,
         "parse_error_count": parse_error_count,
         "parse_failed": parse_failed,
-        # T543: _safe_detail stringifies nested dict/list values. Keep the old
-        # fields for in-process readers, but expose scalar siblings that survive
-        # persistence. This projection has 16 keys, below the 20-key size cap.
+        # T638: all values are scalars; nested dict/list values become repr
+        # strings in _safe_detail. Retain T543 scalar fields for existing readers.
         # Version identifies coverage, not parse health; partial scans stay flagged.
-        "schema_version": 2,
+        "schema_version": 3,
         "text_blocks": block_counts["text"],
         "thinking_blocks": block_counts["thinking"],
         "tool_blocks": block_counts["toolCall"],
@@ -11665,6 +11708,9 @@ def _emit_cli_model_call_terminal(
                 error_detail = str(failure)[:500]
             excerpt = {"error_detail": error_detail, **excerpt}
 
+        # T638 / Seven: bounded provider error text is authorized in this trace.
+        pi_error = _pi_error_message(stdout) if driver == "pi" and not succeeded else ""
+
         if succeeded:
             explain = (
                 f"模型返回（{metrics['driver']}，{dur_ms}ms"
@@ -11698,6 +11744,7 @@ def _emit_cli_model_call_terminal(
             ),
             explain=explain,
             detail={
+                **({"pi_error_head": pi_error[:300]} if pi_error else {}),
                 **route_detail,
                 **{
                     key: metrics.get(key)
@@ -12295,7 +12342,10 @@ def _call_agent_cli_impl(
         # 标记 + 原 detail 一起带上:pi 退出码永远是 0,API 错误(配额/鉴权/断流)
         # 只在 detail 里,而分类器把空回复判定排在规则表**之后** —— detail 有错误
         # 特征时仍然命中 quota_insufficient 等更具体的类,不会被空回复遮蔽。
-        raise _pi_no_reply_error(_cli_error_detail(result.stdout or '', result.stderr or ''))
+        raise _pi_no_reply_error(
+            _cli_error_detail(result.stdout or '', result.stderr or ''),
+            provider_error=_pi_final_stop_reason(result.stdout or '') == "error",
+        )
 
     # codex `exec --json` streams JSONL events; the assistant's text and its
     # reasoning summary live in dedicated events, NOT in any field the generic

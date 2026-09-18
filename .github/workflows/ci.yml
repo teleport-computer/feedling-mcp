@@ -427,11 +427,10 @@ jobs:
             tests/test_agent_call_failure_codes.py \
             tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
-            tests/test_audit_dream_false_no_cards.py \
-            tests/test_admin_dream_false_no_cards.py \
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
+            tests/test_admin_lane_rollup_summary.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
@@ -469,13 +468,15 @@ jobs:
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
 
-      - name: Run Phala CPU recorder regression suite
+      - name: Run Phala CPU and log collector regression suite
         env:
           PYTHONPATH: backend
         run: |
           python -m pytest \
             tests/test_cpu_recorder.py \
             tests/test_cpu_recorder_compose.py \
+            tests/test_log_shipper.py \
+            tests/test_log_shipper_compose.py \
             tests/test_cpu_socket_proxy_integration.py \
             -v
 
@@ -768,7 +769,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (73 files)
+      - name: Run CI security tier 2 (74 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -801,6 +802,7 @@ jobs:
             tests/test_enclave_context_recall.py \
             tests/test_enclave_routes_chat.py \
             tests/test_enclave_routes_envelope.py \
+            tests/test_enclave_reqlog.py \
             tests/test_enclave_routes_frames.py \
             tests/test_enclave_routes_health.py \
             tests/test_enclave_routes_identity.py \
@@ -1054,11 +1056,10 @@ jobs:
             tests/test_agent_call_failure_codes.py \
             tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
-            tests/test_audit_dream_false_no_cards.py \
-            tests/test_admin_dream_false_no_cards.py \
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
+            tests/test_admin_lane_rollup_summary.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
@@ -1134,6 +1135,8 @@ jobs:
             tests/test_admin_data_track_detail_read_failure_html.py \
             tests/test_admin_data_track_status_label_tristate.py \
             tests/test_data_track_debug.py \
+            tests/test_api_errors_doc.py \
+            tests/test_chat_turn_failure_fields.py \
             tests/test_data_track.py \
             tests/test_provider_attempt_ledger.py \
             tests/test_tool_schema_rejection_probe.py \
@@ -2151,7 +2154,6 @@ jobs:
               exit 1
             fi
           done
-
   detect-cvm-changes-pre:
     name: detect CVM changes (pre)
     if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
@@ -2699,6 +2701,7 @@ jobs:
           R2_ACCESS_KEY_ID:             ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:         ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.R2_FRAMES_BUCKET }}
+          R2_LOGS_BUCKET:               ${{ secrets.R2_LOGS_BUCKET }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2718,6 +2721,7 @@ jobs:
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "R2_LOGS_BUCKET=$R2_LOGS_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
@@ -2968,6 +2972,7 @@ jobs:
           R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
+          R2_LOGS_BUCKET:               ${{ secrets.TEST_R2_LOGS_BUCKET }}
         run: |
           echo ">>> deploy-test-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2982,6 +2987,7 @@ jobs:
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "R2_LOGS_BUCKET=$R2_LOGS_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \

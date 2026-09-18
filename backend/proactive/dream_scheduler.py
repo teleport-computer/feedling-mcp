@@ -305,8 +305,7 @@ def load_dream_state(store) -> dict[str, Any]:
 
 
 #: The consolidation ledger: only a completed Dream sets these
-#: (``record_dream_job_status``). ``proactive/dream_ledger_audit.LEDGER_FIELDS``
-#: must name the same keys (pinned by a test).
+#: (``record_dream_job_status``); ordinary state saves preserve persisted values.
 DREAM_LEDGER_FIELDS = (
     "last_dream_completed_at",
     "last_dream_organized_count",
@@ -325,9 +324,8 @@ def save_dream_state(
     """Persist ``state`` as one atomic top-level merge; returns the normalised doc.
 
     Every caller reads the blob, edits a few keys and saves. A full write would
-    put back everything that read saw — including ledger fields an operator
-    repair (``admin/dream_ledger_repair.py``) rewound in between, while a Dream
-    job's status was being recorded. So the ledger is only written by a writer
+    put back everything that read saw — including stale ledger fields after
+    a concurrent Dream completion. So the ledger is only written by a writer
     that sets it (``ledger=True``: a completion); every other key is written as
     before.
     """

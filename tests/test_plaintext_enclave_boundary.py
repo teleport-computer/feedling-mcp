@@ -10,6 +10,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,9 +69,27 @@ class _RuntimeStringVisitor(ast.NodeVisitor):
             self.values.append(node.value)
 
 
-def _runtime_strings(tree: ast.AST) -> list[str]:
+def _runtime_strings(tree: ast.AST, relative: str = "") -> list[str]:
     visitor = _RuntimeStringVisitor()
-    visitor.visit(tree)
+    for statement in tree.body:
+        # This reviewed schema lists route templates; it does not call them.
+        # Exclude only the top-level, all-literal ROUTES frozenset assignment.
+        # The rest of the module (and nonliteral initializers) remains scanned.
+        if (relative == "backend/enclave_reqlog_contract.py"
+                and isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id == "ROUTES"
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name)
+                and statement.value.func.id == "frozenset"
+                and not statement.value.keywords
+                and len(statement.value.args) == 1
+                and isinstance(statement.value.args[0], ast.Set)
+                and all(isinstance(item, ast.Constant) and isinstance(item.value, str)
+                        for item in statement.value.args[0].elts)):
+            continue
+        visitor.visit(statement)
     return visitor.values
 
 
@@ -91,7 +111,20 @@ def test_direct_enclave_decrypt_http_has_a_reviewed_allowlist():
     found: set[str] = set()
     for path in _python_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        if any("/v1/envelope/decrypt" in value for value in _runtime_strings(tree)):
+        if any("/v1/envelope/decrypt" in value for value in _runtime_strings(tree, _relative(path))):
             found.add(_relative(path))
 
     assert found == APPROVED_DIRECT_DECRYPT_HTTP
+
+
+@pytest.mark.parametrize("source,relative,found", [
+    ("ROUTES = frozenset({'/v1/envelope/decrypt'})", "backend/enclave_reqlog_contract.py", False),
+    ("ROUTES = frozenset({'/v1/envelope/decrypt'})", "backend/unreviewed.py", True),
+    ("ROUTES = frozenset({'/v1/envelope/decrypt'})\nrequests.post('/v1/envelope/decrypt')", "backend/enclave_reqlog_contract.py", True),
+    ("ROUTES = frozenset({requests.post('/v1/envelope/decrypt')})", "backend/enclave_reqlog_contract.py", True),
+    ("ROUTES = transport = frozenset({'/v1/envelope/decrypt'})", "backend/enclave_reqlog_contract.py", True),
+    ("def transport():\n    ROUTES = frozenset({'/v1/envelope/decrypt'})", "backend/enclave_reqlog_contract.py", True),
+])
+def test_route_schema_exception_does_not_hide_transport_calls(source, relative, found):
+    strings = _runtime_strings(ast.parse(source), relative)
+    assert any("/v1/envelope/decrypt" in value for value in strings) is found

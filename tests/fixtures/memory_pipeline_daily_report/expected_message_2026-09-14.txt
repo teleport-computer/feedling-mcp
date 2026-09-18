@@ -1,0 +1,19 @@
+[需要关注] 记忆管线日报 2026-09-14（北京时间）
+- 落卡 · V2 model_api：我们这边的故障影响 8 人（阈值 5）
+- 落卡 · V2 model_api：失败率 30%，前一天 3%
+
+落卡 capture
+  V1 resident：活跃 26 人｜成功 139｜失败 14（9%，前一天 0%）｜完全卡死 2 人
+    失败原因：账号/配置类 8 次/2 人（capture_agent_call_failed:resident_agent_cli_logged_out 8）；我们这边 3 次/3 人（capture_memory_actions_failed 3）；未知 3 次/3 人（runtime_failed 3）
+    不算失败：确认是用户自己账号问题 24 次/4 人（capture_agent_call_failed:quota_insufficient 24）；跳过/关闭等控制结果 9 次
+  V2 model_api：活跃 35 人｜成功 172｜失败 72（30%，前一天 3%）｜完全卡死 8 人
+    失败原因：模型服务 18 次/6 人（extraction_failed:upstream_unavailable 12、extraction_failed:rate_limited 6）；我们这边 48 次/8 人（extraction_failed:json_decode_error 24、lease_timeout 24）；未知 6 次/6 人（no_code 6）
+    不算失败：确认是用户自己账号问题 24 次/4 人（extraction_failed:auth_invalid 24）；跳过/关闭等控制结果 10 次
+
+做梦 dream
+  V1 resident：活跃 8 人｜成功 6｜失败 0（0%，前一天 0%）｜完全卡死 0 人
+    不算失败：确认是用户自己账号问题 2 次/2 人（dream_agent_call_failed:auth_invalid 2）
+  V2 model_api：活跃 14 人｜成功 3｜失败 0（0%，前一天 0%）｜完全卡死 0 人
+    不算失败：确认是用户自己账号问题 3 次/3 人（provider_setup:model_api_not_tested 3）；花园太小跳过 8 次
+
+此刻卡着没结束的任务：落卡 5 · 做梦 0
