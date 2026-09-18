@@ -434,6 +434,8 @@ jobs:
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_dream_account_backoff.py \
+            tests/test_extraction_attempt_ledger.py \
             tests/test_v1_capture_backlog_batches.py \
             tests/test_garden_import_engine.py \
             tests/test_genesis_plaintext_garden.py \
@@ -1064,6 +1066,8 @@ jobs:
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_dream_account_backoff.py \
+            tests/test_extraction_attempt_ledger.py \
             tests/test_v1_capture_backlog_batches.py \
             tests/test_garden_import_engine.py \
             tests/test_genesis_plaintext_garden.py \
