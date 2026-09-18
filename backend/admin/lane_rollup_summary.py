@@ -144,6 +144,12 @@ class LaneRouteStats:
     user_unavailable_users: set = field(default_factory=set)
     user_unavailable_codes: Counter = field(default_factory=Counter)
     skipped: int = 0
+    #: Users with at least one operational failure that day (受影响). A user
+    #: whose night retried several times (dream: up to 4x since 2026-09-16)
+    #: adds 4 to ``operational`` but 1 here — repeated failures never count a
+    #: user twice, so this is the number to compare across retry-policy changes.
+    failed_users: int = 0
+    #: Users with operational failures and zero real completions (零成功).
     stuck_users: int = 0
     #: Operational failures only, grouped by who has to act.
     causes: dict = field(default_factory=lambda: {g: CauseStats() for g in GROUP_ORDER})
@@ -198,7 +204,8 @@ def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
     them), that cell's operational failures are shown as 未知 ``unattributed``
     rather than guessed into a group. Failures without a recorded code are
     ``no_code``. "Stuck" users have operational failures and zero real
-    completions that day.
+    completions that day; "affected" users have at least one operational
+    failure (with or without a completion).
     """
     stats = LaneRouteStats(lane=lane, route=route)
     per_user: dict[str, list[int]] = {}
@@ -280,6 +287,7 @@ def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
         totals = per_user.setdefault(uid, [0, 0])
         totals[0] += completed
         totals[1] += operational
+    stats.failed_users = sum(1 for _ok, bad in per_user.values() if bad)
     stats.stuck_users = sum(1 for ok, bad in per_user.values() if bad and not ok)
     return stats
 
@@ -308,7 +316,8 @@ def serialize_stats(stats: LaneRouteStats) -> dict:
     """Expose counts instead of user identities, including each cause group."""
     result = {name: getattr(stats, name) for name in (
         "completed", "failed_raw", "operational", "control", "user_unavailable",
-        "skipped", "stuck_users", "partial", "unclassified", "attempts", "failure_rate")}
+        "skipped", "failed_users", "stuck_users", "partial", "unclassified",
+        "attempts", "failure_rate")}
     result["active_users"] = len(stats.users)
     result["user_unavailable_users"] = len(stats.user_unavailable_users)
     result["user_unavailable_codes"] = dict(stats.user_unavailable_codes)
