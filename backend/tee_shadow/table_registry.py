@@ -76,6 +76,13 @@ class Entry:
 
 
 REGISTRY: dict[str, Entry] = {
+    "memory_vectors": Entry(
+        SKIP,
+        "Primary-local rebuildable plaintext embedding index. The serve-worker "
+        "rebuilds from current authorized cards; no RDS-to-TEE vector replication. "
+        "Both primary modes require the local table; account deletion purges it.",
+        required_in_tee=True,
+    ),
     # ---------------------------------------------------------------- #
     # MIRROR —— 明文运维表，热路径双写（db.py 的 mirror.execute 写点）。
     # 这 13 张是 alembic_tee 0001 baseline 的"13 张明文运维表"，加 0002 的

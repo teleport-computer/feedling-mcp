@@ -12,6 +12,24 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Dream backoff notices now retain account-specific failure guidance. After
+  seven days of persistent account failures, automatic runs switch to recovery
+  probes at the Dream minimum interval (23 hours by default). Cooldown ticks
+  return `dream_account_paused` without changing cards or the consolidation
+  ledger; forced runs bypass the cooldown. Runtime V2 Capture/Dream diagnostics
+  add content-free wire counts, durations, HTTP statuses, and timeout categories
+  to the operator-readable provider ledger. Retry deadlines and Dream write
+  safeguards are unchanged.
+
+- Added disabled-by-default serve-worker preparation of local E5 ONNX vectors for plaintext memories, with versioned projections and bounded scans. Retrieval behavior is unchanged; model/dependency provisioning remains separate.
+  Rolling back the vector-table migration retains the table and its data; removal requires explicit cleanup.
+
+- `POST /v1/perception/photo/evaluate` documents two optional metadata fields
+  that clients already send: `occurred_at` (when the photo was taken) and
+  `source_event_id` (stable device identity). A valid `occurred_at` now dates
+  the photo in perception history; invalid or missing values fall back to the
+  upload time. The wake for the photo is still raised when it is uploaded.
+
 - Production/test deployment sources add filtered diagnostics for the two enclave
   containers: 30-day local retention and optional operator R2 delivery with a
   required 90-day bucket lifecycle. Only validated content-free request metadata

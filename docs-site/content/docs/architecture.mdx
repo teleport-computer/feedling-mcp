@@ -98,6 +98,13 @@ since [new shared content uses plaintext when the deployment gate is open](#new-
 
 ### Enclave operational logs leave the VM only when configured
 
+Separately from enclave logs, the database's operator-readable `provider_attempts`
+ledger stores Runtime V2 Capture/Dream job correlation, provider/model, retry and
+wire counts, wire duration, HTTP status, and closed error/timeout categories.
+This is plaintext operational metadata. Its wire projection excludes request
+and response bodies, URLs, headers, credentials, and raw exception text; missing
+traces remain explicitly unmeasured. It adds no storage recipient or network hop.
+
 The production and test Compose sources include a log collector for only the
 `enclave` and `enclave-domain` containers. It validates a closed request-log
 schema and re-encodes worker lifecycle events; raw paths, credentials, content,
@@ -1122,3 +1129,22 @@ It does not claim that every field or compatibility upload is encrypted, that a
 Runtime V2 turn process is a hostile-code sandbox, that external model
 providers cannot see inference plaintext, or that process liveness proves full
 service readiness.
+
+### Optional memory embedding preparation
+
+A serve-worker-only maintenance pass can prepare vectors for active shared
+plaintext memories. It defaults off and has no model files or inference
+libraries added to the default image by this change. A provisioned local ONNX
+CPU model is loaded lazily in serve-worker; backend request workers and enclave
+routes do not load it. No external embedding API or runtime model download is
+used. Encrypted memories remain outside this preparation pass.
+
+`memory_vectors` stores sensitive derived data in the configured primary
+database, in plaintext float32 form, under user/card/model keys and a projection
+hash. Both database migration chains define the table. There are no card write
+hooks or vector job queues: bounded periodic scans detect changes and prune
+ineligible rows. This is a rebuildable index, not a source of truth. Future
+readers must check current authorization, lifecycle and projection hash rather
+than treating a stored row as proof of eligibility. No retrieval reader uses
+this table yet. Normal database trust and backup protections apply to these
+vectors; the additional enclave encryption path is not used.

@@ -47,6 +47,47 @@ _DEVICE_EVENT_ALLOWED_KEYS = {
     "build",
 }
 
+# Fields that pass only after a per-key check. The generic rule below keeps any
+# short string or number; these two feed perception directly (how long the user
+# was away, and what proves they came back), so a malformed value must not reach
+# it looking valid.
+#
+# ``idle_sec``: iOS measures the background -> active gap on device and sends
+# whole seconds (``FeedlingAPI.sendUnlockAfterAbsence``). Kept as a coarse
+# non-negative integer; a year is far past anything the 30-minute trigger can
+# produce, so a larger value is a broken clock, not an absence.
+_IDLE_SEC_MAX = 366 * 24 * 3600
+# ``presence_evidence``: exactly the perceptkit ``presence_recovery.evidence``
+# enum. A value outside it is dropped rather than guessed upward -- the adapter
+# then records ``unknown``, the only answer that is always true.
+_PRESENCE_EVIDENCE_VALUES = frozenset({
+    "app_entered_foreground",
+    "app_became_active",
+    "protected_data_became_available",
+    "unknown",
+})
+
+
+def _checked_idle_sec(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value < 0 or value > _IDLE_SEC_MAX:  # NaN / out of range
+        return None
+    return int(value)
+
+
+def _checked_presence_evidence(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in _PRESENCE_EVIDENCE_VALUES else None
+
+
+_DEVICE_EVENT_CHECKED_KEYS = {
+    "idle_sec": _checked_idle_sec,
+    "presence_evidence": _checked_presence_evidence,
+}
+
 _DEVICE_EVENT_DROP_RE = re.compile(
     r"(raw|text|content|title|name|address|photo|image|lat|lng|lon|coordinate|phone|email)",
     re.IGNORECASE,
@@ -68,6 +109,12 @@ def _redact_device_payload(payload: dict) -> dict:
     for key, value in payload.items():
         skey = str(key)
         if _DEVICE_EVENT_DROP_RE.search(skey):
+            continue
+        checker = _DEVICE_EVENT_CHECKED_KEYS.get(skey)
+        if checker is not None:
+            checked = checker(value)
+            if checked is not None:
+                redacted[skey] = checked
             continue
         if skey not in _DEVICE_EVENT_ALLOWED_KEYS and not skey.startswith("safe_"):
             continue

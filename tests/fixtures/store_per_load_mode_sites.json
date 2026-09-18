@@ -164,6 +164,11 @@
     {
       "count": 1,
       "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "memory embedding sweep"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
       "reason": "memory envelope construction needs identity only"
     },
     {

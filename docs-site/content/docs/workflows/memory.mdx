@@ -254,7 +254,7 @@ fails as a whole without applying anything; both thresholds are
 deployment-configurable.
 
 Dream does not impose a per-run consolidation count, a per-proposal retired-card
-count, a cross-run cooldown, or any content-quality judgment on rewrites. It
+count, a cross-run content-rewrite cooldown, or any content-quality judgment on rewrites. It
 still rejects repeated use of one source card within a run and proposals that
 target unknown cards. Every proposal is bound to the card snapshot captured
 before the run and all accepted actions are applied afterward, so a card
@@ -273,6 +273,27 @@ budget-truncated full-card read is recorded separately and marks the terminal
 run as using degraded context, so it cannot be mistaken for a model choosing to
 make no changes from a complete input. Card ids, prompts, replies, summaries,
 raw errors, and other memory text are never part of this diagnostic shape.
+
+Runtime V2 Capture and Dream also record provider wire-attempt metadata in the
+operator-readable `provider_attempts` ledger: job correlation, provider/model,
+outer retry and wire counts, each wire's duration and HTTP status, and closed
+error/timeout categories. Missing traces have null measurements, not zero
+attempts. These fields exclude prompts, replies, URLs, headers, credentials,
+and raw error text. The existing `attempt_n` still counts provider rounds;
+`wire_attempt_count` measures the requests inside a round, including retries.
+
+Dream account failures use the same account-specific backoff notices as Capture,
+including expired-login guidance. After seven days of persistent account
+failures, automatic Dream enters recovery mode: it permits at most one probe per
+Dream minimum interval (23 hours by default), subject to the usual night and
+admission gates. Before recovery mode, a gap of more than 24 hours between
+failures restarts the seven-day clock. Once recovery mode is active, another
+account failure keeps it active even after such a gap; success or a non-account
+failure exits it. Cooldown ticks return `enqueued: false` and
+`reason: dream_account_paused`. This is a scheduling skip, not an operational
+failure. It preserves cards, the consolidation ledger, and the unresolved
+account notice; success clears that notice. An explicit forced run bypasses
+the cooldown. Provider timeouts and Dream's write-safety thresholds are unchanged.
 
 Automatic Dream runs are spread across the night window (02:00–05:00 in the
 user's timezone by default) instead of all becoming due when it opens. Each
@@ -901,3 +922,22 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   }
 }
 ```
+
+### Optional vector preparation
+
+The serve-worker contains a disabled-by-default vector preparation pass
+(`FEEDLING_MEMORY_EMBEDDING_ENABLED=0`). When explicitly enabled with a locally
+provisioned multilingual E5-small ONNX model, it scans active, shared plaintext
+cards in its memory-maintenance user set, encoding at most 32 changed or missing
+cards per user per tick. Encrypted cards are skipped. The application never
+downloads model files; a missing model or inference dependency leaves this pass
+unavailable without replacing vectors with synthetic values.
+
+Derived vectors are stored as little-endian float32 data in `memory_vectors`,
+scoped by user, card and model identity, with the text projection hash. Model
+identity includes the artifact digest, precision and IO projection version.
+Updated cards are re-encoded on a later scan; deleted, retired or private cards
+are pruned by that scan. Account deletion and reset remove the derived rows.
+The worker checks the current card projection again before saving an encoding.
+This preparation pass does not yet change search, context selection or query
+encoding, and its batch size is not a latency guarantee.

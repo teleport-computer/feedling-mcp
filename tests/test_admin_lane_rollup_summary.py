@@ -155,6 +155,30 @@ def test_user_with_one_success_is_not_counted_as_stuck():
     assert len(stats.users) == 3
 
 
+def test_affected_users_count_each_failing_user_once_regardless_of_retries():
+    # T646: one broken user retried 4x in a night is 4 operational failures
+    # but one affected user; a user who failed then succeeded is affected
+    # but not stuck; a clean user is neither. The per-attempt rate moves with
+    # retry policy, the two user counts do not.
+    rows = [_row("usr_a", lane="dream", failed=4, codes={"lease_timeout": 4}),
+            _row("usr_b", lane="dream", failed=1, completed=2, codes={"lease_timeout": 1}),
+            _row("usr_c", lane="dream", completed=3)]
+    stats = summary.aggregate_day(rows, lane="dream", route="model_api", day=DAY)
+    assert stats.operational == 5
+    assert (stats.failed_users, stats.stuck_users, len(stats.users)) == (2, 1, 3)
+    serialized = summary.serialize_stats(stats)
+    assert (serialized["failed_users"], serialized["stuck_users"]) == (2, 1)
+
+
+def test_affected_users_ignore_control_and_user_unavailable_outcomes():
+    # A skipped/disabled job or the user's own dead key is not our failure,
+    # so it must not make the user "affected" either.
+    rows = [_row("usr_ctl", lane="dream", failed=2, codes={"dream_disabled": 2}),
+            _row("usr_key", lane="dream", failed=3, codes={"extraction_failed:auth_invalid": 3})]
+    stats = summary.aggregate_day(rows, lane="dream", route="model_api", day=DAY)
+    assert (stats.operational, stats.failed_users, stats.stuck_users) == (0, 0, 0)
+
+
 def test_split_rows_of_one_user_are_summed_before_stuck_check():
     # heartbeat-style enqueue_source splits produce several rows per user.
     rows = [_row("usr_a", failed=2, codes={"lease_timeout": 2}),

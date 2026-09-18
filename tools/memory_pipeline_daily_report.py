@@ -41,6 +41,12 @@ the rollup exists to retire.
 Output never contains user ids, message ids or any free text: counts, lane /
 route labels and sanitized failure codes only.
 
+Each lane/route line carries two user counts next to the per-attempt failure
+rate: ``受影响`` (users with at least one operational failure) and ``零成功``
+(users with failures and no real completion). They come from the summary's
+``failed_users`` / ``stuck_users``; a backend that predates ``failed_users``
+renders ``-`` rather than 0, so an older prod never reads as "nobody affected".
+
 Any unexpected error (a changed response shape, a bug here) still posts a
 content-free "没生成出来" notice naming only the exception type, and exits
 non-zero.
@@ -180,6 +186,21 @@ def _pct(rate: float | None) -> str:
     return "-" if rate is None else f"{round(rate * 100)}%"
 
 
+def _users(stats: Mapping[str, Any], key: str) -> str:
+    """A user count, or ``-`` when the backend predates the field."""
+    value = stats.get(key)
+    return "-" if value is None else str(int(value))
+
+
+#: Shown once per message. The per-attempt failure rate counts a user whose
+#: night retried once per attempt (dream: up to 4 since 2026-09-16, T646), so a
+#: change in retry policy moves the rate by itself; the two user counts on each
+#: line count a repeatedly failing user once (a retry that succeeds still moves
+#: them from 零成功 to 受影响, which is a real change).
+RATE_CAVEAT = ("口径：失败率按次数算；同一用户一晚可重试多次（做梦 2026-09-16 起最多 4 次），"
+               "坏掉的用户会被放大——看「受影响 / 零成功」人数更准")
+
+
 def evaluate_attention(report: dict) -> list[str]:
     reasons: list[str] = []
     for lane in LANES:
@@ -265,7 +286,9 @@ def render_message(report: dict) -> str:
             lines.append(f"  {ROUTE_LABELS[route]}：活跃 {cur['active_users']} 人｜"
                          f"成功 {cur['completed']}｜失败 {cur['operational']}"
                          f"（{_pct(cur['failure_rate'])}，前一天 {_pct(prev['failure_rate'])}）｜"
-                         f"完全卡死 {cur['stuck_users']} 人")
+                         f"受影响 {_users(cur, 'failed_users')} 人"
+                         f"（前一天 {_users(prev, 'failed_users')}）｜"
+                         f"零成功 {cur['stuck_users']} 人（前一天 {prev['stuck_users']}）")
             causes = _cause_line(cur)
             if causes:
                 lines.append(f"    失败原因：{causes}")
@@ -277,6 +300,8 @@ def render_message(report: dict) -> str:
     if stuck:
         lines.append("")
         lines.append("此刻卡着没结束的任务：" + " · ".join(stuck))
+    lines.append("")
+    lines.append(RATE_CAVEAT)
     if incomplete:
         lines.append("")
         lines.append("数据说明：" + "；".join(incomplete))

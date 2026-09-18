@@ -2303,7 +2303,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Evaluate resident Dream scheduling. After seven days of persistent account failures, automatic Dream permits at most one recovery probe per Dream minimum interval (23 hours by default). Cooldown ticks return enqueued=false and reason=dream_account_paused without advancing the consolidation ledger or resolving the account notice. force=true bypasses this cooldown. Runtime V2 scheduling is worker-owned and this endpoint returns its existing scheduler-owned no-op."
       }
     },
     "/v1/genesis/imports": {
@@ -12086,6 +12087,16 @@
                     "type": "string"
                   }
                 ]
+              },
+              "source_event_id": {
+                "type": "string",
+                "maxLength": 128,
+                "description": "Stable, non-reversible device identity for this photo, so a re-upload is not counted twice. Optional."
+              },
+              "occurred_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "When the photo was taken, ISO 8601 with a UTC offset. Optional; when missing, lacking an offset, or more than 60 seconds in the future, the server uses the upload time instead."
               }
             },
             "additionalProperties": false

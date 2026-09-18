@@ -434,6 +434,8 @@ jobs:
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_dream_account_backoff.py \
+            tests/test_extraction_attempt_ledger.py \
             tests/test_v1_capture_backlog_batches.py \
             tests/test_garden_import_engine.py \
             tests/test_genesis_plaintext_garden.py \
@@ -483,8 +485,13 @@ jobs:
       - name: Memory Garden kernel unit tests
         env:
           PYTHONPATH: backend
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
           python -m pytest \
+            tests/test_memory_embedding.py \
+            tests/test_memory_embedding_real.py \
+            tests/test_memory_embedding_sweep.py \
+            tests/test_memory_vectors_migration.py \
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
             tests/test_context_memories.py \
@@ -1031,6 +1038,7 @@ jobs:
             tests/test_lane_rollup.py \
             tests/test_enclave_decrypt_health.py \
             tests/test_enclave_decrypt_alert.py \
+            tests/test_tcp_connect_monitor.py \
             tests/test_distillation_ledger.py \
             tests/test_e2e_tools.py \
             tests/test_e2e_p0_fallback_gate.py \
@@ -1063,6 +1071,8 @@ jobs:
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
+            tests/test_dream_account_backoff.py \
+            tests/test_extraction_attempt_ledger.py \
             tests/test_v1_capture_backlog_batches.py \
             tests/test_garden_import_engine.py \
             tests/test_genesis_plaintext_garden.py \

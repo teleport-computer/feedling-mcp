@@ -41,6 +41,76 @@ def build(conn: Any, *, subject_id: str | None = None) -> dict[str, Any]:
         "wakes": _wakes(conn, subject_id),
         "coverage": coverage,
         "photo_identity": _photo_identity(conn, subject_id),
+        "observation_timing": _observation_timing(conn, subject_id),
+    }
+
+
+#: 时间质量那一格只看最近这么多天（按服务器收到的时刻）。修复上线前后的对比
+#: 要看的是「最近的数据长什么样」，全表累计会被上线前的旧行永远拖住。
+TIMING_WINDOW_DAYS = 7
+
+
+def _observation_timing(conn: Any, subject_id: str | None) -> dict[str, Any]:
+    """两个修复上线后能不能看出效果 —— 只有计数和比例，没有任何一条原始值。
+
+    presence_recovery    离开时长为空的占比、证据是 unknown 的占比。
+                         修复前两者恒为 1.0（白名单删了 idle_sec /
+                         presence_evidence，适配层又读错了字段名）。
+    photo_library_added  观测时间比收到时间早多少，分三档。修复前全在
+                         ≤1 分钟那档（观测时间就是收到时间）；新版 iOS 送了
+                         拍摄时间后，补传的照片会落到后两档。
+    """
+    params: list[Any] = [TIMING_WINDOW_DAYS]
+    and_subject = ""
+    if subject_id:
+        and_subject = "AND subject_id = %s"
+        params.append(subject_id)
+    sql = f"""
+      SELECT
+        COUNT(*) FILTER (WHERE signal = 'presence_recovery'),
+        COUNT(*) FILTER (WHERE signal = 'presence_recovery'
+                           AND typed_value->>'absence_seconds' IS NULL),
+        COUNT(*) FILTER (WHERE signal = 'presence_recovery'
+                           AND COALESCE(typed_value->>'evidence', 'unknown') = 'unknown'),
+        COUNT(*) FILTER (WHERE signal = 'photo_library_added'),
+        COUNT(*) FILTER (WHERE signal = 'photo_library_added'
+                           AND received_at - occurred_at <= interval '1 minute'),
+        COUNT(*) FILTER (WHERE signal = 'photo_library_added'
+                           AND received_at - occurred_at > interval '1 minute'
+                           AND received_at - occurred_at <= interval '1 hour'),
+        COUNT(*) FILTER (WHERE signal = 'photo_library_added'
+                           AND received_at - occurred_at > interval '1 hour')
+      FROM perceptkit_observation
+      WHERE signal IN ('presence_recovery', 'photo_library_added')
+        AND availability = 'observed'
+        AND received_at >= now() - make_interval(days => %s)
+        {and_subject}
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        (presence, null_absence, unknown_evidence,
+         photos, le_1m, le_1h, gt_1h) = (int(v) for v in cur.fetchone())
+
+    def share(n: int, total: int) -> float | None:
+        return round(n / total, 4) if total else None
+
+    return {
+        "window_days": TIMING_WINDOW_DAYS,
+        "presence_recovery": {
+            "count": presence,
+            "null_absence_share": share(null_absence, presence),
+            "unknown_evidence_share": share(unknown_evidence, presence),
+        },
+        "photo_library_added": {
+            "count": photos,
+            # received_at - occurred_at。负数（拍摄时间比收到晚一点点，时钟
+            # 偏差允许范围内）也算进 ≤1 分钟。
+            "received_minus_occurred": {
+                "le_1m": le_1m,
+                "le_1h": le_1h,
+                "gt_1h": gt_1h,
+            },
+        },
     }
 
 
@@ -187,4 +257,4 @@ def _coverage(conn: Any, subject_id: str | None) -> dict[str, Any]:
     }
 
 
-__all__ = ["MAX_ROWS", "build"]
+__all__ = ["MAX_ROWS", "TIMING_WINDOW_DAYS", "build"]

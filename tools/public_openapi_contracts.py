@@ -2079,6 +2079,16 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "is_indoor": {"oneOf": [{"type": "boolean"}, {"type": "string"}]},
                     "has_text_block": {"oneOf": [{"type": "boolean"}, {"type": "string"}]},
                     "is_screenshot": {"oneOf": [{"type": "boolean"}, {"type": "string"}]},
+                    "source_event_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Stable, non-reversible device identity for this photo, so a re-upload is not counted twice. Optional.",
+                    },
+                    "occurred_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "When the photo was taken, ISO 8601 with a UTC offset. Optional; when missing, lacking an offset, or more than 60 seconds in the future, the server uses the upload time instead.",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -2706,6 +2716,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
     ),
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Retired memory.upgrade actions return unsupported_memory_action (400); legacy cards remain readable through read-side adapters. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409).",
+    ("post", "/v1/dream/tick"): "Evaluate resident Dream scheduling. After seven days of persistent account failures, automatic Dream permits at most one recovery probe per Dream minimum interval (23 hours by default). Cooldown ticks return enqueued=false and reason=dream_account_paused without advancing the consolidation ledger or resolving the account notice. force=true bypasses this cooldown. Runtime V2 scheduling is worker-owned and this endpoint returns its existing scheduler-owned no-op.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
