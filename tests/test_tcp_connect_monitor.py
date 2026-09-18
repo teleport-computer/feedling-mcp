@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 
 import pytest
+import conftest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -93,7 +94,7 @@ def test_full_run_threshold_and_raw_artifacts(monkeypatch, tmp_path, failures, e
         bad = command[-1] == probe.TARGETS[0] and calls.count(command[-1]) <= failures
         return result(exit=7 if bad else 0, connect=0 if bad else 0.02, code=0 if bad else 200)
     monkeypatch.setattr(probe.subprocess, "run", run)
-    monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+    conftest.capture_sleeps(monkeypatch, probe)
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "job-summary.md"))
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
@@ -115,7 +116,7 @@ def test_full_run_threshold_and_raw_artifacts(monkeypatch, tmp_path, failures, e
 
 def test_all_measurements_missing_never_green(monkeypatch, tmp_path):
     monkeypatch.setattr(probe.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 2, "", "bad curl"))
-    monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+    conftest.capture_sleeps(monkeypatch, probe)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     assert probe.main(["--output", str(tmp_path)]) == 2
     payload = json.loads((tmp_path / "summary.json").read_text())
@@ -147,7 +148,7 @@ def test_real_curl_ten_sample_green_and_red_controls(monkeypatch, tmp_path, reac
         port = listener.getsockname()[1]
         listener.close()
     monkeypatch.setattr(probe, "TARGETS", (f"http://127.0.0.1:{port}/",))
-    monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+    conftest.capture_sleeps(monkeypatch, probe)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     # A poisoned environment proxy must not affect direct loopback measurements.
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:1")
@@ -219,7 +220,7 @@ def test_real_connect_timeout_ten_sample_red_control(monkeypatch, tmp_path):
         monkeypatch.setattr(probe, "TARGETS", (f"https://127.0.0.1:{port}/",))
         monkeypatch.setattr(probe, "CONNECT_TIMEOUT", 0.3)
         monkeypatch.setattr(probe, "MAX_TIME", 0.5)
-        monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+        conftest.capture_sleeps(monkeypatch, probe)
         monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
         assert probe.main(["--output", str(tmp_path)]) == 1
     finally:
