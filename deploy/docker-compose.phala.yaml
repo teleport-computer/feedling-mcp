@@ -610,7 +610,7 @@ services:
         condition: service_healthy
 
   log-shipper:
-    image: ghcr.io/teleport-computer/feedling:3678f7e
+    image: ghcr.io/teleport-computer/feedling:f2b0fbe
     container_name: log-shipper
     command: ["python", "-u", "ops/log_shipper.py"]
     restart: unless-stopped
