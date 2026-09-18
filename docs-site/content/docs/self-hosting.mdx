@@ -193,6 +193,13 @@ A functional deployment can include:
 | Enclave diagnostic log collector | Optional operational history | Only validated content-free request logs and fixed worker events from the two enclave containers; local volume 30 days, optional operator R2 with a 90-day bucket lifecycle. |
 | CPU history recorder | Optional private operational history | Provide a protected, path-allowlisted Docker socket proxy and a dedicated persistent volume; expose neither service publicly. |
 
+Database operators can read the `provider_attempts` operational ledger, including
+Runtime V2 Capture/Dream job correlation, provider/model, retry counts, wire
+timings, HTTP status, and closed timeout/error categories. These plaintext
+measurements exclude prompts, replies, URLs, headers, credentials, and raw error
+text. Protect database access and backups accordingly; this does not enable
+export to another service.
+
 The production/test log collector uses a protected socket proxy, a dedicated
 persistent volume, and a separate outbound bridge for R2. It does not join the
 business-service network or mount the Docker socket. Compose bridges do not

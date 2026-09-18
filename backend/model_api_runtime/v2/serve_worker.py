@@ -4948,6 +4948,7 @@ def _record_extraction_status(
                 "dream_result": {
                     "organized_count": item_count,
                     "merged_count": item_count,
+                    "reason": str((detail or {}).get("reason") or ""),
                 },
                 "dream_skip_reason": str((detail or {}).get("skip_reason") or ""),
             },

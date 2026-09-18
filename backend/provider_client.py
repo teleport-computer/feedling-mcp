@@ -3631,9 +3631,27 @@ async def _post_within_wire_deadline(post: Any, request_payload: dict[str, Any])
         # Same shape as an httpx read timeout wrapped by the wire adapters
         # (``ProviderError("provider network error: <Name>")``, no status):
         # ``classify_provider_error`` → transient, ``is_timeout_error`` → True.
-        raise ProviderError(
-            "provider network error: WireDeadlineExceeded"
-        ) from exc
+        error = ProviderError("provider network error: WireDeadlineExceeded")
+        error.feedling_timeout_kind = "wire_deadline"
+        raise error from exc
+
+
+def _wire_timeout_kind(exc: BaseException) -> str:
+    """Classify exception types, never provider-controlled exception text."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "feedling_timeout_kind", None) == "wire_deadline":
+            return "wire_deadline"
+        for kind, cls in (("connect", httpx.ConnectTimeout), ("read", httpx.ReadTimeout),
+                          ("write", httpx.WriteTimeout), ("pool", httpx.PoolTimeout)):
+            if isinstance(current, cls):
+                return kind
+        if isinstance(current, (TimeoutError, asyncio.TimeoutError)):
+            return "unknown"
+        current = current.__cause__
+    return "none"
 
 
 async def _traced_async_json_post(
@@ -3667,6 +3685,7 @@ async def _traced_async_json_post(
         "error_class": None,
         "compatibility_fallback": None,
         "duration_ms": 0.0,
+        "timeout_kind": "none",
         "wire": {
             "encoding": "json_body",
             "payload": request_payload,
@@ -3678,6 +3697,7 @@ async def _traced_async_json_post(
         status = getattr(exc, "status_code", None)
         entry["status"] = int(status) if isinstance(status, int) else None
         entry["error_class"] = classify_provider_error(exc)
+        entry["timeout_kind"] = _wire_timeout_kind(exc)
         entry["duration_ms"] = _attempt_duration_ms(started_ns)
         trace.append(entry)
         raise
