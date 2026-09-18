@@ -103,6 +103,54 @@ def photo_envelope(photo_id: str, *, occurred_at: float | datetime,
     ])
 
 
+#: How far into the future a client capture time may sit before it is treated
+#: as a wrong clock. Same allowance the live path gives client timestamps
+#: (``perception.service._FUTURE_TS_TOLERANCE_SEC``); a test pins the two
+#: together.
+PHOTO_CAPTURE_FUTURE_TOLERANCE_SEC = 60.0
+
+#: Longest string accepted as a capture time. ISO 8601 with fractional seconds
+#: and an offset is ~32 characters; anything much longer is not one.
+_CAPTURE_TIME_MAX_LEN = 64
+
+
+def photo_capture_time(raw: Any, *, received: float | datetime) -> datetime | None:
+    """The photo's capture time from its metadata, or None to use receive time.
+
+    ``metadata.occurred_at`` is sent by newer iOS builds as ISO 8601 with an
+    offset (``PHAsset.creationDate``). Older builds omit it; they keep the old
+    behaviour -- receive time -- rather than failing.
+
+    Rejected, each falling back to receive time:
+      * not a string, too long, or not parseable
+      * no timezone -- a naive time is a guess about which day it was
+      * later than receive time by more than the clock-skew allowance
+
+    🔴 **No lower bound on age, on purpose.** iOS only uploads photos newer
+    than its scan cursor (first scan: the last hour; afterwards: wherever the
+    last scan stopped, however long ago), so a user back after two weeks
+    legitimately sends two-week-old photos. The kit accepts past times without
+    limit for exactly this case. Capping at the 7-day *detail* retention would
+    look harmless but the daily photo count is kept **permanently** -- every
+    photo past the cap would be counted on the upload day forever. The detail
+    rows expire on their own; the count stays on the right day.
+    """
+    if not isinstance(raw, str) or not raw or len(raw) > _CAPTURE_TIME_MAX_LEN:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    received_dt = (received.astimezone(timezone.utc) if isinstance(received, datetime)
+                   else datetime.fromtimestamp(float(received), timezone.utc))
+    delta = (received_dt - parsed).total_seconds()
+    if delta < -PHOTO_CAPTURE_FUTURE_TOLERANCE_SEC:
+        return None
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Device events
 # ---------------------------------------------------------------------------
@@ -130,6 +178,25 @@ def _presence_evidence(payload: Mapping[str, Any]) -> str:
     return _PRESENCE_EVIDENCE.get(raw, "unknown")
 
 
+def _absence_seconds(payload: Mapping[str, Any]) -> float | None:
+    """How long the user was away, when the producer measured it.
+
+    ``absence_seconds`` is the manifest's own name; io iOS sends ``idle_sec``
+    (``FeedlingAPI.sendUnlockAfterAbsence``). Before 2026-09-17 this read only
+    the first, which iOS never sends, so every recovery arrived with a null
+    duration. The manifest's name wins when both are present.
+    """
+    for key in ("absence_seconds", "idle_sec"):
+        raw = payload.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        seconds = float(raw)
+        if seconds != seconds or seconds < 0 or seconds == float("inf"):
+            continue
+        return seconds
+    return None
+
+
 def device_event_envelope(event: Mapping[str, Any], *,
                           occurred_at: float | datetime,
                           timezone_id: str | None = None) -> dict[str, Any] | None:
@@ -147,21 +214,20 @@ def device_event_envelope(event: Mapping[str, Any], *,
 
     wake_trigger = str(payload.get("wake_trigger") or "").strip().lower()
     if event_type == "unlock_after_absence" or wake_trigger == "unlock_after_absence":
-        seconds = payload.get("absence_seconds")
+        seconds = _absence_seconds(payload)
         observations.append(_observation(
             "presence_recovery",
             {
                 "recovered_at": at,
-                # iOS reports that an absence ended, not how long it was. The
-                # field is nullable for exactly this case, and `absence_quality`
-                # says which it is -- so a downstream reader can tell "we
-                # measured 40 minutes" from "we know they came back". Inventing
-                # a duration here would make the second look like the first.
-                "absence_seconds": float(seconds) if isinstance(
-                    seconds, (int, float)) and not isinstance(seconds, bool) else None,
-                "absence_quality": "measured" if isinstance(
-                    seconds, (int, float)) and not isinstance(seconds, bool)
-                    else "estimated",
+                # io iOS sends the gap it measured on device as `idle_sec`.
+                # A producer that only knows an absence ended sends nothing;
+                # the field is nullable for exactly that case, and
+                # `absence_quality` says which it is -- so a downstream reader
+                # can tell "we measured 40 minutes" from "we know they came
+                # back". Inventing a duration would make the second look like
+                # the first.
+                "absence_seconds": seconds,
+                "absence_quality": "measured" if seconds is not None else "estimated",
                 # 凭什么说这个人回来了。客户端不给就是 `unknown` ——
                 # **不猜一个更强的证据**：`presence_recovery` 不等于解锁，
                 # 编强了下游就会说出"用户刚解锁了手机"这句没发生过的话。

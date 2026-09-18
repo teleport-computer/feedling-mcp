@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `POST /v1/perception/photo/evaluate` documents two optional metadata fields
+  that clients already send: `occurred_at` (when the photo was taken) and
+  `source_event_id` (stable device identity). A valid `occurred_at` now dates
+  the photo in perception history; invalid or missing values fall back to the
+  upload time. The wake for the photo is still raised when it is uploaded.
+
 - Production/test deployment sources add filtered diagnostics for the two enclave
   containers: 30-day local retention and optional operator R2 delivery with a
   required 90-day bucket lifecycle. Only validated content-free request metadata

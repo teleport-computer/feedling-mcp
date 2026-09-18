@@ -324,14 +324,23 @@ def _guarded(name: str, build, user_id: str) -> dict[str, Any]:
 
 
 def observe_photo(user_id: str, photo_id: str, *,
-                  occurred_at: Any, now: datetime | None = None) -> dict[str, Any]:
+                  occurred_at: Any, captured_at: Any = None,
+                  now: datetime | None = None) -> dict[str, Any]:
     """One confirmed photo. Called after the pixels are durably stored --
-    a photo whose storage failed is not a photo the user added."""
+    a photo whose storage failed is not a photo the user added.
+
+    ``occurred_at`` is the server receive time. ``captured_at`` is the raw
+    ``metadata.occurred_at`` the client sent, if any; when it is a usable
+    capture time it becomes the observation time, so the photo counts toward
+    the day it was taken. The wake the kit raises for it is queued with the
+    delivery time, never the capture time (see wake_port).
+    """
     def build():
-        from .events import photo_envelope
+        from .events import photo_capture_time, photo_envelope
         received = now or datetime.now(timezone.utc)
+        at = photo_capture_time(captured_at, received=occurred_at) or occurred_at
         return _run(user_id,
-                    photo_envelope(photo_id, occurred_at=occurred_at,
+                    photo_envelope(photo_id, occurred_at=at,
                                    timezone_id=_live_timezone(user_id)),
                     received=received)
     return _guarded("photo", build, user_id)

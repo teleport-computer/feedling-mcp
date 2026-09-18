@@ -240,3 +240,65 @@ def test_an_unrecognised_evidence_is_never_upgraded_to_a_stronger_one():
     v = _presence({"wake_trigger": "unlock_after_absence",
                    "evidence": "user_unlocked_phone"})
     assert v["evidence"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 观测时间质量（2026-09-17）：修复上线前后拿 ADMIN_KEY 就能对比
+#
+# presence_recovery 的时长/证据、照片观测时间比收到时间早多少。
+# **只出计数和比例，不出任何一条原始值** —— 这是一个全局 admin 口。
+# ---------------------------------------------------------------------------
+
+def _obs(conn, subject, oid, signal, value, *, occurred, received):
+    from perceptkit.contracts.records import StoredObservation
+    from perception.perceptkit_adapter.storage import PostgresStorage
+    PostgresStorage(conn).append_observation(StoredObservation(
+        observation_id=oid, subject_id=subject, signal=signal,
+        signal_schema_version=1, source="test", occurred_at=occurred,
+        received_at=received, availability="observed",
+        effective_local_date=occurred.date(), typed_value=value,
+    ))
+
+
+def test_observation_timing_aggregates_without_raw_values(conn):
+    import json
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    # presence：一条修复前的形状（时长空、证据 unknown），两条修复后的
+    _obs(conn, "u1", "p1", "presence_recovery",
+         {"recovered_at": now.isoformat(), "absence_seconds": None,
+          "absence_quality": "estimated", "evidence": "unknown"},
+         occurred=now, received=now)
+    for i, secs in enumerate((2417, 7331)):
+        _obs(conn, "u1", f"p{i+2}", "presence_recovery",
+             {"recovered_at": now.isoformat(), "absence_seconds": secs,
+              "absence_quality": "measured", "evidence": "app_became_active"},
+             occurred=now, received=now)
+    # 照片：刚拍的、40 分钟前拍的、5 小时前拍的
+    for oid, ago in (("ph1", timedelta(seconds=3)), ("ph2", timedelta(minutes=40)),
+                     ("ph3", timedelta(hours=5))):
+        _obs(conn, "u2", oid, "photo_library_added",
+             {"count": 1, "added_at": (now - ago).isoformat()},
+             occurred=now - ago, received=now)
+    # 窗口外的旧行不算
+    old = now - timedelta(days=report.TIMING_WINDOW_DAYS + 1)
+    _obs(conn, "u1", "p_old", "presence_recovery",
+         {"recovered_at": old.isoformat(), "absence_seconds": None,
+          "absence_quality": "estimated", "evidence": "unknown"},
+         occurred=old, received=old)
+
+    t = report.build(conn)["observation_timing"]
+    assert t["window_days"] == report.TIMING_WINDOW_DAYS
+    assert t["presence_recovery"] == {
+        "count": 3, "null_absence_share": 0.3333, "unknown_evidence_share": 0.3333}
+    assert t["photo_library_added"] == {
+        "count": 3, "received_minus_occurred": {"le_1m": 1, "le_1h": 1, "gt_1h": 1}}
+
+    blob = json.dumps(t)
+    for raw in ("2417", "7331", "app_became_active", "u1", "u2", now.isoformat()[:16]):
+        assert raw not in blob, f"原始值漏进了汇总: {raw}"
+
+    only_u2 = report.build(conn, subject_id="u2")["observation_timing"]
+    assert only_u2["presence_recovery"]["count"] == 0
+    assert only_u2["presence_recovery"]["null_absence_share"] is None
+    assert only_u2["photo_library_added"]["count"] == 3
