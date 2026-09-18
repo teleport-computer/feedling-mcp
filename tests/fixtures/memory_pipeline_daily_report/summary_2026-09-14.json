@@ -14,6 +14,7 @@
           "capture_agent_call_failed:quota_insufficient": 24
         },
         "skipped": 0,
+        "failed_users": 5,
         "stuck_users": 2,
         "causes": {
           "user_account": {
@@ -60,6 +61,7 @@
           "capture_agent_call_failed:quota_insufficient": 20
         },
         "skipped": 0,
+        "failed_users": 0,
         "stuck_users": 0,
         "causes": {
           "user_account": {
@@ -102,6 +104,7 @@
           "extraction_failed:auth_invalid": 24
         },
         "skipped": 0,
+        "failed_users": 14,
         "stuck_users": 8,
         "causes": {
           "user_account": {
@@ -150,6 +153,7 @@
           "extraction_failed:auth_invalid": 4
         },
         "skipped": 0,
+        "failed_users": 8,
         "stuck_users": 0,
         "causes": {
           "user_account": {
@@ -195,6 +199,7 @@
           "dream_agent_call_failed:auth_invalid": 2
         },
         "skipped": 0,
+        "failed_users": 0,
         "stuck_users": 0,
         "causes": {
           "user_account": {
@@ -235,6 +240,7 @@
           "dream_agent_call_failed:auth_invalid": 2
         },
         "skipped": 0,
+        "failed_users": 0,
         "stuck_users": 0,
         "causes": {
           "user_account": {
@@ -277,6 +283,7 @@
           "provider_setup:model_api_not_tested": 3
         },
         "skipped": 8,
+        "failed_users": 0,
         "stuck_users": 0,
         "causes": {
           "user_account": {
@@ -315,6 +322,7 @@
         "user_unavailable_users": 0,
         "user_unavailable_codes": {},
         "skipped": 0,
+        "failed_users": 0,
         "stuck_users": 0,
         "causes": {
           "user_account": {

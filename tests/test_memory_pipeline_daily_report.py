@@ -120,6 +120,39 @@ def test_quiet_healthy_day_is_marked_normal():
     assert "V1 resident：当天没有任务" in text
 
 
+def test_each_route_line_shows_affected_and_zero_success_users():
+    rows = [_row("usr_a", failed=4, codes={"lease_timeout": 4}),
+            _row("usr_b", failed=1, completed=2, codes={"lease_timeout": 1}),
+            _row("usr_c", completed=3)]
+    text = report_tool.render_message(_report(rows))
+    line = next(l for l in text.splitlines() if l.strip().startswith("V2 model_api：活跃"))
+    assert "失败 5（" in line
+    assert "受影响 2 人（前一天 0）｜零成功 1 人（前一天 0）" in line
+
+
+def test_rate_caveat_is_printed_once_on_every_message():
+    # Seven 2026-09-18: keep the per-attempt rate, but say on the message
+    # itself that retries inflate it (dream retries up to 4x since 09-16).
+    quiet = report_tool.render_message(_report([_row("usr_a", completed=5)]))
+    busy = report_tool.render_message(_report(_stuck_rows(3)))
+    for text in (quiet, busy):
+        assert text.count(report_tool.RATE_CAVEAT) == 1
+    assert "2026-09-16" in report_tool.RATE_CAVEAT
+    assert "受影响" in report_tool.RATE_CAVEAT and "零成功" in report_tool.RATE_CAVEAT
+
+
+def test_backend_without_failed_users_renders_dash_not_zero():
+    # The tool reads whatever prod serves; an older backend must not read as
+    # "nobody affected". stuck_users predates this change and stays numeric.
+    report = _report(_stuck_rows(2))
+    for cell in report["cells"].values():
+        for side in ("day", "previous"):
+            cell[side].pop("failed_users")
+    text = report_tool.render_message(report)
+    line = next(l for l in text.splitlines() if l.strip().startswith("V2 model_api：活跃"))
+    assert "受影响 - 人（前一天 -）｜零成功 2 人（前一天 0）" in line
+
+
 # --------------------------------------------------------------------------- #
 # Lark signature and payload
 # --------------------------------------------------------------------------- #

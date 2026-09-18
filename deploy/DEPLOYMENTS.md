@@ -524,11 +524,15 @@ Once a day (01:30 UTC = 09:30 Beijing) GitHub Actions runs
 `tools/memory_pipeline_daily_report.py` against **prod** and posts one Chinese
 message to the deploy-notice Lark group: capture and dream, split by V1
 `resident` / V2 `model_api`, with active users, real completions, operational
-failures and failure rate, users with operational failures and zero real
-completions, and operational failures grouped as 账号/配置类 / 模型服务 /
-我们这边 / 未知 (grouping reuses `notices.error_contract` blame and
-`memory.capture_failure`). The failure rate uses the admin lane views'
-definition — operational failures ÷ (real completions + operational failures).
+failures and failure rate, users with at least one operational failure
+(受影响), users with operational failures and zero real completions (零成功),
+and operational failures grouped as 账号/配置类 / 模型服务 / 我们这边 / 未知
+(grouping reuses `notices.error_contract` blame and `memory.capture_failure`).
+The failure rate uses the admin lane views' definition — operational failures
+÷ (real completions + operational failures) — and is per attempt: since
+2026-09-16 a Dream retries up to 4 times a night, so one broken user moves
+the rate by four; the message says so in a fixed caveat line and the two user
+counts are the numbers to compare across days (T646, Seven 2026-09-18).
 Control outcomes (V1 `skipped`; V2 `capture_disabled`, `dream_disabled`,
 `turns_halted`, …), failures proven to be the user's own account
 (`notices.catalog` user-unavailable sets) and Dream skips (garden too small,
