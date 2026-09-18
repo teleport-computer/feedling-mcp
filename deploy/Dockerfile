@@ -68,8 +68,8 @@ ENV FEEDLING_GIT_COMMIT=${FEEDLING_GIT_COMMIT} \
 # Run as a fixed non-root UID so bind-mounted volumes on the host can be
 # chowned predictably.
 RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling \
- && mkdir -p /data /tls /var/lib/feedling-cpu \
- && chown -R feedling:feedling /data /tls /var/lib/feedling-cpu /app
+ && mkdir -p /data /tls /var/lib/feedling-cpu /var/lib/feedling-logs \
+ && chown -R feedling:feedling /data /tls /var/lib/feedling-cpu /var/lib/feedling-logs /app
 USER feedling
 
 EXPOSE 5001 9998

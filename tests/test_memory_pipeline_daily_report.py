@@ -4,15 +4,14 @@ Pure unit tests: no database, no network. Every HTTP call goes through an
 injected fake opener, so nothing here can reach the admin API or post a real
 Lark message.
 
-The fixture ``tests/fixtures/memory_pipeline_daily_report/sources_2026-09-14.json``
-uses the exact row projection of ``db.admin_lane_rollup``;
-``tests/test_lane_rollup.py`` locks those key sets (and the outcome columns'
-meaning) against the real DB-backed producer so the fixture cannot silently
-drift from the endpoint.
+The summary fixture is pinned to the raw lane-rollup fixture by
+``tests/test_admin_lane_rollup_summary.py``. ``tests/test_lane_rollup.py``
+locks the raw fixture to the real DB-backed producer, so it cannot silently
+drift from the endpoint. Aggregation tests moved with the backend code;
+this file keeps report policy, presentation and delivery contracts.
 """
 from __future__ import annotations
 
-import copy
 import io
 import json
 import os
@@ -30,11 +29,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(ROOT))
 
-from notices import error_contract  # noqa: E402
+from tests.test_admin_lane_rollup_summary import _row, _report
 from tools import memory_pipeline_daily_report as report_tool  # noqa: E402
 from tools.strict_yaml import load_yaml_strict  # noqa: E402
 
-FIXTURE = ROOT / "tests" / "fixtures" / "memory_pipeline_daily_report" / "sources_2026-09-14.json"
+FIXTURE = ROOT / "tests" / "fixtures" / "memory_pipeline_daily_report" / "summary_2026-09-14.json"
 WORKFLOW = ROOT / ".github" / "workflows" / "memory-pipeline-daily.yml"
 DAY = "2026-09-14"
 PREV = "2026-09-13"
@@ -42,163 +41,6 @@ PREV = "2026-09-13"
 
 def _sources() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
-
-
-def _row(uid, *, day=DAY, route="model_api", lane="capture", completed=0,
-         failed=0, expired=0, codes=None, frozen=True, operational=None,
-         control=0, user=0, silent_declared=0):
-    # V1 cells carry the freezer's outcome split; by default everything failed
-    # is operational (V2 cells always store 0 there, like the real freezer).
-    if route == "resident" and operational is None:
-        operational = failed - control - user
-    return {"user_id": uid, "day": day, "route": route, "lane": lane,
-            "enqueue_source": "", "access_path": "apikey_v2",
-            "mode_source": "explicit", "completed": completed, "failed": failed,
-            "expired": expired, "superseded": 0, "failure_codes": codes or {},
-            "frozen": frozen,
-            "operational_failures": (operational or 0) if frozen else None,
-            "control_outcomes": control if frozen else None,
-            "user_unavailable": user if frozen else None,
-            "spoke": 0, "spoke_completed": 0,
-            "silent_declared": silent_declared, "silent_undeclared": 0}
-
-
-def _payload(rows, *, through=DAY, stuck_total=0, today_partial=None,
-             outcomes_from="2026-08-25", stuck_rows=None):
-    cov = {"backfill_from": "2026-08-01", "through_day": through,
-           "partial_before": "2026-08-01", "voice_from": None,
-           "outcomes_from": outcomes_from, "access_path_from": None}
-    return {"rows": rows, "today_partial": today_partial or [],
-            "stuck": {"rows": stuck_rows or [], "total": stuck_total,
-                      "stuck_after_hours": 6.0, "resident_recent_hours": 24.0,
-                      "note": ""},
-            "coverage": {"resident": dict(cov), "model_api": dict(cov)},
-            "pagination": {"limit": 500, "offset": 0, "returned": len(rows),
-                           "total": len(rows)},
-            "filters": {}}
-
-
-def _report(capture_rows=(), dream_rows=(), **payload_kwargs):
-    sources = {"lane_rollup": {"capture": _payload(list(capture_rows), **payload_kwargs),
-                               "dream": _payload(list(dream_rows))}}
-    return report_tool.build_report(sources, day=DAY)
-
-
-# --------------------------------------------------------------------------- #
-# Message from the realistic fixture
-# --------------------------------------------------------------------------- #
-
-def test_fixture_message_summarizes_each_lane_route_and_marks_attention():
-    text = report_tool.render_message(report_tool.build_report(_sources(), day=DAY))
-
-    assert text.splitlines()[0] == "[需要关注] 记忆管线日报 2026-09-14（北京时间）"
-    # Attention block names what fired, with the threshold.
-    assert "- 落卡 · V2 model_api：我们这边的故障影响 8 人（阈值 5）" in text
-    assert "- 落卡 · V2 model_api：失败率 30%，前一天 3%" in text
-    # Only V2 capture fires: the V1 users out of balance and the scheduler
-    # skips are real, but they are not our failures (review 09-15).
-    assert sum(1 for line in text.splitlines() if line.startswith("- ")) == 2
-    # Failure counts are operational failures (V2 includes expired jobs).
-    assert ("  V1 resident：活跃 26 人｜成功 139｜失败 14（9%，前一天 0%）｜完全卡死 2 人"
-            in text)
-    assert ("  V2 model_api：活跃 35 人｜成功 172｜失败 72（30%，前一天 3%）｜完全卡死 8 人"
-            in text)
-    assert ("失败原因：账号/配置类 8 次/2 人（capture_agent_call_failed:resident_agent_cli_logged_out 8）；"
-            "我们这边 3 次/3 人（capture_memory_actions_failed 3）；未知 3 次/3 人（runtime_failed 3）") in text
-    assert ("不算失败：确认是用户自己账号问题 24 次/4 人（capture_agent_call_failed:quota_insufficient 24）；"
-            "跳过/关闭等控制结果 9 次") in text
-    assert "模型服务 18 次/6 人（extraction_failed:upstream_unavailable 12、extraction_failed:rate_limited 6）" in text
-    assert "我们这边 48 次/8 人（extraction_failed:json_decode_error 24、lease_timeout 24）" in text
-    assert "未知 6 次/6 人（no_code 6）" in text
-    assert ("不算失败：确认是用户自己账号问题 24 次/4 人（extraction_failed:auth_invalid 24）；"
-            "跳过/关闭等控制结果 10 次") in text
-    # Dream skips come from the rollup's silent_declared and are not successes.
-    assert "  V2 model_api：活跃 14 人｜成功 3｜失败 0（0%，前一天 0%）｜完全卡死 0 人" in text
-    assert "花园太小跳过 8 次" in text
-    # V1 live stuck counts only jobs created in the last 24h (2 of the orphan's 40).
-    assert "此刻卡着没结束的任务：落卡 5 · 做梦 0" in text
-    assert "数据说明" not in text
-
-
-def test_message_is_content_free():
-    sources = _sources()
-    text = report_tool.render_message(report_tool.build_report(sources, day=DAY))
-    user_ids = {r["user_id"] for lane in sources["lane_rollup"].values()
-                for r in lane["rows"]}
-    assert user_ids  # the fixture really carries ids that must not leak
-    assert not any(uid in text for uid in user_ids)
-    assert "usr_" not in text
-    assert "job" not in text.lower()
-
-
-def test_cause_breakdown_always_sums_to_operational_failures():
-    report = report_tool.build_report(_sources(), day=DAY)
-    for stats in list(report.today.values()) + list(report.previous.values()):
-        assert sum(c.attempts for c in stats.causes.values()) == stats.operational
-        assert stats.operational + stats.control + stats.user_unavailable == stats.failed_raw
-
-
-# --------------------------------------------------------------------------- #
-# Failure-code grouping
-# --------------------------------------------------------------------------- #
-
-@pytest.mark.parametrize("code,group", [
-    # user's own account / configuration
-    ("auth_invalid", "user_account"),
-    ("extraction_failed:quota_insufficient", "user_account"),
-    ("capture_agent_call_failed:model_not_found", "user_account"),
-    ("dream_agent_call_failed:provider_account_expired", "user_account"),
-    # a local agent timeout is registry-blamed on the system, like chat
-    ("capture_agent_call_failed:turn_timeout", "our_side"),
-    ("capture_agent_call_failed:resident_agent_cli_logged_out", "user_account"),
-    ("provider_setup:model_api_not_tested", "user_account"),
-    ("provider_setup:model_api_not_configured", "user_account"),
-    # model service
-    ("extraction_failed:upstream_unavailable", "model_service"),
-    ("extraction_failed:rate_limited", "model_service"),
-    ("provider_timeout", "model_service"),
-    ("extraction_failed:output_truncated", "model_service"),
-    # our side
-    ("lease_timeout", "our_side"),
-    ("slot_watchdog_timeout", "our_side"),
-    ("watchdog_requeue_exhausted", "our_side"),
-    ("extraction_failed:database_pool_timeout", "our_side"),
-    ("extraction_failed:json_decode_error", "our_side"),
-    ("extraction_failed:no_json_object", "our_side"),
-    ("capture_memory_actions_failed", "our_side"),
-    ("dream_context_unavailable", "our_side"),
-    ("queue_timeout", "our_side"),
-    ("provider_setup:model_api_key_decrypt_failed", "our_side"),
-    ("turns_halted", "our_side"),
-    # unknown
-    ("runtime_failed", "unknown"),
-    ("capture_agent_call_failed:unknown", "unknown"),
-    # a bare prefix names no cause — not "our side" via the capture_ prefix
-    ("capture_agent_call_failed", "unknown"),
-    ("dream_agent_call_failed", "unknown"),
-    ("migrate_agent_call_failed", "unknown"),
-    ("no_code", "unknown"),
-    ("", "unknown"),
-    ("something_brand_new", "unknown"),
-])
-def test_failure_codes_group_by_who_has_to_act(code, group):
-    assert report_tool.classify_failure_code(code) == group
-
-
-def test_registered_codes_follow_the_registry_blame():
-    blame_to_group = {"user_provider": "user_account",
-                      "user_environment": "user_account",
-                      "provider_transient": "model_service",
-                      "system": "our_side"}
-    unknown = {"unknown", error_contract.UNREGISTERED_ERROR_CLASS}
-    checked = 0
-    for spec in error_contract.all_specs():
-        expected = "unknown" if spec.code in unknown else blame_to_group[spec.blame]
-        # A registered code must not be captured by a memory-lane prefix first
-        # unless that prefix is the explicit our-side lease/watchdog list.
-        assert report_tool.classify_failure_code(spec.code) == expected, spec.code
-        checked += 1
-    assert checked > 30
 
 
 # --------------------------------------------------------------------------- #
@@ -212,25 +54,8 @@ def _stuck_rows(n, code="lease_timeout"):
 def test_stuck_users_threshold_boundary():
     below = _report(_stuck_rows(report_tool.STUCK_USERS_ATTENTION - 1))
     at = _report(_stuck_rows(report_tool.STUCK_USERS_ATTENTION))
-    assert not any("完全卡死" in r for r in below.attention)
-    assert any("完全卡死 10 人" in r for r in at.attention)
-
-
-def test_user_with_one_success_is_not_counted_as_stuck():
-    rows = [_row("usr_a", failed=5, codes={"lease_timeout": 5}),
-            _row("usr_b", failed=5, completed=1, codes={"lease_timeout": 5}),
-            _row("usr_c", completed=3)]
-    stats = report_tool.aggregate_day(rows, lane="capture", route="model_api", day=DAY)
-    assert stats.stuck_users == 1
-    assert len(stats.users) == 3
-
-
-def test_split_rows_of_one_user_are_summed_before_stuck_check():
-    # heartbeat-style enqueue_source splits produce several rows per user.
-    rows = [_row("usr_a", failed=2, codes={"lease_timeout": 2}),
-            dict(_row("usr_a", completed=1), enqueue_source="clock")]
-    stats = report_tool.aggregate_day(rows, lane="capture", route="model_api", day=DAY)
-    assert stats.stuck_users == 0
+    assert not any("完全卡死" in r for r in report_tool.evaluate_attention(below))
+    assert any("完全卡死 10 人" in r for r in report_tool.evaluate_attention(at))
 
 
 def test_our_side_users_threshold_boundary():
@@ -238,8 +63,8 @@ def test_our_side_users_threshold_boundary():
     def rows(n):
         return healthy + [_row(f"usr_{i:016x}", completed=1, failed=1,
                                codes={"lease_timeout": 1}) for i in range(n)]
-    assert not any("我们这边" in r for r in _report(rows(4)).attention)
-    assert any("我们这边的故障影响 5 人" in r for r in _report(rows(5)).attention)
+    assert not any("我们这边" in r for r in report_tool.evaluate_attention(_report(rows(4))))
+    assert any("我们这边的故障影响 5 人" in r for r in report_tool.evaluate_attention(_report(rows(5))))
 
 
 def test_failure_rate_jump_boundary_and_minimum_attempts():
@@ -251,66 +76,41 @@ def test_failure_rate_jump_boundary_and_minimum_attempts():
         return prev + today
     no_jump = _report(rows(9, attempts=40))   # 22.5% → +12.5pp
     jump = _report(rows(10, attempts=40))     # 25% → +15pp
-    assert not any("失败率" in r for r in no_jump.attention)
-    assert any("失败率 25%，前一天 10%" in r for r in jump.attention)
+    assert not any("失败率" in r for r in report_tool.evaluate_attention(no_jump))
+    assert any("失败率 25%，前一天 10%" in r for r in report_tool.evaluate_attention(jump))
     # Same jump on too few attempts stays quiet.
     few = [_row("usr_p", day=PREV, completed=9, failed=1, codes={"lease_timeout": 1}),
            _row("usr_t", completed=6, failed=4, codes={"lease_timeout": 4})]
-    assert not any("失败率" in r for r in _report(few).attention)
+    assert not any("失败率" in r for r in report_tool.evaluate_attention(_report(few)))
 
 
 def test_high_failure_rate_fires_without_previous_day():
     rows = [_row("usr_t", completed=10, failed=10,
                  codes={"extraction_failed:upstream_unavailable": 10})]
-    assert any("失败率 50%" in r for r in _report(rows).attention)
+    assert any("失败率 50%" in r for r in report_tool.evaluate_attention(_report(rows)))
     rows = [_row("usr_t", completed=11, failed=9,
                  codes={"extraction_failed:upstream_unavailable": 9})]
-    assert not any("失败率" in r for r in _report(rows).attention)
+    assert not any("失败率" in r for r in report_tool.evaluate_attention(_report(rows)))
     # A 60% day on 5 attempts is noise, not an incident.
     rows = [_row("usr_t", completed=2, failed=3,
                  codes={"extraction_failed:upstream_unavailable": 3})]
-    assert not any("失败率" in r for r in _report(rows).attention)
+    assert not any("失败率" in r for r in report_tool.evaluate_attention(_report(rows)))
 
 
 def test_silent_stop_is_detected_by_active_user_drop():
     prev = [_row(f"usr_{i:016x}", day=PREV, completed=3) for i in range(12)]
     kept = [_row(f"usr_{i:016x}", completed=3) for i in range(6)]
     dropped = [_row(f"usr_{i:016x}", completed=3) for i in range(5)]
-    assert not any("活跃用户" in r for r in _report(prev + kept).attention)
-    fired = _report(prev + dropped).attention
+    assert not any("活跃用户" in r for r in report_tool.evaluate_attention(_report(prev + kept)))
+    fired = report_tool.evaluate_attention(_report(prev + dropped))
     assert any("活跃用户 5 人，前一天 12 人" in r for r in fired)
 
 
 def test_live_stuck_jobs_threshold():
     def stuck(n):
         return _report(stuck_total=n, stuck_rows=[{"route": "model_api", "count": n}])
-    assert not any("卡着没结束" in r for r in stuck(19).attention)
-    assert any("此刻有 20 个任务" in r for r in stuck(20).attention)
-
-
-def test_unfrozen_day_is_flagged_not_reported_as_healthy():
-    live = [_row("usr_a", completed=1, failed=1, frozen=False)]
-    report = _report(through=PREV, today_partial=live)
-    text = report_tool.render_message(report)
-    assert text.startswith("[需要关注]")
-    assert "当天统计还没冻结" in text
-    stats = report.today[("capture", "model_api")]
-    assert stats.operational == 1 and stats.causes["unknown"].codes == {"no_code": 1}
-
-
-def test_lagging_freezer_is_flagged_even_without_live_rows():
-    # A stalled freezer with no live tail must not read as "当天没有任务".
-    report = _report(through=PREV)
-    assert any("数据不完整" in r for r in report.attention)
-    assert "落卡 capture · V2 model_api 当天统计还没冻结" in report_tool.render_message(report)
-
-
-def test_missing_lane_payload_is_flagged():
-    sources = _sources()
-    sources["lane_rollup"].pop("dream")
-    text = report_tool.render_message(report_tool.build_report(sources, day=DAY))
-    assert text.startswith("[需要关注]")
-    assert "做梦 dream 没取到数据" in text
+    assert not any("卡着没结束" in r for r in report_tool.evaluate_attention(stuck(19)))
+    assert any("此刻有 20 个任务" in r for r in report_tool.evaluate_attention(stuck(20)))
 
 
 def test_quiet_healthy_day_is_marked_normal():
@@ -318,124 +118,6 @@ def test_quiet_healthy_day_is_marked_normal():
     text = report_tool.render_message(_report(rows))
     assert text.splitlines()[0].startswith("[正常]")
     assert "V1 resident：当天没有任务" in text
-
-
-def test_dream_skips_come_from_silent_declared_and_are_not_successes():
-    rows = [_row("usr_a", lane="dream", completed=5, silent_declared=5),
-            _row("usr_b", lane="dream", completed=3, silent_declared=1, failed=1,
-                 codes={"extraction_failed:output_truncated": 1}),
-            _row("usr_c", lane="dream", completed=0, failed=1,
-                 codes={"extraction_failed:upstream_unavailable": 1}),
-            _row("usr_d", lane="dream", completed=4, silent_declared=4, failed=2,
-                 codes={"extraction_failed:upstream_unavailable": 2})]
-    stats = report_tool.aggregate_day(rows, lane="dream", route="model_api", day=DAY)
-    assert (stats.completed, stats.skipped, stats.operational) == (2, 10, 4)
-    # A user whose only completions were skips never succeeded that day.
-    assert stats.stuck_users == 2
-    # Capture has no declared skips: silent_declared there is not subtracted.
-    capture = report_tool.aggregate_day(
-        [_row("usr_a", completed=5, silent_declared=5)],
-        lane="capture", route="model_api", day=DAY)
-    assert (capture.completed, capture.skipped) == (5, 0)
-
-
-def test_v1_control_and_user_unavailable_do_not_page():
-    """Review 09-15: V1 skipped jobs and users' own account failures inflated the
-    failure rate, "stuck users" and "我们这边" every day."""
-    rows = []
-    for i in range(12):  # skipped by the scheduler, reason recorded as a code
-        rows.append(_row(f"usr_skip{i:012x}", route="resident", completed=1, failed=4,
-                         codes={"capture_window_unavailable": 4}, control=4))
-    for i in range(12):  # the user's own empty balance
-        rows.append(_row(f"usr_bal{i:013x}", route="resident", failed=3,
-                         codes={"capture_agent_call_failed:quota_insufficient": 3}, user=3))
-    report = _report(rows)
-    stats = report.today[("capture", "resident")]
-    assert (stats.operational, stats.control, stats.user_unavailable) == (0, 48, 36)
-    assert stats.stuck_users == 0
-    assert stats.failure_rate == 0
-    assert report.attention == []
-    text = report_tool.render_message(report)
-    assert text.startswith("[正常]")
-    assert ("不算失败：确认是用户自己账号问题 36 次/12 人（capture_agent_call_failed:quota_insufficient 36）；"
-            "跳过/关闭等控制结果 48 次") in text
-
-
-def test_v1_codes_shared_with_skips_are_not_guessed_into_a_group():
-    # One cell: 2 skips + 3 real failures, all recorded under capture_* reasons.
-    rows = [_row("usr_mix", route="resident", completed=1, failed=5, control=2,
-                 codes={"capture_window_unavailable": 2, "capture_memory_write_failed": 3})]
-    stats = report_tool.aggregate_day(rows, lane="capture", route="resident", day=DAY)
-    assert stats.operational == 3
-    assert stats.causes["unknown"].codes == {"unattributed": 3}
-    assert not stats.causes["our_side"].users
-    # Fewer codes than failures, but a skip shares them: still not guessed.
-    rows = [_row("usr_mix2", route="resident", completed=1, failed=5, control=2,
-                 codes={"capture_window_unavailable": 2})]
-    stats = report_tool.aggregate_day(rows, lane="capture", route="resident", day=DAY)
-    assert stats.causes["unknown"].codes == {"unattributed": 3}
-    assert not stats.causes["our_side"].users
-    # Without control outcomes the leftover codes are exactly the failures.
-    rows = [_row("usr_ours", route="resident", completed=1, failed=4,
-                 codes={"capture_memory_write_failed": 3})]
-    stats = report_tool.aggregate_day(rows, lane="capture", route="resident", day=DAY)
-    assert stats.causes["our_side"].codes == {"capture_memory_write_failed": 3}
-    assert stats.causes["unknown"].codes == {"no_code": 1}
-
-
-def test_v2_control_and_user_unavailable_codes_follow_the_v2_classifier():
-    rows = [_row(f"usr_{i:016x}", completed=0, failed=3,
-                 codes={"capture_disabled": 1, "turns_halted": 1,
-                        "provider_setup:model_api_not_configured": 1})
-            for i in range(12)]
-    report = _report(rows)
-    stats = report.today[("capture", "model_api")]
-    assert (stats.operational, stats.control, stats.user_unavailable) == (0, 24, 12)
-    assert stats.stuck_users == 0 and report.attention == []
-
-
-def test_v2_classifier_literal_matches_jobs_store():
-    from model_api_runtime.v2 import jobs_store
-    import db
-    assert report_tool.v2_control_outcome_codes() == jobs_store.CONTROL_OUTCOME_CODES
-    assert report_tool.skip_declared_lanes() == db.LANE_ROLLUP_SKIP_DECLARED_LANES
-    for code in ("capture_disabled", "extraction_failed:auth_invalid", "lease_timeout",
-                 "queue_timeout", "extraction_failed:upstream_unavailable"):
-        stats = report_tool.aggregate_day(
-            [_row("usr_a", failed=1, codes={code: 1})],
-            lane="capture", route="model_api", day=DAY)
-        expected = jobs_store.terminal_outcome_class(code)
-        got = ("control" if stats.control else "user_unavailable" if stats.user_unavailable
-               else "operational_failure")
-        assert got == ("operational_failure" if expected == "timeout" else expected), code
-
-
-def test_unmeasured_or_unbalanced_v1_outcomes_count_raw_and_say_so():
-    rows = [_row(f"usr_{i:016x}", route="resident", failed=2,
-                 codes={"capture_window_unavailable": 2}, control=2) for i in range(3)]
-    measured = _report(rows)
-    assert measured.today[("capture", "resident")].operational == 0
-    unmeasured = _report(rows, outcomes_from=None)
-    stats = unmeasured.today[("capture", "resident")]
-    assert stats.operational == 6 and stats.unclassified
-    assert any("失败分类缺失" in note for note in unmeasured.incomplete)
-    assert unmeasured.attention
-    broken = [_row("usr_x", route="resident", failed=5, operational=1, control=1)]
-    stats = _report(broken).today[("capture", "resident")]
-    assert stats.operational == 5 and stats.unclassified
-
-
-def test_live_stuck_counts_only_recent_v1_jobs():
-    stuck_rows = [
-        {"route": "resident", "lane": "capture", "count": 40, "recent_count": 2},
-        {"route": "model_api", "lane": "capture", "count": 19},
-    ]
-    report = _report(stuck_total=59, stuck_rows=stuck_rows)
-    assert report.live_stuck["capture"] == 21
-    assert any("此刻有 21 个任务" in r for r in report.attention)
-    # An older backend without recent_count keeps the full count.
-    legacy = [{"route": "resident", "lane": "capture", "count": 40}]
-    assert _report(stuck_total=40, stuck_rows=legacy).live_stuck["capture"] == 40
 
 
 # --------------------------------------------------------------------------- #
@@ -599,15 +281,8 @@ class _FakeAdminAndLark:
         assert request.get_header("X-admin-token") == self.token
         query = dict(urllib.parse.parse_qsl(url.query))
         self.admin_calls.append((url.path, query))
-        if url.path == "/v1/admin/lane-rollup":
-            full = self.sources["lane_rollup"][query["lane"]]
-            limit = self.page_limit or int(query["limit"])
-            offset = int(query["offset"])
-            rows = full["rows"][offset:offset + limit]
-            page = dict(copy.deepcopy(full), rows=rows)
-            page["pagination"] = {"limit": limit, "offset": offset,
-                                  "returned": len(rows), "total": len(full["rows"])}
-            return _Resp(json.dumps(page).encode())
+        if url.path == "/v1/admin/lane-rollup/summary":
+            return _Resp(json.dumps(self.sources).encode())
         raise AssertionError(url.path)
 
 
@@ -622,63 +297,12 @@ def test_live_mode_reads_admin_api_and_posts_signed_message(monkeypatch):
         out=io.StringIO(),
     )
     assert code == 0
-    rollup_calls = [q for p, q in fake.admin_calls if p == "/v1/admin/lane-rollup"]
-    assert {q["lane"] for q in rollup_calls} == {"capture", "dream"}
-    assert all(q["since_day"] == PREV and q["until_day"] == DAY for q in rollup_calls)
-    assert {p for p, _ in fake.admin_calls} == {"/v1/admin/lane-rollup"}
+    assert fake.admin_calls == [("/v1/admin/lane-rollup/summary", {"day": DAY})]
     (post,) = fake.posts
     assert post["sign"] == report_tool.lark_sign(post["timestamp"], "lark-secret")
-    expected = report_tool.render_message(report_tool.build_report(_sources(), day=DAY))
+    expected = report_tool.render_message(_sources())
     assert post["content"]["text"] == expected
     assert "admin-secret" not in json.dumps(post)
-
-
-def test_lane_rollup_pages_are_merged(monkeypatch):
-    monkeypatch.setattr(report_tool, "LANE_ROLLUP_PAGE_LIMIT", 7)
-    fake = _FakeAdminAndLark(_sources(), page_limit=7)
-    merged = report_tool.fetch_lane_rollup("https://api.invalid", "admin-secret",
-                                           lane="capture", since_day=PREV,
-                                           until_day=DAY, opener=fake)
-    assert len(merged["rows"]) == len(_sources()["lane_rollup"]["capture"]["rows"])
-    assert len(fake.admin_calls) > 1
-    assert "truncated" not in merged
-
-
-def test_lane_rollup_pages_are_deduplicated_by_full_cell_key(monkeypatch):
-    """An older backend orders pages without ``route``: a cell can slide across
-    a page boundary and come back on the next page."""
-    rows = _sources()["lane_rollup"]["capture"]["rows"][:4]
-    pages = [[rows[0], rows[1]], [rows[1], rows[2]], [rows[3]]]
-    calls = []
-
-    def opener(request, timeout):
-        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.full_url).query))
-        page = pages[len(calls)]
-        calls.append(int(query["offset"]))
-        return _Resp(json.dumps({"rows": page, "pagination": {
-            "returned": len(page), "total": sum(len(p) for p in pages)}}).encode())
-
-    monkeypatch.setattr(report_tool, "LANE_ROLLUP_PAGE_LIMIT", 2)
-    merged = report_tool.fetch_lane_rollup("https://api.invalid", "t", lane="capture",
-                                           since_day=PREV, until_day=DAY, opener=opener)
-    assert merged["rows"] == rows
-    # Same user/day/lane on the other route is a different cell, not a duplicate.
-    other_route = dict(rows[0], route="model_api")
-    pages[:] = [[rows[0], other_route]]
-    calls.clear()
-    merged = report_tool.fetch_lane_rollup("https://api.invalid", "t", lane="capture",
-                                           since_day=PREV, until_day=DAY, opener=opener)
-    assert merged["rows"] == [rows[0], other_route]
-
-
-def test_lane_rollup_page_cap_is_declared(monkeypatch):
-    monkeypatch.setattr(report_tool, "LANE_ROLLUP_PAGE_LIMIT", 1)
-    monkeypatch.setattr(report_tool, "LANE_ROLLUP_MAX_PAGES", 3)
-    fake = _FakeAdminAndLark(_sources(), page_limit=1)
-    merged = report_tool.fetch_lane_rollup("https://api.invalid", "admin-secret",
-                                           lane="capture", since_day=PREV,
-                                           until_day=DAY, opener=fake)
-    assert merged["truncated"] is True and len(merged["rows"]) == 3
 
 
 def test_fetch_failure_still_posts_a_content_free_notice():
@@ -701,7 +325,7 @@ def test_fetch_failure_still_posts_a_content_free_notice():
     (post,) = posts
     text = post["content"]["text"]
     assert text.startswith("[需要关注] 记忆管线日报 2026-09-14（北京时间）没生成出来")
-    assert "/v1/admin/lane-rollup HTTP 503" in text
+    assert "/v1/admin/lane-rollup/summary HTTP 503" in text
     assert "body with secrets" not in text and "admin-secret" not in text
 
 
@@ -715,10 +339,10 @@ def test_unexpected_error_still_posts_a_content_free_notice(monkeypatch, stage):
         raise TypeError("usr_leaky_secret_value")
 
     if stage == "build":
-        monkeypatch.setattr(report_tool, "build_report", boom)
+        monkeypatch.setattr(report_tool, "render_message", boom)
         argv, environ = ["--fixture", str(FIXTURE), "--day", DAY], {}
     else:
-        monkeypatch.setattr(report_tool, "fetch_sources", boom)
+        monkeypatch.setattr(report_tool, "fetch_summary", boom)
         argv = ["--day", DAY]
         environ = {"FEEDLING_API_URL": "https://api.invalid",
                    "FEEDLING_ADMIN_TOKEN": "admin-secret"}
@@ -757,7 +381,7 @@ def test_changed_response_shape_is_reported_not_crashed():
                                      "LARK_BOT_WEBHOOK": "https://lark.invalid/hook"},
                             out=io.StringIO())
     assert code == 1
-    assert "生成报告出错：AttributeError" in posts[0]["content"]["text"]
+    assert "生成报告出错：KeyError" in posts[0]["content"]["text"]
 
 
 def test_missing_admin_config_is_a_fetch_failure_not_silence():
@@ -833,7 +457,7 @@ def test_thresholds_keep_defaults_and_follow_env_overrides(monkeypatch):
         assert report_tool.LIVE_STUCK_JOBS_ATTENTION == 20
         assert report_tool.OUR_SIDE_USERS_ATTENTION == 5
         # The override reaches the rule, not just the constant.
-        assert any("完全卡死 3 人" in r for r in _report(_stuck_rows(3)).attention)
+        assert any("完全卡死 3 人" in r for r in report_tool.evaluate_attention(_report(_stuck_rows(3))))
 
         # nan compares False with everything (the rule would silently never
         # fire) and inf is just as unreachable: both keep the default.
@@ -848,3 +472,14 @@ def test_thresholds_keep_defaults_and_follow_env_overrides(monkeypatch):
         for name in report_tool.THRESHOLD_ENV_VARS:
             monkeypatch.delenv(name, raising=False)
         importlib.reload(report_tool)
+
+
+def test_standalone_script_needs_only_stdlib_and_defaults_the_day(tmp_path):
+    # No repository on sys.path and site-packages disabled, as in Actions.
+    import shutil
+    script = tmp_path / 'report.py'
+    shutil.copyfile(ROOT / 'tools/memory_pipeline_daily_report.py', script)
+    result = subprocess.run([sys.executable, '-I', '-S', str(script),
+        '--fixture', str(FIXTURE), '--dry-run'], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.rstrip('\n') == FIXTURE.with_name('expected_message_2026-09-14.txt').read_text()

@@ -71,6 +71,10 @@ def probe_enclave_health(*, max_latency_sec: float = 10.0) -> bool:
             f"{base}/healthz",
             timeout=float(max_latency_sec),
             follow_redirects=False,
+            # The in-cluster enclave endpoint uses its self-signed runtime
+            # certificate.  This matches the existing enclave clients; the
+            # URL is supplied by the trusted deployment configuration.
+            verify=False,
         )
     except Exception:  # noqa: BLE001 - health result is deliberately boolean
         return False

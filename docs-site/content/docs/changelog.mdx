@@ -17,6 +17,14 @@ change must not be interpreted as an API guarantee.
   `source_event_id` (stable device identity). A valid `occurred_at` now dates
   the photo in perception history; invalid or missing values fall back to the
   upload time. The wake for the photo is still raised when it is uploaded.
+
+- Production/test deployment sources add filtered diagnostics for the two enclave
+  containers: 30-day local retention and optional operator R2 delivery with a
+  required 90-day bucket lifecycle. Only validated content-free request metadata
+  and fixed worker lifecycle events are retained; raw logs are rejected. Leaving
+  `R2_LOGS_BUCKET` empty disables external delivery. The architecture and
+  self-hosting guides now describe this metadata export boundary.
+
 - Resident pi failures with a final `stopReason=error` now use
   `provider_error_unclassified` when no specific provider-error rule matches,
   instead of reporting an empty reply. The new provider-owned notice says:

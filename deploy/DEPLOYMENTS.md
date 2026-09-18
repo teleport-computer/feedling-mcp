@@ -237,7 +237,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.yaml`; recorded live service set: `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
-| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, `cpu-recorder`, and `log-shipper`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
@@ -277,7 +277,7 @@ python tools/verify_enclave_domain.py \
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.test.yaml`; recorded live service set matches prod: `ingress`, `backend`, `enclave`, with test domains + `_test` volumes |
-| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, `cpu-recorder`, and `log-shipper`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | **TEE primary is live since 2026-08-18**, promoted by test release [`82c4c019`](https://github.com/teleport-computer/feedling-mcp/commit/82c4c019da24e6bfbe47d05411c0f812bf519ae7). `TEST_DATABASE_URL` is the TEE `app`-role DSN shared by the main CVM and runner, `TEST_FEEDLING_DATABASE_SCHEMA=tee`, and the old dual-write secret is absent. CI verified the owner/app database fingerprint, `alembic_tee` head, and application startup contract before changing either CVM; subsequent normal TEE-primary processes run the independent Alembic chain before they become ready. The former RDS is a frozen pre-cutover snapshot only; after the first TEE-primary write it is not a lossless rollback target without reverse reconciliation. |
@@ -319,6 +319,74 @@ python tools/verify_enclave_domain.py \
   --expected-compose-hash "$TEST_COMPOSE_HASH" \
   --expected-content-pk "$TEST_ENCLAVE_CONTENT_PK_BASELINE" \
   --reference-measurements "$TEST_REFERENCE_MEASUREMENTS"
+```
+
+
+#### Enclave diagnostic log history (staged source topology)
+
+Production and test add `log-shipper` alongside CPU history. The existing
+socket proxy admits only GET container listing, stats and logs, from
+`cpu-recorder,log-shipper` ([proxy hostname list syntax](https://github.com/wollomatic/socket-proxy)).
+Only the proxy mounts docker.sock. The shipper is non-root, read-only apart
+from its named volume, drops all capabilities, and is capped at 0.10 CPU/128 MB.
+The image creates the volume mountpoint owned by UID 1000. Business services do
+not depend on either collector. A separate `log-egress` bridge is attached only
+to the shipper for R2; the Docker proxy remains on the internal network. Code
+calls only the proxy and configured R2 endpoint; Compose bridge networking does
+**not** impose a destination-domain firewall.
+
+Container Names are resolved through `/containers/json` every follow cycle:
+`feedling-enclave-enclave-1` / `feedling-enclave-enclave-domain-1` in production,
+`feedling-test-enclave-1` / `feedling-test-enclave-domain-1` in test. Output aliases
+are `enclave` and `enclave-domain`. The allowlist checks every T637 JSON field,
+including closed route templates and truncated user prefixes; gunicorn worker
+boot/exit/timeout messages become fixed event names and PIDs. Legacy free text,
+full user IDs, exceptions and unknown shapes are discarded and counted, with
+an additional PEM/envelope/ciphertext/plaintext_b64/long-hex deny filter. This
+is a filtered diagnostic stream, not a backup of raw container stdout/stderr.
+
+Files are `/var/lib/feedling-logs/<container>/YYYY-MM-DD/HH.log.part` while open,
+then `.log.gz` on UTC hour rollover, replacement or graceful shutdown. Late
+records append to an atomic replacement without losing prior gzip contents.
+Each append is fsynced before its durable per-container-ID cursor advances;
+reconnect uses an exact `seconds.nanoseconds` Docker timestamp and skips
+already acknowledged boundary records
+([Docker log timestamp semantics](https://docs.docker.com/reference/cli/docker/container/logs/)).
+The cursor also counts records at that exact timestamp so distinct same-time
+events remain intact. A new container ID starts from its retained beginning.
+Routine reconnects do not duplicate acknowledged records. Crashes between
+append and cursor persistence (or gzip replacement and part removal) can replay
+records; records already deleted/rotated by Docker
+before collection cannot be recovered. Interrupted unacknowledged tail records
+are replayed. Whole-hour files expire after all their records are at least
+`LOG_SHIPPER_RETENTION_DAYS=30` days old; unuploaded files also expire then.
+
+`feedling_log_history` (prod) / `feedling_log_history_test` (test) survive container
+replacement. Sealed files upload via `object_storage.client()` into the separate
+`R2_LOGS_BUCKET`, key `<env>/<cvm>/<container>/YYYY-MM-DD/HH.log.gz`. A content-digest
+receipt makes late updates pending again. Upload failures use bounded exponential
+retries, retain local files, and retry next UTC hour; uploads run separately so
+an R2 outage cannot stop collection or rotation. Empty bucket means local-only
+and one hourly status line with `R2 未配置`. Configured bucket without credentials
+reports `credentials_missing`; `configured` reports configuration, not a claim
+that a PUT succeeded. Counters expose dropped lines, storage/Docker/upload
+errors and uploaded files without log contents or exception messages.
+
+Before real external delivery, ops must create dedicated buckets, set an R2
+**90-day lifecycle expiration rule**, grant the existing R2 token access to the
+log bucket (or provision an appropriately scoped credential), and configure
+GitHub secrets `R2_LOGS_BUCKET` / `TEST_R2_LOGS_BUCKET`. Existing
+`R2_ENDPOINT/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY` wiring is reused. Empty secret
+is deliberately nonblocking and does not enable uploads. Code never deletes
+remote objects; an unconfigured lifecycle does not implement the 90-day limit.
+Compose changes alter measured compose_hash and require the normal reviewed
+release/attestation update; this source change is not deployment evidence.
+
+```bash
+# Local hour inventory (same aliases in test and prod)
+phala ssh feedling-enclave-v2 -- docker exec log-shipper ls /var/lib/feedling-logs/enclave/2026-09-17/
+# Read a sealed R2 hour with operator-provided credentials
+aws s3 cp --endpoint-url "$R2_ENDPOINT" "s3://$R2_LOGS_BUCKET/prod/feedling-enclave-v2/enclave/2026-09-17/12.log.gz" - | gzip -dc
 ```
 
 ### Runtime V2 worker CVM (test, `feedling-io-agents-test`)
@@ -496,84 +564,6 @@ failure rate ≥ 50% or +15 pp day over day on ≥ 20 attempts, active users hal
   shown as 未知 `unattributed` instead of being guessed into a group. Dream days
   frozen before Dream skips were written to `silent_declared` show those skips
   as completions. The schedule only fires from the default branch.
-
-## Operator repairs (admin API)
-
-### False no-cards Dream ledger repair
-
-For users stuck after the 2026-09-10 / 09-13 incident (a timed-out card read
-was recorded as a completed "no cards" Dream, so the scheduler answers
-`already_dreamed`). Needs only the admin token; selection rules and limits live
-in `backend/proactive/dream_ledger_audit.py`, the write in
-`backend/admin/dream_ledger_repair.py`. All output is content-free (ids,
-timestamps, counts, hashes).
-
-What a repair does per listed user: (1) compare-and-set the `dream_state`
-ledger fields back to the last verified Dream (or never-dreamed zeros), only if
-the ledger fingerprint and the audited job ids still match, the garden still
-has live cards, and the user has no queued/running Dream job; (2) reclassify the
-rewound false completions to `failed` / `dream_context_unavailable` with a
-`dream_ledger_repair` marker (otherwise an unchanged garden recomputes the same
-`dream_key` and the enqueue says `duplicate_dream_key`). It does not enqueue a
-Dream itself: the next scheduler tick decides with its normal rules.
-
-```bash
-API=https://<env-api-host>          # the backend of the environment to repair
-TOKEN=<FEEDLING_ADMIN_TOKEN>        # never paste into shared logs
-W1=2026-09-10T18:00:00Z/2026-09-10T20:00:00Z
-W2=2026-09-13T18:00:00Z/2026-09-13T20:00:00Z
-
-# 1. Read-only audit (repeat user_id=... to narrow). Review candidates[].
-#    Without user_id the scan only sees Dream jobs enqueued up to
-#    max_job_age_days (default 30) before the window: partial=true. A user
-#    whose consumer was offline longer is only found by naming them.
-curl -sG "$API/v1/admin/memory/dream-false-no-cards" \
-  -H "X-Admin-Token: $TOKEN" \
-  --data-urlencode "window=$W1" --data-urlencode "window=$W2" > audit.json
-jq '{verdicts, candidate_count, partial, scan_bound}' audit.json
-
-# 2. Build the request from reviewed rows only (no "all users" mode exists).
-#    Each entry is bound to the job ids the audit showed.
-jq --arg w1 "$W1" --arg w2 "$W2" '{windows: [$w1, $w2],
-  users: [.candidates[] | {user_id, ledger_fingerprint, job_id, rewound_job_ids}]}' \
-  audit.json > repair.json
-
-# 3. Dry run (default): per user action=would_rewind, changes{field:{from,to}},
-#    would_reclassify_job_ids. Nothing is written.
-curl -s "$API/v1/admin/memory/dream-false-no-cards/repair" \
-  -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' \
-  -d @repair.json | jq '.counts, .results[] | {user_id, action, reason}'
-
-# 4. Apply — start with one user, then the rest (max 100 per request).
-jq '.dry_run = false | .users = .users[:1]' repair.json |
-  curl -s "$API/v1/admin/memory/dream-false-no-cards/repair" \
-    -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' -d @- |
-  jq '.counts, .results'
-
-# 5. Verify: re-run step 1 — repaired users move to already_repaired with
-#    unreclassified_job_ids == []; after their next night, later_verified_dream.
-```
-
-Result `action` values: `rewound`; `already_repaired` (no-op; apply mode only
-finishes leftover `unreclassified_job_ids`); `skipped` with `reason` =
-`ledger_changed_since_audit` (a Dream or another write moved the ledger — re-audit
-before retrying), `jobs_changed_since_audit` (the audited `job_id` /
-`rewound_job_ids` no longer match — re-audit), `dream_job_active` (the user has a
-queued or running Dream, ids in `active_job_ids` — re-run after it finishes),
-`ambiguous_legacy_no_cards` (the garden has no live cards now, so the old
-"no cards" may have been true; left alone — a rewind would not make an empty
-garden dream anyway), `garden_unreadable` (card count failed — retry),
-`ledger_missing`, or the selector verdict (`no_incident_completion`,
-`later_verified_dream`, `ledger_moved`); `not_attempted` (35 s request budget
-spent — re-run, it is idempotent). A 503
-`dream_ledger_query_timeout` is safe to retry; narrow with `user_id` for the
-audit. Every applied decision logs `[admin:dream-ledger-repair]` and a rewind
-also writes a `memory.dream.ledger_rewound` trace event (when that user's debug
-trace is enabled).
-
-Known limits: jobs trimmed past the newest 500 per user and Runtime V2 empty
-reads are not found; an orphaned queued Dream job (consumer gone for good)
-keeps the user at `dream_job_active`.
 
 ## Enclave configuration
 

@@ -16,9 +16,10 @@ PROXY_IMAGE = (
 PROXY_COMMAND = [
     "-loglevel=INFO",
     "-listenip=0.0.0.0",
-    "-allowfrom=cpu-recorder",
+    "-allowfrom=cpu-recorder,log-shipper",
     "-allowGET=/containers/json",
     r"-allowGET=/containers/[0-9a-f]{64}/stats",
+    r"-allowGET=/containers/[0-9a-f]{64}/logs",
     "-allowhealthcheck",
     "-watchdoginterval=60",
     "-stoponwatchdog",
@@ -116,7 +117,7 @@ def test_cpu_recorder_compose_is_private_bounded_and_dependency_isolated(
         for key in environment
     )
 
-    business_services = set(services) - {"cpu-socket-proxy", "cpu-recorder"}
+    business_services = set(services) - {"cpu-socket-proxy", "cpu-recorder", "log-shipper"}
     for service_name in business_services:
         service = services[service_name]
         dependencies = service.get("depends_on", {})

@@ -116,6 +116,28 @@ def test_apply_waits_for_consecutive_healthy_probes(monkeypatch):
     assert result.failures == 0
 
 
+def test_enclave_health_probe_accepts_internal_self_signed_certificate(monkeypatch):
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave:5003")
+    calls = []
+
+    class Response:
+        status_code = 200
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(plaintext_repair.httpx, "get", fake_get)
+
+    assert plaintext_repair.probe_enclave_health(max_latency_sec=10) is True
+    assert calls == [
+        (
+            "https://enclave:5003/healthz",
+            {"timeout": 10.0, "follow_redirects": False, "verify": False},
+        )
+    ]
+
+
 def test_apply_stops_after_first_failed_user(monkeypatch):
     monkeypatch.setattr(
         plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a", "usr_b"]

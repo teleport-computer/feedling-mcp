@@ -350,6 +350,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `app_required` | 400 | — | | |
 | `unknown_signals` | 400 | — | agent 感知信号名不识别 | |
 | `unknown_or_unhistorized_signal` | 400 | — | | |
+| `invalid_day` | 400 | — | admin lane-rollup summary 的 `day` 不是 YYYY-MM-DD 有效日期，或不存在前一天 | |
 | `invalid_days` | 400 | — | `days` 查询参数非数字 | |
 
 ## Web 能力（`POST /v1/agent/web/{search,fetch}`，CapabilityResult `error.code`）
@@ -378,8 +379,6 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `export_too_large` | 413 | — | 一次性导出超 80MiB 预算 | |
 | `archive_cleanup_failed` | 503 | system | 账号重置：R2 归档清理失败，reset 中止（可安全重试） | |
 | `confirmation_mismatch` | 400 | — | admin 删除用户端点专用：`confirm` 字段 ≠ `user_id` | |
-| `invalid_dream_ledger_request` | 400 | — | admin 假「没有卡」做梦账本审计/修复端点专用：窗口/用户/指纹/`dry_run` 等参数不合法（`detail` 为不含内容的原因码，如 `users_required`、`invalid_ledger_fingerprint`、`invalid_job_id`、`invalid_rewound_job_ids`） | |
-| `dream_ledger_query_timeout` | 503 | system | 同上两端点：有界读取超过 HTTP 或 PostgreSQL 时限；重跑即可（修复端点幂等） | |
 
 ## 通知中继（notify_relay）
 

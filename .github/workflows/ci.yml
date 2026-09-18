@@ -427,11 +427,10 @@ jobs:
             tests/test_agent_call_failure_codes.py \
             tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
-            tests/test_audit_dream_false_no_cards.py \
-            tests/test_admin_dream_false_no_cards.py \
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
+            tests/test_admin_lane_rollup_summary.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
@@ -469,13 +468,15 @@ jobs:
           printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
           python -m pytest "${consumer_tests[@]}" -v
 
-      - name: Run Phala CPU recorder regression suite
+      - name: Run Phala CPU and log collector regression suite
         env:
           PYTHONPATH: backend
         run: |
           python -m pytest \
             tests/test_cpu_recorder.py \
             tests/test_cpu_recorder_compose.py \
+            tests/test_log_shipper.py \
+            tests/test_log_shipper_compose.py \
             tests/test_cpu_socket_proxy_integration.py \
             -v
 
@@ -1055,11 +1056,10 @@ jobs:
             tests/test_agent_call_failure_codes.py \
             tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
-            tests/test_audit_dream_false_no_cards.py \
-            tests/test_admin_dream_false_no_cards.py \
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
+            tests/test_admin_lane_rollup_summary.py \
             tests/test_memory_pipeline_daily_report.py \
             tests/test_v2_capture_lifecycle.py \
             tests/test_capture_failure_backoff.py \
@@ -2154,7 +2154,6 @@ jobs:
               exit 1
             fi
           done
-
   detect-cvm-changes-pre:
     name: detect CVM changes (pre)
     if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
@@ -2702,6 +2701,7 @@ jobs:
           R2_ACCESS_KEY_ID:             ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:         ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.R2_FRAMES_BUCKET }}
+          R2_LOGS_BUCKET:               ${{ secrets.R2_LOGS_BUCKET }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2721,6 +2721,7 @@ jobs:
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "R2_LOGS_BUCKET=$R2_LOGS_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
@@ -2971,6 +2972,7 @@ jobs:
           R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
+          R2_LOGS_BUCKET:               ${{ secrets.TEST_R2_LOGS_BUCKET }}
         run: |
           echo ">>> deploy-test-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2985,6 +2987,7 @@ jobs:
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
             -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "R2_LOGS_BUCKET=$R2_LOGS_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \

@@ -931,14 +931,13 @@ def test_resident_dream_agent_failures_keep_their_class_in_frozen_codes(
 
 def test_daily_report_fixture_matches_real_rollup_projection(
         clean_rollup):
-    """tools/memory_pipeline_daily_report.py is tested from a saved fixture.
+    """admin.lane_rollup_summary is tested from a saved fixture.
     Lock that fixture to what the producers really return, so a renamed or
     dropped column fails here instead of silently zeroing the daily report."""
     import json as _json
     from pathlib import Path as _P
 
-    sys.path.insert(0, str(_P(__file__).parent.parent))
-    from tools import memory_pipeline_daily_report as report_tool
+    from admin import lane_rollup_summary as report_summary
 
     fixture = _json.loads(
         (_P(__file__).parent / "fixtures" / "memory_pipeline_daily_report"
@@ -983,14 +982,14 @@ def test_daily_report_fixture_matches_real_rollup_projection(
         assert set(payload["coverage"][route]) >= set(
             fixture_payload["coverage"][route])
 
-    v2 = report_tool.aggregate_day(real_rows, lane="capture", route="model_api",
+    v2 = report_summary.aggregate_day(real_rows, lane="capture", route="model_api",
                                    day="2030-06-01")
     assert (v2.failed_raw, v2.operational, v2.control, v2.user_unavailable) == (4, 2, 1, 1)
     assert v2.stuck_users == 1
     assert v2.user_unavailable_codes == {"extraction_failed:auth_invalid": 1}
     assert v2.causes["our_side"].codes == {"lease_timeout": 1}
     assert v2.causes["unknown"].codes == {"no_code": 1}
-    v1 = report_tool.aggregate_day(real_rows, lane="capture", route="resident",
+    v1 = report_summary.aggregate_day(real_rows, lane="capture", route="resident",
                                    day="2030-06-01")
     assert (v1.completed, v1.failed_raw) == (1, 3)
     assert (v1.operational, v1.control, v1.user_unavailable) == (1, 1, 1)
@@ -1010,7 +1009,7 @@ def test_daily_report_fixture_matches_real_rollup_projection(
     (row,) = [r for r in stuck["rows"] if r["user_id"] == stuck_uid]
     assert (row["count"], row["recent_count"]) == (3, 1)
     assert stuck["resident_recent_hours"] == 24.0
-    assert report_tool.live_stuck_total(stuck) == 1
+    assert report_summary.live_stuck_total(stuck) == 1
     fixture_stuck_row = next(r for r in fixture_payload["stuck"]["rows"]
                              if r["route"] == "resident")
     assert set(fixture_stuck_row) == set(row)
