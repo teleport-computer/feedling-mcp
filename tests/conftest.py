@@ -264,6 +264,7 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_tcp_connect_monitor.py",
         "test_log_shipper.py",
         "test_log_shipper_compose.py",
         "test_enclave_reqlog.py",
