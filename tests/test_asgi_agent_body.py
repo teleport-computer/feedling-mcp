@@ -84,7 +84,11 @@ def generation_env(tmp_path, monkeypatch):
         calls.append((config, copy.deepcopy(messages), kwargs))
         return {"reply": json.dumps({"rows": valid_rows()})}
     monkeypatch.setattr(provider_client, "chat_completion", provider)
-    return client, {"X-API-Key": api_key}, route, calls, traces, uid
+    yield client, {"X-API-Key": api_key}, route, calls, traces, uid
+    for event in traces:
+        if event["type"] == "agent_body.generate.finished":
+            for key in ("repair_reason", "invalid_reason"):
+                assert event["detail"][key] in ("", *core.ROWS_INVALID_CODES)
 
 
 def post(env, payload=None):
@@ -105,16 +109,79 @@ def test_model_rows_return_verbatim_with_private_context(generation_env, caplog)
     assert config.api_key == "secret-provider-key"
     assert kwargs["max_tokens"] == 8192 and 0 < kwargs["timeout"] <= 70
     assert kwargs["response_format"] == {"type": "json_object"}
-    assert kwargs["include_reasoning"] is True
+    assert kwargs["include_reasoning"] is False
     for marker in ("private-identity-marker", "private-persona-marker", "private-memory-marker"):
         assert marker in messages[1]["content"]
         assert marker not in json.dumps(traces) + caplog.text
     event = traces[-1]
     assert event["type"] == "agent_body.generate.finished" and event["status"] == "ok"
     assert set(event["detail"]) == {"client_request_id", "generation_id", "status_code", "dur_ms",
-                                    "attempts", "provider", "model", "error_class", "rows_nonzero", "rows_sha256"}
+                                    "attempts", "provider", "model", "error_class", "rows_nonzero", "rows_sha256",
+                                    "repair_reason", "invalid_reason"}
     assert event["detail"]["rows_nonzero"] == 196
+    assert event["detail"]["repair_reason"] == event["detail"]["invalid_reason"] == ""
     assert "secret-provider-key" not in json.dumps(traces) + caplog.text
+
+
+def test_high_reasoning_route_draws_without_thinking(generation_env, monkeypatch):
+    generation_env[2]["reasoning_effort"] = "high"
+    calls = []
+
+    def provider(config, messages, **kwargs):
+        assert config.reasoning_effort == "high"
+        assert kwargs["include_reasoning"] is False
+        calls.append(kwargs)
+        return {"reply": json.dumps({"rows": valid_rows()})}
+
+    monkeypatch.setattr(provider_client, "chat_completion", provider)
+    response = post(generation_env)
+    assert response.status_code == 200, response.get_json()
+    assert len(calls) == 1
+
+
+BAD_ROWS_CASES = {
+    "not_json": ("private-invalid-json", "输出不是合法 JSON 对象"),
+    "row_count": (json.dumps({"rows": valid_rows()[:23]}), "rows 必须恰好有 24 行"),
+    "row_length": (json.dumps({"rows": [[1] * 23] * 24}), "第 1 行必须恰好有 24 个整数"),
+    "non_int": (json.dumps({"rows": [["private-invalid-cell"] * 24] * 24}), "第 1 行含非整数值"),
+    "out_of_range": (json.dumps({"rows": [[3] * 24] * 24}), "第 1 行含越界索引，允许范围为 0..2"),
+    "all_zero": (json.dumps({"rows": [[0] * 24] * 24}), "rows 全空，不能全是 0"),
+}
+
+
+@pytest.mark.parametrize("code", core.ROWS_INVALID_CODES)
+def test_invalid_rows_reason_codes_and_feedback(code):
+    assert set(BAD_ROWS_CASES) == set(core.ROWS_INVALID_CODES)
+    reply, feedback = BAD_ROWS_CASES[code]
+    with pytest.raises(core.RowsInvalid) as caught:
+        core.parse_rows(reply, 2)
+    assert isinstance(caught.value, ValueError)
+    assert caught.value.code == code
+    assert str(caught.value) == feedback
+
+
+@pytest.mark.parametrize("code", core.ROWS_INVALID_CODES)
+def test_repaired_rows_trace_first_failure_reason(generation_env, monkeypatch, code):
+    replies = iter([BAD_ROWS_CASES[code][0], json.dumps({"rows": valid_rows()})])
+    monkeypatch.setattr(provider_client, "chat_completion", lambda *a, **k: {"reply": next(replies)})
+    response = post(generation_env)
+    assert response.status_code == 200, response.get_json()
+    detail = generation_env[4][-1]["detail"]
+    assert detail["repair_reason"] == code
+    assert detail["invalid_reason"] == ""
+    assert detail["attempts"] == 2
+    assert "private-invalid" not in json.dumps(generation_env[4])
+
+
+def test_two_out_of_range_replies_trace_both_failure_reasons(generation_env, monkeypatch):
+    monkeypatch.setattr(provider_client, "chat_completion", lambda *a, **k: {
+        "reply": BAD_ROWS_CASES["out_of_range"][0]})
+    response = post(generation_env)
+    assert response.status_code == 502
+    assert response.get_json()["error"] == "agent_body_generation_invalid_output"
+    detail = generation_env[4][-1]["detail"]
+    assert detail["repair_reason"] == detail["invalid_reason"] == "out_of_range"
+    assert detail["attempts"] == 2
 
 
 @pytest.mark.parametrize("changes", [
@@ -378,8 +445,11 @@ def wait_body_job(env, headers):
 
 
 @pytest.mark.parametrize("credential", ["api_key", "runtime_token"])
-@pytest.mark.parametrize("rows,status", [(valid_rows(), 200), ([], 502), ([["private-invalid"]], 502)])
-def test_resident_poll_result_roundtrip(resident_env, monkeypatch, credential, rows, status):
+@pytest.mark.parametrize("rows,status,invalid_reason", [
+    (valid_rows(), 200, ""), ([], 502, "row_count"),
+    ([[3] * 24] * 24, 502, "out_of_range"), ([["private-invalid"]], 502, ""),
+])
+def test_resident_poll_result_roundtrip(resident_env, monkeypatch, credential, rows, status, invalid_reason):
     from concurrent.futures import ThreadPoolExecutor
     env, headers = resident_env
     if credential == "runtime_token":
@@ -406,6 +476,9 @@ def test_resident_poll_result_roundtrip(resident_env, monkeypatch, credential, r
         else:
             assert result.get_json()["error"] == "agent_body_generation_invalid_output"
             assert "rows" not in result.get_json()
+        detail = env[4][-1]["detail"]
+        assert detail["repair_reason"] == ""
+        assert detail["invalid_reason"] == invalid_reason
         state = db.get_blob(env[5], "consumer_state")
         assert "resident_agent_body_job" not in state
         assert set(state["resident_agent_body_result"]) == {"job_id", "status", "error_code", "finished_at"}
