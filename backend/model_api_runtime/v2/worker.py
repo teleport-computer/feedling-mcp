@@ -5017,6 +5017,13 @@ def _note_provider_attempt(
         usage = response.get("usage") if isinstance(response, dict) else None
         usage = usage if isinstance(usage, dict) else {}
         failed = event_kind == "provider_error"
+        attempt_trace = None
+        if lane in {"capture", "dream"}:
+            attempt_trace = (
+                payload.get("provider_attempt_trace")
+                or (response.get("provider_attempt_trace") if isinstance(response, dict) else None)
+                or provider_client.runtime_provider_attempt_trace(response)
+            )
         provider_attempt_ledger.record_runtime_attempt(
             user_id,
             parent_key=f"v2job:{job_id}" if job_id is not None else "v2job:unknown",
@@ -5038,6 +5045,7 @@ def _note_provider_attempt(
                 else ""
             ),
             dur_ms=payload.get("dur_ms") if failed else None,
+            **({"attempt_trace": attempt_trace} if lane in {"capture", "dream"} else {}),
         )
     except Exception:  # noqa: BLE001 - telemetry must not break a turn
         pass
@@ -12433,7 +12441,7 @@ async def _run_extraction(
             return 0.0
 
     async def _record_extraction_status(
-        status: str, *, item_count: int = 0, skip_reason: str = ""
+        status: str, *, item_count: int = 0, skip_reason: str = "", reason: str = ""
     ) -> None:
         nonlocal extraction_status_recorded
         # Production Capture terminal state is committed by the durable batch
@@ -12450,6 +12458,7 @@ async def _run_extraction(
                 "window": dict(capture_window),
                 "item_count": max(0, int(item_count)),
                 **({"skip_reason": skip_reason} if skip_reason else {}),
+                **({"reason": reason} if reason else {}),
             },
         )
         extraction_status_recorded = True
@@ -12847,13 +12856,11 @@ async def _run_extraction(
             if lane == "dream" and kind == "provider_request":
                 dream_model_attempts += 1
             if trajectory_recorder is not None:
-                await trajectory_recorder.record(kind, payload)
+                await _record_trajectory(trajectory_recorder, kind, payload)
 
         extraction_trajectory_out = (
             _extraction_trajectory
-            if lane == "dream"
-            else trajectory_recorder.record
-            if trajectory_recorder is not None
+            if lane == "dream" or trajectory_recorder is not None
             else None
         )
 
@@ -13586,7 +13593,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
         if lane != "capture" and not extraction_status_recorded:
             try:
-                await _record_extraction_status("failed")
+                await _record_extraction_status("failed", reason=code)
             except Exception as status_exc:  # noqa: BLE001 — primary failure still wins
                 log.warning(
                     "[v2.worker] extraction status write failed user=%s lane=%s code=%s",

@@ -98,6 +98,13 @@ since [new shared content uses plaintext when the deployment gate is open](#new-
 
 ### Enclave operational logs leave the VM only when configured
 
+Separately from enclave logs, the database's operator-readable `provider_attempts`
+ledger stores Runtime V2 Capture/Dream job correlation, provider/model, retry and
+wire counts, wire duration, HTTP status, and closed error/timeout categories.
+This is plaintext operational metadata. Its wire projection excludes request
+and response bodies, URLs, headers, credentials, and raw exception text; missing
+traces remain explicitly unmeasured. It adds no storage recipient or network hop.
+
 The production and test Compose sources include a log collector for only the
 `enclave` and `enclave-domain` containers. It validates a closed request-log
 schema and re-encodes worker lifecycle events; raw paths, credentials, content,

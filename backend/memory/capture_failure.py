@@ -318,6 +318,17 @@ def windowless_failure_patch(state, *, now_ts: float, reason: str = "") -> dict:
     return patch
 
 
+def account_failure_clock(*, since: float, last_failed: float, now_ts: float,
+                          is_account: bool) -> tuple[float, bool]:
+    """Shared account retry clock; idle time beyond the gap is not failure time."""
+    if since and last_failed and now_ts - last_failed > ACCOUNT_CLOCK_GAP_RESET_SEC:
+        since = 0.0
+    since = (since or now_ts) if is_account else since
+    expired = bool(is_account and since > 0
+                   and now_ts - since >= CAPTURE_ACCOUNT_SKIP_AFTER_SEC)
+    return since, expired
+
+
 def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     """一次落卡失败要怎么改状态。返回 ``(补丁, streak, 是否跳过)``。
 
@@ -368,13 +379,9 @@ def capture_failure_patch(state, window, *, now_ts: float, reason: str = ""):
     prev_since = (_safe_float(state.get("capture_account_fail_since"), 0.0)
                   if same else 0.0)
     last_failed = _safe_float(state.get("last_capture_failed_at"), 0.0)
-    if prev_since and last_failed and now_ts - last_failed > ACCOUNT_CLOCK_GAP_RESET_SEC:
-        # 中间很久没失败（用户关了落卡、VPS 离线一周…）：那段时间没在重试，不算「持续失败」。
-        # 否则「429 一次 → 关掉落卡 8 天 → 重开又 429 一次」就会立刻跳过（独立审查复现）。
-        prev_since = 0.0
-    account_since = (prev_since or now_ts) if kind == "account" else prev_since
-    account_expired = (kind == "account" and account_since > 0
-                       and now_ts - account_since >= CAPTURE_ACCOUNT_SKIP_AFTER_SEC)
+    account_since, account_expired = account_failure_clock(
+        since=prev_since, last_failed=last_failed, now_ts=now_ts,
+        is_account=kind == "account")
     if account_expired or (kind != "account" and (
             parse_streak >= CAPTURE_POISON_SKIP_AFTER
             or window_count >= CAPTURE_TRANSIENT_SKIP_AFTER)):

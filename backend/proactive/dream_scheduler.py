@@ -20,6 +20,7 @@ import debug_trace
 import memory_readside_core
 from memgarden import dreaming as mg_dreaming
 from memory import service as memory_service
+from memory import capture_failure, dream_failure
 from proactive import capture_jobs
 
 log = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ DREAM_TERMINAL_STATUSES = frozenset({"completed", "failed", "skipped"})
 # Same content-free vocabulary as the tick reasons below (the kernel's
 # ``needs_dream``); anything else a status patch calls "skipped" leaves the
 # ledger untouched so it can never silence Dream for a day by accident.
-DREAM_SKIP_REASONS = frozenset({"not_enough_new_cards"})
+DREAM_SKIP_REASONS = frozenset({"not_enough_new_cards", "dream_account_paused"})
 # One hour keeps a stalled scheduler visible within a bounded diagnostic window
 # while collapsing a stable 45-second client poll to at most 24 traces/user/day.
 DREAM_TRACE_HEARTBEAT_SEC = 3600.0
@@ -284,6 +285,13 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "last_dream_signature": str(doc.get("last_dream_signature") or "")[:240],
         "pending_dream_key": str(doc.get("pending_dream_key") or "")[:240],
         "dream_fail_streak": max(0, _safe_int(doc.get("dream_fail_streak"), 0)),
+        "dream_account_error_code": (
+            str(doc.get("dream_account_error_code") or "")
+            if str(doc.get("dream_account_error_code") or "") in (
+                capture_failure.ACCOUNT_ERROR_CONTRACT_CODES
+                | {capture_failure.PROVIDER_SETUP_ACCOUNT_CODE}) else ""),
+        "dream_account_fail_since": _safe_float(doc.get("dream_account_fail_since"), 0.0),
+        "dream_account_paused": doc.get("dream_account_paused") is True,
         "last_dream_failed_at": _safe_float(doc.get("last_dream_failed_at"), 0.0),
         # A Dream job that ran but had nothing to consolidate (garden below the
         # kernel minimum). Neither a success (the consolidation ledger above is
@@ -548,6 +556,7 @@ _EXPECTED_SKIP_REASONS = frozenset({
     "dream_disabled", "no_memory_cards", "dream_already_pending",
     "night_not_due", "min_interval", "not_enough_new_cards", "already_dreamed",
     "dream_stagger_not_due", "dream_concurrency_cap", "dream_admission_busy",
+    "dream_account_paused",
 })
 
 
@@ -577,6 +586,12 @@ def _tick_memory_dream(
     # window, this user's first attempt waits for its stable per-user offset.
     if not force and night_only() and _stagger_not_due(store, now=now_ts):
         return {"enqueued": False, "reason": "dream_stagger_not_due", "state": state, "job": None, "snapshot": snapshot}
+    if not force and dream_failure.probe_not_due(
+        state, now=now_ts, interval=min_interval_sec()
+    ):
+        return {"enqueued": False, "status": "skipped",
+                "reason": dream_failure.PAUSED_REASON,
+                "state": state, "job": None, "snapshot": snapshot}
     # 失败退避（同 capture）：min_interval 只看上次成功，对永远失败的 dream
     # （坏 BYOK key）不生效，会退化成每 tick 重试。force 绕过。
     if not force and capture_jobs.in_failure_backoff(
@@ -824,16 +839,23 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         state["last_dream_failed_at"] = 0.0
         state["last_dream_skipped_at"] = 0.0
         state["last_dream_skip_reason"] = ""
+        state.update(dream_failure.SUCCESS_RESET)
     elif status_text == "skipped":
         skip_reason = str(job.get("dream_skip_reason") or "").strip()
         if skip_reason in DREAM_SKIP_REASONS:
             state["last_dream_skipped_at"] = now_ts
             state["last_dream_skip_reason"] = skip_reason
     elif status_text == "failed":
+        result = job.get("dream_result")
+        result = result if isinstance(result, Mapping) else {}
+        reason = str(result.get("reason") or job.get("status_reason")
+                     or job.get("last_error") or job.get("reason") or "")
+        state.update(dream_failure.failure_patch(state, reason=reason, now=now_ts))
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         state["dream_fail_streak"] = int(state.get("dream_fail_streak") or 0) + 1
         state["last_dream_failed_at"] = now_ts
     state = save_dream_state(store, state, now=now_ts, ledger=status_text == "completed")
     capture_jobs.notify_backoff(store, lane="dream", status=status_text,
+                                account_code=str(state.get("dream_account_error_code") or ""),
                                 streak=int(state.get("dream_fail_streak") or 0))
     return state
