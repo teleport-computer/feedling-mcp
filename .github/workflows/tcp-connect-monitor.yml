@@ -1,0 +1,39 @@
+# schedule becomes active only on the default branch; a test merge is not activation.
+name: TCP connect monitor
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/tcp-connect-monitor.yml'
+      - '.github/workflows/tcp_connect_probe.py'
+  push:
+    branches: [test, main]
+    paths:
+      - '.github/workflows/tcp-connect-monitor.yml'
+      - '.github/workflows/tcp_connect_probe.py'
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Sample fresh direct connections (no credentials or retries)
+        run: python3 .github/workflows/tcp_connect_probe.py --output tcp-connect-results
+      - name: Preserve raw samples even when the probe fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcp-connect-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tcp-connect-results/
+          retention-days: 30
+          if-no-files-found: error
