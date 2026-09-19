@@ -712,13 +712,20 @@ def test_data_track_admin_connection_sets_session_timeout_and_resets(
         ):
             raise RuntimeError("detail probe")
 
+    # T653: jit is switched off for the lease (fleet aggregates spent 0.76 s
+    # compiling) and reset alongside statement_timeout before the connection
+    # returns to the pool.
     assert executed == [
         f"SET statement_timeout = '{db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'",
+        "SET jit = off",
+        "RESET jit",
         "RESET statement_timeout",
         (
             "SET statement_timeout = "
             f"'{db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS}ms'"
         ),
+        "SET jit = off",
+        "RESET jit",
         "RESET statement_timeout",
     ]
     assert leases == [

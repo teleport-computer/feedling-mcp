@@ -32,7 +32,7 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
     "user_blobs": (("user_id", "kind"), "user_id, kind, doc"),
     # PK 是 (user_id, stream, seq)，不是 (user_id, seq)——多了 stream 列；
     # seq 是 GENERATED ALWAYS AS IDENTITY，见下面 _IDENTITY_TABLES。
-    "user_logs": (("user_id", "stream", "seq"), "user_id, stream, seq, ts, item_key, doc"),
+    "user_logs": (("user_id", "stream", "seq"), "user_id, stream, seq, ts, item_key, doc, duration_sec"),
     # 主键列叫 item_id，不是 id；还漏了 kind、expires_at。
     "perception_items": (("user_id", "kind", "item_id"), "user_id, kind, item_id, ts, expires_at, doc"),
     # 列叫 date，不是 day；PK 还要带 signal。

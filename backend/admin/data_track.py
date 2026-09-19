@@ -2757,7 +2757,10 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
     rows.sort(key=sort_tuple)
 
 
-def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
+def _data_track_payload(
+    *, include_users: bool = True, include_detail_user: str = "",
+    statement_timeout_ms: int | None = None,
+) -> dict:
     filters = _data_track_request_filters()
     # Read-only snapshot: do NOT normalize+persist here. load_users() already
     # normalizes on boot and on every cross-worker reload, so an admin GET must
@@ -2769,6 +2772,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     user_ids = [str(u.get("user_id") or "") for u in users]
     snapshot = db.admin_data_track_snapshot(
         user_ids,
+        statement_timeout_ms=statement_timeout_ms,
         # Fleet-wide users *and* summary paths must stay bounded. One-user
         # detail bypasses this payload and keeps the legacy breakdowns through
         # admin_data_track_snapshot's default True.

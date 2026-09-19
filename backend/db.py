@@ -1491,12 +1491,15 @@ def _admin_data_track_connection(*, timeout_ms: int | None = None):
             f"SET statement_timeout = '{effective_timeout_ms}ms'"
         )
         try:
+            # Fleet aggregates spend more time compiling JIT than executing.
+            conn.execute("SET jit = off")
             yield conn
         finally:
-            try:
-                conn.execute("RESET statement_timeout")
-            except Exception:  # noqa: BLE001 — pool discards broken sessions
-                pass
+            for setting in ("jit", "statement_timeout"):
+                try:
+                    conn.execute(f"RESET {setting}")
+                except Exception:  # noqa: BLE001 — pool discards broken sessions
+                    pass
 
 
 # user_logs streams read per page rather than fleet-wide.
@@ -1854,19 +1857,13 @@ def admin_data_track_snapshot(
             if narrow_app_usage_to_user_stream:
                 app_usage_sql = """
                     WITH user_tracking AS MATERIALIZED (
-                        SELECT user_id, ts, doc
+                        SELECT user_id, ts, duration_sec, doc
                         FROM user_logs
                         WHERE user_id = ANY(%s)
                           AND stream = 'tracking_events'
                     )
                     SELECT user_id,
-                           COALESCE(SUM(
-                             CASE
-                               WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                               THEN (doc->'payload'->>'duration_sec')::bigint
-                               ELSE 0
-                             END
-                           ), 0)::bigint AS foreground_sec,
+                           COALESCE(SUM(duration_sec), 0)::bigint AS foreground_sec,
                            COUNT(*)::int AS sessions,
                            MAX(ts) AS last_at
                     FROM user_tracking
@@ -1876,13 +1873,7 @@ def admin_data_track_snapshot(
             else:
                 app_usage_sql = """
                     SELECT user_id,
-                           COALESCE(SUM(
-                             CASE
-                               WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                               THEN (doc->'payload'->>'duration_sec')::bigint
-                               ELSE 0
-                             END
-                           ), 0)::bigint AS foreground_sec,
+                           COALESCE(SUM(duration_sec), 0)::bigint AS foreground_sec,
                            COUNT(*)::int AS sessions,
                            MAX(ts) AS last_at
                     FROM user_logs
@@ -10843,8 +10834,8 @@ def claim_and_enqueue_introduction(
         "RETURNING doc"
     )
     job_sql = (
-        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-        "VALUES (%s, 'proactive_jobs', %s, %s, %s) RETURNING seq"
+        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+        "VALUES (%s, 'proactive_jobs', %s, %s, %s, NULL) RETURNING seq"
     )
     claimed_doc = None
     seq = None
@@ -10882,8 +10873,8 @@ def claim_and_enqueue_introduction(
     from tee_shadow import mirror
     _mirror_proactive_settings_current(str(user_id))
     mirror.execute(
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s, NULL) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING",
         (user_id, seq, ts, item_key, Jsonb(job)),
     )
@@ -19045,19 +19036,30 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _user_log_duration_sec(stream: str, doc: dict) -> int | None:
+    """Match the app-session SQL bigint projection without limiting log size."""
+    if stream != "tracking_events" or doc.get("type") != "app_session_end":
+        return None
+    payload = doc.get("payload")
+    value = payload.get("duration_sec") if isinstance(payload, dict) else None
+    text = str(value)
+    return int(text) if re.fullmatch(r"[0-9]{1,10}", text) else None
+
+
 def log_append(user_id: str, stream: str, doc: dict,
                ts: float | None = None, item_key: str | None = None) -> bool:
-    sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-           "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
+    sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+           "VALUES (%s, %s, %s, %s, %s, %s) RETURNING seq")
+    duration_sec = _user_log_duration_sec(stream, doc)
     context = _memory_mutation_context(user_id)
     if context is not None:
         # A memory action and its change log must roll back together. Let a
         # database failure abort the owning transaction, not look successful.
-        row = context[0].execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
+        row = context[0].execute(sql, (user_id, stream, ts, item_key, Jsonb(doc), duration_sec)).fetchone()
     else:
         try:
             with get_pool().connection() as conn:
-                row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
+                row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc), duration_sec)).fetchone()
         except Exception as e:
             log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
             return False
@@ -19071,12 +19073,12 @@ def log_append(user_id: str, stream: str, doc: dict,
     # (same PK (user_id, stream, seq)) idempotent rather than erroring.
     from tee_shadow import mirror
     mirror_sql = (
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
     _defer_memory_post_commit(user_id, lambda: mirror.execute(
-        mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc))))
+        mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc), duration_sec)))
     return True
 
 
@@ -19112,9 +19114,10 @@ def log_append_numbered(
                     )
                     numbered_doc[number_field] = int(cur.fetchone()[0]) + 1
                     cur.execute(
-                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-                        "VALUES (%s, %s, %s, %s, %s) RETURNING seq",
-                        (user_id, stream, ts, item_key, Jsonb(numbered_doc)),
+                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+                        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING seq",
+                        (user_id, stream, ts, item_key, Jsonb(numbered_doc),
+                         _user_log_duration_sec(stream, numbered_doc)),
                     )
                     seq = cur.fetchone()[0]
     except Exception as e:
@@ -19124,10 +19127,11 @@ def log_append_numbered(
 
     from tee_shadow import mirror
     mirror.execute(
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING",
-        (user_id, stream, seq, ts, item_key, Jsonb(numbered_doc)),
+        (user_id, stream, seq, ts, item_key, Jsonb(numbered_doc),
+         _user_log_duration_sec(stream, numbered_doc)),
     )
     return numbered_doc
 
