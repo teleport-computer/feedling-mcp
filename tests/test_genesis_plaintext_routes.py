@@ -1635,13 +1635,19 @@ def test_plaintext_job_heartbeat_renews_processing_lease(monkeypatch):
     )]
 
 
-def test_plaintext_material_cards_come_from_durable_map_outputs(monkeypatch):
+def test_plaintext_material_cards_read_stored_map_outputs(monkeypatch, _memory_checkpoint):
     statuses = []
     monkeypatch.setattr(
         plaintext.db,
         "genesis_set_job_status",
         lambda *_args, **kwargs: statuses.append(kwargs) or None,
     )
+    _memory_checkpoint["job-cards"] = {
+        "tasks": {"plaintext-map:1:history::0": {"status": "done"}},
+        "map_outputs": {"plaintext-map:1:history::0": {
+            "fact_candidates": [{"summary": "one"}, {"summary": "two"}],
+        }},
+    }
     progress = plaintext._PlaintextCheckpointProgress(
         _store(),
         "api-key",
@@ -1653,9 +1659,7 @@ def test_plaintext_material_cards_come_from_durable_map_outputs(monkeypatch):
         }],
     )
 
-    progress.record_map(1, "history", 0, {
-        "fact_candidates": [{"summary": "one"}, {"summary": "two"}],
-    })
+    assert progress.legacy is True
 
     assert statuses[-1]["output"]["materials"] == [{
         "kind": "chat_history",
@@ -1828,13 +1832,16 @@ def test_plaintext_voice_checkpoint_67_windows_stays_bounded(monkeypatch):
     assert checkpoint_bytes < 128 * 1024
 
 
-def test_plaintext_map_diagnostics_are_bounded_in_job_output(monkeypatch):
+def test_plaintext_stored_map_diagnostics_projection_is_bounded(monkeypatch, _memory_checkpoint):
     statuses = []
     monkeypatch.setattr(
         plaintext.db,
         "genesis_set_job_status",
         lambda *_args, **kwargs: statuses.append(kwargs) or None,
     )
+    diagnostics = [{"chunk_index": i, "discard_reason": "empty_fact_candidates"}
+                   for i in range(7)]
+    _memory_checkpoint["job-diagnostics"] = {"map_diagnostics": diagnostics}
     progress = plaintext._PlaintextCheckpointProgress(
         _store(),
         "api-key",
@@ -1846,20 +1853,8 @@ def test_plaintext_map_diagnostics_are_bounded_in_job_output(monkeypatch):
         }],
     )
 
-    progress.record_map_diagnostics(1, "memory_summary", [{
-        "chunk_index": 0,
-        "task_id": "fact-map-0",
-        "discard_reason": "empty_fact_candidates",
-        "raw_output_snippet": "x" * 800,
-        "raw_output_chars": 800,
-        "raw_output_truncated": True,
-    }])
-
-    diagnostic = statuses[-1]["output"]["map_diagnostics"][0]
-    assert diagnostic["discard_reason"] == "empty_fact_candidates"
-    assert len(diagnostic["raw_output_snippet"]) == 500
-    assert diagnostic["raw_output_chars"] == 800
-    assert diagnostic["raw_output_truncated"] is True
+    assert progress.doc["map_diagnostics"] == diagnostics
+    assert statuses[-1]["output"]["map_diagnostics"] == diagnostics[:6]
 
 
 def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():

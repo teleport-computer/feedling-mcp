@@ -1,9 +1,18 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/HISTORY_IMPORT_GARDEN_SESSION.md
+historical_reason: point-in-time
+---
 # 入住记忆处理管线重构 — P0 止血 + 新流程后端支持
 
 - 日期:2026-08-03
 - 发起:Seven(产品定稿,2026-07-28 ~ 08-03 多轮讨论)
 - 执笔:claude;实现:codex(本 spec 全部为 backend);iOS 侧 claude 并行实现
 - 范围:仅 test;上 prod 由 Seven 单独决定
+
+> 2026-09-20 历史注记（T661）：下文 P0-3 记录当时的 fact-map 恢复设计与符号。
+> 旧 plaintext 编排及 fact-map wrapper 已删除；当前导入走 garden session，旧 checkpoint 重置后重跑。
+> 原事故、验收目标与当时的实现记录保留，不能作为当前调用路径。
 
 ## 0. 背景与事故
 

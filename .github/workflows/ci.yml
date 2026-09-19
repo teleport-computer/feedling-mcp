@@ -632,6 +632,7 @@ jobs:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
           python -m pytest \
+            tests/test_genesis_checkpoint.py \
             tests/test_genesis_worker.py \
             tests/test_genesis_reclaim_worker.py \
             -v
