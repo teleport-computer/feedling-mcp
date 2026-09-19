@@ -33,6 +33,10 @@ def _parser() -> argparse.ArgumentParser:
         "--rate", type=float, default=2.0,
         help="maximum migration attempts per second (default: 2)",
     )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="bounded migration workers (1-4; default: 1)",
+    )
     return parser
 
 
@@ -53,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             apply=args.apply,
             limit=args.limit,
             rate=args.rate,
+            workers=args.workers,
         )
     except (PermissionError, ValueError) as exc:
         print(f"migration refused: {exc}", file=sys.stderr)
