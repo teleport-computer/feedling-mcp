@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Anthropic requests that force a tool call now omit incompatible manual extended
+  thinking for that request, while retaining the required or named tool choice.
+  The Bedrock adapter explicitly disables manual thinking for forced tool calls.
+  Ordinary auto/none requests keep their configured reasoning. Runtime V2 model
+  call failure traces add closed `provider_error_type` and `error_signature`
+  values to distinguish known request incompatibilities. Unrecognized errors
+  remain `unknown` / `unclassified`; provider error text is not included.
+  Wake failure codes now preserve recognized causes such as insufficient credit
+  for HTTP 400/422 responses instead of always reporting provider incompatibility.
+
 - Replies whose `<think>` blocks are malformed (nested, reopened, or cut off
   before the closing tag — seen from reasoning models behind relays) are no
   longer replaced by the failure fallback. The strict leak gate still refuses

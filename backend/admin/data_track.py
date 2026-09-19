@@ -4132,6 +4132,13 @@ def _debug_event_public_json(
         provider_error_class = raw_detail.get("provider_error_class")
         if provider_error_class in {"transient", "provider_config", "unknown"}:
             public_detail["provider_error_class"] = provider_error_class
+        for key, allowed in (
+            ("provider_error_type", v2_worker.provider_client.PROVIDER_ERROR_TYPES),
+            ("error_signature", v2_worker.provider_client.PROVIDER_ERROR_SIGNATURES),
+        ):
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed:
+                public_detail[key] = value
         error_class = raw_detail.get("error_class")
         if isinstance(error_class, str) and error_class in _known_error_classes():
             public_detail["error_class"] = error_class
