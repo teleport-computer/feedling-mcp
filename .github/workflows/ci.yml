@@ -561,15 +561,21 @@ jobs:
       # 这个仓库有过这种前科（conftest 无库时静默丢掉整批 DB 模块，
       # 报 391 passed 而真实是 2440）。所以这里对通过数设下限。
       - name: PerceptKit adapter + conformance suite
+        # GitHub's default bash -e has no pipefail; explicit bash adds it so
+        # tee cannot hide pytest failures behind a successful passed-count gate.
+        shell: bash
         env:
           PGPASSWORD: postgres
           PERCEPTKIT_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/perceptkit_ci"
+          # conftest provisions DATABASE_URL for shadow_sensitive's backend pool.
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
           PYTHONPATH: backend
         run: |
           psql -h 127.0.0.1 -U postgres -tAc \
             "SELECT 1 FROM pg_database WHERE datname='perceptkit_ci'" | grep -q 1 \
             || psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE perceptkit_ci"
           python -m pytest \
+            tests/test_ci_perceptkit.py \
             tests/test_perceptkit_postgres.py \
             tests/test_perceptkit_retention.py \
             tests/test_perceptkit_compare.py \
@@ -583,10 +589,23 @@ jobs:
             tests/test_perceptkit_ios_adapter.py \
             tests/test_perceptkit_worker.py \
             -v | tee /tmp/perceptkit-pytest.log
-          passed=$(grep -oE '[0-9]+ passed' /tmp/perceptkit-pytest.log | tail -1 | grep -oE '^[0-9]+')
-          echo "PerceptKit: ${passed:-0} passed"
-          if [ "${passed:-0}" -lt 90 ]; then
-            echo "通过数过低（${passed:-0}）—— 多半是没连上库、整批被 skip 了，而不是真的只有这么多"
+          summary=$(grep -E '^=+ .*(passed|failed|error|skipped).* in [0-9.]+s' /tmp/perceptkit-pytest.log | tail -1)
+          passed=0 failed=0 errors=0
+          if [[ "$summary" =~ ([0-9]+)[[:space:]]passed ]]; then
+            passed=${BASH_REMATCH[1]}
+          fi
+          if [[ "$summary" =~ ([0-9]+)[[:space:]]failed ]]; then
+            failed=${BASH_REMATCH[1]}
+          fi
+          if [[ "$summary" =~ ([0-9]+)[[:space:]]errors? ]]; then
+            errors=${BASH_REMATCH[1]}
+          fi
+          echo "PerceptKit: $passed passed, $failed failed, $errors errors"
+          if [ "$failed" -ne 0 ] || [ "$errors" -ne 0 ]; then
+            exit 1
+          fi
+          if [ "$passed" -lt 90 ]; then
+            echo "通过数过低（${passed}）—— 多半是没连上库、整批被 skip 了，而不是真的只有这么多"
             exit 1
           fi
 
