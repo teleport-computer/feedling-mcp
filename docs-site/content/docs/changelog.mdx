@@ -24,6 +24,7 @@ change must not be interpreted as an API guarantee.
   safeguards are unchanged.
 
 - Added disabled-by-default serve-worker preparation of local E5 ONNX vectors for plaintext memories, with versioned projections and bounded scans. Retrieval behavior is unchanged; model/dependency provisioning remains separate.
+- Test deployment now ships the multilingual-e5-small int8 ONNX weights and inference runtime (onnxruntime, tokenizers) in the shared image and enables the serve-worker embedding sweep (`FEEDLING_MEMORY_EMBEDDING_ENABLED=1`). Production stays off; retrieval behavior is unchanged.
   Rolling back the vector-table migration retains the table and its data; removal requires explicit cleanup.
 
 - `POST /v1/perception/photo/evaluate` documents two optional metadata fields

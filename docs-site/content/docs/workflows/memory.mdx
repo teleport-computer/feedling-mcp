@@ -925,8 +925,9 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 
 ### Optional vector preparation
 
-The serve-worker contains a disabled-by-default vector preparation pass
-(`FEEDLING_MEMORY_EMBEDDING_ENABLED=0`). When explicitly enabled with a locally
+The serve-worker contains a vector preparation pass that is disabled by
+default (`FEEDLING_MEMORY_EMBEDDING_ENABLED=0`; the test deployment enables it and
+ships the model weights inside the image). When explicitly enabled with a locally
 provisioned multilingual E5-small ONNX model, it scans active, shared plaintext
 cards in its memory-maintenance user set, encoding at most 32 changed or missing
 cards per user per tick. Encrypted cards are skipped. The application never

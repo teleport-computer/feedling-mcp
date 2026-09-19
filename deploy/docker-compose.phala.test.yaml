@@ -473,6 +473,13 @@ services:
       # Dream is intentionally always on in test after the guarded rewrite
       # passed live convergence and non-destructive merge verification.
       FEEDLING_V2_DREAM_ENABLED: "1"
+      # Memory embedding sweep (T523 step 1b): encode plaintext cards with the
+      # baked local E5 model (deploy/Dockerfile). test only; prod stays off.
+      FEEDLING_MEMORY_EMBEDDING_ENABLED: "1"
+      FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+      # tokenizers pulls huggingface_hub as a hard dependency; we only ever read
+      # the local tokenizer.json. Make "never phones home" a config fact too.
+      HF_HUB_OFFLINE: "1"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
