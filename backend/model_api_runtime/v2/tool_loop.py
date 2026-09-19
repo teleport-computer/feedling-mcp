@@ -1869,6 +1869,7 @@ async def run_tool_loop(
             "status_code": status_code,
             "error_class": type(exc).__name__,
             "provider_error_class": error_family,
+            **provider_client.provider_error_diagnostics(exc),
         }
 
     async def _record_required_file_missing(round_number: int) -> None:

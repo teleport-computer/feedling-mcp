@@ -86,6 +86,32 @@ def test_safe_failure_codes_are_members_of_the_producer_export():
         assert "private" not in code
 
 
+@pytest.mark.parametrize("status_code", [400, 422])
+@pytest.mark.parametrize("message,expected", [
+    ("Your credit balance is too low to access the Anthropic API.", "quota_insufficient"),
+    ("This tool capability is not supported.", "provider_incompatible"),
+])
+def test_wake_provider_status_preserves_specific_error_class(status_code, message, expected):
+    import httpx
+    import provider_client
+    from admin import data_track
+
+    with pytest.raises(provider_client.ProviderError) as caught:
+        provider_client._raise_for_provider_status(httpx.Response(
+            status_code, json={"error": {
+                "type": "invalid_request_error", "message": message,
+            }},
+        ))
+    code = worker._safe_failure_code("wake_failed", caught.value)
+    assert code == f"wake_failed:{expected}"
+    assert expected in notices_catalog.ERROR_CLASSES
+    assert code in worker.PUBLIC_FAILURE_CODES
+    assert jobs_store._terminal_error_class(
+        code, worker._turn_failure_error_class(caught.value)
+    ) == expected
+    assert data_track._runtime_failure_code(code) == code
+
+
 def test_wake_choice_invalid_crosses_every_terminal_code_boundary():
     exc = tool_loop.WakeChoiceInvalid()
     code = worker._safe_failure_code("wake_failed", exc)
@@ -1702,3 +1728,47 @@ def test_v2_guard_covers_tool_names_and_field_leaks():
     assert v2_worker._self_thinking_internal_term("我调 memory_write 存一下")
     assert v2_worker._self_thinking_internal_term("session_id: 我看下这个")
     assert v2_worker._self_thinking_internal_term("讨论 system prompt 的设计") is None
+
+
+def test_provider_error_signature_reaches_public_trace_without_raw_body(monkeypatch):
+    import json
+    import httpx
+    import provider_client
+    from admin import data_track
+    import debug_trace
+
+    raw_message = "Thinking may not be enabled when tool_choice forces tool use. PRIVATE-KEY-TEXT"
+    async def reject(*args, **kwargs):
+        provider_client._raise_for_provider_status(httpx.Response(400, json={
+            "error": {"type": "invalid_request_error", "message": raw_message},
+        }))
+    monkeypatch.setattr(provider_client, "chat_completion_async", reject)
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda uid, event_type, **fields: captured.append({
+        "user_id": uid, "type": event_type, **fields,
+    })
+    trace = worker._ProviderRoundtripTrace(deps=deps, user_id="u_signature", lane="heartbeat")
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=provider_client.ProviderConfig("anthropic", "claude-sonnet-4-5", "test-key"),
+            build_messages=lambda transcript: [{"role": "user", "content": "hello"}],
+            dispatch_tools=lambda *a: [], on_reply=lambda *a, **k: None,
+            fold_new_messages=lambda: [], add_usage=lambda usage: None, max_calls=1,
+            on_provider_call_event=trace.record_model_call,
+        ))
+    event, = [row for row in captured if row['type'] == 'agent.model.call.error']
+    event['detail'] = debug_trace._safe_detail(event['detail'])
+    public = data_track._debug_event_public_json(event)
+    assert public['detail']['error_signature'] == 'thinking_forced_tool_choice'
+    assert public['detail']['provider_error_type'] == 'invalid_request_error'
+    assert 'PRIVATE-KEY-TEXT' not in json.dumps(captured)
+    assert raw_message not in json.dumps(public)
+    forged = {**event, 'detail': {
+        **event['detail'], 'provider_error_type': 'private-type',
+        'error_signature': 'private-signature', 'provider_error_message': raw_message,
+    }}
+    safe = data_track._debug_event_public_json(forged)['detail']
+    assert safe.get('provider_error_type') != 'private-type'
+    assert safe.get('error_signature') != 'private-signature'
+    assert 'PRIVATE-KEY-TEXT' not in json.dumps(safe)

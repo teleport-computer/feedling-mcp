@@ -871,6 +871,110 @@ def test_anthropic_payload_translates_forced_function_tool_choice():
     assert payload["tool_choice"] == {"type": "tool", "name": "emit_profile"}
 
 
+@pytest.mark.parametrize("choice, expected", [
+    ("required", {"type": "any"}),
+    ({"type": "function", "function": {"name": "reply"}},
+     {"type": "tool", "name": "reply"}),
+    ({"type": "tool", "name": "reply"}, {"type": "tool", "name": "reply"}),
+])
+def test_anthropic_forced_tool_choice_omits_incompatible_manual_thinking(choice, expected):
+    payload, _, _ = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5", base_url="https://api.anthropic.com/v1",
+        key="sk-test", messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None,
+        include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice=choice,
+    )
+    assert payload["tool_choice"] == expected
+    assert "thinking" not in payload
+    assert payload["tools"][0]["name"] == "reply"
+    assert payload["max_tokens"] == 2048
+
+
+@pytest.mark.parametrize("choice", [None, "auto", "none", {"type": "none"}])
+def test_anthropic_unforced_tools_preserve_manual_thinking(choice):
+    payload, _, _ = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5", base_url="https://api.anthropic.com/v1",
+        key="sk-test", messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None,
+        include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice=choice,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+
+
+@pytest.mark.parametrize("choice,expected_choice,expected_thinking", [
+    ("required", {"any": {}}, {"type": "disabled"}),
+    ({"type": "function", "function": {"name": "reply"}},
+     {"tool": {"name": "reply"}}, {"type": "disabled"}),
+    ("auto", None, {"type": "enabled", "budget_tokens": 1024}),
+    (None, None, {"type": "enabled", "budget_tokens": 1024}),
+])
+def test_bedrock_forced_tools_explicitly_disable_manual_thinking(
+    choice, expected_choice, expected_thinking,
+):
+    payload, _, _ = pc._build_bedrock_payload(
+        model="anthropic.claude-sonnet-4-5", base_url="https://bedrock.example",
+        key="synthetic", messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None,
+        include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice=choice,
+    )
+    assert payload["toolConfig"].get("toolChoice") == expected_choice
+    assert payload["additionalModelRequestFields"]["thinking"] == expected_thinking
+    assert payload["toolConfig"]["tools"][0]["toolSpec"]["name"] == "reply"
+    assert payload["inferenceConfig"]["maxTokens"] == 2048
+
+
+@pytest.mark.parametrize("message, signature", [
+    ("Thinking may not be enabled when tool_choice forces tool use.", "thinking_forced_tool_choice"),
+    ("final assistant content cannot end with trailing whitespace", "trailing_whitespace"),
+    ("unexpected tool_use_id in tool_result blocks", "tool_use_id_mismatch"),
+    ("tools.0.input_schema: JSON schema is invalid", "invalid_tool_schema"),
+    ("budget_tokens is not supported", "budget_tokens_unsupported"),
+    ("max_tokens must be greater than 0", "max_tokens_invalid"),
+    ("opaque failure private-user-text sk-secret", "unclassified"),
+])
+def test_provider_error_diagnostics_classifies_without_copying_content(message, signature):
+    response = httpx.Response(400, json={
+        "error": {"type": "invalid_request_error", "message": message},
+    })
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(response)
+    assert pc.provider_error_diagnostics(caught.value) == {
+        "provider_error_type": "invalid_request_error", "error_signature": signature,
+    }
+
+
+def test_provider_error_diagnostics_rejects_arbitrary_type_and_non_provider_text():
+    error = pc.ProviderError("private exception text", raw_response_body=json.dumps({
+        "error": {"type": "private-type-sk-secret", "message": "private message"},
+    }))
+    assert pc.provider_error_diagnostics(error) == {
+        "provider_error_type": "unknown", "error_signature": "unclassified",
+    }
+    assert pc.provider_error_diagnostics(RuntimeError("max_tokens must be 1")) == {
+        "provider_error_type": "unknown", "error_signature": "unclassified",
+    }
+
+
+def test_provider_error_diagnostics_bounds_untrusted_body_processing():
+    nested = pc.ProviderError("error", raw_response_body="[" * 2000 + "]" * 2000)
+    assert pc.provider_error_diagnostics(nested) == {
+        "provider_error_type": "unknown", "error_signature": "unclassified",
+    }
+    long_message = pc.ProviderError("error", raw_response_body=json.dumps({
+        "error": {"type": "invalid_request_error",
+                  "message": "x" * 4096 + "max_tokens must be greater than 0"},
+    }))
+    assert pc.provider_error_diagnostics(long_message) == {
+        "provider_error_type": "invalid_request_error", "error_signature": "unclassified",
+    }
+
+
 def test_anthropic_payload_encodes_tool_choice_none_with_tools():
     payload, _url, _headers = pc._build_anthropic_payload(
         model="claude-opus-4-8",

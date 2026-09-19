@@ -1886,11 +1886,9 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
         isinstance(exc, provider_client.ProviderError)
         and exc.status_code in {400, 422}
     ):
-        # Match the user/provider-facing classifier below. These statuses are
-        # incompatible request/config signals, not opaque runtime failures;
-        # preserving the closed catalog code lets a failed background wake be
-        # diagnosed from agent_jobs.last_error without exposing provider text.
-        kind = "provider_incompatible"
+        # Anthropic also reports insufficient credit as HTTP 400. Preserve the
+        # shared classifier's specific cause before its status-only fallback.
+        kind = _turn_failure_error_class(exc)
     else:
         candidate = type(exc).__name__.lower()
         kind = candidate if candidate in _GENERIC_FAILURE_KINDS else "error"
@@ -3125,6 +3123,13 @@ class _ProviderRoundtripTrace:
         provider_error_class = str(detail.get("provider_error_class") or "")
         if provider_error_class in {"transient", "provider_config", "unknown"}:
             safe["provider_error_class"] = provider_error_class
+        for name, allowed in (
+            ("provider_error_type", provider_client.PROVIDER_ERROR_TYPES),
+            ("error_signature", provider_client.PROVIDER_ERROR_SIGNATURES),
+        ):
+            value = detail.get(name)
+            if isinstance(value, str) and value in allowed:
+                safe[name] = value
         status_code = detail.get("status_code")
         if (
             isinstance(status_code, int)
