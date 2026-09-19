@@ -74,9 +74,22 @@ def summary_payload(query_string: str) -> dict:
         return data_track._data_track_payload(include_users=False)
 
 
-def users_payload(query_string: str) -> dict:
+def users_payload(query_string: str, *, statement_timeout_ms: int | None = None) -> dict:
+    started = time.monotonic()
     with bind(query_string):
-        return data_track._data_track_payload(include_users=True)
+        payload = data_track._data_track_payload(
+            include_users=True, statement_timeout_ms=statement_timeout_ms,
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if elapsed_ms > 5000:
+            # Query strings can contain credentials; only log the parsed limit.
+            limit = data_track._data_track_request_filters()["limit"]
+            log.warning(
+                "[data-track] users slow elapsed_ms=%d budget_ms=5000 limit=%s",
+                elapsed_ms, limit,
+            )
+            payload["slow"] = {"elapsed_ms": elapsed_ms, "soft_budget_ms": 5000}
+        return payload
 
 
 def dau_payload(query_string: str) -> dict:

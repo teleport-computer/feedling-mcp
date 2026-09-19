@@ -597,8 +597,8 @@ class DBScheduledWakeStoreV2:
                     if existing is not None:
                         return scheduled_record_from_doc_v2(existing[0]), False
                     cur.execute(
-                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-                        "VALUES (%s, %s, %s, %s, %s) RETURNING seq",
+                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+                        "VALUES (%s, %s, %s, %s, %s, NULL) RETURNING seq",
                         (
                             record.user_id,
                             SCHEDULED_WAKE_STREAM_V2,
@@ -610,8 +610,8 @@ class DBScheduledWakeStoreV2:
                     inserted_seq = int(cur.fetchone()[0])
         from tee_shadow import mirror
         mirror.execute(
-            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-            "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+            "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s, NULL) "
             "ON CONFLICT (user_id, stream, seq) DO NOTHING",
             (
                 record.user_id,
@@ -812,8 +812,8 @@ class DBScheduledWakeStoreV2:
                             next_doc = scheduled_record_to_doc_v2(next_record)
                             cur.execute(
                                 "INSERT INTO user_logs "
-                                "(user_id,stream,ts,item_key,doc) "
-                                "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+                                "(user_id,stream,ts,item_key,doc,duration_sec) "
+                                "VALUES (%s,%s,%s,%s,%s,NULL) RETURNING seq",
                                 (
                                     user_id,
                                     SCHEDULED_WAKE_STREAM_V2,
@@ -827,8 +827,8 @@ class DBScheduledWakeStoreV2:
         mirror.execute(update_sql, update_params)
         if next_record is not None and next_inserted_seq is not None:
             mirror.execute(
-                "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
-                "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+                "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc,duration_sec) "
+                "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s,NULL) "
                 "ON CONFLICT (user_id,stream,seq) DO NOTHING",
                 (
                     user_id,

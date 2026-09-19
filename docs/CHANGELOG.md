@@ -57,6 +57,11 @@ historical_reason: point-in-time
 
 ## Unreleased
 
+- T653：`user_logs` 新增可空 bigint 列 `duration_sec`（app_session_end 的前台时长，写入时由 `db._user_log_duration_sec` 按原 SQL 规则 `^[0-9]{1,10}$` 填，其余流为 NULL；迁移 alembic 0112 / alembic_tee 0047 幂等回填 85k 行，不重写表）。
+- T653：新增局部覆盖索引 `ix_user_logs_app_session_end_usage (user_id, ts) INCLUDE (duration_sec)`（CONCURRENTLY），管理端 fleet `app_usage` 聚合改读该列、走 Index Only Scan；输出列/语义不变（NULL 计 0、仍计 session）。
+- T653：管理端 data-track 连接租约 `SET jit = off`（fleet 聚合的 JIT 编译曾占 0.76s），随 statement_timeout 一起 RESET。
+- T653：仅 `GET /v1/admin/data-track/users` 的 HTTP 与 SQL 预算放宽到 15s 作兜底（其余 data-track 端点仍 5s）；超过 5s 时记 warning 并在响应顶层附加仅此时出现的 `slow: {elapsed_ms, soft_budget_ms: 5000}`。15s 只覆盖 fleet snapshot，分页段仍 5s 租约。
+- T653：切换窗口说明：迁移回填之后、新代码上线之前由旧代码写入的 app_session_end 行 `duration_sec` 为 NULL（该窗口时长计 0）；重跑迁移里的回填语句（`0112_user_logs_duration_sec.BACKFILL_SQL`，幂等）即可补齐，之后须 `VACUUM (ANALYZE) user_logs`（迁移本身已带）——回填改写过的页会丢 all-visible 位，不 VACUUM 则覆盖索引退化为逐行回表。
 - T651：V2 看门狗故障注入测试先等待四个 foreground 子进程真实报告就绪，超时输出逐槽 liveness；保留健康容量与 2 秒心跳阈值断言。
 - T649：拼豆身体生成的完成 trace 增加闭集 repair_reason / invalid_reason，记录首轮及最终 rows 校验失败原因，不记录行号或模型原文；resident 仅记录后端最终校验原因。
 - T649：拼豆身体的 Model API 调用固定关闭 thinking，避免 Anthropic 直连将输出额度全部用于推理而无正文；保留 8192 token 上限和现有生成提示。

@@ -51,6 +51,7 @@ router = APIRouter()
 
 DEBUG_TRACE_REQUEST_TIMEOUT_SEC = 3.0
 DATA_TRACK_REQUEST_TIMEOUT_SEC = db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC = 15.0
 DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC = (
     db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS / 1000
 )
@@ -212,7 +213,11 @@ async def data_track_summary(request: Request):
 @router.get("/v1/admin/data-track/users")
 async def data_track_users(request: Request):
     _require_admin(request)
-    payload = await _run_data_track_db(admin_core.users_payload, request.url.query)
+    payload = await _run_data_track_db(
+        admin_core.users_payload, request.url.query,
+        timeout_seconds=DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC,
+        statement_timeout_ms=int(DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC * 1000),
+    )
     return JSONResponse(payload)
 
 

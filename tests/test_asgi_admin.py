@@ -287,6 +287,11 @@ def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
             for keyword in bounded_calls[0].keywords
             if keyword.arg == "timeout_seconds"
         ]
+        lease_keywords = [
+            keyword
+            for keyword in bounded_calls[0].keywords
+            if keyword.arg == "statement_timeout_ms"
+        ]
         if handler in {
             admin_asgi.data_track_user,
             admin_asgi.data_track_user_page,
@@ -296,8 +301,23 @@ def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
             assert timeout_keywords[0].value.id == (
                 "DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC"
             )
+            assert lease_keywords == [], handler.__name__
+        elif handler is admin_asgi.data_track_users:
+            # T653: the fleet users list is the one endpoint with a 15 s
+            # fallback budget, and that budget must reach the SQL lease too —
+            # otherwise statement_timeout still cancels the snapshot at 5 s.
+            assert admin_asgi.DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC == 15.0
+            assert len(timeout_keywords) == 1, handler.__name__
+            assert isinstance(timeout_keywords[0].value, ast.Name)
+            assert timeout_keywords[0].value.id == (
+                "DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC"
+            )
+            assert len(lease_keywords) == 1, handler.__name__
+            lease_src = ast.unparse(lease_keywords[0].value)
+            assert lease_src == "int(DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC * 1000)", lease_src
         else:
             assert timeout_keywords == [], handler.__name__
+            assert lease_keywords == [], handler.__name__
 
 
 def test_t428_data_track_deadline_returns_503_without_waiting_for_db(
@@ -1426,3 +1446,65 @@ def test_admin_login_rejects_external_next_and_logout_clears_cookie(env):
     assert "HttpOnly" in cookie_header
     assert "Secure" in cookie_header
     assert "SameSite=lax" in cookie_header
+
+
+# --- T653: only the users list gets the 15 s fallback budget; >5 s is never silent ---
+
+def test_users_list_budget_is_15s_and_reaches_the_sql_lease(env, monkeypatch):
+    from admin import admin_core, routes_asgi
+    assert routes_asgi.DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC == 15.0
+    assert routes_asgi.DATA_TRACK_REQUEST_TIMEOUT_SEC == 5.0
+    seen = []
+
+    def fake_snapshot(user_ids, **kwargs):
+        seen.append(kwargs.get("statement_timeout_ms"))
+        return {}
+
+    monkeypatch.setattr(db, "admin_data_track_snapshot", fake_snapshot)
+    budgets = []
+    real = routes_asgi._run_data_track_db
+
+    async def spy(fn, *args, timeout_seconds=None, **kwargs):
+        budgets.append((fn.__name__, timeout_seconds))
+        return await real(fn, *args, timeout_seconds=timeout_seconds, **kwargs)
+
+    monkeypatch.setattr(routes_asgi, "_run_data_track_db", spy)
+    status, body = _asgi_json("GET", "/v1/admin/data-track/users?limit=5", headers=_admin())
+    assert status == 200, body
+    status, body = _asgi_json("GET", "/v1/admin/data-track/summary", headers=_admin())
+    assert status == 200, body
+    assert seen == [15000, None]
+    assert budgets == [("users_payload", 15.0), ("summary_payload", None)]
+    assert admin_core is not None
+
+
+def test_users_list_over_5s_is_marked_slow_not_silent(env, monkeypatch, caplog):
+    from admin import admin_core
+    monkeypatch.setattr(db, "admin_data_track_snapshot", lambda user_ids, **kw: {})
+
+    class _ClockModule:
+        """admin_core's own ``time`` binding: every attribute is the real
+        module's, except monotonic(), which replays the two readings
+        users_payload takes (start, end). The global time module is untouched."""
+
+        def __init__(self, readings):
+            self._readings = iter(readings)
+
+        def monotonic(self):
+            return next(self._readings)
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    monkeypatch.setattr(admin_core, "time", _ClockModule([100.0, 106.2]))
+    with caplog.at_level("WARNING"):
+        status, body = _asgi_json("GET", "/v1/admin/data-track/users?limit=20", headers=_admin())
+    assert status == 200, body
+    assert body["slow"] == {"elapsed_ms": 6200, "soft_budget_ms": 5000}
+    assert "[data-track] users slow elapsed_ms=6200 budget_ms=5000 limit=20" in caplog.text
+    assert "admin_key" not in caplog.text
+
+    monkeypatch.setattr(admin_core, "time", _ClockModule([100.0, 100.1]))
+    status, body = _asgi_json("GET", "/v1/admin/data-track/users?limit=20", headers=_admin())
+    assert status == 200 and "slow" not in body
+    assert time.monotonic is not None and admin_core.time is not time  # global module never patched
