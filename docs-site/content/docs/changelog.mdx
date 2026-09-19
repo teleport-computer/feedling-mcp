@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Retrying a failed plaintext onboarding or add-memory job with legacy fact-map
+  progress now resets its encrypted checkpoint and runs the current import
+  engine under the same job ID. Existing cards enter the merge index, and the
+  original onboarding greeting is preserved. Current-engine and update-identity
+  checkpoints retain their normal resume behavior.
+
 - Anthropic requests that force a tool call now omit incompatible manual extended
   thinking for that request, while retaining the required or named tool choice.
   The Bedrock adapter explicitly disables manual thinking for forced tool calls.

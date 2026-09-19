@@ -416,6 +416,12 @@ plaintext operational metadata such as job ID, material kind, window counts,
 status, and hashes. Candidate text is not written into the job JSON or progress
 fields. An authorized retry decrypts the checkpoint inside the trusted boundary
 and skips completed windows; successful completion deletes the checkpoint.
+Legacy fact-map checkpoints reused by plaintext onboarding or add-memory jobs
+are first replaced with fresh encrypted import progress. These jobs reprocess
+the submitted material using the current engine and its full existing-card
+index; cards already written are retained. A content-free reset trace records
+only fixed reason/engine/phase values and progress counts. Current-engine and
+update-identity checkpoints keep their existing resume behavior.
 Resident-sealed imports and their local plaintext boundary are unchanged.
 
 Managed clients can first call the plaintext estimate endpoint. The API parses

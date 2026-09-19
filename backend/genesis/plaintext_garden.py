@@ -11,9 +11,8 @@
 
 ## 老 job
 
-升级前就开始、checkpoint 里已经有 fact_map 进度的 job 不走这里 —— 调度处
-（``plaintext._run_plaintext_genesis_job``）按 ``progress.legacy`` 分流，让它在旧流水线
-上跑完。新 job 的 checkpoint 带引擎标记，重试/重启时一直走这里。
+旧 fact_map checkpoint 在加载时重置为新导入进度，同一个 job 从提交的材料重新开始，
+已有卡仍通过完整索引参与合并。带当前引擎标记的 checkpoint 保留正常续跑行为。
 """
 from __future__ import annotations
 
