@@ -21,6 +21,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-limit", type=int, default=0)
     parser.add_argument("--row-limit", type=int, default=0)
     parser.add_argument("--rate", type=float, default=1.0)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--health-latency-sec", type=float, default=10.0)
     parser.add_argument("--health-poll-sec", type=float, default=5.0)
     parser.add_argument("--healthy-streak", type=int, default=2)
@@ -54,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
             user_limit=args.user_limit,
             row_limit=args.row_limit,
             rate=args.rate,
+            workers=args.workers,
             health_probe=lambda: plaintext_repair.probe_enclave_health(
                 max_latency_sec=args.health_latency_sec
             ),

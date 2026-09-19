@@ -8,7 +8,9 @@ this module so the command can be exercised without exposing content values.
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import threading
 import time
 from typing import Iterable
 
@@ -472,12 +474,36 @@ def migrate_item(user_id: str, item: Item, decrypt) -> str:
     return "migrated" if cas_inline_doc(user_id, item, new_doc) else "cas_conflict"
 
 
+class _RateLimiter:
+    """Serialize migration starts behind one process-wide rate budget."""
+
+    def __init__(self, rate: float, *, exact: bool = False) -> None:
+        self._interval = 1.0 / float(rate)
+        self._exact = exact
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            if self._exact:
+                if self._next_at:
+                    time.sleep(self._interval)
+                self._next_at = 1.0
+                return
+            now = time.monotonic()
+            delay = max(0.0, self._next_at - now)
+            self._next_at = max(now, self._next_at) + self._interval
+        if delay:
+            time.sleep(delay)
+
+
 def run(
     user_id: str,
     *,
     apply: bool = False,
     limit: int = 0,
     rate: float = 2.0,
+    workers: int = 1,
 ) -> Result:
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -486,6 +512,8 @@ def run(
         raise ValueError("limit must be >= 0")
     if float(rate) <= 0:
         raise ValueError("rate must be > 0")
+    if int(workers) < 1 or int(workers) > 4:
+        raise ValueError("workers must be between 1 and 4")
     if not user_exists(user_id):
         raise ValueError("target user does not exist")
     if apply and content_encryption_preference(user_id) == "on":
@@ -500,26 +528,37 @@ def run(
     if deferred:
         counts["not_attempted_limit"] = deferred
     attempted_ids = {id(item) for item in attempted_candidates}
-    decrypt = None
-    attempt_index = 0
-    for item in items:
-        if (
-            not apply
-            or item.classification not in candidate_classes
-            or id(item) not in attempted_ids
-        ):
-            if not apply or item.classification not in candidate_classes:
-                counts[item.classification] += 1
-            continue
-        if attempt_index:
-            time.sleep(1.0 / float(rate))
-        attempt_index += 1
+    limiter = _RateLimiter(rate, exact=int(workers) == 1)
+    thread_state = threading.local()
+
+    def attempt(item: Item) -> str:
+        limiter.wait()
         try:
-            if item.classification != "cleanup_pending" and decrypt is None:
-                decrypt = make_decrypt(user_id)
-            counts[migrate_item(user_id, item, decrypt)] += 1
+            if item.classification != "cleanup_pending":
+                decrypt = getattr(thread_state, "decrypt", None)
+                if decrypt is None:
+                    decrypt = make_decrypt(user_id)
+                    thread_state.decrypt = decrypt
+            else:
+                decrypt = None
+            return migrate_item(user_id, item, decrypt)
         except Exception:  # noqa: BLE001 - report only redacted failure class
-            counts["failed_transform_or_storage"] += 1
+            return "failed_transform_or_storage"
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=int(workers)) as executor:
+        for item in items:
+            if (
+                not apply
+                or item.classification not in candidate_classes
+                or id(item) not in attempted_ids
+            ):
+                if not apply or item.classification not in candidate_classes:
+                    counts[item.classification] += 1
+                continue
+            futures[executor.submit(attempt, item)] = item
+        for future in as_completed(futures):
+            counts[future.result()] += 1
     failures = sum(
         count
         for status, count in counts.items()

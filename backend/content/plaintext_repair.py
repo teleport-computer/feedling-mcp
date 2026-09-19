@@ -116,6 +116,7 @@ def run(
     user_limit: int = 0,
     row_limit: int = 0,
     rate: float = 1.0,
+    workers: int = 1,
     health_probe: Callable[[], bool] | None = None,
     healthy_streak: int = 2,
     health_poll_sec: float = 5.0,
@@ -127,6 +128,8 @@ def run(
         raise ValueError("row_limit must be >= 0")
     if float(rate) <= 0:
         raise ValueError("rate must be > 0")
+    if int(workers) < 1 or int(workers) > 4:
+        raise ValueError("workers must be between 1 and 4")
     users = eligible_user_ids(
         start_after=start_after,
         user_limit=user_limit,
@@ -157,6 +160,7 @@ def run(
                 apply=apply,
                 limit=row_limit,
                 rate=rate,
+                workers=workers,
             )
         except (PermissionError, ValueError):
             counts["failed_tier_or_user_changed"] += 1

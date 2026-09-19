@@ -77,8 +77,8 @@ def test_dry_run_is_deterministic_and_does_not_probe_health(monkeypatch):
     )
 
     assert calls == [
-        ("usr_a", {"apply": False, "limit": 0, "rate": 1.0}),
-        ("usr_b", {"apply": False, "limit": 0, "rate": 1.0}),
+        ("usr_a", {"apply": False, "limit": 0, "rate": 1.0, "workers": 1}),
+        ("usr_b", {"apply": False, "limit": 0, "rate": 1.0, "workers": 1}),
     ]
     assert result.public_dict() == {
         "apply": False,

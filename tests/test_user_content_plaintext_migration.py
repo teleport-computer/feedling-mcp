@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import sys
+import threading
+import time
 
 import pytest
 from psycopg.types.json import Jsonb
@@ -932,6 +934,43 @@ def test_apply_limit_and_rate_only_attempt_bounded_migratable_items(monkeypatch)
     }
 
 
+def test_apply_workers_bound_concurrent_migrations(monkeypatch):
+    items = [
+        plaintext_migration.Item(
+            "memory", f"m-{index}", "migratable_shared",
+            {"id": f"m-{index}", "body_ct": "sealed", "K_enclave": "key"},
+        )
+        for index in range(8)
+    ]
+    monkeypatch.setattr(plaintext_migration, "content_encryption_preference", lambda _uid: "off")
+    monkeypatch.setattr(plaintext_migration, "user_exists", lambda _uid: True)
+    monkeypatch.setattr(plaintext_migration, "inventory", lambda _uid: items)
+    monkeypatch.setattr(plaintext_migration, "make_decrypt", lambda _uid: object())
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def migrate(_uid, _item, _decrypt):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return "migrated"
+
+    monkeypatch.setattr(plaintext_migration, "migrate_item", migrate)
+
+    result = plaintext_migration.run(
+        "usr_workers", apply=True, rate=1000, workers=4
+    )
+
+    assert result.counts == {"migrated": 8}
+    assert result.failures == 0
+    assert 1 < max_active <= 4
+
+
 @pytest.mark.parametrize(("limit", "rate"), [(-1, 1.0), (0, 0), (0, -2.0)])
 def test_run_rejects_invalid_limit_or_rate_before_inventory(monkeypatch, limit, rate):
     monkeypatch.setattr(
@@ -941,6 +980,17 @@ def test_run_rejects_invalid_limit_or_rate_before_inventory(monkeypatch, limit, 
     )
     with pytest.raises(ValueError):
         plaintext_migration.run("usr_invalid_controls", limit=limit, rate=rate)
+
+
+@pytest.mark.parametrize("workers", [0, 5])
+def test_run_rejects_workers_outside_safe_bound(monkeypatch, workers):
+    monkeypatch.setattr(
+        plaintext_migration,
+        "inventory",
+        lambda _uid: pytest.fail("validation must precede inventory"),
+    )
+    with pytest.raises(ValueError, match="workers must be between 1 and 4"):
+        plaintext_migration.run("usr_invalid_workers", workers=workers)
 
 
 def test_cli_failure_report_does_not_expose_exception_or_item_id(monkeypatch, capsys):

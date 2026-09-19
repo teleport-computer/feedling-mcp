@@ -345,8 +345,13 @@ export FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1
 python migrate_effective_off_content_to_plaintext.py \
   --apply --allow-plaintext-rewrite \
   --confirm-all-effective-off ALL-EFFECTIVE-OFF \
-  --user-limit 10 --row-limit 20 --rate 1 --json
+  --user-limit 10 --row-limit 20 --rate 1 --workers 1 --json
 ```
+
+`--workers` is bounded to 1--4 and defaults to 1.  It controls per-user
+parallel migration work while `--rate` remains the process-wide maximum start
+rate.  Increase workers only after observing enclave latency and backend CPU;
+CAS writes remain conflict-safe when users are active.
 
 Record `last_completed_user_id` only after a zero-failure user with no
 `not_attempted_limit` rows. When `--row-limit` leaves rows deferred, the
