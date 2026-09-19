@@ -350,7 +350,7 @@ def _build_context_memories(moments, decrypted, query_args):
     context_memories: list[dict] = []
     context_memory_trace: dict | None = None
 
-    cards = readside.moments_to_cards(
+    cards = readside.moments_to_cards_cached(
         moments, query_args["authorized_user_id"], query_args["content_sk"])
     # 生命周期过滤归宿主 —— **必须在翻译之前**。
     # 翻译产物里没有 io 的 archive 字段，放到翻译之后就漏了，已归档的卡
@@ -393,7 +393,10 @@ def _build_context_memories(moments, decrypted, query_args):
         mode = "relevant:unified"
     context_memories = _back_to_original(picked)
     if query_args.get("context_recent"):
-        fresh = recall_metadata.recent_cards(selectable)
+        # copy: recent_cards returns cache-owned dicts now that the pool is cached
+        # (moments_to_cards_cached); these go into the response, so never hand out the
+        # cached objects themselves.
+        fresh = [dict(c) for c in recall_metadata.recent_cards(selectable)]
         fresh_ids = {c["id"] for c in fresh}
         context_memories = fresh + [c for c in context_memories if c.get("id") not in fresh_ids]
         context_memories = context_memories[:_CONTEXT_MEMORY_CAP]
