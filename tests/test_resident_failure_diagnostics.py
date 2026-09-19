@@ -62,7 +62,9 @@ class Response:
 
 
 def test_closed_reason_and_status_vocabularies():
-    assert c.SANITIZER_REASONS == {'thinking_gate_failed', 'protocol_leak', 'file_citation', 'unknown'}
+    assert c.SANITIZER_REASONS == {
+        'thinking_gate_failed', 'thinking_gate_salvaged', 'protocol_leak', 'file_citation', 'unknown',
+    }
     assert c.PROVIDER_STATUS_CLASSES == {'4xx', '5xx', 'none'}
     assert c.SANITIZER_REASONS is error_contract.RESIDENT_SANITIZER_REASONS
     assert c.PROVIDER_STATUS_CLASSES is error_contract.PROVIDER_STATUS_CLASSES
@@ -70,7 +72,9 @@ def test_closed_reason_and_status_vocabularies():
 
 @pytest.mark.parametrize('wire', ['simple', 'openai'])
 @pytest.mark.parametrize('raw,reason', [
-    ('  <think>' + 'x' * 340 + '<aside>nested</think> tail  ', 'thinking_gate_failed'),
+    # Thinking-only text whose tags the strict gate refuses and the salvage
+    # layer cannot rescue either (T656): nothing outside the tags to deliver.
+    ('  <think>' + 'x' * 340 + '<aside>nested</think>  ', 'thinking_gate_failed'),
     ('{"actions": [', 'protocol_leak'),
     ('The user wrote "sweet!" ...\nI think it is best to respond ...', 'unknown'),
 ])
@@ -93,6 +97,22 @@ def test_http_sanitizer_failure_real_handoff(monkeypatch, traces, wire, raw, rea
     assert detail['raw_reply_len'] == len(raw)
     assert detail['think_open_count'] == (2 if reason == 'thinking_gate_failed' else 0)
     assert detail['think_close_count'] == (1 if reason == 'thinking_gate_failed' else 0)
+
+
+@pytest.mark.parametrize('wire', ['simple', 'openai'])
+def test_http_nested_think_with_reply_text_is_salvaged_not_failed(monkeypatch, traces, wire):
+    """T656: the same nested shape WITH text after the tags used to be a
+    reply_parse_failed turn; now the text is delivered and the thinking dropped.
+    The strict gate still refuses it — the salvage layer is what changed."""
+    raw = '  <think>' + 'x' * 340 + '<aside>nested</think> tail  '
+    from agent_protocol_core import self_thinking as st
+    assert st.strip_all_thinking(raw, sanitize=False)[0] == st.FAILED
+    body = {'reply': raw} if wire == 'simple' else {'choices': [{'message': {'role': 'assistant', 'content': raw}}]}
+    monkeypatch.setattr(c._HTTP, 'post', lambda *a, **kw: Response(body))
+    out = getattr(c, '_call_agent_http_' + wire)('hi')
+    text = out if isinstance(out, str) else '\n'.join(out.get('messages') or [])
+    assert 'tail' in text
+    assert 'nested' not in text and 'xxx' not in text and '<' not in text
 
 
 @pytest.mark.parametrize('fallback', [True, False])

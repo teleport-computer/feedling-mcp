@@ -1870,6 +1870,40 @@ def test_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
     assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
 
 
+def test_chat_multi_open_think_is_salvaged_not_failed(monkeypatch):
+    """T656 (T655 shape: MiniMax-M3 opened <think> twice, closed once). The strict
+    gate still says FAILED; the salvage layer delivers the reply text, drops the
+    thinking (marker shown), and the row is NOT a turn failure."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    uid = "u_toolloop_selfthink_salvaged"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-salvaged")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    raw = "<think>她在生气<think>要不要先道歉</think>先别急，我在呢。"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+    _script_provider(monkeypatch, [_text_round(raw)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "你在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == "先别急，我在呢。"
+    assert "<think" not in bubbles[0]["body_ct"] and "她在生气" not in bubbles[0]["body_ct"]
+    assert bubbles[0]["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    assert not bubbles[0].get("turn_failure_error_class")
+    assert _job_status_row(job_id)[0] == "completed"
+
+
 def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     monkeypatch,
 ):

@@ -281,3 +281,196 @@ def test_prefix_support_does_not_widen_to_glued_names():
         status, _thinking, reply = st.strip_all_thinking(raw)
         assert status == st.ABSENT, (raw, status)
         assert reply == raw
+
+
+# ---------------------------------------------------------------------------
+# 打捞层（T656，2026-09-19）。判据不放宽：上面每一条 FAILED 的用例照旧红/绿；
+# 只是 FAILED 之后再扫一遍，分得出正文就发正文、思考全丢。形状取自 T655 线上
+# trace（MiniMax-M3 + openai_compatible + pi：一条回复开 2～3 个 <think>
+# 只关 1～2 个，尾块常被截断），正文用占位符。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,reply,reason", [
+    # T655 主形状：open 2 / close 1（思考里再开一次）
+    ("<think>A<think>B</think>正文", "正文", "nested_open"),
+    # open 3 / close 1
+    ("<think>A<think>B<think>C</think>正文", "正文", "nested_open"),
+    # 成对块 + 正文 + 末尾未闭的第二块（被 token / 输出上限截断）
+    ("<think>A</think>正文1<think>B", "正文1", "trailing_unclosed"),
+    # open 3 / close 2：块、正文、再一块未闭
+    ("<think>A</think>正文1<think>B<think>C</think>正文2<think>D",
+     "正文1\n正文2", "nested_open+trailing_unclosed"),
+    # 2026-08-08 反例的反向：完整块之后的孤立闭标签只丢标签，正文甲不再被吞
+    ("<think>A</think>正文甲</think>正文乙", "正文甲\n正文乙", "stray_close_after_block"),
+    # 开闭错配：第一个闭标签就是闭
+    ("<think>A</reasoning>正文", "正文", "mismatched_close"),
+    # 两个孤立闭、没有任何块：第一个前面是思考，第二个只是噪音
+    ("A</think>B</think>C", "B\nC", "lone_close_head+stray_close_after_block"),
+    # codex4 复审 2026-09-19 反例：完整配平的嵌套块——外层块的尾巴 C 是思考，
+    # 第一版在内层闭标签就出了思考态、把 C 当正文发了出去。
+    ("<think>PRIVATE_OUTER_A<think>PRIVATE_INNER</think>PRIVATE_OUTER_B</think>PUBLIC_REPLY",
+     "PUBLIC_REPLY", "nested_balanced"),
+    # 同形状，命名空间前缀 / aside 标签
+    ("<ns:think>A<ns:think>B</ns:think>C</ns:think>R", "R", "nested_balanced"),
+    ("<aside>A<aside>B</aside>C</aside>R", "R", "nested_balanced"),
+    # 配平嵌套块 + 正文 + 末尾未闭块：正文只有 R
+    ("<think>A<think>B</think>C</think>R<think>D", "R", "nested_balanced+trailing_unclosed"),
+    # 配平嵌套块 + 正文 + 不配平的再开块：G 是再开块闭掉之后的正文
+    ("<think>A<think>B</think>C</think>R<think>E<think>F</think>G", "R\nG", "nested_balanced+nested_open"),
+    # codex4 r2 反例：外层不配平、里面却有一个配平的子块（三开两闭）——
+    # B_TAIL 在配平的子块里，是思考；r2 的「第一个闭标签结束」把它发了出去。
+    ("<think>PRIVATE_A<think>PRIVATE_B<think>PRIVATE_C</think>PRIVATE_B_TAIL</think>PUBLIC_REPLY",
+     "PUBLIC_REPLY", "nested_balanced+nested_open"),
+    ("<aside>PRIVATE_A<aside>PRIVATE_B<aside>PRIVATE_C</aside>PRIVATE_B_TAIL</aside>PUBLIC_REPLY",
+     "PUBLIC_REPLY", "nested_balanced+nested_open"),
+    # 两段各带再开的思考：两段正文都要留下（再开的父块只借第一个子块的闭）
+    ("<think>A<think>B</think>正文1<think>C<think>D</think>正文2", "正文1\n正文2", "nested_open"),
+    # codex4 r3 反例①：再开块借来的闭标签**紧挨着**下一个兄弟块（match.end 是开区间）
+    ("<think>A<think>B</think><think>C</think>PUBLIC_REPLY", "PUBLIC_REPLY", "nested_open"),
+    ("<think>A<think>B</think> <think>C</think>PUBLIC_REPLY", "PUBLIC_REPLY", "nested_open"),
+    # codex4 r3 反例②：借闭的第一个子块自己也是再开块，它借闭之后的兄弟 D 藏在它下面
+    ("<think>A<think>B<think>C</think>PUBLIC_1<think>D</think>PUBLIC_2", "PUBLIC_1\nPUBLIC_2", "nested_open"),
+    ("<think>A<think>B<think>C</think> PUBLIC_1 <think>D</think> PUBLIC_2", "PUBLIC_1 \n PUBLIC_2", "nested_open"),
+    # 再深一层：四开、借闭链三级
+    ("<think>A<think>B<think>C<think>D</think>P1<think>E</think>P2", "P1\nP2", "nested_open"),
+    # 对照：同样四开但第三个块自己配平了（包住 P1/P2）——那它们是思考，只剩 P3
+    ("<think>A<think>B<think>C<think>D</think>P1<think>E</think>P2</think>P3", "P3", "nested_balanced+nested_open"),
+])
+def test_salvage_keeps_reply_text_and_drops_every_thinking_block(raw, reply, reason):
+    # 严格判据仍然拒绝——这是打捞层存在的前提，不是被放宽了。
+    assert st.strip_all_thinking(raw)[0] == st.FAILED
+    status, thinking, visible = st.strip_all_thinking_or_salvage(raw)
+    assert status == st.SALVAGED
+    assert visible == reply
+    assert thinking == ""            # 打捞出的思考不可信，永远不展示
+    assert "<" not in visible        # 没有半个标签出门
+    assert st.salvage_thinking(raw)[2] == reason
+
+
+@pytest.mark.parametrize("raw", [
+    "<think>A<think>B",              # 全是思考，没有正文
+    "<think>A<think>B<think>C",      # 三开零闭：借闭链到底都没有闭，整段是被截断的思考
+    "<think>A<think>B</think>C</think>",  # 配平嵌套、没有正文（codex4 反例的无正文版）
+    "<think>A</think>",              # 只有一个完整块（严格判据本来就 SILENT）
+    "<thin",                         # 截断的协议开标签头
+])
+def test_salvage_still_fails_closed_when_no_reply_text_can_be_told_apart(raw):
+    status, thinking, visible = st.strip_all_thinking_or_salvage(raw)
+    assert status in {st.FAILED, st.SILENT}
+    assert visible == ""
+
+
+def test_salvage_wrapper_is_transparent_for_clean_shapes():
+    for raw, want_status in [
+        ("正文", st.ABSENT),
+        ("<think>A</think>正文", st.COMPLETE),
+        ("<think>A</think>\n<think>B</think>\n正文", st.COMPLETE),
+        ("<think>A</think>", st.SILENT),
+    ]:
+        assert st.strip_all_thinking_or_salvage(raw) == st.strip_all_thinking(raw), raw
+        assert st.strip_all_thinking_or_salvage(raw)[0] == want_status
+
+
+def test_salvage_never_publishes_the_outer_tail_of_a_balanced_nested_block():
+    """独立于参数表再钉一次 codex4 的反例：三个 PRIVATE 都不许出门。"""
+    raw = "<think>PRIVATE_OUTER_A<think>PRIVATE_INNER</think>PRIVATE_OUTER_B</think>PUBLIC_REPLY"
+    status, thinking, visible = st.strip_all_thinking_or_salvage(raw)
+    assert (status, visible, thinking) == (st.SALVAGED, "PUBLIC_REPLY", "")
+    assert "PRIVATE" not in visible
+
+
+def test_salvage_keeps_balanced_child_private_under_unbalanced_parent():
+    """codex4 r2 反例单独钉一次：四个 PRIVATE 一个都不出门。"""
+    raw = "<think>PRIVATE_A<think>PRIVATE_B<think>PRIVATE_C</think>PRIVATE_B_TAIL</think>PUBLIC_REPLY"
+    status, thinking, visible = st.strip_all_thinking_or_salvage(raw)
+    assert (status, visible, thinking) == (st.SALVAGED, "PUBLIC_REPLY", "")
+    assert "PRIVATE" not in visible
+
+
+def test_salvage_is_linear_in_repeated_malformed_blocks():
+    """codex4 r2：r2 的实现对每个不配平块重扫后缀，2000 次重复要 0.5 s；
+    树形单遍后 8000 次 < 0.05 s。这里钉一个宽松上界，红了说明又变二次方了。"""
+    import time
+    for unit, per_unit in (
+        ("<think>A<think>B</think>PUBLIC\n", 1),                       # 再开链
+        ("<think>A<think>B</think><think>C</think>PUBLIC\n", 1),       # 紧挨兄弟
+        ("<think>A<think>B<think>C</think>PUBLIC<think>D</think>PUBLIC\n", 2),  # 借闭链
+    ):
+        raw = unit * 4000
+        started = time.perf_counter()
+        visible, _thinking, _reason = st.salvage_thinking(raw)
+        assert visible.count("PUBLIC") == 4000 * per_unit, unit
+        assert time.perf_counter() - started < 1.0, unit
+
+
+def test_salvage_reasons_are_a_closed_set():
+    raw = "<think>A</think>正文1<think>B<think>C</think>正文2<think>D</reasoning>x</think>y"
+    for part in st.salvage_thinking(raw)[2].split("+"):
+        assert part in st.SALVAGE_REASONS
+
+
+def test_v1_consumer_salvages_multi_open_think_instead_of_dropping_the_turn(monkeypatch):
+    """T655 的落点：以前 thinking_gate_failed 整轮作废；现在正文照发、思考丢掉、
+    记 thinking_gate_salvaged + 打捞理由（日报/巡检靠它数接管了多少）。"""
+    crc = _load_consumer(monkeypatch)
+    turn = crc.AgentTurn()
+    raw = "<think>她在生气<think>要不要先道歉</think>先别急，我在呢。"
+    visible, thinking = crc._split_tagged_thinking(raw, diagnostics=turn)
+    assert visible == "先别急，我在呢。"
+    assert thinking == ""
+    assert turn.sanitizer_reason == "thinking_gate_salvaged"
+    assert turn.raw_reply_diagnostics["salvage_reason"] == "nested_open"
+    assert turn.raw_reply_diagnostics["think_open_count"] == 2
+    assert turn.raw_reply_diagnostics["think_close_count"] == 1
+    # 严格判据仍然会拒：这条不是靠放宽过的。
+    assert st.strip_all_thinking(raw, sanitize=False)[0] == st.FAILED
+
+
+def test_v1_consumer_balanced_nested_block_keeps_outer_tail_private(monkeypatch):
+    """codex4 反例打在真出口上：V1 consumer 只发 PUBLIC_REPLY。"""
+    crc = _load_consumer(monkeypatch)
+    turn = crc.AgentTurn()
+    raw = "<think>PRIVATE_OUTER_A<think>PRIVATE_INNER</think>PRIVATE_OUTER_B</think>PUBLIC_REPLY"
+    visible, thinking = crc._split_tagged_thinking(raw, diagnostics=turn)
+    assert visible == "PUBLIC_REPLY" and thinking == ""
+    assert turn.sanitizer_reason == "thinking_gate_salvaged"
+    assert turn.raw_reply_diagnostics["salvage_reason"] == "nested_balanced"
+
+
+def test_v1_consumer_unbalanced_parent_with_balanced_child_keeps_child_private(monkeypatch):
+    """codex4 r2 反例打在真出口上。"""
+    crc = _load_consumer(monkeypatch)
+    turn = crc.AgentTurn()
+    raw = "<think>PRIVATE_A<think>PRIVATE_B<think>PRIVATE_C</think>PRIVATE_B_TAIL</think>PUBLIC_REPLY"
+    visible, thinking = crc._split_tagged_thinking(raw, diagnostics=turn)
+    assert visible == "PUBLIC_REPLY" and thinking == ""
+    assert "PRIVATE" not in visible
+    assert turn.sanitizer_reason == "thinking_gate_salvaged"
+
+
+@pytest.mark.parametrize("raw,reply", [
+    ("<think>A<think>B</think><think>C</think>PUBLIC_REPLY", "PUBLIC_REPLY"),
+    ("<think>A<think>B<think>C</think>PUBLIC_1<think>D</think>PUBLIC_2", "PUBLIC_1\nPUBLIC_2"),
+])
+def test_v1_consumer_adjacent_and_deep_promoted_shapes_deliver_reply(monkeypatch, raw, reply):
+    """codex4 r3 两个反例打在真出口上：r3 之前这两条整轮 FAILED、用户拿到空。"""
+    crc = _load_consumer(monkeypatch)
+    turn = crc.AgentTurn()
+    visible, thinking = crc._split_tagged_thinking(raw, diagnostics=turn)
+    assert visible == reply and thinking == ""
+    assert not any(ch in visible for ch in "<>")
+    assert turn.sanitizer_reason == "thinking_gate_salvaged"
+
+
+def test_v1_consumer_still_fails_closed_when_nothing_is_reply_text(monkeypatch):
+    crc = _load_consumer(monkeypatch)
+    turn = crc.AgentTurn()
+    visible, thinking = crc._split_tagged_thinking("<think>只有思考<think>没有正文", diagnostics=turn)
+    assert visible == ""
+    assert turn.sanitizer_reason == "thinking_gate_failed"
+
+
+def test_salvaged_is_a_registered_resident_sanitizer_reason():
+    from notices import error_contract
+    assert "thinking_gate_salvaged" in error_contract.RESIDENT_SANITIZER_REASONS
+    assert "thinking_gate_failed" in error_contract.RESIDENT_SANITIZER_REASONS

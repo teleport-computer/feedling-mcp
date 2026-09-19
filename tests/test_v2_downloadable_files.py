@@ -273,6 +273,79 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
     ]
 
 
+def test_send_file_completion_message_with_tangled_think_is_salvaged(monkeypatch):
+    """T656: the completion_message outlet takes the salvage path too. With a
+    live file request the completion_message IS the delivered bubble; a
+    nested/unbalanced <think> in it used to blank it (FAILED) and trip the
+    language-mismatch retry. Now the reply text is delivered as-is and no
+    thinking or tag reaches the bubble."""
+    files = []
+    request = "请生成并发送一个中文纯文本文件，文件名为中文附件，正文写这是中文测试。"
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    async def dispatch(tool_calls):
+        return [
+            ToolResult(
+                call_id=call.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+                metadata={"workspace_revision": 1},
+            )
+            for call in tool_calls
+        ]
+
+    raw = "<think>PRIVATE_OUTER<think>PRIVATE_INNER</think>中文附件已经生成，可以下载了。"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "write-cn",
+                    "name": "workspace_write",
+                    "args": {
+                        "path": "/workspace/中文附件.txt",
+                        "content": "这是中文测试。",
+                        "expected_revision": 0,
+                    },
+                }],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "send-cn",
+                    "name": "send_file",
+                    "args": {
+                        "path": "/workspace/中文附件.txt",
+                        "revision": 1,
+                        "completion_message": raw,
+                    },
+                }],
+                "usage": {},
+            },
+        ],
+        on_file_reply=on_file,
+        dispatch=dispatch,
+        required_file_suffixes=(".txt",),
+        file_requirement_messages=[{"role": "user", "content": request}],
+        max_calls=4,
+        suppress_native_reasoning=True,
+    )
+
+    assert calls[1] == ("send_file",)
+    assert files == [("/workspace/中文附件.txt", 1)]
+    assert replies == [("中文附件已经生成，可以下载了。", True)]
+    assert outcome.stop_reason == "final_text"
+    assert all("PRIVATE" not in text and "<" not in text for text, _final in replies)
+
+
 def test_chinese_file_delivery_uses_chinese_compact_control_messages(monkeypatch):
     files = []
     request = (
