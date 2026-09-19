@@ -12,6 +12,8 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Updated memgarden from 0.21.1 to 0.22.0: the release range contains optional vector retrieval (#8, c32f8d60) and release preparation (#9, 05ad1ef3). IO continues using lexical retrieval; vector fusion remains disabled.
+
 - Dream backoff notices now retain account-specific failure guidance. After
   seven days of persistent account failures, automatic runs switch to recovery
   probes at the Dream minimum interval (23 hours by default). Cooldown ticks
