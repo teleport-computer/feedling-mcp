@@ -649,130 +649,6 @@ def test_history_source_merges_existing_ai_persona_with_voice_exemplars(monkeypa
     assert reducer_output["voice_workset"]["exemplars"][0]["founding"] is True
 
 
-def test_foreground_combined_map_extracts_fact_and_voice_in_one_call(monkeypatch):
-    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
-    calls = []
-
-    class FakeLLM:
-        def complete(self, **kwargs):
-            calls.append(kwargs["task_id"])
-            assert kwargs["task_id"] == "combined-map-0"
-            text = json.dumps({
-                "fact_candidates": [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
-                "voice_candidates": {
-                    "behavior_notes_candidates": ["短句接住"],
-                    "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
-                },
-            })
-            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
-
-    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["user: 我叫 Z\nta: 别急,我在。"],
-        source_kind="history",
-        write_core=False,
-        include_voice_candidates=True,
-    )
-
-    assert calls == ["combined-map-0"]
-    assert output["all_fact_candidates"] == [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}]
-    assert output["voice_candidates"] == [{
-        "behavior_notes_candidates": ["短句接住"],
-        "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
-    }]
-
-
-def test_foreground_combined_map_retries_once_when_empty(monkeypatch):
-    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
-    calls = []
-
-    class FakeLLM:
-        def complete(self, **kwargs):
-            calls.append({"task_id": kwargs["task_id"], "idempotency_key": kwargs["idempotency_key"]})
-            if len(calls) == 1:
-                text = json.dumps({"fact_candidates": [], "voice_candidates": {}})
-            elif len(calls) == 2:
-                text = json.dumps({
-                    "fact_candidates": [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
-                    "voice_candidates": {"behavior_notes_candidates": ["直说"], "exemplar_candidates": []},
-                })
-            else:
-                raise AssertionError(kwargs["task_id"])
-            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["user: 我叫 Z"],
-        source_kind="history",
-        llm=FakeLLM(),
-        write_core=False,
-        include_voice_candidates=True,
-    )
-
-    assert [call["task_id"] for call in calls] == ["combined-map-0", "combined-map-0-empty-retry-1"]
-    assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
-    assert output["all_fact_candidates"][0]["summary"] == "用户叫 Z"
-    assert output["voice_candidates"][0]["behavior_notes_candidates"] == ["直说"]
-
-
-def test_keep_all_empty_maps_return_bounded_raw_diagnostics_without_checkpointing():
-    raw = '{"fact_candidates":[],"explanation":"没有提取到候选"}'
-    llm = _FakeLLM([raw, raw])
-    checkpointed = []
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["用户长期居住在上海，也一直从事产品设计。"],
-        source_kind="memory_summary_import",
-        llm=llm,
-        write_core=False,
-        keep_all=True,
-        on_map_completed=lambda idx, mapped: checkpointed.append((idx, mapped)),
-    )
-
-    assert output["all_fact_candidates"] == []
-    assert checkpointed == []
-    assert [item["discard_reason"] for item in output["map_diagnostics"]] == [
-        "empty_fact_candidates",
-        "empty_fact_candidates",
-    ]
-    assert output["map_diagnostics"][0]["raw_output_snippet"] == raw
-    assert output["map_diagnostics"][0]["raw_output_chars"] == len(raw)
-
-
-def test_keep_all_retry_ignores_legacy_empty_map_checkpoint():
-    llm = _FakeLLM([
-        '{"fact_candidates":[{"about":"user","summary":"用户长期居住在上海"}]}'
-    ])
-    checkpointed = []
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["用户长期居住在上海。"],
-        source_kind="memory_summary_import",
-        llm=llm,
-        write_core=False,
-        keep_all=True,
-        resume_map_outputs={0: {"fact_candidates": []}},
-        on_map_completed=lambda idx, mapped: checkpointed.append((idx, mapped)),
-    )
-
-    assert llm.calls == 1
-    assert output["all_fact_candidates"][0]["summary"] == "用户长期居住在上海"
-    assert checkpointed[0][0] == 0
-    assert output["map_diagnostics"][0]["discard_reason"] == "empty_checkpoint_ignored"
-
-
 def test_fact_write_retries_once_when_empty(monkeypatch):
     calls = []
 
@@ -790,7 +666,7 @@ def test_fact_write_retries_once_when_empty(monkeypatch):
                 raise AssertionError(kwargs["task_id"])
             return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1",
         job_id="job_1",
         runtime=types.SimpleNamespace(),
@@ -822,7 +698,7 @@ def test_fact_write_rewrites_person_references_but_preserves_product_terms():
                 output_ref=kwargs["task_id"],
             )
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1",
         job_id="job_1",
         runtime=types.SimpleNamespace(),
@@ -862,7 +738,7 @@ def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
             }, ensure_ascii=False)
             return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1", job_id="job_1", runtime=types.SimpleNamespace(),
         fact_candidates=[{"about": "user", "summary": "用户叫 Seven"}], llm=FakeLLM(),
     )
@@ -905,7 +781,7 @@ def test_fact_write_dedups_stable_definitions_across_batches_first_seen_wins(mon
                 }, ensure_ascii=False)
             return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1", job_id="job_1", runtime=types.SimpleNamespace(),
         fact_candidates=[{"about": "user", "summary": s} for s in "abcde"],
         llm=FakeLLM(),
@@ -952,7 +828,7 @@ def test_fact_write_provider_config_error_does_not_retry(monkeypatch):
             raise provider_client.ProviderError("out of credits", status_code=402)
 
     with pytest.raises(provider_client.ProviderError):
-        worker.build_memory_output_from_fact_candidates(
+        worker._fact_write(
             user_id="usr_1",
             job_id="job_1",
             runtime=types.SimpleNamespace(),

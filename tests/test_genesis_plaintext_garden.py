@@ -211,7 +211,7 @@ def test_failed_legacy_job_reused_by_input_hash_restarts_on_garden(env, monkeypa
     """Real ASGI → last-100 DB lookup → same failed job → real runner and garden.
 
     Only authentication, the thread scheduling and external model/encryption are
-    substituted. Removing the reset must enter the legacy-runner sentinel.
+    substituted. Removing the reset must persist stale map/task progress as valid state.
     """
     import asyncio
     import httpx
@@ -234,14 +234,6 @@ def test_failed_legacy_job_reused_by_input_hash_restarts_on_garden(env, monkeypa
     monkeypatch.setattr(plaintext_garden, "_apply_non_memory", lambda *_a, **_k: {})
     monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_a, **_k: "hi")
     monkeypatch.setattr(worker, "build_reducer_output_from_texts", lambda **_k: {"memories": []})
-    old_calls = []
-
-    def old_runner(*_a, **_k):
-        old_calls.append("legacy runner reached")
-        raise AssertionError("legacy runner reached")
-
-    monkeypatch.setattr(plaintext, "_run_plaintext_add_memory_job", old_runner)
-    monkeypatch.setattr(plaintext, "_run_plaintext_genesis_v2", old_runner)
     traces = []
     monkeypatch.setattr(plaintext.debug_trace, "trace_event", lambda *_a, **kw: traces.append(kw))
     started = []
@@ -264,12 +256,12 @@ def test_failed_legacy_job_reused_by_input_hash_restarts_on_garden(env, monkeypa
     assert response.status_code == 202, response.text
     assert response.json()["job"]["job_id"] == job_id
     assert started == [job_id]
-    assert old_calls == [], "guard removed: input_hash reuse entered legacy runner"
     assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
     assert _live_cards(env.user_id) == ["周末在西湖骑车"]
     first = env.saved_docs[0]
+    assert not any(first.get(k) for k in ("tasks", "map_outputs", "voice_outputs", "material_cards")), (
+        "guard removed: stale v1 progress persisted as valid checkpoint state")
     assert first["import_engine"] == garden_import.ENGINE
-    assert not any(first.get(k) for k in ("tasks", "map_outputs", "voice_outputs", "material_cards"))
     assert "PRIVATE_" not in json.dumps(first)
     reset = [t for t in traces if t["type"] == "genesis.plaintext.legacy_checkpoint_reset"]
     assert len(reset) == 1
@@ -330,6 +322,26 @@ def test_legacy_reset_persist_failure_stops_before_model(env, monkeypatch):
     assert model.prompts == []
     assert db.genesis_get_job(env.user_id, job_id)["status"] == "failed"
     assert env.checkpoints[job_id] == _legacy_checkpoint()
+
+
+def test_garden_add_memory_retry_resolves_prior_failure_notice(env, monkeypatch):
+    from notices import core as notices_core
+
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    service.mark_failed(env.store, job_id, "connection refused")
+
+    def notice():
+        return next(row for row in db.log_read_all(env.user_id, notices_core.NOTICES_STREAM)
+                    if row["dedupe_key"] == f"genesis:{job_id}")
+
+    assert notice()["resolved"] is False
+    db.genesis_set_job_status(env.user_id, job_id, status="processing")
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("周末在西湖骑车")]}))
+    plaintext._run_plaintext_genesis_job(env.store, "key", job_id, mode="add_memory",
+                                        source_groups=_history_groups("〔窗A〕"))
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert notice()["resolved"] is True
 
 
 def test_locale_comes_from_io_import_language_detection(env, monkeypatch):
