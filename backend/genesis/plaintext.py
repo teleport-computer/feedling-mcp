@@ -652,9 +652,21 @@ class _PlaintextCheckpointProgress:
         self.job_id = job_id
         self.source_groups = source_groups
         loaded = service.load_genesis_checkpoint(store, api_key, job_id)
+        reset_detail = None
+        if use_garden and _checkpoint_is_legacy(loaded):
+            # Failed jobs can be found again by input_hash. Their old map progress
+            # is not an import-session checkpoint; restart from the submitted
+            # material and let the garden's existing-card index reconcile writes.
+            old_phase = loaded.get("phase")
+            reset_detail = {
+                "reason": "legacy_progress",
+                "engine": garden_import.ENGINE,
+                "old_phase": old_phase if isinstance(old_phase, str) and old_phase in checkpoint.PHASES else "unknown",
+                **{name: len(loaded[name]) if isinstance(loaded.get(name), (dict, list)) else 0
+                   for name in ("map_outputs", "tasks", "voice_outputs", "material_cards")},
+            }
+            loaded = None
         self.doc = checkpoint.resume(loaded) if loaded else checkpoint.new_checkpoint()
-        # 升级前开始的 job（checkpoint 里已经有 fact_map 进度、没有引擎标记）在旧流水线上
-        # 跑完；其余一律走 memgarden 导入会话，并把标记写进 checkpoint，重试时不会换回来。
         # ``use_garden`` 只对写记忆卡的模式（onboarding / add_memory）为 True；
         # update_identity 不写卡，进度照旧按窗口任务算。
         self.legacy = (not use_garden) or _checkpoint_is_legacy(self.doc)
@@ -664,6 +676,9 @@ class _PlaintextCheckpointProgress:
         if _voice_checkpoint_enabled():
             self.doc.setdefault("voice_outputs", {})
         service.write_genesis_checkpoint(store, job_id, self.doc)
+        if reset_detail is not None:
+            _trace_genesis(store, "genesis.plaintext.legacy_checkpoint_reset",
+                           job_id=job_id, detail=reset_detail)
         self.publish(stage="plaintext_reducer")
 
     # -- memgarden 导入会话的进度（加密 checkpoint 里的 ``garden_import``） ------ #

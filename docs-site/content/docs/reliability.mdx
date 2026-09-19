@@ -274,6 +274,18 @@ validation retain the durable `processed_chunks` count and per-material
 `windows_done` / `windows_total` values after failure; only a completed job
 reports 100 percent.
 
+Legacy plaintext onboarding and add-memory checkpoints with fact-map progress
+and no current import-engine marker are an exception: retry keeps the same job
+ID but saves fresh import progress and processes the submitted material again.
+Already written cards remain in the garden and enter the full existing-card
+index for model-directed merging. If that index cannot be read, the existing
+`genesis.garden_import.index_unavailable` fallback uses an empty index, so
+cross-import deduplication is unavailable. The reset emits a content-free
+`genesis.plaintext.legacy_checkpoint_reset` trace with the old phase and progress
+counts. Current-engine retries and update-identity checkpoints retain their
+normal resume behavior. Onboarding still re-derives and replaces identity on
+retry; its existing per-user greeting guard keeps the original greeting.
+
 Estimate/commit jobs retain their opaque staged-upload identifier in trusted
 job metadata until successful completion releases the staged upload. Completed
 persona-voice map windows are checkpointed in the same encrypted envelope as

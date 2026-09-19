@@ -51,10 +51,20 @@ def _memory_checkpoint(monkeypatch):
     return checkpoints
 
 
-def _seed_legacy_checkpoint(checkpoints: dict, job_id: str) -> None:
-    """升级前就开始的 job：checkpoint 里已经有旧流水线（fact_map）进度、没有引擎标记。
-    这种 job 在旧流水线上跑完 —— 下面标了这个的测试守的就是那条仍然存在的旧路径；
-    新 job 走 memgarden 导入会话，见 tests/test_genesis_plaintext_garden.py。"""
+def _seed_legacy_checkpoint(monkeypatch, checkpoints: dict, job_id: str) -> None:
+    """Isolate the retained legacy runner until PR-B removes it.
+
+    Production onboarding/add_memory now reset old checkpoints. These old-engine
+    unit tests opt out of garden dispatch; the real route/dispatch contract is
+    covered in test_genesis_plaintext_garden without this substitution.
+    """
+    progress_type = plaintext._PlaintextCheckpointProgress
+
+    def legacy_progress(*args, **kwargs):
+        kwargs["use_garden"] = False
+        return progress_type(*args, **kwargs)
+
+    monkeypatch.setattr(plaintext, "_PlaintextCheckpointProgress", legacy_progress)
     checkpoints[job_id] = {
         "v": 1, "phase": "foreground_processing", "map_outputs": {},
         "tasks": {"plaintext-map:9:pre_upgrade::0": {"status": "done"}},
@@ -1646,7 +1656,7 @@ def test_plaintext_job_heartbeat_renews_processing_lease(monkeypatch):
 
 
 def test_plaintext_background_runner_distills_and_applies(monkeypatch, _memory_checkpoint):
-    _seed_legacy_checkpoint(_memory_checkpoint, "genesis_job_1")
+    _seed_legacy_checkpoint(monkeypatch, _memory_checkpoint, "genesis_job_1")
     store = _store()
     calls: dict = {}
     trace_events: list[dict] = []
@@ -1986,7 +1996,7 @@ def test_plaintext_map_diagnostics_are_bounded_in_job_output(monkeypatch):
 
 
 def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(monkeypatch, _memory_checkpoint):
-    _seed_legacy_checkpoint(_memory_checkpoint, "genesis_job_1")
+    _seed_legacy_checkpoint(monkeypatch, _memory_checkpoint, "genesis_job_1")
     store = _store()
     calls: dict = {"builds": []}
     source_groups = [
@@ -2136,7 +2146,7 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
 
 
 def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch, _memory_checkpoint):
-    _seed_legacy_checkpoint(_memory_checkpoint, "resume_job")
+    _seed_legacy_checkpoint(monkeypatch, _memory_checkpoint, "resume_job")
     store = _store()
     calls = {"maps": 0, "reduces": 0, "failures": [], "cards": 0}
     monkeypatch.setattr(plaintext.worker, "genesis_v2_enabled", lambda: True)
@@ -2316,7 +2326,7 @@ def test_plaintext_merge_reducer_outputs_without_user_layer_signal_omits_it():
 
 
 def test_add_memory_mode_writes_only_memory(monkeypatch, _memory_checkpoint):
-    _seed_legacy_checkpoint(_memory_checkpoint, "job_add")
+    _seed_legacy_checkpoint(monkeypatch, _memory_checkpoint, "job_add")
     store = _store()
     calls: dict = {}
     monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
@@ -2408,7 +2418,7 @@ def test_add_memory_mode_writes_only_memory(monkeypatch, _memory_checkpoint):
 
 
 def test_add_memory_keep_all_zero_cards_fails_with_map_diagnostics(monkeypatch, _memory_checkpoint):
-    _seed_legacy_checkpoint(_memory_checkpoint, "job_add_empty")
+    _seed_legacy_checkpoint(monkeypatch, _memory_checkpoint, "job_add_empty")
     store = _store()
     calls: dict = {"statuses": []}
     monkeypatch.setattr(
