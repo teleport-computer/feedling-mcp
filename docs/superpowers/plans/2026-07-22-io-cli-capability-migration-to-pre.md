@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: point-in-time
+---
 # io_cli 能力补全 → pre(Runtime V2)迁移手册
 
 - 写于:2026-07-23,基于 `feat/io-cli-capability-completion` 分支实际落地代码
@@ -534,6 +539,8 @@ test**):
 - `backend/genesis/plaintext.py`:`_plaintext_merge_reducer_outputs` 同样的
   "有信号"判断扩展,并且这 5 个字段**反过来**要从 `source_family=="user_profile"`
   的输出里取(agent_name/dimensions 继续排除 user_profile,规则不变)。
+  历史注记（2026-09-20，T661）：下面的旧后台编排及专属回归测试现已删除；
+  本段保留当时修复的事实，不代表当前路径。
   **顺手修了一个真实回归**:`_run_plaintext_background_enrichment` 里
   persona-baseline 兜底那段原来是 `merged["identity"] = baseline`(整体覆盖),
   一旦素材只给了 5 字段信号又同时存在 persona 文本,会被这个兜底悄悄冲掉——

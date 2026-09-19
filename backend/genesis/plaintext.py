@@ -560,19 +560,6 @@ def _distill_model_override(value: Any) -> str:
     return model
 
 
-def _material_card_count(output: dict | None) -> int:
-    value = output if isinstance(output, dict) else {}
-    cards = value.get("memories")
-    if not isinstance(cards, list):
-        cards = value.get("facts")
-    count = len(cards) if isinstance(cards, list) else 0
-    if _identity_payload_has_content(value.get("identity")):
-        count += 1
-    if value.get("persona") or value.get("persona_content"):
-        count += 1
-    return count
-
-
 def _plaintext_job_metadata(
     payload: dict,
     prepared: dict,
@@ -642,7 +629,7 @@ def _plaintext_voice_task_id(source_pass: int, source_family: str) -> str:
 
 
 class _PlaintextCheckpointProgress:
-    """Encrypted fact/voice map checkpoint plus the non-content progress projection."""
+    """Encrypted garden/voice checkpoint and identity-update progress projection."""
 
     def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict],
                  *, use_garden: bool = False):
@@ -699,17 +686,6 @@ class _PlaintextCheckpointProgress:
     def _task_id(self, source_pass: int, source_family: str) -> str:
         return _plaintext_map_task_id(source_pass, source_family)
 
-    def resume_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
-        task_id = self._task_id(source_pass, source_family)
-        outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
-        resumed: dict[int, dict] = {}
-        for idx in range(len(self.source_groups[source_pass - 1].get("chunk_texts") or [])):
-            key = checkpoint.task_key(task_id, idx)
-            value = outputs.get(key)
-            if checkpoint.is_task_done(self.doc, task_id, idx) and isinstance(value, dict):
-                resumed[idx] = value
-        return resumed
-
     def resume_voice_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
         if not _voice_checkpoint_enabled():
             return {}
@@ -755,61 +731,6 @@ class _PlaintextCheckpointProgress:
             output_summary=f"voice_candidates={candidate_count}",
         )
         service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
-
-    def record_map(self, source_pass: int, source_family: str, chunk_index: int, output: dict) -> None:
-        task_id = self._task_id(source_pass, source_family)
-        key = checkpoint.task_key(task_id, chunk_index)
-        outputs = dict(self.doc.get("map_outputs") or {})
-        outputs[key] = output
-        self.doc["map_outputs"] = outputs
-        self.doc = checkpoint.upsert_task(
-            self.doc,
-            task_id=task_id,
-            chunk_id=chunk_index,
-            status=checkpoint.TASK_DONE,
-            source_pass=str(source_pass),
-            output_summary=f"candidates={len(output.get('fact_candidates') or [])}",
-        )
-        # Durable checkpoint first, visible progress second. A crash can under-report
-        # completed work, but can never report a window that cannot be resumed.
-        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
-        self.publish(
-            stage="plaintext_reducer",
-            source_family=source_family,
-            source_pass=source_pass,
-        )
-
-    def record_map_diagnostics(
-        self, source_pass: int, source_family: str, diagnostics: list[dict]
-    ) -> None:
-        if not diagnostics:
-            return
-        existing = (
-            self.doc.get("map_diagnostics")
-            if isinstance(self.doc.get("map_diagnostics"), list)
-            else []
-        )
-        safe = list(existing)
-        for raw in diagnostics:
-            if not isinstance(raw, dict) or len(safe) >= 6:
-                break
-            safe.append({
-                "source_pass": max(1, int(source_pass)),
-                "source_family": str(source_family or "")[:80],
-                "chunk_index": max(0, int(raw.get("chunk_index") or 0)),
-                "task_id": str(raw.get("task_id") or "")[:120],
-                "discard_reason": str(raw.get("discard_reason") or "unknown")[:120],
-                "raw_output_snippet": str(raw.get("raw_output_snippet") or "")[:500],
-                "raw_output_chars": max(0, int(raw.get("raw_output_chars") or 0)),
-                "raw_output_truncated": bool(raw.get("raw_output_truncated")),
-            })
-        self.doc["map_diagnostics"] = safe
-        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
-        self.publish(
-            stage="plaintext_reducer",
-            source_family=source_family,
-            source_pass=source_pass,
-        )
 
     def record_non_map_group(
         self, source_pass: int, source_family: str, *, cards: int = 0
@@ -1403,14 +1324,6 @@ def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
         return raw.decode("utf-8")
     except Exception:
         return ""
-
-
-def _merged_has_identity(merged: dict) -> bool:
-    """True when the reduce output carries a usable Identity Card (a name or any
-    dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
-    ident = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
-    dims = ident.get("dimensions") if isinstance(ident.get("dimensions"), list) else []
-    return bool(str(ident.get("agent_name") or "").strip()) or len(dims) > 0
 
 
 def _identity_payload_has_content(identity_payload: dict | None) -> bool:

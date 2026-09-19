@@ -1,3 +1,8 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/MEMORY_GARDEN_EXTRACTION_DESIGN.zh.md
+historical_reason: point-in-time
+---
 # Memory Garden 内核提取 · 技术方案(初版)
 
 > 配套《Memory Garden 内核提取 · 方向》。那份讲为什么和边界,本文讲**具体怎么做**:
@@ -197,7 +202,8 @@ AAD 绑定 owner_user_id | v | item_id  —— 改一个字 enclave 就拒绝解
 genesis 只交出落卡那部分
    genesis/prompts.py → 落卡 prompt 片段进内核;
                         voice / persona / identity 留在 genesis
-   genesis/dedup.py   → 去重原语进内核,分窗/checkpoint 逻辑留 genesis
+   旧 Genesis 词面去重模块 → 当时拟将去重原语移入内核,分窗/checkpoint 留 IO
+      历史注记(2026-09-20,T661):该旧模块现已删除;当前导入会话使用已有记忆索引。
 ```
 
 ---

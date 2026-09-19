@@ -80,16 +80,13 @@ tests/test_expected_consumer_commit.py
 tests/test_file_text.py
 tests/test_gen_url_map.py
 tests/test_generated_image.py
-tests/test_genesis_checkpoint.py
 tests/test_genesis_daemon.py
 tests/test_genesis_daemon_reclaim.py
-tests/test_genesis_dedup.py
 tests/test_genesis_deploy_orphan_p0.py
 tests/test_genesis_distill_acceptance.py
 tests/test_genesis_distill_mode.py
 tests/test_genesis_failure_codes.py
 tests/test_genesis_floor_note.py
-tests/test_genesis_foreground.py
 tests/test_genesis_keep_all.py
 tests/test_genesis_llm_client.py
 tests/test_genesis_prompts.py
@@ -101,7 +98,6 @@ tests/test_genesis_resident_upload.py
 tests/test_genesis_service.py
 tests/test_genesis_terms_note.py
 tests/test_genesis_unclaimed_reaper.py
-tests/test_genesis_v2_e2e.py
 tests/test_genesis_worker_claim.py
 tests/test_genesis_worker_claim_migration.py
 tests/test_gunicorn_conf.py

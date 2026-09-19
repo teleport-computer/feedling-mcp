@@ -1,17 +1,10 @@
-"""Shared identity predicate and current garden foreground-mode configuration."""
+"""Current garden foreground-mode configuration."""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from genesis import plaintext, worker  # noqa: E402
-
-
-def test_merged_has_identity_rule():
-    assert plaintext._merged_has_identity({"identity": {"agent_name": "小柒", "dimensions": []}})
-    assert plaintext._merged_has_identity({"identity": {"agent_name": "", "dimensions": [{"name": "温柔"}]}})
-    assert not plaintext._merged_has_identity({"identity": {"agent_name": "", "dimensions": []}})
-    assert not plaintext._merged_has_identity({"memories": []})
+from genesis import worker  # noqa: E402
 
 
 def test_genesis_v2_flag_gate_off_by_default(monkeypatch):
