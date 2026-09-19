@@ -10594,12 +10594,17 @@ async def _run_wake(
                 wake_self_thinking_failed = True
             if (_wake_gate_on or _wake_self_thinking_on) and text:
                 _wake_split = (
-                    _st_wake.strip_all_thinking
+                    _st_wake.strip_all_thinking_or_salvage
                     if _wake_gate_on
                     else _st_wake.split_thinking
                 )
                 _wst_status, _wst_thinking, _wst_reply = _wake_split(text)
-                if _wst_status == _st_wake.COMPLETE:
+                if _wst_status == _st_wake.SALVAGED:
+                    # Tags too tangled for the strict pass, reply text still
+                    # separable (T656): deliver it, show no thinking.
+                    text = _wst_reply
+                    wake_self_thinking_failed = True
+                elif _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                     if not _structured_wake_thinking:
                         _wake_self_thinking_text = _wst_thinking
@@ -15697,6 +15702,7 @@ async def process_job(
             _st_gate_on = self_thinking.gate_enabled()
             self_thinking_text = ""
             self_thinking_failed = False
+            self_thinking_salvaged = False
             self_thinking_status = None
             if (
                 (_st_gate_on or self_thinking_on)
@@ -15704,13 +15710,35 @@ async def process_job(
                 and text
             ):
                 _st_split = (
-                    self_thinking.strip_all_thinking
+                    self_thinking.strip_all_thinking_or_salvage
                     if _st_gate_on
                     else self_thinking.split_thinking
                 )
+                text_before_salvage = text
                 _st_status, _st_thinking, _st_reply = _st_split(text)
                 self_thinking_status = _st_status
-                if _st_status == self_thinking.COMPLETE:
+                if _st_status == self_thinking.SALVAGED:
+                    # Strict pass refused the tag shape but the reply text is
+                    # separable (T656, Seven 2026-09-19: never fail the turn for
+                    # this). Deliver the reply; drop the thinking and show the
+                    # thinking-failed marker so the envelope stays honest — but
+                    # it is a delivered reply, not a turn failure (see
+                    # turn_failure_error_class below).
+                    text = _st_reply
+                    self_thinking_failed = True
+                    self_thinking_salvaged = True
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "self_thinking_salvaged",
+                        {
+                            "lane": lane,
+                            "final": final,
+                            "salvage_reason": self_thinking.salvage_thinking(text_before_salvage)[2],
+                            "raw_len": len(text_before_salvage),
+                        },
+                        best_effort=True,
+                    )
+                elif _st_status == self_thinking.COMPLETE:
                     text = _st_reply
                     if not validated_final_reply:
                         self_thinking_text = _st_thinking
@@ -15729,7 +15757,9 @@ async def process_job(
             if file_reply is not None and final:
                 raise RuntimeError("a file reply cannot be terminal")
             turn_failure_error_class = (
-                _DEGENERATE_REPLY_ERROR_CLASS if self_thinking_failed else ""
+                _DEGENERATE_REPLY_ERROR_CLASS
+                if self_thinking_failed and not self_thinking_salvaged
+                else ""
             )
             if file_reply is None and text and _is_degenerate_reply(text):
                 log.warning(

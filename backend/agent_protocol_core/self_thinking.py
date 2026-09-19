@@ -30,6 +30,10 @@ ABSENT = "absent"       # no leading <think> → reply is the original text
 COMPLETE = "complete"   # clean <tag>…</tag> + non-empty reply
 SILENT = "silent"       # clean <tag>…</tag> + intentionally empty public reply
 FAILED = "failed"       # unresolvable (truncated/mismatched/nested)
+# strip_all_thinking said FAILED, but a non-nesting rescan could still tell
+# reply text apart from thinking (T656): every thinking block is dropped, the
+# reply is delivered, and the caller records ``thinking_gate_salvaged``.
+SALVAGED = "salvaged"
 
 MAX_THINKING_CHARS = 240
 
@@ -505,3 +509,215 @@ def strip_all_thinking(text: str, *, sanitize: bool = True) -> tuple[str, str, s
     if not reply:
         return SILENT, thinking, ""
     return COMPLETE, thinking, reply
+
+
+# ---------------------------------------------------------------------------
+# 打捞层（2026-09-19，T656）。strip_all_thinking 的判据一字不动：嵌套 / 多开 /
+# 末尾未闭 / 多个孤立闭标签仍然 FAILED（2026-08-08 那次放宽把整段思考端给了用户）。
+# 线上（T655，MiniMax-M3 走 openai_compatible + pi）一条回复开 2～3 个 <think>
+# 只关 1～2 个，FAILED 之后整轮作废，用户只看到兜底话。Seven 定：这种时候宁可把
+# 思考全丢掉、只留正文，也不许整轮失败。
+#
+# 所以不改判据，只在 FAILED 之后再解析一遍——单遍用栈把标签建成树（闭标签弹
+# 最近的开，所以配平的子块永远整段留在父块里，绝不会在内层闭标签处被切开）；
+# 树建完再后序处理没闭的开：有子块 ⇒ 借第一个子块的闭（多出来的开是「再开」，
+# 不是嵌套——T655 形状）；没有子块 ⇒ 到文末（被截断的块，整段丢）。每个顶层块
+# 连同嵌套内容都是思考；正文态里的孤立闭标签，在已剥出过块（或已处理过一次孤立
+# 闭）时只丢标签、前面正文保留，否则它前面的一切当思考（开标签被上游吃掉）。
+# 打捞出的思考永远不展示（结构已乱，不可信），只有正文出门。全程线性。
+# ---------------------------------------------------------------------------
+
+_TAG_TOKEN = re.compile(
+    rf"<\s*(?P<slash>/?)\s*{_NAME_START}(?P<tag>{_TAG_ALT}){_NAME_END}\s*>",
+    re.IGNORECASE,
+)
+
+#: Closed set of salvage reasons, joined with ``+`` in trace details.
+SALVAGE_REASONS = frozenset({
+    "nested_balanced",       # a fully paired inner block inside an outer block
+    "nested_open",           # an open tag while already inside thinking (unbalanced)
+    "trailing_unclosed",     # text ended inside a thinking block
+    "stray_close_after_block",  # a close tag in reply text after ≥1 paired block
+    "lone_close_head",       # a close tag before any block: head is thinking
+    "mismatched_close",      # <think>…</reasoning>: first close still closes
+})
+
+
+class _Block:
+    """One open tag and everything it encloses (a node of the tag tree)."""
+
+    __slots__ = ("open", "close", "children", "promoted")
+
+    def __init__(self, open_match):
+        self.open = open_match
+        self.close = None          # the close token match, once resolved
+        self.children: list = []
+        self.promoted = False      # closed by a child's close, not its own
+
+
+def _resolve_unclosed(root: "_Block") -> None:
+    """Post-order (iterative — the T655 shape repeated thousands of times is
+    one deep chain): an open with no close of its own ends where its FIRST
+    child ends (the extra open was a re-open sharing that close); with no
+    child at all it stays ``None`` = runs to the end of the text (truncated)."""
+    order: list[_Block] = []
+    work = [root]
+    while work:
+        block = work.pop()
+        order.append(block)
+        work.extend(c for c in block.children if c.close is None)
+    for block in reversed(order):          # children before parents
+        if block.close is None and block.children:
+            first_close = block.children[0].close
+            if first_close is not None:
+                block.close = first_close
+                block.promoted = True
+            # else: the first child itself runs to the end of the text, so
+            # this block does too (stays unclosed = trailing, all thinking).
+
+
+def _flatten_promoted(top: list) -> list:
+    """Effective top-level items after resolution, in text order.
+
+    A promoted block ends early (at its first child's close), so descendants
+    that start at or after that close are outside it and become top-level
+    items themselves — at any depth (codex4 r3: the first child may itself be
+    promoted and hide later siblings under it; and ``match.end`` is exclusive,
+    so an adjacent sibling starts exactly at the borrowed close's end).
+    Iterative, each block visited once.
+    """
+    out: list = []
+    work = list(reversed(top))
+    while work:
+        item = work.pop()
+        out.append(item)
+        if not isinstance(item, _Block) or not item.promoted:
+            continue
+        boundary = item.close.end()
+        escaped: list[_Block] = []
+        inside = list(reversed(item.children))
+        while inside:
+            child = inside.pop()
+            if child.open.start() >= boundary:
+                escaped.append(child)        # outside the borrowed span
+            else:
+                inside.extend(reversed(child.children))  # look deeper
+        work.extend(reversed(escaped))
+    return out
+
+
+def salvage_thinking(text: str) -> tuple[str, str, str]:
+    """Rescan text ``strip_all_thinking`` refused.
+
+    One left-to-right pass builds a tag tree with a stack (a close pops the
+    most recent open, so a paired inner block always stays inside its outer
+    block — no balanced span is ever cut in half, codex4 r1/r2 reviews
+    2026-09-19). Opens left on the stack at the end are then resolved
+    post-order:
+
+    * an unclosed open **with children** ends where its first child ends —
+      the extra open was a re-open sharing that close (T655: ``<think>A<think>
+      B</think>X`` → ``X`` is reply; ``<think>A<think>B<think>C</think>B2
+      </think>R`` → ``R`` only, ``B2`` stays inside the balanced child);
+    * an unclosed open **without children** runs to the end of the text
+      (truncated block, dropped).
+
+    Every top-level block, nested content included, is thinking. A close tag
+    met outside any block: after a block (or a second orphan) only the tag is
+    noise; a first orphan close with no block before it means the opener was
+    eaten upstream and the head is thinking.
+
+    Returns ``(visible, thinking, reason)``; ``visible`` is empty when nothing
+    can be told apart as reply text (the caller stays FAILED). ``reason`` is a
+    ``+``-joined subset of :data:`SALVAGE_REASONS`. Linear in the text length.
+    """
+    raw = str(text or "")
+    tokens = list(_TAG_TOKEN.finditer(raw))
+    top: list = []          # top-level items: _Block, or ("close", match)
+    stack: list[_Block] = []
+    reasons: set[str] = set()
+    for m in tokens:
+        if m.group("slash"):
+            if stack:
+                block = stack.pop()
+                block.close = m
+                if block.open.group("tag").lower() != m.group("tag").lower():
+                    reasons.add("mismatched_close")
+            else:
+                top.append(("close", m))
+        else:
+            block = _Block(m)
+            if stack:
+                stack[-1].children.append(block)
+            else:
+                top.append(block)
+            stack.append(block)
+    for block in top:
+        if isinstance(block, _Block) and block.close is None:
+            _resolve_unclosed(block)
+    top = _flatten_promoted(top)
+    # Reasons from the resolved tree: a block closed by its own tag that holds
+    # children is genuine nesting; a promoted block is a re-open.
+    work = [item for item in top if isinstance(item, _Block)]
+    seen: set[int] = set()   # promoted chains reach later blocks twice
+    while work:
+        block = work.pop()
+        if id(block) in seen:
+            continue
+        seen.add(id(block))
+        if block.promoted:
+            reasons.add("nested_open")
+        elif block.close is not None and block.children:
+            reasons.add("nested_balanced")
+        work.extend(block.children)
+    visible_parts: list[str] = []
+    blocks: list[str] = []
+    paired = 0
+    pos = 0
+    for item in top:
+        if not isinstance(item, _Block):
+            m = item[1]
+            visible_parts.append(raw[pos:m.start()])
+            if paired or "lone_close_head" in reasons:
+                reasons.add("stray_close_after_block")
+            else:
+                reasons.add("lone_close_head")
+                blocks.append("".join(visible_parts))
+                visible_parts = []
+            pos = m.end()
+            continue
+        visible_parts.append(raw[pos:item.open.start()])
+        if item.close is None:
+            reasons.add("trailing_unclosed")
+            blocks.append(raw[item.open.end():])
+            pos = len(raw)
+            break
+        blocks.append(raw[item.open.end():item.close.start()])
+        paired += 1
+        pos = item.close.end()
+    visible_parts.append(raw[pos:])
+    visible = re.sub(r"\n{3,}", "\n\n", "\n".join(visible_parts)).strip()
+    if _RESIDUE.search(visible):
+        # Only a truncated ``<thin`` fragment can survive the token scan; that is
+        # not reply text. Fail closed rather than deliver a half tag.
+        return "", "", "residue"
+    thinking_text = "\n".join(b.strip() for b in blocks if b.strip())
+    return visible, thinking_text, "+".join(sorted(reasons))
+
+
+def strip_all_thinking_or_salvage(text: str, *, sanitize: bool = True) -> tuple[str, str, str]:
+    """``strip_all_thinking``, then the salvage layer on FAILED.
+
+    Same ``(status, thinking, reply)`` shape. A :data:`SALVAGED` result always
+    carries an empty ``thinking`` — the blocks it dropped are not trustworthy
+    enough to show — and a non-empty ``reply``. Everything the strict pass
+    already answers (ABSENT / COMPLETE / SILENT) is returned untouched, and a
+    truncated protocol opener stays FAILED (there is no reply text in it).
+    """
+    status, thinking, reply = strip_all_thinking(text, sanitize=sanitize)
+    if status != FAILED or _truncated_protocol_opener(str(text or "")):
+        return status, thinking, reply
+    visible, _dropped, reason = salvage_thinking(text)
+    if not visible or reason == "residue":
+        return FAILED, "", ""
+    return SALVAGED, "", visible

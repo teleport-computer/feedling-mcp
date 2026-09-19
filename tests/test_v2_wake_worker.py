@@ -1173,6 +1173,47 @@ def test_wake_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch
     assert thinking["text"] == self_thinking.THINKING_FAILED_MARKER
 
 
+def test_wake_multi_open_think_in_text_is_salvaged_not_failed(monkeypatch):
+    """T656: the wake outlet takes the same salvage path as chat. The model
+    wrote its thinking as tangled <think> tags inside the visible text (T655
+    shape: two opens, one close); strict gate FAILED used to fail the wake."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    uid = "u_wake_selfthink_salvaged"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    raw = "<think>她好像还没醒<think>要不要等等</think>早，醒了吗？"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+    # The structured ``think`` arg is fine; the tangle sits inside ``text``.
+    _script_provider(monkeypatch, [_wake_reply_round(raw, think="要不要等等")])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "wake-salvaged"},
+    )
+    thinking = {}
+    monkeypatch.setattr(
+        worker,
+        "_build_thinking_payload",
+        lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    status = asyncio.run(
+        worker._run_wake(
+            job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by
+        )
+    )
+
+    assert status == "completed"
+    assert written["text"] == "早，醒了吗？"
+    assert "<think" not in written["text"] and "还没醒" not in written["text"]
+
+
 @pytest.mark.parametrize(
     "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
 )

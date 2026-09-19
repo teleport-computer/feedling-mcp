@@ -1073,9 +1073,10 @@ def _raw_reply_diagnostics(raw: str) -> dict[str, Any]:
     }
 
 
-def _record_sanitizer(turn: AgentTurn, reason: str, raw: str) -> None:
+def _record_sanitizer(turn: AgentTurn, reason: str, raw: str,
+                      *, extra: dict[str, Any] | None = None) -> None:
     turn.sanitizer_reason = _sanitizer_reason(reason)
-    turn.raw_reply_diagnostics = _raw_reply_diagnostics(raw)
+    turn.raw_reply_diagnostics = {**_raw_reply_diagnostics(raw), **(extra or {})}
 
 
 def _sanitized_reply_error(
@@ -5251,12 +5252,22 @@ def _split_tagged_thinking(text: str, *, diagnostics: AgentTurn | None = None) -
     if _st.gate_enabled():
         # sanitize=False：本次统一的是剥离**判据**，V1 的展示格式（保留换行、
         # 上限 700，由下游 _sanitize_thinking_summary 负责）不跟着变。
-        status, thinking, reply = _st.strip_all_thinking(raw, sanitize=False)
+        status, thinking, reply = _st.strip_all_thinking_or_salvage(raw, sanitize=False)
         if status == _st.FAILED:
             # 失败关闭：宁可这轮没有可发内容，也不把带标签的残文端给用户。
             if diagnostics is not None:
                 _record_sanitizer(diagnostics, "thinking_gate_failed", raw)
             return "", thinking
+        if status == _st.SALVAGED:
+            # 严格判据不认（多开 / 未闭 / 孤立闭标签），但打捞层能分出正文：
+            # 思考整段丢掉、正文照发（T656，Seven 2026-09-19：不许整轮失败）。
+            # 记 thinking_gate_salvaged + 打捞理由，日报/巡检能看到它接管了多少。
+            if diagnostics is not None:
+                _record_sanitizer(
+                    diagnostics, "thinking_gate_salvaged", raw,
+                    extra={"salvage_reason": _st.salvage_thinking(raw)[2]},
+                )
+            return reply, ""
         return reply, thinking
 
     blocks: list[str] = []
@@ -6189,7 +6200,12 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         original_visible = obj
         raw, tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
         if turn.sanitizer_reason:
-            turn.raw_reply_diagnostics = _raw_reply_diagnostics(original_visible)
+            # Re-measure against the transport-level text; keep the salvage
+            # reason the splitter attached (it is not derivable from the text).
+            turn.raw_reply_diagnostics = {
+                **_raw_reply_diagnostics(original_visible),
+                **{k: v for k, v in turn.raw_reply_diagnostics.items() if k == "salvage_reason"},
+            }
         raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
             # Our self-authored <think> block, parsed locally on THIS host. With the
@@ -21971,7 +21987,12 @@ def _process_messages(messages: list) -> float:
                      + ("，含思考摘要" if turn.thinking_summary else "，无思考摘要")),
             detail={"n_messages": len(turn.messages), "n_actions": len(turn.actions),
                     "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or "",
-                    **({"sanitizer_reason": turn.sanitizer_reason} if turn.sanitizer_reason else {})},
+                    **({"sanitizer_reason": turn.sanitizer_reason} if turn.sanitizer_reason else {}),
+                    # Salvaged turns: how the tags were shaped, so the shape can be
+                    # tallied without opening content (T656).
+                    **({k: turn.raw_reply_diagnostics.get(k) for k in
+                        ("salvage_reason", "think_open_count", "think_close_count", "raw_reply_len")}
+                       if turn.sanitizer_reason == "thinking_gate_salvaged" else {})},
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
         actions, replies = turn.actions, turn.messages
