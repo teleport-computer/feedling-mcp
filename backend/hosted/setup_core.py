@@ -1901,10 +1901,10 @@ def _record_provider_test_failure(store, exc: BaseException, *, route_id=None) -
             store.user_id, route_id, status="failed",
             error=f"{failure_class}: {exc}"[:240],
         )
+    blame, user_text = notices_catalog.provider_test_notice_for(failure_class)
     notices_core.emit(
         store, source="model_api", error_class=failure_class,
-        blame=notices_catalog.blame_for(failure_class), severity="warning",
-        user_text=notices_catalog.user_text_for(failure_class),
+        blame=blame, severity="warning", user_text=user_text,
         dedupe_key=f"model_api:test_failed:{failure_class}",
     )
     return body

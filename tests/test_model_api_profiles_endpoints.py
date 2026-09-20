@@ -1139,9 +1139,14 @@ def test_probe_failure_class_across_api_notice_and_persisted_route(
     assert len(notices) == 1
     notice = notices[0]
     assert notice['error_class'] == expected_class
-    assert expected_class in catalog.ERROR_CLASSES
-    assert notice['blame'] == catalog.blame_for(expected_class)
-    assert notice['user_text'] == catalog.user_text_for(expected_class)
+    if expected_class == 'provider_config':
+        assert expected_class not in catalog.ERROR_CLASSES
+        assert notice['blame'] == 'user_provider'
+        assert notice['user_text'] == '模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。'
+    else:
+        assert expected_class in catalog.ERROR_CLASSES
+        assert notice['blame'] == catalog.blame_for(expected_class)
+        assert notice['user_text'] == catalog.user_text_for(expected_class)
     assert notice['dedupe_key'] == f'model_api:test_failed:{expected_class}'
     assert notice['occurrences'] == 2
     assert notice['resolved'] is False
@@ -1184,3 +1189,15 @@ def test_successful_probe_resolves_only_probe_notices(
     rows = db.log_read_all(uid, 'user_notices')
     for row in rows:
         assert row['resolved'] == row['dedupe_key'].startswith('model_api:test_failed:')
+
+
+
+def test_probe_config_class_does_not_expand_runtime_registry():
+    from notices import catalog, error_contract
+
+    assert catalog.PROVIDER_TEST_CONFIG_CLASS == 'provider_config'
+    assert 'provider_config' not in catalog.ERROR_CLASSES
+    assert error_contract.spec_for('provider_config') is None
+    assert 'provider_config' not in catalog.registry_export().values
+    assert catalog.blame_for('provider_config') == 'system'
+    assert catalog.provider_test_notice_for('provider_config')[0] == 'user_provider'

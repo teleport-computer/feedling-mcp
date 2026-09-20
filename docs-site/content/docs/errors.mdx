@@ -81,7 +81,10 @@ Saved-route test errors carry a `<failure_class>: ` prefix. A rejected replaceme
 key leaves the previously saved key and its test status intact. Failures also
 produce a safe user notice, deduplicated by `model_api:test_failed:<failure_class>`;
 a successful probe resolves these probe notices. Other Model API notices remain
-unchanged. Raw upstream response text is not copied into the notice.
+unchanged. The probe-local `provider_config` notice uses configuration-specific
+safe copy; it is not added to the runtime error registry and does not change
+runtime health or blame classification. Raw upstream response text is not copied
+into the notice.
 
 ## Pi stream diagnostics
 

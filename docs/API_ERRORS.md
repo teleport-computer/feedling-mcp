@@ -504,4 +504,5 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 新凭证保存前失败不改变旧 route 的有效状态。
 失败通知 source=model_api、error_class=failure_class，以
 `model_api:test_failed:<failure_class>` 去重；成功探针仅消除该探针通知前缀，
-删除配置仍清除整个 `model_api:` 前缀。通知复用 error_contract 的安全文案，不存上游正文。
+删除配置仍清除整个 `model_api:` 前缀。除 provider_config 使用探针专用安全文案和归因外，通知复用 error_contract；
+provider_config 不加入全局运行时分类表，避免改变健康/统计归因。通知不存上游正文。

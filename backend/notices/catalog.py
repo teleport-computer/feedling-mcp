@@ -12,7 +12,7 @@ from notices import error_contract
 # source of truth is ErrorSpec. Adding a second literal here is forbidden.
 ERROR_CLASSES = frozenset(spec.code for spec in error_contract.public_specs())
 # Setup probes expose user-facing status classes, independently of the provider
-# client's retry classification. Values are registered ErrorSpec codes.
+# client's retry classification. Status-derived values reuse ErrorSpec codes.
 PROVIDER_TEST_STATUS_CLASSES = {
     401: "auth_invalid",
     402: "quota_insufficient",
@@ -23,6 +23,12 @@ PROVIDER_TEST_STATUS_CLASSES = {
 }
 PROVIDER_TEST_CONFIG_CLASS = "provider_config"
 PROVIDER_TEST_UNAVAILABLE_CLASS = "upstream_unavailable"
+# Probe-local copy: registering this coarse retry category as a runtime class
+# would change health/blame and other ERROR_CLASSES consumers outside setup.
+_PROVIDER_TEST_CONFIG_NOTICE = (
+    "user_provider",
+    "模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。",
+)
 _CATALOG: dict[str, tuple[str, str]] = {
     spec.code: (spec.blame, spec.safe_text_zh)
     for spec in error_contract.public_specs()
@@ -31,6 +37,13 @@ _UPSTREAM_RULES = tuple(
     (spec.code, spec.matcher())
     for spec in error_contract.matcher_specs()
 )
+
+
+def provider_test_notice_for(failure_class: str) -> tuple[str, str]:
+    """Probe notice metadata without expanding the public runtime registry."""
+    if failure_class == PROVIDER_TEST_CONFIG_CLASS:
+        return _PROVIDER_TEST_CONFIG_NOTICE
+    return blame_for(failure_class), user_text_for(failure_class)
 
 
 def registry_export(source_loaders=None) -> error_contract.RegistryExport:
