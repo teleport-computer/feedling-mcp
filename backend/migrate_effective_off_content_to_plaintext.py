@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import uuid
 
 from content import plaintext_repair
 
@@ -68,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
             health_poll_sec=args.health_poll_sec,
             max_pause_sec=args.max_pause_sec,
             continue_on_failure=args.continue_on_failure,
+            run_id=uuid.uuid4().hex,
         )
     except (ValueError, plaintext_repair.HealthGateError) as exc:
         print(f"repair refused: {exc}", file=sys.stderr)

@@ -41,6 +41,7 @@ class Result:
     user_id: str
     counts: dict[str, int]
     failures: int = 0
+    failure_items: tuple[dict[str, str], ...] = ()
 
     def public_dict(self) -> dict:
         """Return the intentionally content-free operator report."""
@@ -546,6 +547,7 @@ def run(
             return "failed_transform_or_storage"
 
     futures = {}
+    failure_items: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
         for item in items:
             if (
@@ -558,7 +560,17 @@ def run(
                 continue
             futures[executor.submit(attempt, item)] = item
         for future in as_completed(futures):
-            counts[future.result()] += 1
+            status = future.result()
+            counts[status] += 1
+            if status.startswith("failed_") or status == "cas_conflict":
+                item = futures[future]
+                failure_items.append(
+                    {
+                        "surface": str(item.surface),
+                        "item_id": str(item.item_id),
+                        "status": str(status),
+                    }
+                )
     failures = sum(
         count
         for status, count in counts.items()
@@ -569,4 +581,5 @@ def run(
         user_id=user_id,
         counts=dict(sorted(counts.items())),
         failures=failures,
+        failure_items=tuple(failure_items),
     )

@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 import os
+from pathlib import Path
+import threading
 import time
 from typing import Callable
 
@@ -13,6 +17,30 @@ from content import plaintext_migration
 
 
 APPLY_ENV = plaintext_migration.APPLY_ENV
+FAILURE_LOG_ENV = "FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG"
+DEFAULT_FAILURE_LOG = "/data/plaintext-migration-failures.jsonl"
+_FAILURE_LOG_LOCK = threading.Lock()
+
+
+def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> None:
+    """Append content-free failed item records to the persistent CVM volume."""
+    if not failures:
+        return
+    path = Path(os.environ.get(FAILURE_LOG_ENV, DEFAULT_FAILURE_LOG))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with _FAILURE_LOG_LOCK, path.open("a", encoding="utf-8") as stream:
+        for failure in failures:
+            record = {
+                "timestamp": timestamp,
+                "run_id": str(run_id),
+                "user_id": str(user_id),
+                "surface": str(failure.get("surface", "unknown")),
+                "item_id": str(failure.get("item_id", "")),
+                "status": str(failure.get("status", "unknown")),
+            }
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+        stream.flush()
 
 
 class HealthGateError(RuntimeError):
@@ -122,6 +150,7 @@ def run(
     health_poll_sec: float = 5.0,
     max_pause_sec: float = 300.0,
     continue_on_failure: bool = False,
+    run_id: str = "",
     sleep: Callable[[float], None] = time.sleep,
 ) -> RepairResult:
     """Inventory or repair effective-off users, optionally continuing after failures."""
@@ -172,6 +201,11 @@ def run(
             failures += 1
             break
         counts.update(result.counts)
+        append_failure_log(
+            run_id=run_id,
+            user_id=user_id,
+            failures=list(getattr(result, "failure_items", ())),
+        )
         if result.failures:
             failures += int(result.failures)
             if not continue_on_failure:

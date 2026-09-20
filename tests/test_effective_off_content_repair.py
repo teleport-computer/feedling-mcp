@@ -193,6 +193,33 @@ def test_apply_can_continue_after_failed_user_when_requested(monkeypatch):
     assert result.last_completed_user_id == "usr_b"
 
 
+def test_failure_log_appends_content_free_item_details(tmp_path, monkeypatch):
+    path = tmp_path / "plaintext-failures.jsonl"
+    monkeypatch.setenv(plaintext_repair.FAILURE_LOG_ENV, str(path))
+
+    plaintext_repair.append_failure_log(
+        run_id="run-1",
+        user_id="usr_a",
+        failures=[
+            {
+                "surface": "chat",
+                "item_id": "42",
+                "status": "failed_transform_or_storage",
+            }
+        ],
+    )
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["run_id"] == "run-1"
+    assert record["user_id"] == "usr_a"
+    assert record["surface"] == "chat"
+    assert record["item_id"] == "42"
+    assert record["status"] == "failed_transform_or_storage"
+    assert record["timestamp"]
+
+
 def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
     monkeypatch.setattr(
         plaintext_repair,

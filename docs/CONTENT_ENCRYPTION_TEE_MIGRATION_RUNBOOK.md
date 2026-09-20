@@ -360,6 +360,12 @@ CAS writes remain conflict-safe when users are active.
 failed rows, so retain the reported failure count and rerun those users when
 their decrypt or storage issue is resolved.
 
+Apply runs also append one content-free JSONL record per failed item to
+`FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG`, defaulting to
+`/data/plaintext-migration-failures.jsonl` on the persistent backend volume.
+Copy or ship this file before replacing the volume; it contains IDs and error
+classes, never message bodies or keys.
+
 Record `last_completed_user_id` only after a zero-failure user with no
 `not_attempted_limit` rows. When `--row-limit` leaves rows deferred, the
 coordinator stops before the next user, does not count the partial user as
