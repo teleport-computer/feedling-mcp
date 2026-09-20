@@ -551,8 +551,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
 
     # Pull this page's R2-offloaded bodies concurrently before rendering; without
     # it each one costs a serial round-trip inside _chat_history_item.
-    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body)
-    out = [chat_service._chat_history_item(m, include_image_body=include_image_body) for m in msgs]
+    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body, store=store)
+    out = [chat_service._chat_history_item(m, include_image_body=include_image_body, store=store) for m in msgs]
     omitted_bodies = sum(1 for m in out if m.get("body_omitted"))
     omitted_image_bodies = sum(
         1
@@ -650,7 +650,7 @@ def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
     # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
     if not msg or msg.get("source") == "verify_ping":
         return {"error": "message_not_found"}, 404
-    return {"message": chat_service._chat_history_item(msg, include_image_body=True)}, 200
+    return {"message": chat_service._chat_history_item(msg, include_image_body=True, store=store)}, 200
 
 
 def _canvas_workspace_path(filename: str) -> str | None:
