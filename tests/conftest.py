@@ -341,6 +341,7 @@ if not _provisioned:
         "test_web_settings_core.py",
         "test_web_execution_core.py",
         "test_object_storage.py",
+        "test_chat_body_read_trace.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
         "test_chat_activity_projection.py",

@@ -36,6 +36,8 @@ import os
 import secrets
 import threading
 
+import storage_read_trace
+
 log = logging.getLogger(__name__)
 
 _KEY_PREFIX = "frames"
@@ -524,22 +526,29 @@ def get_chat_body_bytes(key: str, user_id: str) -> bytes | None:
     pointer's explicit format marker.  Ownership rejection, missing objects and
     transient fetch failures retain the legacy ``None`` behavior.
     """
-    if not chat_key_owned_by(key, user_id):
-        if key:
-            log.error(
-                "[r2] get_chat_body_bytes refused foreign key %s for user %s",
-                key,
-                user_id,
-            )
-        return None
-    try:
-        resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
-    except Exception as e:  # noqa: BLE001
-        if _is_not_found(e):
+    with storage_read_trace.observe(user_id) as observation:
+        if not chat_key_owned_by(key, user_id):
+            observation.update(status="refused_foreign_key", error_class=None)
+            if key:
+                log.error(
+                    "[r2] get_chat_body_bytes refused foreign key %s for user %s",
+                    key,
+                    user_id,
+                )
             return None
-        log.error("[r2] get_chat_body_bytes(%s) failed: %s", key, e)
-        return None
-    return resp["Body"].read()
+        try:
+            resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
+        except Exception as e:  # noqa: BLE001
+            observation.update(storage_read_trace.failure(e))
+            if _is_not_found(e):
+                return None
+            log.error("[r2] get_chat_body_bytes(%s) failed: %s", key, e)
+            return None
+        # Include streaming-body time. Read failures still propagate as before,
+        # but both this observation and the hydrate observation record them.
+        raw = resp["Body"].read()
+        observation["bytes"] = len(raw)
+        return raw
 
 
 def delete_chat_body(key: str, user_id: str) -> bool:

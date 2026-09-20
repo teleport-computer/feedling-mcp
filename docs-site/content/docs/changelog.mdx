@@ -21,6 +21,10 @@ change must not be interpreted as an API guarantee.
   Admin user summaries expose `wake_provider_circuit_open_users` (null when
   the state cannot be measured).
 
+- Chat attachment delivery now records content-free timing events for object
+  storage GETs (including body reads) and hydration, distinguishing timeouts,
+  missing objects, and upstream server errors without recording keys or content.
+
 - Retrying a failed plaintext onboarding or add-memory job with legacy fact-map
   progress now resets its encrypted checkpoint and runs the current import
   engine under the same job ID. Existing cards enter the merge index, and the
