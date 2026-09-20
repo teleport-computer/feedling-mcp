@@ -11442,6 +11442,7 @@ async def _run_wake(
                 tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
                 on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 regular_wake_choice_required=(lane != "scheduled"),
+                wake_output_budget_required=True,
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,

@@ -358,6 +358,23 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "ProviderTestFailedResponse": {
+        "type": "object",
+        "required": ["error", "detail", "status_code", "failure_class"],
+        "properties": {
+            "error": {"type": "string", "const": "provider_test_failed"},
+            "detail": {"type": "string"},
+            "status_code": {
+                "type": ["integer", "null"],
+                "description": "Upstream HTTP status; null for non-API web endpoints or failures without an HTTP status.",
+            },
+            "failure_class": {
+                "type": "string",
+                "enum": ["auth_invalid", "quota_insufficient", "model_not_found", "rate_limited", "upstream_unavailable", "provider_config"],
+                "description": "User-facing probe classification, independent of the provider client's retry classification.",
+            },
+        },
+    },
     "VoiceCallCancelRequest": {
         "type": "object",
         "required": ["call_id", "reason"],
@@ -3404,6 +3421,24 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         },
     },
 }
+
+
+# All credential-probe entry points share the same additive error contract.
+for _probe_operation in (
+    ("post", "/v1/model_api/setup"),
+    ("post", "/v1/model_api/test"),
+    ("post", "/v1/model_api/routes"),
+    ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/model_api/routes/{route_id}/activate"),
+    ("patch", "/v1/model_api/credentials/{credential_id}"),
+):
+    RESPONSE_OVERRIDES.setdefault(_probe_operation, {})["400"] = {
+        "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+        "content": {"application/json": {"schema": {"anyOf": [
+            {"$ref": "#/components/schemas/ProviderTestFailedResponse"},
+            {"$ref": "#/components/schemas/ErrorResponse"},
+        ]}}},
+    }
 
 
 def _json_request_body(schema_name: str, *, required: bool) -> dict[str, Any]:

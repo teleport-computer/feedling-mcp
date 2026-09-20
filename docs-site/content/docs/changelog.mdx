@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Scheduled Runtime V2 reminders use the same configurable output-token budget
+  as heartbeat, manual, and screen-watch wakes, including correction retries,
+  instead of falling back to the legacy 700-token default. Reminder delivery
+  requirements and subagent output policies are unchanged.
+
+- Model API credential probe errors add `failure_class` to distinguish invalid
+  credentials, insufficient credit, missing models, rate limits, temporary
+  provider failures, and other configuration problems. Existing error fields
+  retain their meaning. Saved-route test errors preserve this classification,
+  and deduplicated notices resolve after a successful probe.
+
 - Runtime V2 pauses automatic heartbeat and screen-watch calls after three
   consecutive quota, authentication, or expired-account failures. A newly
   accepted Chat message or a successful active key/route save clears the
