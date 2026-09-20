@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Model API credential probe errors add `failure_class` to distinguish invalid
+  credentials, insufficient credit, missing models, rate limits, temporary
+  provider failures, and other configuration problems. Existing error fields
+  retain their meaning. Saved-route test errors preserve this classification,
+  and deduplicated notices resolve after a successful probe.
+
 - Anthropic and Bedrock requests select manual extended thinking from an explicit
   model-family capability table. Unknown models omit the thinking parameter and
   record a content-free diagnostic; model names no longer inherit support by

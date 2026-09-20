@@ -4877,11 +4877,18 @@
             }
           },
           "400": {
-            "description": "Invalid path or request parameter.",
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -5241,6 +5248,23 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -5340,11 +5364,18 @@
             }
           },
           "400": {
-            "description": "Invalid path or request parameter.",
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -5393,11 +5424,18 @@
             }
           },
           "400": {
-            "description": "Invalid path or request parameter.",
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -5518,6 +5556,23 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -5558,6 +5613,23 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -8938,6 +9010,43 @@
           }
         },
         "title": "ValidationError"
+      },
+      "ProviderTestFailedResponse": {
+        "type": "object",
+        "required": [
+          "error",
+          "detail",
+          "status_code",
+          "failure_class"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "provider_test_failed"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Upstream HTTP status; null for non-API web endpoints or failures without an HTTP status."
+          },
+          "failure_class": {
+            "type": "string",
+            "enum": [
+              "auth_invalid",
+              "quota_insufficient",
+              "model_not_found",
+              "rate_limited",
+              "upstream_unavailable",
+              "provider_config"
+            ],
+            "description": "User-facing probe classification, independent of the provider client's retry classification."
+          }
+        }
       },
       "VoiceCallCancelRequest": {
         "type": "object",
