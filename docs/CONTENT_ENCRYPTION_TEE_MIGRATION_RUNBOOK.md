@@ -360,6 +360,11 @@ CAS writes remain conflict-safe when users are active.
 failed rows, so retain the reported failure count and rerun those users when
 their decrypt or storage issue is resolved.
 
+With this flag, item failures, user-state/setup failures, and temporary health
+gate failures do not terminate the queue: item/user failures are logged and the
+queue advances; a health-gate failure pauses and retries until the enclave is
+healthy again.
+
 Apply runs also append one content-free JSONL record per failed item to
 `FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG`, defaulting to
 `/data/plaintext-migration-failures.jsonl` on the persistent backend volume.

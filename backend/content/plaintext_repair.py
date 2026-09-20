@@ -209,6 +209,9 @@ def run(
             except HealthGateError:
                 counts["failed_health_gate"] += 1
                 failures += 1
+                if continue_on_failure:
+                    time.sleep(max(1.0, min(float(max_pause_sec), 60.0)))
+                    continue
                 break
         try:
             kwargs = {
@@ -223,10 +226,28 @@ def run(
         except (PermissionError, ValueError):
             counts["failed_tier_or_user_changed"] += 1
             failures += 1
+            append_failure_log(
+                run_id=run_id,
+                user_id=user_id,
+                failures=[{"surface": "user", "item_id": "", "status": "failed_tier_or_user_changed"}],
+            )
+            if continue_on_failure:
+                completed += 1
+                last_completed = user_id
+                continue
             break
         except Exception:  # noqa: BLE001 - never expose content-bearing details
             counts["failed_migration_setup"] += 1
             failures += 1
+            append_failure_log(
+                run_id=run_id,
+                user_id=user_id,
+                failures=[{"surface": "user", "item_id": "", "status": "failed_migration_setup"}],
+            )
+            if continue_on_failure:
+                completed += 1
+                last_completed = user_id
+                continue
             break
         counts.update(result.counts)
         append_failure_log(
