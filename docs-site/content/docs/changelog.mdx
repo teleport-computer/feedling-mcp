@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Anthropic and Bedrock requests select manual extended thinking from an explicit
+  model-family capability table. Unknown models omit the thinking parameter and
+  record a content-free diagnostic; model names no longer inherit support by
+  substring. Claude 4.6 retains its supported manual mode. Adaptive-only models
+  do not receive manual thinking parameters; their provider defaults apply.
+
 - Runtime V2 pauses automatic heartbeat and screen-watch calls after three
   consecutive quota, authentication, or expired-account failures. A newly
   accepted Chat message or a successful active key/route save clears the
