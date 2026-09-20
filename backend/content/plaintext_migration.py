@@ -537,17 +537,23 @@ def run(
 
     def attempt(item: Item) -> str:
         limiter.wait()
-        try:
-            if item.classification != "cleanup_pending":
-                decrypt = getattr(thread_state, "decrypt", None)
-                if decrypt is None:
-                    decrypt = make_decrypt(user_id)
-                    thread_state.decrypt = decrypt
-            else:
-                decrypt = None
-            return migrate_item(user_id, item, decrypt)
-        except Exception:  # noqa: BLE001 - report only redacted failure class
-            return "failed_transform_or_storage"
+        for retry in range(3):
+            try:
+                if item.classification != "cleanup_pending":
+                    decrypt = getattr(thread_state, "decrypt", None)
+                    if decrypt is None:
+                        decrypt = make_decrypt(user_id)
+                        thread_state.decrypt = decrypt
+                else:
+                    decrypt = None
+                status = migrate_item(user_id, item, decrypt)
+            except Exception:  # noqa: BLE001 - report only redacted failure class
+                status = "failed_transform_or_storage"
+            if status not in {"failed_transform_or_storage", "cas_conflict"}:
+                return status
+            if retry < 2:
+                time.sleep(0.25 * (2**retry))
+        return status
 
     futures = {}
     failure_items: list[dict[str, str]] = []
