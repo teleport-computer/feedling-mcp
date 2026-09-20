@@ -8,7 +8,7 @@ this module so the command can be exercised without exposing content values.
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 import threading
 import time
@@ -505,6 +505,7 @@ def run(
     limit: int = 0,
     rate: float = 2.0,
     workers: int = 1,
+    item_ids: set[str] | None = None,
 ) -> Result:
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -524,6 +525,8 @@ def run(
     counts: Counter[str] = Counter()
     candidate_classes = {"migratable_shared", "cleanup_pending"}
     candidates = [item for item in items if item.classification in candidate_classes]
+    if item_ids is not None:
+        candidates = [item for item in candidates if item.item_id in item_ids]
     attempted_candidates = candidates[:limit] if apply and limit else candidates
     deferred = len(candidates) - len(attempted_candidates) if apply else 0
     if deferred:
@@ -549,7 +552,13 @@ def run(
     futures = {}
     failure_items: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
-        for item in items:
+        pending_items = iter(items)
+
+        def submit_next() -> bool:
+            try:
+                item = next(pending_items)
+            except StopIteration:
+                return False
             if (
                 not apply
                 or item.classification not in candidate_classes
@@ -557,20 +566,27 @@ def run(
             ):
                 if not apply or item.classification not in candidate_classes:
                     counts[item.classification] += 1
-                continue
-            futures[executor.submit(attempt, item)] = item
-        for future in as_completed(futures):
-            status = future.result()
-            counts[status] += 1
-            if status.startswith("failed_") or status == "cas_conflict":
-                item = futures[future]
-                failure_items.append(
-                    {
-                        "surface": str(item.surface),
-                        "item_id": str(item.item_id),
-                        "status": str(status),
-                    }
-                )
+            else:
+                futures[executor.submit(attempt, item)] = item
+            return True
+
+        while len(futures) < max(1, int(workers) * 2) and submit_next():
+            pass
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                item = futures.pop(future)
+                status = future.result()
+                counts[status] += 1
+                if status.startswith("failed_") or status == "cas_conflict":
+                    failure_items.append(
+                        {
+                            "surface": str(item.surface),
+                            "item_id": str(item.item_id),
+                            "status": str(status),
+                        }
+                    )
+                submit_next()
     failures = sum(
         count
         for status, count in counts.items()

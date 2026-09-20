@@ -366,6 +366,11 @@ Apply runs also append one content-free JSONL record per failed item to
 Copy or ship this file before replacing the volume; it contains IDs and error
 classes, never message bodies or keys.
 
+Apply runs also take `/data/plaintext-migration.lock` by default and atomically
+write `/data/plaintext-migration-checkpoint.json` after each completed user.
+Use `--retry-failures <path>` to retry only the `user_id`/`item_id` pairs from a
+failure JSONL file.
+
 Record `last_completed_user_id` only after a zero-failure user with no
 `not_attempted_limit` rows. When `--row-limit` leaves rows deferred, the
 coordinator stops before the next user, does not count the partial user as

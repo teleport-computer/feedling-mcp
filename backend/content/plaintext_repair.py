@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import fcntl
 import threading
 import time
 from typing import Callable
@@ -19,6 +20,8 @@ from content import plaintext_migration
 APPLY_ENV = plaintext_migration.APPLY_ENV
 FAILURE_LOG_ENV = "FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG"
 DEFAULT_FAILURE_LOG = "/data/plaintext-migration-failures.jsonl"
+CHECKPOINT_ENV = "FEEDLING_PLAINTEXT_MIGRATION_CHECKPOINT"
+DEFAULT_CHECKPOINT = "/data/plaintext-migration-checkpoint.json"
 _FAILURE_LOG_LOCK = threading.Lock()
 
 
@@ -30,6 +33,7 @@ def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> No
     path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat()
     with _FAILURE_LOG_LOCK, path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         for failure in failures:
             record = {
                 "timestamp": timestamp,
@@ -41,6 +45,26 @@ def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> No
             }
             stream.write(json.dumps(record, sort_keys=True) + "\n")
         stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def write_checkpoint(*, path: str, run_id: str, user_id: str, failures: int) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    payload = {
+        "run_id": str(run_id),
+        "last_completed_user_id": str(user_id),
+        "failures": int(failures),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, target)
 
 
 class HealthGateError(RuntimeError):
@@ -151,6 +175,8 @@ def run(
     max_pause_sec: float = 300.0,
     continue_on_failure: bool = False,
     run_id: str = "",
+    retry_items: dict[str, set[str]] | None = None,
+    checkpoint_path: str = "",
     sleep: Callable[[float], None] = time.sleep,
 ) -> RepairResult:
     """Inventory or repair effective-off users, optionally continuing after failures."""
@@ -185,13 +211,15 @@ def run(
                 failures += 1
                 break
         try:
-            result = plaintext_migration.run(
-                user_id,
-                apply=apply,
-                limit=row_limit,
-                rate=rate,
-                workers=workers,
-            )
+            kwargs = {
+                "apply": apply,
+                "limit": row_limit,
+                "rate": rate,
+                "workers": workers,
+            }
+            if retry_items is not None:
+                kwargs["item_ids"] = retry_items.get(user_id, set())
+            result = plaintext_migration.run(user_id, **kwargs)
         except (PermissionError, ValueError):
             counts["failed_tier_or_user_changed"] += 1
             failures += 1
@@ -214,6 +242,13 @@ def run(
             break
         completed += 1
         last_completed = user_id
+        if checkpoint_path:
+            write_checkpoint(
+                path=checkpoint_path,
+                run_id=run_id,
+                user_id=user_id,
+                failures=failures,
+            )
 
     return RepairResult(
         apply=bool(apply),
