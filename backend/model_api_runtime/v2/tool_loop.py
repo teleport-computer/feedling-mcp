@@ -1869,6 +1869,7 @@ async def run_tool_loop(
             "status_code": status_code,
             "error_class": type(exc).__name__,
             "provider_error_class": error_family,
+            **provider_client.provider_error_diagnostics(exc),
         }
 
     async def _record_required_file_missing(round_number: int) -> None:
@@ -4377,9 +4378,9 @@ async def run_tool_loop(
                 tc.args.get("completion_message") or ""
             ).strip()
             thinking_status, _thinking, visible_completion = (
-                self_thinking.strip_all_thinking(completion_message)
+                self_thinking.strip_all_thinking_or_salvage(completion_message)
             )
-            if thinking_status == self_thinking.COMPLETE:
+            if thinking_status in {self_thinking.COMPLETE, self_thinking.SALVAGED}:
                 completion_message = visible_completion
             elif thinking_status in {self_thinking.SILENT, self_thinking.FAILED}:
                 completion_message = ""

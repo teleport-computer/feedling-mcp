@@ -16,7 +16,7 @@ from typing import Callable, Iterable, Mapping
 
 REGISTRY_STATUS_VALUES = frozenset({"ok", "partial", "unavailable"})
 RESIDENT_SANITIZER_REASONS = frozenset({
-    "thinking_gate_failed", "protocol_leak", "file_citation", "unknown",
+    "thinking_gate_failed", "thinking_gate_salvaged", "protocol_leak", "file_citation", "unknown",
 })
 PROVIDER_STATUS_CLASSES = frozenset({"4xx", "5xx", "none"})
 REGISTRY_SOURCE_NAMES = frozenset({
@@ -301,6 +301,9 @@ def _platform_specs() -> tuple[ErrorSpec, ...]:
 
 def _workflow_specs() -> tuple[ErrorSpec, ...]:
     return (
+        # A backend wake workflow paused by the user's provider account/key state.
+        # No matcher: this is emitted circuit state, never a provider-text classification.
+        _spec("wake_provider_circuit_open", "workflow", "wake", "user_provider", "你的 API 服务连续出错，TA 主动找你的功能先暂停了。充值或重新保存密钥后，再发一条消息即可恢复。", en="Your API service keeps failing, so reaching out to you is paused for now. Top it up or save the key again, then send another message to recover."),
         _spec("genesis_failed", "workflow", "genesis", "system", "入住材料的文件解读没能完成，可稍后在记忆花园重试。", en="Reading your onboarding files did not finish. You can retry later in the Memory Garden."),
         _spec("genesis_partial", "workflow", "genesis", "system", "入住材料的文件解读完成了，但有部分记忆没能导入。", en="Your onboarding files were read, but some memories could not be imported."),
         _spec("import_failed", "workflow", "import", "system", "聊天记录导入失败了，请稍后重试。", en="Importing the chat history failed. Please try again later."),

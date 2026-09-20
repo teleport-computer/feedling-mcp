@@ -8,6 +8,9 @@ canonical_owner: self
 会话（`GardenComponent.import_session`）。本文记录落点、默认策略的依据、在途 job 的兼容
 和还没定的产品问题。代码是事实源，本文只记代码里看不出来的取舍。
 
+> 2026-09-20 历史注记（T661）：下文「之前」列与测量数据描述迁移时的旧实现。
+> 旧 plaintext fact-map 编排与配套前台选择/词面去重脚手架已退役；恢复规则见「在途 job 与崩溃」。
+
 ## 之前 vs 之后
 
     之前  上传 → io 切窗 → 每窗 fact_map（io 提示词抽候选）→ 全部候选 fact_write（io 提示词写卡，
@@ -30,7 +33,7 @@ canonical_owner: self
 
 | 条线 | 入口 | 之前 | 之后 |
 |---|---|---|---|
-| 托管 plaintext（iOS 新用户 onboarding、花园「补充材料」） | `genesis/plaintext.py::_run_plaintext_genesis_job` | `_run_plaintext_add_memory_job` / `_run_plaintext_genesis_v2` / v1 循环 → `worker.build_foreground_output_from_texts`（fact_map）→ `build_memory_output_from_fact_candidates`（fact_write）→ `service.apply_memory_outputs` | 新 job：`genesis/plaintext_garden.py::run_add_memory` / `run_onboarding` → `memory/garden_import.py::run_import`；老 job 仍走左列 |
+| 托管 plaintext（iOS 新用户 onboarding、花园「补充材料」） | `genesis/plaintext.py::_run_plaintext_genesis_job` | 旧 add-memory / 前后台编排 / v1 循环 → fact_map → fact_write → `service.apply_memory_outputs`（历史链路，已删除） | `genesis/plaintext_garden.py::run_add_memory` / `run_onboarding` → `memory/garden_import.py::run_import`；旧进度先重置，再从提交材料重跑 |
 | VPS 自托管（V1 resident） | `tools/chat_resident_consumer.py::_resident_distill_advance_memory` | 同一套 fact_map → fact_write（本地 agent 当模型）→ 客户端封信封 memory.add | 同一个 `run_import`（本地 agent 当模型、客户端封信封、`execute_memory_actions` 写）；进度只在内存 |
 | 加密分块导入（`POST /v1/genesis/imports`，Runtime V2 serve-worker 里的 genesis 线程） | `genesis/worker.py::_process_job` | `_build_reducer_output`（fact_map/fact_write）→ 输出 POST 给 apply 路由写卡 | 人设材料不变；其余来源 `worker._garden_reducer_output` 在 worker 内逐批写卡（runtime token），apply 路由只收人设/身份卡和 `garden_import.cards_written` |
 | 旧上传入口 `POST /v1/history_import/upload` | `hosted/history_import.py::_process_history_import_sync` | 自己的候选抽取 → 打分 → 渲染 → 兜底卡 → 直写 moments | `_GardenMemoryImport` → 同一个 `run_import`，写 memory action（来源仍记 `history_import`），分层张数上限变成 `max_total_cards` |
@@ -102,9 +105,11 @@ compare2.py）。
 
 ## 在途 job 与崩溃
 
-- **托管 plaintext**：`_PlaintextCheckpointProgress` 看 checkpoint —— 没有 `import_engine` 标记但已有
-  旧流水线进度（`map_outputs` / `tasks` / `voice_outputs` / `material_cards`）的 job 在旧流水线上跑完；
-  其余（含刚建好、还没进度的）写入标记后一直走新引擎。update_identity 不写卡，不受影响。
+- **托管 plaintext**：`_PlaintextCheckpointProgress` 看 checkpoint —— 缺少当前 `import_engine` 标记但已有
+  旧流水线进度（`map_outputs` / `tasks` / `voice_outputs` / `material_cards`）的 job，先持久化新的
+  checkpoint 并记录不含内容的 `genesis.plaintext.legacy_checkpoint_reset`，再从提交材料走新引擎；
+  `input_hash` 复用失败 job 也经过同一守卫。已有卡仍由索引交给模型合并（索引不可用的既有降级不变）。
+  当前引擎进度继续续跑；空壳不算旧进度。update_identity 不写卡，仍保留原来的窗口任务恢复。
 - **崩溃续写**：写库之前先把这批的写卡指令存进进度（`pending`），每写完 20 张存一次拿到的 id；续跑时
   pending 就是当前这批就只补写，不再问模型。每条写入现在有稳定幂等键，卡、变更日志和无正文回执在同一
   PostgreSQL 事务提交；写入后进度未保存时重放返回原 id。同 key 改载荷报冲突，不能当成功跳过。

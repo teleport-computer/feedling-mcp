@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 import os
+from pathlib import Path
+import fcntl
+import threading
 import time
 from typing import Callable
 
@@ -13,6 +18,53 @@ from content import plaintext_migration
 
 
 APPLY_ENV = plaintext_migration.APPLY_ENV
+FAILURE_LOG_ENV = "FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG"
+DEFAULT_FAILURE_LOG = "/data/plaintext-migration-failures.jsonl"
+CHECKPOINT_ENV = "FEEDLING_PLAINTEXT_MIGRATION_CHECKPOINT"
+DEFAULT_CHECKPOINT = "/data/plaintext-migration-checkpoint.json"
+_FAILURE_LOG_LOCK = threading.Lock()
+
+
+def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> None:
+    """Append content-free failed item records to the persistent CVM volume."""
+    if not failures:
+        return
+    path = Path(os.environ.get(FAILURE_LOG_ENV, DEFAULT_FAILURE_LOG))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with _FAILURE_LOG_LOCK, path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        for failure in failures:
+            record = {
+                "timestamp": timestamp,
+                "run_id": str(run_id),
+                "user_id": str(user_id),
+                "surface": str(failure.get("surface", "unknown")),
+                "item_id": str(failure.get("item_id", "")),
+                "status": str(failure.get("status", "unknown")),
+            }
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def write_checkpoint(*, path: str, run_id: str, user_id: str, failures: int) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    payload = {
+        "run_id": str(run_id),
+        "last_completed_user_id": str(user_id),
+        "failures": int(failures),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, target)
 
 
 class HealthGateError(RuntimeError):
@@ -121,9 +173,13 @@ def run(
     healthy_streak: int = 2,
     health_poll_sec: float = 5.0,
     max_pause_sec: float = 300.0,
+    continue_on_failure: bool = False,
+    run_id: str = "",
+    retry_items: dict[str, set[str]] | None = None,
+    checkpoint_path: str = "",
     sleep: Callable[[float], None] = time.sleep,
 ) -> RepairResult:
-    """Inventory or repair effective-off users, stopping on the first failure."""
+    """Inventory or repair effective-off users, optionally continuing after failures."""
     if int(row_limit) < 0:
         raise ValueError("row_limit must be >= 0")
     if float(rate) <= 0:
@@ -153,31 +209,67 @@ def run(
             except HealthGateError:
                 counts["failed_health_gate"] += 1
                 failures += 1
+                if continue_on_failure:
+                    time.sleep(max(1.0, min(float(max_pause_sec), 60.0)))
+                    continue
                 break
         try:
-            result = plaintext_migration.run(
-                user_id,
-                apply=apply,
-                limit=row_limit,
-                rate=rate,
-                workers=workers,
-            )
+            kwargs = {
+                "apply": apply,
+                "limit": row_limit,
+                "rate": rate,
+                "workers": workers,
+            }
+            if retry_items is not None:
+                kwargs["item_ids"] = retry_items.get(user_id, set())
+            result = plaintext_migration.run(user_id, **kwargs)
         except (PermissionError, ValueError):
             counts["failed_tier_or_user_changed"] += 1
             failures += 1
+            append_failure_log(
+                run_id=run_id,
+                user_id=user_id,
+                failures=[{"surface": "user", "item_id": "", "status": "failed_tier_or_user_changed"}],
+            )
+            if continue_on_failure:
+                completed += 1
+                last_completed = user_id
+                continue
             break
         except Exception:  # noqa: BLE001 - never expose content-bearing details
             counts["failed_migration_setup"] += 1
             failures += 1
+            append_failure_log(
+                run_id=run_id,
+                user_id=user_id,
+                failures=[{"surface": "user", "item_id": "", "status": "failed_migration_setup"}],
+            )
+            if continue_on_failure:
+                completed += 1
+                last_completed = user_id
+                continue
             break
         counts.update(result.counts)
+        append_failure_log(
+            run_id=run_id,
+            user_id=user_id,
+            failures=list(getattr(result, "failure_items", ())),
+        )
         if result.failures:
             failures += int(result.failures)
-            break
+            if not continue_on_failure:
+                break
         if int(result.counts.get("not_attempted_limit", 0)) > 0:
             break
         completed += 1
         last_completed = user_id
+        if checkpoint_path:
+            write_checkpoint(
+                path=checkpoint_path,
+                run_id=run_id,
+                user_id=user_id,
+                failures=failures,
+            )
 
     return RepairResult(
         apply=bool(apply),

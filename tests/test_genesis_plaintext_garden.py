@@ -4,7 +4,7 @@
 守的是：
   · 新 job 走导入会话；checkpoint 里存导入进度，重试从下一批接着跑，已提交的批次不再问
     模型、卡不重复
-  · 升级前就开始、checkpoint 里已有旧流水线进度的 job 在旧流水线上跑完
+  · 旧流水线 checkpoint 通过 input_hash 被捞回时清空进度，改走导入会话
   · 写卡语言跟 io 的导入语言判定走（英文材料 → 英文提示词）
   · onboarding：前台只读采样窗口 → 身份卡另走一次推导（拿的是真写进去的卡）→ 问候 →
     后台补剩下的窗口；不再调用 fact_map / fact_write
@@ -124,9 +124,11 @@ def env(monkeypatch):
         index_reads.append(cards)
         return cards
 
+    real_existing_cards = import_engine.existing_cards
     monkeypatch.setattr(import_engine, "existing_cards", existing)
     return types.SimpleNamespace(user_id=user_id, store=store, checkpoints=checkpoints,
-                                 saved_docs=saved_docs, index_reads=index_reads)
+                                 saved_docs=saved_docs, index_reads=index_reads,
+                                 real_existing_cards=real_existing_cards, fake_existing_cards=existing)
 
 
 def _job(env, job_id: str, *, mode: str) -> None:
@@ -195,33 +197,151 @@ def test_add_memory_resumes_from_checkpoint_without_rejudging_or_duplicating(env
     assert materials == [] or materials[0]["windows_done"] == materials[0]["windows_total"] == 2
 
 
-def test_in_flight_legacy_checkpoint_finishes_on_old_pipeline(env, monkeypatch):
+def _legacy_checkpoint():
+    return {"v": 1, "phase": "background_processing",
+            "tasks": {"plaintext-map:1:history::0": {"status": "done"}},
+            "map_outputs": {"plaintext-map:1:history::0": {"fact_candidates": [
+                {"summary": "PRIVATE_CANDIDATE"}]}},
+            "voice_outputs": {"secret-key": {"text": "PRIVATE_VOICE"}},
+            "material_cards": [{"summary": "PRIVATE_CARD"}], "identity_ready": True}
+
+
+@pytest.mark.parametrize("mode", ["onboarding", "add_memory"])
+def test_failed_legacy_job_reused_by_input_hash_restarts_on_garden(env, monkeypatch, mode):
+    """Real ASGI → last-100 DB lookup → same failed job → real runner and garden.
+
+    Only authentication, the thread scheduling and external model/encryption are
+    substituted. Removing the reset must persist stale map/task progress as valid state.
+    """
+    import asyncio
+    import httpx
+    from fastapi import FastAPI
+    from genesis import routes_asgi
+
+    payload = {"format": "plaintext", "content": "User: 〔窗A〕 周末在西湖骑车", "mode": mode}
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    db.genesis_create_job(env.user_id, {
+        "job_id": job_id, "status": "failed", "source_kind": "history_import",
+        "metadata": {"ingest": "plaintext", "mode": mode,
+                     "client_job_id": "different-original-client",
+                     "input_hash": plaintext.history_import._history_import_payload_hash(payload)},
+    })
+    env.checkpoints[job_id] = _legacy_checkpoint()
+    model = FakeModel({"〔窗A〕": [_card("周末在西湖骑车")]})
+    _use_model(monkeypatch, model)
+    monkeypatch.setattr(worker, "genesis_v2_enabled", lambda: True)
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity", lambda **_k: ({}, []))
+    monkeypatch.setattr(plaintext_garden, "_apply_non_memory", lambda *_a, **_k: {})
+    monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_a, **_k: "hi")
+    monkeypatch.setattr(worker, "build_reducer_output_from_texts", lambda **_k: {"memories": []})
+    traces = []
+    monkeypatch.setattr(plaintext.debug_trace, "trace_event", lambda *_a, **kw: traces.append(kw))
+    started = []
+
+    def start(store, api_key, job, **kwargs):
+        started.append(job["job_id"])
+        plaintext._run_plaintext_genesis_job(store, api_key, job["job_id"], **kwargs)
+
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", start)
+    app = FastAPI()
+    app.include_router(routes_asgi.router)
+    app.dependency_overrides[routes_asgi.require_auth] = lambda: types.SimpleNamespace(
+        store=env.store, api_key="synthetic_api_key")
+
+    async def post():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            return await client.post("/v1/genesis/imports/plaintext", json=payload)
+
+    response = asyncio.run(post())
+    assert response.status_code == 202, response.text
+    assert response.json()["job"]["job_id"] == job_id
+    assert started == [job_id]
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert _live_cards(env.user_id) == ["周末在西湖骑车"]
+    first = env.saved_docs[0]
+    assert not any(first.get(k) for k in ("tasks", "map_outputs", "voice_outputs", "material_cards")), (
+        "guard removed: stale v1 progress persisted as valid checkpoint state")
+    assert first["import_engine"] == garden_import.ENGINE
+    assert "PRIVATE_" not in json.dumps(first)
+    reset = [t for t in traces if t["type"] == "genesis.plaintext.legacy_checkpoint_reset"]
+    assert len(reset) == 1
+    assert reset[0]["job_id"] == job_id
+    assert reset[0]["detail"] == {"reason": "legacy_progress", "engine": garden_import.ENGINE,
+                                  "old_phase": "background_processing", "map_outputs": 1,
+                                  "tasks": 1, "voice_outputs": 1, "material_cards": 1}
+    assert "PRIVATE_" not in json.dumps(reset)
+
+
+@pytest.mark.parametrize("field", ["map_outputs", "tasks", "voice_outputs", "material_cards"])
+def test_each_legacy_progress_field_resets_before_resume(env, monkeypatch, field):
     job_id = f"job_{uuid.uuid4().hex[:10]}"
     _job(env, job_id, mode="add_memory")
-    env.checkpoints[job_id] = {
-        "v": 1, "phase": "foreground_processing",
-        "tasks": {"plaintext-map:1:history::0": {"status": "done", "task_id": "plaintext-map:1:history",
-                                                  "chunk_id": 0}},
-        "map_outputs": {"plaintext-map:1:history::0": {"fact_candidates": [{"summary": "养了一条狗"}]}},
-    }
-    monkeypatch.setattr(garden_import, "run_import",
-                        lambda **_k: (_ for _ in ()).throw(AssertionError("must stay on old path")))
-    seen = {}
+    env.checkpoints[job_id] = {"v": 1, "phase": "PRIVATE_PHASE", field: {"PRIVATE_KEY": "PRIVATE_VALUE"}}
+    traces = []
+    monkeypatch.setattr(plaintext.debug_trace, "trace_event", lambda *_a, **kw: traces.append(kw))
+    progress = plaintext._PlaintextCheckpointProgress(env.store, "key", job_id, [], use_garden=True)
+    assert not progress.legacy
+    assert not progress.doc.get(field)
+    reset = next(t for t in traces if t["type"] == "genesis.plaintext.legacy_checkpoint_reset")
+    assert reset["detail"]["old_phase"] == "unknown"
+    assert reset["detail"][field] == 1
+    assert "PRIVATE_" not in json.dumps(reset)
 
-    def old_map(**kwargs):
-        seen["resume"] = kwargs.get("resume_map_outputs")
-        return {"all_fact_candidates": [{"summary": "养了一条狗"}]}
 
-    monkeypatch.setattr(worker, "build_foreground_output_from_texts", old_map)
-    monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates",
-                        lambda **_k: {"memories": [{"type": "fact", "summary": "养了一条狗",
-                                                    "content": "家里养了一条狗。"}]})
-    plaintext._run_plaintext_genesis_job(env.store, "api_key", job_id, mode="add_memory",
+@pytest.mark.parametrize("kind", ["empty", "garden", "update_identity"])
+def test_checkpoint_reset_excludes_empty_garden_and_identity(env, monkeypatch, kind):
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="update_identity" if kind == "update_identity" else "add_memory")
+    doc = {"v": 1} if kind == "empty" else _legacy_checkpoint()
+    if kind == "garden":
+        doc["import_engine"] = garden_import.ENGINE
+    env.checkpoints[job_id] = doc
+    traces = []
+    monkeypatch.setattr(plaintext.debug_trace, "trace_event", lambda *_a, **kw: traces.append(kw))
+    progress = plaintext._PlaintextCheckpointProgress(
+        env.store, "key", job_id, [], use_garden=kind != "update_identity")
+    assert not any(t["type"] == "genesis.plaintext.legacy_checkpoint_reset" for t in traces)
+    if kind != "empty":
+        assert progress.doc["map_outputs"] == doc["map_outputs"]
+    assert progress.legacy == (kind == "update_identity")
+
+
+def test_legacy_reset_persist_failure_stops_before_model(env, monkeypatch):
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    env.checkpoints[job_id] = _legacy_checkpoint()
+    model = FakeModel({"〔窗A〕": [_card("骑车")]})
+    _use_model(monkeypatch, model)
+
+    def fail(*_a, **_kw):
+        raise RuntimeError("checkpoint_write_failed")
+
+    monkeypatch.setattr(service, "write_genesis_checkpoint", fail)
+    plaintext._run_plaintext_genesis_job(env.store, "key", job_id, mode="add_memory",
                                          source_groups=_history_groups("〔窗A〕"))
-    assert seen["resume"] == {0: {"fact_candidates": [{"summary": "养了一条狗"}]}}
-    assert "import_engine" not in env.checkpoints[job_id]
+    assert model.prompts == []
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "failed"
+    assert env.checkpoints[job_id] == _legacy_checkpoint()
+
+
+def test_garden_add_memory_retry_resolves_prior_failure_notice(env, monkeypatch):
+    from notices import core as notices_core
+
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    service.mark_failed(env.store, job_id, "connection refused")
+
+    def notice():
+        return next(row for row in db.log_read_all(env.user_id, notices_core.NOTICES_STREAM)
+                    if row["dedupe_key"] == f"genesis:{job_id}")
+
+    assert notice()["resolved"] is False
+    db.genesis_set_job_status(env.user_id, job_id, status="processing")
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("周末在西湖骑车")]}))
+    plaintext._run_plaintext_genesis_job(env.store, "key", job_id, mode="add_memory",
+                                        source_groups=_history_groups("〔窗A〕"))
     assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
-    assert _live_cards(env.user_id) == ["养了一条狗"]
+    assert notice()["resolved"] is True
 
 
 def test_locale_comes_from_io_import_language_detection(env, monkeypatch):
@@ -563,3 +683,72 @@ def test_ledger_empty_foreground_falling_back_to_full_path_records_one_row(env, 
         analysis_messages=[{"role": "user", "content": "嗯", "source": "history_import"}])
     assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
     assert _memory_ledger(env.user_id, job_id) == [("not_provided", "no_write")]
+
+
+def test_reset_merges_already_written_legacy_card_using_full_index(env, monkeypatch):
+    import memory_readside_core
+
+    # The old producer really writes the card, rather than seeding a new-engine
+    # checkpoint or an import action receipt.
+    count, _ = service.apply_memory_outputs(env.store, "key", {
+        "memories": [{"type": "fact", "summary": "周末在西湖骑车", "content": "周末在西湖骑车。"}]
+    })
+    assert count == 1
+    original_id = _existing_id(env.user_id)
+    index_params = []
+
+    def index(store, key, params, **kwargs):
+        index_params.append(params)
+        return {"items": env.fake_existing_cards(store, key)}
+
+    monkeypatch.setattr(memory_readside_core, "memory_index_core", index)
+    monkeypatch.setattr(import_engine, "existing_cards", env.real_existing_cards)
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="add_memory")
+    env.checkpoints[job_id] = _legacy_checkpoint()
+    model = FakeModel({"〔窗A〕": [_card("周末在西湖骑车，清晨出发", action="merge", target=original_id)]})
+    _use_model(monkeypatch, model)
+    plaintext._run_plaintext_genesis_job(env.store, "key", job_id, mode="add_memory",
+                                         source_groups=_history_groups("〔窗A〕"))
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert index_params == [{"limit": 0}]
+    assert original_id in model.prompts[0]
+    assert _live_cards(env.user_id) == ["周末在西湖骑车，清晨出发"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_reset_keeps_single_greeting_and_same_identity_write_path(env, monkeypatch, legacy):
+    from core import envelope
+
+    history = plaintext.history_import
+    monkeypatch.setattr(worker, "genesis_v2_enabled", lambda: True)
+    monkeypatch.setattr(worker, "genesis_combined_map_enabled", lambda: False)
+    monkeypatch.setattr(history, "_generate_model_api_onboarding_greeting", lambda *_a, **_k: ("new greeting", []))
+    monkeypatch.setattr(envelope, "_build_shared_envelope_for_store", lambda store, body, *, item_id=None: (
+        {"id": item_id or "synthetic", "body_ct": body.decode(), "nonce": "n", "K_user": "ku",
+         "K_enclave": "ke", "visibility": "shared", "owner_user_id": store.user_id}, ""))
+    winner = history._append_model_api_onboarding_greeting(env.store, "original greeting")
+    job_id = f"job_{uuid.uuid4().hex[:10]}"
+    _job(env, job_id, mode="onboarding")
+    # Both are retried checkpoints; only one requires legacy reset.
+    doc = _legacy_checkpoint()
+    if not legacy:
+        doc["import_engine"] = garden_import.ENGINE
+    env.checkpoints[job_id] = doc
+    _use_model(monkeypatch, FakeModel({"〔窗A〕": [_card("周末在西湖骑车")]}))
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity", lambda **_k: (
+        {"agent_name": "小满", "dimensions": [{"name": "温柔", "description": "温和", "value": 80}]}, []))
+    writes = []
+    monkeypatch.setattr(history, "_store_identity_payload",
+                        lambda *_a, **kw: writes.append(kw["evidence"]) or {"id": "identity"})
+    monkeypatch.setattr(worker, "build_reducer_output_from_texts", lambda **_k: {"memories": []})
+    plaintext._run_plaintext_genesis_job(env.store, "key", job_id, mode="onboarding",
+        source_groups=_history_groups("〔窗A〕"),
+        analysis_messages=[{"role": "user", "content": "〔窗A〕 周末骑车", "source": "history_import"}])
+    assert db.genesis_get_job(env.user_id, job_id)["status"] == "done"
+    assert writes == [f"genesis_foreground:{job_id}"]
+    with db.get_pool().connection() as conn:
+        rows = conn.execute("SELECT doc FROM chat_messages WHERE user_id = %s "
+                            "AND doc->>'model_api_kind' = 'onboarding_greeting'", (env.user_id,)).fetchall()
+    assert [row[0] for row in rows] == [winner]
+    assert winner["body_ct"] == "original greeting"

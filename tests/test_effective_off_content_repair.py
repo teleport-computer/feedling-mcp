@@ -164,6 +164,62 @@ def test_apply_stops_after_first_failed_user(monkeypatch):
     assert result.last_completed_user_id == ""
 
 
+def test_apply_can_continue_after_failed_user_when_requested(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a", "usr_b"]
+    )
+    called = []
+
+    def migrate(user_id, **_kwargs):
+        called.append(user_id)
+        if user_id == "usr_a":
+            return SimpleNamespace(
+                counts={"failed_transform_or_storage": 1}, failures=1
+            )
+        return SimpleNamespace(counts={"migrated": 2}, failures=0)
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        apply=True,
+        continue_on_failure=True,
+        health_probe=lambda: True,
+        healthy_streak=1,
+    )
+
+    assert called == ["usr_a", "usr_b"]
+    assert result.failures == 1
+    assert result.users_completed == 2
+    assert result.last_completed_user_id == "usr_b"
+
+
+def test_failure_log_appends_content_free_item_details(tmp_path, monkeypatch):
+    path = tmp_path / "plaintext-failures.jsonl"
+    monkeypatch.setenv(plaintext_repair.FAILURE_LOG_ENV, str(path))
+
+    plaintext_repair.append_failure_log(
+        run_id="run-1",
+        user_id="usr_a",
+        failures=[
+            {
+                "surface": "chat",
+                "item_id": "42",
+                "status": "failed_transform_or_storage",
+            }
+        ],
+    )
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["run_id"] == "run-1"
+    assert record["user_id"] == "usr_a"
+    assert record["surface"] == "chat"
+    assert record["item_id"] == "42"
+    assert record["status"] == "failed_transform_or_storage"
+    assert record["timestamp"]
+
+
 def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
     monkeypatch.setattr(
         plaintext_repair,

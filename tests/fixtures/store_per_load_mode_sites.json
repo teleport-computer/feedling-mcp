@@ -263,6 +263,11 @@
     },
     {
       "count": 1,
+      "path": "backend/model_api_runtime/v2/wake_circuit.py",
+      "reason": "wake circuit notice and trace sinks use direct DB reads, no store sections"
+    },
+    {
+      "count": 1,
       "path": "backend/model_api_runtime/v2/worker.py",
       "reason": "chat lane reads bounded DB inputs and durable cursors"
     },

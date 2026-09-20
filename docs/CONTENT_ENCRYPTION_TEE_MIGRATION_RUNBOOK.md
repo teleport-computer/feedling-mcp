@@ -325,8 +325,11 @@ Operator output must remain aggregate-only.
 Use the fleet coordinator only after the code release containing the
 database-backed replication policy resolver is deployed and its exact commit is
 visible in `/healthz`. It selects existing explicit-off and unset/default-off
-users in deterministic `user_id` order, excludes explicit-on users, runs one
-user at a time, and stops on the first migration or health-gate failure.
+ users in deterministic `user_id` order, excludes explicit-on users, and runs
+ one user at a time. By default it stops on the first migration or health-gate
+ failure. For unattended batches, add `--continue-on-failure`: failed rows are
+ counted and left unchanged while later users continue; review and retry the
+ reported failures separately.
 
 Inventory is read-only and does not require the enclave to be healthy:
 
@@ -352,6 +355,26 @@ python migrate_effective_off_content_to_plaintext.py \
 parallel migration work while `--rate` remains the process-wide maximum start
 rate.  Increase workers only after observing enclave latency and backend CPU;
 CAS writes remain conflict-safe when users are active.
+
+`--continue-on-failure` is opt-in. It advances the cursor past users with
+failed rows, so retain the reported failure count and rerun those users when
+their decrypt or storage issue is resolved.
+
+With this flag, item failures, user-state/setup failures, and temporary health
+gate failures do not terminate the queue: item/user failures are logged and the
+queue advances; a health-gate failure pauses and retries until the enclave is
+healthy again.
+
+Apply runs also append one content-free JSONL record per failed item to
+`FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG`, defaulting to
+`/data/plaintext-migration-failures.jsonl` on the persistent backend volume.
+Copy or ship this file before replacing the volume; it contains IDs and error
+classes, never message bodies or keys.
+
+Apply runs also take `/data/plaintext-migration.lock` by default and atomically
+write `/data/plaintext-migration-checkpoint.json` after each completed user.
+Use `--retry-failures <path>` to retry only the `user_id`/`item_id` pairs from a
+failure JSONL file.
 
 Record `last_completed_user_id` only after a zero-failure user with no
 `not_attempted_limit` rows. When `--row-limit` leaves rows deferred, the

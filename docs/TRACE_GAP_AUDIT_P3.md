@@ -1,4 +1,11 @@
+---
+document_lifecycle: historical
+canonical_owner: docs/CURRENT_STATE.md
+historical_reason: point-in-time
+---
 # T154 探针缺漏普查（p3 最终清单）
+
+> 2026-09-20 历史注记（T661）：本文保留审计时的发现。旧 plaintext 前后台编排与未接线的前台选择脚手架已删除；下述旧编排符号仅作历史定位，不代表当前仍可达。
 
 基线：`origin/test@baa22e89309606e1a9fd47b27f2d11a7e972c188`。直接 `debug_trace.trace_event` 数不能当语义探针数：`_trace_genesis`、`_trace_enclave`、`trace_identity_dimensions_set` 等包装器会扩成多个语义位点。下列“有但没实弹验过”表示代码位点/单测存在，但本轮没有看到真实环境持久化后经 admin 出口读回的证据。所有“零探针”判定还带一个前提：trace 开关确实持久化并对执行该路径的 worker 生效；A28 证明这个前提当前并不可靠，因此未实弹条目不得宣称“已覆盖”。
 
@@ -130,7 +137,7 @@ V2 不是“没有 trace”：`worker.py` + `serve_worker.py` 当前可发 16 �
 3. 设备端在 APNs 接受后的实际展示不可得；仅服务端投递边界可测。
 4. admin/data_track 是 trace 消费者，不能给它加 trace_event 自我记录；但读侧必须返回覆盖率 metadata，具体字段与验收见 A26，不能据此解释成“读侧不用管”。
 5. tee_shadow 的权威观测是系统级 tee_sync_runs/日志，不应硬塞进 per-user debug_trace；问题是计数真实性、分表定位与告警。
-6. genesis/foreground.py 等未接入生产的 checkpoint 脚手架不是生产漏探针。
+6. 当时未接入生产的 Genesis 前台 checkpoint 脚手架不是生产漏探针（该脚手架现已删除）。
 7. V1-resident 的 provider/CLI/tool/MCP 内部运行在用户 VPS；后端不能保证进程内细节、stdout 或本机文件可取，这不是服务端 bug。
 8. resident consumer 的 `_emit_debug_trace` 会尝试经 HTTP 回传内部事件，但它是 daemon thread + best-effort 网络；用户机器断网/退出时丢失属于结构边界，不能把“应该必达”作为后端正确性前提。
 9. V1-resident 的消息入队、poll/claim、`/v1/chat/response` 接收、父消息 CAS 与最终 reply 行都发生在后端，**不是**结构性不可得；A44/A45 只要求补齐这些权威网络边界。

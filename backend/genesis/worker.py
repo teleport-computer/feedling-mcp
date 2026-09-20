@@ -22,7 +22,7 @@ import db
 import debug_trace
 import provider_client
 from core.store import get_store_per_load_mode
-from genesis import checkpoint, foreground, prompts, service
+from genesis import checkpoint, prompts, service
 from genesis.llm_client import GenesisLLMClient
 from identity.user_naming import rewrite_user_reference
 from notices import catalog as notices_catalog, core as notices_core
@@ -1303,45 +1303,6 @@ def build_reducer_output_from_texts(
     )
 
 
-def build_memory_output_from_fact_candidates(
-    *,
-    user_id: str,
-    job_id: str,
-    key_prefix: str | None = None,
-    runtime: provider_client.ProviderConfig,
-    fact_candidates: list[dict],
-    known_memories: list[str] | None = None,
-    llm: GenesisLLMClient | None = None,
-    keep_all: bool = False,
-    floor_note: str = "",
-    terms_note: str = "",
-    user_name: str = "",
-) -> dict:
-    """Run the Genesis fact_write step directly for already-mapped candidates.
-
-    Foreground v2 already has all fact candidates after fact_map. This helper lets
-    the route write the full memory set once, without re-mapping the transcript or
-    waiting for voice/persona.
-
-    keep_all (A): long-term-memory archive uploads — write the facts thoroughly rather
-    than filter for brevity. Default False keeps the normal (chat/onboarding) behavior.
-    """
-    llm = llm or GenesisLLMClient()
-    return _fact_write(
-        llm,
-        user_id=user_id,
-        job_id=job_id,
-        key_prefix=key_prefix,
-        runtime=runtime,
-        fact_candidates=[item for item in fact_candidates if isinstance(item, dict)],
-        known_memories=known_memories,
-        keep_all=keep_all,
-        floor_note=floor_note,
-        terms_note=terms_note,
-        user_name=user_name,
-    )
-
-
 def build_memory_recheck_from_material(
     *,
     user_id: str,
@@ -1356,8 +1317,8 @@ def build_memory_recheck_from_material(
     """VPS resident-only second pass: ask whether fact_write missed real memories.
 
     This helper is intentionally not called by the hosted/cloud Genesis flow. The
-    resident consumer can call it after ``build_memory_output_from_fact_candidates``
-    with the original plaintext material plus the just-written cards, then append
+    resident consumer can call it with the original plaintext material plus
+    the just-written cards, then append
     the returned ``memories`` if any. Empty is a valid "nothing missed" result.
     """
     if not str(material or "").strip():
@@ -1694,163 +1655,6 @@ def _voice_candidate_from_combined_map(parsed: dict) -> dict:
                 exemplars.extend(item_exemplars)
         return {"behavior_notes_candidates": notes, "exemplar_candidates": exemplars}
     return {"behavior_notes_candidates": [], "exemplar_candidates": []}
-
-
-def build_foreground_output_from_texts(
-    *,
-    user_id: str,
-    job_id: str,
-    key_prefix: str | None = None,
-    runtime: provider_client.ProviderConfig,
-    chunk_texts: list[str],
-    source_kind: str = "history",
-    foreground_core_max: int = foreground.FOREGROUND_CORE_MAX,
-    llm: GenesisLLMClient | None = None,
-    write_core: bool = True,
-    include_voice_candidates: bool = False,
-    keep_all: bool = False,
-    user_name: str = "",
-    resume_map_outputs: dict[int, dict] | None = None,
-    on_map_completed: Callable[[int, dict], None] | None = None,
-) -> dict:
-    """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
-
-    fact_map over every chunk ONCE -> pick 3-5 core fact_candidates -> fact_write
-    ONLY those -> identity baseline. Deliberately NO voice_map/voice_reduce/persona
-    /full fact_write: those are the background's job. The returned dict carries the
-    SAME full fact_candidate list + the chosen core so the background partitions
-    against them (one extraction, shared candidates — never a second, divergent run).
-
-    Cache discipline: fact_map uses the SAME idempotency prefix as the background
-    reduce, so the two SHARE the cached extraction. fact_write uses a distinct
-    `:fg` prefix, so the foreground's core write never collides with the
-    background's fact_write batches.
-    """
-    llm = llm or GenesisLLMClient()
-    source_family = _source_family(source_kind)
-    shared_prefix = _idempotency_prefix(job_id, key_prefix)   # shared with background
-    fg_write_prefix = f"{shared_prefix}:fg"                   # distinct fact_write namespace
-
-    fact_candidates: list[dict] = []
-    voice_candidates: list[dict] = []
-    map_diagnostics: list[dict] = []
-    history_windows_total = 0
-    history_windows_failed = 0
-    for idx, text in enumerate(chunk_texts):
-        is_history = source_family == "history"
-        if is_history:
-            history_windows_total += 1
-        diagnostic_count_before = len(map_diagnostics)
-
-        def record_discarded(diagnostic: dict, *, chunk_index: int = idx) -> None:
-            if len(map_diagnostics) >= 6:
-                return
-            map_diagnostics.append({"chunk_index": chunk_index, **diagnostic})
-
-        try:
-            cached = (resume_map_outputs or {}).get(idx)
-            if keep_all and isinstance(cached, dict) and _fact_map_output_empty(cached):
-                _emit_map_discard_diagnostic(
-                    record_discarded,
-                    task_id=f"fact-map-{idx}",
-                    reason="empty_checkpoint_ignored",
-                    raw_output=json.dumps(cached, ensure_ascii=False, separators=(",", ":")),
-                )
-                cached = None
-            if isinstance(cached, dict):
-                facts = cached
-                if include_voice_candidates and is_history and genesis_combined_map_enabled():
-                    voice_candidates.append(_voice_candidate_from_combined_map(facts))
-            elif include_voice_candidates and is_history and genesis_combined_map_enabled():
-                facts = _complete_json_retry_empty(
-                    llm,
-                    user_id=user_id,
-                    job_id=job_id,
-                    task_id=f"combined-map-{idx}",
-                    runtime=runtime,
-                    messages=prompts.combined_map_messages(text, user_name=user_name),
-                    max_tokens=2400,
-                    idempotency_key=f"{shared_prefix}:combined_map:{idx}",
-                    is_empty=_combined_map_empty,
-                    empty_reason="empty_combined_map",
-                    on_discarded=record_discarded,
-                )
-                voice_candidates.append(_voice_candidate_from_combined_map(facts))
-            else:
-                facts = _complete_json_retry_empty(
-                    llm,
-                    user_id=user_id,
-                    job_id=job_id,
-                    task_id=f"fact-map-{idx}",
-                    runtime=runtime,
-                    messages=prompts.fact_map_messages(
-                        _source_tagged_fact_text(source_family, text),
-                        keep_all=keep_all,
-                        user_name=user_name,
-                    ),
-                    max_tokens=1800,
-                    idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
-                    is_empty=_fact_map_output_empty,
-                    empty_reason="empty_fact_candidates",
-                    on_discarded=record_discarded,
-                )
-            if (
-                cached is None
-                and on_map_completed is not None
-                and not (keep_all and _fact_map_output_empty(facts))
-            ):
-                on_map_completed(idx, facts)
-        except provider_client.ProviderError as e:
-            if provider_client.classify_provider_error(e) == "provider_config":
-                raise  # hard error (402/401/403/quota/key) -> caller aborts
-            if len(map_diagnostics) == diagnostic_count_before:
-                _emit_map_discard_diagnostic(
-                    record_discarded,
-                    task_id=f"fact-map-{idx}",
-                    reason=provider_client.classify_provider_error(e),
-                    raw_output="",
-                )
-            if is_history:
-                history_windows_failed += 1  # transient exhausted -> skip this chunk, keep going
-            continue
-        except GenesisWorkerError as e:
-            if len(map_diagnostics) == diagnostic_count_before:
-                _emit_map_discard_diagnostic(
-                    record_discarded,
-                    task_id=f"fact-map-{idx}",
-                    reason=_map_discard_reason(e),
-                    raw_output="",
-                )
-            if is_history:
-                history_windows_failed += 1
-            continue
-        if isinstance(facts.get("fact_candidates"), list):
-            fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
-
-    core = foreground.select_core_for_foreground(fact_candidates, max_n=foreground_core_max)
-    fact_write = _fact_write(
-        llm,
-        user_id=user_id,
-        job_id=job_id,
-        key_prefix=fg_write_prefix,   # distinct -> never collides with background fact_write
-        runtime=runtime,
-        fact_candidates=core,
-        user_name=user_name,
-    ) if write_core else {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
-    return {
-        "memories": fact_write.get("memories") or [],
-        "identity": fact_write.get("identity") or {"agent_name": "", "dimensions": []},
-        "source_kind": source_kind,
-        "source_family": source_family,
-        "foreground": True,
-        # handed to the background so it writes only the rest (structural dedup, Codex #1)
-        "all_fact_candidates": fact_candidates,
-        "core_fact_candidates": core,
-        "voice_candidates": voice_candidates,
-        "map_diagnostics": map_diagnostics,
-        "history_windows_total": history_windows_total,
-        "history_windows_failed": history_windows_failed,
-    }
 
 
 def derive_identity_from_persona(

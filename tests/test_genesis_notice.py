@@ -101,47 +101,6 @@ def test_apply_reducer_output_dropped_memory_cards_emits_partial(monkeypatch):
     assert n["resolved"] is False
 
 
-def test_run_plaintext_add_memory_job_resolves_prior_failure(monkeypatch):
-    """_run_plaintext_add_memory_job bypasses apply_reducer_output entirely (it's a
-    third completion path alongside the two identity-first/background paths that
-    already call notices_core.resolve directly) -> a successful add_memory run must
-    still clear a prior genesis failure notice for this user."""
-    uid = _uid(); seed_user(uid); store = get_store(uid)
-    db.genesis_create_job(uid, {"job_id": "job_am1", "status": "created"})
-
-    service.mark_failed(store, "job_am1", "connection refused")
-    assert _notices(uid)["genesis:job_am1"]["resolved"] is False
-
-    monkeypatch.setattr(
-        plaintext.worker, "build_foreground_output_from_texts",
-        lambda **_k: {"all_fact_candidates": [{"type": "fact", "summary": "s", "content": "c"}]},
-    )
-    monkeypatch.setattr(
-        plaintext.worker, "build_memory_output_from_fact_candidates",
-        lambda **_k: {"memories": [{"type": "fact", "summary": "s", "content": "c"}]},
-    )
-    monkeypatch.setattr(
-        plaintext, "_plaintext_merge_reducer_outputs",
-        lambda outputs, **_k: dict(outputs[0]),
-    )
-    monkeypatch.setattr(
-        service, "apply_memory_outputs",
-        lambda *_a, **_k: (1, [{"memory": {"id": "m1"}}]),
-    )
-
-    plaintext._run_plaintext_add_memory_job(
-        store, "api_key", "job_am1",
-        runtime=object(),
-        source_groups=[{"source_kind": "chat_export", "chunk_texts": ["hi"]}],
-    )
-
-    n = _notices(uid)["genesis:job_am1"]
-    assert n["resolved"] is True
-    job = db.genesis_get_job(uid, "job_am1")
-    assert job["status"] == "done"
-    assert not any(key.startswith("profile_") for key in job["output"])
-
-
 def test_run_plaintext_update_identity_job_resolves_prior_failure(monkeypatch):
     """_run_plaintext_update_identity_job (角色卡蒸馏 update_identity retry path) never
     goes through apply_reducer_output -> before this fix its 6 mark_failed exits emitted

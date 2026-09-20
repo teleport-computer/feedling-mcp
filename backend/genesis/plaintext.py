@@ -24,14 +24,13 @@ import debug_trace
 import distillation_ledger
 import provider_client
 from core import envelope as core_envelope
-from genesis import checkpoint, dedup, foreground, foreground_identity, lightweight_identity, service, worker
+from genesis import checkpoint, service, worker
 from genesis.llm_client import GenesisLLMClient
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
 from identity.user_naming import sanitize_user_name
 from memory import garden_import
-from notices import catalog
 from notices import core as notices_core
 
 _SECONDS_PER_DAY = 24 * 60 * 60
@@ -561,19 +560,6 @@ def _distill_model_override(value: Any) -> str:
     return model
 
 
-def _material_card_count(output: dict | None) -> int:
-    value = output if isinstance(output, dict) else {}
-    cards = value.get("memories")
-    if not isinstance(cards, list):
-        cards = value.get("facts")
-    count = len(cards) if isinstance(cards, list) else 0
-    if _identity_payload_has_content(value.get("identity")):
-        count += 1
-    if value.get("persona") or value.get("persona_content"):
-        count += 1
-    return count
-
-
 def _plaintext_job_metadata(
     payload: dict,
     prepared: dict,
@@ -643,7 +629,7 @@ def _plaintext_voice_task_id(source_pass: int, source_family: str) -> str:
 
 
 class _PlaintextCheckpointProgress:
-    """Encrypted fact/voice map checkpoint plus the non-content progress projection."""
+    """Encrypted garden/voice checkpoint and identity-update progress projection."""
 
     def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict],
                  *, use_garden: bool = False):
@@ -652,9 +638,21 @@ class _PlaintextCheckpointProgress:
         self.job_id = job_id
         self.source_groups = source_groups
         loaded = service.load_genesis_checkpoint(store, api_key, job_id)
+        reset_detail = None
+        if use_garden and _checkpoint_is_legacy(loaded):
+            # Failed jobs can be found again by input_hash. Their old map progress
+            # is not an import-session checkpoint; restart from the submitted
+            # material and let the garden's existing-card index reconcile writes.
+            old_phase = loaded.get("phase")
+            reset_detail = {
+                "reason": "legacy_progress",
+                "engine": garden_import.ENGINE,
+                "old_phase": old_phase if isinstance(old_phase, str) and old_phase in checkpoint.PHASES else "unknown",
+                **{name: len(loaded[name]) if isinstance(loaded.get(name), (dict, list)) else 0
+                   for name in ("map_outputs", "tasks", "voice_outputs", "material_cards")},
+            }
+            loaded = None
         self.doc = checkpoint.resume(loaded) if loaded else checkpoint.new_checkpoint()
-        # 升级前开始的 job（checkpoint 里已经有 fact_map 进度、没有引擎标记）在旧流水线上
-        # 跑完；其余一律走 memgarden 导入会话，并把标记写进 checkpoint，重试时不会换回来。
         # ``use_garden`` 只对写记忆卡的模式（onboarding / add_memory）为 True；
         # update_identity 不写卡，进度照旧按窗口任务算。
         self.legacy = (not use_garden) or _checkpoint_is_legacy(self.doc)
@@ -664,6 +662,9 @@ class _PlaintextCheckpointProgress:
         if _voice_checkpoint_enabled():
             self.doc.setdefault("voice_outputs", {})
         service.write_genesis_checkpoint(store, job_id, self.doc)
+        if reset_detail is not None:
+            _trace_genesis(store, "genesis.plaintext.legacy_checkpoint_reset",
+                           job_id=job_id, detail=reset_detail)
         self.publish(stage="plaintext_reducer")
 
     # -- memgarden 导入会话的进度（加密 checkpoint 里的 ``garden_import``） ------ #
@@ -684,17 +685,6 @@ class _PlaintextCheckpointProgress:
 
     def _task_id(self, source_pass: int, source_family: str) -> str:
         return _plaintext_map_task_id(source_pass, source_family)
-
-    def resume_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
-        task_id = self._task_id(source_pass, source_family)
-        outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
-        resumed: dict[int, dict] = {}
-        for idx in range(len(self.source_groups[source_pass - 1].get("chunk_texts") or [])):
-            key = checkpoint.task_key(task_id, idx)
-            value = outputs.get(key)
-            if checkpoint.is_task_done(self.doc, task_id, idx) and isinstance(value, dict):
-                resumed[idx] = value
-        return resumed
 
     def resume_voice_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
         if not _voice_checkpoint_enabled():
@@ -741,61 +731,6 @@ class _PlaintextCheckpointProgress:
             output_summary=f"voice_candidates={candidate_count}",
         )
         service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
-
-    def record_map(self, source_pass: int, source_family: str, chunk_index: int, output: dict) -> None:
-        task_id = self._task_id(source_pass, source_family)
-        key = checkpoint.task_key(task_id, chunk_index)
-        outputs = dict(self.doc.get("map_outputs") or {})
-        outputs[key] = output
-        self.doc["map_outputs"] = outputs
-        self.doc = checkpoint.upsert_task(
-            self.doc,
-            task_id=task_id,
-            chunk_id=chunk_index,
-            status=checkpoint.TASK_DONE,
-            source_pass=str(source_pass),
-            output_summary=f"candidates={len(output.get('fact_candidates') or [])}",
-        )
-        # Durable checkpoint first, visible progress second. A crash can under-report
-        # completed work, but can never report a window that cannot be resumed.
-        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
-        self.publish(
-            stage="plaintext_reducer",
-            source_family=source_family,
-            source_pass=source_pass,
-        )
-
-    def record_map_diagnostics(
-        self, source_pass: int, source_family: str, diagnostics: list[dict]
-    ) -> None:
-        if not diagnostics:
-            return
-        existing = (
-            self.doc.get("map_diagnostics")
-            if isinstance(self.doc.get("map_diagnostics"), list)
-            else []
-        )
-        safe = list(existing)
-        for raw in diagnostics:
-            if not isinstance(raw, dict) or len(safe) >= 6:
-                break
-            safe.append({
-                "source_pass": max(1, int(source_pass)),
-                "source_family": str(source_family or "")[:80],
-                "chunk_index": max(0, int(raw.get("chunk_index") or 0)),
-                "task_id": str(raw.get("task_id") or "")[:120],
-                "discard_reason": str(raw.get("discard_reason") or "unknown")[:120],
-                "raw_output_snippet": str(raw.get("raw_output_snippet") or "")[:500],
-                "raw_output_chars": max(0, int(raw.get("raw_output_chars") or 0)),
-                "raw_output_truncated": bool(raw.get("raw_output_truncated")),
-            })
-        self.doc["map_diagnostics"] = safe
-        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
-        self.publish(
-            stage="plaintext_reducer",
-            source_family=source_family,
-            source_pass=source_pass,
-        )
 
     def record_non_map_group(
         self, source_pass: int, source_family: str, *, cards: int = 0
@@ -1391,14 +1326,6 @@ def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
         return ""
 
 
-def _merged_has_identity(merged: dict) -> bool:
-    """True when the reduce output carries a usable Identity Card (a name or any
-    dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
-    ident = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
-    dims = ident.get("dimensions") if isinstance(ident.get("dimensions"), list) else []
-    return bool(str(ident.get("agent_name") or "").strip()) or len(dims) > 0
-
-
 def _identity_payload_has_content(identity_payload: dict | None) -> bool:
     payload = identity_payload if isinstance(identity_payload, dict) else {}
     if str(payload.get("agent_name") or "").strip():
@@ -1420,408 +1347,6 @@ def _provider_identity_failure(warnings: list[str] | tuple[str, ...] | None) -> 
         if text.startswith("provider_identity_failed:"):
             return text
     return ""
-
-
-def _run_plaintext_genesis_v2(
-    store,
-    api_key: str | None,
-    job_id: str,
-    *,
-    runtime,
-    source_groups: list[dict],
-    relationship_anchor: dict | None = None,
-    analysis_messages: list[dict] | None = None,
-    user_name: str = "",
-    llm: GenesisLLMClient | None = None,
-    progress: _PlaintextCheckpointProgress | None = None,
-) -> bool:
-    """Genesis v2 foreground-fast orchestration (behind FEEDLING_GENESIS_V2_ENABLED).
-
-    Foreground restores the legacy chat_ready contract: pick 3-5 core memories, derive a
-    REAL Identity Card via the existing hosted deriver (foreground_identity, no new
-    prompt), write identity + relationship anchor (_store_identity_payload) + a greeting,
-    and publish identity_ready — so the app can enter with a named/anchored TA, never a
-    blank home. Background then does the heavy full reduce over every remaining window,
-    skipping the core and NOT re-writing identity. The job reaches done only after every
-    material window has a durable checkpoint.
-
-    Edge: if the deriver can't produce an identity, fall back to the v1-style apply
-    (complete on core + background fills identity) — never a fake-complete.
-
-    Returns True when it handled the job. Returns False only when there's nothing to work
-    with (no core), so the caller runs the v1 full path instead.
-    """
-    # Foreground only: cap the history bucket to a small, evenly-sampled window so large
-    # imports stay fast (support buckets — ai_persona/user_profile/memory_summary — are
-    # never sampled here, since identity/name lives in the character card). `source_groups`
-    # itself is left untouched — background enrichment below still consumes the full,
-    # un-sampled groups so the dropped history chunks get fully processed there.
-    fg_source_groups = _cap_foreground_history_chunks(source_groups)
-
-    # primary group: prefer the real chat history (best greeting signal), else the first
-    fg_group = next(
-        (g for g in fg_source_groups if str(g.get("source_family") or "") == "history"),
-        fg_source_groups[0],
-    )
-    fg_idx = fg_source_groups.index(fg_group) + 1
-    fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
-    fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
-
-    if progress:
-        progress.publish(
-            stage="genesis_v2_foreground",
-            source_family=fg_family,
-            source_pass=fg_idx,
-            status="processing",
-        )
-    else:
-        db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={"stage": "genesis_v2_foreground", "source_family": fg_family},
-            processed_chunks=0,
-        )
-    msgs = analysis_messages if isinstance(analysis_messages, list) else []
-    # fresh_start-only = every analysis message is the synthetic sentinel (routed
-    # into the history bucket by _plaintext_route_family, so group source_kind
-    # can't tell it apart from real history — the message `source` can).
-    # isinstance INSIDE the all() condition, never as an `if` filter — filtering
-    # would make non-dict junk (["bad"]) vacuously pass as all([]) is True and
-    # mis-route it into the fresh_start carve-out.
-    fresh_start_only = bool(msgs) and all(
-        isinstance(m, dict)
-        and str(m.get("source") or "") == history_import._FRESH_START_SOURCE
-        for m in msgs
-    )
-    # Computed BEFORE the foreground loop, and combined-map is disabled outright
-    # for sentinel-only input: with the flag on (test compose sets it), the loop
-    # would otherwise extract voice candidates from the sentinel and
-    # build_voice_persona_output_from_candidates would distill persona from
-    # synthetic text — the same "never derive anything from the sentinel" rule
-    # the identity skip below enforces. Gating the flag here also keeps
-    # include_voice_candidates off, not just the final artifact write.
-    combined_map = worker.genesis_combined_map_enabled() and not fresh_start_only
-    foreground_reduces: list[dict] = []
-    primary_reduce: dict | None = None
-    voice_candidates: list[dict] = []
-    persona_material_parts: list[str] = []
-    for idx, group in enumerate(fg_source_groups, start=1):
-        group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
-        group_family = str(group.get("source_family") or worker._source_family(group_kind))
-        raw_group_chunks = list(group.get("chunk_texts") or [])
-        checkpoint_indices = group.get("_checkpoint_chunk_indices")
-        if (
-            not isinstance(checkpoint_indices, list)
-            or len(checkpoint_indices) != len(raw_group_chunks)
-            or not all(isinstance(value, int) for value in checkpoint_indices)
-        ):
-            checkpoint_indices = list(range(len(raw_group_chunks)))
-        indexed_group_chunks = [
-            (full_index, str(text))
-            for full_index, text in zip(checkpoint_indices, raw_group_chunks)
-            if str(text or "").strip()
-        ]
-        if not indexed_group_chunks:
-            continue
-        checkpoint_indices = [full_index for full_index, _text in indexed_group_chunks]
-        group_chunks = [text for _full_index, text in indexed_group_chunks]
-        resume_map_outputs = None
-        on_map_completed = None
-        if progress:
-            completed = progress.resume_outputs(idx, group_family)
-            resume_map_outputs = {
-                local_index: completed[full_index]
-                for local_index, full_index in enumerate(checkpoint_indices)
-                if full_index in completed
-            }
-
-            def on_map_completed(
-                chunk_index,
-                output,
-                *,
-                source_pass=idx,
-                family=group_family,
-                full_indices=tuple(checkpoint_indices),
-            ):
-                progress.record_map(
-                    source_pass,
-                    family,
-                    full_indices[chunk_index],
-                    output,
-                )
-
-        if combined_map and group_family == "ai_persona":
-            persona_material_parts.extend(group_chunks)
-        reduce = worker.build_foreground_output_from_texts(
-            user_id=store.user_id, job_id=job_id,
-            key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
-            runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
-            include_voice_candidates=combined_map,
-            write_core=False,
-            user_name=user_name,
-            llm=llm,
-            resume_map_outputs=resume_map_outputs,
-            on_map_completed=on_map_completed,
-        )
-        if progress and isinstance(reduce.get("map_diagnostics"), list):
-            mapped_diagnostics: list[dict] = []
-            for diagnostic in reduce["map_diagnostics"]:
-                if not isinstance(diagnostic, dict):
-                    continue
-                local_index = int(diagnostic.get("chunk_index") or 0)
-                full_index = (
-                    checkpoint_indices[local_index]
-                    if 0 <= local_index < len(checkpoint_indices)
-                    else local_index
-                )
-                mapped_diagnostics.append({**diagnostic, "chunk_index": full_index})
-            progress.record_map_diagnostics(idx, group_family, mapped_diagnostics)
-        foreground_reduces.append(reduce)
-        voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
-        if idx == fg_idx:
-            primary_reduce = reduce
-
-    if not foreground_reduces:
-        return False
-    primary_reduce = primary_reduce or foreground_reduces[0]
-    hw_total = int(primary_reduce.get("history_windows_total") or 0)
-    hw_failed = int(primary_reduce.get("history_windows_failed") or 0)
-    all_fact_candidates: list[dict] = []
-    for reduce in foreground_reduces:
-        candidates = reduce.get("all_fact_candidates") or reduce.get("core_fact_candidates") or []
-        all_fact_candidates.extend([c for c in candidates if isinstance(c, dict)])
-
-    core = primary_reduce.get("core_fact_candidates") or foreground.select_core_for_foreground(all_fact_candidates)
-    if not core and not fresh_start_only:
-        return False  # nothing to work with -> let the v1 full path handle it
-    # fresh_start has no material BY DEFINITION, so `core` is always empty for it.
-    # Falling back to v1 here would complete the job WITHOUT the onboarding
-    # greeting (the v1 full path never greets) — the user would open an empty
-    # chat. Continue instead: the nameless greeting+done branch below handles an
-    # empty core, and _fact_write short-circuits on zero candidates.
-
-    full_fact_write = worker.build_memory_output_from_fact_candidates(
-        user_id=store.user_id,
-        job_id=job_id,
-        key_prefix=f"{job_id}:foreground_full",
-        runtime=runtime,
-        fact_candidates=all_fact_candidates,
-        user_name=user_name,
-        llm=llm,
-    )
-    fg_merged = _plaintext_merge_reducer_outputs(
-        [{**primary_reduce, **full_fact_write}],
-        relationship_anchor=relationship_anchor,
-    )
-    if combined_map:
-        voice_persona_output = worker.build_voice_persona_output_from_candidates(
-            user_id=store.user_id,
-            job_id=job_id,
-            key_prefix=f"{job_id}:foreground_voice_persona",
-            runtime=runtime,
-            voice_candidates=voice_candidates,
-            existing_persona={"content": "\n\n".join(persona_material_parts).strip()} if persona_material_parts else None,
-            user_name=user_name,
-            llm=llm,
-        )
-        fg_merged = _plaintext_merge_reducer_outputs(
-            [{**fg_merged, **voice_persona_output}],
-            relationship_anchor=relationship_anchor,
-        )
-    _attach_plaintext_user_name(fg_merged, user_name)
-    _attach_plaintext_profile(
-        store,
-        api_key,
-        job_id,
-        runtime=runtime,
-        output=fg_merged,
-        key_prefix=f"{job_id}:foreground_profile",
-        llm=llm,
-    )
-    full_memories = fg_merged.get("memories") or []
-    days = int((relationship_anchor or {}).get("days_with_user") or 0)
-    # explicit relationship_started_at (user typed a date) -> honored verbatim below,
-    # per the documented priority; blank -> _store_identity_payload falls back to memory.
-    explicit_started_at = str((relationship_anchor or {}).get("relationship_started_at") or "").strip()
-    language = history_import._import_language_for_store(store, msgs)
-
-    # Foreground-ready contract: derive identity when the material contains a real
-    # signal, but never invent one or make its absence a speaking gate. Greeting and
-    # identity readiness happen before entry; full-memory completion stays in the
-    # continuation. fresh_start skips the identity LLM entirely: deriving a
-    # name from the synthetic sentinel is meaningless (a hallucinated one would be
-    # wrong), and a provider hiccup there must not push a material-less onboarding
-    # into the retryable-failed path — the greeting below must land regardless.
-    if fresh_start_only:
-        identity_payload, id_warnings = {"agent_name": "", "dimensions": []}, []
-    else:
-        identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
-            runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
-            days_with_user=days, language=language,
-        )
-    provider_failure = _provider_identity_failure(id_warnings)
-    if provider_failure or not foreground_identity.has_identity_signal(identity_payload):
-        # Non-LLM lightweight fallback: try to salvage a name from the uploaded
-        # character card / profile text (never calls the LLM). Covers the common
-        # real failure mode (provider hiccup) that used to hard-fail the job.
-        support_texts = [str(m.get("content") or "") for m in msgs
-                         if history_import._is_import_support_message(m)]
-        lite = lightweight_identity.derive_from_support(
-            support_texts, days_with_user=days, language=language)
-        if lightweight_identity.has_signal(lite):
-            identity_payload = lite
-        else:
-            # Only an explicit provider failure is retryable. Material that simply
-            # contains no identity signal is a valid nameless onboarding result and
-            # follows the same greeting + done path as fresh_start.
-            if provider_failure:
-                service.mark_failed(store, job_id, "onboarding_no_identity:provider_unstable")
-                return True
-    if sanitize_user_name(user_name) != "TA":
-        identity_payload["user_preferred_name"] = sanitize_user_name(user_name)
-    identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
-    persona_ref = ""
-    persona_sha = ""
-    if combined_map and identity_first:
-        persona_ref, persona_sha = service.write_persona_artifact(
-            store, job_id, fg_merged
-        )
-        service.write_voice_artifact(store, job_id, fg_merged)
-
-    if identity_first:
-        # core memories now; identity via the legacy _store_identity_payload (exact old
-        # path — writes the card + relationship anchor); greeting via the legacy pair.
-        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-            mem_count, _mr = service.apply_memory_outputs(
-                store, api_key, {"memories": full_memories}
-            )
-            attempt.finish(
-                "not_provided" if not full_memories
-                else "partial" if mem_count < len(full_memories)
-                else "written"
-            )
-        service.write_profile_artifact(store, job_id, fg_merged, api_key)
-        with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as attempt:
-            identity_row = history_import._store_identity_payload(
-                store, identity_payload, days_with_user=days,
-                evidence=f"genesis_foreground:{job_id}", language=language,
-                relationship_started_at=explicit_started_at,
-            )
-            attempt.finish("written" if identity_row else "not_provided")
-        _append_plaintext_onboarding_greeting(
-            store,
-            job_id=job_id,
-            runtime=runtime,
-            analysis_messages=msgs,
-            memories=full_memories,
-            identity_payload=identity_payload,
-            days=days,
-            language=language,
-            fresh_start=fresh_start_only,
-        )
-        identity_status = "initialized"
-    else:
-        # No foreground identity signal: enter nameless after greeting/core, then
-        # let background enrichment add an identity later if the full material supports it.
-        _append_plaintext_onboarding_greeting(
-            store,
-            job_id=job_id,
-            runtime=runtime,
-            analysis_messages=msgs,
-            memories=full_memories,
-            identity_payload=identity_payload,
-            days=days,
-            language=language,
-            fresh_start=fresh_start_only,
-        )
-        foreground_result = service.apply_reducer_output(
-            store,
-            api_key,
-            job_id,
-            fg_merged,
-            complete_job=False,
-        ) or {}
-        mem_count = int(foreground_result.get("memory_action_count") or 0)
-        identity_status = str(foreground_result.get("identity_status") or "")
-        persona_ref = str(foreground_result.get("persona_ref") or persona_ref)
-        persona_sha = str(foreground_result.get("persona_sha256") or persona_sha)
-
-    # The foreground has produced a usable entry state, but the import is not done
-    # until the full source_groups set is checkpointed below.
-    notices_core.resolve(store, "genesis:")
-
-    if progress:
-        progress.mark_identity_ready()
-        progress.publish(
-            stage="genesis_v2_foreground_ready",
-            status="processing",
-            extra={
-                "history_windows_total": hw_total,
-                "history_windows_failed": hw_failed,
-            },
-        )
-    else:
-        db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={
-                "stage": "genesis_v2_foreground_ready",
-                "identity_ready": True,
-                "history_windows_total": hw_total,
-                "history_windows_failed": hw_failed,
-            },
-        )
-
-    completion = {
-        "memory_action_count": mem_count,
-        "identity_status": identity_status,
-        "persona_ref": persona_ref,
-        "persona_sha256": persona_sha,
-    }
-
-    if fresh_start_only:
-        # No material by definition -> nothing to enrich. Background here would
-        # re-reduce the pure sentinel as history with write_identity=True (prod
-        # can be reached regardless of the combined-map deployment flag) —
-        # inventing persona/identity from synthetic text the foreground
-        # explicitly refuses to distill, plus wasted provider calls. The greeting
-        # landed and there are no real material windows to enrich; complete now.
-        _complete_plaintext_v2_job(store, job_id, progress=progress, **completion)
-        return True
-
-    # foreground core memory texts -> background as "already saved, don't repeat"
-    # (semantic dedup of reworded twins lives in the model).
-    core_memory_texts = [
-        t for t in (str((m or {}).get("summary") or (m or {}).get("content") or "").strip()
-                    for m in full_memories) if t
-    ]
-
-    # Background continuation consumes the full unsampled source groups. Combined-map
-    # already produced voice/persona in the foreground, so its continuation only fills
-    # memory windows; both modes must write the remaining memories.
-    try:
-        _run_plaintext_background_enrichment(
-            store, api_key, job_id, runtime=runtime, source_groups=source_groups,
-            relationship_anchor=relationship_anchor,
-            skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
-            known_memories=core_memory_texts, write_identity=not identity_first,
-            include_memory=True,
-            include_persona_voice=not combined_map,
-            user_name=user_name,
-            llm=llm,
-            progress=progress,
-            completion=completion,
-        )
-    except Exception as e:  # noqa: BLE001
-        service.mark_failed(
-            store,
-            job_id,
-            f"genesis_v2_background_failed:{type(e).__name__}:{str(e)[:220]}",
-            exc=e,
-        )
-    return True
 
 
 def _complete_plaintext_v2_job(
@@ -1860,189 +1385,6 @@ def _complete_plaintext_v2_job(
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
 
 
-def _run_plaintext_background_enrichment(
-    store,
-    api_key: str | None,
-    job_id: str,
-    *,
-    runtime,
-    source_groups: list[dict],
-    relationship_anchor: dict | None,
-    skip_family: str,
-    skip_texts: set[str],
-    known_memories: list[str] | None = None,
-    write_identity: bool = True,
-    include_memory: bool = True,
-    include_persona_voice: bool = True,
-    user_name: str = "",
-    llm: GenesisLLMClient | None = None,
-    progress: _PlaintextCheckpointProgress | None = None,
-    completion: dict[str, Any] | None = None,
-) -> None:
-    """Background continuation: the full reduce over every group (skipping the core the
-    foreground already wrote for skip_family), then apply the REST incrementally —
-    memories + persona + voice. With completion metadata, this is the only path that
-    marks a material-backed v2 job done.
-
-    Dedup is two-layered against the foreground core (`known_memories`): the model
-    dedups reworded twins semantically inside fact_write (known_memories = "already
-    saved, don't repeat"), and a CONSERVATIVE lexical backstop drops any near-identical
-    survivor before apply. The lexical threshold is high on purpose — it must never
-    merge two distinct same-template facts (美式/拿铁, 蛋子/金毛)."""
-    known = [t for t in (str(x or "").strip() for x in (known_memories or [])) if t]
-    reducer_outputs: list[dict] = []
-    existing_persona: dict = {}
-    existing_voice: dict = {}
-    for idx, group in enumerate(source_groups, start=1):
-        group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
-        group_family = str(group.get("source_family") or worker._source_family(group_kind))
-        group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
-        if not group_chunks:
-            continue
-        if progress:
-            progress.publish(
-                stage="genesis_v2_background",
-                source_family=group_family,
-                source_pass=idx,
-                status="processing",
-            )
-        else:
-            db.genesis_set_job_status(
-                store.user_id, job_id, status="processing",
-                output={"stage": "genesis_v2_background", "source_family": group_family,
-                        "source_pass": idx, "source_pass_total": len(source_groups)},
-            )
-        output = worker.build_reducer_output_from_texts(
-            user_id=store.user_id, job_id=job_id,
-            key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
-            runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
-            existing_persona=existing_persona, existing_voice=existing_voice,
-            # only the foreground group needs its already-written core skipped/deduped
-            skip_fact_texts=skip_texts if group_family == skip_family else None,
-            known_memories=known if group_family == skip_family else None,
-            include_memory=include_memory,
-            include_persona_voice=include_persona_voice,
-            user_name=user_name,
-            llm=llm,
-            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
-            resume_voice_outputs=(
-                progress.resume_voice_outputs(idx, group_family) if progress else None
-            ),
-            on_map_completed=(
-                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
-                 progress.record_map(source_pass, family, chunk_index, mapped))
-                if progress else None
-            ),
-            on_voice_completed=(
-                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
-                 progress.record_voice(source_pass, family, chunk_index, mapped))
-                if progress else None
-            ),
-        )
-        if progress and group_family in {"ai_persona", "memory_summary"}:
-            progress.record_non_map_group(
-                idx,
-                group_family,
-                cards=_material_card_count(output),
-            )
-        reducer_outputs.append(output)
-        next_persona = _plaintext_existing_persona_from_output(output)
-        if next_persona:
-            existing_persona = next_persona
-        next_voice = _plaintext_existing_voice_from_output(output)
-        if next_voice:
-            existing_voice = next_voice
-
-    merged = _plaintext_merge_reducer_outputs(reducer_outputs, relationship_anchor=relationship_anchor)
-    # conservative lexical backstop: drop any near-identical survivor the model missed
-    if include_memory and known and isinstance(merged.get("memories"), list):
-        kept, dropped = dedup.filter_semantic_dups(merged["memories"], known)
-        if dropped:
-            merged["memories"] = kept
-    # Generate every derived output for this pass before any of them is
-    # persisted. When foreground had no identity signal, the background may
-    # derive a baseline from the already-generated persona; absence remains
-    # valid and does not block the other products.
-    if write_identity and not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
-        persona_content = str(merged["persona"].get("content") or "").strip()
-        if persona_content:
-            baseline = worker.derive_identity_from_persona(
-                user_id=store.user_id,
-                job_id=job_id,
-                runtime=runtime,
-                persona_content=persona_content,
-                user_name=user_name,
-            )
-            if baseline.get("agent_name") or baseline.get("dimensions"):
-                # B2: merge, don't overwrite — ``merged["identity"]`` may
-                # already carry user-layer signal from a user_profile pass.
-                existing_identity = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
-                merged["identity"] = {**existing_identity, **baseline}
-    _attach_plaintext_user_name(merged, user_name)
-    _attach_plaintext_profile(
-        store,
-        api_key,
-        job_id,
-        runtime=runtime,
-        output=merged,
-        key_prefix=f"{job_id}:background_profile",
-        llm=llm,
-    )
-    # apply the REST without re-completing: memories (core already excluded), persona, voice
-    background_memory_count = 0
-    if include_memory:
-        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-            apply_result = service.apply_memory_outputs(store, api_key, merged)
-            if isinstance(apply_result, tuple) and apply_result:
-                background_memory_count = int(apply_result[0] or 0)
-            raw_memories = merged.get("memories") or merged.get("facts") or []
-            raw_count = len(raw_memories) if isinstance(raw_memories, list) else 0
-            attempt.finish(
-                "not_provided" if raw_count == 0
-                else "partial" if background_memory_count < raw_count
-                else "written"
-            )
-    service.write_profile_artifact(store, job_id, merged, api_key)
-    # Identity is normally written by the foreground (identity-first contract),
-    # so the background skips it when write_identity=False.
-    background_identity_status = ""
-    if write_identity:
-        with distillation_ledger.ArtifactAttempt(store, job_id, "identity") as attempt:
-            background_identity_status = service.init_identity_if_absent(
-                store, merged, api_key
-            ) or "not_provided"
-            attempt.finish(background_identity_status)
-    background_persona_ref, background_persona_sha = service.write_persona_artifact(
-        store, job_id, merged
-    )
-    service.write_voice_artifact(store, job_id, merged)
-    if completion is not None:
-        _complete_plaintext_v2_job(
-            store,
-            job_id,
-            progress=progress,
-            memory_action_count=(
-                int(completion.get("memory_action_count") or 0) + background_memory_count
-            ),
-            identity_status=(
-                background_identity_status
-                or str(completion.get("identity_status") or "")
-            ),
-            persona_ref=(
-                background_persona_ref
-                or str(completion.get("persona_ref") or "")
-            ),
-            persona_sha256=(
-                background_persona_sha
-                or str(completion.get("persona_sha256") or "")
-            ),
-        )
-    elif progress:
-        progress.publish(stage="genesis_v2_done", status=service.DONE_JOB_STATUS)
-    else:
-        db.genesis_set_job_status(
-            store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
-        )
     # Foreground readiness already resolved stale failure notices. Do not resolve
     # again here: later stages may add a fresh partial notice in future revisions.
 
@@ -2095,164 +1437,6 @@ def _append_plaintext_onboarding_greeting(
             return ""
         attempt.finish("written")
     return str(greeting_text or "")
-
-
-def _run_plaintext_add_memory_job(
-    store,
-    api_key: str | None,
-    job_id: str,
-    *,
-    runtime,
-    source_groups: list[dict],
-    relationship_anchor: dict | None = None,
-    user_name: str = "",
-    llm: GenesisLLMClient | None = None,
-    progress: _PlaintextCheckpointProgress | None = None,
-) -> None:
-    # this add_memory job path bypasses service.apply_reducer_output (which resolves
-    # genesis notices for the reducer-driven completion path) -> resolve here too, at
-    # the *start* of the run (matching the fix in apply_reducer_output: resolving
-    # stale notices before any new emit, not after, so a partial notice emitted later
-    # in this same run isn't immediately clobbered by its own dedupe-key prefix match).
-    notices_core.resolve(store, "genesis:")
-    fact_candidates: list[dict] = []
-    first_output: dict = {}
-    # A: long-term-memory archive uploads (source_family=memory_summary) → keep_all (write the
-    # user's curated facts thoroughly). Chat-history uploads keep the normal selective behavior.
-    keep_all_job = False
-    for idx, group in enumerate(source_groups, start=1):
-        group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
-        group_family = str(group.get("source_family") or worker._source_family(group_kind))
-        group_chunks = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
-        if not group_chunks:
-            continue
-        keep_all = group_family == "memory_summary"
-        keep_all_job = keep_all_job or keep_all
-        if progress:
-            progress.publish(
-                stage="plaintext_add_memory",
-                source_family=group_family,
-                source_pass=idx,
-                status="processing",
-            )
-        else:
-            db.genesis_set_job_status(
-                store.user_id,
-                job_id,
-                status="processing",
-                output={
-                    "stage": "plaintext_add_memory",
-                    "source_family": group_family,
-                    "source_pass": idx,
-                    "source_pass_total": len(source_groups),
-                },
-            )
-        output = worker.build_foreground_output_from_texts(
-            user_id=store.user_id,
-            job_id=job_id,
-            key_prefix=f"{job_id}:add_memory:{idx}:{group_family}",
-            runtime=runtime,
-            chunk_texts=group_chunks,
-            source_kind=group_kind,
-            write_core=False,
-            keep_all=keep_all,
-            user_name=user_name,
-            llm=llm,
-            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
-            on_map_completed=(
-                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
-                 progress.record_map(source_pass, family, chunk_index, mapped))
-                if progress else None
-            ),
-        )
-        if progress:
-            progress.record_map_diagnostics(
-                idx,
-                group_family,
-                output.get("map_diagnostics") if isinstance(output.get("map_diagnostics"), list) else [],
-            )
-        if not first_output:
-            first_output = output
-        candidates = output.get("all_fact_candidates") or output.get("core_fact_candidates") or []
-        fact_candidates.extend([item for item in candidates if isinstance(item, dict)])
-
-    memory_output = worker.build_memory_output_from_fact_candidates(
-        user_id=store.user_id,
-        job_id=job_id,
-        key_prefix=f"{job_id}:add_memory:fact_write",
-        runtime=runtime,
-        fact_candidates=fact_candidates,
-        keep_all=keep_all_job,
-        user_name=user_name,
-        llm=llm,
-    )
-    merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor=relationship_anchor)
-    raw_items = merged.get("memories")
-    if raw_items is None:
-        raw_items = merged.get("facts")
-    raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as attempt:
-        mem_count, _results = service.apply_memory_outputs(
-            store,
-            api_key,
-            merged,
-            preserve_dates=keep_all_job,
-            fallback_occurred_at=str((relationship_anchor or {}).get("relationship_started_at") or "").strip(),
-        )
-        attempt.finish(
-            "not_provided" if raw_count == 0
-            else "partial" if mem_count < raw_count
-            else "written"
-        )
-    if keep_all_job and mem_count == 0:
-        distill_diagnostics = {
-            "reason": "keep_all_zero_cards",
-            "map_candidate_count": len(fact_candidates),
-            "raw_memory_count": raw_count,
-        }
-        if progress:
-            progress.publish(
-                stage="plaintext_add_memory_failed",
-                status="processing",
-                extra={"distill_diagnostics": distill_diagnostics},
-            )
-        else:
-            db.genesis_set_job_status(
-                store.user_id,
-                job_id,
-                status="processing",
-                output={
-                    "stage": "plaintext_add_memory_failed",
-                    "distill_diagnostics": distill_diagnostics,
-                },
-            )
-        raise worker.GenesisWorkerError(
-            "distill_empty_output:keep_all_nonempty:zero_memory_cards"
-        )
-    dropped = raw_count - mem_count
-    if dropped > 0:
-        notices_core.emit(store, source="genesis", error_class="genesis_partial",
-                           blame="system", severity="warning",
-                           user_text=catalog.user_text_for("genesis_partial"),
-                           detail=f"dropped {dropped} card(s)",
-                           dedupe_key=f"genesis:{job_id}:partial")
-    completed = db.genesis_complete_job(
-        store.user_id,
-        job_id,
-        output={
-            "stage": "plaintext_add_memory_done",
-        },
-        memory_action_count=mem_count,
-        identity_status="skipped",
-        persona_ref="",
-        persona_sha256="",
-    )
-    if completed:
-        service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
-        if progress:
-            progress.mark_identity_ready()
-            progress.publish(stage="plaintext_add_memory_done", status=service.DONE_JOB_STATUS)
-    _write_back_plaintext_user_name(store, api_key, user_name, job_id=job_id)
 
 
 def _run_plaintext_update_identity_job(
@@ -2455,7 +1639,7 @@ def _run_plaintext_genesis_job(
             store, api_key, runtime, source_groups
         )
 
-        if mode == "add_memory" and not progress.legacy:
+        if mode == "add_memory":
             from genesis import plaintext_garden
 
             _trace_genesis(store, "genesis.plaintext.add_memory.started", job_id=job_id,
@@ -2468,7 +1652,7 @@ def _run_plaintext_genesis_job(
                            detail={"mode": mode, "engine": garden_import.ENGINE},
                            dur_ms=(time.time() - started_at) * 1000)
             return
-        if mode == "onboarding" and not progress.legacy:
+        if mode == "onboarding":
             from genesis import plaintext_garden
 
             path = plaintext_garden.run_onboarding(
@@ -2479,22 +1663,6 @@ def _run_plaintext_genesis_job(
                            detail={"mode": mode, "engine": garden_import.ENGINE,
                                    "genesis_v2": path == "genesis_v2"},
                            dur_ms=(time.time() - started_at) * 1000)
-            return
-        if mode == "add_memory":
-            _trace_genesis(store, "genesis.plaintext.add_memory.started", job_id=job_id, summary="add memory job started")
-            _run_plaintext_add_memory_job(
-                store,
-                api_key,
-                job_id,
-                runtime=runtime,
-                source_groups=source_groups,
-                relationship_anchor=relationship_anchor,
-                user_name=user_name,
-                llm=llm,
-                progress=progress,
-            )
-            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
-                           detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
             return
         if mode == "update_identity":
             _trace_genesis(store, "genesis.plaintext.update_identity.started", job_id=job_id,
@@ -2515,139 +1683,6 @@ def _run_plaintext_genesis_job(
                            dur_ms=(time.time() - started_at) * 1000)
             return
 
-        # Genesis v2 (FEEDLING_GENESIS_V2_ENABLED): foreground-fast — greet on 3-5 core
-        # + identity baseline, push the heavy reduce to background. Returns False when
-        # the foreground yields nothing greetable, so we fall through to the v1 path.
-        if worker.genesis_v2_enabled() and _run_plaintext_genesis_v2(
-            store, api_key, job_id,
-            runtime=runtime, source_groups=source_groups, relationship_anchor=relationship_anchor,
-            analysis_messages=analysis_messages,
-            user_name=user_name,
-            llm=llm,
-            progress=progress,
-        ):
-            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="genesis v2 job handled",
-                           detail={"mode": mode, "genesis_v2": True}, dur_ms=(time.time() - started_at) * 1000)
-            return
-
-        reducer_outputs: list[dict] = []
-        existing_persona: dict = {}
-        existing_voice: dict = {}
-        for idx, group in enumerate(source_groups, start=1):
-            group_source_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
-            group_source_family = str(group.get("source_family") or worker._source_family(group_source_kind))
-            group_chunk_texts = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
-            if not group_chunk_texts:
-                continue
-            progress.publish(
-                stage="plaintext_reducer",
-                source_family=group_source_family,
-                source_pass=idx,
-                status="processing",
-            )
-            pass_started_at = time.time()
-            _trace_genesis(
-                store,
-                "genesis.plaintext.reducer_pass.started",
-                job_id=job_id,
-                summary="source reducer pass started",
-                detail={
-                    "source_family": group_source_family,
-                    "source_pass": idx,
-                    "source_pass_total": len(source_groups),
-                    "chunk_count": len(group_chunk_texts),
-                },
-            )
-            output = worker.build_reducer_output_from_texts(
-                user_id=store.user_id,
-                job_id=job_id,
-                key_prefix=f"{job_id}:source_pass:{idx}:{group_source_family}",
-                runtime=runtime,
-                chunk_texts=group_chunk_texts,
-                source_kind=group_source_kind,
-                existing_persona=existing_persona,
-                existing_voice=existing_voice,
-                user_name=user_name,
-                llm=llm,
-                resume_map_outputs=progress.resume_outputs(idx, group_source_family),
-                resume_voice_outputs=progress.resume_voice_outputs(idx, group_source_family),
-                on_map_completed=(
-                    lambda chunk_index, mapped, source_pass=idx, family=group_source_family:
-                    progress.record_map(source_pass, family, chunk_index, mapped)
-                ),
-                on_voice_completed=(
-                    lambda chunk_index, mapped, source_pass=idx, family=group_source_family:
-                    progress.record_voice(source_pass, family, chunk_index, mapped)
-                ),
-            )
-            if progress and group_source_family in {"ai_persona", "memory_summary"}:
-                progress.record_non_map_group(
-                    idx,
-                    group_source_family,
-                    cards=_material_card_count(output),
-                )
-            _trace_genesis(
-                store,
-                "genesis.plaintext.reducer_pass.done",
-                job_id=job_id,
-                summary="source reducer pass done",
-                detail={
-                    "source_family": group_source_family,
-                    "source_pass": idx,
-                    "source_pass_total": len(source_groups),
-                    "memory_count": len(output.get("memories") or []) if isinstance(output, dict) else 0,
-                    "has_identity": bool(isinstance(output, dict) and output.get("identity")),
-                    "has_persona": bool(isinstance(output, dict) and output.get("persona")),
-                },
-                dur_ms=(time.time() - pass_started_at) * 1000,
-            )
-            reducer_outputs.append(output)
-            next_persona = _plaintext_existing_persona_from_output(output)
-            if next_persona:
-                existing_persona = next_persona
-            next_voice = _plaintext_existing_voice_from_output(output)
-            if next_voice:
-                existing_voice = next_voice
-
-        reducer_output = _plaintext_merge_reducer_outputs(
-            reducer_outputs,
-            relationship_anchor=relationship_anchor,
-        )
-        _attach_plaintext_user_name(reducer_output, user_name)
-        _attach_plaintext_profile(
-            store,
-            api_key,
-            job_id,
-            runtime=runtime,
-            output=reducer_output,
-            key_prefix=f"{job_id}:merged_profile",
-            llm=llm,
-        )
-        progress.publish(stage="plaintext_reducer_done")
-        _trace_genesis(
-            store,
-            "genesis.plaintext.apply.started",
-            job_id=job_id,
-            summary="apply merged reducer output",
-            detail={
-                "source_groups": len(source_groups),
-                "memory_count": len(reducer_output.get("memories") or []) if isinstance(reducer_output, dict) else 0,
-                "has_identity": bool(isinstance(reducer_output, dict) and reducer_output.get("identity")),
-                "has_persona": bool(isinstance(reducer_output, dict) and reducer_output.get("persona")),
-            },
-        )
-        service.apply_reducer_output(store, api_key, job_id, reducer_output)
-        progress.mark_identity_ready()
-        progress.publish(stage="plaintext_reducer_done", status=service.DONE_JOB_STATUS)
-        _write_back_plaintext_user_name(store, api_key, user_name, job_id=job_id)
-        _trace_genesis(
-            store,
-            "genesis.plaintext.done",
-            job_id=job_id,
-            summary="plaintext genesis job done",
-            detail={"mode": mode, "source_groups": len(source_groups)},
-            dur_ms=(time.time() - started_at) * 1000,
-        )
     except Exception as e:  # noqa: BLE001
         _trace_genesis(
             store,

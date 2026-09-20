@@ -2757,7 +2757,10 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
     rows.sort(key=sort_tuple)
 
 
-def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
+def _data_track_payload(
+    *, include_users: bool = True, include_detail_user: str = "",
+    statement_timeout_ms: int | None = None,
+) -> dict:
     filters = _data_track_request_filters()
     # Read-only snapshot: do NOT normalize+persist here. load_users() already
     # normalizes on boot and on every cross-worker reload, so an admin GET must
@@ -2769,6 +2772,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     user_ids = [str(u.get("user_id") or "") for u in users]
     snapshot = db.admin_data_track_snapshot(
         user_ids,
+        statement_timeout_ms=statement_timeout_ms,
         # Fleet-wide users *and* summary paths must stay bounded. One-user
         # detail bypasses this payload and keeps the legacy breakdowns through
         # admin_data_track_snapshot's default True.
@@ -2804,6 +2808,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
                         "message": "取数状态缺失",
                     }
                 ),
+                "wake_provider_circuit_open": snapshot.get(uid, {}).get("wake_provider_circuit_open"),
                 "provider_state": str(
                     health.get("provider_state") or "ok"
                 ),
@@ -3010,6 +3015,11 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         ),
         "proactive_breakdowns_status": proactive_breakdowns_status,
         "provider_needs_user_action": provider_needs_user_action,
+        "wake_provider_circuit_open_users": (
+            sum(row["wake_provider_circuit_open"] is True for row in rows)
+            if all(row.get("wake_provider_circuit_open") is not None for row in rows)
+            else None
+        ),
         "app_usage": {
             "foreground_sec_total": au_fg_total,
             "sessions_total": au_sessions_total,
@@ -4128,6 +4138,13 @@ def _debug_event_public_json(
         provider_error_class = raw_detail.get("provider_error_class")
         if provider_error_class in {"transient", "provider_config", "unknown"}:
             public_detail["provider_error_class"] = provider_error_class
+        for key, allowed in (
+            ("provider_error_type", v2_worker.provider_client.PROVIDER_ERROR_TYPES),
+            ("error_signature", v2_worker.provider_client.PROVIDER_ERROR_SIGNATURES),
+        ):
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed:
+                public_detail[key] = value
         error_class = raw_detail.get("error_class")
         if isinstance(error_class, str) and error_class in _known_error_classes():
             public_detail["error_class"] = error_class
@@ -9023,6 +9040,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         _render_metric("聊天消息总数", summary["chat_messages_total"]),
         _render_metric("记忆总数", summary["memory_total"]),
         _render_metric("主动任务数", summary["proactive_jobs_total"]),
+        _render_metric(
+            "主动唤醒熔断账号行（当前筛选）",
+            summary.get("wake_provider_circuit_open_users")
+            if summary.get("wake_provider_circuit_open_users") is not None else "量不到",
+        ),
         _render_metric(
             "模型配置待处理",
             summary.get("provider_needs_user_action", 0),

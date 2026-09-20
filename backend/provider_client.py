@@ -38,6 +38,56 @@ log = logging.getLogger(__name__)
 _MAX_RAW_PROVIDER_ERROR_BODY_CHARS = 64 * 1024
 
 
+PROVIDER_ERROR_TYPES = frozenset({
+    "invalid_request_error", "authentication_error", "permission_error",
+    "not_found_error", "rate_limit_error", "api_error", "overloaded_error",
+    "context_length_exceeded", "insufficient_quota", "invalid_api_key",
+    "request_too_large", "unknown",
+})
+_PROVIDER_ERROR_SIGNATURE_PATTERNS = (
+    ("thinking_forced_tool_choice", r"thinking.*(?:may not|cannot|not supported|incompatible).*tool_choice|tool_choice.*(?:incompatible|not supported).*thinking"),
+    ("trailing_whitespace", r"(?:final|assistant).*trailing\s+whitespace"),
+    ("tool_use_id_mismatch", r"unexpected\s+tool_use_id|tool_use_id.*(?:not found|missing)|tool_result.*(?:without|must have|matching).*tool_use|tool_use.*(?:without|must have|matching).*tool_result"),
+    ("invalid_tool_schema", r"(?:tools?(?:\[\d+\]|\.\d+)?[.: ]+)?input_schema.*(?:invalid|must|should)|(?:invalid|unsupported).*tool.*schema|tool.*name.*(?:must|match|invalid)"),
+    ("budget_tokens_unsupported", r"budget_tokens.*(?:not supported|unsupported|not permitted|extra)|(?:unsupported|unknown).*budget_tokens"),
+    ("max_tokens_invalid", r"max_tokens.*(?:invalid|must|exceed|greater|less)|(?:invalid|unsupported).*max_tokens"),
+)
+PROVIDER_ERROR_SIGNATURES = frozenset(
+    name for name, _ in _PROVIDER_ERROR_SIGNATURE_PATTERNS
+) | {"unclassified"}
+
+
+def provider_error_diagnostics(exc: BaseException) -> dict[str, str]:
+    """Project untrusted provider errors into closed, content-free values.
+
+    Raw response bodies remain classification-only, never part of the result.
+    Unknown types/messages are explicitly unknown/unclassified, not copied.
+    """
+    error_type = "unknown"
+    message = str(getattr(exc, "response_detail", "") or "")
+    try:
+        body = json.loads(str(getattr(exc, "raw_response_body", "") or ""))
+    except (ValueError, TypeError, RecursionError):
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        for field in ("type", "code"):
+            value = error.get(field)
+            if isinstance(value, str) and value in PROVIDER_ERROR_TYPES:
+                error_type = value
+                break
+        if isinstance(error.get("message"), str):
+            message = error["message"]
+    # Bounded matching also keeps malformed upstream diagnostics inexpensive.
+    message = message[:4096]
+    signature = "unclassified"
+    for name, pattern in _PROVIDER_ERROR_SIGNATURE_PATTERNS:
+        if re.search(pattern, message, re.IGNORECASE | re.DOTALL):
+            signature = name
+            break
+    return {"provider_error_type": error_type, "error_signature": signature}
+
+
 class ProviderError(Exception):
     def __init__(
         self,
@@ -4204,6 +4254,15 @@ def _build_anthropic_payload(
             payload["tool_choice"] = {"type": "any"}
         elif tool_choice == "auto":
             payload["tool_choice"] = {"type": "auto"}
+        # Anthropic rejects manual extended thinking with forced tool use.
+        # Decide from the translated wire choice so both required and named
+        # calls retain their forcing contract; ordinary auto/none rounds keep
+        # reasoning. This builder is shared by sync and async callers.
+        if (
+            payload.get("thinking", {}).get("type") == "enabled"
+            and payload.get("tool_choice", {}).get("type") in {"any", "tool"}
+        ):
+            payload.pop("thinking")
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
     # above; top-level cache_control is not part of the Messages API schema.
@@ -4445,6 +4504,12 @@ def _build_bedrock_payload(
             payload["toolConfig"]["toolChoice"] = {"tool": {"name": tool_choice["function"]["name"]}}
         elif tool_choice == "required":
             payload["toolConfig"]["toolChoice"] = {"any": {}}
+        if thinking_enabled and (
+            {"tool", "any"} & payload["toolConfig"].get("toolChoice", {}).keys()
+        ):
+            # Manual thinking cannot accompany forced tool use on Bedrock.
+            # Retain the translated choice and use its explicit off setting.
+            payload["additionalModelRequestFields"]["thinking"] = {"type": "disabled"}
 
     if _cache_key(prompt_cache_key):
         # Converse evaluates cache checkpoints in tools -> system -> messages

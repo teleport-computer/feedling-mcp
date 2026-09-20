@@ -43,6 +43,7 @@ from core import wake_bus
 from memgarden import timestamps as memory_timestamps
 from memory import capture_failure
 from model_api_runtime.v2 import usage_reporting
+from model_api_runtime.v2 import wake_circuit
 from notices import catalog as notices_catalog
 from proactive import capture_daily
 
@@ -1893,14 +1894,15 @@ def enqueue_job_with_context_log(
                         payload["agent_job_id"] = int(job_id)
                         cur.execute(
                             "INSERT INTO user_logs "
-                            "(user_id,stream,ts,item_key,doc) "
-                            "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+                            "(user_id,stream,ts,item_key,doc,duration_sec) "
+                            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING seq",
                             (
                                 str(user_id),
                                 str(context_stream),
                                 float(context_ts),
                                 str(int(job_id)),
                                 Jsonb(payload),
+                                db._user_log_duration_sec(str(context_stream), payload),
                             ),
                         )
                         seq = int(cur.fetchone()["seq"])
@@ -1923,8 +1925,8 @@ def enqueue_job_with_context_log(
     from tee_shadow import mirror
 
     mirror.execute(
-        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc,duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (user_id,stream,seq) DO NOTHING",
         (
             str(user_id),
@@ -1933,6 +1935,7 @@ def enqueue_job_with_context_log(
             float(context_ts),
             str(job_id),
             Jsonb(payload),
+            db._user_log_duration_sec(str(context_stream), payload),
         ),
     )
     return job_id, coalesced
@@ -2365,6 +2368,9 @@ def mark_completed(
             row = cur.fetchone()
             if row is None:
                 return False
+            wake_circuit.record_result_on_cursor(
+                cur, user_id=str(row[0]), lane=str(row[1]), job_id=int(job_id),
+            )
             if clear_wake_backoff and str(row[1]) in _FAIL_BACKOFF_WAKE_LANES:
                 _clear_wake_backoff_on_cursor(cur, str(row[0]))
             return True
@@ -2539,6 +2545,9 @@ def finish_wake_job(
                     )
                 if clear_wake_backoff:
                     _clear_wake_backoff_on_cursor(cur, user_id)
+                wake_circuit.record_result_on_cursor(
+                    cur, user_id=user_id, lane="heartbeat", job_id=int(job_id),
+                )
                 if has_late_input:
                     late_generation = (
                         int(row["input_generation"] or 0)
@@ -2620,6 +2629,7 @@ def mark_failed(
     silence and therefore do not get an outbox row.
     """
     recovered_reviews: list[tuple[str, str]] = []
+    circuit_opened = False
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -2657,8 +2667,14 @@ def mark_failed(
                     base_sec=float(wake_backoff_base_sec),
                     cap_sec=float(wake_backoff_cap_sec),
                 )
+            circuit_opened = wake_circuit.record_result_on_cursor(
+                cur, user_id=str(row[1]), lane=str(row[2]), job_id=int(job_id),
+                error_class=error_class,
+            )
             recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
             _queue_failure_review_on_cursor(cur, job_id)
+    if circuit_opened:
+        wake_circuit.publish(str(row[1]), opened=True)
     if recovered_reviews:
         # Must wait until the transaction above has committed — see the
         # docstring on _recover_review_runner_on_cursor for the race this
@@ -4864,8 +4880,8 @@ def commit_capture_batch(
                                 }
                                 cur.execute(
                                     "INSERT INTO user_logs "
-                                    "(user_id,stream,item_key,doc) "
-                                    "VALUES (%s,'bootstrap_events',%s,%s) "
+                                    "(user_id,stream,item_key,doc,duration_sec) "
+                                    "VALUES (%s,'bootstrap_events',%s,%s,NULL) "
                                     "RETURNING seq",
                                     (
                                         str(user_id),
@@ -4923,8 +4939,8 @@ def commit_capture_batch(
                                 )
                             cur.execute(
                                 "INSERT INTO user_logs "
-                                "(user_id,stream,item_key,doc) "
-                                "VALUES (%s,'memory_changes',%s,%s) RETURNING seq",
+                                "(user_id,stream,item_key,doc,duration_sec) "
+                                "VALUES (%s,'memory_changes',%s,%s,NULL) RETURNING seq",
                                 (str(user_id), change_id, Jsonb(change_doc)),
                             )
                             mirrored_logs.append(
@@ -4990,9 +5006,10 @@ def commit_capture_batch(
         for seq, stream, log_doc, item_key in mirrored_logs:
             mirror.execute(
                 "INSERT INTO user_logs "
-                "(user_id,stream,seq,item_key,doc) OVERRIDING SYSTEM VALUE "
-                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                (str(user_id), stream, seq, item_key, Jsonb(log_doc)),
+                "(user_id,stream,seq,item_key,doc,duration_sec) OVERRIDING SYSTEM VALUE "
+                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (str(user_id), stream, seq, item_key, Jsonb(log_doc),
+                 db._user_log_duration_sec(stream, log_doc)),
             )
     return result
 
@@ -13650,7 +13667,8 @@ def get_wake_schedule(user_id) -> dict | None:
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
                 "proactive_fail_user_seq, pending_followup_generation, "
                 "pending_followup_source_job_id, "
-                "pending_followup_consumed_context_seq, updated_at "
+                "pending_followup_consumed_context_seq, provider_fail_streak, "
+                "wake_circuit_opened_at,wake_circuit_reason,wake_circuit_reset_at, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )
@@ -13868,6 +13886,7 @@ def heartbeat_due_diagnosis(user_id: str, *, now: float | None = None) -> dict:
         return {"present": False}
     sql = (
         "SELECT "
+        "  (schedule.wake_circuit_opened_at IS NOT NULL) AS provider_circuit, "
         "  (schedule.next_heartbeat_at IS NULL) AS unarmed, "
         "  (schedule.next_heartbeat_at IS NOT NULL AND schedule.next_heartbeat_at "
         "     > COALESCE(to_timestamp(%s), now())) AS not_due_yet, "
@@ -13890,7 +13909,7 @@ def heartbeat_due_diagnosis(user_id: str, *, now: float | None = None) -> dict:
     if row is None:
         return {"present": False}
     blockers = [name for name in
-                ("unarmed", "not_due_yet", "payment_cooldown", "dnd", "proactive_backoff")
+                ("unarmed", "not_due_yet", "payment_cooldown", "dnd", "proactive_backoff", "provider_circuit")
                 if bool(row.get(name))]
     return {"present": True, "blocked_by": blockers}
 
@@ -13906,6 +13925,7 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
             cur.execute(
                 "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
                 "WHERE schedule.next_heartbeat_at IS NOT NULL "
+                "AND schedule.wake_circuit_opened_at IS NULL "
                 "AND schedule.next_heartbeat_at "
                 "<= COALESCE(to_timestamp(%s), now()) "
                 "AND (schedule.payment_cooldown_until IS NULL "
@@ -13940,6 +13960,7 @@ def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> lis
             cur.execute(
                 "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
                 "WHERE schedule.next_screen_watch_at IS NOT NULL "
+                "AND schedule.wake_circuit_opened_at IS NULL "
                 "AND schedule.next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
                 "AND (schedule.payment_cooldown_until IS NULL "
                 "     OR schedule.payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "

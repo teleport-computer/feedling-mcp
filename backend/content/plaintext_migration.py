@@ -8,7 +8,7 @@ this module so the command can be exercised without exposing content values.
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 import threading
 import time
@@ -41,6 +41,7 @@ class Result:
     user_id: str
     counts: dict[str, int]
     failures: int = 0
+    failure_items: tuple[dict[str, str], ...] = ()
 
     def public_dict(self) -> dict:
         """Return the intentionally content-free operator report."""
@@ -504,6 +505,7 @@ def run(
     limit: int = 0,
     rate: float = 2.0,
     workers: int = 1,
+    item_ids: set[str] | None = None,
 ) -> Result:
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -523,6 +525,8 @@ def run(
     counts: Counter[str] = Counter()
     candidate_classes = {"migratable_shared", "cleanup_pending"}
     candidates = [item for item in items if item.classification in candidate_classes]
+    if item_ids is not None:
+        candidates = [item for item in candidates if item.item_id in item_ids]
     attempted_candidates = candidates[:limit] if apply and limit else candidates
     deferred = len(candidates) - len(attempted_candidates) if apply else 0
     if deferred:
@@ -533,21 +537,34 @@ def run(
 
     def attempt(item: Item) -> str:
         limiter.wait()
-        try:
-            if item.classification != "cleanup_pending":
-                decrypt = getattr(thread_state, "decrypt", None)
-                if decrypt is None:
-                    decrypt = make_decrypt(user_id)
-                    thread_state.decrypt = decrypt
-            else:
-                decrypt = None
-            return migrate_item(user_id, item, decrypt)
-        except Exception:  # noqa: BLE001 - report only redacted failure class
-            return "failed_transform_or_storage"
+        for retry in range(3):
+            try:
+                if item.classification != "cleanup_pending":
+                    decrypt = getattr(thread_state, "decrypt", None)
+                    if decrypt is None:
+                        decrypt = make_decrypt(user_id)
+                        thread_state.decrypt = decrypt
+                else:
+                    decrypt = None
+                status = migrate_item(user_id, item, decrypt)
+            except Exception:  # noqa: BLE001 - report only redacted failure class
+                status = "failed_transform_or_storage"
+            if status not in {"failed_transform_or_storage", "cas_conflict"}:
+                return status
+            if retry < 2:
+                time.sleep(0.25 * (2**retry))
+        return status
 
     futures = {}
+    failure_items: list[dict[str, str]] = []
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
-        for item in items:
+        pending_items = iter(items)
+
+        def submit_next() -> bool:
+            try:
+                item = next(pending_items)
+            except StopIteration:
+                return False
             if (
                 not apply
                 or item.classification not in candidate_classes
@@ -555,10 +572,27 @@ def run(
             ):
                 if not apply or item.classification not in candidate_classes:
                     counts[item.classification] += 1
-                continue
-            futures[executor.submit(attempt, item)] = item
-        for future in as_completed(futures):
-            counts[future.result()] += 1
+            else:
+                futures[executor.submit(attempt, item)] = item
+            return True
+
+        while len(futures) < max(1, int(workers) * 2) and submit_next():
+            pass
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                item = futures.pop(future)
+                status = future.result()
+                counts[status] += 1
+                if status.startswith("failed_") or status == "cas_conflict":
+                    failure_items.append(
+                        {
+                            "surface": str(item.surface),
+                            "item_id": str(item.item_id),
+                            "status": str(status),
+                        }
+                    )
+                submit_next()
     failures = sum(
         count
         for status, count in counts.items()
@@ -569,4 +603,5 @@ def run(
         user_id=user_id,
         counts=dict(sorted(counts.items())),
         failures=failures,
+        failure_items=tuple(failure_items),
     )

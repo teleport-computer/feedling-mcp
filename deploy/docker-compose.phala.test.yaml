@@ -148,7 +148,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:e82968f
+    image: &enclave-image ghcr.io/teleport-computer/feedling:c28153e
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -227,7 +227,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:e82968f
+    image: ghcr.io/teleport-computer/feedling:c28153e
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -426,7 +426,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:e82968f
+    image: ghcr.io/teleport-computer/feedling:c28153e
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -473,6 +473,13 @@ services:
       # Dream is intentionally always on in test after the guarded rewrite
       # passed live convergence and non-destructive merge verification.
       FEEDLING_V2_DREAM_ENABLED: "1"
+      # Memory embedding sweep (T523 step 1b): encode plaintext cards with the
+      # baked local E5 model (deploy/Dockerfile). test only; prod stays off.
+      FEEDLING_MEMORY_EMBEDDING_ENABLED: "1"
+      FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+      # tokenizers pulls huggingface_hub as a hard dependency; we only ever read
+      # the local tokenizer.json. Make "never phones home" a config fact too.
+      HF_HUB_OFFLINE: "1"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
@@ -547,7 +554,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:e82968f
+    image: ghcr.io/teleport-computer/feedling:c28153e
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
@@ -577,7 +584,7 @@ services:
         condition: service_healthy
 
   log-shipper:
-    image: ghcr.io/teleport-computer/feedling:e82968f
+    image: ghcr.io/teleport-computer/feedling:c28153e
     container_name: log-shipper
     command: ["python", "-u", "ops/log_shipper.py"]
     restart: unless-stopped

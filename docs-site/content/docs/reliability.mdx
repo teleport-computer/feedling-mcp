@@ -274,6 +274,18 @@ validation retain the durable `processed_chunks` count and per-material
 `windows_done` / `windows_total` values after failure; only a completed job
 reports 100 percent.
 
+Legacy plaintext onboarding and add-memory checkpoints with fact-map progress
+and no current import-engine marker are an exception: retry keeps the same job
+ID but saves fresh import progress and processes the submitted material again.
+Already written cards remain in the garden and enter the full existing-card
+index for model-directed merging. If that index cannot be read, the existing
+`genesis.garden_import.index_unavailable` fallback uses an empty index, so
+cross-import deduplication is unavailable. The reset emits a content-free
+`genesis.plaintext.legacy_checkpoint_reset` trace with the old phase and progress
+counts. Current-engine retries and update-identity checkpoints retain their
+normal resume behavior. Onboarding still re-derives and replaces identity on
+retry; its existing per-user greeting guard keeps the original greeting.
+
 Estimate/commit jobs retain their opaque staged-upload identifier in trusted
 job metadata until successful completion releases the staged upload. Completed
 persona-voice map windows are checkpointed in the same encrypted envelope as
@@ -295,12 +307,36 @@ Successful startup removes that file. Current startup exits belong to the
 system, so their spawn-failure notice does not blame the user's model settings.
 An unreachable decrypt source continues retrying within the live consumer.
 
-Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
+Automatic Runtime V2 heartbeat failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new
 genuine user message invalidates an older delay immediately. Manual wakes and
 screen-watch events bypass this short-horizon guard. Sustained provider
 failures remain the responsibility of the separate provider health circuit.
+
+Runtime V2 also persists a separate provider circuit across heartbeat and
+screen-watch jobs. Three consecutive failures classified as
+`quota_insufficient`, `auth_invalid`, or `provider_account_expired` pause both
+lanes, including jobs already queued. A successful job or another error class
+clears the streak while the circuit is closed. Once open, only a newly accepted
+Chat message or a successful active key, route, or setup save resets it.
+This reset runs after the primary save and is best-effort: a database failure
+is logged without failing the saved Chat or configuration request. The circuit
+may remain open until a later new Chat or active configuration save retries it.
+Idempotent Chat retries and label-only or unsuccessful key saves do not reset
+it; jobs started before a reset cannot re-open it with stale results. Scheduled
+reminders, manual wakes, and Resident are outside this circuit. Generic
+400/404/422 failures retain their existing cooldown/backoff behavior.
+
+Opening writes a `wake_provider_circuit_open` warning to `GET /v1/notices`;
+recovery resolves that warning without adding another notice. Current iOS
+clients do not render this endpoint. The existing best-effort trace/notice
+sinks can omit a transition if a process crashes after the state commits;
+the persistent admission gate does not depend on those sinks. Content-free
+`wake.circuit.open` and `wake.circuit.recover` events record the reason,
+streak, and threshold. Admin data-track user summaries count currently open
+V2 accounts within the selected filters; an unavailable read yields null,
+not zero.
 
 Automatic heartbeat authorization is content-free and fail-closed: the worker
 checks PostgreSQL for at least one genuine user-authored Chat row before loading

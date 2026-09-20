@@ -12,6 +12,53 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Model API credential probe errors add `failure_class` to distinguish invalid
+  credentials, insufficient credit, missing models, rate limits, temporary
+  provider failures, and other configuration problems. Existing error fields
+  retain their meaning. Saved-route test errors preserve this classification,
+  and deduplicated notices resolve after a successful probe.
+
+- Runtime V2 pauses automatic heartbeat and screen-watch calls after three
+  consecutive quota, authentication, or expired-account failures. A newly
+  accepted Chat message or a successful active key/route save clears the
+  persistent circuit; elapsed time alone does not. Scheduled reminders remain
+  eligible. The `wake_provider_circuit_open` warning is written to the notices
+  API and resolved on recovery; the current iOS app does not render this API.
+  Admin user summaries expose `wake_provider_circuit_open_users` (null when
+  the state cannot be measured).
+
+- Chat attachment delivery now records content-free timing events for object
+  storage GETs (including body reads) and hydration, distinguishing timeouts,
+  missing objects, and upstream server errors without recording keys or content.
+
+- Retrying a failed plaintext onboarding or add-memory job with legacy fact-map
+  progress now resets its encrypted checkpoint and runs the current import
+  engine under the same job ID. Existing cards enter the merge index, and the
+  original onboarding greeting is preserved. Current-engine and update-identity
+  checkpoints retain their normal resume behavior.
+
+- Anthropic requests that force a tool call now omit incompatible manual extended
+  thinking for that request, while retaining the required or named tool choice.
+  The Bedrock adapter explicitly disables manual thinking for forced tool calls.
+  Ordinary auto/none requests keep their configured reasoning. Runtime V2 model
+  call failure traces add closed `provider_error_type` and `error_signature`
+  values to distinguish known request incompatibilities. Unrecognized errors
+  remain `unknown` / `unclassified`; provider error text is not included.
+  Wake failure codes now preserve recognized causes such as insufficient credit
+  for HTTP 400/422 responses instead of always reporting provider incompatibility.
+
+- Replies whose `<think>` blocks are malformed (nested, reopened, or cut off
+  before the closing tag — seen from reasoning models behind relays) are no
+  longer replaced by the failure fallback. The strict leak gate still refuses
+  the shape; a salvage pass then drops every thinking block and delivers the
+  remaining reply text on the resident runtime and Runtime V2 chat and wake
+  lanes. Salvaged replies show the thinking-failed marker instead of thinking,
+  are not counted as turn failures, and are recorded as `thinking_gate_salvaged`
+  in resident diagnostics. A reply with no text outside the tags still fails
+  closed.
+
+- Updated memgarden from 0.21.1 to 0.22.0: the release range contains optional vector retrieval (#8, c32f8d60) and release preparation (#9, 05ad1ef3). IO continues using lexical retrieval; vector fusion remains disabled.
+
 - Dream backoff notices now retain account-specific failure guidance. After
   seven days of persistent account failures, automatic runs switch to recovery
   probes at the Dream minimum interval (23 hours by default). Cooldown ticks
@@ -22,6 +69,7 @@ change must not be interpreted as an API guarantee.
   safeguards are unchanged.
 
 - Added disabled-by-default serve-worker preparation of local E5 ONNX vectors for plaintext memories, with versioned projections and bounded scans. Retrieval behavior is unchanged; model/dependency provisioning remains separate.
+- Test deployment now ships the multilingual-e5-small int8 ONNX weights and inference runtime (onnxruntime, tokenizers) in the shared image and enables the serve-worker embedding sweep (`FEEDLING_MEMORY_EMBEDDING_ENABLED=1`). Production stays off; retrieval behavior is unchanged.
   Rolling back the vector-table migration retains the table and its data; removal requires explicit cleanup.
 
 - `POST /v1/perception/photo/evaluate` documents two optional metadata fields

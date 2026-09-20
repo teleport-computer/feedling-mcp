@@ -39,7 +39,8 @@ RUN apt-get update \
 #
 # Two locks, one install: requirements.lock is the shared set every image needs;
 # requirements-v2-worker.lock adds what only the V2 serve-worker executes
-# (trafilatura, for web_fetch article extraction). It ships here because
+# (trafilatura for web_fetch article extraction; onnxruntime + tokenizers for
+# the memory embedding sweep). It ships here because
 # backend / decrypt-enclave / serve-worker all run from this one image. The V1
 # agent-runner image installs requirements.lock only and stays free of the HTML
 # parser — it never runs the capability. The worker lock is compiled with
@@ -51,6 +52,27 @@ RUN pip install --require-hashes -r requirements.lock -r requirements-v2-worker.
 
 COPY backend/ ./backend/
 COPY ops/ ./ops/
+
+# Memory embedding weights (T523 step 1b). multilingual-e5-small, upstream
+# revision 614241f622f53c4eeff9890bdc4f31cfecc418b3, exported to ONNX and
+# dynamically quantised to int8 (export recipe: ~/fleet/p1/T523-step1-delivery.md,
+# mirrored in docs/CHANGELOG.md). Pulled at build time from a fixed release
+# asset and verified against a pinned SHA256 — the application never downloads
+# models at runtime (backend/memory/embedding/e5_onnx.py only reads
+# FEEDLING_EMBED_MODEL_DIR). Every file in the directory is hashed into the
+# embedding model_id at startup, so a changed weight changes the vector version.
+# The archive is ~83 MB (~135 MB extracted); it rides in the shared image (backend / enclave /
+# serve-worker) because splitting a serve-worker image was deliberately
+# deferred (T654). Only the serve-worker ever opens it.
+ARG FEEDLING_EMBED_MODEL_URL=https://github.com/teleport-computer/feedling-mcp/releases/download/models-e5-small-614241f6/multilingual-e5-small-614241f6-int8.tar.gz
+ARG FEEDLING_EMBED_MODEL_SHA256=f964e4a46307a987ad49f46e8285d51c50199ac57933b3617be9e63546b74e17
+RUN set -eu \
+ && curl -fsSL --retry 3 -o /tmp/e5.tar.gz "${FEEDLING_EMBED_MODEL_URL}" \
+ && echo "${FEEDLING_EMBED_MODEL_SHA256}  /tmp/e5.tar.gz" | sha256sum -c - \
+ && mkdir -p /opt/feedling/models/multilingual-e5-small/614241f6 \
+ && tar -xzf /tmp/e5.tar.gz -C /opt/feedling/models/multilingual-e5-small/614241f6 \
+ && rm /tmp/e5.tar.gz \
+ && chmod -R a-w /opt/feedling/models
 
 # Release metadata — baked at build time, read at runtime by
 # backend/enclave_app.py and served inside /attestation.enclave_release
@@ -69,7 +91,8 @@ ENV FEEDLING_GIT_COMMIT=${FEEDLING_GIT_COMMIT} \
 # chowned predictably.
 RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling \
  && mkdir -p /data /tls /var/lib/feedling-cpu /var/lib/feedling-logs \
- && chown -R feedling:feedling /data /tls /var/lib/feedling-cpu /var/lib/feedling-logs /app
+ && chown -R feedling:feedling /data /tls /var/lib/feedling-cpu /var/lib/feedling-logs /app \
+ && chown -R feedling:feedling /opt/feedling/models
 USER feedling
 
 EXPOSE 5001 9998
