@@ -164,6 +164,35 @@ def test_apply_stops_after_first_failed_user(monkeypatch):
     assert result.last_completed_user_id == ""
 
 
+def test_apply_can_continue_after_failed_user_when_requested(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a", "usr_b"]
+    )
+    called = []
+
+    def migrate(user_id, **_kwargs):
+        called.append(user_id)
+        if user_id == "usr_a":
+            return SimpleNamespace(
+                counts={"failed_transform_or_storage": 1}, failures=1
+            )
+        return SimpleNamespace(counts={"migrated": 2}, failures=0)
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        apply=True,
+        continue_on_failure=True,
+        health_probe=lambda: True,
+        healthy_streak=1,
+    )
+
+    assert called == ["usr_a", "usr_b"]
+    assert result.failures == 1
+    assert result.users_completed == 2
+    assert result.last_completed_user_id == "usr_b"
+
+
 def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
     monkeypatch.setattr(
         plaintext_repair,

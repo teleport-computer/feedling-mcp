@@ -121,9 +121,10 @@ def run(
     healthy_streak: int = 2,
     health_poll_sec: float = 5.0,
     max_pause_sec: float = 300.0,
+    continue_on_failure: bool = False,
     sleep: Callable[[float], None] = time.sleep,
 ) -> RepairResult:
-    """Inventory or repair effective-off users, stopping on the first failure."""
+    """Inventory or repair effective-off users, optionally continuing after failures."""
     if int(row_limit) < 0:
         raise ValueError("row_limit must be >= 0")
     if float(rate) <= 0:
@@ -173,7 +174,8 @@ def run(
         counts.update(result.counts)
         if result.failures:
             failures += int(result.failures)
-            break
+            if not continue_on_failure:
+                break
         if int(result.counts.get("not_attempted_limit", 0)) > 0:
             break
         completed += 1

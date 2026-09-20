@@ -26,6 +26,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--health-poll-sec", type=float, default=5.0)
     parser.add_argument("--healthy-streak", type=int, default=2)
     parser.add_argument("--max-pause-sec", type=float, default=300.0)
+    parser.add_argument(
+        "--continue-on-failure",
+        action="store_true",
+        help="record failed items and continue with later users",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -62,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             healthy_streak=args.healthy_streak,
             health_poll_sec=args.health_poll_sec,
             max_pause_sec=args.max_pause_sec,
+            continue_on_failure=args.continue_on_failure,
         )
     except (ValueError, plaintext_repair.HealthGateError) as exc:
         print(f"repair refused: {exc}", file=sys.stderr)
