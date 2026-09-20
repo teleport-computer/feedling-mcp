@@ -197,15 +197,20 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
     assert done["content_excerpt"]["stderr_head"] == ""
 
 
-def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
+@pytest.mark.parametrize("aside", ["", "I want to greet them warmly."])
+def test_call_agent_cli_done_trace_observes_only_display_aside(monkeypatch, aside):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "1")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
+    reply = json.dumps({"messages": ["hi"], "aside": aside})
     stdout = "\n".join([
         '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5",'
         '"content":[{"type":"thinking","thinking":"I inspected the latest prompt."}]}}',
-        '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5",'
-        '"content":[{"type":"text","text":"hi"}]}}',
+        json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": reply}],
+        }}),
     ])
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0, stdout=stdout, stderr="",
@@ -219,9 +224,14 @@ def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
 
     done = calls[1]
     assert done["type"] == "agent.model.call.done"
-    assert done["detail"]["thinking_present"] is True
-    assert done["detail"]["thinking_source"] == "anthropic_thinking"
-    assert done["detail"]["thinking_len"] == len("I inspected the latest prompt.")
+    assert done["detail"]["thinking_present"] is bool(aside)
+    assert done["detail"]["thinking_source"] == ("self_thinking" if aside else "")
+    assert done["detail"]["thinking_len"] == len(aside)
+    # Native reasoning remains diagnostic data; it cannot supply display fields.
+    turn = crc._agent_turn_from_raw(stdout)
+    assert turn.messages == ["hi"]
+    assert turn.thinking_summary == aside
+    assert turn.provider_reasoning_for_diagnostics == "I inspected the latest prompt."
 
 
 def test_call_agent_cli_warns_when_claude_stdout_has_unparsed_thinking_marker(monkeypatch, caplog):
