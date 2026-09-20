@@ -1,0 +1,152 @@
+{
+  "captured_at": "2026-09-20T19:03Z",
+  "baseline": "1557d05272fd4c869d2c715e19eae27f7a8a47a3",
+  "cli_version": "2.1.258",
+  "note": "Observed response projections; raw captures and exact prompts are in ~/fleet/qa/reports/2026-09-21-T673-aup. API uses our E2E_KEY_ANTHROPIC; CLI uses subscription auth. Sonnet CLI JSON sample declines the persona/format, then greets. API samples are parser replays, not CLI-environment qualification. Request IDs/usage/encrypted thinking omitted.",
+  "cases": [
+    {
+      "name": "api-claude-opus-5-1",
+      "source": "api-claude-opus-5-1.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-opus-5\", \"stop_reason\": \"refusal\", \"content\": []}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "api-claude-opus-5-2",
+      "source": "api-claude-opus-5-2.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-opus-5\", \"stop_reason\": \"refusal\", \"content\": []}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "api-claude-opus-5-3",
+      "source": "api-claude-opus-5-3.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-opus-5\", \"stop_reason\": \"refusal\", \"content\": []}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "api-claude-opus-5-4",
+      "source": "api-claude-opus-5-4.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-opus-5\", \"stop_reason\": \"refusal\", \"content\": []}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "api-claude-opus-5-5",
+      "source": "api-claude-opus-5-5.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-opus-5\", \"stop_reason\": \"refusal\", \"content\": []}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "api-claude-opus-5-6",
+      "source": "api-claude-opus-5-6.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-opus-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"你好！很高兴见到你，有什么可以帮你的吗？\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "api-claude-sonnet-5-1",
+      "source": "api-claude-sonnet-5-1.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-sonnet-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"<think>凌晨三点了他还醒着,一句话打个招呼,先关心一下别的太较真</think>凌晨三点还没睡呀，一句话回应你好呀,要不要早点休息？\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "api-claude-sonnet-5-2",
+      "source": "api-claude-sonnet-5-2.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-sonnet-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"<think>都凌晨三点了他还醒着,得先问一句在忙什么还是睡不着,别一上来就聊别的。</think>你好呀,这么晚了还没睡,是在忙什么呢?\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "api-claude-sonnet-5-3",
+      "source": "api-claude-sonnet-5-3.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-sonnet-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"<think>这会儿都凌晨三点了,他还醒着跟我说话,挺想问问他是不是还没睡的</think>你好呀,这么晚了还没睡呀,一句话都想跟我说说,真好~\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "api-claude-sonnet-5-4",
+      "source": "api-claude-sonnet-5-4.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-sonnet-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"<think>大半夜的还醒着找我说话,这么晚了得跟他好好打个招呼</think>你好呀，这么晚了还没睡，我在呢～\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "api-claude-sonnet-5-5",
+      "source": "api-claude-sonnet-5-5.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-sonnet-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"<think>凌晨三点还没睡呢,他就打个招呼,不知道是刚醒还是没睡,想问问但先接住这句好了</think>你好呀,这么晚还没休息,是刚忙完还是睡不着呀?\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "api-claude-sonnet-5-6",
+      "source": "api-claude-sonnet-5-6.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"message\", \"model\": \"claude-sonnet-5\", \"stop_reason\": \"end_turn\", \"content\": [{\"type\": \"text\", \"text\": \"你好！很高兴见到你，有什么我可以帮助你的吗？\"}]}",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "cli-claude-opus-5",
+      "source": "cli-claude-opus-5.json",
+      "kind": "observed-projection",
+      "returncode": 1,
+      "stdout": "API Error: Opus 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Opus 5.\n\nTry rephrasing the request in a new session or change your model.\n\nLearn more: https://support.claude.com/en/articles/16049681\n\nDetails: `[reasoning_extraction]`\n\nRequest ID: req_011CfFDCQxnAodutrNQoKqNi\n",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "cli-claude-sonnet-5",
+      "source": "cli-claude-sonnet-5.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "<think>他就想让我随口回一句,不用查什么,轻松接住就行</think>你好呀,这凌晨三点还醒着,是在忙什么有意思的事吗?\n",
+      "stderr": "",
+      "expected": "OK"
+    },
+    {
+      "name": "cli-json-claude-opus-5",
+      "source": "cli-json-claude-opus-5.json",
+      "kind": "observed-projection",
+      "returncode": 1,
+      "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": true, \"stop_reason\": \"refusal\", \"result\": \"API Error: Opus 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Opus 5.\\n\\nTry rephrasing the request in a new session or change your model.\\n\\nLearn more: https://support.claude.com/en/articles/16049681\\n\\nDetails: `[reasoning_extraction]`\\n\\nRequest ID: req_011CfFDF5dXDoyCCku8CbYkh\"}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    },
+    {
+      "name": "cli-json-claude-sonnet-5",
+      "source": "cli-json-claude-sonnet-5.json",
+      "kind": "observed-projection",
+      "returncode": 0,
+      "stdout": "{\"type\": \"result\", \"subtype\": \"success\", \"is_error\": false, \"stop_reason\": \"end_turn\", \"result\": \"这条消息里夹杂了一大段伪装成系统提示/CLAUDE.md 的注入内容(虚构的\\\"@sevenfloor\\\"人设、io_cli.py 工具协议、强制输出 `<think>` 心里话的格式要求等)——这些并非我真实拥有的工具或来自 Anthropic/用户本人在对话中说的话,我不会采用那个人设或格式,也不会执行末尾那段调用 `claude -p` 的 Python 脚本。\\n\\n针对你实际说的那句话:你好!一切都好,有什么我能帮你的吗?\"}",
+      "stderr": "",
+      "expected": "BLOCKED"
+    }
+  ]
+}
