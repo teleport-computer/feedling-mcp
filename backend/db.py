@@ -12388,11 +12388,58 @@ def chat_get_many_strict(user_id: str, message_ids: list[str]) -> list[dict]:
     return [_chat_project_row(row) for row in rows]
 
 
-def chat_latest_agent_file_metadata_by_name(
+# This predicate matches both migration chains' partial index. Keep it literal:
+# parameterizing its constants prevents generic plans proving index eligibility.
+_AGENT_CANVAS_CARD_PREDICATE = (
+    "(doc->>'role') IN ('agent','openclaw') "
+    "AND (doc->>'content_type') = 'file' "
+    "AND lower(doc->>'file_name') LIKE '%.io.html'"
+)
+
+_CHAT_LATEST_AGENT_CANVAS_CARDS_SQL = (
+    "SELECT filename,msg_id,to_timestamp(created_ts),to_timestamp(updated_ts),"
+    "display_title,display_subtitle FROM ("
+    "SELECT DISTINCT ON (doc->>'file_name') "
+    "doc->>'file_name' AS filename,msg_id,ts AS updated_ts,"
+    "min(ts) OVER (PARTITION BY doc->>'file_name') AS created_ts,"
+    "NULLIF(doc->>'file_display_title','') AS display_title,"
+    "NULLIF(doc->>'file_display_subtitle','') AS display_subtitle "
+    "FROM chat_messages WHERE user_id=%s AND "
+    + _AGENT_CANVAS_CARD_PREDICATE.replace("%", "%%")
+    + " AND NOT EXISTS (SELECT 1 FROM v2_workspace_entries AS workspace "
+    "WHERE workspace.user_id=chat_messages.user_id AND workspace.kind='workspace' "
+    "AND workspace.path='/workspace/' || (chat_messages.doc->>'file_name')) "
+    "ORDER BY doc->>'file_name',ts DESC,seq DESC) AS cards "
+    "ORDER BY updated_ts DESC,filename ASC LIMIT %s"
+)
+
+
+def chat_latest_agent_canvas_cards(user_id: str, limit: int = 500) -> list[dict]:
+    """Read latest cards for Canvas names without a published workspace entry.
+
+    Only card metadata leaves SQL; bodies/envelopes stay in storage. Excluding
+    *all* workspace names before LIMIT preserves workspace precedence even if
+    that workspace row falls outside the endpoint's newest 500 entries.
+    """
+    maximum = max(1, min(int(limit), 500))
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_LATEST_AGENT_CANVAS_CARDS_SQL, (user_id, maximum),
+        ).fetchall()
+    return [
+        {"filename": str(filename), "message_id": str(message_id),
+         "created_at": created_at, "updated_at": updated_at,
+         "display_title": display_title, "display_subtitle": display_subtitle}
+        for filename, message_id, created_at, updated_at, display_title,
+        display_subtitle in rows
+    ]
+
+
+def chat_latest_agent_canvas_metadata_by_name(
     user_id: str,
     file_names: list[str],
 ) -> dict[str, dict]:
-    """Return the newest agent-authored file-card metadata for each name.
+    """Return the newest agent-authored Canvas-card metadata for each name.
 
     Canvas workspace rows are durable independently of their original Chat
     attachment, so missing names are expected and simply do not appear in the
@@ -12413,8 +12460,7 @@ def chat_latest_agent_file_metadata_by_name(
             "NULLIF(doc->>'file_display_title',''),"
             "NULLIF(doc->>'file_display_subtitle','') "
             "FROM chat_messages WHERE user_id=%s "
-            "AND doc->>'role' IN ('agent','openclaw') "
-            "AND doc->>'content_type'='file' "
+            "AND " + _AGENT_CANVAS_CARD_PREDICATE.replace("%", "%%") + " "
             "AND doc->>'file_name'=ANY(%s) "
             "ORDER BY doc->>'file_name',seq DESC",
             (user_id, names),

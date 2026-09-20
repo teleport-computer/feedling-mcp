@@ -616,8 +616,13 @@ def test_canvas_index_filters_non_canvas_kinds_and_isolates_users(user):
     )
 
     assert status == 200
-    assert len(body["canvases"]) == 1
-    assert body["canvases"][0] == {
+    # The artifact workspace row is excluded, but its published agent card
+    # now joins the index independently (V1/self-hosted compatibility).
+    assert len(body["canvases"]) == 2
+    by_name = {card["filename"]: card for card in body["canvases"]}
+    assert by_name["artifact.io.html"]["message_id"] == source["id"]
+    assert by_name["artifact.io.html"]["revision"] == 1
+    assert by_name["Foo.IO.HTML"] == {
         "filename": "Foo.IO.HTML",
         "revision": mixed_case_suffix["revision"],
         "mime_type": "text/html",
