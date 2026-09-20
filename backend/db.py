@@ -52,6 +52,7 @@ from psycopg_pool import ConnectionPool
 
 import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
+import storage_read_trace
 from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
 
@@ -13417,6 +13418,15 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
+    with storage_read_trace.observe(user_id, hydrate=True) as observation:
+        out = _hydrate_chat_file_pointer(user_id, doc)
+        if _is_chat_file_pointer(out) and observation["status"] == "ok":
+            observation.update(status="other", error_class="body_unavailable")
+        return out
+
+
+def _hydrate_chat_file_pointer(user_id: str, doc: dict) -> dict:
+    """Decode/validate an enabled R2 pointer within its hydrate observation."""
     body_format = _chat_body_object_format(doc)
     if body_format == "sealed_v1":
         body = object_storage.get_chat_body(
