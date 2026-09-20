@@ -109,7 +109,7 @@ canonical_owner: self
 | `provider_not_configured` | 409 | user_provider | | ✅ |
 | `provider_not_hostable` | 409 | user_provider | | ✅ |
 | `hosting_runtime_unavailable` | 503 | system | 历史 hosted-supervisor 兼容 slug；Runtime V2 托管路径不再返回（worker 全挂改用 `workers_unavailable`） | ✅ |
-| `provider_test_failed` | 400 | user_provider | 保存/测试 key 时上游拒绝（detail 带 status_code） | |
+| `provider_test_failed` | 400 | 按 failure_class | 保存/测试 key 失败；保留 detail/status_code，增加 failure_class（见下表） | |
 | `cannot_encrypt_provider_key` | 409 | — | 缺 content public key 或 enclave attestation 不可达 | |
 | `route_not_found` | 404 | user_provider | 指定的 route id 不属于该用户或已删除 | |
 | `credential_not_found` | 404 | user_provider | 指定的 credential id 不属于该用户或已删除 | |
@@ -482,3 +482,28 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `resident_decrypt_source_unavailable` | — | user_environment | warning | chat：resident 明确报告 `degraded`/`unconfigured`/`unreachable`；notice 可立即出现，维护消息仅对新用户立即注入，老用户需持续失败超过宽限期 |
 | `resident_decrypt_health_unreported` | — | user_environment | warning | chat：resident 未上报有效、近期的 decrypt-health；仅发 notice，不生成解密修复文案或聊天维护消息 |
 | `resident_never_claimed` | — | user_environment | error | genesis：resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 |
+
+
+### Model API 凭证探针 failure_class
+
+`provider_test_failed` 的 HTTP 状态仍为 400；`status_code` 是上游状态，
+`failure_class` 是叠加的用户可见分类，不改变 provider_client 的重试分类。
+保存配置、手动测试、路由激活/测试（含带 activate 的加路由）和凭证轮换共用此契约。
+
+| 上游证据 | failure_class | 通知归因 |
+| --- | --- | --- |
+| 401 / 403 | `auth_invalid` | user_provider |
+| 402（含 OpenRouter max_tokens 预扣不足） | `quota_insufficient` | user_provider |
+| 404 | `model_not_found` | user_provider |
+| 429 | `rate_limited` | provider_transient |
+| 408 / 5xx / provider_client 网络失败 | `upstream_unavailable` | provider_transient |
+| 其余状态或无状态的未识别失败 | `provider_config` | user_provider |
+| 404 HTML / non-json response（非 API 地址） | `provider_config`；status_code=null | user_provider |
+
+原有 detail 与 status_code 语义不变。已保存凭证的 route 测试失败时，
+`last_test_error`以 `<failure_class>: ` 开头。
+新凭证保存前失败不改变旧 route 的有效状态。
+失败通知 source=model_api、error_class=failure_class，以
+`model_api:test_failed:<failure_class>` 去重；成功探针仅消除该探针通知前缀，
+删除配置仍清除整个 `model_api:` 前缀。除 provider_config 使用探针专用安全文案和归因外，通知复用 error_contract；
+provider_config 不加入全局运行时分类表，避免改变健康/统计归因。通知不存上游正文。
