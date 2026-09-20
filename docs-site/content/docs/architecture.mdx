@@ -209,6 +209,13 @@ proactive promotion terminalizes the wake without advancing the cursor. Both
 forms recheck the source-job owner and input frontier in the publication
 transaction.
 
+Automatic V2 heartbeat and screen-watch admission also consults a persistent
+provider circuit in PostgreSQL. Owned job terminalization updates the shared
+failure streak in the same transaction; scheduler polling and queued-job
+execution both reject an open circuit. Explicit user input or a successful
+active provider configuration save resets it. This adds no service or trust
+boundary; see [recovery behavior](/docs/reliability).
+
 Every Chat and proactive wake turn decrypts the current agent identity card just
 in time and places its complete readable view in the trusted system prefix. An
 absent, unreadable, local-only, or still-default card falls back to the encrypted

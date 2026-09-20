@@ -1758,6 +1758,20 @@ def admin_data_track_snapshot(
         ) as conn:
             _chat_rollup_into(conn, ids, out, ensure)
 
+            # Same bounded admin connection/timeout; absent schedules are closed,
+            # a failed read stays absent so the UI can report unavailable.
+            circuit_rows = conn.execute(
+                "SELECT requested.user_id, "
+                "(schedule.wake_circuit_opened_at IS NOT NULL "
+                "AND control.hosted_runtime_state='v2') AS circuit_open "
+                "FROM unnest(%s::text[]) AS requested(user_id) "
+                "LEFT JOIN v2_wake_schedule AS schedule USING (user_id) "
+                "LEFT JOIN v2_runtime_state AS control USING (user_id)",
+                (ids,),
+            ).fetchall()
+            for uid, circuit_open in circuit_rows:
+                ensure(out, uid)["wake_provider_circuit_open"] = bool(circuit_open)
+
             if include_screen_frames:
                 _screen_frames_into(conn, ids, out, ensure)
 

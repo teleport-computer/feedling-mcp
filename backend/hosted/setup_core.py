@@ -48,6 +48,7 @@ from hosted import vision_routing
 from hosted import vision_observer
 from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
+from model_api_runtime.v2 import wake_circuit
 
 
 _TEST_PATCHABLE_MODULES = (core_enclave,)
@@ -1393,6 +1394,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     cohort_error = _apply_new_user_v2_default_or_error(store)
     if cohort_error is not None:
         return cohort_error
+    wake_circuit.reset(store.user_id, reason="setup_saved")
     accounts_onboarding._save_onboarding_route(store, "model_api")
     hosted_config_store.enqueue_profile_best_effort(
         store.user_id,
@@ -2536,6 +2538,7 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     cohort_error = _apply_new_user_v2_default_or_error(store)
     if cohort_error is not None:
         return cohort_error
+    wake_circuit.reset(store.user_id, reason="route_activated")
     accounts_onboarding._save_onboarding_route(store, "model_api")
     hosted_config_store.enqueue_profile_best_effort(
         store.user_id,
@@ -2754,6 +2757,8 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
     restore_error = _restore_v2_or_error(store, required=restore_v2)
     if restore_error is not None:
         return restore_error
+    if active_key_change:
+        wake_circuit.reset(store.user_id, reason="credential_saved")
     return {"status": "ok"}, 200
 
 

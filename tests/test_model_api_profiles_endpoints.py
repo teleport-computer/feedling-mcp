@@ -1052,3 +1052,64 @@ def test_delete_credential_unknown_id_404(client, registered_user, fake_provider
         headers=headers)
     assert resp.status_code == 404
     assert resp.get_json()["error"] == "credential_not_found"
+
+
+@pytest.mark.parametrize('action', ['key', 'route', 'setup', 'label', 'failed_key'])
+def test_wake_circuit_resets_only_after_successful_active_config_save(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch, action):
+    from conftest import set_v2_runtime_owner
+    from model_api_runtime.v2 import wake_circuit
+    uid = registered_user['user_id']
+    headers = _setup_one(client, registered_user)
+    set_v2_runtime_owner(uid)
+    active = db.model_api_active_route(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO v2_wake_schedule (user_id,wake_circuit_opened_at) "
+                     "VALUES (%s,now()) ON CONFLICT (user_id) DO UPDATE "
+                     "SET wake_circuit_opened_at=now()", (uid,))
+    if action in {'key', 'label', 'failed_key'}:
+        if action == 'failed_key':
+            def reject(_cfg):
+                raise provider_client.ProviderError('provider_http_401', status_code=401)
+            monkeypatch.setattr(provider_client, 'test_provider_key', reject)
+        response = client.patch('/v1/model_api/credentials/' + active['credential_id'],
+                                headers=headers, json={'label': 'new label'} if action == 'label'
+                                else {'api_key': 'sk-new-valid-key'})
+    elif action == 'route':
+        response = client.post('/v1/model_api/routes/' + active['id'] + '/activate', headers=headers)
+    else:
+        response = client.post('/v1/model_api/setup', headers=headers, json={
+            'provider': 'anthropic', 'model': 'claude-sonnet-4-5', 'api_key': 'sk-new-key'})
+    assert response.status_code == (400 if action == 'failed_key' else 200), response.get_data(as_text=True)
+    assert wake_circuit.is_open(uid) == (action in {'label', 'failed_key'})
+
+
+def test_credential_save_survives_circuit_reset_db_failure(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave,
+        monkeypatch, caplog):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from psycopg import OperationalError
+    from conftest import set_v2_runtime_owner
+    from model_api_runtime.v2 import wake_circuit
+
+    uid = registered_user['user_id']
+    headers = _setup_one(client, registered_user)
+    set_v2_runtime_owner(uid)
+    cid = db.model_api_active_route(uid)['credential_id']
+    connect = Mock(side_effect=OperationalError('private-db-error-sentinel'))
+    monkeypatch.setattr(wake_circuit, 'db', SimpleNamespace(
+        get_pool=lambda: SimpleNamespace(connection=connect)))
+
+    response = client.patch(
+        '/v1/model_api/credentials/' + cid, headers=headers,
+        json={'api_key': 'sk-new-valid-key', 'label': 'Saved despite reset failure'})
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert response.get_json()['status'] == 'ok'
+    connect.assert_called_once_with()
+    assert db.model_api_credential_get(uid, cid)['label'] == 'Saved despite reset failure'
+    assert db.model_api_active_route(uid)['test_status'] == 'ok'
+    assert 'wake circuit reset failed' in caplog.text
+    assert 'private-db-error-sentinel' not in caplog.text
