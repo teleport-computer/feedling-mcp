@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 pauses automatic heartbeat and screen-watch calls after three
+  consecutive quota, authentication, or expired-account failures. A newly
+  accepted Chat message or a successful active key/route save clears the
+  persistent circuit; elapsed time alone does not. Scheduled reminders remain
+  eligible. The `wake_provider_circuit_open` warning is written to the notices
+  API and resolved on recovery; the current iOS app does not render this API.
+  Admin user summaries expose `wake_provider_circuit_open_users` (null when
+  the state cannot be measured).
+
 - Retrying a failed plaintext onboarding or add-memory job with legacy fact-map
   progress now resets its encrypted checkpoint and runs the current import
   engine under the same job ID. Existing cards enter the merge index, and the

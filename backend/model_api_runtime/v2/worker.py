@@ -110,6 +110,7 @@ from perception.agent_fields import (
 )
 from perceptkit import prompts as perception_prompts
 from screen import screen_read_core
+from model_api_runtime.v2 import wake_circuit
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -9463,6 +9464,20 @@ async def _run_wake(
             shadow_decision_allowed = False
             if tm is not None:
                 tm.flush(failed=False, status="slept_no_history")
+            return "completed"
+
+        # Queued/event-triggered wakes must obey the same persistent gate as
+        # scheduler polling. Scheduled reminders retain their delivery contract.
+        if lane in wake_circuit.LANES and await asyncio.to_thread(wake_circuit.is_open, user_id):
+            owned = await asyncio.to_thread(
+                jobs_store.mark_completed, job_id, claimed_by=claimed_by,
+                wake_result="sleep", wake_result_reason="provider_circuit_open",
+            )
+            if not owned:
+                raise LostJobLease("wake job ownership lost at provider circuit gate")
+            shadow_decision_allowed = False
+            if tm is not None:
+                tm.flush(failed=False, status="provider_circuit_open")
             return "completed"
 
         # This content-free gate runs before workspace loading, compaction, or
