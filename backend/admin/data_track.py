@@ -2808,6 +2808,7 @@ def _data_track_payload(
                         "message": "取数状态缺失",
                     }
                 ),
+                "wake_provider_circuit_open": snapshot.get(uid, {}).get("wake_provider_circuit_open"),
                 "provider_state": str(
                     health.get("provider_state") or "ok"
                 ),
@@ -3014,6 +3015,11 @@ def _data_track_payload(
         ),
         "proactive_breakdowns_status": proactive_breakdowns_status,
         "provider_needs_user_action": provider_needs_user_action,
+        "wake_provider_circuit_open_users": (
+            sum(row["wake_provider_circuit_open"] is True for row in rows)
+            if all(row.get("wake_provider_circuit_open") is not None for row in rows)
+            else None
+        ),
         "app_usage": {
             "foreground_sec_total": au_fg_total,
             "sessions_total": au_sessions_total,
@@ -9034,6 +9040,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         _render_metric("聊天消息总数", summary["chat_messages_total"]),
         _render_metric("记忆总数", summary["memory_total"]),
         _render_metric("主动任务数", summary["proactive_jobs_total"]),
+        _render_metric(
+            "主动唤醒熔断账号行（当前筛选）",
+            summary.get("wake_provider_circuit_open_users")
+            if summary.get("wake_provider_circuit_open_users") is not None else "量不到",
+        ),
         _render_metric(
             "模型配置待处理",
             summary.get("provider_needs_user_action", 0),
