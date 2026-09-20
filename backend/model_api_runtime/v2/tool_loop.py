@@ -1340,6 +1340,9 @@ async def run_tool_loop(
     # foreground and scheduled contracts, which share this loop but continue to
     # accept ordinary terminal text.
     regular_wake_choice_required: bool = False,
+    # Output capacity is independent of whether this lane requires a terminal
+    # reply/stay_silent choice. Scheduled wakes need the same shared budget.
+    wake_output_budget_required: bool = False,
     include_reasoning: bool = False,
     # Self-authored thinking: when True, NEVER request provider-native reasoning —
     # not via include_reasoning, and NOT via reasoning_effort either. The model then
@@ -2753,19 +2756,22 @@ async def run_tool_loop(
                 # JSON. File generation owns a separate output budget: the
                 # prompt frontier's reserve is input accounting, and increasing
                 # it would silently evict otherwise usable history. This branch
-                # keeps priority over the regular-wake branch below.
+                # keeps priority over the wake-budget branch below.
                 provider_kwargs["max_tokens"] = (
                     min(file_output_max_tokens, 512)
                     if compact_delivery_phase
                     else file_output_max_tokens
                 )
-            elif regular_wake_choice_required:
+            elif regular_wake_choice_required or wake_output_budget_required:
                 # Prod 2026-09-07..14 trace: of 425 silent_empty_response events
                 # on choice_invalid jobs, 421 were length + reasoning_present
                 # + completion_tokens>=700. Wake lanes used provider_client's
                 # 700-token default, leaving reasoning models no room to choose
                 # reply/stay_silent. Reuse the established chat/file output
                 # budget; keep input reserve accounting independent.
+                # Scheduled reminders need that capacity too. Keep this opt-in:
+                # an unconditional else would also raise subagent output limits,
+                # outside their existing per-call reservation policy.
                 provider_kwargs["max_tokens"] = file_output_max_tokens
             if on_provider_tool_surface is not None:
                 candidate_names = {
