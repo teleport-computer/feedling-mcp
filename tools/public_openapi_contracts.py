@@ -1129,7 +1129,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "include_reasoning": {
                 "type": "boolean",
                 "default": False,
-                "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought. If the initial final reply omits that block, Runtime V2 may spend one separately metered, text-only provider round from the existing turn budget to restate the same format contract. If that bounded correction is unavailable or still unusable, the original reply is delivered without a thinking attachment or native-reasoning fallback. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field.",
+                "description": "Legacy per-turn reasoning request for Hosted Runtime V2; resident runtimes ignore this field. Display thinking comes only from the optional aside field when self-authored thinking is enabled (the default), with agent_summary/self_thinking provenance and thinking_native=false. A usable reply without aside is delivered with the thinking-failed marker and no format-correction retry. Provider-native reasoning is never displayed, including when self-authored thinking is disabled.",
             },
             "image_b64": {"type": "string", "contentEncoding": "base64", "description": "Image data; decoded size must not exceed 2,000,000 bytes."},
             "image_base64": {"type": "string", "contentEncoding": "base64", "deprecated": True},

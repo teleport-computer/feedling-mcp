@@ -489,7 +489,42 @@ be presented as missing configuration.
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below
 the final reply. A separately encrypted `thinking_*` envelope remains the only
-source for display-safe reasoning and must not be merged with tool activity.
+source for the optional persona aside and must not be merged with tool activity.
+
+Runtime V2 chat and wake turns share `reply(aside, text)`: `text` is required,
+while `aside` is optional. The aside is sealed separately with
+`thinking_kind: agent_summary`, `thinking_source: self_thinking`, and
+`thinking_native: false`. A usable reply without an aside is delivered without
+an aside-format correction retry. Chat and scheduled turns also accept usable
+direct text. Non-scheduled wake turns still require an explicit `reply` or
+`stay_silent` decision; unstructured text alone does not publish a bubble. With
+aside display enabled, missing or unusable aside text shows `（思考没写完）` instead.
+
+When a non-scheduled wake produces text without a tool call, the text is held as
+an unpublished draft. If the existing turn budget permits, the model gets at
+most one correction request to call `reply(aside, text)` or `stay_silent`.
+A second unstructured answer fails silently with `choice_invalid`; the draft
+itself is never published. Scheduled reminders and chat keep their direct-text
+behavior. The content-free `wake.direct_text_correction` trace records
+`direct_text_seen`, `corrected_to_reply`, `corrected_to_silent`, or `still_invalid`.
+These describe model decisions, not proof of delivery: selected replies still
+pass the existing content and effect checks. Wake language-follow uses prompt
+guidance and post-publication observation, not a blocking language check.
+
+
+Resident V1 uses the optional field in its existing reply JSON:
+
+```json
+{"aside": "I want to pick up where we left off.", "messages": ["How did it go?"]}
+```
+
+Resident asides are sanitized and limited to 700 characters. Provider-native
+reasoning and inline thinking-tag contents never become display summaries,
+including when aside display is disabled. Historical native-reasoning rows
+remain readable. The tag leak gate still strips inline blocks before delivery.
+A resident can recover a complete `messages`/`aside` envelope from an unclosed
+final thinking block; free text, ambiguous JSON, and envelopes containing
+executable actions or tool calls are not recovered.
 
 ## Independent resident loop
 

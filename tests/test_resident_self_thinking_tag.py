@@ -1,12 +1,6 @@
-"""T587: the resident consumer picks the self-thinking tag by driver.
-
-Claude Code driver → ``aside``; pi / codex → ``think`` rendered byte for byte as
-before this change (pinned by sha256 of the exact strings the consumer emitted
-on origin/test c23df32c, 2026-09-15).
-"""
+"""Resident drivers share the optional JSON aside contract."""
 from __future__ import annotations
 
-import hashlib
 import os
 
 import pytest
@@ -24,17 +18,6 @@ for _k, _v in _ENV_DEFAULTS.items():
 import tools.chat_resident_consumer as crc  # noqa: E402
 from agent_protocol_core import self_thinking as st  # noqa: E402
 
-_PRE_CHANGE_SHA = {
-    "wake_zh": "dfe7299ccaa209aa09450b5dbff69aeba97dd50677b745f4e0b1104d36cea4da",
-    "wake_en": "4361a7a37d958140acc50dbe823e98c055cf6ac063caf027d375b18aa7a03f69",
-    "foreground": "69153a072882272872ee97fbd443f8d5dd58e96062d05ccc7fad7ff81db8751e",
-}
-
-
-def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
 @pytest.fixture(autouse=True)
 def _self_thinking_on(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
@@ -51,9 +34,9 @@ def _self_thinking_on(monkeypatch):
     'openclaw agent --json "{message}"',  # not Claude Code → unchanged
     "",  # no CLI configured → unchanged
 ])
-def test_non_claude_drivers_keep_think_byte_for_byte(monkeypatch, cmd):
+def test_non_claude_drivers_use_json_aside(monkeypatch, cmd):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", cmd)
-    _assert_think_rendering_unchanged()
+    _assert_field_rendering()
 
 
 def test_http_mode_ignores_a_leftover_claude_command(monkeypatch):
@@ -71,15 +54,15 @@ def test_http_mode_ignores_a_leftover_claude_command(monkeypatch):
     crc.call_agent("test", raw_text=True)
     assert called == ["http"]
     assert crc._self_thinking_tag() == st.TAG_THINK
-    _assert_think_rendering_unchanged()
+    _assert_field_rendering()
 
 
-def _assert_think_rendering_unchanged():
-    assert crc._self_thinking_tag() == st.TAG_THINK
-    assert crc._foreground_self_thinking_instruction() == st.INSTRUCTION.strip()
-    assert _sha(crc._foreground_self_thinking_instruction()) == _PRE_CHANGE_SHA["foreground"]
-    assert _sha(crc._wake_think_permission_line({"locale": "zh-Hans"})) == _PRE_CHANGE_SHA["wake_zh"]
-    assert _sha(crc._wake_think_permission_line({"locale": "en-US"})) == _PRE_CHANGE_SHA["wake_en"]
+def _assert_field_rendering():
+    expected = st.instruction_for_field(protocol="json").strip()
+    assert crc._foreground_self_thinking_instruction() == expected
+    for locale in ("zh-Hans", "en-US"):
+        assert crc._wake_think_permission_line({"locale": locale}) == expected
+    assert "<think>" not in expected and "<aside>" not in expected
 
 
 @pytest.mark.parametrize("cmd", [
@@ -89,14 +72,7 @@ def _assert_think_rendering_unchanged():
 def test_claude_driver_uses_aside_everywhere(monkeypatch, cmd):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", cmd)
     assert crc._self_thinking_tag() == st.TAG_ASIDE
-    fg = crc._foreground_self_thinking_instruction()
-    assert fg == st.instruction(st.TAG_ASIDE).strip()
-    assert "<think>" not in fg and "<aside>" in fg
-    for locale in ("zh-Hans", "en-US"):
-        line = crc._wake_think_permission_line({"locale": locale})
-        assert "<think>" not in line and "<aside>...</aside>" in line
-        # No private-channel wording in the aside rendering.
-        assert "保持私密" not in line and "stays private" not in line
+    _assert_field_rendering()
 
 
 def test_truncated_aside_never_becomes_a_visible_message(monkeypatch):

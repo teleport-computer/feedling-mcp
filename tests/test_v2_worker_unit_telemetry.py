@@ -817,7 +817,7 @@ def test_prompt_frontier_message_breakdown_uses_only_semantic_closed_names():
         (True, "agent summary", False, "private native cot", "self"),
         (True, "", True, "private native cot", "marker"),
         (True, "", False, "private native cot", "none"),
-        (False, "", False, "private native cot", "native_legacy"),
+        (False, "", False, "private native cot", "native_discarded"),
     ],
 )
 def test_thinking_surface_selector_has_four_explicit_branches(
@@ -843,8 +843,8 @@ def test_thinking_surface_selector_has_four_explicit_branches(
     elif expected == "none":
         assert text == ""
     else:
-        assert text == provider_text
-        assert (kind, source, native) == ("provider_reasoning", None, True)
+        assert text == ""
+        assert (kind, source, native) == ("agent_summary", "self_thinking", False)
 
 
 def test_self_thinking_internal_terms_are_derived_from_tool_specs():

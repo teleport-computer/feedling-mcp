@@ -265,12 +265,11 @@ class AgentTurn:
     thinking_source: str = ""
     thinking_model: str = ""
     thinking_native: bool | None = None
-    # TRUE only when this thinking was parsed out of a leading <think> block by our
-    # own local parser (_split_tagged_thinking) on THIS host — never set from any
-    # provider/CLI JSON field. This is the spoof-proof provenance the self-authored
-    # precedence keys off: an upstream turn that merely *declares*
-    # reasoning_source="self_thinking" in its JSON cannot flip this flag.
+    # Set locally only when an optional JSON aside was parsed.
     thinking_self_authored: bool = False
+    # Private, bounded input for the existing torn-protocol detector. Never
+    # serialized or used as a display summary.
+    provider_reasoning_for_diagnostics: str = ""
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
@@ -5878,28 +5877,15 @@ def _thinking_summary_from_value(value: Any) -> str:
 
 
 def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
-    """Adopt ``src``'s thinking into ``dst`` per the self-authored precedence.
-
-    THE single decision point for "whose thinking wins" — every path that can
-    carry thinking (object merge, stream fallback, …) routes through here so no
-    arrival order silently bypasses the rule.
-
-    Feature ON: a locally-parsed self-authored <think> (``thinking_self_authored``,
-    which upstream JSON cannot forge) wins over provider-native reasoning; within
-    the same provenance class the first-seen thinking is kept. Feature OFF: legacy
-    rule — provider-native reasoning wins over inlined content.
-    """
+    """Prefer a locally parsed aside over temporary native diagnostics."""
+    if src.provider_reasoning_for_diagnostics and not dst.provider_reasoning_for_diagnostics:
+        dst.provider_reasoning_for_diagnostics = src.provider_reasoning_for_diagnostics
     if not src.thinking_summary:
         return
     if not dst.thinking_summary:
         take = True
     else:
-        from agent_protocol_core import self_thinking as _self_thinking_v1
-
-        if _self_thinking_v1.enabled():
-            take = src.thinking_self_authored and not dst.thinking_self_authored
-        else:
-            take = src.thinking_native is True and dst.thinking_native is not True
+        take = src.thinking_self_authored and not dst.thinking_self_authored
     if take:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
@@ -6169,6 +6155,45 @@ def _scan_visible_protocol(text: str) -> tuple[str, Any]:
 
 
 def _agent_turn_from_obj(obj: Any) -> AgentTurn:
+    turn = _agent_turn_from_obj_with_diagnostics(obj)
+    from agent_protocol_core import self_thinking as st
+
+    if not turn.thinking_self_authored or not st.enabled():
+        if not turn.thinking_self_authored and turn.thinking_summary and not turn.provider_reasoning_for_diagnostics:
+            turn.provider_reasoning_for_diagnostics = turn.thinking_summary
+        turn.thinking_summary = ""
+        turn.thinking_kind = ""
+        turn.thinking_source = ""
+        turn.thinking_model = ""
+        turn.thinking_native = None
+    return turn
+
+
+def _unclosed_reply_protocol(raw: str) -> dict | None:
+    """Recover a complete reply envelope from the final unclosed tag tail.
+
+    Use the existing bounded protocol-root scanner. Balanced blocks, free text,
+    ambiguous roots, and action/tool envelopes remain private and ineligible.
+    """
+    from agent_protocol_core import self_thinking as st
+
+    last = None
+    for token in re.finditer(rf"<\s*(?P<slash>/?)\s*{st.tag_name_pattern()}\s*>", raw, re.I):
+        last = token
+    if last is None or last.group("slash"):
+        return None
+    decision, payload = _scan_visible_protocol(raw[last.end():])
+    if (
+        decision == "route" and isinstance(payload, dict)
+        and isinstance(payload.get("messages"), list)
+        and set(payload) <= {"messages", "aside"}
+        and all(isinstance(item, str) for item in payload["messages"])
+    ):
+        return payload
+    return None
+
+
+def _agent_turn_from_obj_with_diagnostics(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
     if isinstance(obj, str):
@@ -6198,7 +6223,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         # legit `{"result":"<think>..</think>.."}` is not corrupted), truncate any
         # unclosed thinking, then scan for a text-top-level protocol root.
         original_visible = obj
-        raw, tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
+        recovered = _unclosed_reply_protocol(raw)
+        if recovered is not None:
+            # Rescue only the complete reply fields, never the surrounding
+            # native text. Existing sanitizer reporting records this fallback.
+            _merge_agent_turn(turn, _agent_turn_from_obj(recovered))
+            _record_sanitizer(
+                turn, "thinking_gate_salvaged", raw,
+                extra={"salvage_reason": "trailing_unclosed"},
+            )
+            return turn
+        raw, _tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
         if turn.sanitizer_reason:
             # Re-measure against the transport-level text; keep the salvage
             # reason the splitter attached (it is not derivable from the text).
@@ -6207,18 +6242,6 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                 **{k: v for k, v in turn.raw_reply_diagnostics.items() if k == "salvage_reason"},
             }
         raw = _truncate_at_unclosed_thinking(raw)
-        if tagged_thinking:
-            # Our self-authored <think> block, parsed locally on THIS host. With the
-            # feature on, the precedence in _merge_agent_turn PREFERS this over the
-            # model's native reasoning ("有 <think> 就用它"); with the feature off,
-            # native still wins (legacy behavior). thinking_self_authored is the
-            # spoof-proof marker (set ONLY here); native-ness is recorded honestly as
-            # False — it is io's own thought, not provider CoT.
-            turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
-            turn.thinking_kind = "provider_reasoning_summary"
-            turn.thinking_source = "tagged_content"
-            turn.thinking_native = False
-            turn.thinking_self_authored = True
         if not raw.strip():
             return turn
         decision, payload = _scan_visible_protocol(raw)
@@ -6300,6 +6323,15 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                 continue
             args = dict(tc["args"]) if isinstance(tc.get("args"), dict) else {}
             turn.tool_calls.append({"name": name, "args": args})
+
+    aside = obj.get("aside")
+    if isinstance(aside, str):
+        turn.thinking_summary = _sanitize_thinking_summary(aside)
+        if turn.thinking_summary:
+            turn.thinking_kind = "agent_summary"
+            turn.thinking_source = "self_thinking"
+            turn.thinking_native = False
+            turn.thinking_self_authored = True
 
     explicit_kind = _sanitize_thinking_kind(obj.get("thinking_kind") or obj.get("reasoning_kind"))
     explicit_source = _sanitize_thinking_meta(
@@ -12728,7 +12760,7 @@ def _suppress_torn_protocol_leaks(turn: "AgentTurn", *, lane: str) -> None:
     foreground turn silently vanish instead of surfacing the honest fallback.
     """
     policy = _leak_lane_policy(lane)
-    reasoning = turn.thinking_summary or ""
+    reasoning = turn.provider_reasoning_for_diagnostics or turn.thinking_summary or ""
     reasoning_implicated = False
     changed = False
 
@@ -12894,16 +12926,10 @@ def call_agent(
         }
         if turn.tool_calls:
             body["tool_calls"] = turn.tool_calls
-        # This body is parsed a SECOND time downstream (_split_agent_turn in the
-        # chat/proactive lanes), so it must speak the same dialect the reader
-        # accepts. Emit the provider_reasoning family — the keys this turn was
-        # parsed FROM — never `thinking_summary`: that key is deliberately NOT in
-        # _JSON_THINKING_FIELDS because a model can forge it in its own reply JSON
-        # (see test_agent_turn_ignores_custom_thinking_summary_from_nested_result),
-        # so a body keyed that way reads back as empty and the thinking is lost
-        # between the model and post_reply's thinking_envelope.
+        # Downstream parses this body again. Preserve the optional aside under
+        # the same JSON field; native diagnostic reasoning is never serialized.
         if turn.thinking_summary:
-            body["provider_reasoning"] = turn.thinking_summary
+            body["aside"] = turn.thinking_summary
         if turn.thinking_kind:
             body["reasoning_kind"] = turn.thinking_kind
         if turn.thinking_source:
@@ -13036,46 +13062,16 @@ def _foreground_self_thinking_instruction() -> str:
         return ""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
-    return _self_thinking_v1.instruction(_self_thinking_tag()).strip()
+    return _self_thinking_v1.instruction_for_field(protocol="json").strip()
 
 
 def _wake_think_permission_line(presence: dict | None = None) -> str:
     """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
     if not _wake_self_thinking_allowed():
         return ""
-    policy = _resident_reply_language(presence)
-    tag = _self_thinking_tag()
-    if tag == "aside":
-        # Claude Code driver: same permission, truthfully described — the block
-        # is folded under 「参考内容」 in the app, never rendered as message text.
-        if policy.language != "en":
-            return (
-                " 你可以在 JSON 前先写一个平常的 <aside>...</aside> 块；它会折叠在"
-                "「参考内容」里展示，不会显示成消息正文。如果选择写，从第一个字到最后"
-                "一个字都使用用户所用的语言。保持你自己的口气；不要写成对用户的评估，"
-                "也不要写成他们应该做什么的行动方案。"
-            )
-        return (
-            " You may open with your usual <aside>...</aside> block before the JSON; "
-            "it is shown folded under the reply, never as message text. Write the "
-            "whole block in the language the user uses, from first word to last. "
-            "Keep it in your own voice; do not turn it into an assessment of the user "
-            "or an action plan for what they should do."
-        )
-    if policy.language != "en":
-        return (
-            " 你可以在 JSON 前先写一个平常的 <think>...</think> 块；它会保持私密，"
-            "不会显示成消息。如果选择思考，从第一个字到最后一个字都使用用户所用的"
-            "语言。保持你自己的私下内心独白；不要写成对用户的评估，也不要写成他们"
-            "应该做什么的行动方案。"
-        )
-    return (
-        " You may open with your usual <think>...</think> block before the JSON; "
-        "it stays private and is never shown as a message. Write the whole block "
-        "in the language the user uses, from first word to last. Keep it in your "
-        "own private inner voice; do not turn it into an assessment of the user or "
-        "an action plan for what they should do."
-    )
+    from agent_protocol_core import self_thinking as _self_thinking_v1
+
+    return _self_thinking_v1.instruction_for_field(protocol="json").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -13346,7 +13342,7 @@ def _reply_only_recovery_result(result: Any) -> dict[str, Any]:
     turn = _split_agent_turn(result)
     body: dict[str, Any] = {"messages": list(turn.messages)}
     if turn.thinking_summary:
-        body["provider_reasoning"] = turn.thinking_summary
+        body["aside"] = turn.thinking_summary
     if turn.thinking_kind:
         body["reasoning_kind"] = turn.thinking_kind
     if turn.thinking_source:

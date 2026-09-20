@@ -140,7 +140,7 @@ def _wake_reply_round(text, *, think="I want to say this now."):
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"think": think, "text": text},
+            "args": {"aside": think, "text": text},
         }],
         "usage": {},
     }
