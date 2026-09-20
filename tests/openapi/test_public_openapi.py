@@ -1069,3 +1069,27 @@ def test_retired_memory_migration_is_not_advertised(public_schema):
     assert "/v1/memory/migration_state" not in public_schema["paths"]
     action_types = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]["enum"]
     assert "memory.upgrade" not in action_types
+
+
+def test_provider_probe_failure_contract_is_additive_and_shared():
+    schema = _build_public_schema(_load_schema())
+    failure = schema['components']['schemas']['ProviderTestFailedResponse']
+    assert set(failure['required']) == {'error', 'detail', 'status_code', 'failure_class'}
+    assert failure['properties']['error']['const'] == 'provider_test_failed'
+    assert failure['properties']['status_code']['type'] == ['integer', 'null']
+    assert set(failure['properties']['failure_class']['enum']) == {
+        'auth_invalid', 'quota_insufficient', 'model_not_found', 'rate_limited',
+        'upstream_unavailable', 'provider_config',
+    }
+    for method, path in [
+        ('post', '/v1/model_api/setup'), ('post', '/v1/model_api/test'),
+        ('post', '/v1/model_api/routes'),
+        ('post', '/v1/model_api/routes/{route_id}/test'),
+        ('post', '/v1/model_api/routes/{route_id}/activate'),
+        ('patch', '/v1/model_api/credentials/{credential_id}'),
+    ]:
+        response = schema['paths'][path][method]['responses']['400']
+        assert response['content']['application/json']['schema']['anyOf'] == [
+            {'$ref': '#/components/schemas/ProviderTestFailedResponse'},
+            {'$ref': '#/components/schemas/ErrorResponse'},
+        ]

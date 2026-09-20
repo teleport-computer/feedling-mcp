@@ -57,6 +57,32 @@ Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.
 
+## Model API credential probes
+
+Credential probe failures return HTTP `400` with `error: "provider_test_failed"`.
+The additive `failure_class` field distinguishes the following outcomes without
+changing the existing `detail` or upstream `status_code` fields:
+
+| Upstream evidence | `failure_class` |
+| --- | --- |
+| 401 or 403 | `auth_invalid` |
+| 402, including insufficient credit for OpenRouter's output reservation | `quota_insufficient` |
+| 404 | `model_not_found` |
+| 429 | `rate_limited` |
+| 408, 5xx, or a provider network failure | `upstream_unavailable` |
+| Other or unrecognized failures | `provider_config` |
+
+A 404 HTML page or a successful HTTP response that is not JSON retains the
+existing non-API-endpoint hint, `status_code: null`, and `provider_config` class.
+This applies to setup, manual tests, route tests and activation, and key rotation.
+It does not change the provider client's retry policy.
+
+Saved-route test errors carry a `<failure_class>: ` prefix. A rejected replacement
+key leaves the previously saved key and its test status intact. Failures also
+produce a safe user notice, deduplicated by `model_api:test_failed:<failure_class>`;
+a successful probe resolves these probe notices. Other Model API notices remain
+unchanged. Raw upstream response text is not copied into the notice.
+
 ## Pi stream diagnostics
 
 For resident clients using the pi driver, `agent.model.call.done` and

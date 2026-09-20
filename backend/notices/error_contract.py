@@ -301,6 +301,7 @@ def _platform_specs() -> tuple[ErrorSpec, ...]:
 
 def _workflow_specs() -> tuple[ErrorSpec, ...]:
     return (
+        _spec("provider_config", "workflow", "model_api", "user_provider", "模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。", en="The model service configuration did not pass its test. Check the endpoint, model name, and settings, then retry."),
         _spec("genesis_failed", "workflow", "genesis", "system", "入住材料的文件解读没能完成，可稍后在记忆花园重试。", en="Reading your onboarding files did not finish. You can retry later in the Memory Garden."),
         _spec("genesis_partial", "workflow", "genesis", "system", "入住材料的文件解读完成了，但有部分记忆没能导入。", en="Your onboarding files were read, but some memories could not be imported."),
         _spec("import_failed", "workflow", "import", "system", "聊天记录导入失败了，请稍后重试。", en="Importing the chat history failed. Please try again later."),

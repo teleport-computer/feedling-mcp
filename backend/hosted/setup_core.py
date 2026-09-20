@@ -48,6 +48,8 @@ from hosted import vision_routing
 from hosted import vision_observer
 from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
+from notices import catalog as notices_catalog
+from notices import core as notices_core
 
 
 _TEST_PATCHABLE_MODULES = (core_enclave,)
@@ -1280,7 +1282,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             f"[model_api:{store.user_id}] setup FAILED provider={provider} "
             f"model={model} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return _provider_test_failed_body(e), 400
+        return _record_provider_test_failure(store, e), 400
 
     # `supports_responses` is retired transport metadata: nothing in the backend
     # reads it (not even spawners.consumer_env), and /responses has exactly one
@@ -1378,6 +1380,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             return restore_error
         return {"error": "model_api_route_write_failed"}, 500
     provider_health.record_success(store.user_id)
+    notices_core.resolve(store, "model_api:test_failed:")
 
     # Rollout flags / last_action_trace_* still live in the model_api_runtime blob;
     # seed it so onboarding validate's hosted_runtime step and GET /v1/model_api/runtime
@@ -1848,6 +1851,22 @@ def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
     return status == 404 and any(marker in text for marker in _HTML_MARKERS)
 
 
+def _provider_test_failure_class(exc: BaseException) -> str:
+    """User-facing probe outcome; never changes provider retry semantics."""
+    if _looks_like_wrong_api_endpoint(exc):
+        return notices_catalog.PROVIDER_TEST_CONFIG_CLASS
+    status = getattr(exc, "status_code", None)
+    # This prefix is produced by provider_client's network/deadline wrappers,
+    # not a free-text matcher against a provider's arbitrary response body.
+    if (isinstance(status, int) and 500 <= status <= 599) or (
+        status is None and str(exc).startswith("provider network error:")
+    ):
+        return notices_catalog.PROVIDER_TEST_UNAVAILABLE_CLASS
+    return notices_catalog.PROVIDER_TEST_STATUS_CLASSES.get(
+        status, notices_catalog.PROVIDER_TEST_CONFIG_CLASS
+    )
+
+
 def _provider_test_failed_body(exc: BaseException) -> dict:
     """provider key 自测失败的统一响应体 —— 四个入口(保存配置 / 手动测试 /
     加路由 / 改凭证)共用一份判据,否则同一个错误从不同入口进来说法会不一样。
@@ -1860,9 +1879,35 @@ def _provider_test_failed_body(exc: BaseException) -> dict:
     if _looks_like_wrong_api_endpoint(exc):
         return {"error": "provider_test_failed",
                 "detail": _WRONG_API_ENDPOINT_HINT,
-                "status_code": None}
+                "status_code": None,
+                "failure_class": _provider_test_failure_class(exc)}
     return {"error": "provider_test_failed", "detail": str(exc),
-            "status_code": getattr(exc, "status_code", None)}
+            "status_code": getattr(exc, "status_code", None),
+            "failure_class": _provider_test_failure_class(exc)}
+
+
+def _record_provider_test_failure(store, exc: BaseException, *, route_id=None) -> dict:
+    """Keep API, saved probe evidence, and deduplicated notice in agreement.
+
+    Only probes of saved credentials pass a route_id. A rejected replacement
+    key must not revoke the existing route's successful test proof.
+    """
+    body = _provider_test_failed_body(exc)
+    failure_class = body["failure_class"]
+    if route_id is not None:
+        # A failed evidence write can leave stale status, but never reports a
+        # successful probe to the caller: the API still returns its failure.
+        db.model_api_route_mark_test(
+            store.user_id, route_id, status="failed",
+            error=f"{failure_class}: {exc}"[:240],
+        )
+    notices_core.emit(
+        store, source="model_api", error_class=failure_class,
+        blame=notices_catalog.blame_for(failure_class), severity="warning",
+        user_text=notices_catalog.user_text_for(failure_class),
+        dedupe_key=f"model_api:test_failed:{failure_class}",
+    )
+    return body
 
 
 def _test_active_route(
@@ -1924,14 +1969,7 @@ def _test_active_route(
             probe_trace_id=probe_trace_id,
         )
     except provider_client.ProviderError as e:
-        # Not checked on purpose: the response below is already an accurate 400
-        # (provider_test_failed) regardless of whether this write lands, so callers
-        # never see a false success here. Worst case on a swallowed write failure is
-        # the route's test_status stays at its pre-test value instead of flipping to
-        # 'failed' — a latent staleness, not a lie told to this caller.
-        db.model_api_route_mark_test(store.user_id, route["id"], status="failed",
-                                     error=str(e)[:240])
-        return _provider_test_failed_body(e), 400
+        return _record_provider_test_failure(store, e, route_id=route["id"]), 400
     # Must check: returning None here tells model_api_test() "success" -> 200. If
     # this write silently fails, test_status never flips to 'ok', so the route can
     # stay excluded from the agent-runtime roster (which gates on test_status='ok')
@@ -1940,6 +1978,7 @@ def _test_active_route(
     if not _mark_route_test_ok(store.user_id, route["id"]):
         return {"error": "model_api_route_write_failed"}, 500
     provider_health.record_success(store.user_id)
+    notices_core.resolve(store, "model_api:test_failed:")
     return None
 
 
@@ -2017,7 +2056,6 @@ def model_api_delete(store) -> tuple[dict, int]:
     # 配置没了,任何 config 期发出的 model_api 通知也随之作废——否则 /v1/notices
     # 会为一个已不存在的 provider 一直显示活跃警告。
     try:
-        from notices import core as notices_core
         notices_core.resolve(store, "model_api:")
     except Exception:
         pass  # 扇出绝不影响 delete 主职责
@@ -2257,15 +2295,11 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
             context_window_tokens=context_window_tokens,
         ))
     except provider_client.ProviderError as e:
-        # Not checked on purpose: both callers (route_test, route_activate) already
-        # surface an accurate 400 below regardless of whether this write lands —
-        # no false success. Swallowed failure just leaves test_status stale.
-        db.model_api_route_mark_test(store.user_id, route["id"], status="failed", error=str(e))
         print(
             f"[model_api:{store.user_id}] route test FAILED provider={route['provider']} "
             f"model={route['model']} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return _provider_test_failed_body(e), 400
+        return _record_provider_test_failure(store, e, route_id=route["id"]), 400
     # Must check: model_api_route_activate() treats a None return here as "test
     # passed" and immediately flips is_active=True. If this write silently fails,
     # test_status never reaches 'ok', so the just-"activated" route is excluded from
@@ -2273,6 +2307,7 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
     # "activated" response — the false-success pattern this pass exists to catch.
     if not _mark_route_test_ok(store.user_id, route["id"]):
         return {"error": "model_api_route_write_failed"}, 500
+    notices_core.resolve(store, "model_api:test_failed:")
     return None
 
 
@@ -2702,7 +2737,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             ))
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
-            return _provider_test_failed_body(e), 400
+            return _record_provider_test_failure(store, e), 400
 
     active_key_change = bool(
         active and active["credential_id"] == credential_id
@@ -2742,6 +2777,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
     if active and active["credential_id"] == credential_id:
         _mark_route_test_ok(store.user_id, active["id"])
         provider_health.record_success(store.user_id)
+        notices_core.resolve(store, "model_api:test_failed:")
 
     # 该 credential 下的非 active route 全部退回 untested（新 key 未在它们上验证过）。
     # Not checked: this is UI-freshness bookkeeping only. Activating any of these

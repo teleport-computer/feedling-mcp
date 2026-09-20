@@ -1052,3 +1052,135 @@ def test_delete_credential_unknown_id_404(client, registered_user, fake_provider
         headers=headers)
     assert resp.status_code == 404
     assert resp.get_json()["error"] == "credential_not_found"
+
+
+# T667: probe failures must remain distinguishable at the HTTP and storage edges.
+_PROBE_FAILURE_CASES = [
+    (400, 'bad request', 'provider_config'),
+    (401, 'invalid key', 'auth_invalid'),
+    (402, 'requires more credits for max_tokens', 'quota_insufficient'),
+    (403, 'authentication denied', 'auth_invalid'),
+    (404, 'model_not_found', 'model_not_found'),
+    (408, 'request timeout', 'upstream_unavailable'),
+    (415, 'unsupported media type', 'provider_config'),
+    (422, 'invalid configuration', 'provider_config'),
+    (429, '<html>rate limited</html>', 'rate_limited'),
+    (500, 'internal error', 'upstream_unavailable'),
+    (503, 'unavailable', 'upstream_unavailable'),
+    (None, 'invalid_output', 'provider_config'),
+    (None, 'provider network error: ConnectTimeout', 'upstream_unavailable'),
+    (None, 'provider returned non-json response', 'provider_config'),
+    (404, '<!doctype html><html>not found</html>', 'provider_config'),
+    (401, '<html>authentication denied</html>', 'auth_invalid'),
+    (402, '<html>payment required</html>', 'quota_insufficient'),
+]
+
+
+def _probe_failure(status, detail):
+    import httpx
+
+    if status is None:
+        return provider_client.ProviderError(detail)
+    try:
+        provider_client._raise_for_provider_status(httpx.Response(status, text=detail))
+    except provider_client.ProviderError as exc:
+        return exc
+    raise AssertionError('expected provider failure')
+
+
+@pytest.mark.parametrize('entry', ['setup', 'test', 'route_create', 'route_test', 'activate', 'credential'])
+@pytest.mark.parametrize('provider_status,detail,expected_class', _PROBE_FAILURE_CASES)
+def test_probe_failure_class_across_api_notice_and_persisted_route(
+    client, registered_user, fake_provider, fake_envelope, fake_enclave,
+    monkeypatch, entry, provider_status, detail, expected_class,
+):
+    from notices import catalog
+
+    uid = registered_user['user_id']
+    headers = _setup_one(client, registered_user)
+    active_before = db.model_api_active_route(uid)
+    rid = active_before['id']
+    cid = active_before['credential_id']
+    credential_before = db.model_api_credential_get(uid, cid)
+    requests = {
+        'setup': ('POST', '/v1/model_api/setup', {
+            'provider': 'anthropic', 'model': 'claude-sonnet-4-5', 'api_key': 'sk-replacement'}),
+        'test': ('POST', '/v1/model_api/test', {}),
+        'route_create': ('POST', '/v1/model_api/routes', {
+            'provider': 'anthropic', 'model': 'claude-haiku-4-5', 'credential_id': cid, 'activate': True}),
+        'route_test': ('POST', f'/v1/model_api/routes/{rid}/test', {}),
+        'activate': ('POST', f'/v1/model_api/routes/{rid}/activate', {}),
+        'credential': ('PATCH', f'/v1/model_api/credentials/{cid}', {'api_key': 'sk-replacement'}),
+    }
+    exc = _probe_failure(provider_status, detail)
+    retry_class_before = provider_client.classify_provider_error(exc)
+
+    def fail(_cfg):
+        raise exc
+
+    monkeypatch.setattr(provider_client, 'test_provider_key', fail)
+    method, path, payload = requests[entry]
+    for _ in range(2):
+        response = client.open(path, method=method, headers=headers, json=payload)
+        assert response.status_code == 400, response.get_data(as_text=True)
+        body = response.get_json()
+        assert body['error'] == 'provider_test_failed'
+        assert body['failure_class'] == expected_class
+        wrong_endpoint = 'non-json response' in detail or (provider_status == 404 and '<html>' in detail)
+        assert body['status_code'] == (None if wrong_endpoint else provider_status)
+        if wrong_endpoint:
+            assert '不是 API Key 的问题' in body['detail']
+        else:
+            assert body['detail'] == str(exc)
+    assert provider_client.classify_provider_error(exc) == retry_class_before
+
+    notices = client.get('/v1/notices', headers=headers).get_json()['notices']
+    notices = [n for n in notices if n['dedupe_key'].startswith('model_api:test_failed:')]
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice['error_class'] == expected_class
+    assert expected_class in catalog.ERROR_CLASSES
+    assert notice['blame'] == catalog.blame_for(expected_class)
+    assert notice['user_text'] == catalog.user_text_for(expected_class)
+    assert notice['dedupe_key'] == f'model_api:test_failed:{expected_class}'
+    assert notice['occurrences'] == 2
+    assert notice['resolved'] is False
+    assert not notice['detail']  # Do not copy upstream raw text into a notice.
+    assert db.model_api_credential_get(uid, cid)['api_key_envelope'] == credential_before['api_key_envelope']
+    if entry in {'setup', 'credential'}:
+        after = db.model_api_route_get(uid, rid)
+        assert after['test_status'] == active_before['test_status'] == 'ok'
+        assert after['last_test_error'] == active_before['last_test_error']
+    else:
+        routes = db.model_api_routes_list(uid)
+        tested = next(r for r in routes if r['model'] == ('claude-haiku-4-5' if entry == 'route_create' else 'claude-sonnet-4-5'))
+        assert tested['test_status'] == 'failed'
+        assert tested['last_test_error'] == f'{expected_class}: {exc}'[:240]
+
+
+@pytest.mark.parametrize('entry', ['setup', 'test', 'route_test', 'activate', 'credential'])
+def test_successful_probe_resolves_only_probe_notices(
+    client, registered_user, fake_provider, fake_envelope, fake_enclave, entry,
+):
+    from notices import core as notices_core
+
+    uid = registered_user['user_id']
+    headers = _setup_one(client, registered_user)
+    store = core_store.get_store(uid)
+    route = db.model_api_active_route(uid)
+    for key in ['model_api:test_failed:auth_invalid', 'model_api:test_failed:quota_insufficient', 'model_api:unrelated']:
+        notices_core.emit(store, source='model_api', error_class='auth_invalid',
+                          blame='user_provider', severity='warning', user_text='test', dedupe_key=key)
+    requests = {
+        'setup': ('POST', '/v1/model_api/setup', {'provider': 'anthropic', 'model': 'claude-sonnet-4-5', 'api_key': 'sk-new'}),
+        'test': ('POST', '/v1/model_api/test', {}),
+        'route_test': ('POST', f'/v1/model_api/routes/{route["id"]}/test', {}),
+        'activate': ('POST', f'/v1/model_api/routes/{route["id"]}/activate', {}),
+        'credential': ('PATCH', f'/v1/model_api/credentials/{route["credential_id"]}', {'api_key': 'sk-new'}),
+    }
+    method, path, payload = requests[entry]
+    response = client.open(path, method=method, headers=headers, json=payload)
+    assert response.status_code == 200, response.get_data(as_text=True)
+    rows = db.log_read_all(uid, 'user_notices')
+    for row in rows:
+        assert row['resolved'] == row['dedupe_key'].startswith('model_api:test_failed:')
