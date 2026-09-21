@@ -38,6 +38,13 @@ change must not be interpreted as an API guarantee.
   Admin user summaries expose `wake_provider_circuit_open_users` (null when
   the state cannot be measured).
 
+- `GET /v1/chat/canvases` now includes agent-authored `.io.html` Chat cards
+  from Resident and self-hosted delivery alongside workspace entries. Workspace
+  entries win identical filenames; the combined result keeps the newest 500.
+  Chat-only entries include a message ID for body reads, with no body copies or
+  historical backfill. Both database migration chains add a concurrent partial
+  index to avoid scanning unrelated messages.
+
 - Chat attachment delivery now records content-free timing events for object
   storage GETs (including body reads) and hydration, distinguishing timeouts,
   missing objects, and upstream server errors without recording keys or content.

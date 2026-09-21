@@ -373,6 +373,7 @@ jobs:
           tests/test_asgi_agent_body.py
           tests/test_asgi_admin.py
           tests/test_asgi_chat_remaining.py
+          tests/test_chat_canvas_index_v1.py
           tests/test_asgi_cors.py
           tests/test_asgi_lifespan_loads_users.py
           tests/test_notification_sound_payload.py
