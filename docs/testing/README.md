@@ -158,6 +158,8 @@ python3 tools/e2e/p0.py --list     # 先看有哪些格子、key 齐不齐
 | `TESTING.md` | **规范**:26 类改动各自要做什么 + 约 80 条通用坑 | 改完代码不确定要测什么时 |
 | `RELEASE_TESTING_PROTOCOL.md` | **规范**:发版分层框架 + 能力矩阵 | 要推生产时 |
 | `CHAT_ACTIVITY_V2_MANUAL.md` | 手工用例:聊天活动轨迹 | 动了 turn-activity 时 |
+| [SELF_THINKING_LANGUAGE_EVAL.md](SELF_THINKING_LANGUAGE_EVAL.md) | 双语 self-thinking 提示词评测方法与执行门禁 | 准备或解读该专题评测时 |
+| [TCP_CONNECT_MONITOR.md](TCP_CONNECT_MONITOR.md) | 独立 TCP 连接观测、读数与首周核验 | 排查连接问题或汇总监控证据时 |
 | `archive/` | 历史报告与模板,**不是规范** | 想看某次是怎么查的 |
 
 ## 跑 E2E 之前:先确认你不会撞上部署重启
