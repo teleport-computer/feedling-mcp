@@ -17,7 +17,78 @@ from enclave import auth as enclave_auth  # noqa: E402
 from enclave import backend_client, keys, readside  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
+from enclave.routes import chat as chat_routes  # noqa: E402
 from memory import memory_core  # noqa: E402
+
+
+def _select_context(monkeypatch, cards, messages):
+    monkeypatch.setattr(readside, "moments_to_cards", lambda *_: cards)
+    monkeypatch.setenv("FEEDLING_MEMORY_RECALL_UNIFIED_RANKER", "1")
+    return chat_routes._build_context_memories([], messages, {
+        "want_trace": True, "authorized_user_id": "usr_recall", "content_sk": None,
+    })
+
+
+@pytest.mark.parametrize("agent_role", ["assistant", "agent", "openclaw"])
+def test_user_entity_survives_long_assistant_topic(monkeypatch, agent_role):
+    """Real IO projection + jieba + selector: last-four query loses this card."""
+    topic = "相册 照片 视频 镜头 构图 曝光 色彩 胶片 摄影 拍摄 编辑 剪辑"
+    cards = [{"id": "pet", "summary": "Mochi 是我养的猫。",
+              "created_at": "2026-06-01T00:00:00"}]
+    cards += [{"id": f"photo{i}", "summary": topic + f"方案{i}",
+               "created_at": "2026-07-01T00:00:00"} for i in range(10)]
+    cards += [{"id": f"neutral{i}", "summary": f"地铁站通勤路线 {i}",
+               "created_at": "2026-05-01T00:00:00"} for i in range(50)]
+    messages = [
+        {"role": "human", "content": "看看这个"},
+        {"role": agent_role, "content": topic * 10},
+        {"role": "user", "content": "Mochi 今天也在旁边呢"},
+        {"role": agent_role, "content": topic * 10},
+    ]
+    picked, trace, _ = _select_context(monkeypatch, cards, messages)
+    assert "pet" in {card["id"] for card in picked}
+    assert "pet" in {item["id"] for item in trace["selected"]}
+    assert len(picked) <= 8
+
+
+@pytest.mark.parametrize("latest", [
+    {"role": "user", "content": ""},
+    {"role": "human", "content": " \n "},
+    {"role": "user", "content": None, "content_type": "image", "image_omitted": True},
+    {"role": "user", "content": "", "content_type": "image", "image_b64": "AA=="},
+    {"role": "human", "content": "你看看", "content_type": "image"},
+])
+def test_recall_query_uses_latest_two_nonempty_user_texts(monkeypatch, latest):
+    seen = []
+    original = chat_routes._unified_selection
+
+    def observe(cards, query):
+        seen.append(query)
+        return original(cards, query)
+
+    monkeypatch.setattr(chat_routes, "_unified_selection", observe)
+    messages = [
+        {"role": "user", "content": "更早的话题"},
+        {"role": "human", "content": "上一条用户消息"},
+        {"role": "assistant", "content": "不能成为查询"},
+        {"role": "user", "content": "最近用户话题"},
+        {"role": "agent", "content": "不能成为查询"},
+        {"role": "openclaw", "content": "不能成为查询"},
+        {"role": "system", "content": "不能成为查询"},
+        latest,
+    ]
+    _select_context(monkeypatch, [], messages)
+    assert seen == ["你看看\n最近用户话题" if latest.get("content") == "你看看"
+                    else "最近用户话题\n上一条用户消息"]
+
+
+def test_recall_query_has_no_assistant_only_fallback(monkeypatch):
+    picked, _, log = _select_context(monkeypatch, [], [
+        {"role": "assistant", "content": "Mochi 是你的猫"},
+        {"role": "user", "content": None, "content_type": "image"},
+    ])
+    assert picked == []
+    assert log["query_empty"] is True
 
 
 def _moment(mid: str, title: str, description: str, *, linked: str = "") -> dict:

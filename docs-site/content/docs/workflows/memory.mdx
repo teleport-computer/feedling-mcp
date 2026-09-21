@@ -128,8 +128,10 @@ loop; after a bounded overview, fetch visible IDs or use a more specific search.
 
 Recall diagnostics distinguish card selection from actual prompt injection.
 Each V2 chat/wake turn can read enclave-selected cards from a sequence-bounded
-history window. The selection query includes the last four conversation messages,
-including assistant replies. The runtime adds a non-system “相关记忆” data block
+history window. The selection query joins the latest two non-empty user messages,
+newest first, excluding assistant replies. A blank message or an image without a
+caption falls back to earlier user text; an image caption remains eligible.
+The runtime adds a non-system “相关记忆” data block
 before conversation replay: card ID, the summary, and the selection reason. It
 never substitutes the card body for a missing summary and never truncates a
 summary: summaries up to 300 characters appear whole, and a longer one is

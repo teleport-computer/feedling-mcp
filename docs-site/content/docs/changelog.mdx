@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Automatic memory recall uses the latest two non-empty user messages, newest
+  first, so long assistant replies no longer contribute competing query terms.
+  Blank messages and images without captions fall back to earlier user text.
+
 - Runtime V2 Dream doubles its per-wire and phase timeouts from 90 to 180
   seconds, with matching Heavy-pool watchdog allowances. Capture, profile,
   chat/wake, resident V1, and Dream's consolidation safety gates retain their
