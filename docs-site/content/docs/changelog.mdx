@@ -12,6 +12,24 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident V1 asks for the persona aside as a leading `<aside>…</aside>` block
+  again, on every driver and route (pi and codex no longer use `<think>`).
+  Foreground chat replies follow the block as plain text, with the JSON
+  envelope optional for multi-bubble replies; heartbeat, perception,
+  scheduled, and screen-watch wakes keep their existing JSON reply shapes and
+  permit the same block before the JSON. Screen-watch wakes also carry the
+  Runtime V2 screen-watch aside note (they previously asked for no aside at
+  all). The envelope's `aside` field stays accepted. The JSON-field instruction
+  introduced with `reply(aside, text)` remains Runtime V2's only. A block whose
+  following body fails the leak gate no longer counts as an aside-only reply.
+  Asking CLI models to hand-write their reply inside a JSON string caused
+  turns with unescaped quotes or line breaks to be dropped as `protocol_leak`
+  and replaced by the failure fallback.
+
+- Automatic memory recall uses the latest two non-empty user messages, newest
+  first, so long assistant replies no longer contribute competing query terms.
+  Blank messages and images without captions fall back to earlier user text.
+
 - Runtime V2 Dream doubles its per-wire and phase timeouts from 90 to 180
   seconds, with matching Heavy-pool watchdog allowances. Capture, profile,
   chat/wake, resident V1, and Dream's consolidation safety gates retain their

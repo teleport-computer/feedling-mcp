@@ -195,6 +195,7 @@ V2 的 bug 表面很杂,底下集中在**五段共用代码**上(上下文组装
 
 | 你改动的类别 | 典型文件 | L1 pytest | L2 本地E2E | L3 部署态 | 额外必做 |
 |---|---|:--:|:--:|:--:|---|
+| **自动召回查询窗口（T684）** | `enclave/routes/chat.py::_build_context_memories` | ✅ `test_context_memories.py` / `test_enclave_context_recall.py` / `test_enclave_routes_chat.py` | 官方 retrieval 语料 + IO 投影/jieba A/B | test 部署后直接问/换说法/隔轮各 ≥3 例 | 必锁长 assistant 话题不挤出用户实体（回退 last4 必红）、空句/纯图片回退、user/human 与 assistant/agent/openclaw 别名；记录排名退步与事故回放分母。模型回答须核注入到达与无据编造，未测不得以单测代替 |
 | **A. 纯后端逻辑** | `service/` `core/` `actions/` | ✅ | — | — | pyflakes；对应 `test_<域>_*.py` 补/更新 |
 | **B. 新增/改路由** | `*/routes_asgi.py` | ✅ | — | ⚠️ 视情况 | PR 描述**列出路由变更**（url_map 是回归基线）；补 `test_asgi_<域>.py` |
 | **C. 错误返回 / slug** | 任何返回 `{"error":...}` 的地方 | ✅ | — | — | **同 PR 登记 `docs/API_ERRORS.md`**（有守卫测试）；slug 冻结、语义变更走新 slug。**别把「长得像」的失败合并成同一个码**——区分度就是下次事故的分诊能力：`no_json_object`（压根没拿到平衡的 JSON 对象:截断/纯散文）与 `json_decode_error`（拿到了平衡对象但它非法 ⇒ **我们抓错了 span**）看着都是"解析失败",但它们指向完全不同的真因;2026-08-09 正是靠这个区分,一眼把「模型输出被截断」排除、锁定「提取器扫进了思维链」。**新增/合并错误码时自问:如果只看 admin 上这个码,我还能不能分辨真因?** 合并前先补一条测试把两个码各自钉住(样板 `tests/test_memory_parse_thinking_leak.py`) |

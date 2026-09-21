@@ -1052,6 +1052,7 @@ jobs:
             tests/test_wake_support_indexes_migration.py \
             tests/test_account_recover_challenges_migration.py \
             tests/test_user_logs_duration_sec.py \
+            tests/test_user_logs_autovacuum.py \
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
@@ -1971,7 +1972,7 @@ jobs:
         env:
           DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
           FEEDLING_DATABASE_SCHEMA:      ${{ vars.PROD_FEEDLING_DATABASE_SCHEMA || 'rds' }}
-          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ vars.PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED || '0' }}
+          FEEDLING_PLAINTEXT_WRITES_ACCEPTED: ${{ vars.PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED || '1' }}
           TEE_DATABASE_URL:              ${{ secrets.PROD_TEE_DATABASE_URL }}
           FEEDLING_TEE_DUAL_WRITE:       ${{ secrets.PROD_FEEDLING_TEE_DUAL_WRITE }}
           PLAINTEXT_SHADOW_DATABASE_URL: ${{ secrets.PROD_PLAINTEXT_SHADOW_DATABASE_URL }}

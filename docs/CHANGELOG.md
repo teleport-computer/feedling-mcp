@@ -77,6 +77,10 @@ historical_reason: point-in-time
 - T649：拼豆身体生成的完成 trace 增加闭集 repair_reason / invalid_reason，记录首轮及最终 rows 校验失败原因，不记录行号或模型原文；resident 仅记录后端最终校验原因。
 - T649：拼豆身体的 Model API 调用固定关闭 thinking，避免 Anthropic 直连将输出额度全部用于推理而无正文；保留 8192 token 上限和现有生成提示。
 
+## 2026-09-21 — 自动召回查询优先用户消息（T684）
+
+- `_build_context_memories` 改取最近两条非空 user/human 消息，最新在前；assistant/agent/openclaw 回复不再参与查询，空句与无 caption 图片回退到此前用户文本。memgarden、cap、排名参数和注入渲染不变。补长回复干扰、图片/空串及角色守卫，同步公开 memory 工作流；线上三格验收另在 test 部署后记录。
+
 ## 2026-09-17
 
 ### [FIX] T638：resident pi 上游错误分型与可持久化诊断

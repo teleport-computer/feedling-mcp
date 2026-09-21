@@ -34,11 +34,11 @@ class _NameOnly:
 VERSION = retrieval.rank("", [], tokenizer=_NameOnly(), **RANK_OPTIONS).version
 
 #: Automatic recall (``enclave/routes/chat.py``) ranks the same way but with a
-#: looser strong-evidence gate. Its query is the last four chat messages; most
-#: of those words were never written into any card, and memgarden counts unseen
-#: query words against coverage ("nobody wrote this" is a no-hit signal for a
-#: search). In a chat window that signal is chit-chat, not absence: with the
-#: search gate, "担心家里猫咪最近不吃饭" inside an ordinary evening chat recalled
+#: looser strong-evidence gate. Its query is the latest two non-empty user
+#: messages, newest first. Conversational words may not occur in any card, and
+#: memgarden counts unseen query words against coverage ("nobody wrote this"
+#: is a no-hit signal for a search). In a chat window that signal is chit-chat,
+#: not absence: with the search gate, "担心家里猫咪最近不吃饭" inside an ordinary evening chat recalled
 #: neither cat card in gardens of 2-200 cards, where the previous selector did.
 #: 0.5 x max IDF lets one strongly matching anchor through again. Calibrated
 #: 2026-09-15 on memgarden evals/retrieval (io projection + jieba) plus

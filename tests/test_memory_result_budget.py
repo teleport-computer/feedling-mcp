@@ -507,7 +507,8 @@ def test_recall_measures_final_provider_request_not_selection(monkeypatch, drop_
     assert "NP-4286" not in json.dumps(observed, ensure_ascii=False)
 
 
-def test_enclave_selection_query_is_last_four_conversation_messages():
+def test_enclave_selection_query_is_latest_two_user_messages_newest_first():
+    # T684 changes the query contract: assistant/tool text cannot supply anchors.
     from enclave.routes import chat
     from memgarden import observability
     rows = [{"role": "user", "content": "old-secret"},
@@ -519,7 +520,7 @@ def test_enclave_selection_query_is_last_four_conversation_messages():
     _, _, log = chat._build_context_memories([], rows, {
         "context_mode": "", "want_trace": True, "authorized_user_id": "u", "content_sk": None,
     })
-    assert log["query_fingerprint"] == observability.query_fingerprint("露营灯\n你问的是保修卡吗\n对\n需要编号")
+    assert log["query_fingerprint"] == observability.query_fingerprint("对\n露营灯")
     assert "old-secret" not in json.dumps(log) and "tool-secret" not in json.dumps(log)
 
 

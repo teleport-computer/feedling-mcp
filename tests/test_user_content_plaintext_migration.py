@@ -1049,3 +1049,29 @@ def test_cli_redacts_unexpected_database_or_setup_failure(monkeypatch, capsys):
     assert secret_dsn not in output.out and secret_dsn not in output.err
     assert output.out == ""
     assert "runtimeerror" in output.err
+
+
+def test_failure_metadata_classifies_cas_conflict_as_retryable():
+    metadata = plaintext_migration.failure_metadata("cas_conflict")
+
+    assert metadata == {
+        "failure_class": "cas_conflict",
+        "failure_detail": "compare_and_swap_lost",
+        "retryable": True,
+    }
+
+
+def test_failure_metadata_classifies_decrypt_failure_as_deterministic():
+    error = RuntimeError("enclave_http_403:decrypt_failed")
+    error.failure_class = "enclave_http_403"
+    error.failure_detail = "aead_verify_failed"
+
+    metadata = plaintext_migration.failure_metadata(
+        "failed_transform_or_storage", error
+    )
+
+    assert metadata == {
+        "failure_class": "enclave_http_403",
+        "failure_detail": "aead_verify_failed",
+        "retryable": False,
+    }

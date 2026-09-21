@@ -20,6 +20,86 @@ from psycopg.types.json import Jsonb
 from tee_replicator import transforms
 
 
+_SAFE_FAILURE_VALUE_MAX = 64
+_RETRYABLE_FAILURE_CLASSES = frozenset({
+    "cas_conflict",
+    "enclave_transport_error",
+    "enclave_unavailable",
+    "api_key_unavailable",
+    "enclave_http_error",
+    "enclave_invalid_response",
+    "r2_fetch_error",
+    "frame_cleanup_pending",
+})
+
+
+def _safe_failure_value(value: object, fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text or len(text) > _SAFE_FAILURE_VALUE_MAX:
+        return fallback
+    if not all(char.isalnum() or char in "_-:" for char in text):
+        return fallback
+    return text
+
+
+def failure_metadata(status: str, exc: Exception | None = None) -> dict[str, object]:
+    """Return bounded, content-free classification for one failed item."""
+    status = str(status or "unknown")
+    if status == "cas_conflict":
+        return {
+            "failure_class": "cas_conflict",
+            "failure_detail": "compare_and_swap_lost",
+            "retryable": True,
+        }
+    status_classes = {
+        "failed_foreign_body_key": ("foreign_body_key", "owner_prefix_mismatch"),
+        "failed_r2_object_missing": ("r2_object_missing", "object_not_found"),
+        "failed_invalid_shape": ("invalid_shape", "unsupported_envelope"),
+        "failed_frame_cleanup_pending": ("frame_cleanup_pending", "cleanup_retry"),
+    }
+    if status in status_classes:
+        failure_class, failure_detail = status_classes[status]
+        return {
+            "failure_class": failure_class,
+            "failure_detail": failure_detail,
+            "retryable": failure_class in _RETRYABLE_FAILURE_CLASSES,
+        }
+
+    failure_class = ""
+    failure_detail = ""
+    if exc is not None:
+        failure_class = _safe_failure_value(
+            getattr(exc, "failure_class", ""), ""
+        )
+        failure_detail = _safe_failure_value(
+            getattr(exc, "failure_detail", ""), ""
+        )
+        message = str(exc)
+        if not failure_class:
+            if "enclave_http_401" in message or "token_expired" in message:
+                failure_class, failure_detail = "enclave_http_error", "token_expired"
+            elif "enclave_http_403" in message:
+                failure_class, failure_detail = "enclave_http_403", "http_403_other"
+            elif "enclave_error:" in message:
+                failure_class, failure_detail = "enclave_transport_error", "transport_error"
+            elif "r2" in message.lower():
+                failure_class, failure_detail = "r2_fetch_error", "r2_error"
+    if not failure_class:
+        failure_class = "runtime_error"
+    if not failure_detail:
+        failure_detail = "unclassified"
+    retryable = failure_class in _RETRYABLE_FAILURE_CLASSES
+    if failure_class == "enclave_http_403" and failure_detail not in {
+        "http_403_other", "unclassified"
+    }:
+        retryable = False
+    return {
+        "failure_class": failure_class,
+        "failure_detail": failure_detail,
+        "retryable": retryable,
+    }
+
+
 APPLY_ENV = "FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION"
 
 
@@ -554,11 +634,16 @@ def run(
                 failure_detail = {
                     "stage": stage,
                     "exception_type": type(exc).__name__,
+                    **failure_metadata(status, exc),
                 }
             else:
-                failure_detail = {}
+                failure_detail = failure_metadata(status)
             if status == "cas_conflict":
-                failure_detail = {"stage": "cas_write", "exception_type": "none"}
+                failure_detail = {
+                    "stage": "cas_write",
+                    "exception_type": "none",
+                    **failure_metadata(status),
+                }
             if status not in {"failed_transform_or_storage", "cas_conflict"}:
                 return status, failure_detail
             if retry < 2:

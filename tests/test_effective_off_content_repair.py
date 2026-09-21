@@ -220,6 +220,90 @@ def test_failure_log_appends_content_free_item_details(tmp_path, monkeypatch):
     assert record["timestamp"]
 
 
+def test_failure_log_persists_stable_failure_metadata(tmp_path, monkeypatch):
+    path = tmp_path / "plaintext-failures.jsonl"
+    monkeypatch.setenv(plaintext_repair.FAILURE_LOG_ENV, str(path))
+
+    plaintext_repair.append_failure_log(
+        run_id="run-2",
+        user_id="usr_a",
+        failures=[
+            {
+                "surface": "frame",
+                "item_id": "frame-1",
+                "status": "failed_transform_or_storage",
+                "failure_class": "enclave_http_403",
+                "failure_detail": "aead_verify_failed",
+                "retryable": False,
+            }
+        ],
+    )
+
+    record = json.loads(path.read_text().splitlines()[0])
+    assert record["failure_class"] == "enclave_http_403"
+    assert record["failure_detail"] == "aead_verify_failed"
+    assert record["retryable"] is False
+    assert record["remediation"] == "manual_key_recovery"
+
+
+def test_load_retry_items_excludes_deterministic_and_legacy_failures(tmp_path):
+    path = tmp_path / "failures.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"user_id": "usr_a", "item_id": "item-1", "retryable": True}),
+                json.dumps({"user_id": "usr_a", "item_id": "item-2", "retryable": False}),
+                json.dumps({"user_id": "usr_b", "item_id": "item-3"}),
+                "not-json",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert plaintext_repair.load_retry_items(str(path)) == {
+        "usr_a": {"item-1"}
+    }
+
+
+def test_load_retry_items_can_explicitly_include_deterministic_failures(tmp_path):
+    path = tmp_path / "failures.jsonl"
+    path.write_text(
+        json.dumps({"user_id": "usr_a", "item_id": "item-1", "retryable": False})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert plaintext_repair.load_retry_items(
+        str(path), include_non_retryable=True
+    ) == {"usr_a": {"item-1"}}
+
+
+def test_summarize_failure_log_reports_stable_classes_and_unique_items(tmp_path):
+    path = tmp_path / "failures.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"user_id": "usr_a", "item_id": "item-1", "failure_class": "cas_conflict", "retryable": True}),
+                json.dumps({"user_id": "usr_a", "item_id": "item-1", "failure_class": "cas_conflict", "retryable": True}),
+                json.dumps({"user_id": "usr_b", "item_id": "item-2", "failure_class": "enclave_http_403", "retryable": False}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert plaintext_repair.summarize_failure_log(str(path)) == {
+        "records": 3,
+        "unique_items": 2,
+        "retryable_records": 2,
+        "non_retryable_records": 1,
+        "by_failure_class": {"cas_conflict": 2, "enclave_http_403": 1},
+        "by_remediation": {"manual_key_recovery": 1, "retry_automatically": 2},
+        "by_surface": {},
+    }
+
+
 def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
     monkeypatch.setattr(
         plaintext_repair,
@@ -259,7 +343,11 @@ def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
     }
 
 
-def test_apply_stops_when_health_does_not_recover(monkeypatch):
+def test_apply_stops_when_health_does_not_recover(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        plaintext_repair.FAILURE_LOG_ENV,
+        str(tmp_path / "plaintext-failures.jsonl"),
+    )
     monkeypatch.setattr(
         plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
     )
@@ -282,6 +370,45 @@ def test_apply_stops_when_health_does_not_recover(monkeypatch):
 
     assert result.failures == 1
     assert result.item_counts == {"failed_health_gate": 1}
+
+
+def test_health_gate_failure_is_persisted_as_retryable_user_record(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
+    )
+    logged = []
+    monkeypatch.setattr(
+        plaintext_repair,
+        "append_failure_log",
+        lambda **kwargs: logged.append(kwargs),
+    )
+
+    result = plaintext_repair.run(
+        apply=True,
+        continue_on_failure=True,
+        health_probe=lambda: False,
+        healthy_streak=1,
+        max_pause_sec=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.failures == 1
+    assert logged == [
+        {
+            "run_id": "",
+            "user_id": "usr_a",
+            "failures": [
+                {
+                    "surface": "user",
+                    "item_id": "",
+                    "status": "failed_health_gate",
+                    "failure_class": "health_gate",
+                    "failure_detail": "enclave_unhealthy",
+                    "retryable": True,
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.parametrize(

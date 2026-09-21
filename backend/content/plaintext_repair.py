@@ -25,6 +25,104 @@ DEFAULT_CHECKPOINT = "/data/plaintext-migration-checkpoint.json"
 _FAILURE_LOG_LOCK = threading.Lock()
 
 
+def remediation_for_failure(failure_class: str, status: str = "") -> str:
+    """Map a stable failure class to an operator action queue."""
+    failure_class = str(failure_class or "unknown").strip().lower()
+    status = str(status or "").strip().lower()
+    if failure_class in {
+        "cas_conflict",
+        "enclave_transport_error",
+        "enclave_unavailable",
+        "api_key_unavailable",
+        "enclave_http_error",
+        "enclave_invalid_response",
+        "health_gate",
+        "r2_fetch_error",
+    }:
+        return "retry_automatically"
+    if failure_class == "frame_cleanup_pending" or status == "failed_frame_cleanup_pending":
+        return "cleanup_only"
+    if failure_class in {"r2_object_missing", "foreign_body_key", "invalid_shape"}:
+        return "repair_source_data"
+    if failure_class in {"enclave_http_403", "enclave_plaintext_decode"}:
+        return "manual_key_recovery"
+    if failure_class in {"runtime_error", "migration_setup"}:
+        return "inspect_and_retry"
+    return "inspect_and_retry"
+
+
+def load_retry_items(
+    path: str, *, include_non_retryable: bool = False
+) -> dict[str, set[str]]:
+    """Load content-free item IDs from a failure log for a targeted retry.
+
+    New records are retried only when explicitly marked retryable.  Records
+    written by older versions have no such field and are intentionally
+    excluded unless the operator opts into the legacy/deterministic lane.
+    Malformed lines and user-level records without an item ID are ignored.
+    """
+    retry_items: dict[str, set[str]] = {}
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+                user_id = str(record["user_id"])
+                item_id = str(record["item_id"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not user_id or not item_id:
+                continue
+            if not include_non_retryable and record.get("retryable") is not True:
+                continue
+            retry_items.setdefault(user_id, set()).add(item_id)
+    return retry_items
+
+
+def summarize_failure_log(path: str) -> dict:
+    """Return an aggregate, content-free summary of a JSONL failure log."""
+    classes: Counter[str] = Counter()
+    remediations: Counter[str] = Counter()
+    surfaces: Counter[str] = Counter()
+    unique_items: set[tuple[str, str, str]] = set()
+    records = retryable = non_retryable = 0
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            records += 1
+            user_id = str(record.get("user_id", ""))
+            item_id = str(record.get("item_id", ""))
+            surface = str(record.get("surface", "unknown"))
+            failure_class = str(record.get("failure_class", "unknown"))
+            remediation = str(
+                record.get("remediation")
+                or remediation_for_failure(failure_class, str(record.get("status", "")))
+            )
+            if user_id and item_id:
+                unique_items.add((user_id, surface, item_id))
+            classes[failure_class] += 1
+            remediations[remediation] += 1
+            if surface != "unknown":
+                surfaces[surface] += 1
+            if record.get("retryable") is True:
+                retryable += 1
+            else:
+                non_retryable += 1
+    return {
+        "records": records,
+        "unique_items": len(unique_items),
+        "retryable_records": retryable,
+        "non_retryable_records": non_retryable,
+        "by_failure_class": dict(sorted(classes.items())),
+        "by_remediation": dict(sorted(remediations.items())),
+        "by_surface": dict(sorted(surfaces.items())),
+    }
+
+
 def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> None:
     """Append content-free failed item records to the persistent CVM volume."""
     if not failures:
@@ -44,6 +142,16 @@ def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> No
                 "status": str(failure.get("status", "unknown")),
                 "stage": str(failure.get("stage", "unknown")),
                 "exception_type": str(failure.get("exception_type", "unknown")),
+                "failure_class": str(failure.get("failure_class", "unknown")),
+                "failure_detail": str(failure.get("failure_detail", "unknown")),
+                "retryable": bool(failure.get("retryable", False)),
+                "remediation": str(
+                    failure.get("remediation")
+                    or remediation_for_failure(
+                        str(failure.get("failure_class", "unknown")),
+                        str(failure.get("status", "unknown")),
+                    )
+                ),
             }
             stream.write(json.dumps(record, sort_keys=True) + "\n")
         stream.flush()
@@ -211,6 +319,20 @@ def run(
             except HealthGateError:
                 counts["failed_health_gate"] += 1
                 failures += 1
+                append_failure_log(
+                    run_id=run_id,
+                    user_id=user_id,
+                    failures=[
+                        {
+                            "surface": "user",
+                            "item_id": "",
+                            "status": "failed_health_gate",
+                            "failure_class": "health_gate",
+                            "failure_detail": "enclave_unhealthy",
+                            "retryable": True,
+                        }
+                    ],
+                )
                 if continue_on_failure:
                     time.sleep(max(1.0, min(float(max_pause_sec), 60.0)))
                     continue

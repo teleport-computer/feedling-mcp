@@ -6193,6 +6193,28 @@ def _unclosed_reply_protocol(raw: str) -> dict | None:
     return None
 
 
+def _drop_adopted_aside_on_body_failure(turn: AgentTurn) -> None:
+    """Invariant: a body failure cannot be turned into an "aside-only success"
+    by the tag aside adopted just before it. Callers treat a non-empty
+    thinking_summary as a usable turn, so the protocol_leak / unknown
+    diagnostic would be lost and the user would get nothing instead of the
+    failure fallback (codex review, T687). Applies wherever the visible body
+    ends with a sanitizer verdict and no deliverable content — direct drops
+    and the recursive parse of a valid envelope alike. A genuine aside-only
+    turn (tag + empty body, no verdict) and a partially delivered envelope
+    (some messages survived) keep the aside."""
+    if not turn.thinking_self_authored or not turn.sanitizer_reason:
+        return
+    if turn.messages or turn.actions or turn.tool_calls:
+        return
+    turn.thinking_summary = ""
+    turn.thinking_kind = ""
+    turn.thinking_source = ""
+    turn.thinking_model = ""
+    turn.thinking_native = None
+    turn.thinking_self_authored = False
+
+
 def _agent_turn_from_obj_with_diagnostics(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
@@ -6233,7 +6255,7 @@ def _agent_turn_from_obj_with_diagnostics(obj: Any) -> AgentTurn:
                 extra={"salvage_reason": "trailing_unclosed"},
             )
             return turn
-        raw, _tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
+        raw, tagged_thinking = _split_tagged_thinking(raw, diagnostics=turn)
         if turn.sanitizer_reason:
             # Re-measure against the transport-level text; keep the salvage
             # reason the splitter attached (it is not derivable from the text).
@@ -6242,23 +6264,47 @@ def _agent_turn_from_obj_with_diagnostics(obj: Any) -> AgentTurn:
                 **{k: v for k, v in turn.raw_reply_diagnostics.items() if k == "salvage_reason"},
             }
         raw = _truncate_at_unclosed_thinking(raw)
+        if tagged_thinking and not (
+            _looks_like_agent_protocol_text(tagged_thinking)
+            or _has_protocol_debris(tagged_thinking)
+        ):
+            # T687 (2026-09-21): the resident lane asks for its aside in a tag
+            # again (prose stays outside JSON — asking CLI models to hand-write
+            # the reply inside a JSON string made unescaped quotes/newlines
+            # drop whole turns as protocol_leak). A block parsed locally on
+            # THIS host is the self-authored aside; upstream JSON cannot forge
+            # it. The optional JSON `aside` field below stays accepted. A block
+            # that holds a protocol envelope is not an aside — it stays private.
+            turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
+            if turn.thinking_summary:
+                turn.thinking_kind = "agent_summary"
+                turn.thinking_source = "self_thinking"
+                turn.thinking_native = False
+                turn.thinking_self_authored = True
         if not raw.strip():
             return turn
         decision, payload = _scan_visible_protocol(raw)
         if decision == "route":
             _merge_agent_turn(turn, _agent_turn_from_obj(payload))
+            # The envelope itself was valid but its recursive parse may have
+            # dropped every message (nested bad body); same invariant as the
+            # direct drops below.
+            _drop_adopted_aside_on_body_failure(turn)
             return turn
         if decision == "drop":
             _record_sanitizer(turn, "protocol_leak", original_visible)
+            _drop_adopted_aside_on_body_failure(turn)
             return turn
         if _looks_like_agent_protocol_text(raw):
             _record_sanitizer(turn, "protocol_leak", original_visible)
+            _drop_adopted_aside_on_body_failure(turn)
             return turn
         clean = _sanitize_reply_text(raw)
         if clean:
             turn.messages.append(clean)
         else:
             _record_sanitizer(turn, "unknown", original_visible)
+            _drop_adopted_aside_on_body_failure(turn)
         return turn
 
     if isinstance(obj, list):
@@ -13029,31 +13075,17 @@ def _wake_self_thinking_allowed() -> bool:
 
 
 def _self_thinking_tag() -> str:
-    """协议标签按 driver / route 选:Claude Code、官方 Gemini 与指定中转的
-    Gemini 模型用 ``aside``，其余 pi / codex 保持 ``think``。
+    """resident V1 的心里话标签:一律 ``aside``(Seven 2026-09-22 定,T687)。
 
-    T587(2026-09-15):这段是人设的第一人称旁白,App 会折叠在「参考内容」里展示给
-    用户,不是模型的私密推理;叫 ``think`` 让 Anthropic 的请求分类器把它读成索取
-    隐藏思维链,Opus 5 家族每轮拒答。标签按 driver 不按模型:矩阵里 sonnet-4-6 /
-    opus-4-8 / opus-5 / opus-5[1m] 用 ``aside`` 全部正常,不用维护型号名单。
-    只有 ``AGENT_MODE == "cli"`` 且 ``cmd[0]`` 是 ``claude`` 才算 Claude Code;
-    其余 driver 再按共享 provider/model 规则选择标签；http 模式里残留的
-    claude 命令不参与判断(见 tests)。"""
+    历史:T587 给 Claude Code driver 用 ``aside``(``think`` 让 Anthropic 的请求
+    分类器把它读成索取隐藏思维链,Opus 5 家族每轮拒答);T591/T601 给 Gemini 路线
+    用 ``aside``(pi 线上 tag-only 回放 ``<think>`` 6/10 HTTP 503,``<aside>`` 0/10);
+    其余 pi / codex 一直是 ``think``。T687 把 V1 从 JSON aside 字段改回标签时统一
+    成一个标签:``aside`` 的渲染也是唯一说真话的那份(这段会折叠在「参考内容」里
+    展示给用户,``think`` 版的「他听不见」并不成立)。V2 不走这里。"""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
-    # Only a turn that really runs the Claude Code CLI gets the aside tag: in
-    # http mode AGENT_CLI_CMD is dead configuration and must not change copy.
-    if AGENT_MODE == "cli" and _is_claude_code_cmd(_cli_cmd_tokens()):
-        return _self_thinking_v1.TAG_ASIDE
-    # T591 (2026-09-15): gemini gets ``aside`` on any driver — measured on
-    # gemini-3.6-flash via the pi wire with a tag-only swap in one captured
-    # request body: 6/10 replays came back HTTP 503 with ``<think>``, 0/10 with
-    # ``<aside>`` in the same window (replay only; no delivery path exercised).
-    # T601: named Gemini routes on openai_compatible/openrouter share the same
-    # selector as V2; other routes keep ``think`` byte for byte.
-    return _self_thinking_v1.tag_for_route(
-        AGENT_RUNTIME_METADATA.get("provider"), AGENT_RUNTIME_METADATA.get("model")
-    )
+    return _self_thinking_v1.TAG_ASIDE
 
 
 def _foreground_self_thinking_instruction() -> str:
@@ -13062,16 +13094,41 @@ def _foreground_self_thinking_instruction() -> str:
         return ""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
-    return _self_thinking_v1.instruction_for_field(protocol="json").strip()
+    return _self_thinking_v1.instruction(_self_thinking_tag()).strip()
 
 
-def _wake_think_permission_line(presence: dict | None = None) -> str:
-    """开关关闭时返回空串 —— 模板里连提都不提 ``<think>``。"""
+def _screen_watch_aside_note() -> str:
+    """V2's screen-watch aside note (``self_thinking.SCREEN_WATCH_INSTRUCTION``):
+    「不要叙述你在看屏幕」only binds what is said out loud; the aside may say
+    what is on the screen. Same switch as the permission line."""
     if not _wake_self_thinking_allowed():
         return ""
     from agent_protocol_core import self_thinking as _self_thinking_v1
 
-    return _self_thinking_v1.instruction_for_field(protocol="json").strip()
+    return _self_thinking_v1.SCREEN_WATCH_INSTRUCTION
+
+
+def _wake_think_permission_line(presence: dict | None = None) -> str:
+    """主动道(心跳 / 感知唤醒 / 定时提醒)只**放开** ``<aside>``,不像前台那样强制。
+    开关关闭时返回空串 —— 模板里连提都不提。标签一律 ``aside``(T687):这段会
+    折叠在 App「参考内容」里展示给用户,文案照实说。"""
+    if not _wake_self_thinking_allowed():
+        return ""
+    policy = _resident_reply_language(presence)
+    if policy.language != "en":
+        return (
+            " 你可以在 JSON 前先写一个平常的 <aside>...</aside> 块；它会折叠在"
+            "「参考内容」里展示，不会显示成消息正文。如果选择写，从第一个字到最后"
+            "一个字都使用用户所用的语言。保持你自己的口气；不要写成对用户的评估，"
+            "也不要写成他们应该做什么的行动方案。"
+        )
+    return (
+        " You may open with your usual <aside>...</aside> block before the JSON; "
+        "it is shown folded under the reply, never as message text. Write the "
+        "whole block in the language the user uses, from first word to last. "
+        "Keep it in your own voice; do not turn it into an assessment of the user "
+        "or an action plan for what they should do."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -17165,7 +17222,12 @@ def _screen_watch_message(
         "worth a closer look. If you want to review earlier moments, use screen_recent / screen_read "
         "(frames are kept ~100 min).",
         "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
-        "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
+        "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}."
+        # T687 (Seven 2026-09-22): the screen-watch lane permits the same
+        # <aside> block as the other wakes, plus V2's screen-watch note —
+        # this lane never carried either on V1 (parity gap with
+        # v2/worker._wake_system_prompt_for_lane).
+        + _wake_think_permission_line() + _screen_watch_aside_note(),
         "Do not mention this watch, the frames, or any system wording to the user.",
         (
             "watch_metadata:\n"

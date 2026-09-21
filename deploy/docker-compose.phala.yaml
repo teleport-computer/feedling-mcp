@@ -307,11 +307,12 @@ services:
       TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
       FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       # TEE-primary → independent decrypted shadow.  The app-role DSN is an
-      # encrypted deploy input; the literal gate defaults off for Gate 1.
+      # encrypted deploy input; the production Gate 1 default is on.
       PLAINTEXT_SHADOW_DATABASE_URL: "${PLAINTEXT_SHADOW_DATABASE_URL:-}"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "${FEEDLING_PLAINTEXT_SHADOW_ENABLED:-0}"
-      # PROD is fail-closed. CI admits 1 only together with TEE-primary wiring.
-      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+      # Prod TEE-primary accepts plaintext writes. CI still validates that the
+      # production schema is TEE before allowing this gate to open.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-1}"
       FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY: "${FEEDLING_PLAINTEXT_SHADOW_INFRA_EVIDENCE_PUBLIC_KEY:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
@@ -481,8 +482,8 @@ services:
       FEEDLING_STORE_LOAD_MODE: "legacy"
       # Only the backend owns the elected decrypted-shadow drain.
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
-      # Must match the backend; CI admits 1 only with TEE-primary wiring.
-      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+      # Must match the backend; prod TEE-primary accepts plaintext writes.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-1}"
       # frame_get resolves R2-backed photo pointers in this process.
       R2_ENDPOINT: "${R2_ENDPOINT:-}"
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
