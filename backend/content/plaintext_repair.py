@@ -279,6 +279,20 @@ def run(
             except HealthGateError:
                 counts["failed_health_gate"] += 1
                 failures += 1
+                append_failure_log(
+                    run_id=run_id,
+                    user_id=user_id,
+                    failures=[
+                        {
+                            "surface": "user",
+                            "item_id": "",
+                            "status": "failed_health_gate",
+                            "failure_class": "health_gate",
+                            "failure_detail": "enclave_unhealthy",
+                            "retryable": True,
+                        }
+                    ],
+                )
                 if continue_on_failure:
                     time.sleep(max(1.0, min(float(max_pause_sec), 60.0)))
                     continue

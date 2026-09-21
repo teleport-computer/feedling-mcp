@@ -341,7 +341,11 @@ def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
     }
 
 
-def test_apply_stops_when_health_does_not_recover(monkeypatch):
+def test_apply_stops_when_health_does_not_recover(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        plaintext_repair.FAILURE_LOG_ENV,
+        str(tmp_path / "plaintext-failures.jsonl"),
+    )
     monkeypatch.setattr(
         plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
     )
@@ -364,6 +368,45 @@ def test_apply_stops_when_health_does_not_recover(monkeypatch):
 
     assert result.failures == 1
     assert result.item_counts == {"failed_health_gate": 1}
+
+
+def test_health_gate_failure_is_persisted_as_retryable_user_record(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
+    )
+    logged = []
+    monkeypatch.setattr(
+        plaintext_repair,
+        "append_failure_log",
+        lambda **kwargs: logged.append(kwargs),
+    )
+
+    result = plaintext_repair.run(
+        apply=True,
+        continue_on_failure=True,
+        health_probe=lambda: False,
+        healthy_streak=1,
+        max_pause_sec=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.failures == 1
+    assert logged == [
+        {
+            "run_id": "",
+            "user_id": "usr_a",
+            "failures": [
+                {
+                    "surface": "user",
+                    "item_id": "",
+                    "status": "failed_health_gate",
+                    "failure_class": "health_gate",
+                    "failure_detail": "enclave_unhealthy",
+                    "retryable": True,
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.parametrize(
