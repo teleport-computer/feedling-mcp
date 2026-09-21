@@ -85,14 +85,31 @@ def truncation_retry_max_output_tokens_for_lane(lane: str) -> int | None:
 
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
-# Wall-clock ceiling of ONE provider wire. ``_TIMEOUT_SEC`` is handed to httpx,
-# which applies it per phase (a read timeout is the gap between two bytes), so a
-# relay trickling keep-alive bytes could hold one wire past the Heavy pool's
-# 120s stall budget and get a healthy Capture/Dream slot killed and requeued
-# (duplicate model calls). The retry wrapper reports progress before every wire,
-# so the longest silence is this value; tests/test_v2_pool_config.py keeps it
-# 30s below every extraction slot's stall budget.
+# Each HTTP wire, including compatibility fallback, has its own progress
+# boundary and wall-clock ceiling. Capture/Profile retain 90s; Dream needs
+# more time for its larger output. httpx's phase timeout is separate.
 WIRE_DEADLINE_SEC = 90.0
+DREAM_WIRE_DEADLINE_SEC = 180.0
+
+
+def wire_deadline_for_lane(lane: str) -> float:
+    if lane == "dream":
+        return DREAM_WIRE_DEADLINE_SEC
+    if lane in {"capture", "profile"}:
+        return WIRE_DEADLINE_SEC
+    raise ValueError(f"unsupported extraction lane: {lane}")
+
+
+def max_wire_deadline_sec() -> float:
+    return max(wire_deadline_for_lane(lane) for lane in ("capture", "dream", "profile"))
+
+
+def nominal_provider_envelope_sec() -> float:
+    # Existing allowance: three reliable attempts, each with at most two
+    # compatibility wires, plus backoff and setup/write margin. This does not
+    # include a separate component parse/truncation re-ask.
+    return 3.0 * (2.0 * max_wire_deadline_sec()) + 6.0 + 120.0
+
 
 class ParseRetry(NamedTuple):
     """「截断/解析/语义结果不合格 → 原样打回去重问一次」的注入点。
@@ -220,6 +237,8 @@ async def extract(
     prompt: str,
     parse: Callable[[str], tuple],
     max_tokens: int = CAPTURE_MAX_OUTPUT_TOKENS,
+    timeout_sec: float | None = None,
+    wire_deadline_sec: float | None = None,
     progress_cb: Callable[[str, int], None] | None = None,
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
@@ -230,6 +249,10 @@ async def extract(
     truncation_retry_max_tokens: int | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
+
+    ``timeout_sec`` and ``wire_deadline_sec`` default independently to the
+    historical Capture limits. Dream supplies both so its phase timeout cannot
+    expire before the longer wire deadline.
 
     `parse` 是 memory/*_prompt_v1 里的纯解析函数。它的返回是 (value, err) 或
     (value, questions, err)；我们只取首项与末项（末项恒为 err）。
@@ -287,8 +310,10 @@ async def extract(
                 messages,
                 max_tokens=budget,
                 temperature=_TEMPERATURE,
-                timeout=_TIMEOUT_SEC,
-                wire_deadline_sec=WIRE_DEADLINE_SEC,
+                timeout=_TIMEOUT_SEC if timeout_sec is None else timeout_sec,
+                wire_deadline_sec=(
+                    WIRE_DEADLINE_SEC if wire_deadline_sec is None else wire_deadline_sec
+                ),
                 progress_cb=progress_cb,
                 # An empty reply that stopped at the token cap is this lane's
                 # truncation (handled below), not a transport blip to re-send

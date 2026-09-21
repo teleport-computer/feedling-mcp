@@ -148,6 +148,11 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
         retry_prompt = "截断重问由组件决定"
         seen.append((kwargs["max_tokens"], retry_prompt))
         retry_budgets.append(kwargs.get("truncation_retry_max_tokens"))
+        if lane == "dream":
+            assert kwargs["timeout_sec"] == kwargs["wire_deadline_sec"] == 180.0
+        else:
+            assert kwargs.get("timeout_sec") is None
+            assert kwargs.get("wire_deadline_sec") is None
         return [], None
 
     retry_budgets = []

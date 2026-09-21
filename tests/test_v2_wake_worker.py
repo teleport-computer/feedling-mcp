@@ -5037,3 +5037,30 @@ def test_persistent_provider_circuit_blocks_queued_wakes_but_not_scheduled(monke
         with db.get_pool().connection() as conn:
             row = conn.execute('SELECT wake_result,wake_result_reason FROM agent_jobs WHERE id=%s', (job_id,)).fetchone()
         assert row == ('sleep', 'provider_circuit_open')
+
+
+def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
+    import inspect
+
+    signature = inspect.signature(provider_client.chat_completion_async)
+    uid = "u_heartbeat_budget_unchanged"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    seen = []
+
+    async def completion(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        seen.append((bound.arguments["timeout"], provider_client._WIRE_DEADLINE_SEC.get()))
+        return {"reply": "", "tool_calls": [{"id": "silent-budget", "name": "stay_silent",
+                "args": {"reason": "无需打扰"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", completion)
+    deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK,
+                                         asyncio.Semaphore(4), claimed_by))
+    assert status == "completed"
+    assert seen == [(60.0, None)]

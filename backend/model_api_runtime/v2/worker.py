@@ -12191,8 +12191,8 @@ async def _run_profile(
                     f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
                 ),
             )
-            # Profile shares heavy-0 with Capture/Dream: same 120s stall budget,
-            # so each wire needs the same true wall-clock ceiling.
+            # Profile shares heavy-0 with Capture/Dream, but retains its own
+            # 90s wire ceiling when Dream receives a larger budget.
             kwargs.setdefault("wire_deadline_sec", v2_extraction.WIRE_DEADLINE_SEC)
             result = await provider_client.reliable_chat_completion_async(
                 *args, **kwargs
@@ -13181,6 +13181,8 @@ async def _run_extraction(
                 parse_retry=parse_retry,
                 session=_capture_session,
                 step_sink=_step_sink,
+                timeout_sec=v2_extraction.wire_deadline_for_lane(lane),
+                wire_deadline_sec=v2_extraction.wire_deadline_for_lane(lane),
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                 truncation_retry_max_tokens=(
                     v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)

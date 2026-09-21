@@ -706,7 +706,7 @@ def test_profile_reports_read_provider_and_durable_write_boundaries(monkeypatch)
 
 
 def test_profile_provider_wires_get_the_heavy_pool_wall_clock_ceiling(monkeypatch):
-    """Profile runs on heavy-0 under the same 120s stall budget as Capture/Dream.
+    """Profile runs on heavy-0 under the shared stall budget as Capture/Dream.
 
     httpx's ``timeout=90`` is per phase, so without the retry wrapper's
     ``wire_deadline_sec`` a trickling relay could hold one wire past the stall
@@ -716,26 +716,14 @@ def test_profile_provider_wires_get_the_heavy_pool_wall_clock_ceiling(monkeypatc
 
     seen = []
 
-    async def _generate(**kwargs):
-        await kwargs["llm"](
-            object(), [], max_tokens=10, temperature=0.2, timeout=90.0
-        )
-        return profile.ProfileGenerationResult(
-            fields={"memory": "事实", "style": "方式"},
-            reject_code="",
-            overlap=None,
-            provider_calls=1,
-        )
-
     async def _reliable(*_args, **kwargs):
         seen.append(kwargs)
-        return {"reply": "ok"}
+        return {"reply": json.dumps({"memory": "事实", "style": "方式"})}
 
     async def _cas(_uid, recompute):
         return _cas_result(await recompute({}))
 
     monkeypatch.setattr(worker, "_report_turn_progress", lambda _stage: None)
-    monkeypatch.setattr(profile, "generate_profile", _generate)
     monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
     monkeypatch.setattr(
         profile_store,
@@ -750,7 +738,8 @@ def test_profile_provider_wires_get_the_heavy_pool_wall_clock_ceiling(monkeypatc
         worker._run_profile(12, "u", _deps(), object(), asyncio.Semaphore(1))
     ) == "completed"
     assert len(seen) == 1
-    assert seen[0]["wire_deadline_sec"] == extraction.WIRE_DEADLINE_SEC
+    assert seen[0]["wire_deadline_sec"] == extraction.WIRE_DEADLINE_SEC == 90.0
+    assert seen[0]["timeout"] == 90.0
     assert callable(seen[0]["progress_cb"])
 
 
