@@ -57,12 +57,12 @@ and attachment plaintext binary uses strict `body_b64`; large objects may use a
    ciphertext using the guarded procedure below, run strict verification, then
    perform Phase 4 and switch both units to TEE.
 7. Open `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` only after compatible clients and
-   regression evidence exist, one environment at a time. Production uses the
-   fail-closed `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` repository variable;
-   CI accepts `1` only when `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the
-   same value to the API, in-CVM worker, and every independent runner. This
-   per-user write gate is independent from the all-plaintext shadow described
-   below.
+   regression evidence exist, one environment at a time. Production now
+   defaults this gate to `1`, while the `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED`
+   repository variable can explicitly close it; CI accepts `1` only when
+   `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the same value to the API,
+   in-CVM worker, and every independent runner. This per-user write gate is
+   independent from the all-plaintext shadow described below.
 
 ## Post-promotion plaintext shadow
 
