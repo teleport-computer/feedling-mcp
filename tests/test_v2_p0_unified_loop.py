@@ -391,20 +391,10 @@ def test_p0_mid_turn_fold_no_restart_no_debounce(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert len(calls) == 3
-    assert sleep_calls == []                     # STRONG: no debounce sleep occurred.
-    assert calls[2]["allow_image_output"] is False
-    assert calls[2]["tool_choice"] == "none"      # The third call is the bounded
-                                                    # text-only correction, not a restart.
-    correction_contract = (
-        worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION.split("\n\n", 1)[1]
-    )
-    correction_system = str(calls[2]["messages"][0]["content"])
-    # Prompt-frontier clipping may remove the one-line retry prefix, but the
-    # correction's reused protocol contract remains as a second full copy.
-    assert correction_system.count(correction_contract) == 2
+    assert len(calls) == 2
+    assert sleep_calls == []  # No debounce or missing-aside correction round.
     outcome = captured["outcome"]
-    assert outcome.rounds == 3                     # Monotonic tool, final, correction rounds.
+    assert outcome.rounds == 2
     assert outcome.stop_reason == "final_text"
 
     round1_joined = " ".join(

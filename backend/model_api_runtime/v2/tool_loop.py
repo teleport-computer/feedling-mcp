@@ -177,26 +177,17 @@ _NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
     }
 )
 _WAKE_REPLY_TOOL = "reply"
-_WAKE_REPLY_TOOL_SPEC = ToolSpec(
+_REPLY_TOOL_SPEC = ToolSpec(
     name=_WAKE_REPLY_TOOL,
     description=(
-        "Reply with what you want to say and end this proactive wake. "
-        "This is the normal way to end a wake."
+        "Reply with what you want to say and end this turn."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "think": {
+            "aside": {
                 "type": "string",
-                "minLength": 1,
-                "description": (
-                    "Your thinking in this moment — why you want to speak and what "
-                    "you mean to say. They can open and read this in the app. Write "
-                    "`think` entirely in their language — the language they speak "
-                    "to you — and in your usual voice with them: everyday intent "
-                    "only, with no tool names, parameters, field names, identity "
-                    "cards, or other internal terms."
-                ),
+                "description": self_thinking.ASIDE_FIELD_DESCRIPTION,
             },
             "text": {
                 "type": "string",
@@ -209,7 +200,7 @@ _WAKE_REPLY_TOOL_SPEC = ToolSpec(
                 ),
             }
         },
-        "required": ["think", "text"],
+        "required": ["text"],
         "additionalProperties": False,
     },
 )
@@ -218,6 +209,15 @@ _WAKE_CHOICE_INSTRUCTION = (
     "is anything you want to say to them. Call stay_silent only if you honestly "
     "have nothing to say, or speaking would clearly intrude."
 )
+_WAKE_DIRECT_TEXT_CORRECTION = (
+    "Your previous assistant text is an unpublished draft, not a message already "
+    "sent. Decide once: call reply with the complete text you want them to see "
+    "and an optional aside, or call stay_silent if you choose not to disturb "
+    "them. Do not return another plain-text draft or call other tools."
+)
+_WAKE_DIRECT_TEXT_OUTCOMES = frozenset({
+    "direct_text_seen", "corrected_to_reply", "corrected_to_silent", "still_invalid",
+})
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
     "Complete the user's request now. Return either non-empty visible answer text "
@@ -1133,21 +1133,20 @@ class ValidatedFinalReply(str):
     """
 
 
-class ValidatedWakeReply(str):
-    """A proactive reply whose text came from the structured ``reply`` tool.
-
-    Non-scheduled wake delivery is fail-closed at the worker boundary: plain
-    provider text, including text accompanying an ordinary tool call, is never
-    authorized to become a bubble.  A ``str`` subtype preserves the callback
-    contract while carrying that provenance through the ordinary final-effect
-    path. ``thinking`` is kept off the string value so it can only reach the
-    separately sealed thinking envelope, never the visible bubble payload.
-    """
+class ValidatedReply(str):
+    """Terminal reply text with an aside kept outside the visible string."""
 
     def __new__(cls, text: str, *, thinking: str):
         value = super().__new__(cls, text)
         value.thinking = thinking
         return value
+
+
+class ValidatedWakeReply(ValidatedReply):
+    """An explicit reply-tool decision authorized by the tool loop.
+
+    Plain provider text is never authorized to become a proactive bubble.
+    """
 
 
 class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
@@ -1314,6 +1313,7 @@ async def run_tool_loop(
     on_provider_tool_surface=None,
     on_provider_call_event=None,
     on_empty_provider_response=None,
+    on_wake_direct_text_correction=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -1333,24 +1333,18 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     on_stay_silent=None,
-    # Non-scheduled proactive callers enable this for the whole turn. Ordinary
-    # tools remain available while the model gathers context; only the terminal
-    # decision must be exactly one reply/stay_silent tool call. Keeping this
-    # explicit (instead of inferring it from require_reply=False) preserves the
-    # foreground and scheduled contracts, which share this loop but continue to
-    # accept ordinary terminal text.
+    # Non-scheduled wakes require an explicit reply/stay_silent choice. A
+    # terminal plain-text response remains an unpublished draft and gets at
+    # most one correction within the existing provider-call budget.
     regular_wake_choice_required: bool = False,
+    reply_tool_enabled: bool = False,
     # Output capacity is independent of whether this lane requires a terminal
     # reply/stay_silent choice. Scheduled wakes need the same shared budget.
     wake_output_budget_required: bool = False,
     include_reasoning: bool = False,
-    # Self-authored thinking: when True, NEVER request provider-native reasoning —
-    # not via include_reasoning, and NOT via reasoning_effort either. The model then
-    # has no separate native-CoT channel and emits its thinking in the reply's
-    # <think> block instead (which the seal surfaces). This is what aligns V2 with
-    # the V1 resident: without it a reasoning-capable model (e.g. sonnet) puts its
-    # thought in the native channel — shown raw, often in the wrong language — and
-    # skips the <think>. Default False → other lanes unchanged.
+    # Preserve the existing provider-request policy: aside-enabled turns do
+    # not explicitly request a second native reasoning channel. Any native
+    # reasoning still returned is diagnostic input only, never display text.
     suppress_native_reasoning: bool = False,
     # Whether a text-free provider reply is an immediate ERROR. Defaults to
     # True for foreground chat. Wake passes False so this loop can inspect an
@@ -1545,6 +1539,9 @@ async def run_tool_loop(
     empty_response_retry_instruction = ""
     wake_choice_retry_used = False
     wake_choice_required = False
+    wake_direct_text_seen = False
+    wake_direct_text_pending = False
+    wake_direct_text_draft = ""
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
     external_content_seen = False
@@ -1663,14 +1660,6 @@ async def run_tool_loop(
             return re.search(r"[A-Za-z]", completion_message) is not None
         return False
 
-    # The self-thinking rendering this turn's system prompt uses (official or
-    # named relay Gemini → ``aside``). Every restatement or continuation must
-    # use the same tag, or the model is asked for two different openers.
-    self_thinking_tag = self_thinking.tag_for_route(
-        getattr(provider_config, "provider", ""),
-        getattr(provider_config, "model", ""),
-    )
-
     def _compact_delivery_system_prompt(
         instruction: str, *, require_self_thinking: bool = True
     ) -> str:
@@ -1681,7 +1670,7 @@ async def run_tool_loop(
         return (
             instruction.rstrip()
             + "\n\n"
-            + self_thinking.instruction(self_thinking_tag).strip()
+            + self_thinking.instruction_for_field().strip()
         )
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
@@ -1824,6 +1813,14 @@ async def run_tool_loop(
             if inspect.isawaitable(emitted):
                 await emitted
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            pass
+
+    async def _emit_wake_direct_text(outcome: str) -> None:
+        if on_wake_direct_text_correction is None:
+            return
+        try:
+            await on_wake_direct_text_correction(outcome, round_number=attempts)
+        except Exception:  # diagnostics cannot change delivery
             pass
 
     async def _emit_provider_tool_surface(
@@ -2016,11 +2013,15 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        if wake_direct_text_pending:
+            # Keep provider-authored draft out of the trusted system suffix and
+            # out of durable conversation history. Frontier budgeting sees it.
+            messages = [*messages, {"role": "assistant", "content": wake_direct_text_draft}]
         turn_catalog = _turn_catalog()
-        if regular_wake_choice_required:
+        if regular_wake_choice_required or reply_tool_enabled:
             turn_catalog = [
                 spec for spec in turn_catalog if spec.name != _WAKE_REPLY_TOOL
-            ] + [_WAKE_REPLY_TOOL_SPEC]
+            ] + [_REPLY_TOOL_SPEC]
         wake_choice_tool_available = any(
             spec.name == tool_schema.STAY_SILENT_TOOL for spec in turn_catalog
         )
@@ -2082,6 +2083,7 @@ async def run_tool_loop(
                 identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
+                _WAKE_DIRECT_TEXT_CORRECTION if wake_direct_text_pending else "",
                 final_reply_correction_instruction,
                 terminal_text_instruction,
             )
@@ -2332,7 +2334,7 @@ async def run_tool_loop(
                     except Exception:
                         pass
                 raise exc
-            tools = [_WAKE_REPLY_TOOL_SPEC, stay_silent_spec]
+            tools = [_REPLY_TOOL_SPEC, stay_silent_spec]
             surface_candidate_tools = list(tools)
             surface_reason = "wake_choice_required"
             forced_delivery_tool = ""
@@ -2699,23 +2701,6 @@ async def run_tool_loop(
                 provider_kwargs["tool_choice"] = "required"
             if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
-            if (
-                suppress_native_reasoning
-                and terminal_text_round
-                and self_thinking_tag == self_thinking.TAG_THINK
-            ):
-                # A continuation prefix is safe only once the loop has made
-                # this a text-only terminal request. Live Anthropic testing
-                # showed that adding it to an ordinary tool round can produce
-                # a mismatched </thinking> block or a prefix-only tool turn.
-                # Unsupported provider/model pairs discard this hint in the
-                # payload builder and therefore retain their exact old request.
-                # The prefix is the ``<think>`` opener, so it is only sent when
-                # the system prompt asked for that tag; an ``aside`` turn sends
-                # no continuation hint (an ``<aside>`` prefill is unverified).
-                provider_kwargs["assistant_prefill"] = (
-                    provider_client.SELF_THINKING_ASSISTANT_PREFILL
-                )
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (
@@ -2842,6 +2827,19 @@ async def run_tool_loop(
                 **provider_kwargs,
             )
         except Exception as exc:
+            if wake_direct_text_pending:
+                # This correction has one provider attempt, including failure;
+                # compatibility fallbacks must not create another correction.
+                await _emit_wake_direct_text("still_invalid")
+                await _provider_call_event("error", {
+                    "round": attempts, **_provider_error_facts(exc),
+                })
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise
             provider_tool_history_rejected = (
                 isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
@@ -3146,6 +3144,40 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        if (
+            regular_wake_choice_required and not wake_direct_text_seen
+            and not pr.tool_calls and not pr.media and pr.text.strip()
+            and not upstream_response_envelope
+        ):
+            wake_direct_text_seen = True
+            await _emit_wake_direct_text("direct_text_seen")
+            await _trajectory("wake_choice_response", {
+                "round": attempts, "choice": "invalid",
+                "tool_call_count": 0, "provider_text_present": True,
+            })
+            await _emit_provider_tool_surface(provider_surface_detail)
+            if (
+                provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
+                and wake_choice_tool_available and attempts < max_calls
+                and tool_calls_used < max_tool_calls_per_turn
+            ):
+                wake_direct_text_pending = True
+                wake_direct_text_draft = pr.text[:max_assistant_tool_text_chars]
+                wake_choice_required = True
+                wake_choice_retry_used = True
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("wake_direct_text_correction_boundary")
+                continue
+            await _emit_wake_direct_text("still_invalid")
+            exc = WakeChoiceInvalid()
+            if on_provider_failure is not None:
+                try:
+                    await on_provider_failure(exc)
+                except Exception:
+                    pass
+            raise exc
+
         regular_terminal_choice_present = bool(
             regular_wake_choice_required
             and len(pr.tool_calls) == 1
@@ -3204,7 +3236,7 @@ async def run_tool_loop(
                 for tc in pr.tool_calls
                 if tc.name not in mcp_names
                 and not (
-                    regular_wake_choice_required
+                    (regular_wake_choice_required or reply_tool_enabled)
                     and tc.name == _WAKE_REPLY_TOOL
                 )
                 and (
@@ -3325,6 +3357,41 @@ async def run_tool_loop(
                 surface_rejection_reasons,
             )
 
+        # Chat and scheduled turns may finish through the same reply schema.
+        # Only consume an offered, sole, structurally valid call. Other calls
+        # retain the ordinary rejected-exchange handling and bounded fallback.
+        if (
+            reply_tool_enabled
+            and not regular_wake_choice_required
+            and not terminal_text_round
+            and not surface_exchange_rejected
+            and len(pr.tool_calls) == 1
+            and pr.tool_calls[0].name == _WAKE_REPLY_TOOL
+        ):
+            reply_call = pr.tool_calls[0]
+            reply_text = reply_call.args.get("text")
+            if (
+                reply_call.args_ok
+                and set(reply_call.args) <= {"aside", "text"}
+                and isinstance(reply_text, str)
+                and reply_text.strip()
+                and len(reply_text) <= max_assistant_tool_text_chars
+                and not pr.media
+            ):
+                aside = reply_call.args.get("aside")
+                tool_calls_used += 1
+                pr = ProviderResponse(
+                    text=ValidatedReply(
+                        reply_text.strip(),
+                        thinking=aside.strip() if isinstance(aside, str) else "",
+                    ),
+                    tool_calls=[], usage=pr.usage, raw=pr.raw,
+                    assistant_turn=None, media=(),
+                )
+            else:
+                validation_errors[reply_call.id] = "reply requires non-empty text"
+                surface_exchange_rejected = True
+
         structured_wake_reply = False
         if wake_choice_required or wake_reply_call_present:
             wake_reply_calls = [
@@ -3341,15 +3408,15 @@ async def run_tool_loop(
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"think", "text"}
+                and set(selected_call.args) <= {"aside", "text"}
                 else None
             )
             selected_reply_thinking = (
-                selected_call.args.get("think")
+                selected_call.args.get("aside")
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"think", "text"}
+                and set(selected_call.args) <= {"aside", "text"}
                 else None
             )
             reply_text = (
@@ -3373,7 +3440,6 @@ async def run_tool_loop(
                 selected_call is not None
                 and selected_call.id
                 and len(wake_reply_calls) == 1
-                and reply_thinking
                 and reply_text
                 and not pr.media
                 and len(reply_text) <= max_assistant_tool_text_chars
@@ -3431,6 +3497,10 @@ async def run_tool_loop(
                 },
             )
             if valid_reply_choice:
+                if wake_direct_text_pending:
+                    await _emit_wake_direct_text("corrected_to_reply")
+                    wake_direct_text_pending = False
+                    wake_direct_text_draft = ""
                 tool_calls_used += 1
                 # Feed the selected text into the ordinary terminal-text path.
                 # Any provider text beside the call is only a preamble, exactly
@@ -3449,11 +3519,20 @@ async def run_tool_loop(
                 wake_choice_required = False
                 structured_wake_reply = True
             elif valid_silent_choice or silent_from_protocol_token:
+                if wake_direct_text_pending:
+                    await _emit_wake_direct_text("corrected_to_silent")
+                    wake_direct_text_pending = False
+                    wake_direct_text_draft = ""
                 wake_choice_required = False
                 if silent_from_protocol_token:
                     tool_calls_used += 1
                     return await _finish_stay_silent(selected_call, silent_reason)
             else:
+                direct_correction_failed = wake_direct_text_pending
+                if direct_correction_failed:
+                    await _emit_wake_direct_text("still_invalid")
+                    wake_direct_text_pending = False
+                    wake_direct_text_draft = ""
                 can_retry_wake_choice = (
                     not wake_choice_retry_used
                     and attempts < max_calls
@@ -3475,7 +3554,7 @@ async def run_tool_loop(
                 )
                 exc = (
                     ProviderEmptyReply("empty_reply")
-                    if provider_returned_nothing
+                    if provider_returned_nothing and not direct_correction_failed
                     else WakeChoiceInvalid()
                 )
                 if on_provider_failure is not None:

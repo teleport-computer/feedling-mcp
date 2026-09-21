@@ -65,6 +65,20 @@ change must not be interpreted as an API guarantee.
   Wake failure codes now preserve recognized causes such as insufficient credit
   for HTTP 400/422 responses instead of always reporting provider incompatibility.
 
+- Runtime V2 chat and wake now share `reply(aside, text)` with optional `aside`;
+  resident V1 accepts `aside` in its reply JSON. Usable replies are delivered
+  when aside is omitted, without an extra aside-format retry. Chat and
+  scheduled turns accept direct text; non-scheduled wake turns retain the
+  explicit `reply`/`stay_silent` decision requirement.
+  A non-scheduled wake's unstructured text is held as a draft and gets at most
+  one correction within the existing turn budget to choose either tool. If the
+  correction remains invalid, the wake fails silently with `choice_invalid`.
+  Content-free traces count drafts and reply, silence, or invalid outcomes.
+  Only the aside field supplies display thinking; native reasoning and inline
+  tag contents are discarded. V1 can recover a complete reply-only JSON
+  envelope from a final unclosed thinking block. Free-text tails and executable
+  action/tool envelopes remain ineligible for this recovery.
+
 - Replies whose `<think>` blocks are malformed (nested, reopened, or cut off
   before the closing tag — seen from reasoning models behind relays) are no
   longer replaced by the failure fallback. The strict leak gate still refuses
@@ -73,7 +87,7 @@ change must not be interpreted as an API guarantee.
   lanes. Salvaged replies show the thinking-failed marker instead of thinking,
   are not counted as turn failures, and are recorded as `thinking_gate_salvaged`
   in resident diagnostics. A reply with no text outside the tags still fails
-  closed.
+  closed, except for the resident reply-only JSON recovery described above.
 
 - Updated memgarden from 0.21.1 to 0.22.0: the release range contains optional vector retrieval (#8, c32f8d60) and release preparation (#9, 05ad1ef3). IO continues using lexical retrieval; vector fusion remains disabled.
 

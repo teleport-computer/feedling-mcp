@@ -444,7 +444,7 @@ def test_chat_system_prompt_keeps_self_thinking_for_non_fable_boundaries(
 
     prompt = context.chat_system_prompt(SimpleNamespace(model=model))
 
-    assert self_thinking.INSTRUCTION.strip() in prompt
+    assert self_thinking.instruction_for_field().strip() in prompt
 
 
 def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
@@ -454,7 +454,7 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
     prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
 
-    instruction = self_thinking.INSTRUCTION.strip()
+    instruction = self_thinking.instruction_for_field().strip()
     assert prompt.count(instruction) == 1
     assert (
         prompt.index(context._CHAT_REPLY_POLICY.rstrip())
@@ -495,10 +495,10 @@ def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
     monkeypatch,
 ):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    shared = self_thinking.INSTRUCTION
+    shared = self_thinking.instruction_for_field()
 
-    assert context.self_thinking.INSTRUCTION is shared
-    assert worker.self_thinking.INSTRUCTION is shared
+    assert context.self_thinking is self_thinking
+    assert worker.self_thinking is self_thinking
 
     chat_prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
     heartbeat_prompt = worker._wake_system_prompt_for_lane(
@@ -510,7 +510,7 @@ def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
 
     assert chat_prompt.count(shared.strip()) == 1
     for prompt in (heartbeat_prompt, screen_prompt):
-        assert shared.strip() not in prompt
+        assert shared.strip() in prompt
         assert (
             "<think>Let me update the name and match a boastful tone</think>"
             not in prompt

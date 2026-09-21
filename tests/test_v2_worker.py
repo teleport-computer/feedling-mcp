@@ -298,7 +298,7 @@ def _wake_reply_round(
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"think": think, "text": text},
+            "args": {"aside": think, "text": text},
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,

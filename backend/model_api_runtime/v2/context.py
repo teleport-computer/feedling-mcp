@@ -376,7 +376,7 @@ def chat_system_prompt(provider_config: Any = None) -> str:
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return _join_policy_blocks(
             _CHAT_REPLY_POLICY,
-            self_thinking.instruction(self_thinking_tag(provider_config)),
+            self_thinking.instruction_for_field(),
             _CHAT_POLICY_AFTER_THINKING,
         )
     return CHAT_SYSTEM_PROMPT

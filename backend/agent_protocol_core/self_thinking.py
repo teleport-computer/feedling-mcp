@@ -237,6 +237,37 @@ def instruction(tag: str = TAG_THINK) -> str:
     return _retag(text, tag)
 
 
+ASIDE_FIELD_DESCRIPTION = (
+    "How you feel right now and how you mean to pick up what they said — "
+    "shown to them folded above the message. Write `aside` entirely in their "
+    "language — the language they speak to you — and in your usual voice "
+    "with them: everyday intent only, with no tool names, parameters, field "
+    "names, identity cards, or other internal terms."
+)
+
+
+def instruction_for_field(*, protocol: str = "reply") -> str:
+    """Render the approved aside copy for a tool or resident JSON envelope."""
+    if protocol not in {"reply", "json"}:
+        raise ValueError(f"unsupported aside protocol: {protocol!r}")
+    _, paragraphs = instruction(TAG_ASIDE).split("\n\n", 1)
+    if protocol == "reply":
+        opening = (
+            " 最终回复请调用 reply 工具，把心里话填在 aside 字段里，"
+            + _ASIDE_CONTENT_PHRASE + "。\n"
+            " 你要对他说的话完整填在 text 字段里。中间调其他工具的轮次不写心里话或正文。"
+        )
+    else:
+        opening = (
+            " 最终回复请使用 JSON，把心里话填在 aside 字段里，"
+            + _ASIDE_CONTENT_PHRASE + "。\n"
+            " 你要对他说的话填在 messages 数组里。中间调工具的轮次不写心里话或正文。"
+        )
+    return (opening + "\n\n" + paragraphs).replace(
+        "<aside>", '{"aside":"'
+    ).replace("</aside>", '"}')
+
+
 # Foreground chat and every proactive wake lane select one whole rendering from
 # the reply-language policy.  Each rendering intentionally has no blank line:
 # hosts group system policy blocks on ``\n\n``, so splitting an example away

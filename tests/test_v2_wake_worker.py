@@ -168,7 +168,7 @@ def _script_provider(monkeypatch, responses):
                     "id": "wake-reply-test",
                     "name": "reply",
                     "args": {
-                        "think": "I want to say this now.",
+                        "aside": "I want to say this now.",
                         "text": response["reply"],
                     },
                 }],
@@ -205,7 +205,7 @@ def _wake_reply_round(text, *, think="I want to say this now.", preamble=""):
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"think": think, "text": text},
+            "args": {"aside": think, "text": text},
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     }
@@ -1136,17 +1136,18 @@ def test_wake_reply_think_uses_thinking_channel_not_visible_bubble(monkeypatch):
     }]
 
 
-def test_wake_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
+@pytest.mark.parametrize("aside", ["memory_write", None, "", "   "])
+def test_wake_invalid_or_missing_aside_delivers_body_with_marker(monkeypatch, aside):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_wake_selfthink_internal_term"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(
-        monkeypatch,
-        [_wake_reply_round("可见回复仍然正常", think="memory_write")],
-    )
+    response = _wake_reply_round("可见回复仍然正常", think=aside)
+    if aside is None:
+        del response["tool_calls"][0]["args"]["aside"]
+    _script_provider(monkeypatch, [response])
     written = {}
     monkeypatch.setattr(
         worker,
@@ -1169,6 +1170,7 @@ def test_wake_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch
     )
 
     assert status == "completed"
+    assert status != "choice_invalid"
     assert written["text"] == "可见回复仍然正常"
     assert thinking["text"] == self_thinking.THINKING_FAILED_MARKER
 
@@ -1648,7 +1650,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
                 "id": "wake-reply",
                 "name": "reply",
                 "args": {
-                    "think": "I want to answer with the context I found.",
+                    "aside": "I want to answer with the context I found.",
                     "text": "workspace-aware wake",
                 },
             }],
@@ -2005,7 +2007,7 @@ def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
         assert "Both are good ways" not in wake_prompt
     assert "Neither choice is preferred" not in worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
     assert "not an error" not in silent
-    assert "normal way to end a wake" in worker.v2_tool_loop._WAKE_REPLY_TOOL_SPEC.description
+    assert "end this turn" in worker.v2_tool_loop._REPLY_TOOL_SPEC.description
 
 
 def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
@@ -2175,7 +2177,7 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
         if message.get("role") == "system"
     )
     assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
-    assert "reply tool's `think` field" in system_text
+    assert "reply tool's `aside` field" in system_text
     assert "never put `<think>` tags in `text`" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is None or schedule["proactive_backoff_until"] is None
@@ -3272,7 +3274,7 @@ def test_wake_invalid_choice_and_provider_vacuum_persist_distinct_codes(
     assert not any(event["kind"] == "error" for event in _status_events(uid))
 
 
-def test_wake_reply_without_think_retries_then_fails_without_bubble(monkeypatch):
+def test_wake_reply_without_aside_completes_without_choice_invalid(monkeypatch):
     uid = "u_wake_reply_missing_think"
     conftest.seed_user(uid)
     _reset(uid)
@@ -3287,7 +3289,7 @@ def test_wake_reply_without_think_retries_then_fails_without_bubble(monkeypatch)
             "tool_calls": [{
                 "id": "reply-without-think",
                 "name": "reply",
-                "args": {"text": "this must not become a bubble"},
+                "args": {"text": "this still becomes a bubble"},
             }],
             "usage": {},
         }
@@ -3305,14 +3307,14 @@ def test_wake_reply_without_think_retries_then_fails_without_bubble(monkeypatch)
         claimed_by,
     ))
 
-    assert status == "failed"
-    assert len(calls) == 2
-    assert calls[1]["tool_choice"] == "required"
-    assert _job_status(job_id) == ("failed", "wake_failed:choice_invalid")
+    assert status == "completed"
+    assert len(calls) == 1
+    assert _job_status(job_id)[0] == "completed"
+    assert "choice_invalid" not in str(_job_status(job_id))
     with db.get_pool().connection() as conn:
         assert conn.execute(
             "SELECT count(*) FROM chat_messages WHERE user_id=%s", (uid,)
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
 
 
 def test_scheduled_failure_retry_wiring_source_guard():
