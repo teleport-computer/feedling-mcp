@@ -334,16 +334,16 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
 
 
 def _build_context_memories(moments, decrypted, query_args):
-    """纯同步 context_memories 选择（在 to_thread 里跑）。函数体 = 旧
-    最近四条对话作为选卡 query（含上一条 AI 回复），context_mode/
+    """纯同步 context_memories 选择（在 to_thread 里跑）。
+    最近两条非空用户消息作为选卡 query（最新在前，不含 AI 回复），context_mode/
     want_trace 已由路由层预解析进 query_args dict（不能跨线程读
     request.query_params）。_load_decrypted_moments 的解密部分 →
     readside.moments_to_cards(moments, ...)（拉取已上移到路由层）。
     返回 (context_memories, context_memory_trace, context_memory_log)。"""
     recent_text = [m["content"] for m in decrypted
-                   if m.get("role") in {"user", "human", "assistant", "agent", "openclaw"}
-                   and isinstance(m.get("content"), str) and m["content"].strip()][-4:]
-    latest_user_text = "\n".join(recent_text)
+                   if m.get("role") in {"user", "human"}
+                   and isinstance(m.get("content"), str) and m["content"].strip()][-2:]
+    latest_user_text = "\n".join(reversed(recent_text))
 
     want_trace = query_args["want_trace"]
 
