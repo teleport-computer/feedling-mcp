@@ -417,7 +417,7 @@ def test_v1_foreground_self_thinking_skips_only_exact_fable(
     from agent_protocol_core import self_thinking
 
     assert result_ts == pytest.approx(1112.75)
-    instruction_present = self_thinking.INSTRUCTION.strip() in captured["message"]
+    instruction_present = self_thinking.instruction_for_field(protocol="json").strip() in captured["message"]
     assert instruction_present is expects_instruction
 
 
@@ -2822,11 +2822,11 @@ def test_agent_turn_splits_tagged_thinking_from_cli_text():
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["这是最终回复。"]
-    assert turn.thinking_summary == "比较了用户最新问题和已有上下文。"
+    assert turn.thinking_summary == ""
     # Inlined <think> is display material, not provider-native reasoning.
-    assert turn.thinking_kind == "provider_reasoning_summary"
-    assert turn.thinking_source == "tagged_content"
-    assert turn.thinking_native is False
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_native == None
 
 
 def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
@@ -2837,10 +2837,10 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["好，我在。"]
-    assert turn.thinking_summary == "先查记忆。\n再组织语气。"
-    assert turn.thinking_kind == "provider_reasoning_summary"
-    assert turn.thinking_source == "tagged_content"
-    assert turn.thinking_native is False
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_native == None
 
 
 def test_self_thinking_on_prefers_tagged_over_native(monkeypatch):
@@ -2857,9 +2857,9 @@ def test_self_thinking_on_prefers_tagged_over_native(monkeypatch):
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["最终回复。"]
-    assert turn.thinking_summary == "内联摘要。"
-    assert turn.thinking_source == "tagged_content"
-    assert turn.thinking_native is False
+    assert turn.thinking_summary == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_native == None
 
 
 def test_self_thinking_off_native_reasoning_wins_over_tagged_content(monkeypatch):
@@ -2874,9 +2874,9 @@ def test_self_thinking_off_native_reasoning_wins_over_tagged_content(monkeypatch
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["最终回复。"]
-    assert turn.thinking_summary == "原生 reasoning 摘要。"
-    assert turn.thinking_source == "openrouter"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_native == None
 
 
 def test_self_thinking_spoofed_source_cannot_suppress_local_think(monkeypatch):
@@ -2892,8 +2892,8 @@ def test_self_thinking_spoofed_source_cannot_suppress_local_think(monkeypatch):
         "reasoning_native": True,
     }
     turn = crc._split_agent_turn(raw)
-    assert turn.thinking_summary == "真实自建"
-    assert turn.thinking_self_authored is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_self_authored == False
     assert turn.messages == ["回复"]
 
 
@@ -2909,9 +2909,9 @@ def test_self_thinking_hermes_native_does_not_discard_local_think(monkeypatch):
         native=True,
     )
     turn = crc._split_agent_turn(body)
-    assert turn.thinking_summary == "我先想想他要啥"
-    assert turn.thinking_source == "tagged_content"
-    assert turn.thinking_self_authored is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_self_authored == False
     assert turn.messages == ["好的没问题"]
 
 
@@ -2930,16 +2930,16 @@ def _claude_stream_native_then_tagged() -> str:
 def test_self_thinking_on_stream_tagged_wins_despite_late_arrival(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
-    assert turn.thinking_summary == "自建后到"
-    assert turn.thinking_self_authored is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_self_authored == False
     assert turn.messages == ["最终回复"]
 
 
 def test_self_thinking_off_stream_native_wins(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
-    assert turn.thinking_summary == "native 先落"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_native == None
 
 
 def _pi_stream_with_thinking(reply: str, thinking: str) -> str:
@@ -2982,7 +2982,7 @@ def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
     the real call_agent output rather than a hand-built dict, so the guard survives
     a rename of whatever key the body happens to use."""
     raw = crc._attach_provider_reasoning(
-        "在的，怎么了？", "用户在打招呼，简短回应即可。",
+        json.dumps({"aside": "用户在打招呼，简短回应即可。", "messages": ["在的，怎么了？"]}), "native discarded",
         source="pi_thinking", kind="provider_reasoning_summary", native=True,
     )
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
@@ -2993,18 +2993,18 @@ def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
 
     assert turn.messages == ["在的，怎么了？"]
     assert turn.thinking_summary == "用户在打招呼，简短回应即可。"
-    assert turn.thinking_kind == "provider_reasoning_summary"
-    assert turn.thinking_source == "pi_thinking"
-    assert turn.thinking_native is True
+    assert turn.thinking_kind == "agent_summary"
+    assert turn.thinking_source == "self_thinking"
+    assert turn.thinking_native is False
 
 
-def test_pi_native_thinking_reaches_post_reply_end_to_end(monkeypatch):
+def test_pi_json_aside_reaches_post_reply_without_native_thinking(monkeypatch):
     """Whole delivery chain, from a real pi event stream down to post_reply: the
     thinking must land in post_reply's kwargs, because post_reply is what builds
     the thinking_envelope that /v1/chat/history hands the app. Before the body-key
     fix the model produced thinking (trace said thinking_present=true) yet every
     delivered message carried no thinking_* field at all."""
-    stream = _pi_stream_with_thinking("在的，怎么了？", "用户在打招呼，简短回应即可。")
+    stream = _pi_stream_with_thinking(json.dumps({"aside": "用户在打招呼，简短回应即可。", "messages": ["在的，怎么了？"]}), "private native text")
     reply, thinking = crc._pi_turn_from_stream(stream)
     assert thinking, "pi's own parser must still extract the thinking block"
     raw = crc._attach_provider_reasoning(
@@ -3020,9 +3020,9 @@ def test_pi_native_thinking_reaches_post_reply_end_to_end(monkeypatch):
 
     kwargs = mock_post.call_args.kwargs
     assert kwargs["thinking_summary"] == "用户在打招呼，简短回应即可。"
-    assert kwargs["thinking_kind"] == "provider_reasoning_summary"
-    assert kwargs["thinking_source"] == "pi_thinking"
-    assert kwargs["thinking_native"] is True
+    assert kwargs["thinking_kind"] == "agent_summary"
+    assert kwargs["thinking_source"] == "self_thinking"
+    assert kwargs["thinking_native"] is False
 
 
 def test_call_agent_passes_message_without_thinking_protocol(monkeypatch):
@@ -3588,11 +3588,11 @@ def test_call_agent_cli_hermes_reads_native_reasoning_from_session_json(monkeypa
     turn = crc._agent_turn_from_raw(raw)
 
     assert turn.messages == ["在。"]
-    assert "current session before replying" in turn.thinking_summary
-    assert "older reasoning" not in turn.thinking_summary
-    assert turn.thinking_kind == "provider_reasoning"
-    assert turn.thinking_source == "hermes_session_json"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_native == None
 
 
 @pytest.mark.parametrize("session_doc", [
@@ -6496,7 +6496,7 @@ def test_thinking_only_turn_is_actually_empty():
     below would pass for the wrong reason."""
     turn = crc._split_agent_turn(_thinking_only())
     assert turn.messages == [] and turn.actions == []
-    assert turn.thinking_summary  # …but the model DID think
+    assert turn.thinking_summary == ""
 
 
 def test_foreground_thinking_only_retries_and_recovers(monkeypatch):
@@ -8372,9 +8372,9 @@ def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_fro
     turn = crc._agent_turn_from_raw(raw)
 
     assert turn.messages == ["没干嘛，就在这儿待着呢。"]
-    assert turn.thinking_summary == "The user is asking a casual check-in."
-    assert turn.thinking_kind == "provider_reasoning"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_native == None
     assert "thinking_summary" not in turn.messages[0]
     assert "messages" not in turn.messages[0]
 
@@ -8413,10 +8413,10 @@ def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["1 + 1 等于 2。"]
-    assert turn.thinking_summary == "The user is asking a simple math question."
-    assert turn.thinking_kind == "provider_reasoning"
-    assert turn.thinking_source == "anthropic_thinking"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_native == None
 
 
 def test_agent_turn_extracts_claude_stream_json_thinking_deltas_without_final_block():
@@ -8476,11 +8476,11 @@ def test_agent_turn_extracts_claude_stream_json_thinking_deltas_without_final_bl
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["最终答案。"]
-    assert turn.thinking_summary == "First thought. Second thought."
-    assert turn.thinking_kind == "provider_reasoning"
-    assert turn.thinking_source == "anthropic_thinking"
-    assert turn.thinking_model == "claude-sonnet-4-5-20250929"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_model == ""
+    assert turn.thinking_native == None
 
 
 # ---------------------------------------------------------------------------
@@ -8677,7 +8677,7 @@ def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch)
     turn = crc._agent_turn_from_raw(raw)
     assert turn.messages == ["找到啦~ 在 ReactFiberHooks.js"]  # exactly one bubble, the answer
     assert all("让我用 deepwiki" not in m for m in turn.messages)  # no preamble bubble
-    assert turn.thinking_summary  # native thinking preserved
+    assert turn.thinking_summary == ""
 
 
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
@@ -8696,11 +8696,11 @@ def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["最终回复。"]
-    assert turn.thinking_summary == "Provider returned this display-safe reasoning."
-    assert turn.thinking_kind == "provider_reasoning"
-    assert turn.thinking_source == "anthropic"
-    assert turn.thinking_model == "claude-sonnet-4.5"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_model == ""
+    assert turn.thinking_native == None
 
 
 def test_agent_turn_extracts_openrouter_reasoning_details():
@@ -8721,11 +8721,11 @@ def test_agent_turn_extracts_openrouter_reasoning_details():
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["这是最终回复。"]
-    assert turn.thinking_summary == "先判断用户在测 OpenRouter。\n再确认需要把推理摘要单独展示。"
-    assert turn.thinking_kind == "provider_reasoning"
-    assert turn.thinking_source == "openrouter"
-    assert turn.thinking_model == "deepseek/deepseek-v4-flash"
-    assert turn.thinking_native is True
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+    assert turn.thinking_source == ""
+    assert turn.thinking_model == ""
+    assert turn.thinking_native == None
 
 
 def test_extract_cli_output_preserves_structured_multi_messages():
@@ -9161,8 +9161,8 @@ def test_call_agent_http_openai_preserves_reasoning_content(monkeypatch):
     turn = crc._split_agent_turn(result)
 
     assert turn.messages == ["我会这样回复。"]
-    assert turn.thinking_summary == "比较了用户问题和最近记忆。"
-    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
 
 
 def test_codex_reply_from_stream_ignores_reasoning_and_handshake():
@@ -9387,8 +9387,8 @@ def test_call_agent_cli_codex_0142_routes_reasoning_to_thinking_not_bubble(monke
     assert turn.messages == ["It means hello."]
     assert reasoning_text not in turn.messages
     # Reasoning rides the thinking disclosure instead.
-    assert turn.thinking_summary
-    assert "previous message" in turn.thinking_summary or "concise" in turn.thinking_summary
+    assert turn.thinking_summary == ""
+    assert turn.thinking_summary == ""
 
 
 def test_call_agent_cli_codex_actions_reply_preserved_with_reasoning(monkeypatch):
@@ -9418,7 +9418,7 @@ def test_call_agent_cli_codex_actions_reply_preserved_with_reasoning(monkeypatch
     turn = crc._agent_turn_from_raw(raw)
     assert turn.actions == [{"type": "proactive.sleep", "reason": "broadcast off"}]
     assert turn.messages == []
-    assert turn.thinking_summary
+    assert turn.thinking_summary == ""
 
 
 def test_call_agent_cli_codex_raw_text_lane_returns_literal_reply(monkeypatch):
@@ -15085,9 +15085,9 @@ def test_wake_templates_share_the_foreground_thinking_switch(monkeypatch):
     on_scheduled = crc._scheduled_wake_message(
         {"scheduled_note": "喝茶", "timezone": "Asia/Shanghai"}
     )
-    assert _st.INSTRUCTION.strip() in on_foreground
-    assert "<think>" in on_proactive
-    assert "<think>" in on_scheduled
+    assert _st.instruction_for_field(protocol="json").strip() in on_foreground
+    assert "aside 字段" in on_proactive
+    assert "aside 字段" in on_scheduled
     # 主动道只放开可选块，不前置前台的整份强制指令。
     assert _st.INSTRUCTION.strip() not in on_proactive
     assert _st.INSTRUCTION.strip() not in on_scheduled
@@ -15134,18 +15134,11 @@ def test_wake_thinking_rule_uses_the_reply_language_policy(
     def _contains_chinese(text: str) -> bool:
         return any("\u3400" <= char <= "\u9fff" for char in text)
 
-    assert "<think>" in think_rule  # 最小存在性守卫；其余断言只钉两条规则的关系。
+    assert "aside 字段" in think_rule
     assert think_rule in message
     assert reply_rule in message
-    assert _contains_chinese(think_rule) is expects_chinese
+    assert "语言跟着他走" in think_rule
     assert _contains_chinese(reply_rule) is expects_chinese
-    if expects_chinese:
-        assert "可以" in think_rule
-        assert "必须" not in think_rule
-    else:
-        normalized = f" {think_rule.lower()} "
-        assert " may " in normalized
-        assert " must " not in normalized
 
 
 @pytest.mark.parametrize(
@@ -15171,7 +15164,7 @@ def test_scheduled_wake_thinking_rule_uses_the_reply_language_policy(
 
     assert think_rule in message
     assert reply_rule in message
-    assert _contains_chinese(think_rule) is expects_chinese
+    assert "语言跟着他走" in think_rule
     assert _contains_chinese(reply_rule) is expects_chinese
 
 
@@ -16619,3 +16612,53 @@ def test_pi_final_end_role_selection_shared_by_stop_and_error(roles, selected_in
     assert crc._pi_error_message(raw) == (f"provider error {selected_index}" if expected else "")
     if expected:
         assert crc._cli_error_detail(raw, "") == f"provider error {selected_index}"
+
+
+@pytest.mark.parametrize("aside", ["想接着他的玩笑说下去。", "x" * 900, None, 42])
+def test_json_aside_is_the_only_display_thinking(aside):
+    turn = crc._agent_turn_from_raw({
+        "aside": aside, "messages": ["<think>private native text</think>正文"],
+        "reasoning_content": "native reasoning never displayed",
+        "reasoning_source": "self_thinking", "reasoning_native": False,
+    })
+    assert turn.messages == ["正文"]
+    assert turn.thinking_summary == (crc._sanitize_thinking_summary(aside) if isinstance(aside, str) else "")
+    assert len(turn.thinking_summary) <= 700
+    assert "native" not in turn.thinking_summary
+    if turn.thinking_summary:
+        assert turn.thinking_kind == "agent_summary"
+        assert turn.thinking_source == "self_thinking"
+        assert turn.thinking_native is False
+
+
+@pytest.mark.parametrize("prefix", ["<think>想一下\n", "<think>native</think><think>接着想\n", "<think><think>接着想\n"])
+def test_unclosed_think_recovers_complete_reply_json(prefix):
+    raw = prefix + json.dumps({"aside": "我想接住这句话。", "messages": ["好 中文就中文", "你接着说"]}, ensure_ascii=False)
+    turn = crc._agent_turn_from_raw(raw)
+    assert turn.messages == ["好 中文就中文", "你接着说"]
+    assert turn.thinking_summary == "我想接住这句话。"
+    assert turn.sanitizer_reason == "thinking_gate_salvaged"
+    assert turn.raw_reply_diagnostics["salvage_reason"] == "trailing_unclosed"
+
+
+@pytest.mark.parametrize("raw", [
+    '<think>sorry baby english only',
+    '<think>{"messages":["private"]}</think>',
+    '<think>{"messages":["unfinished"',
+    '<think>{"messages":["one"]}\n{"messages":["two"]}',
+    '<think>{"messages":["private"],"actions":[{"type":"memory.add"}]}',
+])
+def test_unclosed_think_recovery_does_not_promote_free_text_or_actions(raw):
+    turn = crc._agent_turn_from_raw(raw)
+    assert turn.messages == []
+    assert turn.actions == []
+    assert turn.tool_calls == []
+    assert turn.thinking_summary == ""
+
+
+def test_resident_aside_display_switch_off_does_not_restore_native(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    turn = crc._agent_turn_from_raw({"aside": "visible aside", "reasoning_content": "private native", "messages": ["正文"]})
+    assert turn.messages == ["正文"]
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""

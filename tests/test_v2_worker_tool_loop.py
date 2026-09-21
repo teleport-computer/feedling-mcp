@@ -672,10 +672,7 @@ def test_chat_thinking_language_mismatch_does_not_trigger_a_rewrite(
     calls = _script_provider(monkeypatch, [
         _tool_round(_tc("s1", "web_search", query="first")),
         _tool_round(_tc("s2", "web_search", query="second")),
-        _text_round(
-            "<think>The file is ready and I will finish in English.</think>"
-            "文件已经生成并发送，可以直接下载了。"
-        ),
+        _text_round("<think>The file is ready and I will finish in English.</think>文件已经生成并发送，可以直接下载了。"),
     ])
     traces = []
     deps = _deps(messages=[{
@@ -697,9 +694,7 @@ def test_chat_thinking_language_mismatch_does_not_trigger_a_rewrite(
     assert [row["body_ct"] for row in _bubbles(uid)] == [
         "文件已经生成并发送，可以直接下载了。"
     ]
-    assert _bubbles(uid)[0]["thinking_body_ct"] == (
-        "The file is ready and I will finish in English."
-    )
+    assert _bubbles(uid)[0]["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
     language_trace = next(
         trace for trace in traces if trace["type"] == "reply.language_follow"
     )
@@ -763,10 +758,7 @@ def test_chat_thinking_language_mismatch_publishes_the_first_candidate(
     job = jobs_store.claim_next_job("w-thinking-correction-visible-mismatch")
     _stub_envelope_build(monkeypatch)
     calls = _script_provider(monkeypatch, [
-        _text_round(
-            "<think>I will answer after checking the request carefully.</think>"
-            "这是第一条可见中文回复，只有思考语言不一致。"
-        ),
+        _tool_round(_tc("final-aside", "reply", aside="I will answer after checking the request carefully.", text="这是第一条可见中文回复，只有思考语言不一致。")),
     ])
     deps = _deps(messages=[{
         "id": "m-thinking-correction-visible-mismatch",
@@ -1089,7 +1081,7 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
         for message in calls[0]["messages"]
         if isinstance(message, dict) and message.get("role") == "system"
     )
-    assert self_thinking.INSTRUCTION.strip() in system_text
+    assert self_thinking.instruction_for_field().strip() in system_text
 
 
 def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
@@ -1099,6 +1091,7 @@ def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-fable-plain")
+    _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     calls = _script_provider(monkeypatch, [_text_round("Fable plain reply")])
     deps = _deps(messages=[{
@@ -1153,6 +1146,7 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-selfthink-only")
+    _stub_envelope_build(monkeypatch)
     _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     _script_provider(monkeypatch, [_text_round("<think>只想了但没回答</think>")])
@@ -1214,6 +1208,7 @@ def test_chat_degenerate_fallback_uses_shared_reply_language_policy(
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-fallback-language")
+    _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     _script_provider(monkeypatch, [_text_round("。")])
     deps = _deps(messages=[{
@@ -1254,6 +1249,7 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-degenerate")
+    _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     persisted_extra = {}
     real_write = worker._write_encrypted_reply
@@ -1785,7 +1781,7 @@ def _stub_envelope_build(monkeypatch):
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake)
 
 
-def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
+def test_self_thinking_off_discards_native_reasoning(monkeypatch):
     """Feature OFF preserves the legacy provider chain-of-thought contract.
 
     A final reply whose provider result carried chain-of-thought
@@ -1829,14 +1825,14 @@ def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
     assert len(bubbles) == 1
     bubble = bubbles[0]
     assert bubble["body_ct"] == "the answer"
-    assert bubble.get("thinking_kind") == "provider_reasoning"
-    assert bubble.get("thinking_body_ct") == "step one\nstep two"
+    assert "thinking_kind" not in bubble
+    assert "thinking_body_ct" not in bubble
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "native_legacy",
-        "chars": len("step one\nstep two"),
+        "branch": "native_discarded",
+        "chars": 0,
         "model": _BYOK.model,
         "lane": "chat",
         "retried": 0,
@@ -1946,24 +1942,24 @@ def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     )
 
     assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
+    assert len(calls) == 1
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "the answer"
-    assert "thinking_kind" not in bubble
-    assert "thinking_body_ct" not in bubble
+    assert bubble["thinking_kind"] == "agent_summary"
+    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "none",
-        "chars": 0,
+        "branch": "marker",
+        "chars": len(self_thinking.THINKING_FAILED_MARKER),
         "model": _BYOK.model,
         "lane": "chat",
-        "retried": worker.MAX_SELF_THINKING_ABSENT_RETRIES,
+        "retried": 0,
     }]
 
 
-def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypatch):
+def test_self_thinking_on_discards_inline_and_native_reasoning(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_toolloop_selfthink_authored"
     conftest.seed_user(uid)
@@ -1997,13 +1993,13 @@ def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypat
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "the answer"
     assert bubble["thinking_kind"] == "agent_summary"
-    assert bubble["thinking_body_ct"] == "我先自己归纳"
+    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "self",
-        "chars": len("我先自己归纳"),
+        "branch": "marker",
+        "chars": len(self_thinking.THINKING_FAILED_MARKER),
         "model": _BYOK.model,
         "lane": "chat",
         "retried": 0,
@@ -2024,7 +2020,7 @@ def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypat
             "Please answer this direct-state test",
             self_thinking.COMPLETE,
             "direct answer",
-            "direct thought",
+            self_thinking.THINKING_FAILED_MARKER,
         ),
         (
             "<think>thinking only</think>",
@@ -2080,70 +2076,51 @@ def test_chat_self_thinking_non_absent_terminal_states_do_not_retry(
     assert bubble["thinking_body_ct"] == expected_thinking
 
 
-def test_chat_self_thinking_absent_final_retries_and_surfaces_complete(
-    monkeypatch,
-):
+@pytest.mark.parametrize("shape", ["aside", "missing", "blank", "internal", "direct"])
+def test_chat_optional_aside_delivers_body_without_retry(monkeypatch, shape):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_complete"
+    uid = "u_chat_optional_aside_" + shape
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-complete")
+    job = jobs_store.claim_next_job("w-chat-optional-aside")
     _stub_envelope_build(monkeypatch)
-    long_thinking = "x" * (self_thinking.MAX_THINKING_CHARS + 37)
-    original = "usable original without a thinking block"
-    corrected = "corrected visible answer"
-    expected_calls = 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    calls = _script_provider(monkeypatch, [
-        _text_round(original, prompt_tokens=2, completion_tokens=3),
-        _text_round(
-            f"<think>{long_thinking}</think>{corrected}",
-            prompt_tokens=5,
-            completion_tokens=7,
-        ),
-    ])
-    traces = []
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-complete",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please answer with the required structure",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "event_type": event_type, **fields}
+    body = "Here is the answer."
+    aside = "I want to follow up on what they said."
+    args = {"text": body}
+    if shape != "missing":
+        args["aside"] = {"blank": "   ", "internal": "memory_write"}.get(shape, aside)
+    response = (
+        _text_round(body) if shape == "direct"
+        else _tool_round(_tc("reply-aside", "reply", **args))
     )
-
+    response["reasoning"] = "private native reasoning must stay separate"
+    calls = _script_provider(monkeypatch, [response])
+    deps = _deps(messages=[{
+        "id": "m-aside", "ts": 10.0, "role": "user", "content": "Please answer me."
+    }])
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
     ))
-
     assert status == "completed"
-    assert len(calls) == expected_calls
-    assert calls[0].get("assistant_prefill") is None
-    assert calls[-1]["tools"] is None
-    assert calls[-1].get("assistant_prefill") == (
-        provider_client.SELF_THINKING_ASSISTANT_PREFILL
+    assert len(calls) == 1
+    assert "reply" in {spec.name for spec in calls[0]["tools"]}
+    assert "tool_choice" not in calls[0]
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    bubble = bubbles[0]
+    assert bubble["body_ct"] == body
+    assert not bubble.get("turn_failure_error_class")
+    assert bubble["thinking_body_ct"] == (
+        aside if shape == "aside" else self_thinking.THINKING_FAILED_MARKER
     )
-    retry_system = str(calls[-1]["messages"][0]["content"])
-    assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
-    assert self_thinking.INSTRUCTION.strip() in retry_system
-    bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == corrected
-    assert bubble["thinking_body_ct"] == long_thinking[:self_thinking.MAX_THINKING_CHARS]
-    thinking_trace = next(
-        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
-    )
-    assert thinking_trace["detail"]["branch"] == "self"
-    assert thinking_trace["detail"]["retried"] == (
-        worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    )
+    assert bubble["thinking_kind"] == "agent_summary"
+    assert bubble["thinking_source"] == "self_thinking"
+    assert bubble["thinking_native"] is False
     with db.get_pool().connection() as conn:
-        metric = conn.execute(
-            "SELECT model_calls,prompt_tokens,completion_tokens "
-            "FROM v2_turn_metrics WHERE job_id=%s",
-            (job["id"],),
-        ).fetchone()
-    assert metric == (expected_calls, 7, 10)
+        assert conn.execute(
+            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s", (job["id"],)
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -2446,180 +2423,6 @@ def test_genuinely_unclassified_process_failure_stays_unknown(monkeypatch):
             (job_id,),
         ).fetchone()
     assert terminal_row == ("turn_failed:workspace_prompt_unavailable", "unknown")
-
-
-def test_chat_self_thinking_absent_retry_has_no_visible_language_rider(
-    monkeypatch,
-):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_language_correction"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-language-correction")
-    _stub_envelope_build(monkeypatch)
-    calls = _script_provider(monkeypatch, [
-        _text_round(
-            "Done, the requested file was saved and delivered successfully"
-        ),
-        _text_round(
-            "<think>文件已经成功发送，我用中文完成回复。</think>"
-            "文件已经生成并发送，可以直接下载了。"
-        ),
-    ])
-    traces = []
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-language-correction",
-        "ts": 10.0,
-        "role": "user",
-        "content": "请用中文告诉我这项工作已经完成，回答要自然一点。",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "event_type": event_type, **fields}
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 2
-    retry_system = str(calls[1]["messages"][0]["content"])
-    assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
-    assert "你刚才这条回复,语言和这个人正在说的语言对不上" not in retry_system
-    assert [row["body_ct"] for row in _bubbles(uid)] == [
-        "文件已经生成并发送，可以直接下载了。"
-    ]
-    assert _bubbles(uid)[0]["thinking_body_ct"] == (
-        "文件已经成功发送，我用中文完成回复。"
-    )
-    language_trace = next(
-        trace
-        for trace in traces
-        if trace["event_type"] == "reply.language_follow"
-    )
-    assert language_trace["detail"] == {
-        "user_script": "han",
-        "reply_script": "han",
-        "outcome": "match",
-        "lane": "chat",
-    }
-
-
-def test_chat_self_thinking_absent_retry_still_absent_keeps_original(
-    monkeypatch,
-):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_absent"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-absent")
-    _stub_envelope_build(monkeypatch)
-    original = "first usable answer without thinking"
-    calls = _script_provider(monkeypatch, [
-        _text_round(original),
-        _text_round("second answer still has no thinking block"),
-    ])
-    traces = []
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-absent",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please keep the first usable answer on correction failure",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "event_type": event_type, **fields}
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == original
-    assert "thinking_body_ct" not in bubble
-    thinking_trace = next(
-        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
-    )
-    assert thinking_trace["detail"]["branch"] == "none"
-    assert thinking_trace["detail"]["retried"] == (
-        worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    )
-
-
-def test_chat_self_thinking_absent_retry_internal_term_keeps_original(
-    monkeypatch,
-):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_internal_term"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-internal-term")
-    _stub_envelope_build(monkeypatch)
-    original = "first usable answer without thinking"
-    leaking_thinking = "memory_write"
-    assert worker._self_thinking_internal_term(leaking_thinking) == "memory_write"
-    calls = _script_provider(monkeypatch, [
-        _text_round(original),
-        _text_round(
-            f"<think>{leaking_thinking}</think>"
-            "second answer must not replace the original"
-        ),
-    ])
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-internal-term",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please preserve the original on an invalid correction",
-    }])
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == original
-    assert "thinking_kind" not in bubble
-    assert "thinking_body_ct" not in bubble
-
-
-@pytest.mark.parametrize(
-    "retry",
-    [
-        provider_client.ProviderError("correction unavailable", status_code=400),
-        _text_round(""),
-    ],
-)
-def test_chat_self_thinking_absent_retry_failure_keeps_original(monkeypatch, retry):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_failure_" + type(retry).__name__
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-failure")
-    _stub_envelope_build(monkeypatch)
-    original = "usable original survives a failed correction"
-    calls = _script_provider(monkeypatch, [_text_round(original), retry])
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-failure",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please preserve usable output on retry failure",
-    }])
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    assert _bubbles(uid)[0]["body_ct"] == original
 
 
 def test_chat_tool_round_without_thinking_does_not_trigger_absent_retry(monkeypatch):

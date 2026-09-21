@@ -230,6 +230,14 @@ across Capture runs. Clients subtract the total saved when the user last
 dismissed the banner to show the unconfirmed count. A Capture run that adds no
 cards does not change the total or refresh the timestamp.
 
+Runtime V2 Dream allows up to 180 seconds per provider HTTP wire, with a
+matching 180-second phase timeout. Capture and profile generation retain their
+90-second wire limits; chat and wake provider timeouts are unchanged. The shared
+Heavy pool allows 210 seconds without progress and 1,260 seconds total, derived
+from the largest lane wire budget and the existing provider-attempt allowance.
+Each compatibility fallback reports a new wire boundary. These limits do not
+change Dream's card/output budgets, consolidation safety gates, or resident V1.
+
 Dream maintenance, in both Runtime V2 and resident V1 (hosted and
 self-hosted), reads complete decrypted candidate cards and shows the model each
 card's summary and body. The prompt holds at most 60 cards and 60,000

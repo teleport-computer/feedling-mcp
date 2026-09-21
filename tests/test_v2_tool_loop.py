@@ -239,7 +239,7 @@ def test_tool_loop_threads_visual_fallback_deadline_to_main_provider(monkeypatch
     assert provider.calls[0]["absolute_deadline"] == deadline
 
 
-def test_terminal_self_thinking_round_requests_assistant_prefill(monkeypatch):
+def test_terminal_aside_round_never_requests_think_prefill(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "<think>reason</think>hello", "tool_calls": [], "usage": {}},
     ])
@@ -260,9 +260,7 @@ def test_terminal_self_thinking_round_requests_assistant_prefill(monkeypatch):
 
     assert outcome.stop_reason == "final_text"
     assert provider.calls[0]["tools"] is None
-    assert provider.calls[0].get("assistant_prefill") == (
-        provider_client.SELF_THINKING_ASSISTANT_PREFILL
-    )
+    assert "assistant_prefill" not in provider.calls[0]
 
 
 def test_nonterminal_tool_round_does_not_request_assistant_prefill(monkeypatch):
@@ -4018,7 +4016,7 @@ def test_regular_wake_free_text_retries_once_then_fails_without_bubble(
         ))
 
     assert replies.calls == []
-    assert len(provider.calls) == len(responses)
+    assert len(provider.calls) == 2
     assert all(
         call["max_tokens"] == provider_client.CHAT_OUTPUT_MAX_TOKENS
         for call in provider.calls
@@ -4038,7 +4036,7 @@ def test_regular_wake_free_text_retries_once_then_fails_without_bubble(
         payload["choice"]
         for kind, payload in events
         if kind == "wake_choice_response"
-    ] == ["invalid", "invalid", "invalid"]
+    ] == ["invalid", "invalid"]
 
 
 @pytest.mark.parametrize("file_limit", [None, 16384])
@@ -4085,7 +4083,7 @@ def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
             "id": "wake-reply-1",
             "name": "reply",
             "args": {
-                "think": "I want to say this now.",
+                "aside": "I want to say this now.",
                 "text": "structured proactive reply",
             },
         }],
@@ -4119,8 +4117,8 @@ def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
     reply_spec = next(
         spec for spec in provider.calls[0]["tools"] if spec.name == "reply"
     )
-    assert reply_spec.parameters["required"] == ["think", "text"]
-    think_description = reply_spec.parameters["properties"]["think"]["description"]
+    assert reply_spec.parameters["required"] == ["text"]
+    think_description = reply_spec.parameters["properties"]["aside"]["description"]
     assert "entirely in their language" in think_description
     assert "in your usual voice with them" in think_description
     for forbidden_internal in (
@@ -4142,9 +4140,9 @@ def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
 
 @pytest.mark.parametrize("args", [
     {"text": "message without think"},
-    {"think": "   ", "text": "message with empty think"},
+    {"aside": "   ", "text": "message with empty think"},
 ])
-def test_regular_wake_reply_requires_nonempty_think_then_fails_closed(
+def test_regular_wake_reply_missing_aside_delivers_text(
     monkeypatch,
     args,
 ):
@@ -4161,23 +4159,23 @@ def test_regular_wake_reply_requires_nonempty_think_then_fails_closed(
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     replies = _RecordingReply()
 
-    with pytest.raises(tool_loop.WakeChoiceInvalid, match="choice_invalid"):
-        asyncio.run(tool_loop.run_tool_loop(
-            provider_config=_TEST_PROVIDER_CONFIG,
-            build_messages=_RecordingBuildMessages(),
-            dispatch_tools=_RecordingDispatch(),
-            on_reply=replies,
-            on_stay_silent=lambda _reason: None,
-            regular_wake_choice_required=True,
-            fold_new_messages=_RecordingFold([]),
-            add_usage=_noop_add_usage,
-            max_calls=3,
-            require_reply=False,
-        ))
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=replies,
+        on_stay_silent=lambda _reason: None,
+        regular_wake_choice_required=True,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        require_reply=False,
+    ))
 
-    assert len(provider.calls) == 2
-    assert provider.calls[1]["tool_choice"] == "required"
-    assert replies.calls == []
+    assert len(provider.calls) == 1
+    assert replies.calls == [(args["text"], True)]
+    assert isinstance(replies.calls[0][0], tool_loop.ValidatedWakeReply)
+    assert replies.calls[0][0].thinking == ""
 
 
 def test_regular_wake_reserves_last_call_and_never_uses_text_fallback(
@@ -4392,7 +4390,7 @@ def test_regular_wake_schema_rejection_retries_with_only_terminal_choice_tools(
                     "id": "wake-reply-after-schema-rejection",
                     "name": "reply",
                     "args": {
-                        "think": "I still want to say this now.",
+                        "aside": "I still want to say this now.",
                         "text": "structured reply after schema rejection",
                     },
                 }],
@@ -4456,7 +4454,7 @@ def test_tool_then_empty_wake_forces_terminal_reply_without_preamble_duplicate(
                 "id": "reply-forced",
                 "name": "reply",
                 "args": {
-                    "think": "我想把刚查到的上下文接起来。",
+                    "aside": "我想把刚查到的上下文接起来。",
                     "text": "这是唯一的终局回复",
                 },
             }],

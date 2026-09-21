@@ -151,7 +151,7 @@ def _wake_reply_round(text, *, prompt_tokens=1, completion_tokens=1):
         _tc(
             "wake-reply-test",
             "reply",
-            think="I want to say this now.",
+            aside="I want to say this now.",
             text=text,
         ),
         prompt_tokens=prompt_tokens,
@@ -270,8 +270,8 @@ def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch, ou
     ))
 
     assert status == "failed"
-    assert len(calls) == 3
-    # The budget must reach the initial call and both structured-choice retries.
+    assert len(calls) == 2
+    # Direct text gets exactly one structured-choice correction.
     expected_limit = (
         output_limit if output_limit is not None
         else provider_client.CHAT_OUTPUT_MAX_TOKENS
@@ -294,6 +294,93 @@ def test_wake_terminal_plain_text_fails_without_proactive_bubble(monkeypatch, ou
     assert row[2] == "wake_failed:choice_invalid"
     assert row[3] == 0
     assert _job_status(job_id) == ("failed", "wake_failed:choice_invalid")
+
+
+# De-identified shapes from T658 manual review: A job51093, E job56653.
+_A_WAKE_DRAFT = "早安，昨晚说累得要死，今天有课没？"
+_E_WAKE_DRAFT = "宝贝还在睡呢，让她多休息会儿吧。"
+
+
+@pytest.mark.parametrize("outcome,draft", [
+    ("reply", _A_WAKE_DRAFT),
+    ("silent", _E_WAKE_DRAFT),
+    ("invalid", _A_WAKE_DRAFT),
+    ("empty", _A_WAKE_DRAFT),
+    ("other_tool", _E_WAKE_DRAFT),
+])
+def test_direct_wake_draft_gets_one_explicit_decision(monkeypatch, outcome, draft):
+    monkeypatch.setattr(worker, "_TURN_MAX_LLM_CALLS", 8)
+    uid = "u_wake_draft_" + outcome
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    body = "醒来后慢慢来，记得吃点东西。"
+    terminal = {
+        "reply": _wake_reply_round(body),
+        "silent": _stay_silent_round(),
+        "invalid": _text_round("another unapproved draft"),
+        "empty": _text_round(""),
+        "other_tool": _tool_round(_tc("unexpected", "memory_index")),
+    }[outcome]
+    # A third usable choice must never rescue an invalid correction.
+    calls = _script_provider(monkeypatch, [
+        _text_round(draft), terminal, _wake_reply_round("unauthorized third attempt"),
+    ])
+    sink_calls = []
+    deps = _wake_deps(tail=[{"id":"m1", "ts":1.0, "role":"user", "content":"hi"}], sink_calls=sink_calls)
+    traces = []
+    deps.emit_debug_trace = lambda user_id,event_type,**kw: traces.append((event_type,kw))
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    ))
+    assert len(calls) == 2
+    assert calls[1]["tool_choice"] == "required"
+    assert {t.name for t in calls[1]["tools"]} == {"reply", "stay_silent"}
+    messages = calls[1]["messages"]
+    assert any(m.get("role")=="assistant" and m.get("content")==draft for m in messages if isinstance(m,dict))
+    assert all(draft not in str(m.get("content", "")) for m in messages if isinstance(m,dict) and m.get("role")=="system")
+    assert "unpublished draft" in str(messages)
+    bubbles = _bubbles(uid)
+    if outcome == "reply":
+        assert status == "completed"
+        assert len(bubbles) == 1
+        replies = [p for kind,p in sink_calls if kind == "reply"]
+        assert len(replies) == 1 and replies[0]["text"] == body
+    else:
+        assert bubbles == []
+        assert not any(kind == "reply" for kind,_ in sink_calls)
+        if outcome == "silent":
+            assert status == "completed"
+        else:
+            assert status == "failed"
+            assert _job_status(job_id) == ("failed", "wake_failed:choice_invalid")
+    correction = [debug_trace._safe_detail(kw["detail"]) for name,kw in traces if name == "wake.direct_text_correction"]
+    expected = {"reply":"corrected_to_reply", "silent":"corrected_to_silent"}.get(outcome,"still_invalid")
+    assert [row["outcome"] for row in correction] == ["direct_text_seen", expected]
+    for name in worker.v2_tool_loop._WAKE_DIRECT_TEXT_OUTCOMES:
+        assert sum(row[name] for row in correction) == int(name in {"direct_text_seen",expected})
+    assert draft not in json.dumps(correction,ensure_ascii=False)
+    assert body not in json.dumps(correction,ensure_ascii=False)
+
+
+@pytest.mark.parametrize("budget", [1, 2, 8])
+def test_direct_wake_correction_never_exceeds_remaining_budget(monkeypatch, budget):
+    monkeypatch.setattr(worker, "_TURN_MAX_LLM_CALLS", budget)
+    uid = "u_wake_draft_budget"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    calls = _script_provider(monkeypatch, [_text_round(_E_WAKE_DRAFT)] * 8)
+    sink_calls = []
+    deps = _wake_deps(tail=[{"id":"m1", "ts":1.0, "role":"user", "content":"hi"}], sink_calls=sink_calls)
+    status = asyncio.run(worker.process_job(job,deps,provider_config=_BYOK,api_key=None,runtime_token="rt"))
+    assert len(calls) == min(budget,2)
+    assert status == "failed"
+    assert _job_status(job_id) == ("failed", "wake_failed:choice_invalid")
+    assert _bubbles(uid) == [] and sink_calls == []
 
 
 def test_wake_enqueued_without_sink_is_not_counted_as_visible(monkeypatch):
@@ -496,15 +583,15 @@ def test_wake_reply_natural_language_is_not_a_protocol_token(monkeypatch, text):
 
 
 @pytest.mark.parametrize("malformation", [
-    "missing_think", "extra_arg", "missing_id", "mixed_batch", "too_long", "media",
+    "missing_text", "extra_arg", "missing_id", "mixed_batch", "too_long", "media",
 ])
 def test_protocol_token_does_not_make_an_invalid_reply_a_silent_choice(
     monkeypatch, malformation,
 ):
     response = _wake_reply_round("stay_silent")
     call = response["tool_calls"][0]
-    if malformation == "missing_think":
-        call["args"].pop("think")
+    if malformation == "missing_text":
+        call["args"].pop("text")
     elif malformation == "extra_arg":
         call["args"]["extra"] = True
     elif malformation == "missing_id":
@@ -566,6 +653,42 @@ def test_protocol_token_wake_completes_as_sleep_with_no_bubble(monkeypatch, toke
 # manufacture a user request.
 # ------------------------------------------------------------------
 
+@pytest.mark.parametrize("lane", ["scheduled", "heartbeat", "manual_wake", "screen_watch"])
+@pytest.mark.parametrize("output_limit", [None, 16384])
+def test_all_wake_lanes_share_output_budget_on_initial_and_correction_calls(
+    monkeypatch, lane, output_limit,
+):
+    if output_limit is not None:
+        monkeypatch.setattr(worker, "FILE_OUTPUT_MAX_TOKENS", output_limit)
+    uid = "u_wake_shared_output_budget"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+    final = (
+        _text_round("Time for your reminder.") if lane == "scheduled"
+        else _wake_reply_round("I wanted to check in.")
+    )
+    # Scheduled correction requires a terminated empty provider success;
+    # a completely missing response is intentionally not recoverable in that lane.
+    empty_success = {**_text_round(""), "stop_reason": "end_turn"}
+    calls = _script_provider(monkeypatch, [empty_success, final])
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}],
+    )
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, lane, deps, _BYOK, asyncio.Semaphore(4), str(job["claimed_by"]),
+    ))
+
+    assert status == "completed", _job_status(job_id)
+    assert len(calls) == 2
+    expected = output_limit or provider_client.CHAT_OUTPUT_MAX_TOKENS
+    assert expected != 700
+    assert all(call.get("max_tokens") == expected for call in calls)
+    assert len(_bubbles(uid)) == 1
+
+
 def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
     uid = "u_wake_toolloop_notail"
     conftest.seed_user(uid)
@@ -578,7 +701,7 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
-        assert "max_tokens" not in _kwargs  # Scheduled output policy is unchanged.
+        assert _kwargs["max_tokens"] == worker.FILE_OUTPUT_MAX_TOKENS
         # 必须返**非空**正文。本用例测的是空 tail 下的 prompt 形状（不触发
         # `no_user_messages` 闸、不造用户角色消息），空回复只是早期图省事的载体；
         # scheduled 道打开 require_reply 之后，空回复本身就会让这一轮判失败，

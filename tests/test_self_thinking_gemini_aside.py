@@ -1,21 +1,4 @@
-"""T591/T601: official and named relay Gemini routes use ``aside`` on both runtimes.
-
-Measured 2026-09-15 on gemini-3.6-flash only (T586/T588/T591). Tag-only bisect
-(just ``<think>``→``<aside>``, wording unchanged), direct V2-shaped calls,
-counted among HTTP-200 responses: 7/11 ``MALFORMED_RESPONSE`` with ``<think>``
-vs 0/13 with ``<aside>`` (20 attempts per arm; both arms also saw HTTP 503).
-Tag-only replay of one captured pi-wire body: 6/10 HTTP 503 with ``<think>`` vs
-0/10 with ``<aside>``. The full aside rendering (tag + two wording
-substitutions) was confirmed separately on the V2 shape, 8/8 and 8/8. These
-tests pin the configured behavior; Gemini's server-side reason is not
-observable.
-
-T601 extends this to openai_compatible/openrouter models whose name contains
-gemini. Other routes keep ``think`` byte for byte; the Claude Code driver rule
-from T587 is untouched. The V2 tool loop restates/continues the
-contract with the same tag: compact delivery rounds render ``instruction(tag)``
-and the ``<think>`` assistant prefill is only sent on ``think`` turns.
-"""
+"""All routes use an aside field; legacy tag selection remains parse-compatible."""
 from __future__ import annotations
 
 import os
@@ -101,7 +84,7 @@ def test_context_renders_the_route_model_tag(provider, model, tag):
     assert context.self_thinking_tag(config) == tag
     assert context.chat_system_prompt(config) == context._join_policy_blocks(
         context._CHAT_REPLY_POLICY,
-        st.instruction(tag),
+        st.instruction_for_field(),
         context._CHAT_POLICY_AFTER_THINKING,
     )
 
@@ -125,10 +108,10 @@ def test_gemini_chat_system_prompt_uses_aside_and_never_think():
     prompt = context.chat_system_prompt(_pc("gemini"))
     assert prompt == context._join_policy_blocks(
         context._CHAT_REPLY_POLICY,
-        st.instruction(st.TAG_ASIDE),
+        st.instruction_for_field(),
         context._CHAT_POLICY_AFTER_THINKING,
     )
-    assert "<aside>" in prompt and "</aside>" in prompt
+    assert "aside 字段" in prompt and "<aside>" not in prompt
     assert "<think>" not in prompt and "</think>" not in prompt
 
 
@@ -138,7 +121,7 @@ def test_non_gemini_chat_system_prompt_is_unchanged():
     prompt = context.chat_system_prompt(_pc("anthropic", "claude-sonnet-4-6"))
     assert prompt == context._join_policy_blocks(
         context._CHAT_REPLY_POLICY,
-        st.INSTRUCTION,
+        st.instruction_for_field(),
         context._CHAT_POLICY_AFTER_THINKING,
     )
     assert "<aside>" not in prompt
@@ -148,8 +131,8 @@ def test_scheduled_wake_prompt_follows_the_tag():
     base = "BASE WAKE PROMPT"
     aside = worker._wake_system_prompt_for_lane("scheduled", base, tag=st.TAG_ASIDE)
     think = worker._wake_system_prompt_for_lane("scheduled", base)
-    assert aside == context._join_policy_blocks(base, st.instruction(st.TAG_ASIDE))
-    assert think == context._join_policy_blocks(base, st.INSTRUCTION)
+    assert aside == context._join_policy_blocks(base, st.instruction_for_field())
+    assert think == context._join_policy_blocks(base, st.instruction_for_field())
     assert "<think>" not in aside
 
 
@@ -184,8 +167,8 @@ def _resident_pi(monkeypatch):
 def test_resident_pi_gemini_uses_aside(monkeypatch, _resident_pi):
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", "gemini")
     assert crc._self_thinking_tag() == st.TAG_ASIDE
-    assert crc._foreground_self_thinking_instruction() == st.instruction(st.TAG_ASIDE).strip()
-    assert "<aside>" in crc._wake_think_permission_line()
+    assert crc._foreground_self_thinking_instruction() == st.instruction_for_field(protocol="json").strip()
+    assert "aside 字段" in crc._wake_think_permission_line()
     assert "<think>" not in crc._wake_think_permission_line()
 
 
@@ -194,7 +177,7 @@ def test_resident_pi_other_providers_keep_think(monkeypatch, _resident_pi, provi
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", provider)
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "model", "claude-sonnet-4-6")
     assert crc._self_thinking_tag() == st.TAG_THINK
-    assert crc._foreground_self_thinking_instruction() == st.INSTRUCTION.strip()
+    assert crc._foreground_self_thinking_instruction() == st.instruction_for_field(protocol="json").strip()
 
 
 @pytest.mark.parametrize("provider,model,tag", _ROUTE_TAG_CASES)
@@ -202,9 +185,9 @@ def test_resident_renders_the_metadata_model_tag(monkeypatch, _resident_pi, prov
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", provider)
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "model", model)
     assert crc._self_thinking_tag() == tag
-    assert crc._foreground_self_thinking_instruction() == st.instruction(tag).strip()
+    assert crc._foreground_self_thinking_instruction() == st.instruction_for_field(protocol="json").strip()
     permission = crc._wake_think_permission_line()
-    assert f"<{tag}>" in permission
+    assert "aside 字段" in permission
     other = st.TAG_THINK if tag == st.TAG_ASIDE else st.TAG_ASIDE
     assert f"<{other}>" not in permission
 
@@ -234,16 +217,15 @@ def test_every_wake_prompt_call_site_passes_the_provider_tag():
         assert "tag=context.self_thinking_tag(provider_config)" in window, window
 
 
-def test_every_absent_correction_call_site_passes_the_provider_tag():
-    src = _worker_source()
-    sites = [m for m in re.finditer(r"_self_thinking_absent_correction_instruction\(", src)
-             if not src[max(0, m.start() - 4): m.start()].endswith("def ")]
-    # One rendering of the historical constant plus the live correction site.
-    assert len(sites) >= 2, len(sites)
-    live = [m for m in sites if "self_thinking.TAG_THINK" not in src[m.end(): m.end() + 40]]
-    assert live, "live correction call site not found"
-    for m in live:
-        assert "context.self_thinking_tag(provider_config)" in src[m.end(): m.end() + 120]
+def test_missing_aside_never_requests_an_absent_correction():
+    import ast
+    tree = ast.parse(_worker_source())
+    process = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "process_job")
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "_self_thinking_absent_correction_instruction"
+        for node in ast.walk(process)
+    )
 
 
 # ------------------------------------------ tool loop: prefill / compact rounds
@@ -271,13 +253,13 @@ def _drive_loop(monkeypatch, provider: str, model: str, *, correction: bool):
         )
         system = "\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "system")
         calls.append({"requested": requested, "effective": effective,
-                      "system_has_aside": "<aside>" in system, "system_has_think": "<think>" in system})
+                      "system_has_aside": "aside 字段" in system, "system_has_think": "<think>" in system})
         return {"reply": f"<{tag}>thought</{tag}>hello", "tool_calls": [], "usage": {}}
 
     async def on_reply(text, *, final, reasoning="", correction_outcome=""):
         if correction and len(calls) == 1:
             return tool_loop.FinalReplyCorrectionRequest(
-                instruction=worker._self_thinking_absent_correction_instruction(tag),
+                instruction=st.instruction_for_field(),
                 original_text=text, original_reasoning=reasoning)
         return None
 
@@ -328,12 +310,12 @@ def test_real_loop_relay_gemini_uses_model_for_tag_and_prefill(monkeypatch, prov
 
 
 @pytest.mark.parametrize("correction", [False, True])
-def test_real_loop_keeps_think_prefill_for_continuation_capable_anthropic(monkeypatch, correction):
+def test_real_loop_never_prefills_think_even_when_anthropic_accepts_it(monkeypatch, correction):
     # Positive control: a provider that keeps the think rendering AND accepts the
     # continuation prefix still gets it on the terminal round (unchanged path).
     calls = _drive_loop(monkeypatch, "anthropic", "claude-sonnet-4-5", correction=correction)
-    assert calls[-1]["system_has_think"] and not calls[-1]["system_has_aside"], calls
-    assert calls[-1]["requested"] == "<think>" and calls[-1]["effective"] == "<think>", calls
+    assert calls[-1]["system_has_aside"] and not calls[-1]["system_has_think"], calls
+    assert calls[-1]["requested"] == "" and calls[-1]["effective"] == "", calls
 
 
 def test_compact_delivery_round_renders_the_selected_tag():
@@ -342,5 +324,5 @@ def test_compact_delivery_round_renders_the_selected_tag():
     import inspect
     src = inspect.getsource(tool_loop.run_tool_loop)
     compact = src[src.index("def _compact_delivery_system_prompt"):][:600]
-    assert "self_thinking.instruction(self_thinking_tag)" in compact
+    assert "self_thinking.instruction_for_field()" in compact
     assert "self_thinking.INSTRUCTION" not in compact

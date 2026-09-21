@@ -1146,7 +1146,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "include_reasoning": {
                 "type": "boolean",
                 "default": False,
-                "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought. If the initial final reply omits that block, Runtime V2 may spend one separately metered, text-only provider round from the existing turn budget to restate the same format contract. If that bounded correction is unavailable or still unusable, the original reply is delivered without a thinking attachment or native-reasoning fallback. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field.",
+                "description": "Legacy per-turn reasoning request for Hosted Runtime V2; resident runtimes ignore this field. Display thinking comes only from the optional aside field when self-authored thinking is enabled (the default), with agent_summary/self_thinking provenance and thinking_native=false. A usable reply without aside is delivered with the thinking-failed marker and no format-correction retry. Provider-native reasoning is never displayed, including when self-authored thinking is disabled.",
             },
             "image_b64": {"type": "string", "contentEncoding": "base64", "description": "Image data; decoded size must not exceed 2,000,000 bytes."},
             "image_base64": {"type": "string", "contentEncoding": "base64", "deprecated": True},
@@ -2704,13 +2704,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
     ("get", "/v1/chat/canvases"): (
-        "List up to 500 current IO Canvas workspace entries for the authenticated "
-        "user, ordered by most recent workspace update. This metadata-only index "
-        "matches the .io.html suffix case-insensitively while preserving filename "
-        "case, and "
-        "never returns Canvas bodies or envelopes. message_id and display metadata "
-        "come from the newest matching agent-authored Chat file row and are null "
-        "when no such row exists."
+        "List up to 500 IO Canvases from workspace entries and agent-authored Chat "
+        "file cards, including Resident and self-hosted deliveries. Workspace "
+        "entries take precedence for identical filenames; the combined index is "
+        "ordered by updated_at descending. The .io.html suffix is matched "
+        "case-insensitively while preserving filename case. Chat-only entries "
+        "use revision=1, mime_type=text/html, earliest card timestamp for created_at "
+        "and newest card timestamp for updated_at and message_id. Workspace entries "
+        "retain their revision/timestamps and newest matching Chat metadata (null "
+        "when absent). Bodies and envelopes are never returned."
     ),
     ("get", "/v1/chat/workspace/body"): (
         "Read the authenticated user's current IO Canvas workspace envelope by "
@@ -2913,7 +2915,7 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     },
     ("get", "/v1/chat/canvases"): {
         "200": {
-            "description": "The caller's current Canvas workspace metadata, newest first.",
+            "description": "The caller's workspace and chat-delivered Canvas metadata, newest first.",
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/CanvasIndexResponse"}

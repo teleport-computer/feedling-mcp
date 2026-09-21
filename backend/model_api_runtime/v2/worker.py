@@ -1013,12 +1013,12 @@ _WAKE_SYSTEM_PROMPT = (
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     " For this presence turn, decide before using any user-visible reply, file, "
-    "image, or voice delivery capability. If you choose to speak, put your honest "
-    "in-the-moment thinking in the reply tool's `think` field and the complete "
+    "image, or voice delivery capability. If you choose to speak, put how you feel right now and how you "
+    "mean to pick up what they said in the reply tool's `aside` field and the complete "
     "visible message in its `text` field; never put `<think>` tags in `text`. If "
     "you choose quiet company, call stay_silent with a brief reason and send no "
     "visible text, greeting, placeholder, or user-visible delivery capability. "
-    "Keep the decision in `think` consistent with the visible message; if you "
+    "Keep the decision in `aside` consistent with the visible message; if you "
     "change your mind, update it before calling reply."
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
@@ -1057,17 +1057,18 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 def _wake_system_prompt_for_lane(
     lane: str, base_prompt: str, *, tag: str = self_thinking.TAG_THINK,
 ) -> str:
-    """Attach the shared thinking contract and lane-specific suffixes.
+    """Attach the shared aside-field contract and lane-specific suffixes.
 
-    ``tag`` selects the mandatory instruction rendering for the scheduled lane
-    (``context.self_thinking_tag(provider_config)``; gemini → ``aside``, T591)."""
+    The legacy tag argument is accepted for callers but no longer selects copy.
+    """
     if not self_thinking.enabled():
         return base_prompt
     blocks = [base_prompt]
     if lane == "scheduled":
-        blocks.append(self_thinking.instruction(tag))
+        blocks.append(self_thinking.instruction_for_field())
     else:
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
+        blocks.append(self_thinking.instruction_for_field())
     if lane == "screen_watch":
         blocks.append(self_thinking.SCREEN_WATCH_INSTRUCTION)
     return context._join_policy_blocks(*blocks)
@@ -3328,6 +3329,25 @@ def _provider_tool_surface_callback(
     return _ProviderRoundtripTrace(
         deps, user_id, lane, str(trace_id or ""), str(job_id or "")
     )
+
+
+def _wake_direct_text_correction_callback(deps, user_id, lane, trace_id, job_id):
+    async def emit(outcome: str, *, round_number: int) -> None:
+        if outcome not in v2_tool_loop._WAKE_DIRECT_TEXT_OUTCOMES:
+            return
+        if deps.emit_debug_trace is None:
+            return
+        await asyncio.to_thread(
+            deps.emit_debug_trace, user_id, "wake.direct_text_correction",
+            trace_id=trace_id, job_id=str(job_id), status="ok",
+            summary="Wake direct-text correction outcome",
+            detail={
+                "lane": lane, "round": int(round_number), "outcome": outcome,
+                **{name: int(name == outcome)
+                   for name in v2_tool_loop._WAKE_DIRECT_TEXT_OUTCOMES},
+            },
+        )
+    return emit
 
 
 def _schema_surface_trace_callback(
@@ -7746,10 +7766,7 @@ def _generated_image_reply_from_provider(
 
 
 def _sanitize_reasoning(text: str) -> str:
-    """Bound provider chain-of-thought before it is sealed into a thinking body.
-
-    Only length-caps and trims; IO stores and renders reasoning as-provided and
-    never manufactures it.  An empty result means "no reasoning to surface"."""
+    """Bound the optional aside or failure marker before sealing its envelope."""
     cleaned = str(text or "").strip()
     if len(cleaned) > _THINKING_MAX_CHARS:
         cleaned = cleaned[:_THINKING_MAX_CHARS]
@@ -7788,18 +7805,11 @@ def _select_thinking_surface(
     self_thinking_text: str = "",
     self_thinking_failed: bool = False,
 ) -> tuple[str, str, str | None, bool, str]:
-    """Choose the only thinking text a final V2 reply may surface.
+    """Surface only the optional aside; native reasoning is never displayed.
 
-    While self-thinking is enabled, provider-native chain-of-thought is never a
-    fallback: the model-authored ``<think>`` summary (or the existing failure
-    marker) is the complete display contract.  Disabling the feature preserves
-    the legacy native-reasoning behavior byte-for-byte.
-
-    The final item is a content-free observability branch name.  Keep this
-    decision shared by chat and wake so the two duplicated reply sinks cannot
-    drift again. Wake does not pass ``self_thinking_failed`` because malformed
-    wake output fails before sealing; the marker branch is reachable only from
-    foreground Chat.
+    The final item is a content-free branch shared by the chat and wake sinks.
+    Historical native-reasoning envelopes remain readable, but no new reply
+    selects that provenance, including when the aside feature is disabled.
     """
     if self_thinking_on:
         if self_thinking_failed:
@@ -7820,8 +7830,8 @@ def _select_thinking_surface(
             )
         return "", "agent_summary", "self_thinking", False, "none"
     if provider_reasoning:
-        return provider_reasoning, "provider_reasoning", None, True, "native_legacy"
-    return "", "provider_reasoning", None, True, "none"
+        return "", "agent_summary", "self_thinking", False, "native_discarded"
+    return "", "agent_summary", "self_thinking", False, "none"
 
 
 async def _emit_thinking_surfaced_trace(
@@ -7839,7 +7849,7 @@ async def _emit_thinking_surfaced_trace(
         return
     safe_branch = (
         branch
-        if branch in {"self", "marker", "none", "native_legacy"}
+        if branch in {"self", "marker", "none", "native_discarded"}
         else "none"
     )
     safe_lane = "wake" if lane == "wake" else "chat"
@@ -10582,7 +10592,7 @@ async def _run_wake(
                 raise v2_tool_loop.WakeChoiceInvalid()
             _structured_wake_thinking = (
                 str(getattr(text, "thinking", "") or "").strip()
-                if isinstance(text, v2_tool_loop.ValidatedWakeReply)
+                if isinstance(text, v2_tool_loop.ValidatedReply)
                 else ""
             )
             text = str(text or "").strip()
@@ -10626,11 +10636,6 @@ async def _run_wake(
                     wake_self_thinking_failed = True
                 elif _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
-                    if not _structured_wake_thinking:
-                        _wake_self_thinking_text = _wst_thinking
-                        if _self_thinking_internal_term(_wake_self_thinking_text):
-                            _wake_self_thinking_text = ""
-                            wake_self_thinking_failed = True
                 elif _wst_status == _st_wake.SILENT:
                     # A clean thinking-only response is an intentional weak-wake
                     # sleep, not malformed protocol. There is no reply effect to
@@ -10649,6 +10654,8 @@ async def _run_wake(
                     if final:
                         raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
+            if _wake_self_thinking_on and not _wake_self_thinking_text:
+                wake_self_thinking_failed = True
             if text and _is_degenerate_reply(text):
                 await _suppress_empty_visible_reply(
                     final=final,
@@ -11442,6 +11449,8 @@ async def _run_wake(
                 tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
                 on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 regular_wake_choice_required=(lane != "scheduled"),
+                reply_tool_enabled=True,
+                wake_output_budget_required=True,
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -11488,6 +11497,9 @@ async def _run_wake(
                     exc,
                 ),
                 on_provider_tool_surface=provider_roundtrip_trace,
+                on_wake_direct_text_correction=_wake_direct_text_correction_callback(
+                    deps, user_id, lane, trace_id, job_id,
+                ),
                 on_provider_call_event=_provider_model_call_callback(
                     provider_reply_signal,
                     provider_roundtrip_trace,
@@ -12179,8 +12191,8 @@ async def _run_profile(
                     f"profile_provider_{stage}:{ordinal}:{int(attempt)}"
                 ),
             )
-            # Profile shares heavy-0 with Capture/Dream: same 120s stall budget,
-            # so each wire needs the same true wall-clock ceiling.
+            # Profile shares heavy-0 with Capture/Dream, but retains its own
+            # 90s wire ceiling when Dream receives a larger budget.
             kwargs.setdefault("wire_deadline_sec", v2_extraction.WIRE_DEADLINE_SEC)
             result = await provider_client.reliable_chat_completion_async(
                 *args, **kwargs
@@ -13169,6 +13181,8 @@ async def _run_extraction(
                 parse_retry=parse_retry,
                 session=_capture_session,
                 step_sink=_step_sink,
+                timeout_sec=v2_extraction.wire_deadline_for_lane(lane),
+                wire_deadline_sec=v2_extraction.wire_deadline_for_lane(lane),
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
                 truncation_retry_max_tokens=(
                     v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
@@ -15642,21 +15656,6 @@ async def process_job(
         thinking_trace_emitted = False
         language_trace_emitted = False
         language_user_rows: list[dict] = []
-        self_thinking_absent_retry_requests = 0
-        self_thinking_absent_retried = 0
-        self_thinking_absent_retry_pending = False
-        self_thinking_absent_retry_response_seen = False
-
-        def _cancel_self_thinking_absent_retry() -> None:
-            nonlocal self_thinking_absent_retry_requests
-            nonlocal self_thinking_absent_retried
-            nonlocal self_thinking_absent_retry_pending
-            nonlocal self_thinking_absent_retry_response_seen
-            self_thinking_absent_retry_requests = 0
-            self_thinking_absent_retried = 0
-            self_thinking_absent_retry_pending = False
-            self_thinking_absent_retry_response_seen = False
-
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -15672,13 +15671,12 @@ async def process_job(
             nonlocal final_job_completed_atomically, voice_reply_slot
             nonlocal voice_call_ended_atomically
             nonlocal thinking_trace_emitted, language_trace_emitted
-            nonlocal self_thinking_absent_retry_requests
-            nonlocal self_thinking_absent_retried
-            nonlocal self_thinking_absent_retry_pending
-            nonlocal self_thinking_absent_retry_response_seen
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             validated_final_reply = isinstance(
                 text, v2_tool_loop.ValidatedFinalReply
+            )
+            structured_aside = (
+                text.thinking if isinstance(text, v2_tool_loop.ValidatedReply) else ""
             )
             raw_reply_text = "" if file_reply is not None else str(text or "").strip()
             text = raw_reply_text
@@ -15720,9 +15718,11 @@ async def process_job(
             # 因此：闸开 → 一律全文剥离；闸关但 self-thinking 开 → 旧行为；两者都关
             # → 完全不处理。展示与否仍然只看 self_thinking_on。
             _st_gate_on = self_thinking.gate_enabled()
-            self_thinking_text = ""
+            self_thinking_text = structured_aside
             self_thinking_failed = False
-            self_thinking_salvaged = False
+            if _self_thinking_internal_term(self_thinking_text):
+                self_thinking_text = ""
+                self_thinking_failed = True
             self_thinking_status = None
             if (
                 (_st_gate_on or self_thinking_on)
@@ -15746,7 +15746,6 @@ async def process_job(
                     # turn_failure_error_class below).
                     text = _st_reply
                     self_thinking_failed = True
-                    self_thinking_salvaged = True
                     await _record_trajectory(
                         trajectory_recorder,
                         "self_thinking_salvaged",
@@ -15760,11 +15759,6 @@ async def process_job(
                     )
                 elif _st_status == self_thinking.COMPLETE:
                     text = _st_reply
-                    if not validated_final_reply:
-                        self_thinking_text = _st_thinking
-                        if _self_thinking_internal_term(self_thinking_text):
-                            self_thinking_text = ""
-                            self_thinking_failed = True
                 elif _st_status in {self_thinking.SILENT, self_thinking.FAILED}:
                     # Foreground chat must always answer, so both malformed protocol
                     # and a clean thinking-only response keep the pre-existing FAILED
@@ -15778,7 +15772,7 @@ async def process_job(
                 raise RuntimeError("a file reply cannot be terminal")
             turn_failure_error_class = (
                 _DEGENERATE_REPLY_ERROR_CLASS
-                if self_thinking_failed and not self_thinking_salvaged
+                if self_thinking_status in {self_thinking.SILENT, self_thinking.FAILED}
                 else ""
             )
             if file_reply is None and text and _is_degenerate_reply(text):
@@ -15904,59 +15898,14 @@ async def process_job(
                     )
                     if not pending_file_replies:
                         raise TurnError("internal_file_reference_without_attachment")
-            if correction_outcome:
-                if self_thinking_absent_retry_pending:
-                    # The loop republishes the first usable reply when the bounded
-                    # correction errors, is empty, is rejected, or has no call
-                    # budget. Count only a provider call that actually happened.
-                    if (
-                        correction_outcome != "skipped"
-                        and not self_thinking_absent_retry_response_seen
-                    ):
-                        self_thinking_absent_retried += 1
-                    self_thinking_absent_retry_pending = False
-                    self_thinking_absent_retry_response_seen = False
-            elif (
-                final
-                and file_reply is None
+            # Missing optional aside is a presentation failure only. Never
+            # spend another provider call or turn a usable body into an error.
+            if (
+                self_thinking_on and file_reply is None and text
                 and not validated_final_reply
-                and not image_replies
-                and text
+                and not self_thinking_text
             ):
-                if self_thinking_absent_retry_pending:
-                    self_thinking_absent_retried += 1
-                    self_thinking_absent_retry_response_seen = True
-                    if (
-                        self_thinking_status == self_thinking.COMPLETE
-                        and not self_thinking_failed
-                    ):
-                        self_thinking_absent_retry_pending = False
-                        self_thinking_absent_retry_response_seen = False
-                    else:
-                        # A correction may improve the saved candidate only by
-                        # satisfying the existing COMPLETE contract. ABSENT,
-                        # SILENT, FAILED, and internal-term failures all preserve
-                        # the first usable reply without surfacing a new marker.
-                        return v2_tool_loop.FinalReplyCorrectionRejected()
-                elif (
-                    self_thinking_on
-                    and self_thinking_status == self_thinking.ABSENT
-                    and self_thinking_absent_retry_requests
-                    < MAX_SELF_THINKING_ABSENT_RETRIES
-                ):
-                    self_thinking_absent_retry_requests += 1
-                    self_thinking_absent_retry_pending = True
-                    correction_instruction = (
-                        _self_thinking_absent_correction_instruction(
-                            context.self_thinking_tag(provider_config)
-                        )
-                    )
-                    return v2_tool_loop.FinalReplyCorrectionRequest(
-                        instruction=correction_instruction,
-                        original_text=raw_reply_text,
-                        original_reasoning=reasoning,
-                        on_cancel=_cancel_self_thinking_absent_retry,
-                    )
+                self_thinking_failed = True
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
@@ -16288,7 +16237,7 @@ async def process_job(
                             lane="chat",
                             branch=_thinking_branch,
                             chars=_thinking_chars,
-                            retried=self_thinking_absent_retried,
+                            retried=0,
                         )
                     if final and not language_trace_emitted:
                         language_trace_emitted = True
@@ -16374,7 +16323,7 @@ async def process_job(
                     lane="chat",
                     branch=_thinking_branch,
                     chars=_thinking_chars,
-                    retried=self_thinking_absent_retried,
+                    retried=0,
                 )
             if final and not language_trace_emitted:
                 language_trace_emitted = True
@@ -16733,6 +16682,7 @@ async def process_job(
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
             memory_delete_allowed=True,
+            reply_tool_enabled=_self_thinking_v2.enabled(),
             allow_image_output=True,
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,

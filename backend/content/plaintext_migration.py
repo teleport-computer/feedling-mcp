@@ -535,9 +535,10 @@ def run(
     limiter = _RateLimiter(rate, exact=int(workers) == 1)
     thread_state = threading.local()
 
-    def attempt(item: Item) -> str:
+    def attempt(item: Item) -> tuple[str, dict[str, str]]:
         limiter.wait()
         for retry in range(3):
+            stage = "decrypt_setup"
             try:
                 if item.classification != "cleanup_pending":
                     decrypt = getattr(thread_state, "decrypt", None)
@@ -546,14 +547,24 @@ def run(
                         thread_state.decrypt = decrypt
                 else:
                     decrypt = None
+                stage = "transform_or_storage"
                 status = migrate_item(user_id, item, decrypt)
-            except Exception:  # noqa: BLE001 - report only redacted failure class
+            except Exception as exc:  # noqa: BLE001 - report only safe failure class
                 status = "failed_transform_or_storage"
+                failure_detail = {
+                    "stage": stage,
+                    "exception_type": type(exc).__name__,
+                }
+            else:
+                failure_detail = {}
+            if status == "cas_conflict":
+                failure_detail = {"stage": "cas_write", "exception_type": "none"}
             if status not in {"failed_transform_or_storage", "cas_conflict"}:
-                return status
+                return status, failure_detail
             if retry < 2:
                 time.sleep(0.25 * (2**retry))
-        return status
+        failure_detail["status"] = status
+        return status, failure_detail
 
     futures = {}
     failure_items: list[dict[str, str]] = []
@@ -582,16 +593,15 @@ def run(
             done, _ = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
                 item = futures.pop(future)
-                status = future.result()
+                status, failure_detail = future.result()
                 counts[status] += 1
                 if status.startswith("failed_") or status == "cas_conflict":
-                    failure_items.append(
-                        {
-                            "surface": str(item.surface),
-                            "item_id": str(item.item_id),
-                            "status": str(status),
-                        }
-                    )
+                    failure_items.append({
+                        "surface": str(item.surface),
+                        "item_id": str(item.item_id),
+                        "status": str(status),
+                        **failure_detail,
+                    })
                 submit_next()
     failures = sum(
         count

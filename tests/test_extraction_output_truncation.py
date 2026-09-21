@@ -448,131 +448,155 @@ def test_slow_compatibility_fallback_wires_never_starve_the_heavy_pool_stall_clo
         ), (slot.slot_id, longest_silence)
 
 
-async def _trickle_server(trickle_sec: float, body: bytes):
-    """A real HTTP/1.1 server that keeps a response alive with keep-alive bytes.
+class _VirtualTimeLoop(asyncio.SelectorEventLoop):
+    """Run real asyncio timers/cancellation without waiting for wall time.
 
-    It sends headers at once, then one leading space every 20ms for
-    ``trickle_sec`` (JSON allows leading whitespace), then ``body``. No gap is
-    anywhere near httpx's per-phase read timeout, so only a wall-clock
-    ceiling can end the wire before the body arrives.
+    Only the test loop's clock changes. The production wait_for, transport,
+    retry wrapper and extraction code are not replaced. With MockTransport
+    there is no external I/O: when runnable work drains, jump to the next timer.
     """
-    gap = 0.02
-    spaces = max(1, int(trickle_sec / gap))
-    wires: list[float] = []
 
-    async def handle(reader, writer):
-        try:
-            head = await reader.readuntil(b"\r\n\r\n")
-            length = 0
-            for line in head.split(b"\r\n"):
-                if line.lower().startswith(b"content-length:"):
-                    length = int(line.split(b":", 1)[1])
-            await reader.readexactly(length)
-            wires.append(asyncio.get_running_loop().time())
-            writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                + f"Content-Length: {spaces + len(body)}\r\n\r\n".encode()
-            )
-            await writer.drain()
-            for _ in range(spaces):
-                writer.write(b" ")
-                await writer.drain()
-                await _REAL_ASYNC_SLEEP(gap)
-            writer.write(body)
-            await writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError):
-            pass
-        finally:
-            writer.close()
+    def __init__(self):
+        super().__init__()
+        self._virtual_now = 0.0
 
-    server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    return server, port, wires
+    def time(self):
+        return self._virtual_now
+
+    def _run_once(self):
+        if not self._ready:
+            if not self._scheduled:
+                raise AssertionError("virtual transport stalled without a timer")
+            self._virtual_now = max(self._virtual_now, self._scheduled[0]._when)
+        super()._run_once()
 
 
+@pytest.mark.parametrize("lane,expected_deadline", [("capture", 90.0), ("dream", 180.0)])
 def test_trickling_wire_is_cut_at_the_wall_clock_deadline_before_the_heavy_stall_budget(
-    monkeypatch,
+    monkeypatch, lane, expected_deadline,
 ):
-    """A trickling relay must not outlive one wire's budget (Codex r2 I1).
+    """Independent 300s trickle vs real lane deadline, with no socket timing.
 
-    httpx's ``timeout=`` is per phase (read = gap between two bytes), so a relay
-    that drips keep-alive bytes can hold one extraction wire far past the Heavy
-    pool's 120s stall budget; the watchdog then kills a healthy slot and the job
-    is re-run (duplicate model spend). Scaled down: the phase timeout and the
-    wall-clock ceiling are 0.5s, the relay trickles for 1.5s.
-
-    Control: the real transport with only the phase timeout lets the trickle
-    run to completion (the premise). Then real ``extract``: every wire is cut
-    at the ceiling, classified exactly like a read timeout (transient → three
-    attempts → ``upstream_unavailable``), and the longest silence the watchdog
-    could observe stays under a stall budget that one uncut wire would blow.
+    MockTransport yields bytes every 10 virtual seconds and is deliberately
+    unaware of the deadline. The real client's per-wire wait_for must cancel
+    the stream; counting requests/cancellations avoids conflating accepted
+    socket connections with provider attempts. The unbounded control must
+    finish, proving the fixture does not manufacture a timeout itself.
     """
-    from model_api_runtime.v2 import watchdog
+    from model_api_runtime.v2 import pool_config, watchdog
 
-    deadline, trickle = 0.5, 1.5
-    monkeypatch.setattr(extraction, "_TIMEOUT_SEC", deadline)
-    monkeypatch.setattr(extraction, "WIRE_DEADLINE_SEC", deadline)
+    deadline = extraction.wire_deadline_for_lane(lane)
+    assert deadline == expected_deadline  # independent anchors; never scale the fixture with it
+    trickle, gap = 300.0, 10.0
     monkeypatch.setattr(pc, "_reliable_retry_delay_sec", lambda *_a, **_k: 0.0)
     monkeypatch.setattr(pc, "_validate_egress_url", lambda _url: None, raising=False)
     body = json.dumps(_valid_dream_reply()).encode()
+    wires = []
+
+    class Trickle(httpx.AsyncByteStream):
+        def __init__(self, wire):
+            self.wire = wire
+
+        async def __aiter__(self):
+            try:
+                for _ in range(int(trickle / gap)):
+                    await _REAL_ASYNC_SLEEP(gap)
+                    self.wire["chunks"] += 1
+                    yield b" "
+                yield body
+                self.wire["completed_at"] = asyncio.get_running_loop().time()
+            except asyncio.CancelledError:
+                self.wire["cancelled_at"] = asyncio.get_running_loop().time()
+                raise
+
+    async def handler(request):
+        wire = {"started_at": asyncio.get_running_loop().time(), "chunks": 0,
+                "phase_timeout": request.extensions["timeout"]["read"]}
+        wires.append(wire)
+        return httpx.Response(200, stream=Trickle(wire),
+                              headers={"content-type": "application/json"})
 
     async def scenario():
-        server, port, wires = await _trickle_server(trickle, body)
-        client = httpx.AsyncClient()
-        monkeypatch.setattr(pc, "_shared_async_client", client)
-        config = pc.ProviderConfig(
-            provider="openai_compatible", model="m", api_key="k",
-            base_url=f"http://127.0.0.1:{port}/v1",
-        )
-        loop = asyncio.get_running_loop()
-        try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            monkeypatch.setattr(pc, "_shared_async_client", client)
+            config = pc.ProviderConfig(
+                provider="openai_compatible", model="m", api_key="k",
+                base_url="https://relay.example/v1", capture_attempt_trace=True,
+            )
+            loop = asyncio.get_running_loop()
             started = loop.time()
             control = await pc.reliable_chat_completion_async(
                 config, _MESSAGES, max_tokens=10, timeout=deadline, max_attempts=1,
             )
             control_elapsed = loop.time() - started
-            wires.clear()
+            control_wire = wires.pop()
+            progress = []
+            events = []
 
-            progress: list[tuple[float, str]] = []
+            async def record(kind, payload):
+                events.append((kind, payload))
+
+            # Match the actual lane wiring: Capture uses extract's unchanged
+            # defaults; Dream supplies its independent phase and wire budgets.
+            budgets = ({"timeout_sec": deadline, "wire_deadline_sec": deadline}
+                       if lane == "dream" else {})
             started = loop.time()
             outcome = await extraction.extract(
                 provider_config=config, prompt="P", parse=_dream_parse,
                 parse_retry=_dream_parse_retry(), max_tokens=100,
                 progress_cb=lambda stage, _attempt: progress.append((loop.time(), stage)),
+                trajectory_out=record, **budgets,
             )
-            return control, control_elapsed, outcome, progress, started, loop.time(), list(wires)
-        finally:
-            await client.aclose()
-            server.close()
-            await server.wait_closed()
+            return (control, control_elapsed, control_wire, outcome, progress,
+                    started, loop.time(), events)
 
-    control, control_elapsed, outcome, progress, started, finished, wires = asyncio.run(scenario())
+    loop = _VirtualTimeLoop()
+    try:
+        (control, control_elapsed, control_wire, outcome, progress,
+         started, finished, events) = loop.run_until_complete(scenario())
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
 
     assert control["reply"] == '{"consolidations": []}'
-    assert control_elapsed >= trickle  # the per-phase timeout never fired
-
+    assert control_elapsed == trickle
+    assert control_wire["chunks"] == 30 and "cancelled_at" not in control_wire
+    assert control_wire["completed_at"] - control_wire["started_at"] == trickle
     assert outcome == (None, "provider_call_failed:upstream_unavailable")
-    assert len(wires) == 3  # transient: retried like a read timeout
+    assert len(wires) == 3
+    for wire in wires:
+        assert wire["phase_timeout"] == expected_deadline
+        assert gap < wire["phase_timeout"]
+        assert wire["chunks"] > 0 and "completed_at" not in wire
+        assert wire["cancelled_at"] - wire["started_at"] == expected_deadline
+    error, = [payload for kind, payload in events if kind == "provider_error"]
+    attempts = error["provider_attempt_trace"]["attempts"]
+    http_attempts = [attempt for attempt in attempts if attempt["kind"] == "http_attempt"]
+    assert len(http_attempts) == 3
+    assert {attempt["timeout_kind"] for attempt in http_attempts} == {"wire_deadline"}
     stages = [stage for _at, stage in progress]
-    assert stages.count("wire_start") == 3 and stages.count("attempt_failed") == 3
+    assert stages.count("wire_start") == stages.count("attempt_failed") == 3
     boundaries = [started, *(at for at, _stage in progress), finished]
     longest_silence = max(b - a for a, b in zip(boundaries, boundaries[1:]))
-    assert longest_silence < deadline + 0.4 < trickle
-    stall_budget = deadline + 0.5  # below one uncut wire (trickle)
-    assert not watchdog.should_kill(
-        {
-            "alive": True,
-            "event_loop_heartbeat_age_sec": 0.0,
-            "last_slot_progress_age_sec": 0.0,
-            "active_turn_count": 1,
+    assert longest_silence == expected_deadline
+    slots = [s for s in pool_config.RuntimePoolConfig.from_env().slots if lane in s.lanes]
+    assert slots
+    for slot in slots:
+        assert longest_silence < slot.stall_budget_sec < trickle
+        state = {
+            "alive": True, "event_loop_heartbeat_age_sec": 0.0,
+            "last_slot_progress_age_sec": 0.0, "active_turn_count": 1,
             "current_turn_age_sec": finished - started,
             "current_turn_stall_age_sec": longest_silence,
-        },
-        child_liveness_timeout_sec=45.0,
-        jobs_claimable=True,
-        turn_stall_timeout_sec=stall_budget,
-        turn_absolute_timeout_sec=60.0,
-    )
+        }
+        budgets = dict(child_liveness_timeout_sec=45.0, jobs_claimable=True,
+                       turn_stall_timeout_sec=slot.stall_budget_sec,
+                       turn_absolute_timeout_sec=slot.absolute_budget_sec)
+        assert not watchdog.should_kill(state, **budgets)
+        # Uncut control would cross the real Heavy stall threshold.
+        assert watchdog.should_kill(
+            {**state, "current_turn_stall_age_sec": trickle}, **budgets,
+        )
 
 
 def test_wire_deadline_expiry_is_classified_like_a_wrapped_read_timeout(monkeypatch):

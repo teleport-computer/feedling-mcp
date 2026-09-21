@@ -100,6 +100,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import enclave_broker as v2_enclave_broker
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import pool_config as v2_pool_config
 from model_api_runtime.v2 import pool_supervisor as v2_pool_supervisor
 from model_api_runtime.v2 import profile as v2_profile
@@ -5912,10 +5913,9 @@ if _CHILD_STARTUP_TIMEOUT_SEC <= _CHILD_LIVENESS_TIMEOUT_SEC:
 # A turn has two different clocks and they must never be conflated:
 #
 # * stall timeout — no real in-turn boundary was crossed.  240s is above the
-#   longest single adapter attempt (up to two 90s wires for extraction's
-#   compatibility fallback). Reliable retries report a fresh boundary between
-#   attempts, so their total envelope does not consume one continuous stall
-#   budget.
+#   longest extraction wire (Dream 180s). The provider wrapper reports a fresh
+#   boundary before every wire, including compatibility fallback, so multiple
+#   wires never consume one continuous stall budget.
 # * absolute timeout — the turn keeps reporting progress but never terminates.
 #   This must fit the configured 600s prompt catch-up plus up to two bounded
 #   60s provider wires per round and setup/write margin.  The old single 180s
@@ -5935,14 +5935,13 @@ elif os.environ.get("FEEDLING_V2_TURN_HARD_TIMEOUT_SEC", "").strip():
 else:
     _TURN_STALL_TIMEOUT_SEC = 240.0
 
-# The longest single adapter attempt is extraction's 90s request; a provider
-# wire may make one bounded compatibility fallback before returning.  Require a
-# margin above 2 x 90s so a valid attempt can never be classified as a stall.
-_MIN_TURN_STALL_TIMEOUT_SEC = 210.0
+# Capture/Dream/Profile report progress before each HTTP wire. Leave the
+# same 30s margin above the longest lane deadline as the Heavy slot budget.
+_MIN_TURN_STALL_TIMEOUT_SEC = v2_extraction.max_wire_deadline_sec() + 30.0
 if _TURN_STALL_TIMEOUT_SEC < _MIN_TURN_STALL_TIMEOUT_SEC:
     raise RuntimeError(
         "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC (or legacy "
-        "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC) must be at least 210s"
+        f"FEEDLING_V2_TURN_HARD_TIMEOUT_SEC) must be at least {_MIN_TURN_STALL_TIMEOUT_SEC:g}s"
     )
 
 
@@ -6019,10 +6018,9 @@ _CHAT_TURN_BUDGET_SEC = (
     + float(v2_worker.MCP_TURN_WALL_BUDGET_SEC)
     + 120.0
 )
-# capture/dream use three 90s reliable attempts plus bounded retry backoff;
-# this is lower than the default chat budget but remains explicit so future
-# tuning cannot accidentally make a background lane the unaccounted maximum.
-_EXTRACTION_TURN_BUDGET_SEC = 3.0 * (2.0 * 90.0) + 6.0 + 120.0
+# Keep the same bounded provider-attempt envelope as the Heavy slot budget;
+# separate component parse/truncation re-asks remain outside this allowance.
+_EXTRACTION_TURN_BUDGET_SEC = v2_extraction.nominal_provider_envelope_sec()
 _MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(_CHAT_TURN_BUDGET_SEC, _EXTRACTION_TURN_BUDGET_SEC)
 if _TURN_ABSOLUTE_TIMEOUT_SEC < _MIN_TURN_ABSOLUTE_TIMEOUT_SEC:
     raise RuntimeError(

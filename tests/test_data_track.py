@@ -2849,9 +2849,9 @@ def test_fleet_wide_read_does_not_scan_memory_docs_for_breakdowns(client, monkey
     assert page_ids == seeded[2:4]
 
     breakdown_ids = [
-        params[1]
+        params[0]
         for sql, params in calls
-        if "COALESCE(NULLIF(doc->>%s" in sql and "memory_moments" in sql
+        if "jsonb_to_record(" in sql and "memory_moments" in sql
     ]
     assert breakdown_ids, (
         "no by_type/by_source SQL ran at all — this guard would pass "
@@ -3133,6 +3133,8 @@ def test_fleet_wide_read_does_not_scan_the_paged_log_streams(client, monkeypatch
     assert "bootstrap_events" not in fleet_log_sql[0], (
         "bootstrap_events is back in the fleet-wide user_logs aggregate"
     )
+    assert "tracking_events" not in fleet_log_sql[0]
+    assert "device_events" not in fleet_log_sql[0]
     assert "'memory_changes'" in fleet_log_sql[0], (
         "memory_changes must stay fleet-wide: it is the second element of the "
         "memory sort tuple, so it takes part in a full-set ordering"
@@ -3149,8 +3151,10 @@ def test_fleet_wide_read_does_not_scan_the_paged_log_streams(client, monkeypatch
         f"{[len(params[0]) for _, params in paged_calls]} ids per call for a "
         f"page of {len(page_ids)} out of {len(seeded)} seeded users"
     )
-    assert all(list(params[1]) == ["bootstrap_events"] for _, params in paged_calls), (
-        "the page-scoped log read must ask for exactly bootstrap_events; got "
+    # T680 pages two more counts; tracking MAX stays fleet-wide separately.
+    assert all(list(params[1]) == ["bootstrap_events", "tracking_events", "device_events"]
+               for _, params in paged_calls), (
+        "the page-scoped log read must ask for exactly these three streams; got "
         f"{[list(params[1]) for _, params in paged_calls]}"
     )
 

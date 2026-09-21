@@ -18,16 +18,21 @@ assistant reply.
 
 An IO Canvas card may outlive the Chat attachment that first published it.
 Authenticated clients should build the Canvas library from
-`GET /v1/chat/canvases`, which reads the caller's current workspace index
-directly instead of walking Chat history. The response contains at most 500
-metadata-only entries ordered by `updated_at` descending. Each entry includes
-the original case-preserving `filename`, workspace revision, MIME type, and
-creation/update timestamps. The `.io.html` suffix match is case-insensitive,
-while the returned filename preserves its original case. When a matching agent-authored file card still
-exists in Chat, the newest row contributes `message_id`, `display_title`, and
-`display_subtitle`; those three fields are `null` when the workspace entry
-predates or outlives its Chat card. Canvas bodies and envelopes are never part
-of this listing response.
+`GET /v1/chat/canvases`, which combines the caller's workspace index with
+agent-authored Chat file cards, including Resident and self-hosted deliveries.
+The response contains at most 500 metadata-only entries ordered by `updated_at`
+descending after combining both sources. The `.io.html` suffix match is
+case-insensitive; filenames retain their original case. Workspace entries take
+precedence for identical filenames and keep their revision, MIME type and
+timestamps. Their newest matching Chat card contributes `message_id`,
+`display_title` and `display_subtitle`; these fields are `null` if no card remains.
+
+Chat-only entries use revision `1` and MIME type `text/html`. Each filename's
+first card timestamp becomes `created_at`, while its newest card supplies
+`updated_at`, `message_id` and display metadata. Read these entries through
+`GET /v1/chat/messages/{message_id}/body`. Historical cards are visible without
+a backfill or body copies; deleting their Chat rows removes them from this
+source. Canvas bodies and envelopes never appear in the listing.
 
 Authenticated clients can read the current Canvas source with
 `GET /v1/chat/workspace/body?filename=<original-file_name>`. The endpoint accepts
@@ -489,7 +494,42 @@ be presented as missing configuration.
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below
 the final reply. A separately encrypted `thinking_*` envelope remains the only
-source for display-safe reasoning and must not be merged with tool activity.
+source for the optional persona aside and must not be merged with tool activity.
+
+Runtime V2 chat and wake turns share `reply(aside, text)`: `text` is required,
+while `aside` is optional. The aside is sealed separately with
+`thinking_kind: agent_summary`, `thinking_source: self_thinking`, and
+`thinking_native: false`. A usable reply without an aside is delivered without
+an aside-format correction retry. Chat and scheduled turns also accept usable
+direct text. Non-scheduled wake turns still require an explicit `reply` or
+`stay_silent` decision; unstructured text alone does not publish a bubble. With
+aside display enabled, missing or unusable aside text shows `（思考没写完）` instead.
+
+When a non-scheduled wake produces text without a tool call, the text is held as
+an unpublished draft. If the existing turn budget permits, the model gets at
+most one correction request to call `reply(aside, text)` or `stay_silent`.
+A second unstructured answer fails silently with `choice_invalid`; the draft
+itself is never published. Scheduled reminders and chat keep their direct-text
+behavior. The content-free `wake.direct_text_correction` trace records
+`direct_text_seen`, `corrected_to_reply`, `corrected_to_silent`, or `still_invalid`.
+These describe model decisions, not proof of delivery: selected replies still
+pass the existing content and effect checks. Wake language-follow uses prompt
+guidance and post-publication observation, not a blocking language check.
+
+
+Resident V1 uses the optional field in its existing reply JSON:
+
+```json
+{"aside": "I want to pick up where we left off.", "messages": ["How did it go?"]}
+```
+
+Resident asides are sanitized and limited to 700 characters. Provider-native
+reasoning and inline thinking-tag contents never become display summaries,
+including when aside display is disabled. Historical native-reasoning rows
+remain readable. The tag leak gate still strips inline blocks before delivery.
+A resident can recover a complete `messages`/`aside` envelope from an unclosed
+final thinking block; free text, ambiguous JSON, and envelopes containing
+executable actions or tool calls are not recovered.
 
 ## Independent resident loop
 

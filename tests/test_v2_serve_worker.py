@@ -2533,3 +2533,28 @@ def test_an_empty_tool_surface_does_not_consume_the_fingerprint(monkeypatch):
     later = _catalog_traces(monkeypatch, store, fingerprint="sha256:f",
                             specs=[_spec()])
     assert _catalog_of(later) is not None
+
+
+@pytest.mark.parametrize("dream_deadline,expected_min,accepted", [
+    (180.0, 210.0, True), (220.0, 250.0, False),
+])
+def test_default_stall_validates_actual_longest_wire(dream_deadline, expected_min, accepted):
+    # Isolate import-time configuration validation; reloading serve_worker in
+    # this process would replace globals used by background threads/fixtures.
+    script = f'''
+from model_api_runtime.v2 import extraction
+extraction.DREAM_WIRE_DEADLINE_SEC = {dream_deadline!r}
+from model_api_runtime.v2 import serve_worker
+assert serve_worker._TURN_STALL_TIMEOUT_SEC == 240.0
+assert serve_worker._MIN_TURN_STALL_TIMEOUT_SEC == {expected_min!r}
+'''
+    env = {k: v for k, v in os.environ.items() if k not in {
+        "FEEDLING_V2_TURN_STALL_TIMEOUT_SEC", "FEEDLING_V2_TURN_HARD_TIMEOUT_SEC"}}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "backend")
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, timeout=30)
+    if accepted:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert f"must be at least {expected_min:g}s" in result.stderr

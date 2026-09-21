@@ -42,6 +42,8 @@ def append_failure_log(*, run_id: str, user_id: str, failures: list[dict]) -> No
                 "surface": str(failure.get("surface", "unknown")),
                 "item_id": str(failure.get("item_id", "")),
                 "status": str(failure.get("status", "unknown")),
+                "stage": str(failure.get("stage", "unknown")),
+                "exception_type": str(failure.get("exception_type", "unknown")),
             }
             stream.write(json.dumps(record, sort_keys=True) + "\n")
         stream.flush()

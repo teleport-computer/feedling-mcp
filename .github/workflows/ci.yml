@@ -373,6 +373,7 @@ jobs:
           tests/test_asgi_agent_body.py
           tests/test_asgi_admin.py
           tests/test_asgi_chat_remaining.py
+          tests/test_chat_canvas_index_v1.py
           tests/test_asgi_cors.py
           tests/test_asgi_lifespan_loads_users.py
           tests/test_notification_sound_payload.py
@@ -1171,6 +1172,7 @@ jobs:
             tests/test_api_errors_doc.py \
             tests/test_chat_turn_failure_fields.py \
             tests/test_data_track.py \
+            tests/test_data_track_read_cost.py \
             tests/test_provider_attempt_ledger.py \
             tests/test_tool_schema_rejection_probe.py \
             tests/test_admin_discarded_reason.py \
