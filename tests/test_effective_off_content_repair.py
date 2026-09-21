@@ -243,6 +243,7 @@ def test_failure_log_persists_stable_failure_metadata(tmp_path, monkeypatch):
     assert record["failure_class"] == "enclave_http_403"
     assert record["failure_detail"] == "aead_verify_failed"
     assert record["retryable"] is False
+    assert record["remediation"] == "manual_key_recovery"
 
 
 def test_load_retry_items_excludes_deterministic_and_legacy_failures(tmp_path):
@@ -298,6 +299,7 @@ def test_summarize_failure_log_reports_stable_classes_and_unique_items(tmp_path)
         "retryable_records": 2,
         "non_retryable_records": 1,
         "by_failure_class": {"cas_conflict": 2, "enclave_http_403": 1},
+        "by_remediation": {"manual_key_recovery": 1, "retry_automatically": 2},
         "by_surface": {},
     }
 

@@ -78,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             for failure_class, count in summary["by_failure_class"].items():
                 print(f"failure_class.{failure_class}={count}")
+            for remediation, count in summary["by_remediation"].items():
+                print(f"remediation.{remediation}={count}")
             for surface, count in summary["by_surface"].items():
                 print(f"surface.{surface}={count}")
         return 0
