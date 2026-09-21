@@ -36,7 +36,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retry-failures",
         default="",
-        help="JSONL failure log to retry by user_id/item_id",
+        help="JSONL failure log; retries only records marked retryable",
+    )
+    parser.add_argument(
+        "--retry-non-retryable",
+        action="store_true",
+        help="also retry deterministic/legacy records from --retry-failures",
+    )
+    parser.add_argument(
+        "--summarize-failures",
+        default="",
+        help="print an aggregate summary of a JSONL failure log and exit",
     )
     parser.add_argument(
         "--checkpoint",
@@ -52,17 +62,31 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.summarize_failures:
+        try:
+            summary = plaintext_repair.summarize_failure_log(args.summarize_failures)
+        except OSError as exc:
+            print(f"failure summary unavailable: {type(exc).__name__.lower()}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(summary, sort_keys=True))
+        else:
+            print(
+                f"records={summary['records']} unique_items={summary['unique_items']} "
+                f"retryable={summary['retryable_records']} "
+                f"non_retryable={summary['non_retryable_records']}"
+            )
+            for failure_class, count in summary["by_failure_class"].items():
+                print(f"failure_class.{failure_class}={count}")
+            for surface, count in summary["by_surface"].items():
+                print(f"surface.{surface}={count}")
+        return 0
     retry_items: dict[str, set[str]] = {}
     if args.retry_failures:
-        with open(args.retry_failures, encoding="utf-8") as stream:
-            for line in stream:
-                try:
-                    record = json.loads(line)
-                    retry_items.setdefault(str(record["user_id"]), set()).add(
-                        str(record["item_id"])
-                    )
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
+        retry_items = plaintext_repair.load_retry_items(
+            args.retry_failures,
+            include_non_retryable=args.retry_non_retryable,
+        )
     if args.apply and (
         not args.allow_plaintext_rewrite
         or args.confirm_all_effective_off != _CONFIRMATION
