@@ -1520,7 +1520,10 @@ def _admin_data_track_connection(*, timeout_ms: int | None = None):
 # log_trim/log_prune_older_than anywhere — so paging it would keep an unbounded
 # GROUP BY alive for no consumer, and, sharing this query with bootstrap_events,
 # could time the bootstrap read out and mark a readable row degraded.
-_PAGED_LOG_STREAMS = ("bootstrap_events",)
+# tracking/device counts only render on a row. Tracking MAX(ts) stays in the
+# fleet snapshot: it contributes to last_activity_at and active_1d/3d before
+# pagination. Device timestamps have no fleet consumer.
+_PAGED_LOG_STREAMS = ("bootstrap_events", "tracking_events", "device_events")
 
 
 def _paged_log_streams_into(conn, ids: list[str], out: dict, ensure) -> None:
@@ -1636,48 +1639,58 @@ def admin_screen_frames(
 
 
 def _memory_breakdowns_into(conn, ids: list[str], out: dict, ensure) -> None:
-    """Per-user memory breakdowns — page-scoped, never fleet-wide.
+    """Extract page memory fields together, then aggregate just the metadata.
 
-    ``memory_moments.doc`` is an encrypted card large enough to live out of
-    line, so every additional ``doc->`` expression costs another detoast pass
-    over the whole matched set: on a 25.9k-row fixture the four-expression
-    aggregate read 310,819 buffers where a bare ``COUNT(*)`` read 320. None of
-    the fields below reaches fleet summary, sort or filters — data_track.py
-    renders them on the user's own row, and the detail page computes its own
-    via _memory_stats — so they are read for the current page only.
+    jsonb_to_record extracts all four fields together after the type guard.
+    The materialized relation contains only metadata, not the encrypted body. The
+    CASE preserves ->>'s NULL result for scalar/array/null documents; text
+    conversion and empty-string handling match the former three queries.
+    These breakdowns do not feed fleet ordering, filters or summaries.
     """
     rows = conn.execute(
         """
-        SELECT user_id,
-               MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
-               MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
-               MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
-        FROM memory_moments
-        WHERE user_id = ANY(%s)
-        GROUP BY user_id
+        WITH metadata AS MATERIALIZED (
+            SELECT user_id,
+                   NULLIF(m.created_at, '') AS created_at,
+                   NULLIF(m.occurred_at, '') AS occurred_at,
+                   COALESCE(NULLIF(m.type, ''), 'unknown') AS type,
+                   COALESCE(NULLIF(m.source, ''), 'unknown') AS source
+            FROM memory_moments
+            CROSS JOIN LATERAL jsonb_to_record(
+                CASE WHEN jsonb_typeof(doc) = 'object' THEN doc
+                     ELSE '{}'::jsonb END
+            ) AS m(created_at text, occurred_at text, type text, source text)
+            WHERE user_id = ANY(%s)
+        ), dates AS (
+            SELECT user_id, MIN(created_at) AS first_created_at,
+                   MIN(occurred_at) AS earliest_occurred_at,
+                   MAX(occurred_at) AS latest_occurred_at
+            FROM metadata GROUP BY user_id
+        ), types AS (
+            SELECT user_id, jsonb_object_agg(type, n) AS by_type
+            FROM (SELECT user_id, type, COUNT(*)::int AS n
+                  FROM metadata GROUP BY user_id, type) counts
+            GROUP BY user_id
+        ), sources AS (
+            SELECT user_id, jsonb_object_agg(source, n) AS by_source
+            FROM (SELECT user_id, source, COUNT(*)::int AS n
+                  FROM metadata GROUP BY user_id, source) counts
+            GROUP BY user_id
+        )
+        SELECT user_id, first_created_at, earliest_occurred_at,
+               latest_occurred_at, by_type, by_source
+        FROM dates JOIN types USING (user_id) JOIN sources USING (user_id)
         """,
         (ids,),
     ).fetchall()
-    for uid, first_created_at, earliest_occurred_at, latest_occurred_at in rows:
-        memory = ensure(out, uid).setdefault("memory", {})
-        memory["first_created_at"] = first_created_at or ""
-        memory["earliest_occurred_at"] = earliest_occurred_at or ""
-        memory["latest_occurred_at"] = latest_occurred_at or ""
-
-    for field, target in (("type", "by_type"), ("source", "by_source")):
-        rows = conn.execute(
-            """
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM memory_moments
-            WHERE user_id = ANY(%s)
-            GROUP BY user_id, value
-            """,
-            (field, ids),
-        ).fetchall()
-        for uid, value, count in rows:
-            memory = ensure(out, uid).setdefault("memory", {})
-            memory.setdefault(target, {})[value] = count
+    for uid, first, earliest, latest, by_type, by_source in rows:
+        ensure(out, uid).setdefault("memory", {}).update({
+            "first_created_at": first or "",
+            "earliest_occurred_at": earliest or "",
+            "latest_occurred_at": latest or "",
+            "by_type": by_type,
+            "by_source": by_source,
+        })
 
 
 def admin_memory_breakdowns(
@@ -1848,7 +1861,7 @@ def admin_data_track_snapshot(
                 WHERE user_id = ANY(%s)
                   AND stream IN (
                     'memory_changes', 'gate_decisions',
-                    'proactive_jobs', 'device_events', 'tracking_events'
+                    'proactive_jobs'
                   )
                 GROUP BY user_id, stream
                 """,
@@ -1860,12 +1873,25 @@ def admin_data_track_snapshot(
                     "last_ts": max_ts,
                 }
 
-            # memory_changes stays here on a harder criterion than "feeds the
-            # summary": it is the second element of the memory sort tuple in
-            # _data_track_sort_rows, so it is part of a full-set ordering. The
-            # four remaining streams are per-user trimmed, and all of them are
-            # read fleet-wide (proactive_jobs/gate_decisions through the
-            # proactive sort tuple, tracking_events through _latest_epoch).
+            # Counts for these three streams participate in full-set sorting.
+            # Tracking count does not, but its last timestamp feeds fleet
+            # activity. MAX uses the existing (user_id, stream, ts) index and
+            # ignores NULL timestamps, exactly like the former GROUP BY.
+            rows = conn.execute(
+                """
+                SELECT requested.user_id,
+                       (SELECT MAX(l.ts) FROM user_logs l
+                        WHERE l.user_id = requested.user_id
+                          AND l.stream = 'tracking_events')
+                FROM unnest(%s::text[]) AS requested(user_id)
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, max_ts in rows:
+                ensure(out, uid).setdefault("logs", {})["tracking_events"] = {
+                    "last_ts": max_ts,
+                }
+
             if include_paged_log_streams:
                 _paged_log_streams_into(conn, ids, out, ensure)
 

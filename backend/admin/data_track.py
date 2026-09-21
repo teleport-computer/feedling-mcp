@@ -2785,10 +2785,10 @@ def _data_track_payload(
         # latest_ts is not one of _latest_epoch's inputs, so no fleet-wide
         # consumer reads this aggregate. Re-read for the page below.
         include_screen_frames=False,
-        # And bootstrap_events, which has no fleet-wide reader at all. See
-        # db._PAGED_LOG_STREAMS for why it qualifies — in particular why it may
-        # leave the fleet-wide _latest_epoch inputs, and why memory_capture_jobs
-        # is dropped outright instead of being re-read per page.
+        # Bootstrap/tracking/device counts only render on the current page.
+        # Tracking MAX(ts) remains fleet-wide for activity; bootstrap timestamps
+        # are always NULL. See db._PAGED_LOG_STREAMS for the consumer boundary
+        # and why unused memory_capture_jobs is omitted outright.
         include_paged_log_streams=False,
     )
     human_cutoff = time.time() - int(filters.get("human_days") or 7) * 86400
@@ -3103,6 +3103,12 @@ def _data_track_payload(
             if logs:
                 logs_snap["logs"] = {**(snap.get("logs") or {}), **logs}
             row["bootstrap_events"] = _data_track_bootstrap_from_snapshot(logs_snap)
+            # Only counts moved to this page. Fleet tracking/proactive timestamps
+            # already supplied the summary and ordering above.
+            row["tracking"] = _data_track_tracking_from_snapshot(logs_snap)
+            row["proactive"] = _with_proactive_lens(
+                _data_track_proactive_from_snapshot(logs_snap, row["chat"])
+            )
             for status in (memory_read_status, screen_read_status, logs_read_status):
                 if status.get("level") != "ok":
                     row["snapshot_read_status"] = dict(status)
