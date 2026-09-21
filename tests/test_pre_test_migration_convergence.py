@@ -26,10 +26,11 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0112_user_logs_duration_sec"]
+    assert script.get_heads() == ["0114_agent_canvas_cards"]
+    assert script.get_revision("0114_agent_canvas_cards").down_revision == "0113_v2_wake_circuit"
     assert (
-        script.get_revision("0112_user_logs_duration_sec").down_revision
-        == "0111_memory_vectors"
+        script.get_revision("0113_v2_wake_circuit").down_revision
+        == "0112_user_logs_duration_sec"
     )
     assert (
         script.get_revision("0109_divergence_skew").down_revision
@@ -127,10 +128,11 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0047_user_logs_duration_sec"]
+    assert script.get_heads() == ["0049_agent_canvas_cards"]
+    assert script.get_revision("0049_agent_canvas_cards").down_revision == "0048_v2_wake_circuit"
     assert (
-        script.get_revision("0047_user_logs_duration_sec").down_revision
-        == "0046_memory_vectors"
+        script.get_revision("0048_v2_wake_circuit").down_revision
+        == "0047_user_logs_duration_sec"
     )
     assert (
         script.get_revision("0045_account_recover_challenges").down_revision

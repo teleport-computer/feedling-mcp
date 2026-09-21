@@ -28,6 +28,7 @@ from hosted import context as hosted_context
 from hosted import turn as hosted_turn
 from hosted import vision_routing
 from model_api_runtime.v2 import admission
+from model_api_runtime.v2 import wake_circuit
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
 from proactive import capture_scheduler
@@ -521,6 +522,7 @@ def model_api_chat_send_core(
     )
     inserted = not bool(user_row.pop("_client_msg_replayed", False))
     if inserted:
+        wake_circuit.reset(store.user_id, reason="new_chat")
         store.notify_chat_waiters()
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。

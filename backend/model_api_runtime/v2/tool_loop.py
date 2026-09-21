@@ -1333,11 +1333,14 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     on_stay_silent=None,
-    # Non-scheduled wakes offer reply/stay_silent and reserve a final choice
-    # attempt for empty responses. A usable terminal plain-text response is
-    # also delivered; text accompanying other tool calls remains a draft.
+    # Non-scheduled wakes require an explicit reply/stay_silent choice. A
+    # terminal plain-text response remains an unpublished draft and gets at
+    # most one correction within the existing provider-call budget.
     regular_wake_choice_required: bool = False,
     reply_tool_enabled: bool = False,
+    # Output capacity is independent of whether this lane requires a terminal
+    # reply/stay_silent choice. Scheduled wakes need the same shared budget.
+    wake_output_budget_required: bool = False,
     include_reasoning: bool = False,
     # Preserve the existing provider-request policy: aside-enabled turns do
     # not explicitly request a second native reasoning channel. Any native
@@ -2738,19 +2741,22 @@ async def run_tool_loop(
                 # JSON. File generation owns a separate output budget: the
                 # prompt frontier's reserve is input accounting, and increasing
                 # it would silently evict otherwise usable history. This branch
-                # keeps priority over the regular-wake branch below.
+                # keeps priority over the wake-budget branch below.
                 provider_kwargs["max_tokens"] = (
                     min(file_output_max_tokens, 512)
                     if compact_delivery_phase
                     else file_output_max_tokens
                 )
-            elif regular_wake_choice_required:
+            elif regular_wake_choice_required or wake_output_budget_required:
                 # Prod 2026-09-07..14 trace: of 425 silent_empty_response events
                 # on choice_invalid jobs, 421 were length + reasoning_present
                 # + completion_tokens>=700. Wake lanes used provider_client's
                 # 700-token default, leaving reasoning models no room to choose
                 # reply/stay_silent. Reuse the established chat/file output
                 # budget; keep input reserve accounting independent.
+                # Scheduled reminders need that capacity too. Keep this opt-in:
+                # an unconditional else would also raise subagent output limits,
+                # outside their existing per-call reservation policy.
                 provider_kwargs["max_tokens"] = file_output_max_tokens
             if on_provider_tool_surface is not None:
                 candidate_names = {

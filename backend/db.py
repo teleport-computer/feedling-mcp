@@ -52,6 +52,7 @@ from psycopg_pool import ConnectionPool
 
 import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
+import storage_read_trace
 from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
 
@@ -1756,6 +1757,20 @@ def admin_data_track_snapshot(
             timeout_ms=statement_timeout_ms,
         ) as conn:
             _chat_rollup_into(conn, ids, out, ensure)
+
+            # Same bounded admin connection/timeout; absent schedules are closed,
+            # a failed read stays absent so the UI can report unavailable.
+            circuit_rows = conn.execute(
+                "SELECT requested.user_id, "
+                "(schedule.wake_circuit_opened_at IS NOT NULL "
+                "AND control.hosted_runtime_state='v2') AS circuit_open "
+                "FROM unnest(%s::text[]) AS requested(user_id) "
+                "LEFT JOIN v2_wake_schedule AS schedule USING (user_id) "
+                "LEFT JOIN v2_runtime_state AS control USING (user_id)",
+                (ids,),
+            ).fetchall()
+            for uid, circuit_open in circuit_rows:
+                ensure(out, uid)["wake_provider_circuit_open"] = bool(circuit_open)
 
             if include_screen_frames:
                 _screen_frames_into(conn, ids, out, ensure)
@@ -12373,11 +12388,58 @@ def chat_get_many_strict(user_id: str, message_ids: list[str]) -> list[dict]:
     return [_chat_project_row(row) for row in rows]
 
 
-def chat_latest_agent_file_metadata_by_name(
+# This predicate matches both migration chains' partial index. Keep it literal:
+# parameterizing its constants prevents generic plans proving index eligibility.
+_AGENT_CANVAS_CARD_PREDICATE = (
+    "(doc->>'role') IN ('agent','openclaw') "
+    "AND (doc->>'content_type') = 'file' "
+    "AND lower(doc->>'file_name') LIKE '%.io.html'"
+)
+
+_CHAT_LATEST_AGENT_CANVAS_CARDS_SQL = (
+    "SELECT filename,msg_id,to_timestamp(created_ts),to_timestamp(updated_ts),"
+    "display_title,display_subtitle FROM ("
+    "SELECT DISTINCT ON (doc->>'file_name') "
+    "doc->>'file_name' AS filename,msg_id,ts AS updated_ts,"
+    "min(ts) OVER (PARTITION BY doc->>'file_name') AS created_ts,"
+    "NULLIF(doc->>'file_display_title','') AS display_title,"
+    "NULLIF(doc->>'file_display_subtitle','') AS display_subtitle "
+    "FROM chat_messages WHERE user_id=%s AND "
+    + _AGENT_CANVAS_CARD_PREDICATE.replace("%", "%%")
+    + " AND NOT EXISTS (SELECT 1 FROM v2_workspace_entries AS workspace "
+    "WHERE workspace.user_id=chat_messages.user_id AND workspace.kind='workspace' "
+    "AND workspace.path='/workspace/' || (chat_messages.doc->>'file_name')) "
+    "ORDER BY doc->>'file_name',ts DESC,seq DESC) AS cards "
+    "ORDER BY updated_ts DESC,filename ASC LIMIT %s"
+)
+
+
+def chat_latest_agent_canvas_cards(user_id: str, limit: int = 500) -> list[dict]:
+    """Read latest cards for Canvas names without a published workspace entry.
+
+    Only card metadata leaves SQL; bodies/envelopes stay in storage. Excluding
+    *all* workspace names before LIMIT preserves workspace precedence even if
+    that workspace row falls outside the endpoint's newest 500 entries.
+    """
+    maximum = max(1, min(int(limit), 500))
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_LATEST_AGENT_CANVAS_CARDS_SQL, (user_id, maximum),
+        ).fetchall()
+    return [
+        {"filename": str(filename), "message_id": str(message_id),
+         "created_at": created_at, "updated_at": updated_at,
+         "display_title": display_title, "display_subtitle": display_subtitle}
+        for filename, message_id, created_at, updated_at, display_title,
+        display_subtitle in rows
+    ]
+
+
+def chat_latest_agent_canvas_metadata_by_name(
     user_id: str,
     file_names: list[str],
 ) -> dict[str, dict]:
-    """Return the newest agent-authored file-card metadata for each name.
+    """Return the newest agent-authored Canvas-card metadata for each name.
 
     Canvas workspace rows are durable independently of their original Chat
     attachment, so missing names are expected and simply do not appear in the
@@ -12398,8 +12460,7 @@ def chat_latest_agent_file_metadata_by_name(
             "NULLIF(doc->>'file_display_title',''),"
             "NULLIF(doc->>'file_display_subtitle','') "
             "FROM chat_messages WHERE user_id=%s "
-            "AND doc->>'role' IN ('agent','openclaw') "
-            "AND doc->>'content_type'='file' "
+            "AND " + _AGENT_CANVAS_CARD_PREDICATE.replace("%", "%%") + " "
             "AND doc->>'file_name'=ANY(%s) "
             "ORDER BY doc->>'file_name',seq DESC",
             (user_id, names),
@@ -13417,6 +13478,15 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
+    with storage_read_trace.observe(user_id, hydrate=True) as observation:
+        out = _hydrate_chat_file_pointer(user_id, doc)
+        if _is_chat_file_pointer(out) and observation["status"] == "ok":
+            observation.update(status="other", error_class="body_unavailable")
+        return out
+
+
+def _hydrate_chat_file_pointer(user_id: str, doc: dict) -> dict:
+    """Decode/validate an enabled R2 pointer within its hydrate observation."""
     body_format = _chat_body_object_format(doc)
     if body_format == "sealed_v1":
         body = object_storage.get_chat_body(

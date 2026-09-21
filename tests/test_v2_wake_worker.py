@@ -5005,3 +5005,35 @@ def test_screen_watch_live_pixels_keep_read_mcp_but_drop_write_web_and_task(
     assert cap_tool_schema.TASK_TOOL not in offered
     assert read_name in offered, "read-only user MCP survives the pixel fence"
     assert write_name not in offered, "screen pixels must fence MCP writes"
+
+
+@pytest.mark.parametrize('lane', ['heartbeat', 'screen_watch', 'scheduled'])
+def test_persistent_provider_circuit_blocks_queued_wakes_but_not_scheduled(monkeypatch, lane):
+    uid = 'u_wake_circuit_' + lane
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO v2_wake_schedule (user_id,wake_circuit_opened_at) "
+                     "VALUES (%s,now()) ON CONFLICT (user_id) DO UPDATE "
+                     "SET wake_circuit_opened_at=now()", (uid,))
+    provider_calls = []
+    async def fake_provider(*args, **kwargs):
+        provider_calls.append(True)
+        raise provider_client.ProviderError('provider_http_402', status_code=402)
+    monkeypatch.setattr(provider_client, 'chat_completion_async', fake_provider)
+    deps = _wake_deps(tail=[{'role': 'user', 'text': 'hi'}])
+    prompt_calls = []
+    deps.load_workspace_prompt = lambda *a, **k: prompt_calls.append(True) or {
+        'identity_card_or_persona': '', 'trusted_system_blocks': []}
+    result = asyncio.run(worker._run_wake(job_id, uid, lane, deps, _BYOK, asyncio.Semaphore(4), claimed_by))
+    if lane == 'scheduled':
+        assert provider_calls
+        assert result == 'failed'
+    else:
+        assert provider_calls == [] and prompt_calls == []
+        assert result == 'completed'
+        with db.get_pool().connection() as conn:
+            row = conn.execute('SELECT wake_result,wake_result_reason FROM agent_jobs WHERE id=%s', (job_id,)).fetchone()
+        assert row == ('sleep', 'provider_circuit_open')

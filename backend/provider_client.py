@@ -2892,11 +2892,48 @@ def _gemini_empty_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Manual enabled+budget_tokens capability, not support for reasoning in general.
+# Sources checked 2026-09-21:
+# [A] https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+# [B] https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html
+# 4.6 still accepts manual mode (deprecated); adaptive-only models must not get it.
+ANTHROPIC_MANUAL_THINKING_CAPABILITIES: dict[str, bool] = {
+    "claude-3-7-sonnet": True,  # [B] extended thinking
+    "claude-sonnet-4": True,  # [A, B] extended only
+    "claude-opus-4": True,  # [A, B] extended only
+    "claude-opus-4-1": True,  # [A] earlier Claude 4 models: extended only
+    "claude-sonnet-4-5": True,  # [A, B] extended only
+    "claude-opus-4-5": True,  # [A, B] extended only
+    "claude-haiku-4-5": True,  # [A, B] extended only
+    "claude-sonnet-4-6": True,  # [A, B] manual accepted, deprecated
+    "claude-opus-4-6": True,  # [A, B] manual accepted, deprecated
+    "claude-opus-4-7": False,  # [A] adaptive only
+    "claude-opus-4-8": False,  # [A] adaptive only
+    "claude-opus-5": False,  # [A] adaptive only
+    "claude-sonnet-5": False,  # [A] adaptive only
+}
+
+
 def _anthropic_supports_thinking(model: str) -> bool:
+    """Resolve only documented manual-thinking families; unknown stays usable.
+
+    Accept dated/latest aliases and Bedrock version/profile decorations, never
+    arbitrary substrings or unlisted minor versions. This shared builder check
+    emits a content-free diagnostic when requested reasoning cannot be resolved.
+    """
     lower = (model or "").lower()
-    return (
-        "claude-3-7" in lower or "claude-sonnet-4" in lower or "claude-opus-4" in lower
-    )
+    lower = re.sub(r"^(?:(?:us|eu|apac|global|jp|au)\.)?anthropic\.", "", lower)
+    lower = re.sub(r"-v[0-9]+(?::[0-9]+)?$", "", lower)
+    lower = re.sub(r"-(?:[0-9]{8}|latest)$", "", lower)
+    supported = ANTHROPIC_MANUAL_THINKING_CAPABILITIES.get(lower)
+    if supported is None:
+        # Model is configuration metadata. Bound it to the configured model ID
+        # limit and JSON-encode controls; never include prompts, keys or URLs.
+        log.warning("[provider_client] thinking_omitted %s", json.dumps({
+            "reason": "unknown_model", "model": lower[:160],
+        }))
+        return False
+    return supported
 
 
 def _openai_uses_responses_for_reasoning(model: str) -> bool:

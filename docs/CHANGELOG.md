@@ -57,6 +57,17 @@ historical_reason: point-in-time
 
 ## Unreleased
 
+- `GET /v1/chat/canvases` now includes agent-authored `.io.html` Chat cards
+  from Resident and self-hosted delivery alongside workspace entries. Workspace
+  entries win identical filenames; the combined result keeps the newest 500.
+  Chat-only entries include a message ID for body reads, with no body copies or
+  historical backfill. Both database migration chains add a concurrent partial
+  index to avoid scanning unrelated messages.
+
+- T670：聊天附件交付新增 `object_storage.get` 与 `chat.file_body.hydrate`
+  耗时 trace（subsystem=`chat`），只记 dur_ms/bytes/status/error_class，区分
+  超时、404、5xx 和所有权拒绝，覆盖流读取及历史页预取，不记录 key/路径/正文。
+
 - T653：`user_logs` 新增可空 bigint 列 `duration_sec`（app_session_end 的前台时长，写入时由 `db._user_log_duration_sec` 按原 SQL 规则 `^[0-9]{1,10}$` 填，其余流为 NULL；迁移 alembic 0112 / alembic_tee 0047 幂等回填 85k 行，不重写表）。
 - T653：新增局部覆盖索引 `ix_user_logs_app_session_end_usage (user_id, ts) INCLUDE (duration_sec)`（CONCURRENTLY），管理端 fleet `app_usage` 聚合改读该列、走 Index Only Scan；输出列/语义不变（NULL 计 0、仍计 session）。
 - T653：管理端 data-track 连接租约 `SET jit = off`（fleet 聚合的 JIT 编译曾占 0.76s），随 statement_timeout 一起 RESET。

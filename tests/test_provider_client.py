@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -844,6 +845,165 @@ def test_openai_compat_payload_preserves_forced_tool_choice():
 
     assert payload["tool_choice"] == choice
     assert payload["tool_choice"] is not choice
+
+
+def test_manual_thinking_capabilities_have_documented_positive_and_negative_rows():
+    table = pc.ANTHROPIC_MANUAL_THINKING_CAPABILITIES
+    assert table
+    supported = {family for family, enabled in table.items() if enabled}
+    unsupported = {family for family, enabled in table.items() if not enabled}
+    assert supported and unsupported
+    assert all(type(enabled) is bool for enabled in table.values())
+    # Independent official-doc oracle: derived wire tests alone would follow an
+    # erroneous table edit. Pin the documented support, including deprecated 4.6.
+    # https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html
+    assert supported == {
+        "claude-3-7-sonnet", "claude-sonnet-4", "claude-opus-4",
+        "claude-opus-4-1", "claude-sonnet-4-5", "claude-opus-4-5",
+        "claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6",
+    }
+    assert unsupported == {
+        "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5",
+    }
+
+
+@pytest.mark.parametrize("family, supported", pc.ANTHROPIC_MANUAL_THINKING_CAPABILITIES.items())
+@pytest.mark.parametrize("prefix,suffix", [
+    ("", ""), ("", "-latest"), ("", "-20250514"),
+    ("anthropic.", ""), ("anthropic.", "-v1"),
+    ("us.anthropic.", "-20250514-v1:0"),
+    ("eu.anthropic.", "-20250514-v1:0"),
+    ("apac.anthropic.", "-20250514-v1:0"),
+    ("global.anthropic.", "-v1:0"),
+    ("jp.anthropic.", "-v1:0"), ("au.anthropic.", "-v1:0"),
+])
+def test_manual_thinking_table_drives_both_payloads(family, supported, prefix, suffix, caplog):
+    # Suffix fixtures exercise normalization, not provider availability of IDs.
+    model = f"{prefix}{family}{suffix}"
+    bedrock = bool(prefix)
+    builder = pc._build_bedrock_payload if bedrock else pc._build_anthropic_payload
+    payload, _, _ = builder(
+        model=model, base_url="https://provider.example", key="synthetic",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=0.2, response_format=None, include_reasoning=True,
+    )
+    container = payload.get("additionalModelRequestFields", {}) if bedrock else payload
+    inference = payload["inferenceConfig"] if bedrock else payload
+    if supported:
+        assert container["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+        assert "temperature" not in inference
+    else:
+        assert "thinking" not in container
+        assert inference["temperature"] == 0.2
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("family,supported", pc.ANTHROPIC_MANUAL_THINKING_CAPABILITIES.items())
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+def test_manual_thinking_table_preserves_forced_tool_contract(family, supported, provider):
+    builder = pc._build_anthropic_payload if provider == "anthropic" else pc._build_bedrock_payload
+    payload, _, _ = builder(
+        model=family if provider == "anthropic" else f"anthropic.{family}",
+        base_url="https://provider.example", key="synthetic",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None, include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+    if provider == "anthropic":
+        assert payload["tool_choice"] == {"type": "any"}
+        assert "thinking" not in payload
+    else:
+        assert payload["toolConfig"]["toolChoice"] == {"any": {}}
+        fields = payload.get("additionalModelRequestFields", {})
+        if supported:
+            assert fields["thinking"] == {"type": "disabled"}
+        else:
+            assert "thinking" not in fields
+
+
+@pytest.mark.parametrize("model", [
+    "claude-sonnet-4-7", "claude-opus-4-99", "claude-sonnet-40",
+    "claude-opus-4-secret", "private/claude-sonnet-4-5",
+    "claude-3-7-unknown", "claude-opus-4-5-20250101-extra", "",
+    "private.anthropic.claude-opus-4-5", "claude-opus-4-5\nsecret",
+    "CLAUDE-SONNET-4-99", "unlisted-" + "x" * 200,
+])
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+def test_unknown_thinking_model_omits_parameter_and_logs_no_content(model, provider, caplog):
+    builder = pc._build_anthropic_payload if provider == "anthropic" else pc._build_bedrock_payload
+    payload, _, _ = builder(
+        model=f"us.anthropic.{model}" if provider == "bedrock" else model,
+        base_url="https://private.example", key="private-key",
+        messages=[{"role": "user", "content": "private-prompt"}],
+        max_tokens=2048, temperature=None, response_format=None, include_reasoning=True,
+    )
+    container = payload.get("additionalModelRequestFields", {}) if provider == "bedrock" else payload
+    assert "thinking" not in container
+    assert len(caplog.records) == 1
+    event, raw_detail = caplog.records[0].getMessage().split(" ", 2)[1:]
+    assert event == "thinking_omitted"
+    assert json.loads(raw_detail) == {"reason": "unknown_model", "model": model.lower()[:160]}
+    assert "\n" not in raw_detail
+    assert all(secret not in caplog.text for secret in (
+        "private-prompt", "private-key", "https://private.example",
+    ))
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+@pytest.mark.parametrize("include_reasoning,max_tokens", [(False, 2048), (True, 1024)])
+def test_known_thinking_model_retains_opt_out_and_budget_gate(provider, include_reasoning, max_tokens, caplog):
+    builder = pc._build_anthropic_payload if provider == "anthropic" else pc._build_bedrock_payload
+    payload, _, _ = builder(
+        model="claude-sonnet-4-6" if provider == "anthropic" else "us.anthropic.claude-sonnet-4-6",
+        base_url="https://provider.example", key="synthetic",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=max_tokens, temperature=0.2, response_format=None,
+        include_reasoning=include_reasoning,
+    )
+    container = payload.get("additionalModelRequestFields", {}) if provider == "bedrock" else payload
+    assert "thinking" not in container
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_unknown_thinking_model_still_completes_request(provider, asynchronous, monkeypatch, caplog):
+    requests = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        container = payload.get("additionalModelRequestFields", {}) if provider == "bedrock" else payload
+        assert "thinking" not in container
+        requests.append(payload)
+        body = {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        if provider == "bedrock":
+            body = {"output": {"message": {"content": [{"text": "ok"}]}}, "stopReason": "end_turn"}
+        return httpx.Response(200, json=body)
+
+    config = pc.ProviderConfig(
+        provider=provider, model="us.anthropic.claude-sonnet-4-99" if provider == "bedrock" else "claude-sonnet-4-99",
+        api_key="synthetic", base_url="https://provider.example",
+    )
+    kwargs = {"max_tokens": 2048, "include_reasoning": True}
+    messages = [{"role": "user", "content": "private-prompt"}]
+    if asynchronous:
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                monkeypatch.setattr(pc, "_shared_async_client", client)
+                return await pc.chat_completion_async(config, messages, **kwargs)
+        result = asyncio.run(run())
+    else:
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            monkeypatch.setattr(pc, "_shared_client", client)
+            result = pc.chat_completion(config, messages, **kwargs)
+    assert result["reply"] == "ok"
+    assert len(requests) == 1
+    assert len(caplog.records) == 1
+    assert json.loads(caplog.records[0].getMessage().split(" ", 2)[2]) == {
+        "reason": "unknown_model", "model": "claude-sonnet-4-99",
+    }
 
 
 def test_anthropic_payload_translates_forced_function_tool_choice():

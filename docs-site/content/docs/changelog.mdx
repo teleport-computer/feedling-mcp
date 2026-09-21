@@ -12,6 +12,43 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Scheduled Runtime V2 reminders use the same configurable output-token budget
+  as heartbeat, manual, and screen-watch wakes, including correction retries,
+  instead of falling back to the legacy 700-token default. Reminder delivery
+  requirements and subagent output policies are unchanged.
+
+- Model API credential probe errors add `failure_class` to distinguish invalid
+  credentials, insufficient credit, missing models, rate limits, temporary
+  provider failures, and other configuration problems. Existing error fields
+  retain their meaning. Saved-route test errors preserve this classification,
+  and deduplicated notices resolve after a successful probe.
+
+- Anthropic and Bedrock requests select manual extended thinking from an explicit
+  model-family capability table. Unknown models omit the thinking parameter and
+  record a content-free diagnostic; model names no longer inherit support by
+  substring. Claude 4.6 retains its supported manual mode. Adaptive-only models
+  do not receive manual thinking parameters; their provider defaults apply.
+
+- Runtime V2 pauses automatic heartbeat and screen-watch calls after three
+  consecutive quota, authentication, or expired-account failures. A newly
+  accepted Chat message or a successful active key/route save clears the
+  persistent circuit; elapsed time alone does not. Scheduled reminders remain
+  eligible. The `wake_provider_circuit_open` warning is written to the notices
+  API and resolved on recovery; the current iOS app does not render this API.
+  Admin user summaries expose `wake_provider_circuit_open_users` (null when
+  the state cannot be measured).
+
+- `GET /v1/chat/canvases` now includes agent-authored `.io.html` Chat cards
+  from Resident and self-hosted delivery alongside workspace entries. Workspace
+  entries win identical filenames; the combined result keeps the newest 500.
+  Chat-only entries include a message ID for body reads, with no body copies or
+  historical backfill. Both database migration chains add a concurrent partial
+  index to avoid scanning unrelated messages.
+
+- Chat attachment delivery now records content-free timing events for object
+  storage GETs (including body reads) and hydration, distinguishing timeouts,
+  missing objects, and upstream server errors without recording keys or content.
+
 - Retrying a failed plaintext onboarding or add-memory job with legacy fact-map
   progress now resets its encrypted checkpoint and runs the current import
   engine under the same job ID. Existing cards enter the merge index, and the

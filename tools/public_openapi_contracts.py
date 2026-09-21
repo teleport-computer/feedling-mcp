@@ -358,6 +358,23 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "ProviderTestFailedResponse": {
+        "type": "object",
+        "required": ["error", "detail", "status_code", "failure_class"],
+        "properties": {
+            "error": {"type": "string", "const": "provider_test_failed"},
+            "detail": {"type": "string"},
+            "status_code": {
+                "type": ["integer", "null"],
+                "description": "Upstream HTTP status; null for non-API web endpoints or failures without an HTTP status.",
+            },
+            "failure_class": {
+                "type": "string",
+                "enum": ["auth_invalid", "quota_insufficient", "model_not_found", "rate_limited", "upstream_unavailable", "provider_config"],
+                "description": "User-facing probe classification, independent of the provider client's retry classification.",
+            },
+        },
+    },
     "VoiceCallCancelRequest": {
         "type": "object",
         "required": ["call_id", "reason"],
@@ -2687,13 +2704,15 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
     ("get", "/v1/chat/canvases"): (
-        "List up to 500 current IO Canvas workspace entries for the authenticated "
-        "user, ordered by most recent workspace update. This metadata-only index "
-        "matches the .io.html suffix case-insensitively while preserving filename "
-        "case, and "
-        "never returns Canvas bodies or envelopes. message_id and display metadata "
-        "come from the newest matching agent-authored Chat file row and are null "
-        "when no such row exists."
+        "List up to 500 IO Canvases from workspace entries and agent-authored Chat "
+        "file cards, including Resident and self-hosted deliveries. Workspace "
+        "entries take precedence for identical filenames; the combined index is "
+        "ordered by updated_at descending. The .io.html suffix is matched "
+        "case-insensitively while preserving filename case. Chat-only entries "
+        "use revision=1, mime_type=text/html, earliest card timestamp for created_at "
+        "and newest card timestamp for updated_at and message_id. Workspace entries "
+        "retain their revision/timestamps and newest matching Chat metadata (null "
+        "when absent). Bodies and envelopes are never returned."
     ),
     ("get", "/v1/chat/workspace/body"): (
         "Read the authenticated user's current IO Canvas workspace envelope by "
@@ -2896,7 +2915,7 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     },
     ("get", "/v1/chat/canvases"): {
         "200": {
-            "description": "The caller's current Canvas workspace metadata, newest first.",
+            "description": "The caller's workspace and chat-delivered Canvas metadata, newest first.",
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/CanvasIndexResponse"}
@@ -3402,6 +3421,24 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         },
     },
 }
+
+
+# All credential-probe entry points share the same additive error contract.
+for _probe_operation in (
+    ("post", "/v1/model_api/setup"),
+    ("post", "/v1/model_api/test"),
+    ("post", "/v1/model_api/routes"),
+    ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/model_api/routes/{route_id}/activate"),
+    ("patch", "/v1/model_api/credentials/{credential_id}"),
+):
+    RESPONSE_OVERRIDES.setdefault(_probe_operation, {})["400"] = {
+        "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+        "content": {"application/json": {"schema": {"anyOf": [
+            {"$ref": "#/components/schemas/ProviderTestFailedResponse"},
+            {"$ref": "#/components/schemas/ErrorResponse"},
+        ]}}},
+    }
 
 
 def _json_request_body(schema_name: str, *, required: bool) -> dict[str, Any]:

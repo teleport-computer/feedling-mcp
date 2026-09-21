@@ -86,6 +86,21 @@ Applications should make them configurable for self-hosted deployments.
 
 ## Provider health and proactive retries
 
+The Anthropic and Bedrock adapters add manual extended thinking only for
+explicitly recognized model families with that capability. This includes Claude
+3.7 Sonnet, Sonnet/Opus 4, Opus 4.1, Sonnet/Opus/Haiku 4.5, and Sonnet/Opus 4.6;
+4.6 still accepts manual mode despite its deprecation. Dated/latest model aliases
+and Bedrock profile/version decorations resolve to the same family table.
+Unknown families omit `thinking` and produce a `thinking_omitted` log diagnostic
+with `reason=unknown_model` and the normalized model ID (at most 160 characters),
+without prompt, response, key, or endpoint content. This adapter log is separate
+from per-user flow trace events. Adaptive-only models also omit manual thinking parameters, leaving
+the provider's default behavior in effect. This does not disable a model's
+default reasoning or guarantee that an unknown model accepts other request fields.
+The existing token-budget gate and forced-tool handling still apply: Anthropic
+omits manual thinking for forced tools, while Bedrock explicitly disables it on
+recognized manual-thinking models.
+
 Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
 choice. Speaking is the default; silence is the agent's own call when it has
 nothing it wants to say or when speaking would clearly intrude. An unanswered
@@ -98,12 +113,13 @@ token (for example, `stay_silent`) is treated as `stay_silent` and never deliver
 The screen-watch lane follows the same default while keeping its own guidance
 to avoid interrupting the user's flow.
 
-Regular wake provider calls, including choice-correction retries, now use the
-same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
+All wake provider calls, including scheduled reminders and correction retries,
+use the same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
 giving reasoning models room to make the terminal tool call. Operators can tune
 that shared budget with `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS`. It is separate from
 the prompt-frontier output reserve and does not change the input frontier;
-file-capable calls retain their existing budget precedence.
+file-capable calls retain their existing budget precedence. Scheduled reminders
+still require delivery; sharing the budget does not enable a silence choice.
 
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours
@@ -307,12 +323,36 @@ Successful startup removes that file. Current startup exits belong to the
 system, so their spawn-failure notice does not blame the user's model settings.
 An unreachable decrypt source continues retrying within the live consumer.
 
-Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
+Automatic Runtime V2 heartbeat failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new
 genuine user message invalidates an older delay immediately. Manual wakes and
 screen-watch events bypass this short-horizon guard. Sustained provider
 failures remain the responsibility of the separate provider health circuit.
+
+Runtime V2 also persists a separate provider circuit across heartbeat and
+screen-watch jobs. Three consecutive failures classified as
+`quota_insufficient`, `auth_invalid`, or `provider_account_expired` pause both
+lanes, including jobs already queued. A successful job or another error class
+clears the streak while the circuit is closed. Once open, only a newly accepted
+Chat message or a successful active key, route, or setup save resets it.
+This reset runs after the primary save and is best-effort: a database failure
+is logged without failing the saved Chat or configuration request. The circuit
+may remain open until a later new Chat or active configuration save retries it.
+Idempotent Chat retries and label-only or unsuccessful key saves do not reset
+it; jobs started before a reset cannot re-open it with stale results. Scheduled
+reminders, manual wakes, and Resident are outside this circuit. Generic
+400/404/422 failures retain their existing cooldown/backoff behavior.
+
+Opening writes a `wake_provider_circuit_open` warning to `GET /v1/notices`;
+recovery resolves that warning without adding another notice. Current iOS
+clients do not render this endpoint. The existing best-effort trace/notice
+sinks can omit a transition if a process crashes after the state commits;
+the persistent admission gate does not depend on those sinks. Content-free
+`wake.circuit.open` and `wake.circuit.recover` events record the reason,
+streak, and threshold. Admin data-track user summaries count currently open
+V2 accounts within the selected filters; an unavailable read yields null,
+not zero.
 
 Automatic heartbeat authorization is content-free and fail-closed: the worker
 checks PostgreSQL for at least one genuine user-authored Chat row before loading

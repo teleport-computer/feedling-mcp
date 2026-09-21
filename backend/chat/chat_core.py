@@ -551,8 +551,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
 
     # Pull this page's R2-offloaded bodies concurrently before rendering; without
     # it each one costs a serial round-trip inside _chat_history_item.
-    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body)
-    out = [chat_service._chat_history_item(m, include_image_body=include_image_body) for m in msgs]
+    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body, store=store)
+    out = [chat_service._chat_history_item(m, include_image_body=include_image_body, store=store) for m in msgs]
     omitted_bodies = sum(1 for m in out if m.get("body_omitted"))
     omitted_image_bodies = sum(
         1
@@ -650,7 +650,7 @@ def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
     # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
     if not msg or msg.get("source") == "verify_ping":
         return {"error": "message_not_found"}, 404
-    return {"message": chat_service._chat_history_item(msg, include_image_body=True)}, 200
+    return {"message": chat_service._chat_history_item(msg, include_image_body=True, store=store)}, 200
 
 
 def _canvas_workspace_path(filename: str) -> str | None:
@@ -705,11 +705,11 @@ def _canvas_index_timestamp(value) -> str:
 
 
 def canvas_index(store: UserStore) -> tuple[dict, int]:
-    """Return metadata for the caller's current IO Canvas workspace entries."""
+    """Return workspace and chat-delivered Canvas metadata, newest first."""
     rows = v2_jobs_store.list_canvas_workspace_entries(store.user_id, limit=500)
     prefix = "/workspace/"
     filenames = [str(row["path"])[len(prefix):] for row in rows]
-    message_metadata = db.chat_latest_agent_file_metadata_by_name(
+    message_metadata = db.chat_latest_agent_canvas_metadata_by_name(
         store.user_id,
         filenames,
     )
@@ -726,7 +726,26 @@ def canvas_index(store: UserStore) -> tuple[dict, int]:
             "display_title": message.get("display_title"),
             "display_subtitle": message.get("display_subtitle"),
         })
-    return {"canvases": canvases}, 200
+    cards = db.chat_latest_agent_canvas_cards(store.user_id, limit=500)
+    for card in cards:
+        canvases.append({
+            "filename": card["filename"],
+            "revision": 1,
+            "mime_type": "text/html",
+            "created_at": _canvas_index_timestamp(card["created_at"]),
+            "updated_at": _canvas_index_timestamp(card["updated_at"]),
+            "message_id": card["message_id"],
+            "display_title": card["display_title"],
+            "display_subtitle": card["display_subtitle"],
+        })
+    # Both sources return aware datetimes. Sort those values rather than their
+    # ISO strings (fractional seconds and timezone offsets need numeric order).
+    updated_by_name = {name: row["updated_at"] for row, name in zip(rows, filenames)}
+    updated_by_name.update({card["filename"]: card["updated_at"] for card in cards})
+    canvases.sort(key=lambda card: (
+        -updated_by_name[card["filename"]].timestamp(), card["filename"],
+    ))
+    return {"canvases": canvases[:500]}, 200
 
 
 # --------------------------------------------------------------------------- #

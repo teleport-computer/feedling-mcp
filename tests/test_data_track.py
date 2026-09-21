@@ -3901,3 +3901,29 @@ def test_admin_user_detail_redacts_skipped_control_reasons(client):
     # Collapsing two raw keys into one bucket must not lose either job.
     assert sum(proactive["job_control_reasons"].values()) == 3
     assert proactive["heartbeat_control"] == 3
+
+
+def test_admin_data_track_surfaces_wake_circuit_count_and_unavailable(client, monkeypatch):
+    from conftest import set_v2_runtime_owner
+    user_id, _ = _register(client)
+    set_v2_runtime_owner(user_id)
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO v2_wake_schedule (user_id,wake_circuit_opened_at) "
+                     "VALUES (%s,now()) ON CONFLICT (user_id) DO UPDATE "
+                     "SET wake_circuit_opened_at=now()", (user_id,))
+    body = client.get('/v1/admin/data-track/users', headers=_admin_headers()).get_json()
+    assert body['summary']['wake_provider_circuit_open_users'] == 1
+    assert body['users'][0]['wake_provider_circuit_open'] is True
+    html = client.get('/admin/data-track?view=users', headers=_admin_headers()).get_data(as_text=True)
+    assert '主动唤醒熔断账号行' in html
+    original = db.admin_data_track_snapshot
+    def unavailable(*args, **kwargs):
+        result = original(*args, **kwargs)
+        for row in result.values():
+            row.pop('wake_provider_circuit_open', None)
+            row['snapshot_read_status'] = {'level': 'unavailable', 'message': 'test read failure'}
+        return result
+    monkeypatch.setattr(db, 'admin_data_track_snapshot', unavailable)
+    body = client.get('/v1/admin/data-track/users', headers=_admin_headers()).get_json()
+    assert body['summary']['wake_provider_circuit_open_users'] is None
+    assert body['users'][0]['wake_provider_circuit_open'] is None

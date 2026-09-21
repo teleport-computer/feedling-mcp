@@ -220,6 +220,14 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
         api_key="sk-parent-route",
     )
     provider_calls = []
+    child_loop_calls = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def record_child_loop(**kwargs):
+        child_loop_calls.append(kwargs)
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", record_child_loop)
     responses = iter(
         [
             {
@@ -247,6 +255,7 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
                 "config": config,
                 "messages": messages,
                 "tools": tools,
+                **kwargs,
             }
         )
         return next(responses)
@@ -322,6 +331,9 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
     assert all(call["config"].api_key == provider_config.api_key for call in provider_calls)
     assert all(call["config"].model == provider_config.model for call in provider_calls)
     assert all(call["config"].context_window_tokens == 32_768 for call in provider_calls)
+    assert len(child_loop_calls) == 1
+    assert "wake_output_budget_required" not in child_loop_calls[0]
+    assert all("max_tokens" not in call for call in provider_calls)
     offered = {spec.name for spec in provider_calls[0]["tools"]}
     assert offered == worker._SUBAGENT_ALLOWED_TOOLS
     assert {"task", "reply", "workspace_write", "memory_write"}.isdisjoint(offered)
