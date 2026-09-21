@@ -39,22 +39,27 @@ RESET_OPTIONS_SQL = """ALTER TABLE user_logs RESET (
 )"""
 
 
-def _prepared_head(head: str) -> None:
+def _prepared_head_sql(head: str) -> str:
     # The existing prepared-primary marker must follow the TEE migration head.
-    op.execute("""UPDATE server_config SET value=convert_to(
+    return """UPDATE server_config SET value=convert_to(
         jsonb_set(convert_from(value, 'UTF8')::jsonb, '{tee_heads}',
         '["%s"]'::jsonb)::text, 'UTF8')
         WHERE key='phase4_primary_prepared'
-        AND COALESCE(convert_from(value, 'UTF8')::jsonb->>'prepared','false')='true'""" % head)
+        AND COALESCE(convert_from(value, 'UTF8')::jsonb->>'prepared','false')='true'""" % head
+
+
+# Keep the current-head preflight inspection contract on the SQL we execute.
+_UPDATE_PREPARED_HEAD = _prepared_head_sql(revision)
+_RESTORE_PREPARED_HEAD = _prepared_head_sql(down_revision)
 
 
 def upgrade() -> None:
     with op.get_context().autocommit_block():
         op.execute(SET_OPTIONS_SQL)
-    _prepared_head(revision)
+    op.execute(_UPDATE_PREPARED_HEAD)
 
 
 def downgrade() -> None:
     with op.get_context().autocommit_block():
         op.execute(RESET_OPTIONS_SQL)
-    _prepared_head(down_revision)
+    op.execute(_RESTORE_PREPARED_HEAD)
