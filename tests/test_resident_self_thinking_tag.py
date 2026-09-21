@@ -53,16 +53,22 @@ def test_http_mode_ignores_a_leftover_claude_command(monkeypatch):
     monkeypatch.setattr(crc, "call_agent_http", fake_http)
     crc.call_agent("test", raw_text=True)
     assert called == ["http"]
-    assert crc._self_thinking_tag() == st.TAG_THINK
+    # T687: resident V1 renders ``aside`` for every driver/route, so a leftover
+    # claude command can no longer change the copy — same rendering either way.
+    assert crc._self_thinking_tag() == st.TAG_ASIDE
     _assert_field_rendering()
 
 
 def _assert_field_rendering():
-    expected = st.instruction_for_field(protocol="json").strip()
+    # T687: resident V1 renders the aside as a tag again (prose stays outside
+    # JSON); the JSON-field rendering is V2's. Tag follows _self_thinking_tag().
+    tag = crc._self_thinking_tag()
+    expected = st.instruction(tag).strip()
     assert crc._foreground_self_thinking_instruction() == expected
     for locale in ("zh-Hans", "en-US"):
-        assert crc._wake_think_permission_line({"locale": locale}) == expected
-    assert "<think>" not in expected and "<aside>" not in expected
+        assert f"<{tag}>" in crc._wake_think_permission_line({"locale": locale})
+    assert f"<{tag}>" in expected
+    assert "aside 字段" not in expected
 
 
 @pytest.mark.parametrize("cmd", [

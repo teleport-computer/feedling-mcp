@@ -517,16 +517,35 @@ pass the existing content and effect checks. Wake language-follow uses prompt
 guidance and post-publication observation, not a blocking language check.
 
 
-Resident V1 uses the optional field in its existing reply JSON:
+Resident V1 asks its model for the aside as a leading `<aside>` block on every
+driver and route. In foreground chat the reply that follows the block is plain
+text:
+
+```text
+<aside>I want to pick up where we left off.</aside>How did it go?
+```
+
+Foreground replies may still use the JSON envelope for multi-bubble replies.
+Heartbeat, perception, and screen-watch wakes keep their existing reply
+shapes — `{"messages": [...]}` to speak, `{"actions": [{"type":
+"proactive.sleep", ...}]}` to stay quiet. Scheduled reminders keep their own
+rule: they must deliver one `{"messages": [...]}` bubble and never stay quiet.
+On all four wake lanes the optional `<aside>` block is written before the
+JSON. The envelope's `aside` field is also accepted on every lane:
 
 ```json
 {"aside": "I want to pick up where we left off.", "messages": ["How did it go?"]}
 ```
 
-Resident asides are sanitized and limited to 700 characters. Provider-native
-reasoning and inline thinking-tag contents never become display summaries,
-including when aside display is disabled. Historical native-reasoning rows
-remain readable. The tag leak gate still strips inline blocks before delivery.
+Foreground prose is deliberately kept outside JSON strings on this runtime:
+CLI models write their reply by hand, and a reply typed inside a JSON string
+breaks on unescaped quotes or line breaks. A `<aside>` block whose following
+body fails the leak gate does not become an aside-only success; the turn
+fails as before and the diagnostic is kept. Resident asides are sanitized and limited to
+700 characters. Provider-native reasoning never becomes a display summary;
+only a tag block parsed locally by the resident, or the JSON `aside` field, does.
+Historical native-reasoning rows remain readable. The tag leak gate still
+strips inline blocks before delivery.
 A resident can recover a complete `messages`/`aside` envelope from an unclosed
 final thinking block; free text, ambiguous JSON, and envelopes containing
 executable actions or tool calls are not recovered.

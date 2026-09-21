@@ -106,17 +106,20 @@ def test_aside_field_instruction_parity(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     monkeypatch.setattr(resident, "_supports_mandatory_self_thinking_v1", lambda: True)
     field = st.instruction_for_field().strip()
-    resident_field = st.instruction_for_field(protocol="json").strip()
     assert field in context.chat_system_prompt()
     for lane in ("scheduled", "heartbeat", "screen_watch"):
         assert field in worker._wake_system_prompt_for_lane(lane, "base")
-    assert resident._foreground_self_thinking_instruction() == resident_field
-    assert resident._wake_think_permission_line() == resident_field
-    for prompt in (field, resident_field):
-        assert st._ASIDE_CONTENT_PHRASE in prompt
-        assert st._ASIDE_VISIBILITY_SENTENCE in prompt
-        assert "<think>" not in prompt and "<aside>" not in prompt
-        assert "语言跟着他走" in prompt
-        assert "不出现工具名、参数、字段名" in prompt
+    assert st._ASIDE_CONTENT_PHRASE in field
+    assert st._ASIDE_VISIBILITY_SENTENCE in field
+    assert "<think>" not in field and "<aside>" not in field
+    # T687: resident V1 deliberately does NOT share the JSON-field rendering —
+    # CLI models hand-write their reply, and prose inside a JSON string broke
+    # on unescaped quotes. It renders the tag form for its driver's tag.
+    tag = resident._self_thinking_tag()
+    assert resident._foreground_self_thinking_instruction() == st.instruction(tag).strip()
+    assert f"<{tag}>" in resident._wake_think_permission_line()
+    assert "aside 字段" not in resident._foreground_self_thinking_instruction()
+    assert "语言跟着他走" in field
+    assert "不出现工具名、参数、字段名" in field
     assert tool_loop._REPLY_TOOL_SPEC.parameters["properties"]["aside"]["description"] == st.ASIDE_FIELD_DESCRIPTION
     assert tool_loop._REPLY_TOOL_SPEC.parameters["required"] == ["text"]
