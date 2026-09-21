@@ -167,29 +167,30 @@ def _resident_pi(monkeypatch):
 def test_resident_pi_gemini_uses_aside(monkeypatch, _resident_pi):
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", "gemini")
     assert crc._self_thinking_tag() == st.TAG_ASIDE
-    assert crc._foreground_self_thinking_instruction() == st.instruction_for_field(protocol="json").strip()
-    assert "aside 字段" in crc._wake_think_permission_line()
+    assert crc._foreground_self_thinking_instruction() == st.instruction(st.TAG_ASIDE).strip()
+    assert "<aside>" in crc._wake_think_permission_line()
     assert "<think>" not in crc._wake_think_permission_line()
 
 
 @pytest.mark.parametrize("provider", ["openai_compatible", "openrouter", "deepseek", ""])
-def test_resident_pi_other_providers_keep_think(monkeypatch, _resident_pi, provider):
+def test_resident_pi_other_providers_use_aside_too(monkeypatch, _resident_pi, provider):
+    """T687 (Seven 2026-09-22): resident V1 renders ``aside`` for every route;
+    the per-route ``think``/``aside`` split now only governs Runtime V2
+    (``tag_for_route`` is still pinned above for that caller)."""
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", provider)
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "model", "claude-sonnet-4-6")
-    assert crc._self_thinking_tag() == st.TAG_THINK
-    assert crc._foreground_self_thinking_instruction() == st.instruction_for_field(protocol="json").strip()
+    assert crc._self_thinking_tag() == st.TAG_ASIDE
+    assert crc._foreground_self_thinking_instruction() == st.instruction(st.TAG_ASIDE).strip()
 
 
 @pytest.mark.parametrize("provider,model,tag", _ROUTE_TAG_CASES)
-def test_resident_renders_the_metadata_model_tag(monkeypatch, _resident_pi, provider, model, tag):
+def test_resident_renders_aside_regardless_of_route_metadata(monkeypatch, _resident_pi, provider, model, tag):
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "provider", provider)
     monkeypatch.setitem(crc.AGENT_RUNTIME_METADATA, "model", model)
-    assert crc._self_thinking_tag() == tag
-    assert crc._foreground_self_thinking_instruction() == st.instruction_for_field(protocol="json").strip()
+    assert crc._self_thinking_tag() == st.TAG_ASIDE
+    assert crc._foreground_self_thinking_instruction() == st.instruction(st.TAG_ASIDE).strip()
     permission = crc._wake_think_permission_line()
-    assert "aside 字段" in permission
-    other = st.TAG_THINK if tag == st.TAG_ASIDE else st.TAG_ASIDE
-    assert f"<{other}>" not in permission
+    assert "<aside>" in permission and "<think>" not in permission
 
 
 def test_resident_claude_driver_rule_still_wins(monkeypatch):
