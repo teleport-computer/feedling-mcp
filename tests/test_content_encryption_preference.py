@@ -203,8 +203,8 @@ def test_plaintext_write_gate_defaults_closed():
     assert core_envelope._plaintext_writes_accepted({key: " 1 "}) is True
 
 
-def test_all_release_units_share_the_plaintext_gate_and_prod_defaults_closed():
-    """Every reply writer agrees; PROD is configurable but fails closed."""
+def test_all_release_units_share_the_plaintext_gate_and_prod_defaults_open():
+    """PROD defaults to plaintext like PRE/TEST; CI still requires TEE-primary."""
     from pathlib import Path
 
     import yaml
@@ -234,11 +234,11 @@ def test_all_release_units_share_the_plaintext_gate_and_prod_defaults_closed():
     prod_compose = yaml.safe_load(prod)
     for service in ("backend", "serve-worker"):
         assert prod_compose["services"][service]["environment"][key] == (
-            "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+            "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-1}"
         )
     prod_runner_compose = yaml.safe_load(prod_runner)
     assert prod_runner_compose["services"]["agent-runner"]["environment"][key] == (
-        "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+        "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-1}"
     )
 
     workflow = (root / ".github/workflows/ci.yml").read_text()
