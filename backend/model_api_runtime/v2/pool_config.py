@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Literal
+
+
+from model_api_runtime.v2 import extraction
 
 
 PoolName = Literal["foreground", "wake", "heavy"]
@@ -62,16 +66,14 @@ class RuntimePoolConfig:
             SlotSpec("wake", index, _WAKE_POOL_LANES, 240.0, 900.0)
             for index in range(wake_slots)
         )
-        # Heavy's 120s stall is shorter than serve_worker's default clock (which
-        # must cover two 90s extraction wires). It holds for Capture/Dream/Profile
-        # only because the provider retry wrapper reports a boundary before every
-        # HTTP wire AND those lanes cap each wire's wall-clock
-        # (``extraction.WIRE_DEADLINE_SEC``; httpx's own timeout is per phase), so
-        # the longest silence is one bounded wire; see
-        # tests/test_v2_pool_config.py::test_heavy_extraction_slots_outlast_one_provider_wire.
+        # Every HTTP wire (including compatibility fallback) reports progress;
+        # one longest wire plus 30s bounds the silence, not two wires. Round the
+        # existing provider envelope up to a minute for the absolute allowance.
+        heavy_stall = extraction.max_wire_deadline_sec() + 30.0
+        heavy_absolute = 60.0 * math.ceil(extraction.nominal_provider_envelope_sec() / 60.0)
         for index in range(heavy_slots):
             lanes = _HEAVY_LANES | ({"profile"} if index == 0 else set())
-            slots.append(SlotSpec("heavy", index, frozenset(lanes), 120.0, 1200.0))
+            slots.append(SlotSpec("heavy", index, frozenset(lanes), heavy_stall, heavy_absolute))
 
         return cls(
             slots=tuple(slots),

@@ -67,7 +67,7 @@ def test_slots_have_fixed_lane_allowlists_and_initial_budgets(monkeypatch):
     )
     assert (slots["foreground-0"].stall_budget_sec, slots["foreground-0"].absolute_budget_sec) == (240.0, 1500.0)
     assert (slots["wake-0"].stall_budget_sec, slots["wake-0"].absolute_budget_sec) == (240.0, 900.0)
-    assert (slots["heavy-0"].stall_budget_sec, slots["heavy-0"].absolute_budget_sec) == (120.0, 1200.0)
+    assert (slots["heavy-0"].stall_budget_sec, slots["heavy-0"].absolute_budget_sec) == (210.0, 1260.0)
     assert sum("profile" in slot.lanes for slot in config.slots) == 1
 
 
@@ -116,18 +116,10 @@ def test_retired_switches_cannot_change_the_topology(monkeypatch):
 
 
 def test_heavy_extraction_slots_outlast_one_provider_wire(monkeypatch):
-    """Pool-specific stall invariant for Capture/Dream/Profile.
+    """Each wire reports progress, including compatibility fallback.
 
-    ``serve_worker`` validates its *default* stall clock (>= 210s) but pool
-    slots carry their own budgets, and the Heavy pool runs Capture/Dream at
-    120s. That is only safe because the provider retry wrapper reports a
-    progress boundary before every HTTP wire (compatibility fallbacks
-    included) AND each wire has a true wall-clock ceiling
-    (``extraction.WIRE_DEADLINE_SEC``; httpx's 90s ``timeout`` is per phase and
-    a trickling relay outlives it): the longest silence is then one bounded
-    wire, not an attempt of several. Keep a 30s margin for parse/progress
-    overhead (the same margin ``serve_worker`` requires between an MCP call
-    and the stall clock).
+    The largest lane deadline plus 30s must fit each extraction slot, and the
+    absolute allowance must cover the existing provider-attempt envelope.
     """
     from model_api_runtime.v2 import extraction
 
@@ -140,5 +132,22 @@ def test_heavy_extraction_slots_outlast_one_provider_wire(monkeypatch):
 
     assert extraction_slots
     for slot in extraction_slots:
-        assert slot.stall_budget_sec >= extraction.WIRE_DEADLINE_SEC + 30.0, slot.slot_id
+        assert slot.stall_budget_sec >= max(
+            extraction.wire_deadline_for_lane(lane)
+            for lane in slot.lanes & {"capture", "dream", "profile"}
+        ) + 30.0, slot.slot_id
         assert slot.absolute_budget_sec > slot.stall_budget_sec, slot.slot_id
+        assert slot.absolute_budget_sec >= extraction.nominal_provider_envelope_sec()
+
+
+def test_dream_budget_anchors_and_pool_derivation(monkeypatch):
+    from model_api_runtime.v2 import extraction
+
+    assert extraction.DREAM_WIRE_DEADLINE_SEC == 180.0
+    assert extraction.wire_deadline_for_lane("capture") == 90.0
+    assert extraction.wire_deadline_for_lane("profile") == 90.0
+    assert extraction.nominal_provider_envelope_sec() == 1206.0
+    monkeypatch.setattr(extraction, "DREAM_WIRE_DEADLINE_SEC", 220.0)
+    heavy = next(s for s in RuntimePoolConfig.from_env().slots if s.pool == "heavy")
+    assert heavy.stall_budget_sec == 250.0
+    assert heavy.absolute_budget_sec == 1500.0

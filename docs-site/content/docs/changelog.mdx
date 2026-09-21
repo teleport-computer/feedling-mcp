@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 Dream doubles its per-wire and phase timeouts from 90 to 180
+  seconds, with matching Heavy-pool watchdog allowances. Capture, profile,
+  chat/wake, resident V1, and Dream's consolidation safety gates retain their
+  existing provider or safety limits.
+
 - Scheduled Runtime V2 reminders use the same configurable output-token budget
   as heartbeat, manual, and screen-watch wakes, including correction retries,
   instead of falling back to the legacy 700-token default. Reminder delivery
