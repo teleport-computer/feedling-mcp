@@ -1052,6 +1052,7 @@ jobs:
             tests/test_wake_support_indexes_migration.py \
             tests/test_account_recover_challenges_migration.py \
             tests/test_user_logs_duration_sec.py \
+            tests/test_user_logs_autovacuum.py \
             tests/test_v2_first_chat_activation_backfill.py \
             tests/test_pre_runtime_preflight.py \
             tests/test_pre_test_migration_convergence.py \
