@@ -2405,3 +2405,32 @@ def test_empty_capture_successor_clears_stale_failure_state_and_notice(monkeypat
     asyncio.run(worker._notify_capture_backoff(deps, job, "completed"))
     rows = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
     assert rows["memory_backoff:capture"]["resolved"] is True
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_refusal_observer_is_wired_without_trajectory_or_semantic_change(monkeypatch, lane):
+    from memory import extraction_trace
+    uid = f"u_refusal_{lane}"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    traces, emit_trace = _trace_collector()
+
+    async def fake_extract(**kwargs):
+        await kwargs["refusal_out"]({
+            "stop_reason": "refusal", "refusal_category": "reasoning_extraction",
+            "attempt": 1,
+        })
+        return None, "empty_reply"
+
+    monkeypatch.setattr(extraction, "extract", fake_extract)
+    status = asyncio.run(worker.process_job(
+        job, _deps(emit_debug_trace=emit_trace), provider_config=_BYOK,
+        api_key=None, runtime_token="rt",
+    ))
+    observed = [e for e in traces if e["type"] == extraction_trace.REFUSAL_TRACE_TYPE]
+    assert len(observed) == 1
+    assert observed[0]["detail"]["lane"] == lane
+    assert observed[0]["job_id"] == str(job_id)
+    assert status == "failed"
+    assert "empty_reply" in _job_row(job_id)[1]
