@@ -20,6 +20,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 import generated_image
+import provider_refusal
 import safe_url_fetch
 from core import net_safety
 from generated_image import (
@@ -4329,17 +4330,21 @@ def _parse_anthropic_body(
     tool_calls = _decode_tool_calls_anthropic(body)
     content = body.get("content")
     stop_reason = str(body.get("stop_reason") or "").strip()
+    refusal = provider_refusal.from_anthropic_body(body)
     try:
         reply = _extract_anthropic_reply(
             body, required=require_reply and not tool_calls
         )
     except ProviderError as exc:
+        if refusal is not None:
+            exc.provider_refusal = refusal
         raise _mark_output_truncation(
             exc,
             stop_reason=stop_reason,
             usage=_normalize_usage("anthropic", body.get("usage")),
         )
     return {
+        **({"provider_refusal": refusal} if refusal is not None else {}),
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
         ),
@@ -6243,12 +6248,17 @@ async def reliable_chat_completion_async(
     base_delay_sec: float = 1.0,
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
+    refusal_out: Any = None,
     absolute_deadline: float | None = None,
     retry_output_truncation: bool = True,
     wire_deadline_sec: float | None = None,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
+
+    ``refusal_out`` observes explicit policy metadata on each outer attempt,
+    including a refused attempt followed by recovery. It never supplies retry
+    decisions; observer failures are swallowed and no raw policy text is passed.
 
     Same semantics as `reliable_chat_completion`: exponential backoff (base·3^n)
     + jitter, capped; honours 429 Retry-After when present. NEVER retries
@@ -6366,6 +6376,7 @@ async def reliable_chat_completion_async(
                 result = await _with_wire_progress(
                     chat_completion_async(*args, **attempt_kwargs), attempt
                 )
+            await provider_refusal.observe(refusal_out, result, attempt)
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
@@ -6405,6 +6416,7 @@ async def reliable_chat_completion_async(
                 result = _with_provider_attempt_trace(result, provider_attempt_trace)
             return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
+            await provider_refusal.observe(refusal_out, exc, attempt)
             _progress("attempt_failed", attempt)
             cls = classify_provider_error(exc)
             last_exc = exc

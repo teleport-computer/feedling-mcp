@@ -1144,6 +1144,7 @@ jobs:
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \
             tests/test_v2_extraction.py \
+            tests/test_extraction_refusal.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
             tests/test_v2_extract_session.py \

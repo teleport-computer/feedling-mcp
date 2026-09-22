@@ -219,7 +219,10 @@ def _response_shape(stop_reason: Any, usage: Any, budget: int) -> dict[str, Any]
         "stop_reason": (
             "length"
             if provider_client.is_token_limit_stop_reason(raw_stop_reason)
-            else ("other" if raw_stop_reason else "")
+            else (
+                "refusal" if raw_stop_reason == "refusal"
+                else ("other" if raw_stop_reason else "")
+            )
         ),
         "completion_tokens": (
             max(0, int(raw_completion_tokens))
@@ -243,6 +246,7 @@ async def extract(
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
     failure_detail_out: Callable[[dict], None] | None = None,
+    refusal_out: Callable[[dict], Awaitable[None]] | None = None,
     parse_retry: ParseRetry | None = None,
     session: Any = None,
     step_sink: Any = None,
@@ -315,6 +319,7 @@ async def extract(
                     WIRE_DEADLINE_SEC if wire_deadline_sec is None else wire_deadline_sec
                 ),
                 progress_cb=progress_cb,
+                refusal_out=refusal_out,
                 # An empty reply that stopped at the token cap is this lane's
                 # truncation (handled below), not a transport blip to re-send
                 # three times at the budget that just ran out.
