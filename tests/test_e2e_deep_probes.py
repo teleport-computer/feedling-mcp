@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 import pytest
 
@@ -218,19 +220,28 @@ def test_collision_wait_has_recent_and_clear_window_extremes(monkeypatch):
     assert sleeps == []
 
 
-def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monkeypatch):
+@pytest.mark.parametrize("text,expected", [
+    ("七七，周一中午，此刻陪你，记忆小测验告一段落了吗？", "PASS"),
+    ("七七，此刻陪你，也会记得上海时区。", "PRODUCT_FAIL"),
+    ("七七，周一晚上，此刻陪你。", "PRODUCT_FAIL"),
+    ("七七，周日中午，此刻陪你。", "PRODUCT_FAIL"),
+])
+def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monkeypatch, text, expected):
     client = _PriorityClient()
-    reply = {"role": "agent", "id": "quality-reply", "ts": 12.0}
+    reply = {"role": "agent", "id": "quality-reply", "ts": _ts("2026-09-21T12:59:00+08:00")}
+    response = httpx.Response(200, headers={"date": "Mon, 21 Sep 2026 04:58:00 GMT"},
+                              json={"job": {"id": "wake-quality", "lane": "manual_wake"}})
+
+    def post(path, **kwargs):
+        client.posts.append((path, kwargs.get("json")))
+        return response
+
+    monkeypatch.setattr(client, "post", post)
     monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
     monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
     monkeypatch.setattr(proactive_probe, "_wait_out_chat_collision", lambda _c: 0.0)
     monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
     capture_sleeps(monkeypatch, proactive_probe)
-    monkeypatch.setattr(
-        proactive_probe,
-        "_body",
-        lambda *_a, **_kw: {"job": {"id": "wake-quality", "lane": "manual_wake"}},
-    )
     monkeypatch.setattr(
         proactive_probe,
         "_wait_for_wake_delivery",
@@ -244,14 +255,75 @@ def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monk
     monkeypatch.setattr(
         proactive_probe,
         "_decrypt",
-        lambda *_a, **_kw: "七七，此刻陪你，也会记得上海时区。",
+        lambda *_a, **_kw: text,
     )
     monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [reply])
 
-    detail = proactive_probe._case_proactive_message_quality(client)
-
-    assert "collision_wait=0.0s" in detail
+    result = proactive_probe._case("quality", lambda: proactive_probe._case_proactive_message_quality(client))
+    assert result["result"] == expected
+    if expected == "PASS":
+        assert "collision_wait=0.0s" in result["detail"]
+        assert "2026-09-21T12:57:59+08:00" in result["detail"]
     assert [path for path, _body in client.posts] == ["/v1/proactive/tick"]
+
+
+def _ts(value):
+    return datetime.fromisoformat(value).timestamp()
+
+
+@pytest.mark.parametrize("stamp,text", [
+    ("2026-09-21T12:59:00+08:00", "周一中午，陪你坐会儿。"),
+    ("2026-09-22T02:00:00+08:00", "星期二凌晨，睡不着吗？"),
+    ("2026-09-23T06:00:01+08:00", "礼拜三早晨，吃早饭了吗？"),
+    ("2026-09-24T11:59:00+08:00", "周四上午，先喝口水。"),
+    ("2026-09-25T14:00:01+08:00", "星期五午后，可以歇一会。"),
+    ("2026-09-26T18:00:01+08:00", "礼拜六晚间，忙完了吗？"),
+    ("2026-09-27T20:00:00+08:00", "星期天晚上，陪你。"),
+    ("2026-09-27T20:00:00+08:00", "周日夜晚，陪你。"),
+])
+def test_quality_grounding_uses_shanghai_weekday_and_period(stamp, text):
+    ts = _ts(stamp)
+    assert "Asia/Shanghai" in proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
+
+
+@pytest.mark.parametrize("text", ["上海时区", "北京时间，周一晚上", "周日中午", "周一", "中午"])
+def test_quality_grounding_rejects_place_name_or_wrong_time(text):
+    ts = _ts("2026-09-21T12:59:00+08:00")
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+@pytest.mark.parametrize("start,end,text", [
+    ("2026-09-21T23:59:30+08:00", "2026-09-22T00:00:30+08:00", "周一晚上"),
+    ("2026-09-21T23:59:30+08:00", "2026-09-22T00:00:30+08:00", "周二凌晨"),
+    ("2026-09-21T13:59:30+08:00", "2026-09-21T14:00:30+08:00", "周一中午"),
+    ("2026-09-21T13:59:30+08:00", "2026-09-21T14:00:30+08:00", "周一下午"),
+])
+def test_quality_grounding_accepts_generation_boundary(start, end, text):
+    proactive_probe._assert_timezone_grounding(text, _ts(start), _ts(end))
+
+
+def test_quality_grounding_does_not_mix_weekday_and_period_across_midnight():
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(
+            "周二晚上", _ts("2026-09-21T23:59:30+08:00"), _ts("2026-09-22T00:00:30+08:00"))
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+@pytest.mark.parametrize("start,end", [(0, 10), (10, 0), (10, float("nan")),
+                                       (float("inf"), 10), (20, 10), (10, 99999), (1e20, 1e20)])
+def test_quality_grounding_missing_clock_is_not_a_product_failure(start, end):
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding("周一中午", start, end)
+    assert exc.value.result == "BLOCKED_EVIDENCE"
+
+
+@pytest.mark.parametrize("date", ["", "not-a-date", "Mon, 21 Sep 2026 04:58:00"])
+def test_quality_grounding_requires_server_date(date):
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._server_response_time(httpx.Response(200, headers={"date": date}))
+    assert exc.value.result == "BLOCKED_EVIDENCE"
 
 
 def test_wait_for_scheduled_fire_returns_exact_agent_job_then_times_out(monkeypatch):

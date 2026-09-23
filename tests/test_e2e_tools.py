@@ -219,6 +219,35 @@ def test_p0_blocking_verdict() -> None:
     ])
 
 
+def test_p0_default_run_uses_only_the_two_required_vps_harnesses(monkeypatch):
+    ran = []
+    monkeypatch.setattr(sys, "argv", ["p0.py"])
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(p0, "HOSTED_CELLS", [])
+
+    def run(cell):
+        ran.append(cell.name)
+        return {"cell": cell.name, "result": "ok", "steps": []}
+
+    monkeypatch.setattr(p0, "run_vps_cell", run)
+    assert p0.main() == 0
+    assert ran == ["vps-claude-code", "vps-codex"]
+
+
+def test_p0_list_and_explicit_selection_exclude_hermes(monkeypatch, capsys):
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--list"])
+    assert p0.main() == 0
+    output = capsys.readouterr().out
+    assert "vps-claude-code" in output and "vps-codex" in output
+    assert "vps-hermes" not in output
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--only", "vps-hermes"])
+    with pytest.raises(SystemExit) as exc:
+        p0.main()
+    assert exc.value.code == 2
+    assert "unknown cell(s): vps-hermes" in capsys.readouterr().err
+
+
 # --- hardening batch (codex2 R1 on the shakedown fixes) ----------------------
 
 def _sleepless(monkeypatch):

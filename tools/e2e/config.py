@@ -105,7 +105,7 @@ VPS_CELLS: list[VpsCell] = [
     VpsCell("vps-claude-code", 'claude -p "{message}"', "claude"),
     VpsCell("vps-codex", "codex exec --skip-git-repo-check --json "
                          "--dangerously-bypass-approvals-and-sandbox {message}", "codex"),
-    VpsCell("vps-hermes", 'hermes chat -Q --source tool --max-turns 60 -q "{message}"',
-            "hermes"),
+    # Hermes: excluded from release P0 by Seven (2026-09-06); this does not
+    # remove the harness or its feature-specific regression coverage.
     # OpenClaw: 暂免（无用户，Seven 2026-07-17 定）——加回时补一格即可。
 ]
