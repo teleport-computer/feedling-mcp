@@ -88,9 +88,11 @@ def test_message_body_emits_two_content_free_timings(rig, monkeypatch, plaintext
     field = "body_b64" if plaintext else "body_ct"
     assert base64.b64decode(result["message"][field]) == _RAW
     assert "body_key" not in result["message"]
-    _assert_pair(events, "ok", size=len(_RAW))
+    _assert_pair(events[:2], "ok", size=len(_RAW))
     # GET headers arrive at 125ms, body finishes at 250ms: count the latter.
-    assert [e["detail"]["dur_ms"] for _, e in events] == [250.0, 250.0]
+    assert [e["detail"]["dur_ms"] for _, e in events] == [250.0, 250.0, 250.0]
+    assert events[-1][1]['type'] == 'chat.message_body.read'
+    assert events[-1][1]['detail']['status'] == 'ok'
 
 
 @pytest.mark.parametrize(("exc", "expected"), [
@@ -213,3 +215,80 @@ def test_trace_failure_cannot_break_delivery(rig, monkeypatch):
     monkeypatch.setattr(debug_trace, "trace_event", broken_trace)
     item = service._chat_history_item(_pointer(), store=store)
     assert base64.b64decode(item["body_ct"]) == _RAW
+
+
+def test_endpoint_observation_inherits_swallowed_hydration_error(rig, monkeypatch):
+    store, events, client, _ = rig
+    pointer = {**_pointer(), 'file_name': 'private.IO.HTML'}
+    monkeypatch.setattr(db, 'chat_get_strict', lambda uid, mid: pointer)
+
+    def fail(**kwargs):
+        raise TimeoutError('secret-endpoint')
+
+    client.get_object = fail
+    body, status = chat_core.message_body(store, pointer['id'])
+    assert status == 200 and 'body_ct' not in body['message']
+    _assert_pair(events[:2], 'timeout')
+    event = events[-1][1]
+    assert event['type'] == 'chat.message_body.read'
+    assert event['status'] == 'error'
+    assert event['detail']['status'] == 'timeout'
+    assert event['detail']['http_status'] == 200
+    assert event['detail']['is_canvas'] is True
+    assert 'secret-endpoint' not in json.dumps(event)
+
+
+def test_endpoint_trace_failure_cannot_break_delivery(rig, monkeypatch):
+    store, _, _, _ = rig
+    monkeypatch.setattr(db, 'chat_get_strict', lambda uid, mid: _pointer())
+
+    def broken_trace(*args, **kwargs):
+        raise RuntimeError('trace backend unavailable')
+
+    monkeypatch.setattr(debug_trace, 'trace_event', broken_trace)
+    body, status = chat_core.message_body(store, 'private-message-id')
+    assert status == 200
+    assert base64.b64decode(body['message']['body_ct']) == _RAW
+
+
+def test_concurrent_endpoint_reads_keep_failure_and_owner_isolated(rig, monkeypatch):
+    _, events, client, _ = rig
+    barrier = threading.Barrier(2)
+    monkeypatch.setattr(db, 'chat_get_strict', lambda uid, mid: _pointer(
+        uid=uid, key=f'chatfiles/{uid}/private',
+    ))
+
+    def get_object(**kwargs):
+        barrier.wait(timeout=5)
+        if kwargs['Key'].startswith('chatfiles/alice/'):
+            raise TimeoutError('secret-endpoint')
+        return {'Body': SimpleNamespace(read=lambda: _RAW)}
+
+    client.get_object = get_object
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(chat_core.message_body, UserStore(uid), 'private-id')
+                   for uid in ('alice', 'bob')]
+        for future in futures:
+            assert future.result(timeout=5)[1] == 200
+    reads = [(uid, e) for uid, e in events if e['type'] == 'chat.message_body.read']
+    assert len(reads) == 2
+    assert {uid: e['detail']['status'] for uid, e in reads} == {'alice': 'timeout', 'bob': 'ok'}
+
+
+def test_cache_lookup_is_not_reported_as_client_history_fallback(rig, monkeypatch):
+    store, events, _, _ = rig
+    store.chat_messages = [{'id': 'private-id', 'content_type': 'file',
+                            'file_name': 'private.io.html', 'body_ct': 'aA=='}]
+
+    def database_unavailable(*args):
+        raise TimeoutError('private-db-address')
+
+    monkeypatch.setattr(db, 'chat_get_strict', database_unavailable)
+    body, status = chat_core.message_body(store, 'private-id')
+    assert status == 200 and body['message']['body_ct'] == 'aA=='
+    assert len(events) == 1
+    detail = events[0][1]['detail']
+    assert detail['lookup_source'] == 'hot_cache'
+    assert detail['is_canvas'] is True and detail['status'] == 'ok'
+    assert 'history_fallback' not in json.dumps(events)
+    assert 'private-db-address' not in json.dumps(events)
