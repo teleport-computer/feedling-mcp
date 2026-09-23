@@ -240,6 +240,19 @@ async def lifespan(app):
         v2_reaper.run_cleanup_loop(reaper_stop, **cleanup_settings)
     )
 
+    # (8) 感知事件的发件箱排空。在这之前只有"这次上报刚产生了新事件"才会
+    # 顺带把积压的补投一次 —— 用户不再产生新数据时，投递失败过的提醒就一直
+    # 卡着，而"他这会儿没在用"恰恰是最常见的情形（外部审查 F6）。
+    # 和 reaper 共用一个 stop event：它们的生命周期一样，多一个没有意义。
+    from perception.perceptkit_adapter import worker as _pk_worker
+
+    perceptkit_task = asyncio.create_task(
+        _pk_worker.run_loop(
+            reaper_stop,
+            interval=float(os.environ.get("FEEDLING_PERCEPTKIT_DISPATCH_INTERVAL_SEC", "30")),
+        )
+    )
+
     print(
         f"[asgi] startup ready: threadpool={settings.db_threads} "
         f"http_max={settings.http_max_connections} poller_max={settings.poller_max_active} "
@@ -259,6 +272,6 @@ async def lifespan(app):
         registry.wake_all()
         core_store.set_async_wake_hook(None)
         reaper_stop.set()
-        await asyncio.gather(reaper_task, cleanup_task)
+        await asyncio.gather(reaper_task, cleanup_task, perceptkit_task)
         await app.state.internal_http.aclose()
         await app.state.provider_http.aclose()

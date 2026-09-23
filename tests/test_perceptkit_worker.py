@@ -76,21 +76,34 @@ def test_importing_the_module_starts_nothing(db):
     assert store.list_pending_events(subject_id="u1")     # 还躺在发件箱里
 
 
-def test_no_scheduler_or_supervisor_references_this_worker():
-    """接线是单独一步、要人来做。这条测试会在有人接上时红 ——
-    那时请连同「接在哪、默认起不起」一起想清楚，再改这条测试。
+def test_the_dispatcher_is_wired_into_the_asgi_lifespan():
+    """接上了 —— 这条钉住"真的有人会去跑它"（外部审查 F6）。
+
+    在这之前只有"这次上报刚产生了新事件"才会顺带把积压的补投一次。用户不再
+    产生新数据时，投递失败过的提醒就一直卡着，而"他这会儿没在用"恰恰是最
+    常见的情形。
+
+    这条测的是**接线存在**，不是投递本身对不对（那是下面那些）。
     """
     import pathlib
-    import re
-    root = pathlib.Path(__file__).resolve().parent.parent / "backend"
-    hits = []
-    for p in root.rglob("*.py"):
-        if "perceptkit_adapter" in str(p):
-            continue
-        if re.search(r"perceptkit_adapter[.\s]*(import\s+)?worker|from .*worker import run_forever",
-                     p.read_text(encoding="utf-8")):
-            hits.append(str(p.relative_to(root)))
-    assert not hits, "有人把 worker 接上了：" + ", ".join(hits)
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "backend" / "asgi" / "lifespan.py").read_text(encoding="utf-8")
+    assert "perceptkit_adapter" in text and "run_loop" in text, \
+        "没有任何常驻进程会去排空发件箱"
+    assert "perceptkit_task" in text and "gather" in text, \
+        "起了但没在关闭时等它收尾 —— 进程退出时正在投的那条会被硬切"
+
+
+def test_the_loop_stops_when_asked():
+    """关机时要停得下来。停不下来的循环会把优雅关闭拖成硬杀。"""
+    import asyncio
+
+    async def go():
+        stop = asyncio.Event()
+        stop.set()                      # 一开始就要求停
+        await asyncio.wait_for(worker.run_loop(stop, interval=0.01), timeout=2)
+
+    asyncio.run(go())
 
 
 # ---------------------------------------------------------------------------
