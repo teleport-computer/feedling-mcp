@@ -35,6 +35,7 @@ import uuid
 import db
 import debug_trace
 import generated_image
+import storage_read_trace
 from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
@@ -636,21 +637,36 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
 # --------------------------------------------------------------------------- #
 
 def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
-    try:
-        msg = db.chat_get_strict(store.user_id, str(message_id))
-    except Exception as e:  # noqa: BLE001 — preserve cache fallback on DB blips
-        print(f"[chat/body:{store.user_id}] durable lookup failed, using hot cache: {e}")
-        with store.chat_lock:
-            msg = next(
-                (m for m in store.chat_messages
-                 if str(m.get("id") or "") == str(message_id)),
-                None,
+    with storage_read_trace.observe_read(
+        store, event_type="chat.message_body.read", source="chat_message",
+    ) as observation:
+        observation["lookup_source"] = "durable"
+        observation["is_canvas"] = None
+        try:
+            msg = db.chat_get_strict(store.user_id, str(message_id))
+        except Exception as e:  # noqa: BLE001 — preserve cache fallback on DB blips
+            print(f"[chat/body:{store.user_id}] durable lookup failed, using hot cache: {e}")
+            observation["lookup_source"] = "hot_cache"
+            with store.chat_lock:
+                msg = next(
+                    (m for m in store.chat_messages
+                     if str(m.get("id") or "") == str(message_id)),
+                    None,
+                )
+        # A verify-loop synthetic row is never a legitimate single-body fetch target;
+        # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
+        if not msg or msg.get("source") == "verify_ping":
+            return storage_read_trace.finish_response(
+                observation, {"error": "message_not_found"}, 404,
             )
-    # A verify-loop synthetic row is never a legitimate single-body fetch target;
-    # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
-    if not msg or msg.get("source") == "verify_ping":
-        return {"error": "message_not_found"}, 404
-    return {"message": chat_service._chat_history_item(msg, include_image_body=True, store=store)}, 200
+        observation["is_canvas"] = (
+            msg.get("content_type") == "file"
+            and str(msg.get("file_name") or "").casefold().endswith(".io.html")
+        )
+        body = {"message": chat_service._chat_history_item(
+            msg, include_image_body=True, store=store,
+        )}
+        return storage_read_trace.finish_response(observation, body, 200)
 
 
 def _canvas_workspace_path(filename: str) -> str | None:
@@ -686,18 +702,26 @@ def _canvas_workspace_path(filename: str) -> str | None:
 
 def workspace_canvas_body(store: UserStore, filename: str) -> tuple[dict, int]:
     """Return the caller's current opaque Canvas workspace envelope."""
-    path = _canvas_workspace_path(filename)
-    if path is None:
-        return {"error": "invalid_canvas_filename"}, 400
-    row = v2_jobs_store.get_workspace_entry(store.user_id, path)
-    if row is None or str(row.get("kind") or "") != "workspace":
-        return {"error": "workspace_entry_not_found"}, 404
-    return {
-        "filename": filename,
-        "revision": int(row["revision"]),
-        "mime_type": str(row.get("mime_type") or "text/html"),
-        "envelope": dict(row["content_envelope"]),
-    }, 200
+    with storage_read_trace.observe_read(
+        store, event_type="chat.canvas.body", source="workspace",
+    ) as observation:
+        path = _canvas_workspace_path(filename)
+        if path is None:
+            return storage_read_trace.finish_response(
+                observation, {"error": "invalid_canvas_filename"}, 400,
+            )
+        row = v2_jobs_store.get_workspace_entry(store.user_id, path)
+        if row is None or str(row.get("kind") or "") != "workspace":
+            return storage_read_trace.finish_response(
+                observation, {"error": "workspace_entry_not_found"}, 404,
+            )
+        body = {
+            "filename": filename,
+            "revision": int(row["revision"]),
+            "mime_type": str(row.get("mime_type") or "text/html"),
+            "envelope": dict(row["content_envelope"]),
+        }
+        return storage_read_trace.finish_response(observation, body, 200)
 
 
 def _canvas_index_timestamp(value) -> str:
@@ -706,46 +730,60 @@ def _canvas_index_timestamp(value) -> str:
 
 def canvas_index(store: UserStore) -> tuple[dict, int]:
     """Return workspace and chat-delivered Canvas metadata, newest first."""
-    rows = v2_jobs_store.list_canvas_workspace_entries(store.user_id, limit=500)
-    prefix = "/workspace/"
-    filenames = [str(row["path"])[len(prefix):] for row in rows]
-    message_metadata = db.chat_latest_agent_canvas_metadata_by_name(
-        store.user_id,
-        filenames,
-    )
-    canvases = []
-    for row, filename in zip(rows, filenames):
-        message = message_metadata.get(filename, {})
-        canvases.append({
-            "filename": filename,
-            "revision": int(row["revision"]),
-            "mime_type": str(row["mime_type"]),
-            "created_at": _canvas_index_timestamp(row["created_at"]),
-            "updated_at": _canvas_index_timestamp(row["updated_at"]),
-            "message_id": message.get("message_id"),
-            "display_title": message.get("display_title"),
-            "display_subtitle": message.get("display_subtitle"),
-        })
-    cards = db.chat_latest_agent_canvas_cards(store.user_id, limit=500)
-    for card in cards:
-        canvases.append({
-            "filename": card["filename"],
-            "revision": 1,
-            "mime_type": "text/html",
-            "created_at": _canvas_index_timestamp(card["created_at"]),
-            "updated_at": _canvas_index_timestamp(card["updated_at"]),
-            "message_id": card["message_id"],
-            "display_title": card["display_title"],
-            "display_subtitle": card["display_subtitle"],
-        })
-    # Both sources return aware datetimes. Sort those values rather than their
-    # ISO strings (fractional seconds and timezone offsets need numeric order).
-    updated_by_name = {name: row["updated_at"] for row, name in zip(rows, filenames)}
-    updated_by_name.update({card["filename"]: card["updated_at"] for card in cards})
-    canvases.sort(key=lambda card: (
-        -updated_by_name[card["filename"]].timestamp(), card["filename"],
-    ))
-    return {"canvases": canvases[:500]}, 200
+    with storage_read_trace.observe_read(
+        store, event_type="chat.canvas.index", source="canvas_index",
+    ) as observation:
+        rows = v2_jobs_store.list_canvas_workspace_entries(store.user_id, limit=500)
+        prefix = "/workspace/"
+        filenames = [str(row["path"])[len(prefix):] for row in rows]
+        message_metadata = db.chat_latest_agent_canvas_metadata_by_name(
+            store.user_id,
+            filenames,
+        )
+        canvases = []
+        for row, filename in zip(rows, filenames):
+            message = message_metadata.get(filename, {})
+            canvases.append({
+                "filename": filename,
+                "revision": int(row["revision"]),
+                "mime_type": str(row["mime_type"]),
+                "created_at": _canvas_index_timestamp(row["created_at"]),
+                "updated_at": _canvas_index_timestamp(row["updated_at"]),
+                "message_id": message.get("message_id"),
+                "display_title": message.get("display_title"),
+                "display_subtitle": message.get("display_subtitle"),
+            })
+        cards = db.chat_latest_agent_canvas_cards(store.user_id, limit=500)
+        for card in cards:
+            canvases.append({
+                "filename": card["filename"],
+                "revision": 1,
+                "mime_type": "text/html",
+                "created_at": _canvas_index_timestamp(card["created_at"]),
+                "updated_at": _canvas_index_timestamp(card["updated_at"]),
+                "message_id": card["message_id"],
+                "display_title": card["display_title"],
+                "display_subtitle": card["display_subtitle"],
+            })
+        # Both sources return aware datetimes. Sort those values rather than their
+        # ISO strings (fractional seconds and timezone offsets need numeric order).
+        updated_by_name = {name: row["updated_at"] for row, name in zip(rows, filenames)}
+        updated_by_name.update({card["filename"]: card["updated_at"] for card in cards})
+        canvases.sort(key=lambda card: (
+            -updated_by_name[card["filename"]].timestamp(), card["filename"],
+        ))
+        selected = canvases[:500]
+        workspace_names = set(filenames)
+        workspace_count = sum(card["filename"] in workspace_names for card in selected)
+        observation.update(
+            workspace_count=workspace_count,
+            chat_card_count=len(selected) - workspace_count,
+            cards=len(selected),
+            # Each source query is independently capped at 500. Saturation is
+            # observable; whether another row exists beyond either cap is not.
+            limit_reached=len(selected) == 500,
+        )
+        return storage_read_trace.finish_response(observation, {"canvases": selected}, 200)
 
 
 # --------------------------------------------------------------------------- #
