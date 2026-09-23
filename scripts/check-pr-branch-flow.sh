@@ -14,12 +14,13 @@
 # 这条不是形式主义，是踩出来的：那次修复第一版就是从 main 拉的干净分支，
 # 后来为了走 pre 路线把 origin/pre 合了进去 —— 分支瞬间从 100 行变成 12806 行、
 # 123 个文件。如果那时直接合了，"只上一个 hotfix" 就成了一句空话，而 diff 大到
-# 没人会逐行看。所以这里用祖先关系机械地卡住：hotfix 分支的历史里不许出现
-# main 之外的东西。
+# 没人会逐行看。祖先检查要求基于最新 main；提交数上限限制额外历史的规模。
+# 这不能证明少量提交的来源或内容，仍需人工审阅。
 set -euo pipefail
 
 base_branch="${1:-}"
 head_branch="${2:-}"
+head_sha="${3:-}"
 
 if [[ -z "$base_branch" || -z "$head_branch" ]]; then
   echo "::error title=Invalid PR branch flow::base and head branch names are required" >&2
@@ -39,20 +40,36 @@ fi
 
 # hotfix 通道
 if [[ "$head_branch" == hotfix/* ]]; then
-  # 必须从 main 拉：main 的头必须是这个分支的祖先，且分支不含 main 之外的历史。
-  # 前者保证"基于最新 main"，后者保证"没合进别的线"。
-  if ! git merge-base --is-ancestor "origin/main" "HEAD" 2>/dev/null; then
+  # HEAD is the trusted base checkout in pull_request_target, NOT the PR head.
+  unable() {
+    echo "::error title=Unable to validate hotfix::$1" >&2
+    exit 2
+  }
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || unable "An explicit full PR head SHA is required"
+  main_sha="$(git rev-parse --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null)" || \
+    unable "Missing origin/main commit object"
+  git cat-file -e "${head_sha}^{commit}" 2>/dev/null || unable "Missing PR head commit object"
+  shallow="$(git rev-parse --is-shallow-repository 2>/dev/null)" || unable "Cannot inspect repository history"
+  [[ "$shallow" == "false" ]] || unable "Complete history required; repository is shallow"
+  max="${HOTFIX_MAX_COMMITS:-10}"
+  [[ "$max" =~ ^[0-9]{1,9}$ ]] || unable "HOTFIX_MAX_COMMITS must be a non-negative integer (at most 9 digits)"
+  max=$((10#$max))
+
+  # Latest main must be an ancestor of the actual PR commit.
+  if git merge-base --is-ancestor "$main_sha" "$head_sha"; then
+    :
+  else
+    rc=$?
+    [[ "$rc" -eq 1 ]] || unable "Cannot determine PR ancestry (git exit $rc)"
     echo "::error title=Hotfix must be rebased on main::'$head_branch' 落后于 origin/main。\
 先 rebase 到 main 再提 PR。" >&2
     exit 1
   fi
-  # 分支相对 main 的提交数。hotfix 就该是少量提交；挟带整条线会立刻超标。
-  extra="$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 999)"
-  max="${HOTFIX_MAX_COMMITS:-10}"
+  extra="$(git rev-list --count "$main_sha..$head_sha")" || unable "Cannot count PR commits"
   if (( extra > max )); then
     echo "::error title=Hotfix carries too much::'${head_branch}' 相对 main 有 ${extra} 个提交\
-（上限 ${max}）。hotfix 通道只用于自成一体的紧急修复 —— 这个数字说明它合进了别的分支，\
-那样等于用 hotfix 的名义放行整条线。走常规的 test/pre 路线，或把分支重建干净。" >&2
+（上限 ${max}）。hotfix 通道只用于少量提交的紧急修复。\
+走常规的 test/pre 路线，或把分支重建干净。" >&2
     exit 1
   fi
   echo "Branch flow allowed: $head_branch -> main (hotfix, $extra 个提交)"
