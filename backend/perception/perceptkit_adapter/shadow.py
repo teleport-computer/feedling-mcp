@@ -480,16 +480,26 @@ def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         from .events import calendar_rows
         from perceptkit.contracts.records import CalendarEventMirror
         rows = calendar_rows(payload)
-        if not rows:
+        # ⚠️ 被截断（事件数超过客户端上限）时**不能**声明全量：那批不是窗口
+        # 内的全部，被截掉的会被当成"已删除"删掉。截断时 coverage 传 None。
+        coverage = None if payload.get("calendar_events_truncated") else \
+            _coverage_window(payload)
+        # 🔴 **空的全量快照要照常走下去** —— 那是"用户把这个窗口里的日程都删光了"。
+        #
+        #    原来在这之前就 `if not rows: return None`，于是删到只剩一个、再把
+        #    它也删掉时，最后那条永远留在 io 这边（外部审查 F8）。此前的测试
+        #    只覆盖了 2 条→1 条，漏了 1 条→0 条。
+        #
+        #    没窗口的空批次直接返回，省一次白跑的增量同步。**这一句不是安全
+        #    保证** —— 真正拦住"没看全就当用户删了"的是下面 `_sync_mirror` 里
+        #    的 `kind = FULL if coverage else INCREMENTAL`。把这一句删掉测试
+        #    照样绿（故障注入验过），别把它当成那道闸。
+        if not rows and coverage is None:
             return None
         received = datetime.now(timezone.utc)
         events = [CalendarEventMirror(subject_id=user_id, source=_MIRROR_SOURCE,
                                       updated_at=received, **row)
                   for row in rows]
-        # ⚠️ 被截断（事件数超过客户端上限）时**不能**声明全量：那批不是窗口
-        # 内的全部，被截掉的会被当成"已删除"删掉。截断时 coverage 传 None。
-        coverage = None if payload.get("calendar_events_truncated") else \
-            _coverage_window(payload)
         return _sync_mirror(user_id, "calendar", events, received,
                             coverage=coverage) or {
                 "ran": True, "producer": "ios_calendar_mirror",

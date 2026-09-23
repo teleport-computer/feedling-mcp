@@ -1005,6 +1005,37 @@ def test_an_event_deleted_upstream_disappears_from_the_mirror(clean):
     assert _titles(conn) == ["e1"], "窗口里没出现的事件应该被删掉"
 
 
+def test_deleting_the_last_event_actually_deletes_it(clean):
+    """删到只剩一个、再把它也删掉 —— 那一个必须跟着消失（外部审查 F8）。
+
+    原来在"这批有没有事件"之前就直接返回了，于是**空的全量快照根本不会
+    走到删除那一步**：用户把日历清空，io 这边永远留着最后那条。
+    此前的测试只覆盖了 2 条→1 条，漏了 1 条→0 条。
+    """
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1")]))
+    assert _titles(conn) == ["e1"]
+    _mirror(conn, _cal_payload([]))                      # 用户把最后一个也删了
+    assert _titles(conn) == [], "清空日历之后，最后那条还留着"
+
+
+def test_an_empty_batch_without_a_window_never_deletes(clean):
+    """反向守卫：**没有覆盖窗口的空批次不许删任何东西。**
+
+    "这个窗口里一个日程都没有"和"这次压根没拿到日历数据"（没授权、
+    客户端没发这一项）长得一模一样。按前者处理会把用户的镜像清空，
+    而且不可逆。
+
+    这条盯的是**行为**，不是某一行代码：拦住它的是 `_sync_mirror` 里
+    「没窗口就退回增量」那一步，不是 mirror_calendar 的提前返回
+    （故障注入验过——把提前返回删掉，这条照样绿）。
+    """
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1")]))
+    _mirror(conn, _cal_payload([], window=False))
+    assert _titles(conn) == ["e1"], "没有窗口的空批次把镜像清空了"
+
+
 def test_a_truncated_batch_never_deletes(clean):
     """截断意味着这批**不是**窗口内的全部。当成全量的话，被截掉的那些会被
     当成"用户删了"删掉 —— 不可逆。"""
