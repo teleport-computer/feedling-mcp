@@ -502,8 +502,17 @@ while `aside` is optional. The aside is sealed separately with
 `thinking_native: false`. A usable reply without an aside is delivered without
 an aside-format correction retry. Chat and scheduled turns also accept usable
 direct text. Non-scheduled wake turns still require an explicit `reply` or
-`stay_silent` decision; unstructured text alone does not publish a bubble. With
-aside display enabled, missing or unusable aside text shows `（思考没写完）` instead.
+`stay_silent` decision; unstructured text alone does not publish a bubble. On
+both the chat and wake lanes an aside the model did not write displays
+nothing. A malformed inline thinking block whose reply text could still be
+recovered is dropped silently on its own — the reply is delivered, and if the
+model separately supplied an aside through `reply(aside, text)` that aside
+still displays normally; only when there is no displayable aside at all does
+the thinking area stay empty. `（思考没写完）` is shown only for an aside that
+existed and had to be withheld: one carrying an internal identifier, or a
+chat reply whose text could not be told apart from its thinking at all
+(delivered as the honest fallback bubble; the wake lane instead ends that turn
+silently or fails it, never with a marker).
 
 When a non-scheduled wake produces text without a tool call, the text is held as
 an unpublished draft. If the existing turn budget permits, the model gets at

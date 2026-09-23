@@ -694,7 +694,10 @@ def test_chat_thinking_language_mismatch_does_not_trigger_a_rewrite(
     assert [row["body_ct"] for row in _bubbles(uid)] == [
         "文件已经生成并发送，可以直接下载了。"
     ]
-    assert _bubbles(uid)[0]["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    # T697: the model's own inline block is discarded and no aside was written,
+    # so nothing is displayed (the language check still must not rewrite).
+    assert not _bubbles(uid)[0].get("thinking_body_ct")
+    assert "finish in English" not in str(_bubbles(uid)[0].get("thinking_body_ct") or "")
     language_trace = next(
         trace for trace in traces if trace["type"] == "reply.language_follow"
     )
@@ -1863,13 +1866,18 @@ def test_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
     assert status == "completed"
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "可见回复仍然正常"
-    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    # T697: the internal term is inside the model's own inline block, which is
+    # stripped and discarded; with no aside written nothing is displayed. The
+    # leak guard is what matters here and still holds.
+    assert not bubble.get("thinking_body_ct")
+    assert "memory_write" not in str(bubble.get("thinking_body_ct") or "")
 
 
 def test_chat_multi_open_think_is_salvaged_not_failed(monkeypatch):
     """T656 (T655 shape: MiniMax-M3 opened <think> twice, closed once). The strict
     gate still says FAILED; the salvage layer delivers the reply text, drops the
-    thinking (marker shown), and the row is NOT a turn failure."""
+    thinking, and the row is NOT a turn failure. T697 (Seven 2026-09-23): a
+    recovered body shows NOTHING in the thinking area — no marker."""
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
     uid = "u_toolloop_selfthink_salvaged"
@@ -1895,7 +1903,9 @@ def test_chat_multi_open_think_is_salvaged_not_failed(monkeypatch):
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == "先别急，我在呢。"
     assert "<think" not in bubbles[0]["body_ct"] and "她在生气" not in bubbles[0]["body_ct"]
-    assert bubbles[0]["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    # T697: recovered body, thinking dropped silently — nothing displayed.
+    assert not bubbles[0].get("thinking_body_ct")
+    assert "她在生气" not in str(bubbles[0].get("thinking_body_ct") or "")
     assert not bubbles[0].get("turn_failure_error_class")
     assert _job_status_row(job_id)[0] == "completed"
 
@@ -1903,7 +1913,11 @@ def test_chat_multi_open_think_is_salvaged_not_failed(monkeypatch):
 def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     monkeypatch,
 ):
-    """Provider-native CoT is never a fallback while self-thinking is ON."""
+    """Provider-native CoT is never a fallback while self-thinking is ON.
+
+    T697: a reply with no aside shows NOTHING (branch ``none``), not the
+    thinking-failed marker — the field is optional and nothing was written.
+    """
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_toolloop_selfthink_no_fallback"
     conftest.seed_user(uid)
@@ -1945,14 +1959,13 @@ def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     assert len(calls) == 1
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "the answer"
-    assert bubble["thinking_kind"] == "agent_summary"
-    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    assert not bubble.get("thinking_body_ct")
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "marker",
-        "chars": len(self_thinking.THINKING_FAILED_MARKER),
+        "branch": "none",
+        "chars": 0,
         "model": _BYOK.model,
         "lane": "chat",
         "retried": 0,
@@ -1992,14 +2005,17 @@ def test_self_thinking_on_discards_inline_and_native_reasoning(monkeypatch):
     assert status == "completed"
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "the answer"
-    assert bubble["thinking_kind"] == "agent_summary"
-    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    # Seven 2026-09-23 (T697): a model's own inline <think> is NOT our aside.
+    # It is still stripped and discarded — and because no aside was written,
+    # nothing is displayed rather than the thinking-failed marker.
+    assert "我先自己归纳" not in str(bubble.get("thinking_body_ct") or "")
+    assert not bubble.get("thinking_body_ct")
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "marker",
-        "chars": len(self_thinking.THINKING_FAILED_MARKER),
+        "branch": "none",
+        "chars": 0,
         "model": _BYOK.model,
         "lane": "chat",
         "retried": 0,
@@ -2016,11 +2032,15 @@ def test_self_thinking_on_discards_inline_and_native_reasoning(monkeypatch):
     ),
     [
         (
+            # T697: a COMPLETE inline block is stripped and discarded (it is the
+            # model's own reasoning, not our aside) and no aside was written, so
+            # nothing is displayed — the marker is reserved for a block we had
+            # but could not use.
             "<think>direct thought</think>direct answer",
             "Please answer this direct-state test",
             self_thinking.COMPLETE,
             "direct answer",
-            self_thinking.THINKING_FAILED_MARKER,
+            "",
         ),
         (
             "<think>thinking only</think>",
@@ -2073,11 +2093,19 @@ def test_chat_self_thinking_non_absent_terminal_states_do_not_retry(
     )
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == expected_body
-    assert bubble["thinking_body_ct"] == expected_thinking
+    assert (bubble.get("thinking_body_ct") or "") == expected_thinking
 
 
 @pytest.mark.parametrize("shape", ["aside", "missing", "blank", "internal", "direct"])
 def test_chat_optional_aside_delivers_body_without_retry(monkeypatch, shape):
+    """The full aside -> display/branch map for the chat lane (T697).
+
+    Seven 2026-09-23: an aside the model never wrote shows NOTHING; the
+    thinking-failed marker is reserved for a block we had but could not use
+    (here: an aside carrying an internal term). A model's own inline/native
+    reasoning is never our aside either way (T658), so the plain-text shape
+    also displays nothing.
+    """
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_chat_optional_aside_" + shape
     conftest.seed_user(uid)
@@ -2099,6 +2127,10 @@ def test_chat_optional_aside_delivers_body_without_retry(monkeypatch, shape):
     deps = _deps(messages=[{
         "id": "m-aside", "ts": 10.0, "role": "user", "content": "Please answer me."
     }])
+    traces: list[dict] = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
+    )
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
     ))
@@ -2111,12 +2143,22 @@ def test_chat_optional_aside_delivers_body_without_retry(monkeypatch, shape):
     bubble = bubbles[0]
     assert bubble["body_ct"] == body
     assert not bubble.get("turn_failure_error_class")
-    assert bubble["thinking_body_ct"] == (
-        aside if shape == "aside" else self_thinking.THINKING_FAILED_MARKER
-    )
-    assert bubble["thinking_kind"] == "agent_summary"
-    assert bubble["thinking_source"] == "self_thinking"
-    assert bubble["thinking_native"] is False
+    expected_display = {
+        "aside": aside,
+        "internal": self_thinking.THINKING_FAILED_MARKER,
+    }.get(shape, "")
+    assert (bubble.get("thinking_body_ct") or "") == expected_display
+    expected_branch = {"aside": "self", "internal": "marker"}.get(shape, "none")
+    surfaced = [t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"]
+    assert [d["branch"] for d in surfaced] == [expected_branch], shape
+    assert [d["chars"] for d in surfaced] == [len(expected_display)], shape
+    assert [d["retried"] for d in surfaced] == [0], shape
+    if expected_display:
+        assert bubble["thinking_kind"] == "agent_summary"
+        assert bubble["thinking_source"] == "self_thinking"
+        assert bubble["thinking_native"] is False
+    # The model's own reasoning is never promoted into the display channel.
+    assert "private native reasoning" not in str(bubble.get("thinking_body_ct") or "")
     with db.get_pool().connection() as conn:
         assert conn.execute(
             "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s", (job["id"],)

@@ -1137,7 +1137,11 @@ def test_wake_reply_think_uses_thinking_channel_not_visible_bubble(monkeypatch):
 
 
 @pytest.mark.parametrize("aside", ["memory_write", None, "", "   "])
-def test_wake_invalid_or_missing_aside_delivers_body_with_marker(monkeypatch, aside):
+def test_wake_invalid_or_missing_aside_delivers_body(monkeypatch, aside):
+    """T697 (Seven 2026-09-23): the wake lane follows the chat lane — an aside
+    the model never wrote (absent/empty/blank) displays nothing; the
+    thinking-failed marker is kept for an aside we had and could not use (here:
+    one carrying an internal identifier). The body is delivered either way."""
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_wake_selfthink_internal_term"
     conftest.seed_user(uid)
@@ -1160,8 +1164,12 @@ def test_wake_invalid_or_missing_aside_delivers_body_with_marker(monkeypatch, as
         "_build_thinking_payload",
         lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
     )
+    traces: list[dict] = []
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
     )
     status = asyncio.run(
         worker._run_wake(
@@ -1172,7 +1180,16 @@ def test_wake_invalid_or_missing_aside_delivers_body_with_marker(monkeypatch, as
     assert status == "completed"
     assert status != "choice_invalid"
     assert written["text"] == "可见回复仍然正常"
-    assert thinking["text"] == self_thinking.THINKING_FAILED_MARKER
+    thinking_traces = [
+        t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"
+    ]
+    if aside == "memory_write":
+        assert thinking["text"] == self_thinking.THINKING_FAILED_MARKER
+        assert "memory_write" not in thinking["text"]
+        assert [t["branch"] for t in thinking_traces] == ["marker"]
+    else:
+        assert thinking == {}
+        assert [t["branch"] for t in thinking_traces] == ["none"]
 
 
 def test_wake_multi_open_think_in_text_is_salvaged_not_failed(monkeypatch):
@@ -1202,8 +1219,12 @@ def test_wake_multi_open_think_in_text_is_salvaged_not_failed(monkeypatch):
         "_build_thinking_payload",
         lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
     )
+    traces: list[dict] = []
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
     )
     status = asyncio.run(
         worker._run_wake(
@@ -1214,6 +1235,71 @@ def test_wake_multi_open_think_in_text_is_salvaged_not_failed(monkeypatch):
     assert status == "completed"
     assert written["text"] == "早，醒了吗？"
     assert "<think" not in written["text"] and "还没醒" not in written["text"]
+    # T697 (Seven 2026-09-23): the tangled inline block is dropped silently —
+    # no 「思考没写完」 marker for a recovered body. The aside the model DID
+    # supply through the reply tool is what gets displayed.
+    assert thinking["text"] == "要不要等等"
+    assert thinking["text"] != self_thinking.THINKING_FAILED_MARKER
+    assert "她好像还没醒" not in thinking["text"]
+    thinking_traces = [
+        t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"
+    ]
+    assert [t["branch"] for t in thinking_traces] == ["self"]
+
+
+def test_wake_multi_open_think_in_text_is_salvaged_with_no_separate_aside(
+    monkeypatch,
+):
+    """T697 (Seven 2026-09-23), codex review follow-up: SALVAGED without a
+    separately supplied aside must land on branch "none", not "self" or
+    "marker" — the stripped inline block is not promoted, and its absence is
+    not a failure either. Same tangled-tag shape as the sibling test above,
+    but the reply tool's own ``aside`` arg is never provided."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    uid = "u_wake_selfthink_salvaged_no_aside"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    raw = "<think>她好像还没醒<think>要不要等等</think>早，醒了吗？"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+    response = _wake_reply_round(raw)
+    del response["tool_calls"][0]["args"]["aside"]
+    _script_provider(monkeypatch, [response])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "wake-salvaged-none"},
+    )
+    thinking = {}
+    monkeypatch.setattr(
+        worker,
+        "_build_thinking_payload",
+        lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
+    )
+    traces: list[dict] = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
+    )
+    status = asyncio.run(
+        worker._run_wake(
+            job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by
+        )
+    )
+
+    assert status == "completed"
+    assert written["text"] == "早，醒了吗？"
+    assert "<think" not in written["text"] and "还没醒" not in written["text"]
+    assert thinking == {}
+    thinking_traces = [
+        t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"
+    ]
+    assert [t["branch"] for t in thinking_traces] == ["none"]
 
 
 @pytest.mark.parametrize(
