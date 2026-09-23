@@ -1,14 +1,16 @@
-"""Content-free observations for synchronous chat-body reads.
+"""Content-free observations for synchronous Canvas and chat-body reads.
 
 The request-local hydrate observation inherits an inner GET failure even when
-the storage API returns its historical None sentinel. No keys or bodies are
-retained here, and concurrent reads cannot exchange observations.
+the storage API returns its historical None sentinel, and propagates that
+failure to an enclosing endpoint read. No keys or bodies are retained here,
+and concurrent reads cannot exchange observations.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import json
 import time
 
 
@@ -16,6 +18,9 @@ _hydrate_observation: ContextVar[tuple[str, dict] | None] = ContextVar(
     "chat_body_hydrate_observation", default=None,
 )
 _store: ContextVar[object | None] = ContextVar("chat_body_trace_store", default=None)
+_read_observation: ContextVar[tuple[str, dict] | None] = ContextVar(
+    "chat_endpoint_read_observation", default=None,
+)
 
 
 @contextmanager
@@ -79,6 +84,55 @@ def _emit(user_id: str, event_type: str, detail: dict) -> None:
 
 
 @contextmanager
+def observe_read(store, *, event_type: str, source: str):
+    """Observe a complete read, including inline bodies and missing rows.
+
+    Source describes the server's actual read path, never the client's reason
+    for requesting it. In particular, history pagination cannot distinguish a
+    Canvas fallback from ordinary chat history. Nor does a storage source prove
+    which runtime originally wrote a card.
+    """
+    detail = {
+        "source": source, "status": "ok", "error_class": None,
+        "http_status": None, "response_bytes": None,
+    }
+    token = _read_observation.set((store.user_id, detail))
+    started = time.monotonic()
+    with bind_store(store):
+        try:
+            yield detail
+        except Exception as exc:
+            detail.update(failure(exc))
+            raise
+        finally:
+            detail["dur_ms"] = round((time.monotonic() - started) * 1000, 1)
+            _read_observation.reset(token)
+            _emit(store.user_id, event_type, detail)
+
+
+def finish_response(detail: dict, body: dict, status: int) -> tuple[dict, int]:
+    """Record response size, without retaining or decoding the response body.
+
+    This is the compact UTF-8 JSON size emitted by JSONResponse, including the
+    opaque envelope/metadata; it is NOT plaintext size or storage GET bytes.
+    """
+    detail["http_status"] = status
+    if status >= 400:
+        detail["status"] = (
+            "not_found" if status == 404 else
+            "invalid_request" if status < 500 else "http_5xx"
+        )
+    try:
+        detail["response_bytes"] = len(json.dumps(
+            body, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        ).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeError):
+        # Size unavailable must not become zero or change response behavior.
+        pass
+    return body, status
+
+
+@contextmanager
 def observe(user_id: str, *, hydrate: bool = False):
     detail = {"status": "ok", "error_class": None, "bytes": None}
     token = _hydrate_observation.set((user_id, detail)) if hydrate else None
@@ -92,6 +146,11 @@ def observe(user_id: str, *, hydrate: bool = False):
         detail["dur_ms"] = round((time.monotonic() - started) * 1000, 1)
         if hydrate:
             _hydrate_observation.reset(token)
+            read = _read_observation.get()
+            if read is not None and read[0] == user_id and detail["status"] != "ok":
+                # A swallowed storage failure can still return HTTP 200 with
+                # no body. Preserve that failure in the endpoint observation.
+                read[1].update({key: detail[key] for key in ("status", "error_class")})
         else:
             parent = _hydrate_observation.get()
             if parent is not None and parent[0] == user_id:
