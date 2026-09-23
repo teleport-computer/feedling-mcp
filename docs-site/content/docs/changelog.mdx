@@ -12,6 +12,21 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 replies whose optional `aside` was never written now display no
+  thinking at all instead of the `（思考没写完）` marker, recorded on the
+  `none` branch. A reply whose inline thinking block was malformed but still
+  yielded a separable body now drops only that stripped block silently — it is
+  not itself a reason for the marker; an aside supplied separately through the
+  reply tool still displays normally. Both chat and wake lanes follow this
+  rule, matching the resident runtime. The marker is reserved for an aside
+  that existed and had to be withheld: one carrying an internal identifier, or
+  a chat reply whose text could not be separated from its thinking at all
+  (still delivered as the honest fallback bubble; the wake lane ends such a
+  turn silently or fails it instead of showing a marker). Provider native
+  reasoning and inline thinking-tag content remain non-display material. The
+  chat lane still records a salvage event on the trajectory for observability;
+  the wake lane does not.
+
 - Resident V1 asks for the persona aside as a leading `<aside>…</aside>` block
   again, on every driver and route (pi and codex no longer use `<think>`).
   Foreground chat replies follow the block as plain text, with the JSON
