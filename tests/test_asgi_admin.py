@@ -1480,7 +1480,6 @@ def test_users_list_budget_is_15s_and_reaches_the_sql_lease(env, monkeypatch):
 
 def test_users_list_over_5s_is_marked_slow_not_silent(env, monkeypatch, caplog):
     from admin import admin_core
-    monkeypatch.setattr(db, "admin_data_track_snapshot", lambda user_ids, **kw: {})
 
     class _ClockModule:
         """admin_core's own ``time`` binding: every attribute is the real
@@ -1496,15 +1495,281 @@ def test_users_list_over_5s_is_marked_slow_not_silent(env, monkeypatch, caplog):
         def __getattr__(self, name):
             return getattr(time, name)
 
+    monkeypatch.setattr(admin_asgi, "time", _ClockModule([100.0]))
     monkeypatch.setattr(admin_core, "time", _ClockModule([100.0, 106.2]))
     with caplog.at_level("WARNING"):
         status, body = _asgi_json("GET", "/v1/admin/data-track/users?limit=20", headers=_admin())
     assert status == 200, body
-    assert body["slow"] == {"elapsed_ms": 6200, "soft_budget_ms": 5000}
-    assert "[data-track] users slow elapsed_ms=6200 budget_ms=5000 limit=20" in caplog.text
+    assert body["slow"]["elapsed_ms"] == 6200
+    assert body["slow"]["soft_budget_ms"] == 5000
+    assert sum(body["slow"]["stages_ms"].values()) == 6200
+    assert "[data-track] users slow elapsed_ms=6200 budget_ms=5000 limit=20 total_ms=6200 stages_ms=" in caplog.text
     assert "admin_key" not in caplog.text
 
+    monkeypatch.setattr(admin_asgi, "time", _ClockModule([100.0]))
     monkeypatch.setattr(admin_core, "time", _ClockModule([100.0, 100.1]))
     status, body = _asgi_json("GET", "/v1/admin/data-track/users?limit=20", headers=_admin())
     assert status == 200 and "slow" not in body
     assert time.monotonic is not None and admin_core.time is not time  # global module never patched
+
+
+class _StageClock:
+    """Only the three timing modules see this clock; driver/ASGI clocks stay real."""
+    def __init__(self):
+        self.now = 100.0
+
+    def monotonic(self):
+        value = self.now
+        self.now += 0.125  # exact binary intervals, independent of machine speed
+        return value
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_users_stages_cover_real_snapshot_page_and_cursor_reads(env, monkeypatch, caplog):
+    import admin_read_timing
+    import psycopg
+    from admin import admin_core
+    from model_api_runtime.v2 import jobs_store
+
+    uid, _ = _register()
+    # Use the same injection as asgi_app, including its explicit cursor path.
+    monkeypatch.setattr(data_track, "_runtime_token_usage_summary", jobs_store.recent_token_usage_summary)
+    clock = _StageClock()
+    for module in (admin_core, admin_asgi, admin_read_timing):
+        monkeypatch.setattr(module, "time", clock)
+    executed = []
+    fetched = []
+    real_execute = psycopg.Cursor.execute
+    real_fetchone, real_fetchall = psycopg.Cursor.fetchone, psycopg.Cursor.fetchall
+
+    def execute(cur, query, *args, **kwargs):
+        if admin_read_timing._current.get() is not None:
+            executed.append(str(query))
+        return real_execute(cur, query, *args, **kwargs)
+
+    def fetchone(cur):
+        if admin_read_timing._current.get() is not None:
+            fetched.append("one")
+        return real_fetchone(cur)
+
+    def fetchall(cur):
+        if admin_read_timing._current.get() is not None:
+            fetched.append("all")
+        return real_fetchall(cur)
+
+    monkeypatch.setattr(psycopg.Cursor, "execute", execute)
+    monkeypatch.setattr(psycopg.Cursor, "fetchone", fetchone)
+    monkeypatch.setattr(psycopg.Cursor, "fetchall", fetchall)
+    # The driver spy must exclude calls outside this request's collection.
+    with db.get_pool().connection() as outside:
+        assert outside.execute("SELECT 42").fetchone() == (42,)
+    assert executed == [] and fetched == []
+    with caplog.at_level("WARNING"):
+        status, body = _asgi_json(
+            "GET", "/v1/admin/data-track/users?limit=5&admin_key=credential-canary",
+            headers=_admin(),
+        )
+    assert status == 200, body
+    assert [row["user_id"] for row in body["users"]] == [uid]
+    assert body["users"][0]["snapshot_read_status"]["level"] == "ok"
+    stages = body["slow"]["stages_ms"]
+    assert set(stages) == {
+        "queue_ms", "pool_wait_ms", "sql_ms", "python_assembly_ms", "unaccounted_ms",
+    }
+    assert all(isinstance(value, int) and value > 0 for value in stages.values())
+    assert sum(stages.values()) == body["slow"]["total_ms"]
+    # Each real execute/fetch takes one controlled 125 ms interval. Includes
+    # SET/RESET, token cursor, watermarks, fleet and all paged SQL statements.
+    assert stages["sql_ms"] == 125 * (len(executed) + len(fetched))
+    assert any("memory_moments" in sql for sql in executed)
+    assert any("v2_turn_metrics" in sql for sql in executed)
+    assert any("lane_rollup_watermark" in sql for sql in executed)
+    assert "credential-canary" not in caplog.text and uid not in caplog.text
+    assert "SELECT" not in caplog.text and "admin_key" not in caplog.text
+    assert str(stages) in caplog.text
+    assert admin_read_timing._current.get() is None
+    assert db.get_pool() is db._pool  # other requests retain the real pool
+
+
+def test_users_stages_preserve_pool_exit_and_exception_context(env):
+    import admin_read_timing
+    from contextlib import contextmanager
+
+    error = ValueError("sentinel")
+    seen = []
+
+    class DriverPool:
+        @contextmanager
+        def connection(self):
+            try:
+                yield object()
+            except ValueError as exc:
+                seen.append(exc)
+                raise
+            finally:
+                seen.append("returned")
+
+    with pytest.raises(ValueError, match="sentinel"):
+        with admin_read_timing.collect():
+            with admin_read_timing.wrap_pool(DriverPool()).connection():
+                raise error
+    assert seen == [error, "returned"]
+    assert admin_read_timing._current.get() is None
+
+
+def test_users_stages_are_isolated_across_nested_collections(env, monkeypatch):
+    import admin_read_timing
+    monkeypatch.setattr(admin_read_timing, "time", _StageClock())
+    with admin_read_timing.collect() as outer:
+        with outer.stage("sql_ms"):
+            pass
+        with admin_read_timing.collect() as inner:
+            with inner.stage("pool_wait_ms"):
+                pass
+        assert admin_read_timing._current.get() is outer
+    assert outer.seconds == {"sql_ms": 0.125, "pool_wait_ms": 0, "python_assembly_ms": 0}
+    assert inner.seconds == {"sql_ms": 0, "pool_wait_ms": 0.125, "python_assembly_ms": 0}
+    assert admin_read_timing._current.get() is None
+
+
+@pytest.mark.parametrize("queue_s,total_s,slow", [(0, 5, False), (0, 5.125, True), (6, 6.25, True)])
+def test_users_slow_threshold_and_pre_thread_wait(env, monkeypatch, queue_s, total_s, slow):
+    import admin_read_timing
+    from admin import admin_core
+    from types import SimpleNamespace
+
+    readings = iter((100 + queue_s, 100 + total_s))
+    monkeypatch.setattr(admin_core, "time", SimpleNamespace(monotonic=lambda: next(readings)))
+    monkeypatch.setattr(admin_asgi, "time", SimpleNamespace(monotonic=lambda: 100))
+    # No elapsed time inside the payload in this boundary test; its real SQL
+    # path is separately timed against PostgreSQL above.
+    monkeypatch.setattr(admin_read_timing, "time", SimpleNamespace(monotonic=lambda: 100 + queue_s))
+    status, body = _asgi_json("GET", "/v1/admin/data-track/users?limit=5", headers=_admin())
+    assert status == 200, body
+    assert ("slow" in body) is slow
+    if slow:
+        assert body["slow"]["total_ms"] == int(total_s * 1000)
+        assert body["slow"]["elapsed_ms"] == int((total_s - queue_s) * 1000)
+        assert body["slow"]["stages_ms"]["queue_ms"] == int(queue_s * 1000)
+        assert sum(body["slow"]["stages_ms"].values()) == int(total_s * 1000)
+
+
+def test_users_timing_collectors_do_not_cross_threads(env):
+    import admin_read_timing
+    from concurrent.futures import ThreadPoolExecutor
+
+    barrier = threading.Barrier(2)
+    raw_pool = db.get_pool()
+
+    def work():
+        assert admin_read_timing._current.get() is None
+        with admin_read_timing.collect() as timings:
+            barrier.wait(timeout=5)
+            pool = db.get_pool()
+            assert pool._pool is raw_pool
+            assert pool._timings is timings
+            with pool.connection() as conn:
+                assert conn.execute("SELECT 1").fetchone() == (1,)
+            barrier.wait(timeout=5)
+            assert admin_read_timing._current.get() is timings
+        assert admin_read_timing._current.get() is None
+        return timings
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(work)
+        second = executor.submit(work)
+        left, right = first.result(timeout=10), second.result(timeout=10)
+    assert left is not right
+    assert left.seconds["sql_ms"] > 0 and right.seconds["sql_ms"] > 0
+
+
+def test_users_timing_does_not_leak_when_worker_thread_is_reused(env, monkeypatch):
+    import admin_read_timing
+    from admin import admin_core
+    from concurrent.futures import ThreadPoolExecutor
+
+    raw_pool = db.get_pool()
+    real_get_pool = db.get_pool
+    seen = []
+
+    def observe_pool():
+        pool = real_get_pool()
+        seen.append(pool)
+        return pool
+
+    monkeypatch.setattr(db, "get_pool", observe_pool)
+
+    def users():
+        admin_core.users_payload("limit=5")
+        assert admin_read_timing._current.get() is None
+        return threading.get_ident()
+
+    def summary():
+        assert db.get_pool() is raw_pool
+        admin_core.summary_payload("")
+        assert admin_read_timing._current.get() is None
+        return threading.get_ident()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        users_thread = executor.submit(users).result(timeout=5)
+        assert seen and all(pool is not raw_pool for pool in seen)
+        seen.clear()
+        summary_thread = executor.submit(summary).result(timeout=5)
+    assert summary_thread == users_thread
+    assert seen and all(pool is raw_pool for pool in seen)
+
+
+def test_users_sql_timing_rethrows_same_driver_exception(env, monkeypatch):
+    import admin_read_timing
+    import psycopg
+    error = QueryCanceled("driver-error-canary")
+    monkeypatch.setattr(admin_read_timing, "time", _StageClock())
+
+    def fail(_conn, *args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(psycopg.Connection, "execute", fail)
+    with admin_read_timing.collect() as timings:
+        with pytest.raises(QueryCanceled) as caught:
+            with db.get_pool().connection() as conn:
+                conn.execute("SELECT 1")
+        assert caught.value is error
+        assert timings.seconds["sql_ms"] == 0.125
+        assert timings.seconds["pool_wait_ms"] == 0.125
+        assert timings.active is None
+    assert admin_read_timing._current.get() is None
+
+
+@pytest.mark.parametrize("api", ["connection_iterator", "cursor_iterator", "fetchmany"])
+def test_users_timed_cursor_iteration_and_batches_use_real_driver(env, monkeypatch, api):
+    import admin_read_timing
+
+    clock = _StageClock()
+    monkeypatch.setattr(admin_read_timing, "time", clock)
+    with admin_read_timing.collect() as timings:
+        with db.get_pool().connection() as conn:
+            with conn.cursor() as explicit_cursor:
+                if api == "connection_iterator":
+                    cursor = conn.execute("SELECT generate_series(1, 3)")
+                else:
+                    cursor = explicit_cursor.execute("SELECT generate_series(1, 3)")
+                before = timings.seconds["sql_ms"]
+                assert before == 0.125
+                if api == "fetchmany":
+                    assert cursor.fetchmany(size=2) == [(1,), (2,)]
+                    assert cursor.fetchmany() == [(3,)]
+                    assert cursor.fetchmany(2) == []
+                    expected_steps = 3
+                else:
+                    rows = []
+                    with timings.stage("python_assembly_ms"):
+                        for row in cursor:
+                            rows.append(row)
+                            clock.now += 1  # consumer work must not count as SQL
+                    assert rows == [(1,), (2,), (3,)]
+                    expected_steps = 4  # three rows + StopIteration
+                assert timings.seconds["sql_ms"] - before == 0.125 * expected_steps
+        assert timings.active is None
+    assert admin_read_timing._current.get() is None

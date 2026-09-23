@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote
 
 from core.reqctx import request
 
+import admin_read_timing
 import db
 import debug_trace
 import provider_attempt_ledger
@@ -2758,6 +2759,7 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
     rows.sort(key=sort_tuple)
 
 
+@admin_read_timing.python_assembly
 def _data_track_payload(
     *, include_users: bool = True, include_detail_user: str = "",
     statement_timeout_ms: int | None = None,
