@@ -27,6 +27,11 @@ change must not be interpreted as an API guarantee.
   chat lane still records a salvage event on the trajectory for observability;
   the wake lane does not.
 
+- Runtime V2 Capture and Dream traces now distinguish explicit Anthropic
+  refusals with content-free `memory.extraction.refusal` observations, including
+  refusals seen before a successful retry. Existing failure outcomes and retry
+  budgets are unchanged; unknown refusal categories remain `unclassified`.
+
 - Resident V1 asks for the persona aside as a leading `<aside>…</aside>` block
   again, on every driver and route (pi and codex no longer use `<think>`).
   Foreground chat replies follow the block as plain text, with the JSON

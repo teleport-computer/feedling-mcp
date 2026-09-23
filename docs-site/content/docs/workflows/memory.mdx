@@ -284,6 +284,20 @@ run as using degraded context, so it cannot be mistaken for a model choosing to
 make no changes from a complete input. Card ids, prompts, replies, summaries,
 raw errors, and other memory text are never part of this diagnostic shape.
 
+With tracing enabled, Runtime V2 Capture and Dream emit
+`memory.extraction.refusal` when an Anthropic response explicitly reports
+`stop_reason: refusal`, including attempts that later retry successfully. The
+closed detail contains `runtime`, `lane`, `stop_reason`, `refusal_category`, and
+`attempt` (the outer attempt number within that provider round). Categories are
+`cyber`, `bio`, `frontier_llm`, `reasoning_extraction`, `general_harms`, or
+`unclassified` for missing/unknown values. Neither provider explanations nor
+prompt/reply text enter this event. The admin projection accepts only that exact
+shape plus the database’s closed `outcome_class_provenance` field. This is an
+observation, not a new terminal error classification: existing
+job outcomes, provider-health attribution, retry counts, and budgets are
+unchanged. Text-only refusals and other provider wires are not identified by
+this marker; absence of the event is not proof that no refusal occurred.
+
 Runtime V2 Capture and Dream also record provider wire-attempt metadata in the
 operator-readable `provider_attempts` ledger: job correlation, provider/model,
 outer retry and wire counts, each wire's duration and HTTP status, and closed

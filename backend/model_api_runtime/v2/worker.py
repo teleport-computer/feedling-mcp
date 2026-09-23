@@ -96,6 +96,7 @@ from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from memory import capture_failure
+from memory import extraction_trace as memory_extraction_trace
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
 from memgarden import timestamps as memory_timestamps
@@ -12905,6 +12906,10 @@ async def _run_extraction(
             if trajectory_recorder is not None:
                 await _record_trajectory(trajectory_recorder, kind, payload)
 
+        extraction_refusal_out = memory_extraction_trace.refusal_observer(
+            deps.emit_debug_trace, user_id, lane=lane, job_id=job_id, trace_id=trace_id,
+        )
+
         extraction_trajectory_out = (
             _extraction_trajectory
             if lane == "dream" or trajectory_recorder is not None
@@ -13055,6 +13060,7 @@ async def _run_extraction(
                     ),
                     usage_out=tm.add_call if tm is not None else None,
                     trajectory_out=extraction_trajectory_out,
+                    refusal_out=extraction_refusal_out,
                 )
                 _report_turn_progress("extraction_provider_complete")
                 return result
@@ -13203,6 +13209,7 @@ async def _run_extraction(
                 ),
                 usage_out=tm.add_call if tm is not None else None,
                 trajectory_out=extraction_trajectory_out,
+                refusal_out=extraction_refusal_out,
             )
             _report_turn_progress("extraction_provider_complete")
             if not reason and not items and dream_model_attempts == 0:

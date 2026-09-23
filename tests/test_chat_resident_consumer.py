@@ -5133,6 +5133,94 @@ def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
     assert extra["cards_superseded"] == 1
 
 
+def test_capture_memory_action_uses_plaintext_shape_when_effective_off(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_plain_capture")
+    monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", "off")
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_capture_build_envelope",
+        lambda **_kwargs: pytest.fail("plaintext capture must not build an envelope"),
+    )
+
+    action = crc._capture_memory_action(
+        {"type": "event", "summary": "A meeting", "content": "A useful meeting.",
+         "bucket": "Work", "threads": ["meeting"], "importance": 0.7, "pulse": 0.4},
+        occurred_at="2026-09-23T10:00:00Z",
+        source="memory_capture",
+    )
+
+    assert action["type"] == "memory.add"
+    assert action["memory"] == {
+        "type": "event",
+        "summary": "A meeting",
+        "content": "A useful meeting.",
+        "bucket": "Work",
+        "threads": ["meeting"],
+        "importance": 0.7,
+        "pulse": 0.4,
+        "source": "memory_capture",
+        "occurred_at": "2026-09-23T10:00:00Z",
+    }
+
+
+def test_capture_memory_action_keeps_envelope_when_effective_on(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_sealed_capture")
+    monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", "on")
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_capture_build_envelope", lambda *_args, **_kwargs: {"body_ct": "sealed"})
+
+    action = crc._capture_memory_action(
+        {"type": "fact", "summary": "A fact", "content": "A sealed fact."},
+        occurred_at="2026-09-23T10:00:00Z",
+        source="memory_capture",
+    )
+
+    assert action["type"] == "memory.add"
+    assert action["envelope"] == {"body_ct": "sealed"}
+    assert "memory" not in action
+
+
+def test_capture_memory_action_unknown_effective_fails_safe_to_envelope(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", "future-value")
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_capture_build_envelope", lambda *_args, **_kwargs: {"body_ct": "sealed"})
+
+    action = crc._capture_memory_action(
+        {"type": "fact", "summary": "A fact", "content": "A sealed fact."},
+        occurred_at="2026-09-23T10:00:00Z",
+        source="memory_capture",
+    )
+
+    assert action["envelope"] == {"body_ct": "sealed"}
+
+
+def test_capture_memory_action_plaintext_supersede_keeps_targets(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", "off")
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_capture_build_envelope",
+        lambda **_kwargs: pytest.fail("plaintext supersede must not build an envelope"),
+    )
+
+    action = crc._capture_memory_action(
+        {"type": "fact", "summary": "Updated", "content": "Updated content."},
+        occurred_at="2026-09-23T10:00:00Z",
+        source="memory_dream",
+        action_type="memory.supersede",
+        supersedes=["old-a", "old-b"],
+    )
+
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == ["old-a", "old-b"]
+    assert action["memory"]["source"] == "memory_dream"
+
+
 _CAPTURE_INDEX_BODY = {
     "items": [
         {"id": "mem_meeting", "summary": "Seven's weekly meeting always stresses him out.",
@@ -11934,6 +12022,8 @@ def _patch_memory_distill(monkeypatch, *, windows=3, cards_by_window=None, mater
         return [dict(job)] if calls["pending"] == 1 else []
 
     monkeypatch.setattr(crc, "_distill_in_progress", None)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
     monkeypatch.setattr(crc, "genesis_resident_pending", fake_pending)
     monkeypatch.setattr(crc, "_decrypt_sealed_material", lambda env: b"doc")
     monkeypatch.setattr(
