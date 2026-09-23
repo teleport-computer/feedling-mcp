@@ -246,30 +246,64 @@ def test_gzip_head_and_unhandled_500(capsys):
     assert row["resp_bytes"] == len(response.content)
 
 
-def test_thread_queue_and_execution_are_separate(capsys):
+def test_thread_queue_and_execution_are_separate(capsys, monkeypatch):
+    """queue = enqueue -> worker start; exec = worker start -> worker end.
+
+    A local clock replaces wall time (T707: the old 80 ms sleep + >=50 ms
+    threshold flaked). The job is held in the thread queue while the clock
+    advances 0.100 s, then its worker advances it 0.010 s, so both fields are
+    exact and any swap of the timing points shows up as a wrong value.
+    """
+    clock = {"now": 1000.0, "reads": 0}
+
+    def perf_counter():
+        clock["reads"] += 1
+        return clock["now"]
+
+    monkeypatch.setattr(_reqlog, "time", type("_Clock", (), {"perf_counter": staticmethod(perf_counter)}))
     app = build_app()
+
     @app.get("/test-queue")
     async def queued(request: Request):
         limiter = anyio.to_thread.current_default_thread_limiter()
         old = limiter.total_tokens
         limiter.total_tokens = 1
-        entered = asyncio.Event()
+        entered, release = asyncio.Event(), asyncio.Event()
+
         async def hold():
             async with limiter:
                 entered.set()
-                await asyncio.sleep(0.08)
+                await release.wait()
+
+        def work():
+            clock["now"] += 0.010
+
         holder = asyncio.create_task(hold())
         await entered.wait()
+        job = None
         try:
-            await _reqlog.decrypt_job(request, time.sleep, 0.01)
+            reads_before = clock["reads"]
+            job = asyncio.create_task(_reqlog.decrypt_job(request, work))
+            for _ in range(100):  # bounded: a regression must fail, not hang
+                if clock["reads"] > reads_before:
+                    break
+                await asyncio.sleep(0)
+            assert clock["reads"] > reads_before, "decrypt_job must stamp `queued` before the thread queue"
+            assert not job.done()  # ...and is parked behind the held token
+            clock["now"] += 0.100
+            release.set()
             await holder
+            await job
         finally:
+            release.set()
+            await asyncio.gather(holder, *([job] if job else []), return_exceptions=True)
             limiter.total_tokens = old
         return JSONResponse({"ok": True})
+
     assert TestClient(app).get("/test-queue").status_code == 200
     row, = records(capsys)
-    assert row["decrypt_queue_ms"] >= 50
-    assert 5 <= row["decrypt_ms"] < row["decrypt_queue_ms"]
+    assert row["decrypt_queue_ms"] == pytest.approx(100.0)
+    assert row["decrypt_ms"] == pytest.approx(10.0)
 
 
 def test_sink_provenance_has_one_closed_record_output():
