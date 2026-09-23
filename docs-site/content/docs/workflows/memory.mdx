@@ -286,17 +286,34 @@ raw errors, and other memory text are never part of this diagnostic shape.
 
 With tracing enabled, Runtime V2 Capture and Dream emit
 `memory.extraction.refusal` when an Anthropic response explicitly reports
-`stop_reason: refusal`, including attempts that later retry successfully. The
+`stop_reason: refusal`. The
 closed detail contains `runtime`, `lane`, `stop_reason`, `refusal_category`, and
 `attempt` (the outer attempt number within that provider round). Categories are
 `cyber`, `bio`, `frontier_llm`, `reasoning_extraction`, `general_harms`, or
 `unclassified` for missing/unknown values. Neither provider explanations nor
 prompt/reply text enter this event. The admin projection accepts only that exact
-shape plus the database’s closed `outcome_class_provenance` field. This is an
-observation, not a new terminal error classification: existing
-job outcomes, provider-health attribution, retry counts, and budgets are
-unchanged. Text-only refusals and other provider wires are not identified by
-this marker; absence of the event is not proof that no refusal occurred.
+shape plus the database’s closed `outcome_class_provenance` field. Text-only
+refusals and other provider wires are not identified by this marker; absence
+of the event is not proof that no refusal occurred.
+
+Capture and Dream stop the current extraction on this explicit marker, even
+when the refused response contains partial text. They do not retry that
+response or pass its text to the memory parser, and the job fails with
+`extraction_failed:content_filtered`. This policy applies whether tracing is
+enabled or not, and a failing trace sink cannot change it. A refusal proves
+that the provider route answered, so it records provider-health success rather
+than a service failure. Ordinary empty replies and transient service failures
+retain their retry policy; chat, tool calls, and Resident V1 are unchanged.
+
+For Capture, this failure uses the existing non-account backoff and six-failure
+window-skip policy. With default settings, six consecutive refused jobs make
+six provider calls; the five intervening backoffs total 5 hours 10 minutes,
+plus execution and scheduling delays. The third through fifth failures use the
+existing generic memory-backoff notice instead of account-repair guidance.
+The sixth failure advances the cursor past that window and resolves the
+notice: that skipped conversation batch produces no memories. A failure
+without a known window never advances the cursor. Dream retains its normal
+non-account scheduling policy and leaves its source cards unchanged.
 
 Runtime V2 Capture and Dream also record provider wire-attempt metadata in the
 operator-readable `provider_attempts` ledger: job correlation, provider/model,

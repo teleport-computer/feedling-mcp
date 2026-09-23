@@ -2434,3 +2434,129 @@ def test_refusal_observer_is_wired_without_trajectory_or_semantic_change(monkeyp
     assert observed[0]["job_id"] == str(job_id)
     assert status == "failed"
     assert "empty_reply" in _job_row(job_id)[1]
+
+
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+@pytest.mark.parametrize("response", ["empty_refusal", "partial_refusal", "empty", "unavailable"])
+def test_real_extraction_refusal_policy_and_persisted_health(monkeypatch, lane, response):
+    """Real parser/reliable/session/worker/DB: a policy rejection is a live route."""
+    import inspect
+    from memory import extraction_trace
+
+    uid = f"u_policy_{lane}_{response}"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    traces, emit = _trace_collector()
+    calls, failures, writes = [], [], []
+    record_failure = worker.provider_health.record_failure
+
+    def track_failure(*args, **kwargs):
+        failures.append(kwargs["error_class"])
+        return record_failure(*args, **kwargs)
+
+    async def wire(*args, **kwargs):
+        calls.append(1)
+        if response == "unavailable":
+            exc = provider_client.ProviderError("unavailable")
+            exc.status_code = 503
+            raise exc
+        return provider_client._parse_anthropic_body({
+            "stop_reason": "refusal" if "refusal" in response else "end_turn",
+            "stop_details": {"category": "reasoning_extraction"},
+            "content": [{"type": "text", "text": '{"cards": []}'}]
+            if response == "partial_refusal" else [],
+        }, model="test", require_reply=True)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", wire)
+    monkeypatch.setattr(provider_client, "_reliable_retry_delay_sec", lambda *a, **k: 0)
+    monkeypatch.setattr(worker.provider_health, "record_failure", track_failure)
+    deps = _deps(emit_debug_trace=emit, apply_memory_actions=lambda *a: writes.append(a))
+    assert asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    )) == "failed"
+    refused = "refusal" in response
+    expected_code = "content_filtered" if refused else "upstream_unavailable"
+    assert _job_row(job_id) == ("failed", f"extraction_failed:{expected_code}")
+    assert len(calls) == (1 if refused else inspect.signature(
+        provider_client.reliable_chat_completion_async).parameters["max_attempts"].default)
+    assert failures == ([] if refused else ["upstream_unavailable"])
+    assert writes == []
+    assert len([e for e in traces if e["type"] == extraction_trace.REFUSAL_TRACE_TYPE]) == int(refused)
+    with db.get_pool().connection() as conn:
+        health = conn.execute(
+            "SELECT provider_state, last_provider_success_at, last_provider_failure_at, "
+            "last_provider_error_class FROM provider_health WHERE user_id=%s", (uid,),
+        ).fetchone()
+        assert conn.execute("SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)).fetchone()[0] == 0
+    assert health is not None
+    if refused:
+        assert health[0] == "ok" and health[1] is not None
+        assert health[2] is None and not health[3]
+    else:
+        assert health[1] is None and health[2] is not None
+        assert health[3] == "upstream_unavailable"
+
+
+def test_capture_refusal_skips_same_window_only_at_existing_threshold(monkeypatch):
+    from memory import capture_failure
+    from model_api_runtime.v2 import serve_worker
+    from notices import core as notices_core
+
+    uid = "u_policy_refusal_skip"
+    _seed_v2(uid)
+    calls = []
+    def forbidden(*a, **kw):
+        pytest.fail("refusal must not prepare or apply any memory")
+
+    async def wire(*args, **kwargs):
+        calls.append(1)
+        return provider_client._parse_anthropic_body({
+            "stop_reason": "refusal", "content": [],
+        }, model="test", require_reply=True)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", wire)
+    monkeypatch.setattr(provider_client, "_reliable_retry_delay_sec", lambda *a, **k: 0)
+    deps = _deps(
+        read_capture_state=serve_worker._read_capture_state,
+        prepare_capture_batch=forbidden, apply_memory_actions=forbidden,
+    )
+    threshold = capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER
+    for attempt in range(1, threshold + 1):
+        # Explicit enqueue bypasses scheduler wait; production backoff is not changed.
+        job_id, _ = jobs_store.enqueue_job(uid, "capture")
+        job = jobs_store.claim_next_job("w")
+        assert asyncio.run(worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+        )) == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:content_filtered")
+        assert len(calls) == attempt
+        state = db.get_blob_strict(uid, "capture_state")
+        assert state["capture_account_error_code"] == ""
+        assert not state.get("capture_account_fail_since")
+        assert int(state.get("last_captured_until_seq") or 0) == int(attempt == threshold)
+        assert int(state.get("capture_skipped_windows") or 0) == int(attempt == threshold)
+        asyncio.run(worker._notify_capture_backoff(deps, job, "failed"))
+        notices = {r["dedupe_key"]: r for r in db.log_read_all(uid, notices_core.NOTICES_STREAM)}
+        if 3 <= attempt < threshold:
+            notice = notices["memory_backoff:capture"]
+            assert not notice["resolved"]
+            assert notice["user_text"] == f"记忆整理（capture）连续失败 {attempt} 次，正在退避重试。"
+            assert notice["blame"] == "system"
+        if attempt == threshold:
+            assert notices["memory_backoff:capture"]["resolved"] is True
+    assert state["last_captured_until_message_id"] == "m1"
+    assert state["capture_fail_streak"] == 0
+
+
+def test_content_filtered_without_window_never_skips():
+    from memory import capture_failure
+    state = {"last_captured_until_seq": 17}
+    for attempt in range(1, capture_failure.CAPTURE_TRANSIENT_SKIP_AFTER + 3):
+        patch, streak, skipped = capture_failure.capture_failure_patch(
+            state, {}, now_ts=float(attempt), reason="extraction_failed:content_filtered",
+        )
+        state.update(patch)
+        assert not skipped and streak == attempt
+        assert state["last_captured_until_seq"] == 17
+        assert not state.get("capture_skipped_windows")

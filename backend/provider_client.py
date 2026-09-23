@@ -6249,6 +6249,7 @@ async def reliable_chat_completion_async(
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
     refusal_out: Any = None,
+    retry_refusal: bool = True,
     absolute_deadline: float | None = None,
     retry_output_truncation: bool = True,
     wire_deadline_sec: float | None = None,
@@ -6259,6 +6260,12 @@ async def reliable_chat_completion_async(
     ``refusal_out`` observes explicit policy metadata on each outer attempt,
     including a refused attempt followed by recovery. It never supplies retry
     decisions; observer failures are swallowed and no raw policy text is passed.
+
+    ``retry_refusal=False`` lets Capture/Dream stop on the explicit structured
+    refusal metadata recognized by ``provider_refusal.project``. Both empty
+    refusals and refused responses carrying partial text raise on that attempt
+    with ``feedling_error_class == "content_filtered"``. Other callers retain
+    the default policy; this choice is independent of the observer callback.
 
     Same semantics as `reliable_chat_completion`: exponential backoff (base·3^n)
     + jitter, capped; honours 429 Retry-After when present. NEVER retries
@@ -6376,6 +6383,17 @@ async def reliable_chat_completion_async(
                 result = await _with_wire_progress(
                     chat_completion_async(*args, **attempt_kwargs), attempt
                 )
+            refusal = provider_refusal.project(
+                result.get("provider_refusal") if isinstance(result, dict) else None
+            )
+            if not retry_refusal and refusal is not None:
+                # A partial refused answer is not a usable extraction result.
+                # Enter the same exception path as an empty parser refusal,
+                # retaining wire evidence and observing this attempt once.
+                exc = ProviderError("provider_refusal")
+                exc.provider_refusal = refusal
+                _attach_provider_attempt_trace(exc, _attempts_from_result(result))
+                raise exc
             await provider_refusal.observe(refusal_out, result, attempt)
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
@@ -6427,9 +6445,13 @@ async def reliable_chat_completion_async(
             truncation_terminal = (
                 not retry_output_truncation and is_output_truncation_error(exc)
             )
+            refusal_terminal = not retry_refusal and provider_refusal.project(
+                getattr(exc, "provider_refusal", None)
+            ) is not None
             terminal = (
                 cls == "provider_config"
                 or truncation_terminal
+                or refusal_terminal
                 or attempt >= attempts
                 or deadline_exhausted
             )
@@ -6471,7 +6493,9 @@ async def reliable_chat_completion_async(
                 )
             if terminal:
                 exc.feedling_error_class = (
-                    "provider_config"
+                    "content_filtered"
+                    if refusal_terminal
+                    else "provider_config"
                     if cls == "provider_config"
                     else "output_truncated"
                     if truncation_terminal

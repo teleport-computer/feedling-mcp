@@ -33,9 +33,13 @@ change must not be interpreted as an API guarantee.
   the wake lane does not.
 
 - Runtime V2 Capture and Dream traces now distinguish explicit Anthropic
-  refusals with content-free `memory.extraction.refusal` observations, including
-  refusals seen before a successful retry. Existing failure outcomes and retry
-  budgets are unchanged; unknown refusal categories remain `unclassified`.
+  refusals with content-free `memory.extraction.refusal` observations; unknown
+  categories remain `unclassified`. Explicit refusals stop the extraction on
+  that attempt with `content_filtered`, including responses with partial text,
+  and do not count as provider-health failures. Capture uses its existing
+  generic backoff notice and skips the window after six failed jobs; skipped
+  batches produce no memories. Ordinary empty replies, transient service
+  retries, chat, and Resident V1 retain their existing behavior.
 
 - Resident V1 asks for the persona aside as a leading `<aside>…</aside>` block
   again, on every driver and route (pi and codex no longer use `<think>`).
