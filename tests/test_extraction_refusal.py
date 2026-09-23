@@ -1,11 +1,13 @@
-"""Refusal telemetry observes provider policy markers, never changes outcomes."""
+"""Explicit refusal policy is lane-scoped and independent of telemetry."""
 import asyncio
 import inspect
 import json
 
+import httpx
 import pytest
 
 import provider_client as pc
+import provider_attempt_metadata
 import provider_refusal
 from admin import data_track
 from memory import extraction_trace
@@ -107,7 +109,7 @@ def test_real_parser_reliable_extraction_to_trace_and_admin(monkeypatch, lane):
     observer = extraction_trace.refusal_observer(
         emit, "u", lane=lane, job_id="job", trace_id="trace",
     )
-    # Nonempty explicit refusal is also observable without changing reply parse.
+    # Partial refused text must never become memory content.
     async def wire(*args, **kwargs):
         return pc._parse_anthropic_body(body(text="partial"), model="test", require_reply=True)
     monkeypatch.setattr(pc, "chat_completion_async", wire)
@@ -115,7 +117,7 @@ def test_real_parser_reliable_extraction_to_trace_and_admin(monkeypatch, lane):
         provider_config=object(), prompt=PRIVATE, parse=lambda reply: ([reply], None),
         refusal_out=observer,
     ))
-    assert result == (["partial"], None)
+    assert result == (None, "provider_call_failed:content_filtered")
     assert len(traces) == 1
     detail = traces[0]["detail"]
     assert detail == {
@@ -158,6 +160,7 @@ def test_trace_sink_failure_does_not_change_extraction_result(monkeypatch):
         raise RuntimeError(PRIVATE)
     kwargs = dict(provider_config=object(), prompt="p", parse=lambda reply: ([reply], None))
     baseline = asyncio.run(extraction.extract(**kwargs))
+    assert baseline == (None, "provider_call_failed:content_filtered")
     assert asyncio.run(extraction.extract(**kwargs, refusal_out=extraction_trace.refusal_observer(
         broken, "u", lane="capture", job_id="job", trace_id="trace",
     ))) == baseline
@@ -185,7 +188,7 @@ def test_refusal_survives_production_trace_storage_and_admin(monkeypatch, lane):
         refusal_out=extraction_trace.refusal_observer(
             emit, uid, lane=lane, job_id="job", trace_id="trace",
         ),
-    )) == (["partial"], None)
+    )) == (None, "provider_call_failed:content_filtered")
     rows = [r for r in debug_trace.read_trace(store) if r["type"] == extraction_trace.REFUSAL_TRACE_TYPE]
     assert len(rows) == 1
     assert rows[0]["detail"]["refusal_category"] == "reasoning_extraction"
@@ -216,3 +219,112 @@ def test_refusal_stop_marker_requires_exact_case_sensitive_match(stop, boundary)
         assert provider_refusal.project({
             "stop_reason": stop, "refusal_category": "reasoning_extraction",
         }) is None
+
+
+@pytest.mark.parametrize("text", ["", "partial"])
+@pytest.mark.parametrize("observer", ["absent", "working", "broken"])
+def test_opt_out_refusal_stops_one_real_wire_and_preserves_trace(monkeypatch, text, observer):
+    calls, seen = [], []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json=body(text=text))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(pc, "_shared_async_client", client)
+    cfg = pc.ProviderConfig(
+        provider="anthropic", model="test", api_key="private-key",
+        base_url="https://relay.example/v1", capture_attempt_trace=True,
+    )
+
+    async def callback(detail):
+        seen.append(detail)
+        if observer == "broken":
+            raise RuntimeError(PRIVATE)
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(pc.reliable_chat_completion_async(
+            cfg, [{"role": "user", "content": PRIVATE}], retry_refusal=False,
+            refusal_out=None if observer == "absent" else callback, base_delay_sec=0,
+        ))
+    assert len(calls) == 1
+    assert raised.value.feedling_error_class == "content_filtered"
+    assert raised.value.provider_refusal == provider_refusal.from_anthropic_body(body())
+    assert len(seen) == (0 if observer == "absent" else 1)
+    attempts = pc.runtime_provider_attempt_trace(raised.value)["attempts"]
+    assert [a["kind"] for a in attempts] == ["http_attempt", "outer_attempt"]
+    assert [a["status"] for a in attempts] == [200, 200]
+    assert attempts[-1]["outcome"] == "terminal_error"
+    assert attempts[-1]["wire"]["ordinals"] == [1]
+    # This private runtime envelope deliberately retains the request; public
+    # refusal detail is independently content-free.
+    assert PRIVATE not in json.dumps(seen)
+    public = provider_attempt_metadata.project(pc.runtime_provider_attempt_trace(raised.value))
+    assert public["wire_attempt_count"] == public["outer_attempt_count"] == 1
+    assert PRIVATE not in json.dumps(public)
+
+
+@pytest.mark.parametrize("stop", ["end_turn", "refusal_pending", "no_refusal", "soft-refusal", "REFUSAL"])
+def test_opt_out_still_retries_nonrefusal_empty_replies(monkeypatch, stop):
+    calls = []
+
+    async def wire(*args, **kwargs):
+        assert "retry_refusal" not in kwargs
+        calls.append(1)
+        return pc._parse_anthropic_body(body(stop=stop), model="test", require_reply=True)
+
+    monkeypatch.setattr(pc, "chat_completion_async", wire)
+    monkeypatch.setattr(pc, "_reliable_retry_delay_sec", lambda *a, **k: 0)
+    assert asyncio.run(extraction.extract(
+        provider_config=object(), prompt="p", parse=lambda r: pytest.fail("empty reply parsed"),
+    )) == (None, "provider_call_failed:upstream_unavailable")
+    assert len(calls) == DEFAULT_ATTEMPTS
+
+
+@pytest.mark.parametrize("session_mode", [False, True])
+@pytest.mark.parametrize("text", ["", "partial"])
+def test_refusal_never_reaches_parser_or_component_session(monkeypatch, session_mode, text):
+    calls = []
+
+    async def wire(*args, **kwargs):
+        calls.append(1)
+        return pc._parse_anthropic_body(body(text=text), model="test", require_reply=True)
+
+    class Session:
+        def next_prompt(self):
+            return "p"
+
+        def feed(self, *args, **kwargs):
+            pytest.fail("refused text reached component parser")
+
+        def result(self):
+            pytest.fail("refusal must return before component result")
+
+    monkeypatch.setattr(pc, "chat_completion_async", wire)
+    monkeypatch.setattr(pc, "_reliable_retry_delay_sec", lambda *a, **k: 0)
+    assert asyncio.run(extraction.extract(
+        provider_config=object(), prompt="p", parse=lambda r: pytest.fail("refused text parsed"),
+        session=Session() if session_mode else None,
+    )) == (None, "provider_call_failed:content_filtered")
+    assert len(calls) == 1
+
+
+def test_default_async_partial_refusal_still_returns_reply(monkeypatch):
+    async def wire(*args, **kwargs):
+        return pc._parse_anthropic_body(body(text="partial"), model="test", require_reply=True)
+    monkeypatch.setattr(pc, "chat_completion_async", wire)
+    result = asyncio.run(pc.reliable_chat_completion_async())
+    assert result["reply"] == "partial"
+    assert result["provider_refusal"]["stop_reason"] == "refusal"
+
+
+def test_sync_refusal_keeps_default_retry_policy(monkeypatch):
+    calls = []
+    def wire(*args, **kwargs):
+        calls.append(1)
+        return pc._parse_anthropic_body(body(), model="test", require_reply=True)
+    monkeypatch.setattr(pc, "chat_completion", wire)
+    with pytest.raises(pc.ProviderError) as raised:
+        pc.reliable_chat_completion(base_delay_sec=0)
+    assert len(calls) == inspect.signature(pc.reliable_chat_completion).parameters["max_attempts"].default
+    assert raised.value.feedling_error_class == "transient_exhausted"

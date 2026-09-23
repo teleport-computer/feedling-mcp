@@ -263,10 +263,10 @@ async def _extract_with_provider_health(
         raise
     _items, reason = result
     provider_failure = v2_extraction.provider_failure_code_from_reason(reason or "")
-    if provider_failure is not None:
+    if provider_failure is not None and provider_failure != "content_filtered":
         await _record_provider_failure_class(user_id, provider_failure)
     else:
-        # Parse/semantic rejection still proves the provider route answered;
+        # Policy refusal and parse/semantic rejection prove the route answered;
         # provider-health tracks route liveness, not card quality.
         await _record_provider_success(
             user_id, latency_ms=(time.monotonic() - started) * 1000.0
