@@ -1112,3 +1112,71 @@ def test_per_segment_wins_over_the_daily_totals_in_the_same_payload(clean):
     kept = _sleep_only(out.applied)
     assert [o.stored.source_event_id for o in kept] == ["seg-only"], \
         "有分段时不该再按总数摊出 deep/rem 那两条"
+
+
+# ---------------------------------------------------------------------------
+# 删掉一条数据之后，提醒记录里的原值也抹掉（hx 2026-09-17 拍板）
+# ---------------------------------------------------------------------------
+
+def test_retracting_a_fact_scrubs_the_value_from_the_alert_it_triggered(clean):
+    """早上称 72kg 触发了涨重提醒，下午发现秤没放平把它删了 ——
+    提醒记录里不许再留着 72，只留"有过一条已被删除的数据触发过"。
+
+    整条删掉是不行的："这条提醒当初为什么发"就再也解释不清了。
+    """
+    from datetime import datetime, timezone
+
+    from perceptkit.contracts.records import EventOutboxEntry
+
+    conn = connect()
+    s = store(conn)
+    now = datetime(2026, 9, 6, 9, 0, tzinfo=timezone.utc)
+    s.enqueue_event(EventOutboxEntry(
+        event_id="evt-1", subject_id="u1", definition_id="weight_over",
+        definition_version=1, event_type="health.weight_over",
+        occurred_at=now, detected_at=now,
+        fact_snapshot={"current": 72.0, "previous": 70.0},
+        source="ios", source_event_id="hk-B",
+    ))
+
+    hit = s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
+                                  source="ios", source_event_id="hk-B")
+    assert hit == 1, "没找到那条提醒"
+
+    raw = conn.execute(
+        "SELECT fact_snapshot FROM perceptkit_event_outbox WHERE event_id='evt-1'"
+    ).fetchone()[0]
+    assert raw.get("retracted") is True, "没标出来触发它的数据已被删除"
+    assert raw.get("current") is None and raw.get("previous") is None, \
+        f"提醒记录里还留着被删掉的数值：{raw}"
+    still_there = conn.execute(
+        "SELECT 1 FROM perceptkit_event_outbox WHERE event_id='evt-1'").fetchone()
+    assert still_there, "整条记录被删掉了 —— 该留下「触发过」这件事"
+
+
+def test_scrubbing_leaves_other_alerts_alone(clean):
+    """反向守卫：别人的、以及同一个人另一条数据触发的提醒，一个字都不许动。"""
+    from datetime import datetime, timezone
+
+    from perceptkit.contracts.records import EventOutboxEntry
+
+    conn = connect()
+    s = store(conn)
+    now = datetime(2026, 9, 6, 9, 0, tzinfo=timezone.utc)
+    for eid, subject, src_id in (("evt-1", "u1", "hk-B"),
+                                 ("evt-2", "u1", "hk-OTHER"),
+                                 ("evt-3", "u2", "hk-B")):
+        s.enqueue_event(EventOutboxEntry(
+            event_id=eid, subject_id=subject, definition_id="weight_over",
+            definition_version=1, event_type="health.weight_over",
+            occurred_at=now, detected_at=now,
+            fact_snapshot={"current": 72.0}, source="ios", source_event_id=src_id,
+        ))
+
+    assert s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
+                                   source="ios", source_event_id="hk-B") == 1
+    kept = conn.execute(
+        "SELECT event_id FROM perceptkit_event_outbox "
+        "WHERE fact_snapshot->>'current' IS NOT NULL ORDER BY event_id"
+    ).fetchall()
+    assert [r[0] for r in kept] == ["evt-2", "evt-3"], kept

@@ -427,16 +427,53 @@ class PostgresStorage:
             INSERT INTO perceptkit_event_outbox
               (event_id, subject_id, definition_id, definition_version, event_type,
                occurred_at, detected_at, delivery_state, attempt_count,
-               fact_snapshot, next_attempt_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               fact_snapshot, next_attempt_at, source, source_event_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (event_id) DO NOTHING
             RETURNING 1
             """,
             (e.event_id, e.subject_id, e.definition_id, e.definition_version,
              e.event_type, e.occurred_at, e.detected_at, e.delivery_state,
-             e.attempt_count, _j(e.fact_snapshot), e.next_attempt_at),
+             e.attempt_count, _j(e.fact_snapshot), e.next_attempt_at,
+             getattr(e, "source", None), getattr(e, "source_event_id", None)),
         )
         return bool(rows)
+
+    def scrub_event_snapshots(self, *, subject_id, signal, source,
+                              source_event_id) -> int:
+        """把被撤回那条事实触发过的事件里的**原值**抹掉，返回改了几条。
+
+        用户在健康 app 里删掉一条体重之后，"体重 72kg 触发了涨重提醒"这条
+        记录里的 72 也不该再留着（hx 2026-09-17 拍板，是「删除不再提供原值」
+        的延伸）。
+
+        **记录本身留着**，只把快照里的数值换成"已删除"的标记 —— 整条删掉的话
+        "这条提醒当初为什么发"就再也解释不清了。已经投出去的消息不回收，
+        那是已经发生的事。
+
+        `retracted` 已经为真的跳过：撤回会重传，不能每次都改一遍
+        （也省得把同一件事记成好几次）。
+
+        **`signal` 没进 WHERE 是有意的**：这张表没有 signal 列，而
+        (人, 来源, 样本id) 本身就唯一 —— source_event_id 是上游那条样本的 id。
+        加一列只为多一个恒真的条件，不值得。
+        """
+        rows = self._q(
+            """
+            UPDATE perceptkit_event_outbox
+               SET fact_snapshot = fact_snapshot
+                     || jsonb_build_object('previous', NULL,
+                                           'current',  NULL,
+                                           'retracted', TRUE)
+             WHERE subject_id = %s
+               AND source = %s
+               AND source_event_id = %s
+               AND COALESCE((fact_snapshot->>'retracted')::boolean, FALSE) = FALSE
+            RETURNING 1
+            """,
+            (subject_id, source, source_event_id),
+        )
+        return len(rows or ())
 
     def claim_pending_event(self, *, worker_id, now, lease_seconds):
         """Atomically pick one row and take ownership of it.

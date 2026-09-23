@@ -77,6 +77,9 @@ COMPARABLE: dict[str, dict[str, Any]] = {
     },
     "broadcast": {
         "is_active": "broadcast_active",
+        # 0.8.0 新增：区分采集中 / 暂停 / 关闭。老路一直有同名的这一格，
+        # 所以这是真能对比的一对，不是"没东西可比"。
+        "broadcast_state": "broadcast_state",
     },
     "focus_state": {
         "is_active": "in_focus",
@@ -182,6 +185,10 @@ KIT_ONLY: dict[tuple[str, str], str] = {
     ("music_playback", "track_key"): "computed by the adapter; nothing to compare against",
     ("music_playback", "position_seconds"): "iOS reports the track's total duration, not the playback position; neither side has this",
     ("music_playback", "edge_quality"): "computed by the adapter; nothing to compare against",
+    # 0.8.0 新增的两格。老路的 now_playing 只有一个曲名字符串，
+    # 既没有类型也没有总时长 —— 没东西可比，不是比出来一致。
+    ("music_playback", "media_type"): "live now_playing is a single title string; no media type",
+    ("music_playback", "duration_seconds"): "live now_playing is a single title string; no duration",
     ("health_workout", "active_energy_kcal"): "live health_workout does not carry it",
     ("health_workout", "distance_m"): "live health_workout does not carry it",
     ("health_workout", "start_at"): "live stores no workout interval",
@@ -306,6 +313,11 @@ NOT_SHADOWED: dict[str, str] = {
     # the shadow never saw them. Every perception entry point is tapped now
     # (see events.py). Anything added back belongs here with its reason rather
     # than left to look like agreement.
+    #
+    # place_zone 是 0.8.0 新增的信号（用户命名区域的内/外）。io 的 iOS 不发
+    # 这一项，目录里也没有这个上报键 —— 影子根本收不到它。写在这里而不是
+    # 留空，是为了让"没接"和"接了但一致"分得开。
+    "place_zone": "io's iOS does not report it; the signal has no report key here",
 }
 
 

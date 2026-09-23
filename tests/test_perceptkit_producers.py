@@ -48,15 +48,20 @@ def value(envelope, signal):
 # --------------------------------------------------------------------------
 
 def test_no_signal_is_left_unshadowed_any_more():
-    """`NOT_SHADOWED` 必须是空的。
+    """名单逐条钉住，而且覆盖率要合得上。
 
-    非空就意味着有信号从来没被喂进 kit，而报告照样是干净的 ——
-    「没比过」和「比过都一样」长得一模一样，这条就是不让它们再长得一样。
+    名单里的每一条都意味着有信号从来没被喂进 kit，而报告照样是干净的 ——
+    「没比过」和「比过都一样」长得一模一样。所以名单不是"可以随便加"，
+    新增一条必须在这里显式认下来。
+
+    place_zone：kit 0.8.0 新增，io 的 iOS 不发这一项，目录里也没有这个
+    上报键 —— 影子收不到它，不是"接了但一致"。
     """
-    assert compare.NOT_SHADOWED == {}
+    assert set(compare.NOT_SHADOWED) == {"place_zone"}
     cov = compare.coverage(MINIMAL_SIGNALS)
     assert len(cov["signals_compared"]) + len(cov["signals_observed_only"]) \
-        + len(cov["shape_differs"]) == cov["signals_total"]
+        + len(cov["shape_differs"]) + len(compare.NOT_SHADOWED) \
+        == cov["signals_total"]
 
 
 def test_signals_without_a_live_counterpart_say_so():

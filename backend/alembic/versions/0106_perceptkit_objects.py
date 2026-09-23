@@ -132,7 +132,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
   next_attempt_at    TIMESTAMPTZ,
   claim_token        TEXT,
   claimed_by         TEXT,
-  claim_expires_at   TIMESTAMPTZ
+  claim_expires_at   TIMESTAMPTZ,
+  -- 这条事件是被哪条源事实触发的。用户删掉那条数据时，靠它找到这条记录、
+  -- 把快照里的原值抹掉（只留"有过一条已被删除的数据触发过"）。
+  -- 可空：这之前落库的事件没有这个信息，编一个比留空更坏。
+  source             TEXT,
+  source_event_id    TEXT
 );
 
 -- How a worker picks up work: by state and due time. Ordering within one
@@ -140,6 +145,11 @@ CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
 CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_claimable
   ON perceptkit_event_outbox (delivery_state, next_attempt_at)
   WHERE delivery_state IN ('pending', 'claimed');
+
+-- 抹值是按 (人, 信号, 来源, 样本id) 找行；没有这个索引就是全表扫，
+-- 而撤回发生在用户点"删除"的那一刻，是同步路径。
+CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_source
+  ON perceptkit_event_outbox (subject_id, source, source_event_id);
 
 CREATE TABLE IF NOT EXISTS perceptkit_wake_receipt (
   event_id    TEXT        NOT NULL,
