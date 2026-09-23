@@ -10632,9 +10632,12 @@ async def _run_wake(
                 _wst_status, _wst_thinking, _wst_reply = _wake_split(text)
                 if _wst_status == _st_wake.SALVAGED:
                     # Tags too tangled for the strict pass, reply text still
-                    # separable (T656): deliver it, show no thinking.
+                    # separable (T656): deliver it, drop the stripped inline
+                    # block silently (T697 — same rule as the chat lane; no
+                    # marker just for that). This does not clear
+                    # _wake_self_thinking_text: an aside supplied separately
+                    # through the reply tool still displays (branch "self").
                     text = _wst_reply
-                    wake_self_thinking_failed = True
                 elif _wst_status == _st_wake.COMPLETE:
                     text = _wst_reply
                 elif _wst_status == _st_wake.SILENT:
@@ -10655,8 +10658,15 @@ async def _run_wake(
                     if final:
                         raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
-            if _wake_self_thinking_on and not _wake_self_thinking_text:
-                wake_self_thinking_failed = True
+            # Same rule as the chat lane (T697, Seven 2026-09-23): an aside the
+            # model never wrote is not a failure, so display nothing instead of
+            # the thinking-failed marker. The internal-term site above is the
+            # only place left that still sets the marker in this lane. SALVAGED
+            # (above) drops only the stripped inline block silently — it does
+            # not clear a separately supplied _wake_self_thinking_text, which
+            # still displays normally (branch "self") when present. SILENT/
+            # FAILED never reach a marker here: they end the wake via an early
+            # return or TurnError, not a delivered bubble.
             if text and _is_degenerate_reply(text):
                 await _suppress_empty_visible_reply(
                     final=final,
@@ -15679,9 +15689,6 @@ async def process_job(
             nonlocal voice_call_ended_atomically
             nonlocal thinking_trace_emitted, language_trace_emitted
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
-            validated_final_reply = isinstance(
-                text, v2_tool_loop.ValidatedFinalReply
-            )
             structured_aside = (
                 text.thinking if isinstance(text, v2_tool_loop.ValidatedReply) else ""
             )
@@ -15747,12 +15754,16 @@ async def process_job(
                 if _st_status == self_thinking.SALVAGED:
                     # Strict pass refused the tag shape but the reply text is
                     # separable (T656, Seven 2026-09-19: never fail the turn for
-                    # this). Deliver the reply; drop the thinking and show the
-                    # thinking-failed marker so the envelope stays honest — but
-                    # it is a delivered reply, not a turn failure (see
-                    # turn_failure_error_class below).
+                    # this). Deliver the reply and drop the stripped inline block
+                    # silently — T697, Seven 2026-09-23: an inline <think> we had
+                    # to discard is not itself a reason to show the marker (this
+                    # is what the V1 resident lane has always done). This does
+                    # NOT touch self_thinking_text: an aside supplied separately
+                    # through the reply tool still displays normally (branch
+                    # "self") below; only the absence of any displayable aside
+                    # falls through to branch "none". The salvage is still
+                    # recorded on the trajectory below for observability.
                     text = _st_reply
-                    self_thinking_failed = True
                     await _record_trajectory(
                         trajectory_recorder,
                         "self_thinking_salvaged",
@@ -15905,14 +15916,20 @@ async def process_job(
                     )
                     if not pending_file_replies:
                         raise TurnError("internal_file_reference_without_attachment")
-            # Missing optional aside is a presentation failure only. Never
-            # spend another provider call or turn a usable body into an error.
-            if (
-                self_thinking_on and file_reply is None and text
-                and not validated_final_reply
-                and not self_thinking_text
-            ):
-                self_thinking_failed = True
+            # A missing aside is not a failure: the field is optional, so the
+            # model simply did not write one and there is nothing to show
+            # (T697, Seven 2026-09-23). Showing the thinking-failed marker here
+            # told the user "思考没写完" for a turn where nothing was ever
+            # written — 133 of 378 chat turns on 09-22, against 13 the day
+            # before (T695). The marker stays for the two cases where a
+            # displayable aside existed and had to be withheld: an aside
+            # carrying an internal term (above), and SILENT/FAILED — malformed
+            # tags with no separable reply text, so the honest fallback bubble
+            # ships with the marker (above). SALVAGED (malformed tags but a
+            # separable body) drops only the stripped inline block silently; it
+            # does not clear a separately supplied aside. Provider-native
+            # reasoning and inline tag content remain non-display material
+            # either way (T658).
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.
