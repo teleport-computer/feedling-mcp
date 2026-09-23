@@ -218,9 +218,11 @@ upload_material / send_chat / run_consumer / teardown）。
 > 的 `failure` 字段（`complete`/`phase`/`jobs[].status` 三个都可能说"成了"，只有它会反对），
 > 副闸比对**从 runtime 模块派生**的兜底常量集——别在本文档里抄一份字面量，那是会漂的第二份拷贝。
 
-**VPS 侧 P0**（本地起 consumer 连 test 环境，三个 harness 各一遍）：
-Claude Code / Codex / Hermes 各：注册 resident 账号 → 本地 consumer 起 →
+**VPS 侧 P0**（本地起 consumer 连 test 环境，两个 harness 各一遍）：
+Claude Code / Codex 各：注册 resident 账号 → 本地 consumer 起 →
 verify_loop passing → 发消息收回复 → 删号。
+
+Hermes 不纳入发版 P0（Seven 2026-09-06 定）；§5 中触及 harness 的专项回归仍保留。
 
 > **hosted 深度关**：本节 P0 是"能不能用"的浅冒烟。hosted API-key 路线的**深度认证**
 > （五阶段延迟/记忆契约/语义 persona/strict V2）走 §10 的 sxysun `qa/` 引擎（PR #95）——

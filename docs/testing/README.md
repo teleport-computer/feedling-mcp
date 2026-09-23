@@ -99,7 +99,7 @@ python3 tools/e2e/p0.py --only anthropic-official,openai-official
 ```sh
 # 真实形态:起一个本地 consumer,走完整回合
 python3 tools/e2e/p0.py --only vps-claude-code
-#   还可以 --only vps-codex / vps-hermes(取决于本机装了哪个 CLI)
+#   还可以 --only vps-codex；Hermes 已免发版 P0（Seven 2026-09-06 定）
 
 # 消费端的守卫测试
 python3 -m pytest -q tests/test_chat_resident_consumer*.py tests/test_consumer_*.py
@@ -128,7 +128,7 @@ Hosted Resident 还要覆盖 supervisor→consumer 接线与 self-update 契约�
 **一条命令,所有格子,一张结果表:**
 
 ```sh
-python3 tools/e2e/p0.py            # 7 个托管 provider + 3 种 VPS 形态
+python3 tools/e2e/p0.py            # 配置中的托管 provider + 2 种 VPS 形态
 python3 tools/e2e/p0.py --list     # 先看有哪些格子、key 齐不齐
 ```
 
