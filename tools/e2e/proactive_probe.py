@@ -621,6 +621,18 @@ def _assert_timezone_grounding(text: str, server_started: float, server_finished
             else ("下午", "午后") if hour < 18
             else ("晚上", "晚间", "夜晚", "夜里")
         )
+        # Natural day-period words overlap the canonical prompt labels.
+        # Keep these overlaps hour-bounded, with the same weekday as above.
+        if 5 <= hour < 12:
+            periods += ("清早", "一早", "大早")
+        if hour in (17, 18):
+            periods += ("傍晚",)
+        if hour >= 18:
+            periods += ("今晚", "今夜")
+        if hour >= 22 or hour < 6:
+            periods += ("深夜", "半夜")
+        if hour == 23 or hour < 6:
+            periods += ("午夜",)
         if any(word in text for word in weekdays) and any(word in text for word in periods):
             return f"Asia/Shanghai server_interval={start.isoformat()}..{end.isoformat()}"
         cursor += timedelta(hours=1)

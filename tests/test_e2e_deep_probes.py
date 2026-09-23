@@ -286,6 +286,33 @@ def test_quality_grounding_uses_shanghai_weekday_and_period(stamp, text):
     assert "Asia/Shanghai" in proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
 
 
+@pytest.mark.parametrize("hour,word", [
+    (7, "一早"), (7, "清早"), (7, "一大早"), (7, "大清早"),
+    (5, "一早"), (11, "清早"),
+    (17, "傍晚"), (18, "傍晚"),
+    (18, "今晚"), (20, "今晚"), (20, "今夜"),
+    (22, "深夜"), (23, "深夜"), (22, "半夜"), (23, "午夜"),
+    (0, "半夜"), (0, "午夜"), (5, "半夜"), (5, "午夜"),
+])
+def test_quality_grounding_accepts_natural_period_synonyms(hour, word):
+    ts = _ts(f"2026-09-24T{hour:02d}:05:00+08:00")
+    proactive_probe._assert_timezone_grounding(f"周四{word}，此刻陪你。", ts, ts + 30)
+
+
+@pytest.mark.parametrize("hour,word", [
+    (4, "一早"), (12, "清早"), (12, "一大早"),
+    (16, "傍晚"), (19, "傍晚"),
+    (17, "今晚"), (12, "今夜"),
+    (21, "深夜"), (21, "半夜"), (22, "午夜"),
+    (6, "半夜"), (6, "午夜"),
+])
+def test_quality_grounding_synonyms_do_not_match_other_hours(hour, word):
+    ts = _ts(f"2026-09-24T{hour:02d}:05:00+08:00")
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(f"周四{word}", ts, ts + 30)
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
 @pytest.mark.parametrize("text", ["上海时区", "北京时间，周一晚上", "周日中午", "周一", "中午"])
 def test_quality_grounding_rejects_place_name_or_wrong_time(text):
     ts = _ts("2026-09-21T12:59:00+08:00")
