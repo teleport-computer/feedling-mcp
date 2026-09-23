@@ -50,6 +50,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+import admin_read_timing
 import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 import storage_read_trace
@@ -178,7 +179,7 @@ def configure_pool_max_size(max_size: int | str) -> int:
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is not None:
-        return _pool
+        return admin_read_timing.wrap_pool(_pool)
     with _pool_lock:
         if _pool is None:
             _pool = ConnectionPool(
@@ -191,7 +192,7 @@ def get_pool() -> ConnectionPool:
                 open=True,
                 **_database_pool_lifetime_kwargs(),
             )
-    return _pool
+    return admin_read_timing.wrap_pool(_pool)
 
 
 def get_health_pool() -> ConnectionPool:
