@@ -36,6 +36,7 @@ from core import util as core_util
 from core import wake_bus
 from core.store import UserStore
 from accounts import onboarding as accounts_onboarding
+from accounts import registry as accounts_registry
 from memory import service as memory_service
 import provider_client
 import provider_attempt_ledger
@@ -1903,7 +1904,10 @@ def _record_provider_test_failure(store, exc: BaseException, *, route_id=None) -
             store.user_id, route_id, status="failed",
             error=f"{failure_class}: {exc}"[:240],
         )
-    blame, user_text = notices_catalog.provider_test_notice_for(failure_class)
+    blame, user_text = notices_catalog.provider_test_notice_for(
+        failure_class,
+        language=accounts_registry._get_user_archive_language(store.user_id) or "",
+    )
     notices_core.emit(
         store, source="model_api", error_class=failure_class,
         blame=blame, severity="warning", user_text=user_text,
