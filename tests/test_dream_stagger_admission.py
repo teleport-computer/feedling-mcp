@@ -21,6 +21,7 @@ import db  # noqa: E402
 from conftest import seed_user  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from core import wake_bus as core_wake_bus  # noqa: E402
 from model_api_runtime.v2 import jobs_store, serve_worker  # noqa: E402
 from proactive import capture_jobs  # noqa: E402
 from proactive import dream_scheduler  # noqa: E402
@@ -72,6 +73,10 @@ def dream_env(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     core_store._stores.clear()
+    # wire_assembly() would start the process-wide wake-bus listener, which has
+    # no stop and outlives this file: it re-notifies cached stores for later
+    # tests' chat writes (T701). These tests only need the handler wiring.
+    monkeypatch.setattr(core_wake_bus, "start_listener", lambda: None)
     yield
 
 
@@ -366,6 +371,19 @@ def test_admission_held_elsewhere_answers_busy_and_lock_failure_admits(monkeypat
     monkeypatch.setattr(dream_scheduler.db, "memory_dream_admission_lock", _boom)
     other = _user_with_cards("usr_dream_admission_lock_fails")
     assert dream_scheduler.tick_memory_dream(other, now=time.time())["enqueued"] is True
+
+
+def test_dream_env_wiring_starts_no_wake_bus_listener(dream_env):
+    """T701: the listener thread is process-wide with no stop; if these tests
+    start it, later files' notify_chat_waiters counts pick up extra wakes."""
+    import threading
+
+    def _listeners():
+        return [t for t in threading.enumerate() if t.name == "wake-bus-listener"]
+
+    before = len(_listeners())
+    serve_worker.wire_assembly()
+    assert len(_listeners()) == before
 
 
 def test_ceiling_blocks_the_v2_scheduler_producer(monkeypatch, dream_env, no_v2_jobs):
