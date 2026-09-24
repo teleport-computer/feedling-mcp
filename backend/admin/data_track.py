@@ -3054,8 +3054,10 @@ def _data_track_payload(
         # filter, no sort key, no summary aggregate — and the fleet-level fields
         # below come from the ids-independent watermark table.
         page_ids = [str(r.get("user_id") or "") for r in page]
+        from model_api_runtime.v2 import jobs_store as v2_jobs_store
         background_report = db.admin_background_lane_users(
             page_ids,
+            classify_v2_code=v2_jobs_store.terminal_outcome_class,
             days=int(filters.get("lane_days") or 7),
         )
         # Same pushdown for the memory breakdowns. The row is rebuilt through
@@ -3138,7 +3140,8 @@ def _data_track_payload(
             ),
             "denominator": "completed + operational_failures",
             "excluded": (
-                "control_outcomes, user_unavailable, superseded, expired; "
+                "control_outcomes, user_unavailable, superseded; "
+                "V2 expired/unknown failures remain operational; "
                 "nonterminal jobs are reported by the separate stuck metric"
             ),
         }
@@ -4249,6 +4252,7 @@ def _data_track_debug_flat_payload(
     offset: int,
     page: int,
     user_filter: str,
+    user_exists: bool | None,
     subsystem_filter: str,
     status_filter: str,
     trace_filter: str,
@@ -4404,6 +4408,7 @@ def _data_track_debug_flat_payload(
         },
         "options": _debug_filter_options(option_events),
         "observability": {
+            "user_exists": user_exists,
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
@@ -4446,6 +4451,18 @@ def _data_track_debug_payload() -> dict:
     q = str(filters.get("q") or "").strip().lower()
     since_epoch = float(filters.get("since_epoch") or 0)
 
+    # A deleted account's retained traces remain queryable (T184). Distinguish
+    # an absent exact uid from a live account with no matching events without
+    # making account membership a gate on the trace read. None means no uid filter.
+    user_exists = None
+    if user_filter:
+        connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
+        user_exists = db.user_exists(
+            user_filter,
+            connection_timeout=connection_timeout,
+            statement_timeout_ms=statement_timeout_ms,
+        )
+
     with registry._users_lock:
         live_users = {
             str(user.get("user_id") or ""): dict(user)
@@ -4466,6 +4483,7 @@ def _data_track_debug_payload() -> dict:
             offset=offset,
             page=page,
             user_filter=user_filter,
+            user_exists=user_exists,
             subsystem_filter=subsystem_filter,
             status_filter=status_filter,
             trace_filter=trace_filter,
@@ -4616,6 +4634,7 @@ def _data_track_debug_payload() -> dict:
         },
         "options": _debug_filter_options(all_events_raw),
         "observability": {
+            "user_exists": user_exists,
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
@@ -9246,7 +9265,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
 	  <div class="note-box"><b>后台道按用户失败率</b><br>
 	  数据来自冻结 <code>lane_daily_rollup</code>，默认最近 {int(filters.get('lane_days') or 7)} 个完整北京日；
-	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；
+	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；V2 expired/未知失败仍算运营失败；
 	  pending/claimed/running 不塞进失败率，另由 stuck 指标负责。覆盖不完整时格子明确标 partial，
 	  不会把未量到的 0 冒充健康。可用 <code>lane_days</code> 改窗口。</div>
 	  <div class="sortbar">{sort_controls}</div>
@@ -10877,6 +10896,11 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
     vocabulary_warnings = []
+    if (payload.get("observability") or {}).get("user_exists") is False:
+        vocabulary_warnings.append(
+            "No current account matches this exact user_id. Prefixes are not expanded; "
+            "retained trace events for deleted accounts are still shown when they match the filters."
+        )
     if trace_vocabulary_status != "ok":
         vocabulary_warnings.append(
             "Trace 词表暂不可用；后台任务 lane / enqueue reason 闭集字段未展示，"

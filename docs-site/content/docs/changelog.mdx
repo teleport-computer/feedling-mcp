@@ -12,6 +12,36 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 Capture now doubles only a truncated reply's re-ask budget
+  (1,500 → 3,000 tokens by default, capped at the provider ceiling), with
+  180-second wire and phase limits. First calls remain at 1,500 tokens and
+  90 seconds. Capture and Dream can fall back once to the original budget
+  after a larger-budget 402, as already supported for too-large 400/422
+  responses. Capture's truncation re-ask and budget fallback each allow one
+  reliable attempt, fitting the existing 1,260-second Heavy pool limit; the
+  global 3,000-second default is unchanged.
+  Already-truncated jobs may spend more tokens or make a budget-fallback call;
+  normal jobs keep their existing call budget.
+
+- Runtime V2 model-call error traces now report shared failure causes in
+  `error_class` instead of Python exception class names. The original name is
+  retained separately as `exception_type`; retry categories remain unchanged.
+
+- Setup and manual Model API probe traces now retain a bounded upstream HTTP
+  `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
+  without storing provider error text or response bodies.
+
+- Resident CLI errors reporting Codex usage exhaustion now use the existing
+  `quota_insufficient` classification and quota notice instead of the generic
+  `unknown` fallback. Temporary rate-limit errors keep their existing class.
+
+- Automatic memory recall now gives the latest user message first priority,
+  then fills remaining seats from the latest two user messages. A long previous
+  topic can no longer displace already selected current-message hits; short
+  follow-ups retain previous-message context. The eight-card cap, relevance
+  gates, and recent-card supplement remain in place. Recall diagnostics label
+  the new host merge rule and preserve the underlying ranking evidence.
+
 - Model API credential probe notices now select existing registry translations
   using the user's stored `archive_language`. English users receive English text
   for registered failure classes; the probe-local `provider_config` notice

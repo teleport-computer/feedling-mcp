@@ -137,6 +137,7 @@ from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import tail_anchor as v2_tail_anchor
+from model_api_runtime.v2 import provider_errors as v2_provider_errors
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 from model_api_runtime.v2 import tool_surface as v2_tool_surface
 from model_api_runtime.v2 import trajectory as v2_trajectory
@@ -2049,33 +2050,7 @@ def _turn_failure_error_class(exc: BaseException) -> str:
         # reject suffix is diagnostic, never evidence of a provider/user fault.
         return "unknown"
 
-    status_code = getattr(exc, "status_code", None)
-    if status_code in {401, 403}:
-        return (
-            "auth_invalid"
-            if error_contract.provider_response_is_auth_failure(
-                status_code,
-                getattr(exc, "raw_response_body", "")
-                or getattr(exc, "response_detail", ""),
-            )
-            else "upstream_unavailable"
-        )
-    classified = notices_catalog.classify_upstream(str(exc))
-    if classified:
-        return classified
-    if status_code == 402:
-        return "quota_insufficient"
-    if status_code in {400, 422}:
-        return "provider_incompatible"
-    if status_code == 408:
-        return "provider_timeout"
-    if status_code == 429:
-        return "rate_limited"
-    if isinstance(status_code, int) and 500 <= status_code <= 599:
-        return "upstream_unavailable"
-    if provider_client.classify_provider_error(exc) == "transient":
-        return "upstream_unavailable"
-    return "unknown"
+    return v2_provider_errors.error_class_for_exception(exc)
 
 
 def _image_generation_unavailable_from_exception(
@@ -3118,11 +3093,22 @@ class _ProviderRoundtripTrace:
             | {"unspecified", "timeout", "http_error", "provider_error"}
         ):
             safe["finish_reason"] = finish_reason
-        error_class = re.sub(
-            r"[^A-Za-z0-9_.-]", "", str(detail.get("error_class") or "")
+        if "error_class" in detail:
+            error_class = detail["error_class"]
+            safe["error_class"] = (
+                error_class
+                if isinstance(error_class, str)
+                and error_class in notices_catalog.ERROR_CLASSES
+                else "unknown"
+            )
+        # Preserve the old exception-name diagnostic separately from the
+        # shared cause vocabulary. Public projections still redact this open
+        # string; it must never contain an exception message or response body.
+        exception_type = re.sub(
+            r"[^A-Za-z0-9_.-]", "", str(detail.get("exception_type") or "")
         )[:80]
-        if error_class:
-            safe["error_class"] = error_class
+        if exception_type:
+            safe["exception_type"] = exception_type
         provider_error_class = str(detail.get("provider_error_class") or "")
         if provider_error_class in {"transient", "provider_config", "unknown"}:
             safe["provider_error_class"] = provider_error_class
@@ -13054,6 +13040,15 @@ async def _run_extraction(
                     session=_capture_session,
                     step_sink=_step_sink,
                     max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
+                    truncation_retry_max_tokens=(
+                        v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
+                    ),
+                    truncation_retry_timeout_sec=(
+                        v2_extraction.truncation_retry_wire_deadline_sec()
+                    ),
+                    truncation_retry_max_attempts=(
+                        v2_extraction.CAPTURE_TRUNCATION_MAX_ATTEMPTS
+                    ),
                     failure_detail_out=extraction_failure_detail.update,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"

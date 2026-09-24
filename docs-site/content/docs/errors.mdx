@@ -53,6 +53,12 @@ copy. These rejection counters are best-effort diagnostics: if persistence
 fails, Feedling records a content-free warning in service logs, so dashboard
 totals can be lower than the actual number of rejected values.
 
+Resident CLI failures reporting Codex's `hit your usage limit` message are
+classified as `quota_insufficient` with `blame: "user_provider"` and the existing
+quota notice. This applies with either straight or curly apostrophes in
+`You've` / `You’ve`. Ordinary `429 Too Many Requests` failures retain the
+`rate_limited` classification.
+
 Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.
@@ -77,6 +83,14 @@ existing non-API-endpoint hint, `status_code: null`, and `provider_config` class
 This applies to setup, manual tests, route tests and activation, and key rotation.
 It does not change the provider client's retry policy.
 
+Setup and manual-test `model_api.provider_probe.*` trace events include
+`detail.status_code`: the failed probe's upstream HTTP integer (100–599), or
+`null` when unavailable or invalid. Strings, booleans, floats, and out-of-range
+values are discarded. Start, success, and runtime-fence events use `null`; a
+successful probe does not expose its transport status. This distinguishes
+401/402/403 without persisting exception messages, response details, or raw
+provider bodies. Existing error classes and API failure responses are unchanged.
+
 Saved-route test errors carry a `<failure_class>: ` prefix. A rejected replacement
 key leaves the previously saved key and its test status intact. Failures also
 produce a safe user notice, deduplicated by `model_api:test_failed:<failure_class>`;
@@ -87,6 +101,19 @@ unchanged. The probe-local `provider_config` notice still uses Chinese configura
 safe copy; it is not added to the runtime error registry and does not change
 runtime health or blame classification. Raw upstream response text is not copied
 into the notice.
+
+## Runtime V2 model-call diagnostics
+
+Runtime V2 `agent.model.call.error` events use the shared error vocabulary in
+`detail.error_class`, such as `auth_invalid`, `quota_insufficient`, `rate_limited`,
+and `upstream_unavailable`. Unrecognized causes use `unknown`. The separate
+`provider_error_class` remains the retry category (`transient`, `provider_config`,
+or `unknown`); it does not identify the specific cause.
+
+The original Python exception class name is retained as `exception_type` in the
+stored diagnostic detail and remains redacted in the public trace projection.
+Exception messages and provider response bodies are not copied into these fields.
+This diagnostic change does not alter retries or user-facing failure notices.
 
 ## Pi stream diagnostics
 

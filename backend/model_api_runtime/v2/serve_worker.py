@@ -6018,14 +6018,15 @@ _CHAT_TURN_BUDGET_SEC = (
     + float(v2_worker.MCP_TURN_WALL_BUDGET_SEC)
     + 120.0
 )
-# Keep the same bounded provider-attempt envelope as the Heavy slot budget;
-# separate component parse/truncation re-asks remain outside this allowance.
+# Include Capture's component re-ask and one rejected-budget fallback, using the
+# same nominal envelope as the Heavy slot budget.
 _EXTRACTION_TURN_BUDGET_SEC = v2_extraction.nominal_provider_envelope_sec()
 _MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(_CHAT_TURN_BUDGET_SEC, _EXTRACTION_TURN_BUDGET_SEC)
 if _TURN_ABSOLUTE_TIMEOUT_SEC < _MIN_TURN_ABSOLUTE_TIMEOUT_SEC:
     raise RuntimeError(
         "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC must cover prompt catch-up, "
-        "all provider rounds, the MCP turn wall budget, and 120s "
+        "all provider rounds (including Capture re-ask/budget fallback), "
+        "the MCP turn wall budget, and 120s "
         "setup/write margin "
         f"(minimum {_MIN_TURN_ABSOLUTE_TIMEOUT_SEC:.0f}s)"
     )
