@@ -128,9 +128,19 @@ loop; after a bounded overview, fetch visible IDs or use a more specific search.
 
 Recall diagnostics distinguish card selection from actual prompt injection.
 Each V2 chat/wake turn can read enclave-selected cards from a sequence-bounded
-history window. The selection query joins the latest two non-empty user messages,
-newest first, excluding assistant replies. A blank message or an image without a
-caption falls back to earlier user text; an image caption remains eligible.
+history window. Automatic recall in both runtimes first selects relevant cards
+using the latest non-empty user message alone. It then fills remaining seats
+using the latest two non-empty user messages joined newest first, deduplicating
+by card ID within the same eight-card cap. This keeps a long previous topic from
+crowding out the current question, while retaining context for short follow-ups
+such as “what about it?”. Both passes use the existing relevance gate; bucket
+quotas do not admit unrelated cards just to fill seats. Assistant replies never
+supply query text. A blank message or an image without a caption falls back to
+earlier user text; an image caption remains eligible. Current-message hits also
+take priority when the runtime applies its prompt budget. Recall diagnostics
+identify the host merge rule as `host:latest-first-v1`; response traces retain
+the kernel scores and each pass's query fingerprint. The persisted record keeps
+the combined-query fingerprint and content-free counts, never the query text.
 The runtime adds a non-system “相关记忆” data block
 before conversation replay: card ID, the summary, and the selection reason. It
 never substitutes the card body for a missing summary and never truncates a

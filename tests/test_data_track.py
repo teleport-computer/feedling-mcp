@@ -17,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from accounts import registry  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -581,7 +582,9 @@ def test_empty_ids_reads_watermark_without_scanning_lane_rows(client, monkeypatc
             yield _RecordingConn(conn, executed)
 
     monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
-    report = db.admin_background_lane_users([], days=1)
+    report = db.admin_background_lane_users(
+        [], days=1, classify_v2_code=jobs_store.terminal_outcome_class,
+    )
 
     lane_sql = [sql for sql in executed if "lane_daily_rollup" in sql]
     watermark_sql = [sql for sql in executed if "lane_rollup_watermark" in sql]
@@ -3931,3 +3934,85 @@ def test_admin_data_track_surfaces_wake_circuit_count_and_unavailable(client, mo
     body = client.get('/v1/admin/data-track/users', headers=_admin_headers()).get_json()
     assert body['summary']['wake_provider_circuit_open_users'] is None
     assert body['users'][0]['wake_provider_circuit_open'] is None
+
+
+@pytest.mark.parametrize("lane", ["capture", "heartbeat"])
+@pytest.mark.parametrize("code,operational,user,control", [
+    ("extraction_failed:auth_invalid", 1, 2, 0),
+    ("extraction_failed:quota_insufficient", 1, 2, 0),
+    ("extraction_failed:model_not_found", 1, 2, 0),
+    ("extraction_failed:upstream_unavailable", 3, 0, 0),
+    ("extraction_failed:provider_config", 3, 0, 0),
+    ("wake_failed:providererror", 3, 0, 0),
+    ("future_failure_code", 3, 0, 0),
+    (None, 3, 0, 0),
+    ("turns_halted", 1, 0, 2),
+])
+def test_v2_background_users_share_daily_summary_classification(
+        client, lane, code, operational, user, control):
+    """Real DB -> users API -> HTML; V1-only frozen columns remain zero."""
+    from admin import lane_rollup_summary
+    uid, _ = _register(client)
+    yesterday = (datetime.now(ZoneInfo("Asia/Shanghai")).date()
+                 - timedelta(days=1)).isoformat()
+    codes = {code: 2} if code else {}
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO lane_daily_rollup "
+            "(user_id,day,route,lane,completed,failed,expired,superseded,failure_codes) "
+            "VALUES (%s,%s,'model_api',%s,2,2,1,4,%s::jsonb)",
+            (uid, yesterday, lane, json.dumps(codes)),
+        )
+        conn.execute(
+            "INSERT INTO lane_rollup_watermark "
+            "(route,backfill_from,through_day,outcomes_from) "
+            "VALUES ('model_api',%s,%s,NULL),('resident',%s,%s,%s) "
+            "ON CONFLICT (route) DO UPDATE SET "
+            "backfill_from=EXCLUDED.backfill_from,through_day=EXCLUDED.through_day,"
+            "outcomes_from=EXCLUDED.outcomes_from",
+            (yesterday,) * 5,
+        )
+    response = client.get("/v1/admin/data-track/users?lane_days=1",
+                          headers=_admin_headers())
+    assert response.status_code == 200, response.get_data(as_text=True)
+    payload = response.get_json()
+    block = next(r for r in payload["users"] if r["user_id"] == uid)["background_lanes"]
+    row = block["routes"]["model_api"][lane]
+    assert row == {
+        "completed": 2, "failed": 2, "expired": 1, "superseded": 4,
+        "operational_failures": operational, "user_unavailable": user,
+        "control_outcomes": control, "terminal_attempts": 2 + operational,
+        "failure_rate": pytest.approx(operational / (2 + operational)),
+        "failure_codes": codes,
+    }
+    assert block["lanes"][lane] == row
+    assert block["coverage"]["level"] == "green"
+    coverage = payload["background_lane_window"]["coverage_by_route"]["model_api"]
+    assert coverage["level"] == "green"
+    assert coverage["outcomes_from"] is None, "V2 has no V1 outcome watermark"
+    frozen = db.admin_lane_rollup(user_id=uid, lane=lane,
+                                 since_day=yesterday, until_day=yesterday)["rows"]
+    assert frozen[0]["operational_failures"] == 0, "no historical row rewrite"
+    daily = lane_rollup_summary.aggregate_day(
+        frozen, lane=lane, route="model_api", day=yesterday,
+    )
+    assert (daily.completed, daily.failed_raw, daily.operational, daily.control,
+            daily.user_unavailable, daily.attempts, daily.failure_rate) == (
+        row["completed"], row["failed"] + row["expired"], row["operational_failures"],
+        row["control_outcomes"], row["user_unavailable"], row["terminal_attempts"],
+        row["failure_rate"],
+    )
+    page = client.get("/admin/data-track?view=users&lane_days=1",
+                      headers=_admin_headers())
+    assert page.status_code == 200
+    label = "心跳" if lane == "heartbeat" else "capture"
+    expected = (f"{label} {operational / (2 + operational):.0%}"
+                f"（成2/故{operational}/分母{2 + operational}）")
+    assert expected in page.get_data(as_text=True)
+    assert expected + " · 覆盖" not in page.get_data(as_text=True)
+    with db.get_pool().connection() as conn:
+        conn.execute("UPDATE lane_rollup_watermark SET through_day=%s WHERE route='model_api'",
+                     ((datetime.fromisoformat(yesterday).date() - timedelta(days=1)).isoformat(),))
+    incomplete = client.get("/v1/admin/data-track/users?lane_days=1",
+                            headers=_admin_headers()).get_json()
+    assert incomplete["background_lane_window"]["coverage_by_route"]["model_api"]["level"] == "partial"

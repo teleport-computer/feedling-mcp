@@ -114,6 +114,7 @@ def _emit_model_api_probe_trace(
     outcome_class: str | None = None,
     usage: dict | None = None,
     error_class: str = "",
+    status_code: object = None,
     dur_ms: float | None = None,
 ) -> None:
     event_type = {
@@ -126,6 +127,12 @@ def _emit_model_api_probe_trace(
         "phase": phase,
         "provider": provider,
         "model": model,
+        # Only a measured HTTP integer may cross this diagnostic boundary.
+        # Never coerce strings/body fragments (or bools) into status evidence.
+        "status_code": (
+            status_code if type(status_code) is int and 100 <= status_code <= 599
+            else None
+        ),
     }
     if usage:
         detail["usage"] = dict(usage)
@@ -189,6 +196,7 @@ def _test_provider_key_observed(
             outcome_class="operational_failure",
             error_class=error_class,
             dur_ms=(time.monotonic() - started) * 1000.0,
+            status_code=exc.status_code,
         )
         raise
 

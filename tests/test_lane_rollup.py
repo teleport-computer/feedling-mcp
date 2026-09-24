@@ -34,6 +34,7 @@ import distillation_ledger  # noqa: E402
 from conftest import capture_mirror_groups, configure_model_api_route, seed_user  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import data_track  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from admin import lane_rollup_scheduler as sched  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 import asgi.lifespan as lifespan_mod  # noqa: E402
@@ -1640,7 +1641,9 @@ def test_background_user_reader_is_bounded_and_uses_operational_denominator(
             (yesterday, yesterday, yesterday),
         )
 
-    report = db.admin_background_lane_users([u1, u2], days=1)
+    report = db.admin_background_lane_users(
+        [u1, u2], days=1, classify_v2_code=jobs_store.terminal_outcome_class,
+    )
     assert report["window"]["start_day"] == yesterday
     assert report["window"]["end_day"] == yesterday
     assert report["window"]["open_day_excluded"] is True
@@ -1664,7 +1667,8 @@ def test_background_user_reader_is_bounded_and_uses_operational_denominator(
 
 def test_background_user_zero_keeps_missing_coverage_distinct(clean_rollup):
     report = db.admin_background_lane_users(
-        ["usr_t133_unmeasured"], days=1
+        ["usr_t133_unmeasured"], days=1,
+        classify_v2_code=jobs_store.terminal_outcome_class
     )
     assert report["users"] == {}
     assert report["coverage_by_route"]["resident"]["level"] == "unavailable"
