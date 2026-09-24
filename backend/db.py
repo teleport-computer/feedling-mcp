@@ -40,6 +40,7 @@ import re
 import struct
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
@@ -56,6 +57,7 @@ import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 import storage_read_trace
 from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
+from notices.rollup_outcomes import split_v2_outcomes
 
 log = logging.getLogger("feedling.db")
 
@@ -7253,7 +7255,8 @@ def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
 
 
 def admin_background_lane_users(
-    user_ids: list[str], *, days: int = 7, tz: str = "Asia/Shanghai"
+    user_ids: list[str], *, classify_v2_code: Callable[[str], str],
+    days: int = 7, tz: str = "Asia/Shanghai"
 ) -> dict:
     """Bounded per-user heartbeat/capture outcomes from immutable day cells.
 
@@ -7261,6 +7264,8 @@ def admin_background_lane_users(
     ``user_logs`` for every page load and reached the production server's 240s
     boundary.  This reader scans only completed Beijing-day cells.  Counts and
     coverage stay separate so an unmeasured zero cannot look healthy.
+    The admin caller injects V2's producer classifier to keep the database
+    independent of the runtime package and share the daily summary's split.
     """
     ids = list(dict.fromkeys(str(uid) for uid in user_ids if str(uid)))
     day_count = max(1, min(int(days or 7), 90))
@@ -7377,10 +7382,12 @@ def admin_background_lane_users(
         complete = (
             bool(wm.get("backfill_from"))
             and bool(wm.get("through_day"))
-            and bool(wm.get("outcomes_from"))
             and str(wm["backfill_from"]) <= start_day.isoformat()
-            and str(wm["outcomes_from"]) <= start_day.isoformat()
             and str(wm["through_day"]) >= end_day.isoformat()
+            and (route == "model_api" or (
+                bool(wm.get("outcomes_from"))
+                and str(wm["outcomes_from"]) <= start_day.isoformat()
+            ))
         )
         coverage[route] = {
             "level": "green" if complete else "partial",
@@ -7395,6 +7402,16 @@ def admin_background_lane_users(
         uid, route, lane = str(row[0]), str(row[1]), str(row[2])
         completed = int(row[3] or 0)
         operational = int(row[7] or 0)
+        control, user_unavailable = int(row[8] or 0), int(row[9] or 0)
+        codes = {str(code): int(count or 0)
+                 for code, count in dict(row[10] or {}).items()}
+        if route == "model_api":
+            outcomes = split_v2_outcomes(
+                int(row[4] or 0) + int(row[5] or 0), codes,
+                classify=classify_v2_code,
+            )
+            operational = outcomes.operational
+            control, user_unavailable = outcomes.control, outcomes.user_unavailable
         denominator = completed + operational
         lane_row = {
             "completed": completed,
@@ -7402,14 +7419,11 @@ def admin_background_lane_users(
             "expired": int(row[5] or 0),
             "superseded": int(row[6] or 0),
             "operational_failures": operational,
-            "control_outcomes": int(row[8] or 0),
-            "user_unavailable": int(row[9] or 0),
+            "control_outcomes": control,
+            "user_unavailable": user_unavailable,
             "terminal_attempts": denominator,
             "failure_rate": operational / denominator if denominator else None,
-            "failure_codes": {
-                str(code): int(count or 0)
-                for code, count in dict(row[10] or {}).items()
-            },
+            "failure_codes": codes,
         }
         user = users.setdefault(uid, {"routes": {}, "lanes": {}})
         user["routes"].setdefault(route, {})[lane] = dict(lane_row)
