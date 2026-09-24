@@ -153,6 +153,8 @@ def test_extraction_lane_passes_its_own_output_budget(monkeypatch, lane):
         else:
             assert kwargs.get("timeout_sec") is None
             assert kwargs.get("wire_deadline_sec") is None
+            assert kwargs["truncation_retry_timeout_sec"] == 180.0
+            assert kwargs["truncation_retry_max_attempts"] == 1
         return [], None
 
     retry_budgets = []
@@ -1252,6 +1254,102 @@ def test_dream_escalated_truncation_retry_rejected_as_too_large_falls_back_to_th
     if fallback_reply_truncated:
         assert status == "failed"
         assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    else:
+        assert status == "completed"
+        assert _job_row(job_id) == ("completed", None)
+
+
+@pytest.mark.parametrize("scenario", [
+    "normal", "recovered", "truncated_again", "parse_retry",
+    "rejected_400", "rejected_422", "rejected_402",
+    "fallback_truncated", "fallback_402", "initial_402",
+    "retry_503", "fallback_503", "initial_503",
+])
+def test_capture_truncation_budgets_on_real_worker_transport(monkeypatch, scenario):
+    """Exercise the actual fenced Capture entry, session, extract and provider.
+
+    Observe token caps and both timeout layers at the HTTP boundary, rather
+    than deriving expectations from the helper whose wiring is under test.
+    """
+    import httpx
+
+    uid = "u_x_capture_truncation_budget"
+    _seed_v2(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    requests = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        requests.append((payload, request.extensions["timeout"],
+                         provider_client._WIRE_DEADLINE_SEC.get()))
+        first = len(requests) == 1
+        if ((scenario == "initial_503" and first)
+            or (scenario == "retry_503" and not first)
+            or (scenario == "fallback_503" and not first and payload["max_tokens"] == 1500)):
+            return httpx.Response(503, json={"error": {"message": "temporarily unavailable"}})
+        rejected = scenario.startswith("rejected_") or scenario.startswith("fallback_")
+        if (first and scenario == "initial_402") or (
+            rejected and payload["max_tokens"] > 1500
+        ) or (not first and scenario == "fallback_402"):
+            code = int(scenario.removeprefix("rejected_")) if scenario.startswith("rejected_") else 402
+            message = "insufficient prepaid balance" if code == 402 else "max_tokens is too large: 3000, maximum allowed is 1500"
+            return httpx.Response(code, json={"type": "error", "error": {
+                "type": "invalid_request_error", "message": message,
+            }})
+        truncated = (
+            (first and scenario not in {"normal", "parse_retry"})
+            or scenario in {"truncated_again", "fallback_truncated"}
+        )
+        text = (
+            '{"cards": [{"action": "add", "summary": "", "content": "Durable fact."}]}'
+            if first and scenario == "parse_retry" else '{"cards": []}'
+        )
+        return httpx.Response(200, json={
+            "id": "msg_capture", "type": "message", "role": "assistant",
+            "content": ([{"type": "thinking", "thinking": "...", "signature": "s"}]
+                        if truncated else [{"type": "text", "text": text}]),
+            "stop_reason": "max_tokens" if truncated else "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": payload["max_tokens"] if truncated else 10},
+        })
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            monkeypatch.setattr(provider_client, "_shared_async_client", client)
+            return await worker.process_job(
+                job, _deps(), provider_config=_BYOK,
+                api_key=None, runtime_token="rt",
+            )
+
+    status = asyncio.run(run())
+    budgets = [row[0]["max_tokens"] for row in requests]
+    if scenario in {"normal", "initial_402"}:
+        assert budgets == [1500]
+    elif scenario in {"parse_retry", "initial_503"}:
+        assert budgets == [1500, 1500]
+    elif scenario.startswith(("rejected_", "fallback_")):
+        assert budgets[0] == budgets[-1] == 1500
+        assert budgets.count(1500) == 2  # exactly one original-budget fallback
+        assert 1 <= len(budgets[1:-1]) <= 2  # bounded compatibility wire
+        assert set(budgets[1:-1]) == {3000}
+        assert len({json.dumps(row[0]["messages"]) for row in requests[1:]}) == 1
+        assert requests[0][0]["messages"] != requests[-1][0]["messages"]
+    else:
+        assert budgets == [1500, 3000]
+    for payload, phases, deadline in requests:
+        expected = 180.0 if payload["max_tokens"] == 3000 else 90.0
+        assert phases["read"] == phases["connect"] == phases["write"] == expected
+        assert deadline == expected
+
+    if scenario in {"truncated_again", "fallback_truncated"}:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:output_truncated")
+    elif scenario in {"initial_402", "fallback_402"}:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:quota_insufficient")
+    elif scenario in {"retry_503", "fallback_503"}:
+        assert status == "failed"
+        assert _job_row(job_id) == ("failed", "extraction_failed:upstream_unavailable")
     else:
         assert status == "completed"
         assert _job_row(job_id) == ("completed", None)
