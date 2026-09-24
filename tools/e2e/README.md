@@ -41,7 +41,8 @@ E2E_KEY_GEMINI=…
 E2E_KEY_OPENROUTER=sk-or-…
 E2E_KEY_RELAY=…            # 中转站代表
 E2E_RELAY_BASE=https://…   # 中转站 base_url
-E2E_RELAY_MODEL=…          # 中转站模型名（可带标签，测清洗）
+E2E_RELAY_MODEL=…          # 仅专项探针(如 self_thinking_prompt_probe)在读;发版 P0/P1/processing
+                           # 的 relay 型号写在 tools/e2e/config.py(cell.models 优先,此值被忽略)
 E2E_KEY_DEEPSEEK=sk-…
 ```
 
@@ -148,6 +149,9 @@ provider stub 只在 wake 回复里混入现场同形的 `<parameter>` 标记，
 钉在用户私钥解密后的正文。真实 HTTP、调度入队、worker、信封加解密与账号
 清理均不替换。
 
-**中转站要测两家**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
-带方括号标签 / 裸名),推荐链路只测一家不够 —— `relay-openai-compatible`
-与 `hojimi-relay` 两个格子就是为此并存。
+**中转站格子**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
+带方括号标签 / 斜杠 / 裸名)。2026-09-25(T726,Seven「没用的中转站可以从回归中去掉」)
+移除 jiushi-relay(余额耗尽)与 zhailian-relay(Free 分组无可用模型)后,hosted P0
+只剩 `relay-openai-compatible` 一家中转、选的是裸名型号 —— 少的是第二家中转,以及
+「选中方括号标签名 / 斜杠名型号并走完 setup→回合」这段往返;目录解析仍覆盖(该中转
+`/models` 里仍有方括号与斜杠名,型号预检读整份目录)。要补回往返需另找一家有余额的中转。

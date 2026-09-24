@@ -55,42 +55,22 @@ HOSTED_CELLS: list[HostedCell] = [
                ["gemini-3.6-flash", "gemini-3.1-pro-preview"]),
     HostedCell("openrouter", "openrouter", "E2E_KEY_OPENROUTER",
                ["anthropic/claude-sonnet-4.6", "deepseek/deepseek-chat"]),
+    # 2026-09-25 T726(Seven「没用的中转站可以从回归中去掉 如果中转站还有钱就是模型下架就换一个模型」):
+    # 原 E2E_RELAY_MODEL=gpt-5.5 仍列在该中转 /models 里,但对这把 key 的分组 404「not available
+    # for this group」;同 key 其它模型可调 ⇒ 有钱、该型号对本 key 分组不可用(不是目录下架),
+    # 换成实测会发 tool_calls 的裸名模型。型号从本机 key 文件
+    # 挪进这里入版本库(key 仍只在 key 文件)。当日直打:kimi-k3 4.2s、qwen3.8-max 3.4s 均 200 +
+    # finish_reason=tool_calls。
     HostedCell("relay-openai-compatible", "openai_compatible", "E2E_KEY_RELAY",
-               [], base_url_env="E2E_RELAY_BASE"),   # models from E2E_RELAY_MODEL
+               ["kimi-k3", "qwen3.8-max"], base_url_env="E2E_RELAY_BASE"),
     HostedCell("deepseek-official", "deepseek", "E2E_KEY_DEEPSEEK",
                ["deepseek-chat"]),
-    # 第二、第三个中转站:不同中转站的 /models 目录格式差异很大,推荐链路(§2-10)
-    # 必须都能匹配 —— 只测一个不够。2026-09-14 hojimi 退役(Seven 定,连续两轮把
-    # 兜底话术当正文复读),换成玖时 + 宅恋。当日实测 /models 形状(去内容化):
-    #   (四类计数按特征各自统计,会重叠,不是互斥分布)
-    #   relay-openai-compatible  171 个:方括号标签 143(其中 1 个同时带 8 位日期后缀
-    #                            [MAX-CC]claude-opus-4-5-20251101)/ 无标签 28 = 裸名 27
-    #                            + 斜杠 1(BAAI/bge-m3)
-    #   jiushi-relay             140 个:方括号标签 122 / 裸名 18(gpt-*/gemini-*)
-    #   zhailian-relay             6 个:全是「[标签]厂商/型号」带斜杠的形状
-    #   空悲切(.env KONGBEIQIE_*)的 key+base 与 E2E_RELAY_* 逐字节相同 ⇒ 它就是
-    #   relay-openai-compatible 这一格,不另开格(同一家两个名字会测两遍)。
-    # ⚠️ hojimi 原来覆盖的「裸名 + 8 位日期后缀」(claude-haiku-4-5-20251001)形状
-    # 两家都没有;换来的是 zhailian 的斜杠形状。两家目录里都没有 haiku,候选取
-    # 当日目录里的 claude 系 + 一个非 claude 兜底(未比价)。宅恋 09-14 22:5x 观测:
-    # 本机直打 opus-5/deepseek/GLM 各 1 次 60s ReadTimeout、kimi-k3 1 次 45s 通过后
-    # 下一次 429;test 后端 setup 对 opus-5、deepseek 各 1 次 ReadTimeout。kimi-k3
-    # 作为 setup 候选尚未在 p0 里跑过。该格 setup 红时先看中转连通性再看产品。
-    # 2026-09-15(T596,Seven 拍板 A:gpt-5.5 → gemini → [AG4]claude):[AG4]claude-sonnet-4-6
-    # 通道后端按 Gemini 格式转发,对我们工具 schema 里漏出的本地标记 enforceItemBounds
-    # 返 400 → 运行时裁掉全部工具、记忆链不可用(T589 定界;根修在 T595 剥离标记)。
-    # 同一中转直打(reports/T589-run-20260915/T596-jiushi-schema-probe.txt):
-    # gemini-3-flash-preview / gpt-5.5 带全部 36 个工具 200,[AG4]claude 剥掉标记后 200。
-    # p0 实跑(同目录 p0_jiushi_*.log + T596-jiushi-gemini-trace-timeline.txt):
-    # gemini-3-flash-preview 2/2 round1 tool_calls 正常、round2 finish_reason=timeout
-    # → 兜底;gpt-5.5 1/1 harness 六步 ✅ 但 memory 步 WARN(300s 内 index 0 卡,
-    # 库 trace 无 capture 事件)。故候选顺序 gpt > gemini > [AG4]claude。
-    HostedCell("jiushi-relay", "openai_compatible", "E2E_KEY_JIUSHI",
-               ["gpt-5.5", "gemini-3-flash-preview", "[AG4]claude-sonnet-4-6"],
-               base_url_env="E2E_JIUSHI_BASE"),
-    HostedCell("zhailian-relay", "openai_compatible", "E2E_KEY_ZHAILIAN",
-               ["[0.01]限时/claude-opus-5", "[0.01]限时/kimi-k3"],
-               base_url_env="E2E_ZHAILIAN_BASE"),
+    # 2026-09-25 T726 移除 jiushi-relay 与 zhailian-relay(Seven 同上原话):jiushi 403
+    # 「用户剩余额度 ¥0.007708」没钱;zhailian 的 key 在 Free 分组下 /v1/models 返回 0 个、
+    # 两个候选均 503「No available channel」,无模型可换。⚠️覆盖面损失:hosted P0 少了第二、第三家
+    # 中转;剩下的 relay-openai-compatible 选的是裸名型号,所以「选中方括号标签名 / 斜杠名型号
+    # 并走完 setup→回合」这段往返不再实跑。目录解析本身仍覆盖:该中转 /models 里仍有方括号与
+    # 斜杠名,型号预检照常读取整份目录。原 09-14 的两家目录形状记录见 git 历史。
 ]
 
 
