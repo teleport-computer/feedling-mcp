@@ -201,23 +201,25 @@ def test_instrument_stale_is_neither_pass_nor_fail_and_does_not_block():
     assert p0.p0_blocks_release([stale, {"result": "fail"}]) is True
 
 
-# ── relay cell roster (2026-09-14: hojimi retired → jiushi + zhailian) ─────────
+# ── relay cell roster (2026-09-25 T726: jiushi + zhailian removed, relay model pinned) ──
 # Lives here (not in test_self_thinking_prompt_probe.py) because that module is
 # skipped wholesale on machines where the agent-protocol-core distribution is
 # still installed — a roster assertion must run under normal collection.
 
-def test_relay_cells_are_jiushi_and_zhailian_with_own_key_pool_wiring():
+def test_release_matrix_relay_roster_after_t726():
     from tools.e2e.config import HOSTED_CELLS
     by_name = {c.name: c for c in HOSTED_CELLS}
-    assert "hojimi-relay" not in by_name
-    for name, key_env, base_env in (
-        ("jiushi-relay", "E2E_KEY_JIUSHI", "E2E_JIUSHI_BASE"),
-        ("zhailian-relay", "E2E_KEY_ZHAILIAN", "E2E_ZHAILIAN_BASE"),
-    ):
-        cell = by_name[name]
-        assert cell.provider == "openai_compatible"
-        assert (cell.key_env, cell.base_url_env) == (key_env, base_env)
-        assert cell.models, f"{name} needs at least one model candidate"
+    # Seven 2026-09-25: relays with no money / no usable model leave the matrix.
+    for retired in ("hojimi-relay", "jiushi-relay", "zhailian-relay"):
+        assert retired not in by_name, f"{retired} was removed from the release matrix"
+    relay = by_name["relay-openai-compatible"]
+    assert relay.provider == "openai_compatible"
+    assert (relay.key_env, relay.base_url_env) == ("E2E_KEY_RELAY", "E2E_RELAY_BASE")
+    # The model is versioned here, not only in the local key file, so a model
+    # change shows up as a reviewed diff. gpt-5.5 is still listed in the relay's
+    # /models but returns 404 "not available for this group" for this key.
+    assert relay.models == ["kimi-k3", "qwen3.8-max"]
+    assert "gpt-5.5" not in relay.models
     # every relay cell must read its own pool slots — a copy/paste sharing one
     # key would make two cells measure the same relay under two names
     relay_slots = [(c.key_env, c.base_url_env) for c in HOSTED_CELLS if c.base_url_env]
