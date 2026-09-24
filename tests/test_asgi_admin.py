@@ -243,6 +243,105 @@ def test_debug_route_deadline_abandons_a_slow_sync_worker(env, monkeypatch):
     assert elapsed < 1.0
 
 
+@pytest.mark.parametrize("mode", ["flat", "timeline"])
+@pytest.mark.parametrize("case", ["empty", "prefix", "missing", "deleted", "filtered"])
+def test_debug_exact_user_membership_is_independent_of_matching_events(env, monkeypatch, mode, case):
+    """Real users/trace tables distinguish a missing uid without hiding retained traces."""
+    uid, _ = _register()
+    if case in {"prefix", "deleted", "filtered"}:
+        db.insert_trace_events_strict(uid, [{
+            "ts": time.time(), "subsystem": "agent", "type": "agent.test",
+            "status": "ok", "trace_id": "membership-test",
+        }])
+    selected = uid[:8] if case == "prefix" else "usr_no_such_account" if case == "missing" else uid
+    if case == "deleted":
+        assert db.delete_user(uid)
+    # Both stale-cache directions: DB has a live account absent from the cache,
+    # or cache still contains a deleted/unknown uid. Neither may decide the flag.
+    registry._users[:] = [] if case in {"empty", "filtered"} else [{"user_id": selected}]
+    query = f"mode={mode}&user_id={selected}"
+    if case == "filtered":
+        query += "&q=does-not-match-any-event"
+    try:
+        status, payload = _asgi_json("GET", "/v1/admin/data-track/debug?" + query, headers=_admin())
+        assert status == 200
+        assert payload["observability"]["user_exists"] is (case in {"empty", "filtered"})
+        assert payload["summary"]["events_total"] == int(case == "deleted")
+        assert [event["user_id"] for event in payload["events"]] == ([uid] if case == "deleted" else [])
+        assert payload["filters"]["user_id"] == selected
+        html = admin_asgi.admin_core.page_html("view=debug&" + query)
+        assert ("No current account matches this exact user_id" in html) is (case not in {"empty", "filtered"})
+        if case == "deleted":
+            assert "agent.test" in html
+    finally:
+        db.delete_trace_events_for_user(uid)
+
+
+@pytest.mark.parametrize("mode", ["flat", "timeline"])
+def test_debug_unfiltered_membership_is_unmeasured_without_db_lookup(env, monkeypatch, mode):
+    def forbidden(*args, **kwargs):
+        pytest.fail("blank user filter must not perform an account lookup")
+    monkeypatch.setattr(db, "user_exists", forbidden)
+    status, payload = _asgi_json(
+        "GET", f"/v1/admin/data-track/debug?mode={mode}&user_id=%20%20", headers=_admin(),
+    )
+    assert status == 200
+    assert payload["observability"]["user_exists"] is None
+
+
+@pytest.mark.parametrize("mode", ["flat", "timeline"])
+@pytest.mark.parametrize("failure,code", [(QueryCanceled, "debug_query_timeout"), (PoolTimeout, "service_busy")])
+def test_debug_membership_read_failure_is_not_missing_account(env, monkeypatch, mode, failure, code):
+    seen = []
+    def unavailable(user_id, **kwargs):
+        seen.append((user_id, kwargs))
+        raise failure("synthetic membership read failure")
+    monkeypatch.setattr(db, "user_exists", unavailable)
+    status, payload = _asgi_json(
+        "GET", f"/v1/admin/data-track/debug?mode={mode}&user_id=missing", headers=_admin(),
+    )
+    assert (status, payload) == (503, {"error": code})
+    assert seen[0][0] == "missing"
+    limits = seen[0][1]
+    assert 0 < limits["connection_timeout"] <= data_track.DEBUG_TRACE_DB_CONNECTION_TIMEOUT_SEC
+    assert 0 < limits["statement_timeout_ms"] <= data_track.DEBUG_TRACE_DB_STATEMENT_TIMEOUT_MS
+
+
+def test_debug_membership_lookup_stays_behind_admin_auth(env, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("unauthorized request reached membership lookup")
+    monkeypatch.setattr(db, "user_exists", forbidden)
+    for uid in ("known", "missing"):
+        assert _asgi("GET", f"/v1/admin/data-track/debug?user_id={uid}").status_code == 401
+
+
+def test_user_exists_honors_admin_read_budget_without_leaking_timeout(env, monkeypatch):
+    from contextlib import contextmanager
+    uid, _ = _register()
+    pool = db.get_pool()
+    seen = []
+    @contextmanager
+    def connection(**kwargs):
+        seen.append(kwargs)
+        with pool.connection(**kwargs) as conn:
+            before = conn.execute("SHOW statement_timeout").fetchone()
+            yield conn
+            assert conn.execute("SHOW statement_timeout").fetchone() == before
+    from types import SimpleNamespace
+    monkeypatch.setattr(db, "get_pool", lambda: SimpleNamespace(connection=connection))
+    scope = db._local_statement_timeout
+    @contextmanager
+    def checked_scope(conn, milliseconds):
+        with scope(conn, milliseconds):
+            assert conn.execute("SHOW statement_timeout").fetchone() == ("321ms",)
+            yield
+    monkeypatch.setattr(db, "_local_statement_timeout", checked_scope)
+    assert db.user_exists(uid, connection_timeout=0.5, statement_timeout_ms=321)
+    assert not db.user_exists(uid[:8], connection_timeout=0.5, statement_timeout_ms=321)
+    assert db.user_exists(uid)  # Existing callers keep their default pool settings.
+    assert seen == [{"timeout": 0.5}, {"timeout": 0.5}, {}]
+
+
 def test_t428_all_ten_data_track_routes_use_bounded_db_bridge():
     handlers = (
         admin_asgi.data_track_summary,

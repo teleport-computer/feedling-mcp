@@ -1249,19 +1249,34 @@ def clear_reconcile_cursor(table: str) -> None:
         log.warning("[db] clear_reconcile_cursor(%s) failed: %s", table, e)
 
 
-def user_exists(user_id: str) -> bool:
+def user_exists(
+    user_id: str,
+    *,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> bool:
     """Authoritative membership check against the users table. The push path uses
     it to close the sub-second window where another worker committed a delete but
     THIS worker's in-memory registry hasn't processed the ``users`` wake-bus
     reload yet — the stale snapshot would otherwise pass the guard and send a push
     to a just-deleted account. One indexed PK lookup; negligible next to the store
-    load / chat work a push already does."""
+    load / chat work a push already does. Admin callers may supply their remaining
+    read budget; failures propagate rather than reporting a missing account."""
     if not user_id:
         return False
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
-        ).fetchone()
+    connection_kwargs = (
+        {"timeout": float(connection_timeout)}
+        if connection_timeout is not None else {}
+    )
+    with get_pool().connection(**connection_kwargs) as conn:
+        timeout_scope = (
+            _local_statement_timeout(conn, int(statement_timeout_ms))
+            if statement_timeout_ms is not None else nullcontext()
+        )
+        with timeout_scope:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
+            ).fetchone()
     return row is not None
 
 

@@ -4249,6 +4249,7 @@ def _data_track_debug_flat_payload(
     offset: int,
     page: int,
     user_filter: str,
+    user_exists: bool | None,
     subsystem_filter: str,
     status_filter: str,
     trace_filter: str,
@@ -4404,6 +4405,7 @@ def _data_track_debug_flat_payload(
         },
         "options": _debug_filter_options(option_events),
         "observability": {
+            "user_exists": user_exists,
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
@@ -4446,6 +4448,18 @@ def _data_track_debug_payload() -> dict:
     q = str(filters.get("q") or "").strip().lower()
     since_epoch = float(filters.get("since_epoch") or 0)
 
+    # A deleted account's retained traces remain queryable (T184). Distinguish
+    # an absent exact uid from a live account with no matching events without
+    # making account membership a gate on the trace read. None means no uid filter.
+    user_exists = None
+    if user_filter:
+        connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
+        user_exists = db.user_exists(
+            user_filter,
+            connection_timeout=connection_timeout,
+            statement_timeout_ms=statement_timeout_ms,
+        )
+
     with registry._users_lock:
         live_users = {
             str(user.get("user_id") or ""): dict(user)
@@ -4466,6 +4480,7 @@ def _data_track_debug_payload() -> dict:
             offset=offset,
             page=page,
             user_filter=user_filter,
+            user_exists=user_exists,
             subsystem_filter=subsystem_filter,
             status_filter=status_filter,
             trace_filter=trace_filter,
@@ -4616,6 +4631,7 @@ def _data_track_debug_payload() -> dict:
         },
         "options": _debug_filter_options(all_events_raw),
         "observability": {
+            "user_exists": user_exists,
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
@@ -10877,6 +10893,11 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
     vocabulary_warnings = []
+    if (payload.get("observability") or {}).get("user_exists") is False:
+        vocabulary_warnings.append(
+            "No current account matches this exact user_id. Prefixes are not expanded; "
+            "retained trace events for deleted accounts are still shown when they match the filters."
+        )
     if trace_vocabulary_status != "ok":
         vocabulary_warnings.append(
             "Trace 词表暂不可用；后台任务 lane / enqueue reason 闭集字段未展示，"
