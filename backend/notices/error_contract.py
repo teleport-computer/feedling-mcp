@@ -38,6 +38,12 @@ REJECTION_BOUNDARY_DOMAINS: Mapping[str, str] = MappingProxyType({
 REJECTION_FALLBACK_CODES = frozenset({UNREGISTERED_ERROR_CLASS})
 
 
+def localized_text(text_zh: str, text_en: str, language: str = "") -> str:
+    if str(language or "").strip().lower().startswith("en"):
+        return text_en or text_zh
+    return text_zh
+
+
 @dataclass(frozen=True, slots=True)
 class ErrorSpec:
     code: str
@@ -51,9 +57,7 @@ class ErrorSpec:
     activity_result: bool = False
 
     def text(self, language: str = "") -> str:
-        if str(language or "").strip().lower().startswith("en"):
-            return self.safe_text_en or self.safe_text_zh
-        return self.safe_text_zh
+        return localized_text(self.safe_text_zh, self.safe_text_en, language)
 
     def matcher(self) -> re.Pattern[str] | None:
         return (

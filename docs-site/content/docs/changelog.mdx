@@ -18,6 +18,10 @@ change must not be interpreted as an API guarantee.
   `aside` guidance now asks what makes the agent want to reach out now instead of
   how it will answer a message. Scheduled and screen-watch wakes are unchanged.
 
+- The probe-local `provider_config` credential-test notice now has English copy
+  and follows the user's stored `archive_language`, like registered probe
+  classes. It remains outside the runtime error registry.
+
 - Runtime V2 Capture now doubles only a truncated reply's re-ask budget
   (1,500 → 3,000 tokens by default, capped at the provider ceiling), with
   180-second wire and phase limits. First calls remain at 1,500 tokens and
