@@ -507,3 +507,10 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 `model_api:test_failed:<failure_class>` 去重；成功探针仅消除该探针通知前缀，
 删除配置仍清除整个 `model_api:` 前缀。除 provider_config 使用探针专用安全文案和归因外，通知复用 error_contract；
 provider_config 不加入全局运行时分类表，避免改变健康/统计归因。通知不存上游正文。
+
+Setup 与手动 test 的 `model_api.provider_probe.*` trace 在 `detail.status_code`
+记录安全上游状态：仅接受整数 100–599；字符串、布尔值、浮点数、越界值及无状态
+均为 null，不从异常原文猜测。失败终态取 ProviderError.status_code；started、
+success（返回结果未提供 HTTP 状态）和 runtime_fenced 控制事件为 null。
+此诊断字段可区分 401/402/403，不改变原有 error_class、HTTP 回执或重试分类；
+trace 不记录异常消息、response_detail 或原始响应正文。

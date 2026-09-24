@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Setup and manual Model API probe traces now retain a bounded upstream HTTP
+  `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
+  without storing provider error text or response bodies.
+
 - Resident CLI errors reporting Codex usage exhaustion now use the existing
   `quota_insufficient` classification and quota notice instead of the generic
   `unknown` fallback. Temporary rate-limit errors keep their existing class.

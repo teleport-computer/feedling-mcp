@@ -83,6 +83,14 @@ existing non-API-endpoint hint, `status_code: null`, and `provider_config` class
 This applies to setup, manual tests, route tests and activation, and key rotation.
 It does not change the provider client's retry policy.
 
+Setup and manual-test `model_api.provider_probe.*` trace events include
+`detail.status_code`: the failed probe's upstream HTTP integer (100–599), or
+`null` when unavailable or invalid. Strings, booleans, floats, and out-of-range
+values are discarded. Start, success, and runtime-fence events use `null`; a
+successful probe does not expose its transport status. This distinguishes
+401/402/403 without persisting exception messages, response details, or raw
+provider bodies. Existing error classes and API failure responses are unchanged.
+
 Saved-route test errors carry a `<failure_class>: ` prefix. A rejected replacement
 key leaves the previously saved key and its test status intact. Failures also
 produce a safe user notice, deduplicated by `model_api:test_failed:<failure_class>`;
