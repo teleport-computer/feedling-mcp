@@ -102,6 +102,19 @@ safe copy; it is not added to the runtime error registry and does not change
 runtime health or blame classification. Raw upstream response text is not copied
 into the notice.
 
+## Runtime V2 model-call diagnostics
+
+Runtime V2 `agent.model.call.error` events use the shared error vocabulary in
+`detail.error_class`, such as `auth_invalid`, `quota_insufficient`, `rate_limited`,
+and `upstream_unavailable`. Unrecognized causes use `unknown`. The separate
+`provider_error_class` remains the retry category (`transient`, `provider_config`,
+or `unknown`); it does not identify the specific cause.
+
+The original Python exception class name is retained as `exception_type` in the
+stored diagnostic detail and remains redacted in the public trace projection.
+Exception messages and provider response bodies are not copied into these fields.
+This diagnostic change does not alter retries or user-facing failure notices.
+
 ## Pi stream diagnostics
 
 For resident clients using the pi driver, `agent.model.call.done` and

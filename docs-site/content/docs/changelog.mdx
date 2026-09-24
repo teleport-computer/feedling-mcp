@@ -23,6 +23,10 @@ change must not be interpreted as an API guarantee.
   Already-truncated jobs may spend more tokens or make a budget-fallback call;
   normal jobs keep their existing call budget.
 
+- Runtime V2 model-call error traces now report shared failure causes in
+  `error_class` instead of Python exception class names. The original name is
+  retained separately as `exception_type`; retry categories remain unchanged.
+
 - Setup and manual Model API probe traces now retain a bounded upstream HTTP
   `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
   without storing provider error text or response bodies.
