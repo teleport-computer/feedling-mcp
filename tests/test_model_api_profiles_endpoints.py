@@ -32,6 +32,11 @@ from core import store as core_store  # noqa: E402
 from hosted import config_store  # noqa: E402
 
 _ENV = {"v": 1, "body_ct": "ct", "nonce": "n"}
+PROVIDER_CONFIG_TEXT_ZH = "模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。"
+PROVIDER_CONFIG_TEXT_EN = (
+    "Model service settings failed the test. Check the endpoint URL, model name, "
+    "and settings, then try again."
+)
 
 
 @pytest.fixture
@@ -1143,11 +1148,13 @@ def test_probe_failure_class_across_api_notice_and_persisted_route(
     notice = notices[0]
     assert notice['error_class'] == expected_class
     if expected_class == 'provider_config':
-        # Deliberate probe-local exception: no approved English copy exists.
-        # Preserve its Chinese text even for English users, without registration.
+        # Probe-local notice: localized by archive_language, still unregistered.
         assert expected_class not in catalog.ERROR_CLASSES
         assert notice['blame'] == 'user_provider'
-        assert notice['user_text'] == '模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。'
+        assert notice['user_text'] == (
+            PROVIDER_CONFIG_TEXT_EN if registered_user['archive_language'] == 'en'
+            else PROVIDER_CONFIG_TEXT_ZH
+        )
     else:
         assert expected_class in catalog.ERROR_CLASSES
         assert notice['blame'] == catalog.blame_for(expected_class)
@@ -1207,6 +1214,21 @@ def test_probe_config_class_does_not_expand_runtime_registry():
     assert 'provider_config' not in catalog.registry_export().values
     assert catalog.blame_for('provider_config') == 'system'
     assert catalog.provider_test_notice_for('provider_config')[0] == 'user_provider'
+
+
+@pytest.mark.parametrize('language,expected', [
+    ('en', PROVIDER_CONFIG_TEXT_EN),
+    ('en-US', PROVIDER_CONFIG_TEXT_EN),
+    ('zh-Hans', PROVIDER_CONFIG_TEXT_ZH),
+    ('', PROVIDER_CONFIG_TEXT_ZH),
+])
+def test_probe_config_notice_follows_archive_language(language, expected):
+    from notices import catalog
+
+    assert catalog.provider_test_notice_for('provider_config', language=language) == (
+        'user_provider', expected,
+    )
+    assert 'provider_config' not in catalog.ERROR_CLASSES
 
 
 @pytest.mark.parametrize('action', ['key', 'route', 'setup', 'label', 'failed_key'])

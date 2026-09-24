@@ -97,8 +97,9 @@ produce a safe user notice, deduplicated by `model_api:test_failed:<failure_clas
 a successful probe resolves these probe notices. Registered probe classes use
 the user's stored `archive_language` to select existing registry translations;
 an unset language retains the Chinese default. Other Model API notices remain
-unchanged. The probe-local `provider_config` notice still uses Chinese configuration-specific
-safe copy; it is not added to the runtime error registry and does not change
+unchanged. The probe-local `provider_config` notice uses configuration-specific
+safe copy selected by the same `archive_language` rule (English for `en*`, Chinese
+otherwise); it is not added to the runtime error registry and does not change
 runtime health or blame classification. Raw upstream response text is not copied
 into the notice.
 
