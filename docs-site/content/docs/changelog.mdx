@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 Capture now doubles only a truncated reply's re-ask budget
+  (1,500 → 3,000 tokens by default, capped at the provider ceiling), with
+  180-second wire and phase limits. First calls remain at 1,500 tokens and
+  90 seconds. Capture and Dream can fall back once to the original budget
+  after a larger-budget 402, as already supported for too-large 400/422
+  responses. Capture's truncation re-ask and budget fallback each allow one
+  reliable attempt, fitting the existing 1,260-second Heavy pool limit; the
+  global 3,000-second default is unchanged.
+  Already-truncated jobs may spend more tokens or make a budget-fallback call;
+  normal jobs keep their existing call budget.
+
 - Setup and manual Model API probe traces now retain a bounded upstream HTTP
   `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
   without storing provider error text or response bodies.
