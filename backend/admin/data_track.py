@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote
 
 from core.reqctx import request
 
+import admin_read_timing
 import db
 import debug_trace
 import provider_attempt_ledger
@@ -39,6 +40,7 @@ from core import store as core_store
 from core.store_sections import StoreSection
 from core import util as core_util
 from identity import service as identity_service
+from memory import extraction_trace as memory_extraction_trace
 from memory import dream_trace as memory_dream_trace
 
 
@@ -2757,6 +2759,7 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
     rows.sort(key=sort_tuple)
 
 
+@admin_read_timing.python_assembly
 def _data_track_payload(
     *, include_users: bool = True, include_detail_user: str = "",
     statement_timeout_ms: int | None = None,
@@ -3915,7 +3918,24 @@ def _debug_event_public_json(
                 value = raw_detail.get(key)
                 if isinstance(value, str) and len(value) <= limit:
                     public_detail[key] = value
-    if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
+    if ev.get("type") == memory_extraction_trace.REFUSAL_TRACE_TYPE:
+        # Storage adds one closed provenance field to every trace. Validate it
+        # separately so a real persisted event keeps its refusal metadata.
+        candidate = dict(raw_detail) if isinstance(raw_detail, dict) else {}
+        provenance = candidate.pop(db.TRACE_OUTCOME_PROVENANCE_FIELD, None)
+        valid_provenance = isinstance(raw_detail, dict) and (
+            db.TRACE_OUTCOME_PROVENANCE_FIELD not in raw_detail
+            or (
+                isinstance(provenance, str)
+                and provenance in db.TRACE_OUTCOME_PROVENANCE_VALUES
+            )
+        )
+        public_detail = (
+            dict(raw_detail)
+            if valid_provenance and memory_extraction_trace.valid_refusal_detail(candidate)
+            else {}
+        )
+    elif ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail
         # instead of inheriting the generic numeric/boolean projection.

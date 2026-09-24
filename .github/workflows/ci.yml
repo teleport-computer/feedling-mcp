@@ -447,6 +447,7 @@ jobs:
             tests/test_reply_language.py \
             tests/test_chat_language_follow_module.py \
             tests/test_pr_branch_flow.py \
+            tests/test_branch_flow_guard.py \
             tests/test_pi_mcp_bridge.py \
             tests/test_v2_cache_retry_metrics.py \
             tests/test_v2_screen_chat.py \
@@ -1144,6 +1145,7 @@ jobs:
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \
             tests/test_v2_extraction.py \
+            tests/test_extraction_refusal.py \
             tests/test_v2_extraction_lanes.py \
             tests/test_v2_extraction_memory_integration.py \
             tests/test_v2_extract_session.py \

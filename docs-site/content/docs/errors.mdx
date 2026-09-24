@@ -80,8 +80,10 @@ It does not change the provider client's retry policy.
 Saved-route test errors carry a `<failure_class>: ` prefix. A rejected replacement
 key leaves the previously saved key and its test status intact. Failures also
 produce a safe user notice, deduplicated by `model_api:test_failed:<failure_class>`;
-a successful probe resolves these probe notices. Other Model API notices remain
-unchanged. The probe-local `provider_config` notice uses configuration-specific
+a successful probe resolves these probe notices. Registered probe classes use
+the user's stored `archive_language` to select existing registry translations;
+an unset language retains the Chinese default. Other Model API notices remain
+unchanged. The probe-local `provider_config` notice still uses Chinese configuration-specific
 safe copy; it is not added to the runtime error registry and does not change
 runtime health or blame classification. Raw upstream response text is not copied
 into the notice.

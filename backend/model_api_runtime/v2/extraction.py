@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable, NamedTuple
 from memgarden.prompts.recall_fields import retrieval_cues
 
 import provider_client
+import provider_refusal
 from notices import error_contract
 
 # Dream renders up to 60 full cards / 60k chars (serve_worker
@@ -161,6 +162,8 @@ def provider_failure_code_from_reason(reason: str) -> str | None:
 
 def _provider_failure_code(exc: BaseException) -> str:
     """Classify without inspecting user messages; provider error bodies are allowed."""
+    if provider_refusal.project(getattr(exc, "provider_refusal", None)) is not None:
+        return "content_filtered"
     status = getattr(exc, "status_code", None)
     if not isinstance(status, int):
         trace = provider_client.runtime_provider_attempt_trace(exc) or {}
@@ -219,7 +222,10 @@ def _response_shape(stop_reason: Any, usage: Any, budget: int) -> dict[str, Any]
         "stop_reason": (
             "length"
             if provider_client.is_token_limit_stop_reason(raw_stop_reason)
-            else ("other" if raw_stop_reason else "")
+            else (
+                "refusal" if raw_stop_reason == "refusal"
+                else ("other" if raw_stop_reason else "")
+            )
         ),
         "completion_tokens": (
             max(0, int(raw_completion_tokens))
@@ -243,6 +249,7 @@ async def extract(
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
     failure_detail_out: Callable[[dict], None] | None = None,
+    refusal_out: Callable[[dict], Awaitable[None]] | None = None,
     parse_retry: ParseRetry | None = None,
     session: Any = None,
     step_sink: Any = None,
@@ -262,6 +269,9 @@ async def extract(
     空回复分两种：停在输出上限（``length`` / ``max_tokens`` 等，典型是思考模型把
     预算花在隐藏推理上）的**算截断**、走截断重问；没有上限标记的空回复仍按
     provider 故障处理（``upstream_unavailable``）。
+
+    明确的结构化拒答（包括带部分正文的拒答）只调用一次，返回
+    ``provider_call_failed:content_filtered``；不交给解析或组件重问。
 
     ## ``session``：让 GardenComponent 决定问什么
 
@@ -315,6 +325,8 @@ async def extract(
                     WIRE_DEADLINE_SEC if wire_deadline_sec is None else wire_deadline_sec
                 ),
                 progress_cb=progress_cb,
+                refusal_out=refusal_out,
+                retry_refusal=False,
                 # An empty reply that stopped at the token cap is this lane's
                 # truncation (handled below), not a transport blip to re-send
                 # three times at the budget that just ran out.

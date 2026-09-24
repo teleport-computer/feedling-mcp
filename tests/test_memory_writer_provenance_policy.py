@@ -158,7 +158,12 @@ def test_repo_memory_writer_provenance_matches_closed_policy():
             node.name: node
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in {"_memory_envelope_from_card", "_capture_build_envelope"}
+            and node.name
+            in {
+                "_memory_envelope_from_card",
+                "_capture_build_envelope",
+                "_capture_memory_action",
+            }
         }
         for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
             if not isinstance(call.func, ast.Name) or call.func.id not in envelope_builders:

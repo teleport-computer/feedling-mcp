@@ -199,4 +199,11 @@ jieba==0.42.1  # deterministic Chinese BM25 tokenization; hash in requirements.l
 # 换值、catalog 新增 health_steps）顺带带进来。io 的快照字段筛选读的是
 # perceptkit.catalog.SIGNALS，升级前后逐项对比无变化；step_count 改挂
 # health_steps 是另一件事，不在这次。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.7.0/perceptkit-0.7.0-py3-none-any.whl
+# 0.7.0 → 0.9.0（2026-09-23）。外部审查里能在库内修的全部修完（F1–F5/F7/F9–F12）。
+# **这次 pin 和代码必须一起改**：0.9.0 会调宿主的 scrub_event_snapshots
+# 把被删数据触发过的提醒记录里的原值抹掉，而那个方法和它要的两列是这一批
+# 才加的；装着 0.7.0 跑本分支，撤回时那一步直接不存在。
+#
+# ⚠️ 破坏性：observation_id 的算法变了（只影响新写入的行）。入口同时查新旧
+# 两个摘要兜住已落库的数据，否则"每次重传都翻倍"会变成"升级当天翻一次"。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.9.0/perceptkit-0.9.0-py3-none-any.whl

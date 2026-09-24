@@ -18393,6 +18393,62 @@ def _capture_inner_from_card(card: dict, *, voice_call_id: str = "") -> dict:
     return inner
 
 
+def _capture_effective_encryption() -> str:
+    """Return the cached write tier for automatic memory actions.
+
+    Unknown or missing values fail safe to the historical sealed shape.  This
+    mirrors the chat reply policy and prevents a stale/old backend response
+    from silently sending memory plaintext to a server that does not support
+    the plaintext tier.
+    """
+    value = str(_whoami_cache.get("content_encryption_effective") or "on").strip().lower()
+    return value if value in {"on", "off"} else "on"
+
+
+def _capture_memory_action(
+    card: dict,
+    *,
+    occurred_at: str,
+    source: str,
+    voice_call_id: str = "",
+    action_type: str = "memory.add",
+    supersedes: str | list[str] = "",
+) -> dict:
+    """Build one automatic memory mutation in the user's effective write tier.
+
+    Resident capture/dream historically always supplied a client-sealed
+    envelope.  Known plaintext-tier users must instead use the normal
+    ``memory`` action shape so the backend performs its own at-rest handling;
+    sealed users retain the existing envelope path.
+    """
+    if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
+        raise RuntimeError("capture_whoami_refresh_failed")
+    action: dict[str, Any]
+    if _capture_effective_encryption() == "off":
+        memory: dict[str, Any] = {
+            "type": str(card.get("type") or "event").strip().lower() or "event",
+            "summary": str(card.get("summary") or "").strip(),
+            "content": str(card.get("content") or "").strip(),
+            "source": str(source or "memory_capture")[:80],
+            "occurred_at": str(occurred_at or "")[:80],
+        }
+        for key in ("bucket", "threads", "importance", "pulse", "anchor_memory_ids", "retrieval_cues"):
+            if key in card and card[key] is not None:
+                memory[key] = card[key]
+        action = {"type": action_type, "memory": memory}
+    else:
+        envelope_kwargs = {"occurred_at": occurred_at, "source": source}
+        if voice_call_id:
+            envelope_kwargs["voice_call_id"] = voice_call_id
+        action = {
+            "type": action_type,
+            "envelope": _capture_build_envelope(card, **envelope_kwargs),
+        }
+    if supersedes:
+        action["supersedes"] = supersedes
+    return action
+
+
 def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", voice_call_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
@@ -18452,20 +18508,36 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
         # source of repeated duplicate cards.
         if action in {"merge", "supersede"} and not target_id:
             continue
-        envelope = _capture_build_envelope(
-            card, occurred_at=occurred_at, voice_call_id=voice_call_id)
         base = {
-            "envelope": envelope,
             "reason": "Memory captured from a completed chat window.",
             "capture_mode": "memory_capture",
             "source_chat_message_ids": source_ids,
         }
         if action == "add":
-            actions.append({"type": "memory.add", **base})
+            actions.append({
+                **_capture_memory_action(
+                    card,
+                    occurred_at=occurred_at,
+                    source="memory_capture",
+                    voice_call_id=voice_call_id,
+                    action_type="memory.add",
+                ),
+                **base,
+            })
             cards_added += 1
             continue
         if action in {"merge", "supersede"} and target_id:
-            actions.append({"type": "memory.supersede", "supersedes": target_id, **base})
+            actions.append({
+                **_capture_memory_action(
+                    card,
+                    occurred_at=occurred_at,
+                    source="memory_capture",
+                    voice_call_id=voice_call_id,
+                    action_type="memory.supersede",
+                    supersedes=target_id,
+                ),
+                **base,
+            })
             cards_superseded += 1
     rejected_without_target = sum(
         1
@@ -19367,11 +19439,14 @@ def _dream_actions_from_consolidations(
             "pulse": float(result.get("pulse") or 0),
             "retrieval_cues": result.get("retrieval_cues"),
         }
-        envelope = _capture_build_envelope(card, occurred_at=occurred_at, source="memory_dream")
         actions.append({
-            "type": "memory.supersede",
-            "supersedes": card_ids,
-            "envelope": envelope,
+            **_capture_memory_action(
+                card,
+                occurred_at=occurred_at,
+                source="memory_dream",
+                action_type="memory.supersede",
+                supersedes=card_ids,
+            ),
             "reason": f"Memory dream {op} consolidation.",
             "capture_mode": "memory_dream",
             "dream_op": op,
@@ -22303,9 +22378,9 @@ def _process_messages(messages: list) -> float:
 # result. (Cloud users upload plaintext → the server-side worker; the two coexist.)
 #
 # CRYPTO contract (verified against the backend — do not conflate the two lanes):
-#   • memory.add   → this consumer seals the card CLIENT-side (it holds the keys,
-#                    exactly like the capture lane) because /v1/memory/actions
-#                    HARD-requires an envelope.
+#   • memory.add   → this consumer uses the user's effective write tier: known
+#                    plaintext-tier users send the normal memory action and the
+#                    backend writes it; sealed users keep the client envelope.
 #   • identity.replace → this consumer sends PLAINTEXT + source/job_id/reason; the
 #                    SERVER builds the envelope (the P3 gate rejects a client envelope).
 #
@@ -23289,12 +23364,15 @@ def _resident_guard_distill_card(card: dict) -> dict | None:
 
 
 def _resident_import_action(card: dict, *, now_iso: str, supersedes: str = "") -> dict:
-    """One import card → client-sealed memory action (same envelope shape capture uses)."""
+    """One import card in the user's effective memory write shape."""
     occurred_at = str(card.get("occurred_at") or "").strip()[:80] or now_iso
     action = {
-        "type": "memory.add",
-        "envelope": _capture_build_envelope(
-            card, occurred_at=occurred_at, source="genesis_resident_distill"
+        **_capture_memory_action(
+            card,
+            occurred_at=occurred_at,
+            source="genesis_resident_distill",
+            action_type="memory.add",
+            supersedes=supersedes,
         ),
         "reason": "Distilled from material the user uploaded.",
         "capture_mode": "genesis_resident_distill",
@@ -23302,7 +23380,6 @@ def _resident_import_action(card: dict, *, now_iso: str, supersedes: str = "") -
     }
     if supersedes:
         action["type"] = "memory.supersede"
-        action["supersedes"] = supersedes
     return action
 
 

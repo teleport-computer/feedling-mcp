@@ -212,9 +212,11 @@ async def data_track_summary(request: Request):
 
 @router.get("/v1/admin/data-track/users")
 async def data_track_users(request: Request):
+    request_started = time.monotonic()
     _require_admin(request)
     payload = await _run_data_track_db(
         admin_core.users_payload, request.url.query,
+        request_started=request_started,
         timeout_seconds=DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC,
         statement_timeout_ms=int(DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC * 1000),
     )

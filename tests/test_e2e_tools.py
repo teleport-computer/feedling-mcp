@@ -219,6 +219,35 @@ def test_p0_blocking_verdict() -> None:
     ])
 
 
+def test_p0_default_run_uses_only_the_two_required_vps_harnesses(monkeypatch):
+    ran = []
+    monkeypatch.setattr(sys, "argv", ["p0.py"])
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(p0, "HOSTED_CELLS", [])
+
+    def run(cell):
+        ran.append(cell.name)
+        return {"cell": cell.name, "result": "ok", "steps": []}
+
+    monkeypatch.setattr(p0, "run_vps_cell", run)
+    assert p0.main() == 0
+    assert ran == ["vps-claude-code", "vps-codex"]
+
+
+def test_p0_list_and_explicit_selection_exclude_hermes(monkeypatch, capsys):
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--list"])
+    assert p0.main() == 0
+    output = capsys.readouterr().out
+    assert "vps-claude-code" in output and "vps-codex" in output
+    assert "vps-hermes" not in output
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--only", "vps-hermes"])
+    with pytest.raises(SystemExit) as exc:
+        p0.main()
+    assert exc.value.code == 2
+    assert "unknown cell(s): vps-hermes" in capsys.readouterr().err
+
+
 # --- hardening batch (codex2 R1 on the shakedown fixes) ----------------------
 
 def _sleepless(monkeypatch):
@@ -1004,3 +1033,41 @@ def test_admin_confirms_absent_only_404_is_true(monkeypatch, tmp_path) -> None:
     assert got is False and "ConnectError" in detail                 # TLS failure ⇒ not confirmed
     got, detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=tmp_path / "missing")
     assert got is None and "unavailable" in detail
+
+
+# --- tests/live_web_gate_check.py (manual live tool; T710) ------------------
+
+def _live_web_gate_module():
+    import importlib.util
+
+    path = Path(__file__).parent / "live_web_gate_check.py"
+    spec = importlib.util.spec_from_file_location("live_web_gate_check_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, path
+
+
+def test_live_web_gate_key_prefers_env_then_shared_key_pool(monkeypatch, tmp_path):
+    live, _ = _live_web_gate_module()
+    pool = tmp_path / "keys.env"
+    pool.write_text("E2E_KEY_DEEPSEEK=pool-key\n")
+    monkeypatch.setattr(config, "KEYS_FILE", pool)
+    monkeypatch.setenv("DEEPSEEK_KEY", "env-key")
+    assert live._load_key() == "env-key"
+    monkeypatch.delenv("DEEPSEEK_KEY")
+    assert live._load_key() == "pool-key"
+
+
+def test_live_web_gate_missing_key_names_the_pool_file(monkeypatch, tmp_path):
+    live, _ = _live_web_gate_module()
+    monkeypatch.delenv("DEEPSEEK_KEY", raising=False)
+    monkeypatch.setattr(config, "KEYS_FILE", tmp_path / "absent.env")
+    with pytest.raises(SystemExit, match="absent.env"):
+        live._load_key()
+
+
+def test_live_web_gate_has_no_machine_specific_paths(monkeypatch):
+    monkeypatch.setenv("FEEDLING_TEST_PG", "postgresql://u@db.example:5432/postgres")
+    live, path = _live_web_gate_module()
+    assert live.ADMIN == "postgresql://u@db.example:5432/postgres"
+    assert "/Users/" not in path.read_text(encoding="utf-8")

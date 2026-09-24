@@ -1005,6 +1005,37 @@ def test_an_event_deleted_upstream_disappears_from_the_mirror(clean):
     assert _titles(conn) == ["e1"], "窗口里没出现的事件应该被删掉"
 
 
+def test_deleting_the_last_event_actually_deletes_it(clean):
+    """删到只剩一个、再把它也删掉 —— 那一个必须跟着消失（外部审查 F8）。
+
+    原来在"这批有没有事件"之前就直接返回了，于是**空的全量快照根本不会
+    走到删除那一步**：用户把日历清空，io 这边永远留着最后那条。
+    此前的测试只覆盖了 2 条→1 条，漏了 1 条→0 条。
+    """
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1")]))
+    assert _titles(conn) == ["e1"]
+    _mirror(conn, _cal_payload([]))                      # 用户把最后一个也删了
+    assert _titles(conn) == [], "清空日历之后，最后那条还留着"
+
+
+def test_an_empty_batch_without_a_window_never_deletes(clean):
+    """反向守卫：**没有覆盖窗口的空批次不许删任何东西。**
+
+    "这个窗口里一个日程都没有"和"这次压根没拿到日历数据"（没授权、
+    客户端没发这一项）长得一模一样。按前者处理会把用户的镜像清空，
+    而且不可逆。
+
+    这条盯的是**行为**，不是某一行代码：拦住它的是 `_sync_mirror` 里
+    「没窗口就退回增量」那一步，不是 mirror_calendar 的提前返回
+    （故障注入验过——把提前返回删掉，这条照样绿）。
+    """
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1")]))
+    _mirror(conn, _cal_payload([], window=False))
+    assert _titles(conn) == ["e1"], "没有窗口的空批次把镜像清空了"
+
+
 def test_a_truncated_batch_never_deletes(clean):
     """截断意味着这批**不是**窗口内的全部。当成全量的话，被截掉的那些会被
     当成"用户删了"删掉 —— 不可逆。"""
@@ -1081,3 +1112,71 @@ def test_per_segment_wins_over_the_daily_totals_in_the_same_payload(clean):
     kept = _sleep_only(out.applied)
     assert [o.stored.source_event_id for o in kept] == ["seg-only"], \
         "有分段时不该再按总数摊出 deep/rem 那两条"
+
+
+# ---------------------------------------------------------------------------
+# 删掉一条数据之后，提醒记录里的原值也抹掉（hx 2026-09-17 拍板）
+# ---------------------------------------------------------------------------
+
+def test_retracting_a_fact_scrubs_the_value_from_the_alert_it_triggered(clean):
+    """早上称 72kg 触发了涨重提醒，下午发现秤没放平把它删了 ——
+    提醒记录里不许再留着 72，只留"有过一条已被删除的数据触发过"。
+
+    整条删掉是不行的："这条提醒当初为什么发"就再也解释不清了。
+    """
+    from datetime import datetime, timezone
+
+    from perceptkit.contracts.records import EventOutboxEntry
+
+    conn = connect()
+    s = store(conn)
+    now = datetime(2026, 9, 6, 9, 0, tzinfo=timezone.utc)
+    s.enqueue_event(EventOutboxEntry(
+        event_id="evt-1", subject_id="u1", definition_id="weight_over",
+        definition_version=1, event_type="health.weight_over",
+        occurred_at=now, detected_at=now,
+        fact_snapshot={"current": 72.0, "previous": 70.0},
+        source="ios", source_event_id="hk-B",
+    ))
+
+    hit = s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
+                                  source="ios", source_event_id="hk-B")
+    assert hit == 1, "没找到那条提醒"
+
+    raw = conn.execute(
+        "SELECT fact_snapshot FROM perceptkit_event_outbox WHERE event_id='evt-1'"
+    ).fetchone()[0]
+    assert raw.get("retracted") is True, "没标出来触发它的数据已被删除"
+    assert raw.get("current") is None and raw.get("previous") is None, \
+        f"提醒记录里还留着被删掉的数值：{raw}"
+    still_there = conn.execute(
+        "SELECT 1 FROM perceptkit_event_outbox WHERE event_id='evt-1'").fetchone()
+    assert still_there, "整条记录被删掉了 —— 该留下「触发过」这件事"
+
+
+def test_scrubbing_leaves_other_alerts_alone(clean):
+    """反向守卫：别人的、以及同一个人另一条数据触发的提醒，一个字都不许动。"""
+    from datetime import datetime, timezone
+
+    from perceptkit.contracts.records import EventOutboxEntry
+
+    conn = connect()
+    s = store(conn)
+    now = datetime(2026, 9, 6, 9, 0, tzinfo=timezone.utc)
+    for eid, subject, src_id in (("evt-1", "u1", "hk-B"),
+                                 ("evt-2", "u1", "hk-OTHER"),
+                                 ("evt-3", "u2", "hk-B")):
+        s.enqueue_event(EventOutboxEntry(
+            event_id=eid, subject_id=subject, definition_id="weight_over",
+            definition_version=1, event_type="health.weight_over",
+            occurred_at=now, detected_at=now,
+            fact_snapshot={"current": 72.0}, source="ios", source_event_id=src_id,
+        ))
+
+    assert s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
+                                   source="ios", source_event_id="hk-B") == 1
+    kept = conn.execute(
+        "SELECT event_id FROM perceptkit_event_outbox "
+        "WHERE fact_snapshot->>'current' IS NOT NULL ORDER BY event_id"
+    ).fetchall()
+    assert [r[0] for r in kept] == ["evt-2", "evt-3"], kept

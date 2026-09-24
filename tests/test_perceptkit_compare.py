@@ -284,12 +284,16 @@ def test_coverage_accounts_for_every_signal():
 def test_nothing_is_left_unshadowed():
     """先前这条断言的是「照片、app 开关那几条**没接**，而且写明了原因」。
 
-    现在都接上了，所以它反过来断言：`NOT_SHADOWED` 是空的。
-    以后要是又有信号进不来，往那里加一行**并写明原因** —— 这条会逼着写，
-    因为空字典之外的每一项都必须带理由。
+    现在都接上了，所以它反过来断言：名单是**逐条钉住**的，而且每条都带理由。
+    新信号进不来时会红 —— 那时请判断是"该接没接"还是"这个宿主本来就不发"，
+    再决定是去接它、还是往名单里加一行写明原因。
+
+    place_zone：kit 0.8.0 新增的信号（用户命名区域的内/外）。io 的 iOS 不发
+    这一项，目录里也没有这个上报键 —— 影子根本收不到。留空名单会让
+    "没接"和"接了但一致"分不开。
     """
-    assert compare.NOT_SHADOWED == {}
-    assert all(compare.NOT_SHADOWED.values())     # 加回来的每条都得有理由
+    assert set(compare.NOT_SHADOWED) == {"place_zone"}
+    assert all(compare.NOT_SHADOWED.values())     # 每条都得有理由
 
 
 def test_the_declared_vocabulary_is_applied_to_the_live_side_too():

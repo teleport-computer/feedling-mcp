@@ -39,11 +39,11 @@ _UPSTREAM_RULES = tuple(
 )
 
 
-def provider_test_notice_for(failure_class: str) -> tuple[str, str]:
+def provider_test_notice_for(failure_class: str, *, language: str = "") -> tuple[str, str]:
     """Probe notice metadata without expanding the public runtime registry."""
     if failure_class == PROVIDER_TEST_CONFIG_CLASS:
         return _PROVIDER_TEST_CONFIG_NOTICE
-    return blame_for(failure_class), user_text_for(failure_class)
+    return blame_for(failure_class), user_text_for(failure_class, language=language)
 
 
 def registry_export(source_loaders=None) -> error_contract.RegistryExport:
