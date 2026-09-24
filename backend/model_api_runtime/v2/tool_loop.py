@@ -23,6 +23,7 @@ from capabilities import result_budget
 from capabilities import tool_schema
 from agent_protocol_core import protocol_leak, self_thinking
 from chat import language_follow
+from model_api_runtime.v2 import provider_errors
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
@@ -1867,7 +1868,9 @@ async def run_tool_loop(
                 )
             ),
             "status_code": status_code,
-            "error_class": type(exc).__name__,
+            "error_class": provider_errors.error_class_for_exception(exc),
+            "exception_type": type(exc).__name__,
+            # Retry family is independent of the shared notice cause above.
             "provider_error_class": error_family,
             **provider_client.provider_error_diagnostics(exc),
         }
