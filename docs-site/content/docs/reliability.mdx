@@ -110,6 +110,13 @@ fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
 A regular wake's otherwise valid `reply` whose entire text is a bare protocol
 token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
+Heartbeat and manual wakes first make one provider call without `reply` or
+`stay_silent`, so the agent looks at its context before deciding. If it needs no
+lookup, any drafted text stays unpublished and carries into one ordinary decision
+round with both choices offered. This uses the existing provider-call budget and
+applies only when that budget allows at least three calls. For these two lanes, the
+optional `aside` asks what makes the agent want to reach out now rather than how it
+will answer a message.
 The screen-watch lane follows the same default while keeping its own guidance
 to avoid interrupting the user's flow.
 

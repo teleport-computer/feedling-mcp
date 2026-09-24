@@ -1338,6 +1338,10 @@ async def run_tool_loop(
     # terminal plain-text response remains an unpublished draft and gets at
     # most one correction within the existing provider-call budget.
     regular_wake_choice_required: bool = False,
+    # Presence wakes withhold reply/stay_silent from their first provider call so
+    # the model looks at its context before deciding (prod T723: GLM decided in
+    # one call 96% of the time and chose silence 93% of the time).
+    wake_look_first: bool = False,
     reply_tool_enabled: bool = False,
     # Output capacity is independent of whether this lane requires a terminal
     # reply/stay_silent choice. Scheduled wakes need the same shared budget.
@@ -1500,6 +1504,8 @@ async def run_tool_loop(
         raise ValueError(
             "regular_wake_choice_required requires on_stay_silent"
         )
+    if wake_look_first and not regular_wake_choice_required:
+        raise ValueError("wake_look_first requires regular_wake_choice_required")
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -1543,6 +1549,10 @@ async def run_tool_loop(
     wake_direct_text_seen = False
     wake_direct_text_pending = False
     wake_direct_text_draft = ""
+    # Needs one look round, one decision round and one spare correction round.
+    wake_look_first_pending = bool(wake_look_first and max_calls >= 3)
+    wake_look_first_decide = False
+    wake_look_first_draft = ""
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
     external_content_seen = False
@@ -2039,6 +2049,29 @@ async def run_tool_loop(
             wake_choice_required = True
             force_text_fallback = False
             force_text_fallback_reason = ""
+        look_first_round = bool(
+            wake_look_first_pending
+            and not wake_choice_required
+            and not wake_direct_text_pending
+        )
+        if look_first_round:
+            look_catalog = [
+                spec for spec in turn_catalog
+                if spec.name not in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+            ]
+            if look_catalog:
+                turn_catalog = look_catalog
+            else:
+                # Nothing to look with: an empty tool list is not a valid wire.
+                look_first_round = False
+                wake_look_first_pending = False
+        look_first_decide_round = wake_look_first_decide
+        if look_first_decide_round and wake_look_first_draft:
+            # Same boundary as a direct-text draft: never persisted, never sent.
+            messages = [
+                *messages,
+                {"role": "assistant", "content": wake_look_first_draft},
+            ]
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -2087,6 +2120,17 @@ async def run_tool_loop(
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 _WAKE_DIRECT_TEXT_CORRECTION if wake_direct_text_pending else "",
+                (
+                    (
+                        _WAKE_DIRECT_TEXT_CORRECTION
+                        if wake_look_first_draft
+                        else _WAKE_CHOICE_INSTRUCTION
+                    )
+                    if look_first_decide_round
+                    and not wake_choice_required
+                    and not wake_direct_text_pending
+                    else ""
+                ),
                 final_reply_correction_instruction,
                 terminal_text_instruction,
             )
@@ -2467,7 +2511,7 @@ async def run_tool_loop(
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
-        if regular_wake_choice_required:
+        if regular_wake_choice_required and not look_first_round:
             required_schema_names = set(required_schema_names) | {
                 _WAKE_REPLY_TOOL,
                 tool_schema.STAY_SILENT_TOOL,
@@ -3147,6 +3191,53 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        if look_first_decide_round:
+            wake_look_first_decide = False
+            wake_look_first_draft = ""
+        if look_first_round:
+            wake_look_first_pending = False
+            early_decision_calls = [
+                tc for tc in pr.tool_calls
+                if tc.name in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+            ]
+            early_decision_only = bool(pr.tool_calls) and len(
+                early_decision_calls
+            ) == len(pr.tool_calls)
+            if (not pr.tool_calls and not pr.media) or early_decision_only:
+                # No lookup was wanted. A decision attempted before it was
+                # offered is not a protocol violation: carry any drafted text
+                # (plain text or reply.text) as an unpublished draft into one
+                # ordinary decision round; from there the existing direct-text
+                # and empty-response paths apply unchanged.
+                early_reply_text = next(
+                    (
+                        str((tc.args or {}).get("text") or "")
+                        for tc in early_decision_calls
+                        if tc.name == _WAKE_REPLY_TOOL
+                        and isinstance(tc.args, dict)
+                    ),
+                    "",
+                )
+                draft_source = early_reply_text or (
+                    pr.text if not upstream_response_envelope else ""
+                )
+                wake_look_first_decide = True
+                wake_look_first_draft = (
+                    draft_source[:max_assistant_tool_text_chars]
+                    if draft_source.strip()
+                    else ""
+                )
+                await _trajectory("wake_look_first", {
+                    "round": attempts,
+                    "tool_call_count": len(pr.tool_calls),
+                    "early_decision": early_decision_only,
+                    "provider_text_present": bool(wake_look_first_draft),
+                })
+                await _emit_provider_tool_surface(provider_surface_detail)
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("wake_look_first_decide_boundary")
+                continue
         if (
             regular_wake_choice_required and not wake_direct_text_seen
             and not pr.tool_calls and not pr.media and pr.text.strip()
