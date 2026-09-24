@@ -151,3 +151,30 @@ def test_dream_budget_anchors_and_pool_derivation(monkeypatch):
     heavy = next(s for s in RuntimePoolConfig.from_env().slots if s.pool == "heavy")
     assert heavy.stall_budget_sec == 250.0
     assert heavy.absolute_budget_sec == 1500.0
+
+
+def test_capture_full_retry_envelope_fits_both_watchdogs():
+    from model_api_runtime.v2 import extraction, serve_worker
+
+    # First request: three reliable attempts plus nominal backoff. Truncation
+    # re-ask and budget fallback: one each, still up to two compatibility wires.
+    required = (3 * 2 * 90 + 6) + (1 * 2 * 180) + (1 * 2 * 90) + 120
+    assert required == 1206
+    assert extraction.nominal_provider_envelope_sec() == required
+    assert serve_worker._EXTRACTION_TURN_BUDGET_SEC >= required
+    assert serve_worker._TURN_ABSOLUTE_TIMEOUT_SEC >= required
+    for slot in RuntimePoolConfig.from_env().slots:
+        if "capture" in slot.lanes:
+            assert slot.absolute_budget_sec == 1260 >= required
+            assert slot.stall_budget_sec == 210
+
+
+def test_capture_envelope_tracks_its_actual_wire_and_attempt_limits(monkeypatch):
+    from model_api_runtime.v2 import extraction
+
+    # Default Capture and the old Dream single-call allowance happen to match.
+    # A changed Capture deadline must not hide behind that accidental equality.
+    monkeypatch.setattr(extraction, "WIRE_DEADLINE_SEC", 110.0)
+    assert extraction.nominal_provider_envelope_sec() == 1366.0
+    monkeypatch.setattr(extraction, "CAPTURE_TRUNCATION_MAX_ATTEMPTS", 2)
+    assert extraction.nominal_provider_envelope_sec() == 1949.0

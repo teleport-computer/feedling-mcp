@@ -315,15 +315,18 @@ def test_dream_output_budget_leaves_room_and_retry_escalates_under_wire_ceiling(
     assert first >= 12000
     assert retry == min(first * 2, ceiling)
     assert first < retry <= ceiling
-    # Capture keeps its historical same-budget retry.
-    assert extraction.truncation_retry_max_output_tokens_for_lane("capture") is None
+    # T713: the historical same-budget Capture retry also exhausted its cap.
+    assert extraction.max_output_tokens_for_lane("capture") == 1500
+    assert extraction.truncation_retry_max_output_tokens_for_lane("capture") == 3000
 
 
-def test_dream_retry_budget_is_clamped_to_the_shared_wire_ceiling(monkeypatch):
+@pytest.mark.parametrize("lane", ["capture", "dream"])
+def test_extraction_retry_budget_is_clamped_to_the_shared_wire_ceiling(monkeypatch, lane):
     ceiling = extraction.provider_client.CHAT_OUTPUT_MAX_TOKENS
-    monkeypatch.setattr(extraction, "DREAM_MAX_OUTPUT_TOKENS", ceiling * 3)
-    assert extraction.max_output_tokens_for_lane("dream") == ceiling
-    assert extraction.truncation_retry_max_output_tokens_for_lane("dream") == ceiling
+    monkeypatch.setattr(extraction, f"{lane.upper()}_MAX_OUTPUT_TOKENS", ceiling * 3)
+    if lane == "dream":
+        assert extraction.max_output_tokens_for_lane(lane) == ceiling
+    assert extraction.truncation_retry_max_output_tokens_for_lane(lane) == ceiling
 
 
 def test_extract_truncation_retry_uses_the_larger_budget_without_session(monkeypatch):

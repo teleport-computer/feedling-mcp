@@ -65,21 +65,20 @@ def max_output_tokens_for_lane(lane: str) -> int:
     raise ValueError(f"unsupported extraction lane: {lane}")
 
 
-def truncation_retry_max_output_tokens_for_lane(lane: str) -> int | None:
+def truncation_retry_max_output_tokens_for_lane(lane: str) -> int:
     """Budget for the one retry that follows a length-stopped reply.
 
-    Dream doubles its budget (the same escalation genesis' JSON repair uses),
+    Capture and Dream double their budget (as genesis' JSON repair does),
     clamped to ``provider_client.CHAT_OUTPUT_MAX_TOKENS`` — the one audited
     ceiling every provider wire already accepts from foreground file-capable
     Chat. Retrying at the budget that just truncated only asks for a shorter
     answer; a garden whose consolidation genuinely needs more room fails the
-    same way every night. Capture keeps its historical same-budget retry
-    (``None``).
+    same way every night. Capture's historical same-budget retry was exhausted
+    twice in 245 jobs in T713's eight-day sample (368 truncated failures).
+    Only the truncation re-ask gets more room; the first request is unchanged.
     """
-    if lane == "capture":
-        return None
-    if lane == "dream":
-        base = max_output_tokens_for_lane("dream")
+    if lane in {"capture", "dream"}:
+        base = max_output_tokens_for_lane(lane)
         return min(base * 2, provider_client.CHAT_OUTPUT_MAX_TOKENS)
     raise ValueError(f"unsupported extraction lane: {lane}")
 
@@ -91,6 +90,10 @@ _TIMEOUT_SEC = 90.0
 # more time for its larger output. httpx's phase timeout is separate.
 WIRE_DEADLINE_SEC = 90.0
 DREAM_WIRE_DEADLINE_SEC = 180.0
+# Only Capture's truncation re-ask and its budget fallback use this limit.
+# Keeping each to one reliable attempt fits the existing Heavy slot allowance
+# while allowing a longer wire; first/parse/semantic calls keep three attempts.
+CAPTURE_TRUNCATION_MAX_ATTEMPTS = 1
 
 
 def wire_deadline_for_lane(lane: str) -> float:
@@ -102,14 +105,37 @@ def wire_deadline_for_lane(lane: str) -> float:
 
 
 def max_wire_deadline_sec() -> float:
-    return max(wire_deadline_for_lane(lane) for lane in ("capture", "dream", "profile"))
+    return max(
+        *(wire_deadline_for_lane(lane) for lane in ("capture", "dream", "profile")),
+        truncation_retry_wire_deadline_sec(),
+    )
+
+
+def truncation_retry_wire_deadline_sec() -> float:
+    """Capture's longer truncation re-ask uses Dream's wire and phase limit."""
+    return DREAM_WIRE_DEADLINE_SEC
 
 
 def nominal_provider_envelope_sec() -> float:
-    # Existing allowance: three reliable attempts, each with at most two
-    # compatibility wires, plus backoff and setup/write margin. This does not
-    # include a separate component parse/truncation re-ask.
-    return 3.0 * (2.0 * max_wire_deadline_sec()) + 6.0 + 120.0
+    # Preserve the existing single-call allowance for all lanes, and cover
+    # Capture's first request + truncation re-ask + one budget-rejection
+    # fallback. The first call has three reliable attempts; the two truncation
+    # calls each have one. Each attempt can still use two compatibility wires.
+    # Nominal backoff excludes optional Retry-After. This does NOT resolve the
+    # separate pre-existing Dream re-ask/fallback envelope gap.
+    def call_envelope(deadline: float, attempts: int = 3) -> float:
+        return provider_client.reliable_chat_nominal_envelope_sec(
+            request_inactivity_timeout_sec=2.0 * deadline,
+            max_attempts=attempts,
+            base_delay_sec=1.0,
+        )
+
+    capture = (
+        call_envelope(wire_deadline_for_lane("capture"))
+        + call_envelope(truncation_retry_wire_deadline_sec(), CAPTURE_TRUNCATION_MAX_ATTEMPTS)
+        + call_envelope(wire_deadline_for_lane("capture"), CAPTURE_TRUNCATION_MAX_ATTEMPTS)
+    )
+    return max(call_envelope(max_wire_deadline_sec()), capture) + 120.0
 
 
 class ParseRetry(NamedTuple):
@@ -254,6 +280,8 @@ async def extract(
     session: Any = None,
     step_sink: Any = None,
     truncation_retry_max_tokens: int | None = None,
+    truncation_retry_timeout_sec: float | None = None,
+    truncation_retry_max_attempts: int = 3,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
@@ -287,15 +315,20 @@ async def extract(
 
     ## ``truncation_retry_max_tokens``
 
-    截断之后的那一次重问用的输出预算。``None`` = 沿用 ``max_tokens``（capture
-    的历史行为）。dream 传一个更大的值：若只换「更简洁」的提示词而预算不变，
+    截断之后的那一次重问用的输出预算。``None`` = 沿用 ``max_tokens``。
+    Capture / Dream 传一个更大的值：若只换「更简洁」的提示词而预算不变，
     真的需要更多输出空间的花园会原样再截断一次（prod 上有用户连续多晚
     ``output_truncated``）。只作用于截断之后的调用，首问预算不变。
 
     没有逐模型的输出上限元数据：若这条路由接受 ``max_tokens`` 却以 400/422
-    拒绝更大的重问预算（"max_tokens too large"），同一个简洁提示词会退回
+    拒绝更大的重问预算（"max_tokens too large"），或返回 402（预算预扣不足），
+    同一个简洁提示词会退回
     ``max_tokens`` 再问一次（轨迹 ``extraction_output_budget_fallback``），
     而不是把可恢复的截断变成 ``provider_config`` 失败。
+    ``truncation_retry_timeout_sec`` 只覆盖截断重问的 phase 和 wire 时限；
+    首问、格式/语义重问和原预算回退仍用原时限。首问的 402 不回退。
+    ``truncation_retry_max_attempts`` 限制重问及原预算回退各自的可靠尝试次数。
+    Capture 传 1，以便整条截断重问链仍适配既有 Heavy 槽位的总时限。
     """
     retry_budget = max(
         int(max_tokens),
@@ -303,10 +336,14 @@ async def extract(
         if truncation_retry_max_tokens is not None
         else int(max_tokens),
     )
+    base_timeout = _TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    base_wire_deadline = WIRE_DEADLINE_SEC if wire_deadline_sec is None else wire_deadline_sec
 
     async def _call(
         attempt_prompt: str,
         budget: int = max_tokens,
+        retry_timeout: float | None = None,
+        max_attempts: int = 3,
     ) -> tuple[str | None, str | None, dict[str, Any]]:
         """跑一次 provider，返回 reply、error 与 content-free 响应形状。"""
         messages = [{"role": "user", "content": attempt_prompt}]
@@ -319,10 +356,11 @@ async def extract(
                 provider_config,
                 messages,
                 max_tokens=budget,
+                max_attempts=max_attempts,
                 temperature=_TEMPERATURE,
-                timeout=_TIMEOUT_SEC if timeout_sec is None else timeout_sec,
+                timeout=base_timeout if retry_timeout is None else retry_timeout,
                 wire_deadline_sec=(
-                    WIRE_DEADLINE_SEC if wire_deadline_sec is None else wire_deadline_sec
+                    base_wire_deadline if retry_timeout is None else retry_timeout
                 ),
                 progress_cb=progress_cb,
                 refusal_out=refusal_out,
@@ -361,6 +399,10 @@ async def extract(
                 )
             budget_rejected = budget > max_tokens and (
                 provider_client.is_output_budget_rejection(e)
+                or (
+                    isinstance(e, provider_client.ProviderError)
+                    and e.status_code == 402
+                )
             )
             error_code = (
                 _OUTPUT_BUDGET_REJECTED if budget_rejected else _provider_failure_code(e)
@@ -399,11 +441,14 @@ async def extract(
 
         There is no per-model output-cap metadata, so a model that accepted
         ``max_tokens`` but rejects the doubled budget (400/422 "max_tokens too
-        large") would otherwise turn a recoverable concise retry into a
-        ``provider_config`` failure. Re-ask the same concise prompt once at the
+        large", or 402 prepaid-budget rejection) would otherwise turn a
+        recoverable concise retry into a provider failure. Re-ask once at the
         budget this route already accepted.
         """
-        reply, call_error, shape = await _call(attempt_prompt, retry_budget)
+        reply, call_error, shape = await _call(
+            attempt_prompt, retry_budget, truncation_retry_timeout_sec,
+            truncation_retry_max_attempts,
+        )
         if call_error != _OUTPUT_BUDGET_REJECTED:
             return reply, call_error, shape
         if trajectory_out is not None:
@@ -411,7 +456,9 @@ async def extract(
                 "extraction_output_budget_fallback",
                 {"rejected_max_tokens": retry_budget, "max_tokens": max_tokens},
             )
-        return await _call(attempt_prompt, max_tokens)
+        return await _call(
+            attempt_prompt, max_tokens, max_attempts=truncation_retry_max_attempts
+        )
 
     async def _report_truncated(
         response_shape: dict[str, Any], *, attempt: int

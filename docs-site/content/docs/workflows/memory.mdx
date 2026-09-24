@@ -242,13 +242,34 @@ across Capture runs. Clients subtract the total saved when the user last
 dismissed the banner to show the unconfirmed count. A Capture run that adds no
 cards does not change the total or refresh the timestamp.
 
-Runtime V2 Dream allows up to 180 seconds per provider HTTP wire, with a
-matching 180-second phase timeout. Capture and profile generation retain their
-90-second wire limits; chat and wake provider timeouts are unchanged. The shared
-Heavy pool allows 210 seconds without progress and 1,260 seconds total, derived
-from the largest lane wire budget and the existing provider-attempt allowance.
-Each compatibility fallback reports a new wire boundary. These limits do not
-change Dream's card/output budgets, consolidation safety gates, or resident V1.
+Runtime V2 Capture starts with a 1,500-token output budget and 90-second wire
+and phase timeouts. Only a reply stopped at the output limit triggers a larger
+re-ask: twice the configured Capture budget (3,000 by default), capped by the
+shared provider output ceiling, with 180-second wire and phase timeouts. A
+second truncated reply ends the job with `output_truncated`; the budget does
+not keep increasing. Format or semantic re-asks retain the original limits.
+Only already-truncated jobs can spend more output tokens on this re-ask;
+normal jobs keep their existing budget and number of calls.
+
+If the larger Capture or Dream budget is rejected as too large (400/422), or
+with a payment-required response (402), the same concise prompt gets one
+fallback at the original budget and timeouts. An initial 402 remains a quota
+failure. This fallback can add a provider call; it cannot escalate again.
+
+Runtime V2 Dream retains 180-second wire and phase timeouts; profile generation
+retains 90 seconds. Chat and wake provider timeouts are unchanged. The shared
+Heavy pool retains its limits of 210 seconds without progress and 1,260 seconds
+in total. Capture's complete nominal envelope is 1,206 seconds: the initial
+request allows three reliable attempts, while the truncation re-ask and its
+budget fallback each allow one. Every attempt can still make two compatibility
+wires; each wire reports progress. The envelope includes nominal backoff and a
+120-second setup/write margin. A transient failure on the truncation re-ask or
+its budget fallback therefore ends the job without another reliable attempt;
+normal first calls and format/semantic re-asks keep their existing retries.
+The global absolute timeout default stays at 3,000 seconds. The nominal envelope
+excludes optional provider `Retry-After` delays and does not yet cover Dream's
+full re-ask plus budget-fallback envelope. Dream's output
+budgets, consolidation safety gates, and resident V1 are unchanged.
 
 Dream maintenance, in both Runtime V2 and resident V1 (hosted and
 self-hosted), reads complete decrypted candidate cards and shows the model each
