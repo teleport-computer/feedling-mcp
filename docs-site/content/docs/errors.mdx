@@ -53,6 +53,12 @@ copy. These rejection counters are best-effort diagnostics: if persistence
 fails, Feedling records a content-free warning in service logs, so dashboard
 totals can be lower than the actual number of rejected values.
 
+Resident CLI failures reporting Codex's `hit your usage limit` message are
+classified as `quota_insufficient` with `blame: "user_provider"` and the existing
+quota notice. This applies with either straight or curly apostrophes in
+`You've` / `You’ve`. Ordinary `429 Too Many Requests` failures retain the
+`rate_limited` classification.
+
 Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.
