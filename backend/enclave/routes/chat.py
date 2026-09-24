@@ -72,6 +72,55 @@ def _unified_selection(garden_cards: list[dict], query: str) -> tuple[list[dict]
     return picked, trace
 
 
+def _latest_first_selection(garden_cards, current_query, combined_query, selector):
+    """Reserve current-message hits, then fill from the two-message context.
+
+    Both kernel selectors gate *every* bucket before applying quotas: BM25 uses
+    the retrieval gate; legacy requires min_relevance and medium/strong
+    confidence. Their picked lists are the eligibility signal; do not invent a
+    host threshold or admit rejected recent/turning cards to fill spare seats.
+    """
+    current, current_trace = selector(garden_cards, current_query)
+    passes = [("current", current, current_trace, current_query)]
+    if combined_query != current_query:
+        fallback, fallback_trace = selector(garden_cards, combined_query)
+        passes.append(("context", fallback, fallback_trace, combined_query))
+
+    picked, selected, seen = [], [], set()
+    # V1 and V2 renderers sort by score. Offset current hits above all fallback
+    # scores so a long previous topic cannot evict them at the prompt budget.
+    # Keep the kernel score separately: host priority is not lexical evidence.
+    priority = (max([0.0, *(float(s.get("score") or 0)
+                           for s in passes[-1][2].get("selected", []))]) + 1.0
+                if len(passes) > 1 else 0.0)
+    for source, candidates, trace, _ in passes:
+        reasons = {str(s["id"]): s for s in trace.get("selected", [])}
+        for card in candidates:
+            mid = str(card.get("id") or "")
+            if not mid or mid in seen or len(picked) >= _CONTEXT_MEMORY_CAP:
+                continue
+            seen.add(mid)
+            picked.append(card)
+            reason = reasons[mid]
+            score = float(reason.get("score") or 0)
+            selected.append({**reason, "query_source": source, "kernel_score": score,
+                             "score": score + (priority if source == "current" else 0)})
+    kernel_version = current_trace.get("version") or "legacy-relevance"
+    trace = {
+        "mode": "latest_first", "version": f"{kernel_version}+host:latest-first-v1",
+        "kernel_version": kernel_version, "cap": _CONTEXT_MEMORY_CAP,
+        "index_count": sum(bool(c.get("id")) for c in garden_cards),
+        "selected": selected,
+        "passes": [{"source": source, "query_fingerprint": mg_observability.query_fingerprint(query),
+                    "trace": pass_trace} for source, _, pass_trace, query in passes],
+        # This is a sample from the final query, not all rejected candidates.
+        # A current hit rejected by that query is still an injected card.
+        "rejected_sample": [s for s in passes[-1][2].get("rejected_sample", [])
+                            if str(s.get("id") or "") not in seen],
+    }
+    return picked, trace
+
+
 def _attach_chat_metadata(source: dict, target: dict) -> None:
     """Carry bounded reply and voice metadata into the decrypt view."""
     for key, limit in (
@@ -335,7 +384,7 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
 
 def _build_context_memories(moments, decrypted, query_args):
     """纯同步 context_memories 选择（在 to_thread 里跑）。
-    最近两条非空用户消息作为选卡 query（最新在前，不含 AI 回复），context_mode/
+    最新非空用户消息先选卡，再用最近两条补位（不含 AI 回复）。context_mode/
     want_trace 已由路由层预解析进 query_args dict（不能跨线程读
     request.query_params）。_load_decrypted_moments 的解密部分 →
     readside.moments_to_cards(moments, ...)（拉取已上移到路由层）。
@@ -343,7 +392,8 @@ def _build_context_memories(moments, decrypted, query_args):
     recent_text = [m["content"] for m in decrypted
                    if m.get("role") in {"user", "human"}
                    and isinstance(m.get("content"), str) and m["content"].strip()][-2:]
-    latest_user_text = "\n".join(reversed(recent_text))
+    current_query = recent_text[-1] if recent_text else ""
+    combined_query = "\n".join(reversed(recent_text))
 
     want_trace = query_args["want_trace"]
 
@@ -380,17 +430,12 @@ def _build_context_memories(moments, decrypted, query_args):
     # Resident 与 Hosted Runtime V2 固定走同一套分桶策略，确保用户切换
     # runtime 时召回不漂移。context_mode/context_strict 仍作为兼容参数接收，
     # 但不再选择不同 policy。
-    if _unified_recall_enabled():
-        picked, selection_trace = _unified_selection(garden_cards, latest_user_text)
-        # The mode label carries the ranking version, so a stored record says
-        # which ruler picked the cards (the same string memory_search reports).
-        mode = f"relevant:unified:{selection_trace.get('version') or search_contract.RECALL_VERSION}"
-    else:
-        picked, selection_trace = memory_relevance.select_relevant_context_memories_with_trace(
-            garden_cards,
-            latest_user_text,
-        )
-        mode = "relevant:unified"
+    selector = (_unified_selection if _unified_recall_enabled()
+                else memory_relevance.select_relevant_context_memories_with_trace)
+    picked, selection_trace = _latest_first_selection(
+        garden_cards, current_query, combined_query, selector)
+    # The persisted label identifies both the kernel and the host merge rule.
+    mode = f"relevant:unified:{selection_trace['version']}"
     context_memories = _back_to_original(picked)
     if query_args.get("context_recent"):
         fresh = recall_metadata.recent_cards(selectable)
@@ -415,7 +460,7 @@ def _build_context_memories(moments, decrypted, query_args):
 
     context_memory_log = mg_observability.injection_record(
         mode=mode,
-        query=latest_user_text,
+        query=combined_query,
         candidate_pool=len(cards),
         selection_trace=selection_trace,
         injected_ids=[str(c.get("id") or "") for c in context_memories],
