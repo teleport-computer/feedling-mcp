@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident CLI errors reporting Codex usage exhaustion now use the existing
+  `quota_insufficient` classification and quota notice instead of the generic
+  `unknown` fallback. Temporary rate-limit errors keep their existing class.
+
 - Automatic memory recall now gives the latest user message first priority,
   then fills remaining seats from the latest two user messages. A long previous
   topic can no longer displace already selected current-message hits; short
