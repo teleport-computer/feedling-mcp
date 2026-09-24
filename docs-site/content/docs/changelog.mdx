@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Setup and manual Model API probe traces now retain a bounded upstream HTTP
+  `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
+  without storing provider error text or response bodies.
+
 - Model API credential probe notices now select existing registry translations
   using the user's stored `archive_language`. English users receive English text
   for registered failure classes; the probe-local `provider_config` notice
