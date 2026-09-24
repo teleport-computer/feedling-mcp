@@ -3054,8 +3054,10 @@ def _data_track_payload(
         # filter, no sort key, no summary aggregate — and the fleet-level fields
         # below come from the ids-independent watermark table.
         page_ids = [str(r.get("user_id") or "") for r in page]
+        from model_api_runtime.v2 import jobs_store as v2_jobs_store
         background_report = db.admin_background_lane_users(
             page_ids,
+            classify_v2_code=v2_jobs_store.terminal_outcome_class,
             days=int(filters.get("lane_days") or 7),
         )
         # Same pushdown for the memory breakdowns. The row is rebuilt through
@@ -3138,7 +3140,8 @@ def _data_track_payload(
             ),
             "denominator": "completed + operational_failures",
             "excluded": (
-                "control_outcomes, user_unavailable, superseded, expired; "
+                "control_outcomes, user_unavailable, superseded; "
+                "V2 expired/unknown failures remain operational; "
                 "nonterminal jobs are reported by the separate stuck metric"
             ),
         }
@@ -9246,7 +9249,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
 	  <div class="note-box"><b>后台道按用户失败率</b><br>
 	  数据来自冻结 <code>lane_daily_rollup</code>，默认最近 {int(filters.get('lane_days') or 7)} 个完整北京日；
-	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；
+	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；V2 expired/未知失败仍算运营失败；
 	  pending/claimed/running 不塞进失败率，另由 stuck 指标负责。覆盖不完整时格子明确标 partial，
 	  不会把未量到的 0 冒充健康。可用 <code>lane_days</code> 改窗口。</div>
 	  <div class="sortbar">{sort_controls}</div>
