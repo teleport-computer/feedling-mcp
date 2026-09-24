@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident CLI errors reporting Codex usage exhaustion now use the existing
+  `quota_insufficient` classification and quota notice instead of the generic
+  `unknown` fallback. Temporary rate-limit errors keep their existing class.
+
 - Model API credential probe notices now select existing registry translations
   using the user's stored `archive_language`. English users receive English text
   for registered failure classes; the probe-local `provider_config` notice
