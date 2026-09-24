@@ -36,6 +36,10 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import worker
+from wake_look_first_helpers import (
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
 from perception.glance import perception_glance_fingerprint
 
 pytestmark = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="needs PG")
@@ -679,6 +683,8 @@ def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
     forced_choices = []
 
     async def fake_provider(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         if kwargs.get("tool_choice") == "required":
             forced_choices.append(kwargs["tool_choice"])
             return _stay_silent_round()
@@ -928,6 +934,11 @@ def test_successful_heartbeat_without_context_reader_does_not_persist_fingerprin
     provider_calls = []
 
     async def fake_provider(*args, **kwargs):
+        messages = args[1] if len(args) > 1 else kwargs.get("messages")
+        if _is_look_first_round(
+            kwargs.get("tools"), messages, kwargs.get("tool_choice")
+        ):
+            return _looked_nothing_needed()
         provider_calls.append(kwargs)
         if kwargs.get("tool_choice") == "required":
             return _stay_silent_round()

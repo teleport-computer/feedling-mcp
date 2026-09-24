@@ -454,6 +454,8 @@ jobs:
             tests/test_v2_serve_worker_screen_frames.py \
             tests/test_v2_user_triage.py \
             tests/test_v2_wake_tool_loop.py \
+            tests/test_v2_wake_look_first.py \
+            tests/test_wake_open_rate_report.py \
             -v
 
       - name: Run resident consumer regression suite

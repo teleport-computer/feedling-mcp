@@ -38,6 +38,11 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
+from wake_look_first_helpers import (
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
 from core import store as core_store
 
 pytestmark = pytest.mark.skipif(
@@ -124,9 +129,13 @@ def _wake_deps(*, tail=None, load_mcp_turn=None, emit_debug_trace=None):
 
 def _script_provider(monkeypatch, responses):
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            # Presence-wake look-first round (T723): "looked, nothing needed".
+            calls.look_rounds.append({"messages": messages, "tools": tools})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 

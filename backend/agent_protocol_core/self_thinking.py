@@ -166,6 +166,9 @@ _ASIDE_VISIBILITY_SENTENCE = " 这几句会折叠在消息上方的「参考内�
 # candidate out of three that each measured 0/3 on Opus 5 and Opus 5[1m]), 0/3.
 _THINK_CONTENT_PHRASE = "里面写你此刻心里真实的想法"
 _ASIDE_CONTENT_PHRASE = "里面写你这会儿的感受，和你打算怎么接他这句"
+# Presence wakes (heartbeat / manual wake) have no line of theirs to answer:
+# on prod the chat phrasing coincided with "nothing to say" silence (T723).
+_PRESENCE_ASIDE_CONTENT_PHRASE = "里面写你这会儿的感受，和你为什么这会儿想找他说这些"
 # Substitutions applied to INSTRUCTION for the aside rendering, in order. Each
 # anchor must occur exactly once so a wording edit upstream cannot silently
 # leave the think phrasing in the aside rendering.
@@ -246,15 +249,21 @@ ASIDE_FIELD_DESCRIPTION = (
 )
 
 
-def instruction_for_field(*, protocol: str = "reply") -> str:
-    """Render the approved aside copy for a tool or resident JSON envelope."""
+def instruction_for_field(*, protocol: str = "reply", presence: bool = False) -> str:
+    """Render the approved aside copy for a tool or resident JSON envelope.
+
+    ``presence`` selects the proactive-wake opening; only the reply protocol has one.
+    """
     if protocol not in {"reply", "json"}:
         raise ValueError(f"unsupported aside protocol: {protocol!r}")
+    if presence and protocol != "reply":
+        raise ValueError("presence aside copy exists only for the reply protocol")
     _, paragraphs = instruction(TAG_ASIDE).split("\n\n", 1)
     if protocol == "reply":
         opening = (
             " 最终回复请调用 reply 工具，把心里话填在 aside 字段里，"
-            + _ASIDE_CONTENT_PHRASE + "。\n"
+            + (_PRESENCE_ASIDE_CONTENT_PHRASE if presence else _ASIDE_CONTENT_PHRASE)
+            + "。\n"
             " 你要对他说的话完整填在 text 字段里。中间调其他工具的轮次不写心里话或正文。"
         )
     else:

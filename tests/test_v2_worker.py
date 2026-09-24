@@ -28,6 +28,11 @@ from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import worker
+from wake_look_first_helpers import (
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -268,9 +273,13 @@ def _script_provider(monkeypatch, responses):
     assert what the model actually saw each round (e.g. that a prior round's
     tool observation was folded in)."""
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            # Presence-wake look-first round (T723): "looked, nothing needed".
+            calls.look_rounds.append({"messages": messages, "tools": tools, **kwargs})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **kwargs})
         return next(it)
 
@@ -2060,9 +2069,13 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     assert row is not None
     assert row[0] == uid
     assert row[1] == "heartbeat"
-    assert row[2] == 17          # real usage, surfaced via the scripted round's usage
-    assert row[3] == 4
-    assert row[4] == 1           # exactly one model call
+    # Real usage, surfaced via the scripted rounds' usage: the look-first
+    # round (T723) plus the one decision round.
+    assert len(provider_calls.look_rounds) == 1
+    look_usage = _looked_nothing_needed()["usage"]
+    assert row[2] == 17 + look_usage["prompt_tokens"]
+    assert row[3] == 4 + look_usage["completion_tokens"]
+    assert row[4] == 2           # look-first call + exactly one decision call
     assert row[5] is False
     assert row[6] == "ok"
 
@@ -2075,7 +2088,7 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    _script_provider(monkeypatch, [
+    weak_calls = _script_provider(monkeypatch, [
         _text_round("", prompt_tokens=9, completion_tokens=0),
         _stay_silent_round(prompt_tokens=2, completion_tokens=1),
     ])
@@ -2103,8 +2116,10 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
             "SELECT prompt_tokens, model_calls, failed, status "
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
-    assert row[0] == 11
-    assert row[1] == 2
+    # Look-first round (T723) + empty round + forced explicit sleep.
+    assert len(weak_calls.look_rounds) == 1
+    assert row[0] == 11 + _looked_nothing_needed()["usage"]["prompt_tokens"]
+    assert row[1] == 3
     assert row[2] is False
     assert row[3] == "ok"
 
