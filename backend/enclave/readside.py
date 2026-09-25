@@ -271,10 +271,13 @@ def decrypt_readside_items(
     return items, unavailable_ids
 
 
-def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list[dict]:
+def moments_to_cards(moments: list, authorized_user_id: str, content_sk,
+                     inner_out: dict | None = None) -> list[dict]:
     """把 /v1/memory/list 的 envelope 列表解密成 context_memories 明文卡。
     失败（local_only、解密错）静默丢弃——context_memories 是 best-effort。
-    纯同步计算：调用方负责放进 to_thread（backend 拉取已上移到路由层）。"""
+    纯同步计算：调用方负责放进 to_thread（backend 拉取已上移到路由层）。
+    ``inner_out`` (hybrid recall only): receives {id: decrypted inner body} so the
+    caller can recompute a card's projection hash without decrypting twice."""
     out: list[dict] = []
     for m in moments or []:
         if m.get("visibility") == "local_only":
@@ -284,6 +287,8 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             inner = json.loads(plaintext.decode("utf-8"))
         except (envelope.DecryptFailure, json.JSONDecodeError):
             continue
+        if inner_out is not None and m.get("id"):
+            inner_out[str(m.get("id"))] = inner
         out.append({
             **recall_metadata.fields(inner, m),
             "id": m.get("id"),

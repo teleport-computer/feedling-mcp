@@ -142,6 +142,22 @@ async def memory_list(request: Request, auth: AuthResult = Depends(require_auth)
     return JSONResponse(body, status_code=status)
 
 
+@router.post("/v1/memory/vectors")
+async def memory_vectors(request: Request, auth: AuthResult = Depends(require_auth)):
+    """The caller's own eligible card vectors for the given card ids (T523).
+
+    Internal: excluded from the public OpenAPI. The enclave forwards the end
+    user's auth headers, so the identity is the authenticated store; a user id
+    in the body is ignored. See memory.embedding.serve for the eligibility rules.
+    """
+    from memory.embedding import serve as embedding_serve
+
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        embedding_serve.authorized_vectors, auth.store, payload)
+    return JSONResponse(body, status_code=status)
+
+
 @router.get("/v1/memory/get")
 async def memory_get(request: Request, auth: AuthResult = Depends(require_auth)):
     body, status = await threadpool.run_db(

@@ -348,6 +348,15 @@ def traced(loop):
                 "prompt_observations": prompt_observations,
                 "tool_results": tool_results,
             }
+            hybrid = (memory_context_observation or {}).get("hybrid")
+            if isinstance(hybrid, dict):
+                # Flat scalars only: the durable trace keeps one level (T523).
+                detail["selection_mode"] = (memory_context_observation or {}).get("selection_mode")
+                for key in ("status", "fallback_reason", "encode_ms", "encode_queue_ms",
+                            "encode_compute_ms", "vectors_ms", "vectors_requested",
+                            "vectors_received", "vectors_rejected", "with_vector",
+                            "hash_mismatch"):
+                    detail["hybrid_" + key] = hybrid.get(key)
             try:
                 result = on_memory_recall_completed(detail)
                 if inspect.isawaitable(result):

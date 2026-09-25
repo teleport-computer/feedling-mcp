@@ -89,6 +89,12 @@ def render(payload: dict, *, profile: str = "", rows: list[dict] = ()) -> dict:
     block = "\n".join([HEADER, NOTICE, *parts, FOOTER]) if parts else ""
     log = payload.get("context_memory_log") or {}
     known = isinstance(cards, list) and isinstance(log, dict) and log.get("mode") != "failed"
-    return {"block": block, "ids": ids, "chars": len(block),
+    view = {"block": block, "ids": ids, "chars": len(block),
             "selected": len(cards) if known else None,
             "selection_status": "ok" if known else "unavailable"}
+    # T523: the enclave adds a content-free ``hybrid`` record only while hybrid
+    # recall is on; carry it for the recall trace. Absent otherwise.
+    if isinstance(log, dict) and isinstance(log.get("hybrid"), dict):
+        view["selection_mode"] = str(log.get("mode") or "")
+        view["hybrid"] = dict(log["hybrid"])
+    return view
