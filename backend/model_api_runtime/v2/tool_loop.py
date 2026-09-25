@@ -1351,6 +1351,9 @@ async def run_tool_loop(
     # not explicitly request a second native reasoning channel. Any native
     # reasoning still returned is diagnostic input only, never display text.
     suppress_native_reasoning: bool = False,
+    # ``ReplyLanguage.language`` of the turn; selects the zh/en aside copy the
+    # compact delivery round re-attaches (T734).
+    reply_language: str | None = None,
     # Whether a text-free provider reply is an immediate ERROR. Defaults to
     # True for foreground chat. Wake passes False so this loop can inspect an
     # empty 200 and force the bounded reply/stay_silent choice itself; the
@@ -1681,7 +1684,7 @@ async def run_tool_loop(
         return (
             instruction.rstrip()
             + "\n\n"
-            + self_thinking.instruction_for_field().strip()
+            + self_thinking.instruction_for_field(language=reply_language).strip()
         )
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:

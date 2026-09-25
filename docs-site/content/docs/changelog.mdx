@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Runtime V2 now gives English reply-language accounts the English
+  version of the `aside` guidance (foreground chat, every proactive wake lane,
+  and the screen-watch note). Chinese accounts keep the existing Chinese text
+  unchanged. Previously every account got the Chinese guidance, which could
+  pull English conversations into Chinese replies.
 - Hosted Runtime V2 no longer shows a reply call's `aside` when a model writes
   the call as visible text. For XML-style tool markup, when removing the whole
   block would leave nothing, only the reply's `text` (or its bare body) is kept

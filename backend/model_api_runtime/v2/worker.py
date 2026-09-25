@@ -1070,24 +1070,28 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 
 def _wake_system_prompt_for_lane(
     lane: str, base_prompt: str, *, tag: str = self_thinking.TAG_THINK,
+    language: str | None = None,
 ) -> str:
     """Attach the shared aside-field contract and lane-specific suffixes.
 
     The legacy tag argument is accepted for callers but no longer selects copy.
+    ``language`` (``ReplyLanguage.language``) selects the zh/en aside copy.
     """
     if not self_thinking.enabled():
         return base_prompt
     blocks = [base_prompt]
     if lane == "scheduled":
-        blocks.append(self_thinking.instruction_for_field())
+        blocks.append(self_thinking.instruction_for_field(language=language))
     elif lane in _PRESENCE_WAKE_LANES:
         blocks.append(_PRESENCE_WAKE_SELF_THINKING_INSTRUCTION)
-        blocks.append(self_thinking.instruction_for_field(presence=True))
+        blocks.append(
+            self_thinking.instruction_for_field(presence=True, language=language)
+        )
     else:
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
-        blocks.append(self_thinking.instruction_for_field())
+        blocks.append(self_thinking.instruction_for_field(language=language))
     if lane == "screen_watch":
-        blocks.append(self_thinking.SCREEN_WATCH_INSTRUCTION)
+        blocks.append(self_thinking.screen_watch_instruction(language))
     return context._join_policy_blocks(*blocks)
 
 
@@ -11282,6 +11286,11 @@ async def _run_wake(
         )
         turn_memory_observation: dict = {}
 
+        wake_reply_language = infer_reply_language(
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(temporal_snapshot.get("archive_language") or ""),
+        )
+
         def _wake_builder():
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
@@ -11293,16 +11302,11 @@ async def _run_wake(
             # self-authored thought instead of raw native reasoning.
             _wake_sys = _wake_system_prompt_for_lane(
                 lane, _wake_sys, tag=context.self_thinking_tag(provider_config),
-            )
-            reply_language = infer_reply_language(
-                locale=str(temporal_snapshot.get("locale") or ""),
-                archive_language=str(
-                    temporal_snapshot.get("archive_language") or ""
-                ),
+                language=wake_reply_language.language,
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(reply_language),
+                reply_language_system_line(wake_reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
@@ -11443,6 +11447,7 @@ async def _run_wake(
                 ),
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
+                reply_language=wake_reply_language.language,
                 disabled_tool_names=wake_disabled_tool_names,
                 extra_tool_specs=offered_mcp_tool_specs,
                 refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
@@ -16576,7 +16581,9 @@ async def process_job(
 
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
-                context.chat_system_prompt(provider_config),
+                context.chat_system_prompt(
+                    provider_config, language=chat_reply_language.language,
+                ),
                 reply_language_system_line(chat_reply_language),
             )
             return _make_build_messages_fn(
@@ -16716,6 +16723,7 @@ async def process_job(
             on_memory_recall_completed=_memory_recall_callback(deps, user_id, job, lane),
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
+            reply_language=chat_reply_language.language,
             memory_delete_allowed=True,
             reply_tool_enabled=_self_thinking_v2.enabled(),
             allow_image_output=True,
