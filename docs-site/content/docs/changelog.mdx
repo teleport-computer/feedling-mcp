@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Heartbeat and manual wake guidance, and the `stay_silent` description, now say
+  that several unanswered messages over a day or two are still not a reason to go
+  quiet, and ask the agent to say something new rather than repeat itself. Wake
+  scheduling and intervals are unchanged; screen-watch wording is unchanged.
+
 - Hosted Runtime V2 now also removes DeepSeek DSML tool-call markup that a model
   writes into its visible reply. A DSML `reply` call keeps only its `text`
   payload; the `aside` and any other parameters are never shown. A DSML block
