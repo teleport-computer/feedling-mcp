@@ -17,6 +17,13 @@ change must not be interpreted as an API guarantee.
   quota instead of an invalid API key, on every Model API lane and in credential
   probes. Other `403` responses keep their existing classification.
 
+- Hosted Runtime V2 no longer shows a reply call's `aside` when a model writes
+  the call as visible text. For XML-style tool markup, when removing the whole
+  block would leave nothing, only the reply's `text` (or its bare body) is kept
+  instead of every parameter. A message that is only a reply-arguments JSON
+  object (`{"aside": ..., "text": ...}`) now shows just its `text`. Markup with
+  other visible prose outside it is still removed as before.
+
 - Heartbeat and manual wake guidance, and the `stay_silent` description, now say
   that several unanswered messages over a day or two are still not a reason to go
   quiet, and ask the agent to say something new rather than repeat itself. Wake

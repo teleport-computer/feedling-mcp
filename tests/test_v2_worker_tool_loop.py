@@ -1732,6 +1732,45 @@ def test_foreground_dsml_non_reply_call_uses_existing_fallback(monkeypatch):
     assert bubble["turn_failure_error_class"] == "upstream_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("leaked", "body"),
+    [
+        pytest.param('{"aside":"他就问单号，我直接给他。","text":"旅行杯盖子的维修单号是 LK-7319。"}',
+                     "旅行杯盖子的维修单号是 LK-7319。", id="raw-reply-json"),
+        pytest.param('<function_calls><invoke name="reply"><parameter name="aside">他就问单号，我直接给他。</parameter>'
+                     '<parameter name="text">旅行杯盖子的维修单号是 LK-7319。</parameter></invoke></function_calls>',
+                     "旅行杯盖子的维修单号是 LK-7319。", id="xml-reply-with-aside"),
+
+        pytest.param(json.dumps({"aside": "他就问单号，我直接给他。", "text": '<｜｜DSML｜｜ invoke name="reply">'
+                                 '<｜｜DSML｜｜ parameter name="aside">他就问单号，我直接给他。</｜｜DSML｜｜ parameter>'
+                                 '<｜｜DSML｜｜ parameter name="text">旅行杯盖子的维修单号是 LK-7319。</｜｜DSML｜｜ parameter>'
+                                 "</｜｜DSML｜｜ invoke>"}, ensure_ascii=False),
+                     "旅行杯盖子的维修单号是 LK-7319。", id="json-wrapping-dsml-reply"),
+    ],
+)
+def test_foreground_reply_shapes_deliver_body_without_aside(monkeypatch, leaked, body):
+    """T733 (T730 local run, deepseek): the reply call's arguments reached the
+    user as visible text, aside included. The production chain must deliver
+    only the body."""
+    uid = "u_toolloop_t733_" + str(abs(hash(leaked)) % 100000)
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-t733")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "单号是多少"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == [body]
+    assert not any("直接给他" in b or "aside" in b for b in bodies)
+
+
 def test_torn_protocol_evidence_lane_policy():
     """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
     foreground only strong cross-channel evidence."""
