@@ -107,8 +107,15 @@ def test_aside_field_instruction_parity(monkeypatch):
     monkeypatch.setattr(resident, "_supports_mandatory_self_thinking_v1", lambda: True)
     field = st.instruction_for_field().strip()
     assert field in context.chat_system_prompt()
-    for lane in ("scheduled", "heartbeat", "screen_watch"):
+    for lane in ("scheduled", "screen_watch"):
         assert field in worker._wake_system_prompt_for_lane(lane, "base")
+    # Presence wakes share the rendering with one intent phrase swapped (T723).
+    presence_field = st.instruction_for_field(presence=True).strip()
+    assert presence_field == field.replace(
+        st._ASIDE_CONTENT_PHRASE, st._PRESENCE_ASIDE_CONTENT_PHRASE)
+    for lane in sorted(worker._PRESENCE_WAKE_LANES):
+        prompt = worker._wake_system_prompt_for_lane(lane, "base")
+        assert presence_field in prompt and field not in prompt
     assert st._ASIDE_CONTENT_PHRASE in field
     assert st._ASIDE_VISIBILITY_SENTENCE in field
     assert "<think>" not in field and "<aside>" not in field

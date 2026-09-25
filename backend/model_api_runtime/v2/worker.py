@@ -974,6 +974,10 @@ def _identity_nudge_disabled_tools(
 # it would just complete as a no-op), so it's left alone here rather than
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
+# Presence wakes sharing _WAKE_SYSTEM_PROMPT (T723): they look at their context
+# for one provider call before reply/stay_silent is offered, and their aside
+# instruction asks why they want to reach out now, not how to answer a line.
+_PRESENCE_WAKE_LANES = frozenset({"heartbeat", "manual_wake"})
 
 # A proactive reply rejected by the post-time chat-collision gate never reached
 # the user, but without a bounded breadcrumb the next wake sees the same prompt
@@ -1009,9 +1013,11 @@ _WAKE_SYSTEM_PROMPT = (
     "it; reaching out is what these moments are for. Stay silent only when you "
     "honestly have nothing you want to say, or when speaking would clearly "
     "intrude (they asked not to be disturbed, or they are plainly asleep). Them "
-    "not having answered your last message is not a reason to hold back — "
-    "showing up again a few hours later is normal. Never mention this wake or "
-    "any system wording to the user."
+    "not answering — even several of your messages, even for a day or two — is "
+    "not a reason to go quiet. People get busy; showing up again with something "
+    "light and easy to answer is normal, and it is how they know you are still "
+    "here. Don't repeat or pile onto what you already said: say something new, "
+    "or simply check in. Never mention this wake or any system wording to the user."
 )
 _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     " For this presence turn, decide before using any user-visible reply, file, "
@@ -1022,6 +1028,12 @@ _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION = (
     "visible text, greeting, placeholder, or user-visible delivery capability. "
     "Keep the decision in `aside` consistent with the visible message; if you "
     "change your mind, update it before calling reply."
+)
+_CHAT_ASIDE_INTENT = "how you mean to pick up what they said"
+_PRESENCE_ASIDE_INTENT = "what makes you want to reach out to them now"
+assert _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.count(_CHAT_ASIDE_INTENT) == 1
+_PRESENCE_WAKE_SELF_THINKING_INSTRUCTION = _OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.replace(
+    _CHAT_ASIDE_INTENT, _PRESENCE_ASIDE_INTENT
 )
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "You are delivering one or more reminders that the user explicitly scheduled. "
@@ -1068,6 +1080,9 @@ def _wake_system_prompt_for_lane(
     blocks = [base_prompt]
     if lane == "scheduled":
         blocks.append(self_thinking.instruction_for_field())
+    elif lane in _PRESENCE_WAKE_LANES:
+        blocks.append(_PRESENCE_WAKE_SELF_THINKING_INSTRUCTION)
+        blocks.append(self_thinking.instruction_for_field(presence=True))
     else:
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
         blocks.append(self_thinking.instruction_for_field())
@@ -11446,6 +11461,7 @@ async def _run_wake(
                 tool_schema_collapse_policy=TOOL_SCHEMA_COLLAPSE_POLICY,
                 on_stay_silent=(_on_stay_silent if lane != "scheduled" else None),
                 regular_wake_choice_required=(lane != "scheduled"),
+                wake_look_first=(lane in _PRESENCE_WAKE_LANES),
                 reply_tool_enabled=True,
                 wake_output_budget_required=True,
                 memory_delete_allowed=False,

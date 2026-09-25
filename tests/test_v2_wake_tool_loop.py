@@ -129,11 +129,24 @@ def _apply_effects_factory(sink_calls):
     return _apply
 
 
+from wake_look_first_helpers import (  # noqa: E402
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
+
+
 def _script_provider(monkeypatch, responses):
+    """Presence wakes' look-first round (T723) is answered with "looked,
+    nothing needed" without consuming a scripted response and is recorded in
+    ``calls.look_rounds``."""
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            calls.look_rounds.append({"messages": messages, "tools": tools, **_kwargs})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **_kwargs})
         return next(it)
 

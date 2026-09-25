@@ -103,13 +103,21 @@ recognized manual-thinking models.
 
 Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
 choice. Speaking is the default; silence is the agent's own call when it has
-nothing it wants to say or when speaking would clearly intrude. An unanswered
-previous message is not by itself a reason to stay silent. These are model
+nothing it wants to say or when speaking would clearly intrude. Unanswered
+messages, even several over a day or two, are not by themselves a reason to stay
+silent; the agent is asked to say something new rather than repeat itself. These are model
 instructions, not new scheduler gates. Missing or invalid choices still
 fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
 A regular wake's otherwise valid `reply` whose entire text is a bare protocol
 token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
+Heartbeat and manual wakes first make one provider call without `reply` or
+`stay_silent`, so the agent looks at its context before deciding. If it needs no
+lookup, any drafted text stays unpublished and carries into one ordinary decision
+round with both choices offered. This uses the existing provider-call budget and
+applies only when that budget allows at least three calls. For these two lanes, the
+optional `aside` asks what makes the agent want to reach out now rather than how it
+will answer a message.
 The screen-watch lane follows the same default while keeping its own guidance
 to avoid interrupting the user's flow.
 

@@ -52,8 +52,10 @@ canonical_owner: self
 
 - 存放：本地 `~/.feedling-e2e-keys.env`（chmod 600，**永不入 git**）；格式
   `E2E_KEY_ANTHROPIC=… / E2E_KEY_OPENAI=… / E2E_KEY_GEMINI=… /
-  E2E_KEY_OPENROUTER=… / E2E_KEY_RELAY=…（含 E2E_RELAY_BASE/E2E_RELAY_MODEL）/
+  E2E_KEY_OPENROUTER=… / E2E_KEY_RELAY=…（含 E2E_RELAY_BASE）/
   E2E_KEY_DEEPSEEK=…`。
+  自 T726 起,发版 P0/P1 的 relay 型号写在 `tools/e2e/config.py`(cell.models 优先);
+  key 池里的 `E2E_RELAY_MODEL` 只剩专项探针在读。
 - 建池动作（待 Seven/志豪提供 key）：额度各留最低档即可，P0 单轮消耗很小。
 
 **中转型号预检（T544）**：hosted P0 的中转格（`openai_compatible`/`openrouter`）
@@ -65,7 +67,7 @@ canonical_owner: self
 - 确认不在售（目录**完整**返回但没有该型号，含合法空目录）→ 该格结果
   `🧪 instrument_stale`，**单列，不计 PASS 也不计 FAIL、不阻断发布**
   （`p0_blocks_release` 不含它）。日志给出该 relay 当前在售的候选型号，据此更新
-  key 池的 `E2E_RELAY_MODEL`/cell 型号。
+  `tools/e2e/config.py` 里该 cell 的型号(自 T726 起 relay 型号入版本库)。
 - 读不到 / 目录畸形 / **分页截断未取全（complete=false）** → `unverifiable`，
   **不 gate**，照常进 setup（"没问成 / 没看全"不等于"确认下架"）。
 官方 provider 不做此预检；TLS 校验始终开启（不得 `verify=False`）。缘由：下架型号会

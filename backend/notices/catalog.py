@@ -25,9 +25,11 @@ PROVIDER_TEST_CONFIG_CLASS = "provider_config"
 PROVIDER_TEST_UNAVAILABLE_CLASS = "upstream_unavailable"
 # Probe-local copy: registering this coarse retry category as a runtime class
 # would change health/blame and other ERROR_CLASSES consumers outside setup.
-_PROVIDER_TEST_CONFIG_NOTICE = (
-    "user_provider",
-    "模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。",
+_PROVIDER_TEST_CONFIG_BLAME = "user_provider"
+_PROVIDER_TEST_CONFIG_TEXT_ZH = "模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。"
+_PROVIDER_TEST_CONFIG_TEXT_EN = (
+    "Model service settings failed the test. Check the endpoint URL, model name, "
+    "and settings, then try again."
 )
 _CATALOG: dict[str, tuple[str, str]] = {
     spec.code: (spec.blame, spec.safe_text_zh)
@@ -42,7 +44,9 @@ _UPSTREAM_RULES = tuple(
 def provider_test_notice_for(failure_class: str, *, language: str = "") -> tuple[str, str]:
     """Probe notice metadata without expanding the public runtime registry."""
     if failure_class == PROVIDER_TEST_CONFIG_CLASS:
-        return _PROVIDER_TEST_CONFIG_NOTICE
+        return _PROVIDER_TEST_CONFIG_BLAME, error_contract.localized_text(
+            _PROVIDER_TEST_CONFIG_TEXT_ZH, _PROVIDER_TEST_CONFIG_TEXT_EN, language,
+        )
     return blame_for(failure_class), user_text_for(failure_class, language=language)
 
 

@@ -508,14 +508,19 @@ def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
         "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
     )
 
+    presence = self_thinking.instruction_for_field(presence=True)
     assert chat_prompt.count(shared.strip()) == 1
-    for prompt in (heartbeat_prompt, screen_prompt):
-        assert shared.strip() in prompt
+    # Heartbeat asks why it reaches out now (T723); screen_watch keeps chat's.
+    for prompt, field, wake_instruction in (
+        (heartbeat_prompt, presence, worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION),
+        (screen_prompt, shared, worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION),
+    ):
+        assert field.strip() in prompt
         assert (
             "<think>Let me update the name and match a boastful tone</think>"
             not in prompt
         )
-        assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in prompt
+        assert wake_instruction.strip() in prompt
 
 
 def test_ordered_reply_tail_restores_causal_order_and_hides_later_users():

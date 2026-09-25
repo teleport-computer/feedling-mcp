@@ -774,8 +774,8 @@ DESCRIPTIONS: dict[str, str] = {
     STAY_SILENT_TOOL: (
         "Skip speaking this time. Use it when you honestly have nothing you want "
         "to say right now, or when speaking would clearly intrude (they asked "
-        "not to be disturbed, or they are plainly asleep). Their not answering "
-        "your last message is not a reason by itself. Say briefly why."
+        "not to be disturbed, or they are plainly asleep). Their not answering, "
+        "even several messages in a row, is not a reason by itself. Say briefly why."
     ),
     FILE_REPLY_TOOL: (
         "Deliver an existing /workspace source as a downloadable attachment. "

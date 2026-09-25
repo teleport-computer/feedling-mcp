@@ -70,6 +70,21 @@ _NARRATED_CALL_EVIDENCE_RE = re.compile(
 )
 _QUOTE_OPENER_LEAD = frozenset(" \t\n\r:=(,[{")
 
+# DeepSeek DSML: the model writes its native tool-call block as text —
+# ``<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="reply">…`` (T727, T557 L1).
+# Anchored on the literal DSML sentinel between bars, so it stays a closed
+# family. The generic marker-only fallback must never apply here: the reply
+# tool's ``aside`` parameter sits beside its body and would reach the user as
+# visible text. Instead a block keeps only the closed ``text`` parameter of a
+# ``reply`` invoke (the payload the model meant to send, matching the
+# "wrapped reply payload is not lost" rule) and drops everything else; a block
+# without one is removed whole and the reply falls to the existing fallback.
+_DSML_TOKEN_RE = re.compile(
+    r"<\s*(?P<closing>/\s*)?[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<tail>[^>]*)>"
+)
+_DSML_ATTR_NAME_RE = re.compile(r"""\bname\s*=\s*["']([^"']*)["']""")
+
 # Provider-native end-of-turn sentinels sometimes leak into ``content`` instead
 # of being consumed by the relay.  Match only a small, explicit, whole-message
 # family: this must never grow into a generic angle-bracket/HTML sanitizer.
@@ -205,6 +220,123 @@ def _narrated_calls(
         cursor = end
 
 
+def _dsml_reply_payload(text: str, start: int, end: int) -> str:
+    """Closed ``text`` parameters that are direct children of a valid ``reply``.
+
+    Parsed with a parent stack. A ``reply`` invoke is valid only at the block's
+    top level or directly inside a top-level ``calls``; a ``text`` parameter is captured
+    only when its parent is such an invoke, so nothing under ``aside``, a
+    non-reply invoke or an unknown container can start a capture. The block
+    fails closed (empty payload, whole block removed) on any marker inside a
+    captured body or any closing marker that does not match its opener.
+    """
+    payloads: list[str] = []
+    stack: list[tuple[str, bool]] = []  # (element name, is a valid reply invoke)
+    capture_from: int | None = None
+    for match in _DSML_TOKEN_RE.finditer(text, start, end):
+        name = match.group("name").lower()
+        closing = bool(match.group("closing"))
+        self_closing = not closing and match.group("tail").rstrip().endswith("/")
+        attr = _DSML_ATTR_NAME_RE.search(match.group("tail"))
+        attr_name = attr.group(1).strip().lower() if attr else ""
+        if capture_from is not None:
+            if not (closing and name == "parameter"):
+                return ""
+            payloads.append(text[capture_from:match.start()].strip())
+            capture_from = None
+            stack.pop()
+            continue
+        if self_closing:
+            continue
+        if closing:
+            if not stack or stack[-1][0] != name:
+                return ""
+            stack.pop()
+            continue
+        parent = stack[-1] if stack else None
+        if name == "invoke":
+            valid_reply = attr_name == "reply" and (
+                not stack or (len(stack) == 1 and stack[0][0] == "calls")
+            )
+            stack.append((name, valid_reply))
+        else:
+            stack.append((name, False))
+            if (
+                name == "parameter"
+                and attr_name == "text"
+                and parent is not None
+                and parent[0] == "invoke"
+                and parent[1]
+            ):
+                capture_from = match.end()
+    return "\n\n".join(payload for payload in payloads if payload)
+
+
+def _dsml_blocks(text: str) -> list[tuple[int, int, str]]:
+    """``(start, end, replacement)`` of DSML tool-call blocks, in source order.
+
+    Same fence rule as narrated calls: a fence opened outside a block protects
+    its contents, while a fence inside a block's payload is part of the block.
+    An unclosed block runs to the end of the text; a stray closing marker is
+    removed alone.
+    """
+    found: list[tuple[int, int, str]] = []
+    stack: list[tuple[str, int]] = []
+    cursor = 0
+    while True:
+        match = _DSML_TOKEN_RE.search(text, cursor)
+        if not stack:
+            fence_start = text.find(
+                _CODE_FENCE, cursor, match.start() if match else len(text)
+            )
+            if fence_start >= 0:
+                fence_end = text.find(_CODE_FENCE, fence_start + len(_CODE_FENCE))
+                if fence_end < 0:
+                    return found
+                cursor = fence_end + len(_CODE_FENCE)
+                continue
+        if match is None:
+            break
+        name = match.group("name").lower()
+        closing = bool(match.group("closing"))
+        self_closing = not closing and match.group("tail").rstrip().endswith("/")
+        cursor = match.end()
+        if self_closing:
+            if not stack:
+                found.append((match.start(), match.end(), ""))
+            continue
+        if not closing:
+            stack.append((name, match.start()))
+            continue
+        opening_index = next(
+            (i for i in range(len(stack) - 1, -1, -1) if stack[i][0] == name), None
+        )
+        if opening_index is None:
+            if not stack:
+                found.append((match.start(), match.end(), ""))
+            continue
+        outer_start = stack[0][1]
+        del stack[opening_index:]
+        if not stack:
+            found.append(
+                (outer_start, match.end(), _dsml_reply_payload(text, outer_start, match.end()))
+            )
+    if stack:
+        found.append((stack[0][1], len(text), _dsml_reply_payload(text, stack[0][1], len(text))))
+    return found
+
+
+def _replace_dsml_blocks(text: str, blocks: list[tuple[int, int, str]]) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, replacement in blocks:
+        pieces.append(text[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def find_narrated_tool_calls(text: str, *, tool_names=()) -> tuple[str, ...]:
     """Names of narrated tool calls in ``text`` (fenced code excluded), in order.
 
@@ -287,14 +419,16 @@ def strip_tool_markup(text: str, *, tool_names=()) -> tuple[str, bool]:
     """
     raw = str(text or "")
     names = frozenset(str(name).lower() for name in tool_names if name)
-    # Narrated calls first, on the raw text: a call is self-delimiting (the
+    dsml_blocks = _dsml_blocks(raw)
+    raw = _replace_dsml_blocks(raw, dsml_blocks)
+    # Narrated calls next, on the raw text: a call is self-delimiting (the
     # bracket *is* the payload) so it is removed whole under both strategies,
     # and its payload may contain a fence that must not become a protected
     # code block (T621 review P1).
     narrated_intervals = [
         (start, end) for start, end, _name in _narrated_calls(raw, names)
     ]
-    removed = bool(narrated_intervals)
+    removed = bool(dsml_blocks or narrated_intervals)
     raw = _remove_intervals(raw, narrated_intervals)
     block_output: list[str] = []
     marker_output: list[str] = []

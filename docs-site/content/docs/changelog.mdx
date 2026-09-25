@@ -12,6 +12,27 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Heartbeat and manual wake guidance, and the `stay_silent` description, now say
+  that several unanswered messages over a day or two are still not a reason to go
+  quiet, and ask the agent to say something new rather than repeat itself. Wake
+  scheduling and intervals are unchanged; screen-watch wording is unchanged.
+
+- Hosted Runtime V2 now also removes DeepSeek DSML tool-call markup that a model
+  writes into its visible reply. A DSML `reply` call keeps only its `text`
+  payload; the `aside` and any other parameters are never shown. A DSML block
+  without a completed reply body is removed and the existing fallback applies.
+  Fenced code examples are left unchanged.
+
+- Runtime V2 heartbeat and manual wakes now look before deciding: their first
+  provider call omits `reply`/`stay_silent`, then the usual choice is offered.
+  Drafted text from that first call is never delivered directly. Their optional
+  `aside` guidance now asks what makes the agent want to reach out now instead of
+  how it will answer a message. Scheduled and screen-watch wakes are unchanged.
+
+- The probe-local `provider_config` credential-test notice now has English copy
+  and follows the user's stored `archive_language`, like registered probe
+  classes. It remains outside the runtime error registry.
+
 - Runtime V2 Capture now doubles only a truncated reply's re-ask budget
   (1,500 → 3,000 tokens by default, capped at the provider ceiling), with
   180-second wire and phase limits. First calls remain at 1,500 tokens and
