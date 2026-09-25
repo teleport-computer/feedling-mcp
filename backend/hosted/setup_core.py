@@ -51,6 +51,7 @@ from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import wake_circuit
 from notices import catalog as notices_catalog
+from notices import error_contract
 from notices import core as notices_core
 
 
@@ -1873,6 +1874,11 @@ def _provider_test_failure_class(exc: BaseException) -> str:
         status is None and str(exc).startswith("provider network error:")
     ):
         return notices_catalog.PROVIDER_TEST_UNAVAILABLE_CLASS
+    if status == 403 and error_contract.provider_response_is_quota_exhausted(
+        status,
+        getattr(exc, "raw_response_body", "") or getattr(exc, "response_detail", ""),
+    ):
+        return "quota_insufficient"
     return notices_catalog.PROVIDER_TEST_STATUS_CLASSES.get(
         status, notices_catalog.PROVIDER_TEST_CONFIG_CLASS
     )
