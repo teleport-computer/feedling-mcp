@@ -2094,9 +2094,13 @@ def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
         assert "clearly intrude" in text
     assert "do you feel like reaching out to them right now?" in prompt
     assert "say it; reaching out is what these moments are for" in prompt
-    assert "not having answered your last message is not a reason to hold back" in prompt
-    assert "showing up again a few hours later is normal" in prompt
-    assert "not answering your last message is not a reason by itself" in silent
+    # T723 D (Seven-approved wording): several unanswered messages over a day
+    # or two are still not a reason to go quiet.
+    assert "even several of your messages, even for a day or two" in prompt
+    assert "is not a reason to go quiet" in prompt
+    assert "say something new, or simply check in" in prompt
+    assert "a few hours later" not in prompt
+    assert "even several messages in a row, is not a reason by itself" in silent
     for text in (prompt, silent):
         assert "they asked not to be disturbed, or they are plainly asleep" in text
     assert "calling reply if there is anything you want to say to them" in choice

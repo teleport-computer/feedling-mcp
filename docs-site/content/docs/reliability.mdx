@@ -103,8 +103,9 @@ recognized manual-thinking models.
 
 Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
 choice. Speaking is the default; silence is the agent's own call when it has
-nothing it wants to say or when speaking would clearly intrude. An unanswered
-previous message is not by itself a reason to stay silent. These are model
+nothing it wants to say or when speaking would clearly intrude. Unanswered
+messages, even several over a day or two, are not by themselves a reason to stay
+silent; the agent is asked to say something new rather than repeat itself. These are model
 instructions, not new scheduler gates. Missing or invalid choices still
 fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
