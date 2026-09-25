@@ -1670,6 +1670,68 @@ def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
 
 
+_DSML_REPLY = (
+    "<｜｜DSML｜｜ calls>\n"
+    '<｜｜DSML｜｜ invoke name="reply">\n'
+    '<｜｜DSML｜｜ parameter name="aside" string="true">他在问那顿慈善饭，我没查到，照实说。</｜｜DSML｜｜ parameter>\n'
+    '<｜｜DSML｜｜ parameter name="text" string="true">这个我没记下来。是哪天？告诉我这次记住。</｜｜DSML｜｜ parameter>\n'
+    "</｜｜DSML｜｜ invoke>\n"
+    "</｜｜DSML｜｜ calls>"
+)
+
+
+def test_foreground_dsml_reply_delivers_body_without_aside(monkeypatch):
+    """T727 (T557 L1): DeepSeek wrote its reply tool call as DSML text. The
+    production chain must deliver the reply body and never the aside."""
+    uid = "u_toolloop_dsml_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-dsml-reply")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round(_DSML_REPLY)])
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "那顿饭是哪天"}])
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == ["这个我没记下来。是哪天？告诉我这次记住。"]
+    assert not any("慈善饭" in body or "DSML" in body for body in bodies)
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"]["reason"] == "tool_markup_leak_sanitized"
+
+
+def test_foreground_dsml_non_reply_call_uses_existing_fallback(monkeypatch):
+    uid = "u_toolloop_dsml_non_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-dsml-non-reply")
+    _patch_real_write(monkeypatch)
+    leaked = (
+        '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="memory_write">'
+        '<｜｜DSML｜｜ parameter name="text" string="true">不该给用户看的</｜｜DSML｜｜ parameter>'
+        "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert "不该给用户看的" not in bubble["body_ct"] and "DSML" not in bubble["body_ct"]
+    assert bubble["turn_failure_error_class"] == "upstream_unavailable"
+
+
 def test_torn_protocol_evidence_lane_policy():
     """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
     foreground only strong cross-channel evidence."""
