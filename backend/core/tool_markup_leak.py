@@ -14,6 +14,7 @@ tool-looking name, so ordinary bracketed prose is untouched.
 """
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 
@@ -220,21 +221,32 @@ def _narrated_calls(
         cursor = end
 
 
-def _dsml_reply_payload(text: str, start: int, end: int) -> str:
+def _dsml_name(match: re.Match) -> str:
+    return match.group("name").lower()
+
+
+def _xml_name(match: re.Match) -> str:
+    # Pair by allowlisted stem so namespace prefixes and plural drift agree.
+    return match.group("stem").lower()
+
+
+def _reply_payload(text, start, end, token_re, name_of, top_containers, *, allow_bare=False) -> str:
     """Closed ``text`` parameters that are direct children of a valid ``reply``.
 
     Parsed with a parent stack. A ``reply`` invoke is valid only at the block's
-    top level or directly inside a top-level ``calls``; a ``text`` parameter is captured
-    only when its parent is such an invoke, so nothing under ``aside``, a
-    non-reply invoke or an unknown container can start a capture. The block
-    fails closed (empty payload, whole block removed) on any marker inside a
-    captured body or any closing marker that does not match its opener.
+    top level or directly inside a top-level call container; a ``text``
+    parameter is captured only when its parent is such an invoke, so nothing
+    under ``aside``, a non-reply invoke or an unknown container can start a
+    capture. The block fails closed (empty payload, whole block removed) on any
+    marker inside a captured body or any closing marker that does not match.
     """
     payloads: list[str] = []
     stack: list[tuple[str, bool]] = []  # (element name, is a valid reply invoke)
     capture_from: int | None = None
-    for match in _DSML_TOKEN_RE.finditer(text, start, end):
-        name = match.group("name").lower()
+    # A valid reply invoke with no child marker at all carries its body directly.
+    bare_reply: list[int | None] = [None]
+    for match in token_re.finditer(text, start, end):
+        name = name_of(match)
         closing = bool(match.group("closing"))
         self_closing = not closing and match.group("tail").rstrip().endswith("/")
         attr = _DSML_ATTR_NAME_RE.search(match.group("tail"))
@@ -247,18 +259,25 @@ def _dsml_reply_payload(text: str, start: int, end: int) -> str:
             stack.pop()
             continue
         if self_closing:
+            bare_reply[0] = None  # any child marker, self-closing included
             continue
         if closing:
             if not stack or stack[-1][0] != name:
                 return ""
-            stack.pop()
+            element = stack.pop()
+            if element[1] and bare_reply[0] is not None:
+                payloads.append(text[bare_reply[0]:match.start()].strip())
+            bare_reply[0] = None
             continue
         parent = stack[-1] if stack else None
+        bare_reply[0] = None  # any child marker means the body is not bare
         if name == "invoke":
             valid_reply = attr_name == "reply" and (
-                not stack or (len(stack) == 1 and stack[0][0] == "calls")
+                not stack or (len(stack) == 1 and stack[0][0] in top_containers)
             )
             stack.append((name, valid_reply))
+            if valid_reply and allow_bare:
+                bare_reply[0] = match.end()
         else:
             stack.append((name, False))
             if (
@@ -272,19 +291,37 @@ def _dsml_reply_payload(text: str, start: int, end: int) -> str:
     return "\n\n".join(payload for payload in payloads if payload)
 
 
-def _dsml_blocks(text: str) -> list[tuple[int, int, str]]:
-    """``(start, end, replacement)`` of DSML tool-call blocks, in source order.
+def _has_reply_invoke(text, start, end, token_re, name_of) -> bool:
+    for match in token_re.finditer(text, start, end):
+        if name_of(match) == "invoke" and not match.group("closing"):
+            attr = _DSML_ATTR_NAME_RE.search(match.group("tail"))
+            if attr and attr.group(1).strip().lower() == "reply":
+                return True
+    return False
+
+
+def _protocol_blocks(text, token_re, name_of, top_containers, *, reply_blocks_only=False, allow_bare=False):
+    """``(start, end, replacement)`` of tool-call blocks, in source order.
 
     Same fence rule as narrated calls: a fence opened outside a block protects
     its contents, while a fence inside a block's payload is part of the block.
-    An unclosed block runs to the end of the text; a stray closing marker is
-    removed alone.
+    An unclosed block runs to the end of the text. With ``reply_blocks_only``
+    (generic XML markup) only blocks that contain a ``reply`` invoke are
+    returned; every other marker is left to the generic block/marker pass.
+    Otherwise (DSML) a stray closing or self-closing marker is removed alone.
     """
     found: list[tuple[int, int, str]] = []
     stack: list[tuple[str, int]] = []
     cursor = 0
+
+    def emit(start, end):
+        if reply_blocks_only and not _has_reply_invoke(text, start, end, token_re, name_of):
+            return
+        found.append((start, end, _reply_payload(text, start, end, token_re, name_of, top_containers,
+                                                 allow_bare=allow_bare)))
+
     while True:
-        match = _DSML_TOKEN_RE.search(text, cursor)
+        match = token_re.search(text, cursor)
         if not stack:
             fence_start = text.find(
                 _CODE_FENCE, cursor, match.start() if match else len(text)
@@ -297,12 +334,12 @@ def _dsml_blocks(text: str) -> list[tuple[int, int, str]]:
                 continue
         if match is None:
             break
-        name = match.group("name").lower()
+        name = name_of(match)
         closing = bool(match.group("closing"))
         self_closing = not closing and match.group("tail").rstrip().endswith("/")
         cursor = match.end()
         if self_closing:
-            if not stack:
+            if not stack and not reply_blocks_only:
                 found.append((match.start(), match.end(), ""))
             continue
         if not closing:
@@ -312,21 +349,19 @@ def _dsml_blocks(text: str) -> list[tuple[int, int, str]]:
             (i for i in range(len(stack) - 1, -1, -1) if stack[i][0] == name), None
         )
         if opening_index is None:
-            if not stack:
+            if not stack and not reply_blocks_only:
                 found.append((match.start(), match.end(), ""))
             continue
         outer_start = stack[0][1]
         del stack[opening_index:]
         if not stack:
-            found.append(
-                (outer_start, match.end(), _dsml_reply_payload(text, outer_start, match.end()))
-            )
+            emit(outer_start, match.end())
     if stack:
-        found.append((stack[0][1], len(text), _dsml_reply_payload(text, stack[0][1], len(text))))
+        emit(stack[0][1], len(text))
     return found
 
 
-def _replace_dsml_blocks(text: str, blocks: list[tuple[int, int, str]]) -> str:
+def _replace_blocks(text: str, blocks: list[tuple[int, int, str]]) -> str:
     pieces: list[str] = []
     cursor = 0
     for start, end, replacement in blocks:
@@ -335,6 +370,33 @@ def _replace_dsml_blocks(text: str, blocks: list[tuple[int, int, str]]) -> str:
         cursor = end
     pieces.append(text[cursor:])
     return "".join(pieces)
+
+
+_REPLY_JSON_KEYS = frozenset({"aside", "text"})
+
+
+def _reply_json_payload(text: str) -> str | None:
+    """The ``text`` of a whole-message reply-tool argument object, else None.
+
+    Some models write the reply call's JSON arguments as the visible message
+    (T733). Only an object whose keys are a subset of ``{"aside", "text"}``
+    with string values qualifies; the aside is never returned.
+    """
+    candidate = text.strip()
+    if not (candidate.startswith("{") and candidate.endswith("}")):
+        return None
+    try:
+        obj = json.loads(candidate)
+    except ValueError:
+        return None
+    if (
+        not isinstance(obj, dict)
+        or not obj
+        or not set(obj) <= _REPLY_JSON_KEYS
+        or not all(isinstance(value, str) for value in obj.values())
+    ):
+        return None
+    return obj.get("text", "").strip()
 
 
 def find_narrated_tool_calls(text: str, *, tool_names=()) -> tuple[str, ...]:
@@ -419,8 +481,12 @@ def strip_tool_markup(text: str, *, tool_names=()) -> tuple[str, bool]:
     """
     raw = str(text or "")
     names = frozenset(str(name).lower() for name in tool_names if name)
-    dsml_blocks = _dsml_blocks(raw)
-    raw = _replace_dsml_blocks(raw, dsml_blocks)
+    json_payload = _reply_json_payload(raw)
+    if json_payload is not None:
+        # The extracted text is still model output: run the whole chain on it.
+        raw = json_payload
+    dsml_blocks = _protocol_blocks(raw, _DSML_TOKEN_RE, _dsml_name, frozenset({"calls"}))
+    raw = _replace_blocks(raw, dsml_blocks)
     # Narrated calls next, on the raw text: a call is self-delimiting (the
     # bracket *is* the payload) so it is removed whole under both strategies,
     # and its payload may contain a fence that must not become a protected
@@ -428,12 +494,35 @@ def strip_tool_markup(text: str, *, tool_names=()) -> tuple[str, bool]:
     narrated_intervals = [
         (start, end) for start, end, _name in _narrated_calls(raw, names)
     ]
-    removed = bool(dsml_blocks or narrated_intervals)
     raw = _remove_intervals(raw, narrated_intervals)
+    block_clean, marker_clean, changed = _generic_pass(raw)
+    removed = bool(json_payload is not None or dsml_blocks or narrated_intervals) or changed
+    if not removed:
+        return raw, False
+    if not (
+        is_degenerate_visible_text(block_clean)
+        and not is_degenerate_visible_text(marker_clean)
+    ):
+        return block_clean, True
+    # Whole-block removal would eat the reply, so the marker-only payload is the
+    # fallback. For a reply call that payload also carries its aside and other
+    # parameters (T733); keep only the direct text of a top-level reply instead.
+    reply_blocks = _protocol_blocks(
+        raw, _TAG_TOKEN_RE, _xml_name, frozenset({"function_call", "tool_call"}),
+        reply_blocks_only=True, allow_bare=True,  # legacy `<invoke name="reply">body</invoke>`
+    )
+    if not reply_blocks:
+        return marker_clean, True
+    reply_clean, _unused_marker, _changed = _generic_pass(_replace_blocks(raw, reply_blocks))
+    return reply_clean, True
+
+
+def _generic_pass(raw: str) -> tuple[str, str, bool]:
+    """Run the closed-set block/marker strategies over ``raw``, fences protected."""
     block_output: list[str] = []
     marker_output: list[str] = []
+    removed = False
     cursor = 0
-
     while cursor < len(raw):
         fence_start = raw.find(_CODE_FENCE, cursor)
         if fence_start < 0:
@@ -460,15 +549,4 @@ def strip_tool_markup(text: str, *, tool_names=()) -> tuple[str, bool]:
         block_output.append(raw[fence_start:fence_end])
         marker_output.append(raw[fence_start:fence_end])
         cursor = fence_end
-
-    if not removed:
-        return raw, False
-    block_clean = "".join(block_output).strip()
-    marker_clean = "".join(marker_output).strip()
-    clean = (
-        marker_clean
-        if is_degenerate_visible_text(block_clean)
-        and not is_degenerate_visible_text(marker_clean)
-        else block_clean
-    )
-    return clean, True
+    return "".join(block_output).strip(), "".join(marker_output).strip(), removed
