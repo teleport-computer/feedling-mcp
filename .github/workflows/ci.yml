@@ -1261,6 +1261,7 @@ jobs:
             tests/test_v2_context.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_profile_lane.py \
+            tests/test_v2_profile.py \
             tests/test_v2_profile_prompt.py \
             tests/test_v2_profile_refresh.py \
             tests/test_v2_profile_retry.py \
