@@ -7,6 +7,7 @@ T619 仅更新普通 wake 第二段及其派生快照，包含复用该段的 sc
 T628 按批准文案更新 screen_watch 选择句及其派生快照，保留屏幕专属指引。
 T658 仅更新五个 wake 派生快照：aside 字段版指令替换 think 标签版；基础文案不变。
 T723 仅更新 heartbeat/manual_wake 两个派生快照：aside 意图句换成心跳版（为什么这会儿想找他），其余逐字不变。
+T723 批次2（D）按 Seven 批准文案替换普通 wake 的「未回复」一句（及其派生快照，含复用它的 scheduled_no_notes）；screen_watch 自有文案不变。
 
 ★ 四格验收矩阵（2026-08-20 补，见
   .superpowers/sdd/2026-08-19-perception-extraction-step1/matrix-report.md）：
