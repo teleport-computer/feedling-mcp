@@ -3434,13 +3434,16 @@ def _memory_recall_callback(deps, user_id, job, lane):
                     log.warning("[v2.memory] observation trace failed: %s", type(exc).__name__)
         terminal_detail = {k: v for k, v in detail.items()
                            if k not in {"tool_results", "prompt_observations"}}
+        # The event tallies ride inside counts: _safe_detail keeps only the first
+        # 20 top-level keys, and every key past that is dropped without a marker.
+        counts = {**(detail.get("counts") or {}),
+                  "tool_result_events": len(detail.get("tool_results", [])),
+                  "provider_requests": len(detail.get("prompt_observations", []))}
         await asyncio.to_thread(
             deps.emit_debug_trace, user_id, "memory.recall.completed",
             status="ok", trace_id=trace_id, turn_id=turn_id, job_id=job_id,
             summary=memory_recall.summary(detail["counts"]),
-            detail={**terminal_detail, **coordinates,
-                    "tool_result_events": len(detail.get("tool_results", [])),
-                    "provider_requests": len(detail.get("prompt_observations", []))},
+            detail={**terminal_detail, "counts": counts, **coordinates},
         )
     return emit
 

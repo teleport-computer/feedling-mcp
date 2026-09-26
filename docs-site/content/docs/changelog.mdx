@@ -28,7 +28,11 @@ change must not be interpreted as an API guarantee.
   and fuses a cosine lane with the lexical ranker (memgarden 0.22.0). A per-turn
   budget (default 2 s) bounds the vector read and encoding; any failure keeps the
   whole turn on the unchanged lexical path and records a content-free fallback
-  reason. Runtime V2 recall traces gain flat `hybrid_*` fields only while enabled.
+  reason. Runtime V2 recall traces gain a `selection_mode` field and a nested
+  `hybrid` object only while enabled. The recall trace's event tallies
+  (`tool_result_events`, `provider_requests`) now sit inside `counts`, so the
+  turn's `lane`, `attempt`, `turn_id` and `job_id` are no longer dropped from
+  the stored event.
   While disabled, recall output is byte-identical to before. Public API unchanged.
 
 - Hosted Runtime V2 no longer shows a reply call's `aside` when a model writes

@@ -555,7 +555,7 @@ def test_v2_render_is_unchanged_without_a_hybrid_record():
     assert set(view) == {"block", "ids", "chars", "selected", "selection_status"}
 
 
-def test_v2_recall_completed_gets_flat_hybrid_fields_only_when_present():
+def test_v2_recall_completed_gets_a_nested_hybrid_record_only_when_present():
     import asyncio
     from types import SimpleNamespace
     from model_api_runtime.v2 import memory_recall
@@ -567,7 +567,7 @@ def test_v2_recall_completed_gets_flat_hybrid_fields_only_when_present():
     plain, with_hybrid = [], []
     asyncio.run(turn(dispatch_tools=None, on_memory_recall_completed=plain.append,
                      memory_context_observation=_render({"mode": "relevant:unified:x"})))
-    assert not any(k.startswith("hybrid_") or k == "selection_mode" for k in plain[0])
+    assert not any(k.startswith("hybrid") or k == "selection_mode" for k in plain[0])
     record = {"status": "fallback", "fallback_reason": "deadline_exceeded", "encode_ms": 2001.5,
               "vectors_ms": 3.0, "vectors_received": 9, "vectors_rejected": 0, "with_vector": 9,
               "hash_mismatch": 0, "lanes": [{"source": "current"}]}
@@ -576,9 +576,59 @@ def test_v2_recall_completed_gets_flat_hybrid_fields_only_when_present():
                      memory_context_observation=view))
     detail = with_hybrid[0]
     assert detail["selection_mode"] == "relevant:unified:x:hybrid-fallback"
-    assert detail["hybrid_status"] == "fallback" and detail["hybrid_fallback_reason"] == "deadline_exceeded"
-    assert detail["hybrid_encode_ms"] == 2001.5 and detail["hybrid_with_vector"] == 9
-    assert all(not isinstance(v, (dict, list)) for k, v in detail.items() if k.startswith("hybrid_"))
+    assert detail["hybrid"]["status"] == "fallback"
+    assert detail["hybrid"]["fallback_reason"] == "deadline_exceeded"
+    assert detail["hybrid"]["encode_ms"] == 2001.5 and detail["hybrid"]["with_vector"] == 9
+    assert all(not isinstance(v, (dict, list)) for v in detail["hybrid"].values())
+    assert not any(k.startswith("hybrid_") for k in detail)
+
+
+def _durable_recall_completed(log):
+    """memory.recall.completed as stored: traced() -> worker callback -> _safe_detail."""
+    import asyncio
+    from types import SimpleNamespace
+    import debug_trace
+    from model_api_runtime.v2 import memory_recall, worker
+
+    @memory_recall.traced
+    async def turn(**kwargs):
+        return SimpleNamespace(stop_reason="final_text")
+
+    raw, sent = [], []
+    asyncio.run(turn(dispatch_tools=None, on_memory_recall_completed=raw.append,
+                     memory_context_observation=_render(log)))
+    callback = worker._memory_recall_callback(
+        SimpleNamespace(emit_debug_trace=lambda _uid, kind, **kw: sent.append((kind, kw["detail"]))),
+        "u", {"id": 7, "trace_id": "trace7", "attempt_count": 2}, "chat")
+    asyncio.run(callback(raw[0]))
+    detail = dict(sent)["memory.recall.completed"]
+    return detail, debug_trace._safe_detail(detail)
+
+
+def test_t741_durable_recall_trace_drops_no_key_with_a_real_hybrid_record():
+    """T741: flat hybrid_* keys took the event to 31 keys; the durable trace keeps
+    20, so five hybrid counters and the turn coordinates were silently dropped.
+    The record here is the one the enclave builds, so a field added there that
+    V2 does not carry fails the key-set check instead of vanishing."""
+    import debug_trace
+    _, _, record = chat._try_hybrid_selection(
+        {"fallback_reason": "embedder_loading", "vectors_ms": 4.5, "vectors_requested": 6,
+         "vectors_rejected": 1, "stored": {"a": ("h", [1.0])}}, [], [], {}, "q", "q")
+    record = {**record, "lanes": [{"source": "current", "vector_only": 1}]}
+    mode = ("relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+            "+host:latest-first-v1:hybrid-fallback:recent7d")
+    for log in ({"mode": mode}, {"mode": mode, "hybrid": record}):
+        sent, stored = _durable_recall_completed(log)
+        assert len(sent) <= debug_trace._DETAIL_MAX_KEYS
+        assert list(stored) == list(sent)  # nothing dropped
+        assert stored["attempt"] == 2 and stored["lane"] == "chat"
+        assert stored["turn_id"] == "trace7" and stored["job_id"] == "7"
+        assert stored["counts"]["tool_result_events"] == 0
+        assert stored["counts"]["provider_requests"] == 0
+    assert stored["selection_mode"] == mode  # full length, not cut to 80
+    assert set(stored["hybrid"]) == set(record) - {"lanes"}
+    assert stored["hybrid"] == {k: v for k, v in record.items() if k != "lanes"}
+    assert stored["hybrid"]["vectors_requested"] == 6 and stored["hybrid"]["with_vector"] == 0
 
 
 # --------------------------------------------------------------------------- #
