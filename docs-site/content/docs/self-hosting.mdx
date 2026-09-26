@@ -184,7 +184,7 @@ A functional deployment can include:
 | TLS reverse proxy | Any Internet-facing API | Terminate HTTPS and forward only intended ports. |
 | ASGI backend | All API operations | Runs FastAPI under gunicorn/Uvicorn worker; public HTTP default is port 5001. |
 | PostgreSQL | All persistent user state | `DATABASE_URL` is mandatory; there is no current file-persistence fallback. |
-| Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. |
+| Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. With optional hybrid recall enabled it also loads the local embedding model and receives the caller's plaintext derived card vectors from the backend; size its memory and CPU for that. |
 | Runtime V2 worker pool | Hosted `/v1/model_api/chat/send` | Shares PostgreSQL and runtime-token configuration with the backend and publishes worker-capacity heartbeats. |
 | Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. |
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |

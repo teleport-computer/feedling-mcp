@@ -1300,6 +1300,41 @@ def _with_system_suffix(messages: list, suffix: str) -> list:
     return updated
 
 
+def _provider_error_facts(exc: BaseException) -> dict[str, object]:
+    """Derive closed failure metadata without trusting exception text.
+
+    Module level so every V2 lane that calls a provider (tool loop, Profile)
+    projects a failed call through the same closed vocabulary.
+    """
+    status_code = getattr(exc, "status_code", None)
+    try:
+        timed_out = provider_client.is_timeout_error(exc)
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+        timed_out = False
+    try:
+        error_family = provider_client.classify_provider_error(exc)
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+        error_family = "unknown"
+    return {
+        "finish_reason": (
+            "timeout"
+            if timed_out
+            else (
+                "http_error"
+                if isinstance(status_code, int)
+                and not isinstance(status_code, bool)
+                else "provider_error"
+            )
+        ),
+        "status_code": status_code,
+        "error_class": provider_errors.error_class_for_exception(exc),
+        "exception_type": type(exc).__name__,
+        # Retry family is independent of the shared notice cause above.
+        "provider_error_class": error_family,
+        **provider_client.provider_error_diagnostics(exc),
+    }
+
+
 @memory_recall.traced
 async def run_tool_loop(
     *,
@@ -1857,36 +1892,6 @@ async def run_tool_loop(
             )
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
             pass
-
-    def _provider_error_facts(exc: BaseException) -> dict[str, object]:
-        """Derive closed failure metadata without trusting exception text."""
-        status_code = getattr(exc, "status_code", None)
-        try:
-            timed_out = provider_client.is_timeout_error(exc)
-        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
-            timed_out = False
-        try:
-            error_family = provider_client.classify_provider_error(exc)
-        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
-            error_family = "unknown"
-        return {
-            "finish_reason": (
-                "timeout"
-                if timed_out
-                else (
-                    "http_error"
-                    if isinstance(status_code, int)
-                    and not isinstance(status_code, bool)
-                    else "provider_error"
-                )
-            ),
-            "status_code": status_code,
-            "error_class": provider_errors.error_class_for_exception(exc),
-            "exception_type": type(exc).__name__,
-            # Retry family is independent of the shared notice cause above.
-            "provider_error_class": error_family,
-            **provider_client.provider_error_diagnostics(exc),
-        }
 
     async def _record_required_file_missing(round_number: int) -> None:
         nonlocal required_file_missing_recorded

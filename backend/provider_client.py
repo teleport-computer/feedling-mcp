@@ -46,7 +46,8 @@ PROVIDER_ERROR_TYPES = frozenset({
     "request_too_large", "unknown",
 })
 _PROVIDER_ERROR_SIGNATURE_PATTERNS = (
-    ("thinking_forced_tool_choice", r"thinking.*(?:may not|cannot|not supported|incompatible).*tool_choice|tool_choice.*(?:incompatible|not supported).*thinking"),
+    ("thinking_forced_tool_choice", r"thinking.*(?:may not|cannot|not supported|does not support|incompatible).*tool_choice|tool_choice.*(?:incompatible|not supported).*thinking"),
+    ("forced_tool_json_mime", r"forced\s+function\s+calling.*(?:mime|json).*(?:unsupported|not supported)"),
     ("trailing_whitespace", r"(?:final|assistant).*trailing\s+whitespace"),
     ("tool_use_id_mismatch", r"unexpected\s+tool_use_id|tool_use_id.*(?:not found|missing)|tool_result.*(?:without|must have|matching).*tool_use|tool_use.*(?:without|must have|matching).*tool_result"),
     ("invalid_tool_schema", r"(?:tools?(?:\[\d+\]|\.\d+)?[.: ]+)?input_schema.*(?:invalid|must|should)|(?:invalid|unsupported).*tool.*schema|tool.*name.*(?:must|match|invalid)"),
@@ -56,6 +57,20 @@ _PROVIDER_ERROR_SIGNATURE_PATTERNS = (
 PROVIDER_ERROR_SIGNATURES = frozenset(
     name for name, _ in _PROVIDER_ERROR_SIGNATURE_PATTERNS
 ) | {"unclassified"}
+
+
+def _forces_named_or_required_tool(tool_choice: Any) -> bool:
+    """True for the OpenAI-chat tool choices that force a call.
+
+    ``required`` forces any tool; ``{"type": "function", "function": {"name":
+    ...}}`` forces one named tool. ``auto``/``none``/absent do not force.
+    """
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        return isinstance(function, dict) and bool(str(function.get("name") or "").strip())
+    return False
 
 
 def provider_error_diagnostics(exc: BaseException) -> dict[str, str]:
@@ -3295,15 +3310,16 @@ def _build_openai_compat_payload(
         if tool_choice is not None:
             payload["tool_choice"] = copy.deepcopy(tool_choice)
         # DeepSeek supports tools in thinking mode, but its Chat Completions
-        # endpoint rejects the narrower combination of native thinking and the
-        # literal ``required`` tool choice.  Keep thinking for ordinary/auto
-        # rounds and disable it only for the request whose wire contract must
-        # force a tool call.  Key this on the declared provider, never the URL:
-        # an openai_compatible route remains owned by that adapter even when it
+        # endpoint rejects native thinking combined with a *forcing* tool
+        # choice: the literal ``required`` and a named function alike (T735:
+        # "Thinking mode does not support this tool_choice" for the Profile
+        # emit_profile call).  Keep thinking for ordinary/auto rounds and
+        # disable it only for the request whose wire contract must force a
+        # tool call.  Key this on the declared provider, never the URL: an
+        # openai_compatible route remains owned by that adapter even when it
         # happens to point at a DeepSeek host.
-        if (
-            normalize_provider(provider) == "deepseek"
-            and payload.get("tool_choice") == "required"
+        if normalize_provider(provider) == "deepseek" and _forces_named_or_required_tool(
+            payload.get("tool_choice")
         ):
             payload["thinking"] = {"type": "disabled"}
     if cache_key := _cache_key(prompt_cache_key):

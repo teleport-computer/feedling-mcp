@@ -196,6 +196,11 @@ def classify_image_generation_error(
         return incompatible_code
 
     status_code = _safe_status_code(getattr(exc, "status_code", None))
+    if status_code == 403 and error_contract.provider_response_is_quota_exhausted(
+        status_code,
+        getattr(exc, "raw_response_body", "") or getattr(exc, "response_detail", ""),
+    ):
+        return "image_generation_quota_insufficient"
     if status_code in {401, 403}:
         if error_contract.provider_response_is_auth_failure(
             status_code,

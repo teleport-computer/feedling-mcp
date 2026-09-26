@@ -215,7 +215,6 @@ tests/test_v2_optional_anchor.py
 tests/test_v2_p0_aba.py
 tests/test_v2_p0_exactly_once.py
 tests/test_v2_p0_seq_integrity.py
-tests/test_v2_profile.py
 tests/test_v2_profile_cards.py
 tests/test_v2_prompt_invariant.py
 tests/test_v2_provenance.py

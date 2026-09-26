@@ -1569,6 +1569,12 @@ def build_profile_output_from_sources(
         # JSON mode but not forced tool choice.  The shared profile prompt is
         # already strict JSON, so preserve JSON mode and intentionally ignore
         # the optional tool hint instead of rejecting the V2 call contract.
+        # Since T735 the shared final call carries its structure only in the
+        # forced ``emit_profile`` tool (some routes reject tool + JSON mode);
+        # dropping that tool here must bring JSON mode back, or Genesis would
+        # send neither.
+        if tools and response_format is None:
+            response_format = {"type": "json_object"}
         del timeout, tools, tool_choice
         nonlocal call_number
         call_number += 1

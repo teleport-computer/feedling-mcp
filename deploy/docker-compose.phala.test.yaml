@@ -148,7 +148,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:2d15c75
+    image: &enclave-image ghcr.io/teleport-computer/feedling:1c6a796
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -171,6 +171,18 @@ services:
         # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
         # max 47.7s → 34s chat replies of which pi was only 3.1s.
         FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+        # Hybrid automatic recall (T523 step 4, T739): dense E5 lane fused with
+        # the lexical ranker in this enclave's /v1/chat/history selection. test
+        # only; prod stays off. Both enclave services share this anchor so the
+        # direct (:5003) and custom-domain (:5004) entrypoints recall alike.
+        # MIN_COSINE 0.80 = positive 5th percentile of the dev-set calibration
+        # (reports/T523-calib, disjoint from the T557 acceptance set). The model
+        # is the same baked, SHA-pinned E5 the serve-worker sweep uses; loaded in
+        # a background thread at startup, never on a request; never downloads.
+        FEEDLING_MEMORY_RECALL_HYBRID: "1"
+        FEEDLING_MEMORY_RECALL_MIN_COSINE: "0.80"
+        FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+        HF_HUB_OFFLINE: "1"
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it
@@ -227,7 +239,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:2d15c75
+    image: ghcr.io/teleport-computer/feedling:1c6a796
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -426,7 +438,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:2d15c75
+    image: ghcr.io/teleport-computer/feedling:1c6a796
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -554,7 +566,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:2d15c75
+    image: ghcr.io/teleport-computer/feedling:1c6a796
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
@@ -584,7 +596,7 @@ services:
         condition: service_healthy
 
   log-shipper:
-    image: ghcr.io/teleport-computer/feedling:2d15c75
+    image: ghcr.io/teleport-computer/feedling:1c6a796
     container_name: log-shipper
     command: ["python", "-u", "ops/log_shipper.py"]
     restart: unless-stopped

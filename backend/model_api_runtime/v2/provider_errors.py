@@ -18,6 +18,11 @@ def error_class_for_exception(exc: BaseException) -> str:
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "provider_timeout"
     status_code = getattr(exc, "status_code", None)
+    if status_code == 403 and error_contract.provider_response_is_quota_exhausted(
+        status_code,
+        getattr(exc, "raw_response_body", "") or getattr(exc, "response_detail", ""),
+    ):
+        return "quota_insufficient"
     if status_code in {401, 403}:
         return (
             "auth_invalid"

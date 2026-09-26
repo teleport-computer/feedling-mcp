@@ -8,17 +8,31 @@ import time
 from fastapi import APIRouter
 from starlette.responses import JSONResponse, Response
 
-from enclave import config, state
+from enclave import config, recall_hybrid, state
 
 router = APIRouter()
 
 
+def _rss_kb() -> int | None:
+    """Current resident set size of this process (Linux VmRSS), or None."""
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def _health_body() -> dict:
-    """Liveness + readiness snapshot, built purely from the in-memory ``_state``.
+    """Liveness + readiness snapshot, built from local process state only.
 
     The enclave is reentrancy-sensitive, so /healthz does
-    NO crypto and NO backend round-trip — every field here is a plain read of
-    the attestation/bootstrap state cached at process start. Backward compatible:
+    NO crypto and NO backend round-trip. Most fields are plain reads of the
+    attestation/bootstrap state cached at process start; ``rss_kb`` is read
+    from this process's procfs and ``recall_hybrid`` reflects the current flag
+    and model-load state, both local and content-free. Backward compatible:
     ``ok`` / ``ready`` / ``error`` keep their old meaning; ``status`` /
     ``release`` / ``uptime_s`` / ``tls_enabled`` / ``phase`` are additive so an
     external heartbeat can see build + TLS posture without hitting /attestation.
@@ -44,6 +58,10 @@ def _health_body() -> dict:
         "transport_mode": config.ENCLAVE_TRANSPORT_MODE,
         "phase": 3 if st["tls_enabled"] else 1,
         "error": st["error"],
+        # Additive capacity/deploy evidence (T739): process memory and the
+        # hybrid-recall flag/model state. No user data, no paths.
+        "rss_kb": _rss_kb(),
+        "recall_hybrid": recall_hybrid.status_snapshot(),
     }
 
 

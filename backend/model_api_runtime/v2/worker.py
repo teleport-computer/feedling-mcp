@@ -3104,7 +3104,7 @@ class _ProviderRoundtripTrace:
             "lane": self.lane,
             "round": round_number,
         }
-        if self.lane != "chat":
+        if self.lane not in {"chat", "profile"}:
             safe["wake_kind"] = self.lane
         finish_reason = str(detail.get("finish_reason") or "")
         if finish_reason in (
@@ -3438,20 +3438,25 @@ def _memory_recall_callback(deps, user_id, job, lane):
                     log.warning("[v2.memory] observation trace failed: %s", type(exc).__name__)
         terminal_detail = {k: v for k, v in detail.items()
                            if k not in {"tool_results", "prompt_observations"}}
+        # The event tallies ride inside counts: _safe_detail keeps only the first
+        # 20 top-level keys, and every key past that is dropped without a marker.
+        counts = {**(detail.get("counts") or {}),
+                  "tool_result_events": len(detail.get("tool_results", [])),
+                  "provider_requests": len(detail.get("prompt_observations", []))}
         await asyncio.to_thread(
             deps.emit_debug_trace, user_id, "memory.recall.completed",
             status="ok", trace_id=trace_id, turn_id=turn_id, job_id=job_id,
             summary=memory_recall.summary(detail["counts"]),
-            detail={**terminal_detail, **coordinates,
-                    "tool_result_events": len(detail.get("tool_results", [])),
-                    "provider_requests": len(detail.get("prompt_observations", []))},
+            detail={**terminal_detail, "counts": counts, **coordinates},
         )
     return emit
 
 
 def _normalize_provider_trace_lane(lane: object) -> str:
     raw_lane = str(lane or "").strip()
-    return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
+    if raw_lane in {"chat", "profile"} or raw_lane in _WAKE_LANES:
+        return raw_lane
+    return "other"
 
 
 def _normalize_provider_trace_reason(
@@ -12197,6 +12202,25 @@ async def _run_profile(
                 },
             )
         provider_call_ordinal = 0
+        # Content-free model-call events (T735): the same closed projection
+        # Chat/Wake use, so a failed Profile call leaves its HTTP status and
+        # error signature instead of only "providererror". Telemetry never
+        # changes the call's result or its retry/cancel behaviour.
+        model_call_trace = _provider_tool_surface_callback(
+            deps, user_id, "profile", job_id=job_id
+        )
+        call_route = {
+            "provider": str(getattr(provider_config, "provider", "") or "unknown"),
+            "model": str(getattr(provider_config, "model", "") or "unknown"),
+        }
+
+        async def _record_profile_call(event_kind: str, detail: dict) -> None:
+            if model_call_trace is None:
+                return
+            try:
+                await model_call_trace.record_model_call(event_kind, detail)
+            except Exception:  # noqa: BLE001 -- telemetry is best-effort
+                pass
 
         async def _profile_llm(*args, **kwargs):
             nonlocal provider_call_ordinal
@@ -12212,8 +12236,39 @@ async def _run_profile(
             # Profile shares heavy-0 with Capture/Dream, but retains its own
             # 90s wire ceiling when Dream receives a larger budget.
             kwargs.setdefault("wire_deadline_sec", v2_extraction.WIRE_DEADLINE_SEC)
-            result = await provider_client.reliable_chat_completion_async(
-                *args, **kwargs
+            await _record_profile_call("start", {**call_route, "round": ordinal})
+            started = time.monotonic()
+            try:
+                result = await provider_client.reliable_chat_completion_async(
+                    *args, **kwargs
+                )
+            except Exception as exc:
+                try:
+                    facts = v2_tool_loop._provider_error_facts(exc)
+                except Exception:  # noqa: BLE001 -- never replace the real failure
+                    facts = {"exception_type": type(exc).__name__}
+                await _record_profile_call(
+                    "error",
+                    {
+                        **call_route,
+                        "round": ordinal,
+                        "dur_ms": (time.monotonic() - started) * 1000.0,
+                        **facts,
+                    },
+                )
+                raise
+            await _record_profile_call(
+                "done",
+                {
+                    **call_route,
+                    "round": ordinal,
+                    "dur_ms": (time.monotonic() - started) * 1000.0,
+                    "finish_reason": (
+                        str(result.get("finish_reason") or "")
+                        if isinstance(result, dict)
+                        else ""
+                    ),
+                },
             )
             _report_turn_progress(f"profile_provider_response:{ordinal}")
             return result

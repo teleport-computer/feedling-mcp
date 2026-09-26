@@ -428,11 +428,46 @@ def test_deepseek_required_tool_choice_disables_thinking_for_that_request(
 
 
 @pytest.mark.parametrize(
+    ("configured_model", "wire_model"),
+    [
+        ("deepseek-flash", "deepseek-flash"),
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek-reasoner", "deepseek-v4-flash"),
+    ],
+)
+def test_deepseek_named_tool_choice_disables_thinking_for_that_request(
+    configured_model,
+    wire_model,
+):
+    """T735: a named forcing choice conflicts with thinking exactly like
+    ``required`` ("Thinking mode does not support this tool_choice")."""
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    named = {"type": "function", "function": {"name": "ping"}}
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice=named,
+    )
+
+    assert payload["model"] == wire_model
+    assert payload["tool_choice"] == named
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
     "tool_choice",
     [
         None,
         "auto",
-        {"type": "function", "function": {"name": "ping"}},
+        {"type": "function", "function": {"name": ""}},
     ],
 )
 def test_deepseek_non_required_tool_choice_preserves_default_thinking(
@@ -1091,6 +1126,14 @@ def test_bedrock_forced_tools_explicitly_disable_manual_thinking(
 
 @pytest.mark.parametrize("message, signature", [
     ("Thinking may not be enabled when tool_choice forces tool use.", "thinking_forced_tool_choice"),
+    # T735: DeepSeek's wording for the same conflict.
+    ("Thinking mode does not support this tool_choice", "thinking_forced_tool_choice"),
+    # T735: Gemini rejects a forced call combined with a JSON response mime type.
+    ("Forced function calling (ANY mode) with a response mime type: 'application/json' is unsupported",
+     "forced_tool_json_mime"),
+    # Negatives: the same words without the specific conflict stay unclassified.
+    ("This model does not support this tool_choice value", "unclassified"),
+    ("Function calling with a response mime type is fine", "unclassified"),
     ("final assistant content cannot end with trailing whitespace", "trailing_whitespace"),
     ("unexpected tool_use_id in tool_result blocks", "tool_use_id_mismatch"),
     ("tools.0.input_schema: JSON schema is invalid", "invalid_tool_schema"),

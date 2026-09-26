@@ -17,6 +17,30 @@ change must not be interpreted as an API guarantee.
   and the screen-watch note). Chinese accounts keep the existing Chinese text
   unchanged. Previously every account got the Chinese guidance, which could
   pull English conversations into Chinese replies.
+
+- The enclave `/healthz` adds `rss_kb` (the process's current resident memory)
+  and `recall_hybrid` (`enabled`, `min_cosine`, `embedder_state`,
+  `failure_reason`, and a model-id prefix). It carries no user data and no
+  paths, and is used as deploy-state and capacity evidence for hybrid recall.
+
+- A relay's `403` that explicitly reports an exhausted balance (for example
+  `code: insufficient_user_quota`, 「预扣费额度失败」) is now reported as insufficient
+  quota instead of an invalid API key, on every Model API lane and in credential
+  probes. Other `403` responses keep their existing classification.
+
+- Added disabled-by-default hybrid automatic recall (`FEEDLING_MEMORY_RECALL_HYBRID`).
+  When enabled, the enclave encodes the query with the local E5 model, reads the
+  caller's current-projection card vectors through a new internal backend route,
+  and fuses a cosine lane with the lexical ranker (memgarden 0.22.0). A per-turn
+  budget (default 2 s) bounds the vector read and encoding; any failure keeps the
+  whole turn on the unchanged lexical path and records a content-free fallback
+  reason. Runtime V2 recall traces gain a `selection_mode` field and a nested
+  `hybrid` object only while enabled. The recall trace's event tallies
+  (`tool_result_events`, `provider_requests`) now sit inside `counts`, so the
+  turn's `lane`, `attempt`, `turn_id` and `job_id` are no longer dropped from
+  the stored event.
+  While disabled, recall output is byte-identical to before. Public API unchanged.
+
 - Hosted Runtime V2 no longer shows a reply call's `aside` when a model writes
   the call as visible text. For XML-style tool markup, when removing the whole
   block would leave nothing, only the reply's `text` (or its bare body) is kept

@@ -1,0 +1,2223 @@
+{
+ "cases": {
+  "v1_cn_no_recent": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "description": "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。",
+     "id": "cat",
+     "linked_dimension": "猫咪",
+     "status": "active",
+     "summary": "",
+     "title": "猫咪照顾"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "recent": 2
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 2,
+     "rejected_sampled": 0
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "cat",
+     "fresh1"
+    ],
+    "mode": "relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1",
+    "query_empty": false,
+    "query_fingerprint": "34c46339d2a3",
+    "rejected_reasons": {}
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "2d64f343adbe",
+      "source": "current",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 1,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 1,
+       "mode": "bm25",
+       "query_stopwords": 3,
+       "query_tokens": 9,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.132465,
+         "id": "cat",
+         "matched_phrases": [
+          "猫咪"
+         ],
+         "reason": "bm25_match",
+         "score": 4.6549,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     },
+     {
+      "query_fingerprint": "34c46339d2a3",
+      "source": "context",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 2,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 2,
+       "mode": "bm25",
+       "query_stopwords": 4,
+       "query_tokens": 17,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.060945,
+         "id": "cat",
+         "matched_phrases": [
+          "猫咪"
+         ],
+         "reason": "bm25_match",
+         "score": 4.6549,
+         "selected": true
+        },
+        {
+         "bucket": "recent",
+         "coverage": 0.060945,
+         "id": "fresh1",
+         "matched_phrases": [
+          "刚"
+         ],
+         "reason": "bm25_match",
+         "score": 4.1586,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     }
+    ],
+    "rejected_sample": [],
+    "selected": [
+     {
+      "bucket": "recent",
+      "coverage": 0.132465,
+      "id": "cat",
+      "kernel_score": 4.6549,
+      "matched_phrases": [
+       "猫咪"
+      ],
+      "query_source": "current",
+      "reason": "bm25_match",
+      "score": 10.3098,
+      "selected": true
+     },
+     {
+      "bucket": "recent",
+      "coverage": 0.060945,
+      "id": "fresh1",
+      "kernel_score": 4.1586,
+      "matched_phrases": [
+       "刚"
+      ],
+      "query_source": "context",
+      "reason": "bm25_match",
+      "score": 4.1586,
+      "selected": true
+     }
+    ],
+    "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1"
+   }
+  },
+  "v1_cn_no_trace": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "description": "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。",
+     "id": "cat",
+     "linked_dimension": "猫咪",
+     "status": "active",
+     "summary": "",
+     "title": "猫咪照顾"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "recent": 2
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 2,
+     "rejected_sampled": 0
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "cat",
+     "fresh1"
+    ],
+    "mode": "relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1",
+    "query_empty": false,
+    "query_fingerprint": "34c46339d2a3",
+    "rejected_reasons": {}
+   },
+   "context_memory_trace": null
+  },
+  "v1_legacy_ranker": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "description": "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。",
+     "id": "cat",
+     "linked_dimension": "猫咪",
+     "status": "active",
+     "summary": "",
+     "title": "猫咪照顾"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "recent": 1
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 1,
+     "rejected_sampled": 8
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "cat"
+    ],
+    "mode": "relevant:unified:legacy-relevance+host:latest-first-v1",
+    "query_empty": false,
+    "query_fingerprint": "34c46339d2a3",
+    "rejected_reasons": {
+     "no_overlap": 2,
+     "weak_generic_overlap": 6
+    }
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "legacy-relevance",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "2d64f343adbe",
+      "source": "current",
+      "trace": {
+       "min_relevance": 0.35,
+       "mode": "relevant",
+       "query_rare_terms": [],
+       "query_strong_phrases": [
+        "家里猫咪",
+        "心家里猫",
+        "担心家里",
+        "猫咪最近",
+        "里猫咪最",
+        "咪最近",
+        "家里猫",
+        "心家里",
+        "担心家",
+        "猫咪最",
+        "里猫咪",
+        "吃饭",
+        "咪最",
+        "家里",
+        "心家",
+        "担心",
+        "最近",
+        "猫咪",
+        "还行",
+        "里猫"
+       ],
+       "query_units": [
+        "家里猫咪",
+        "心家里猫",
+        "担心家里",
+        "猫咪最近",
+        "里猫咪最",
+        "咪最近",
+        "家里猫",
+        "心家里",
+        "担心家",
+        "猫咪最",
+        "里猫咪",
+        "吃饭",
+        "咪最",
+        "家里",
+        "心家",
+        "担心",
+        "最近",
+        "猫咪",
+        "还行",
+        "里猫",
+        "吃",
+        "咪",
+        "家",
+        "心",
+        "担",
+        "最",
+        "猫",
+        "行",
+        "近",
+        "还",
+        "里",
+        "饭"
+       ],
+       "query_weak_terms": [
+        "吃",
+        "咪",
+        "家",
+        "心",
+        "担",
+        "最",
+        "猫",
+        "行",
+        "近",
+        "还",
+        "里",
+        "饭"
+       ],
+       "rejected_sample": [
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "kidney",
+         "matched_phrases": [],
+         "matched_units": [
+          "咪",
+          "猫"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.12,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "turning",
+         "matched_phrases": [],
+         "matched_units": [
+          "最"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "fresh4",
+         "matched_phrases": [],
+         "matched_units": [
+          "家"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "sister",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "mixed",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh3",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh2",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh1",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        }
+       ],
+       "selected": [
+        {
+         "bucket": "recent",
+         "confidence": "strong",
+         "id": "cat",
+         "matched_phrases": [
+          "家里猫咪",
+          "猫咪最近",
+          "里猫咪最",
+          "猫咪最",
+          "里猫咪",
+          "猫咪"
+         ],
+         "matched_units": [
+          "家里猫咪",
+          "猫咪最近",
+          "里猫咪最",
+          "猫咪最",
+          "里猫咪",
+          "猫咪",
+          "咪",
+          "猫"
+         ],
+         "reason": "phrase_match",
+         "score": 0.8,
+         "selected": true,
+         "title": "",
+         "type": ""
+        }
+       ]
+      }
+     },
+     {
+      "query_fingerprint": "34c46339d2a3",
+      "source": "context",
+      "trace": {
+       "min_relevance": 0.35,
+       "mode": "relevant",
+       "query_rare_terms": [],
+       "query_strong_phrases": [
+        "下班到家",
+        "今天好累",
+        "刚下班到",
+        "家里猫咪",
+        "心家里猫",
+        "担心家里",
+        "猫咪最近",
+        "里猫咪最",
+        "下班到",
+        "今天好",
+        "刚下班",
+        "咪最近",
+        "天好累",
+        "家里猫",
+        "心家里",
+        "担心家",
+        "猫咪最",
+        "班到家",
+        "里猫咪",
+        "下班",
+        "刚下",
+        "到家",
+        "吃饭",
+        "咪最",
+        "天好",
+        "家里",
+        "心家",
+        "担心",
+        "最近",
+        "猫咪"
+       ],
+       "query_units": [
+        "下班到家",
+        "今天好累",
+        "刚下班到",
+        "家里猫咪",
+        "心家里猫",
+        "担心家里",
+        "猫咪最近",
+        "里猫咪最",
+        "下班到",
+        "今天好",
+        "刚下班",
+        "咪最近",
+        "天好累",
+        "家里猫",
+        "心家里",
+        "担心家",
+        "猫咪最",
+        "班到家",
+        "里猫咪",
+        "下班",
+        "今天",
+        "刚下",
+        "到家",
+        "吃饭",
+        "咪最",
+        "天好",
+        "好累",
+        "家里",
+        "心家",
+        "担心",
+        "最近",
+        "猫咪",
+        "班到",
+        "还行",
+        "里猫",
+        "下",
+        "今",
+        "刚",
+        "到",
+        "吃"
+       ],
+       "query_weak_terms": [
+        "今天",
+        "好累",
+        "下",
+        "今",
+        "刚",
+        "到",
+        "吃",
+        "咪",
+        "天",
+        "好",
+        "家",
+        "心",
+        "担",
+        "最",
+        "猫",
+        "班",
+        "累",
+        "行",
+        "近",
+        "还",
+        "里",
+        "饭"
+       ],
+       "rejected_sample": [
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "turning",
+         "matched_phrases": [],
+         "matched_units": [
+          "今",
+          "最"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.12,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "kidney",
+         "matched_phrases": [],
+         "matched_units": [
+          "咪",
+          "猫"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.12,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "fresh1",
+         "matched_phrases": [],
+         "matched_units": [
+          "刚",
+          "天"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.12,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "fresh4",
+         "matched_phrases": [],
+         "matched_units": [
+          "家"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "fresh3",
+         "matched_phrases": [],
+         "matched_units": [
+          "好"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "commute",
+         "matched_phrases": [],
+         "matched_units": [
+          "天"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "sister",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "mixed",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        }
+       ],
+       "selected": [
+        {
+         "bucket": "recent",
+         "confidence": "strong",
+         "id": "cat",
+         "matched_phrases": [
+          "家里猫咪",
+          "猫咪最近",
+          "里猫咪最",
+          "猫咪最",
+          "里猫咪",
+          "猫咪"
+         ],
+         "matched_units": [
+          "家里猫咪",
+          "猫咪最近",
+          "里猫咪最",
+          "猫咪最",
+          "里猫咪",
+          "猫咪",
+          "咪",
+          "猫"
+         ],
+         "reason": "phrase_match",
+         "score": 0.8,
+         "selected": true,
+         "title": "",
+         "type": ""
+        }
+       ]
+      }
+     }
+    ],
+    "rejected_sample": [
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "turning",
+      "matched_phrases": [],
+      "matched_units": [
+       "今",
+       "最"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.12,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "kidney",
+      "matched_phrases": [],
+      "matched_units": [
+       "咪",
+       "猫"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.12,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "fresh1",
+      "matched_phrases": [],
+      "matched_units": [
+       "刚",
+       "天"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.12,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "fresh4",
+      "matched_phrases": [],
+      "matched_units": [
+       "家"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.06,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "fresh3",
+      "matched_phrases": [],
+      "matched_units": [
+       "好"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.06,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "commute",
+      "matched_phrases": [],
+      "matched_units": [
+       "天"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.06,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "sister",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "mixed",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     }
+    ],
+    "selected": [
+     {
+      "bucket": "recent",
+      "confidence": "strong",
+      "id": "cat",
+      "kernel_score": 0.8,
+      "matched_phrases": [
+       "家里猫咪",
+       "猫咪最近",
+       "里猫咪最",
+       "猫咪最",
+       "里猫咪",
+       "猫咪"
+      ],
+      "matched_units": [
+       "家里猫咪",
+       "猫咪最近",
+       "里猫咪最",
+       "猫咪最",
+       "里猫咪",
+       "猫咪",
+       "咪",
+       "猫"
+      ],
+      "query_source": "current",
+      "reason": "phrase_match",
+      "score": 2.6,
+      "selected": true,
+      "title": "",
+      "type": ""
+     }
+    ],
+    "version": "legacy-relevance+host:latest-first-v1"
+   }
+  },
+  "v2_cn_recent": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-09-20T07:00:00+00:00",
+     "id": "fresh3",
+     "status": "active",
+     "summary": "买了新的笔记本，封面很好看"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-19T20:00:00+00:00",
+     "id": "fresh2",
+     "status": "active",
+     "summary": "周末去了新开的咖啡店"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    },
+    {
+     "content": "",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "description": "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。",
+     "id": "cat",
+     "linked_dimension": "猫咪",
+     "status": "active",
+     "summary": "",
+     "title": "猫咪照顾"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "fresh_recent": 3,
+     "recent": 1
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 4,
+     "rejected_sampled": 0
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "fresh3",
+     "fresh2",
+     "fresh1",
+     "cat"
+    ],
+    "mode": "relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1:recent7d",
+    "query_empty": false,
+    "query_fingerprint": "34c46339d2a3",
+    "rejected_reasons": {}
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "2d64f343adbe",
+      "source": "current",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 1,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 1,
+       "mode": "bm25",
+       "query_stopwords": 3,
+       "query_tokens": 9,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.132465,
+         "id": "cat",
+         "matched_phrases": [
+          "猫咪"
+         ],
+         "reason": "bm25_match",
+         "score": 4.6549,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     },
+     {
+      "query_fingerprint": "34c46339d2a3",
+      "source": "context",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 2,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 2,
+       "mode": "bm25",
+       "query_stopwords": 4,
+       "query_tokens": 17,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.060945,
+         "id": "cat",
+         "matched_phrases": [
+          "猫咪"
+         ],
+         "reason": "bm25_match",
+         "score": 4.6549,
+         "selected": true
+        },
+        {
+         "bucket": "recent",
+         "coverage": 0.060945,
+         "id": "fresh1",
+         "matched_phrases": [
+          "刚"
+         ],
+         "reason": "bm25_match",
+         "score": 4.1586,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     }
+    ],
+    "rejected_sample": [],
+    "selected": [
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh3",
+      "reason": "created_within_7_days",
+      "score": 11.3098
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh2",
+      "reason": "created_within_7_days",
+      "score": 11.3098
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh1",
+      "reason": "created_within_7_days",
+      "score": 11.3098
+     },
+     {
+      "bucket": "recent",
+      "coverage": 0.132465,
+      "id": "cat",
+      "kernel_score": 4.6549,
+      "matched_phrases": [
+       "猫咪"
+      ],
+      "query_source": "current",
+      "reason": "bm25_match",
+      "score": 10.3098,
+      "selected": true
+     }
+    ],
+    "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1"
+   }
+  },
+  "v2_empty_query": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-09-20T07:00:00+00:00",
+     "id": "fresh3",
+     "status": "active",
+     "summary": "买了新的笔记本，封面很好看"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-19T20:00:00+00:00",
+     "id": "fresh2",
+     "status": "active",
+     "summary": "周末去了新开的咖啡店"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "fresh_recent": 3
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 3,
+     "rejected_sampled": 0
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "fresh3",
+     "fresh2",
+     "fresh1"
+    ],
+    "mode": "relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1:recent7d",
+    "query_empty": true,
+    "query_fingerprint": "",
+    "rejected_reasons": {}
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "",
+      "source": "current",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 0,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 0,
+       "mode": "bm25",
+       "query_stopwords": 0,
+       "query_tokens": 0,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     }
+    ],
+    "rejected_sample": [],
+    "selected": [
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh3",
+      "reason": "created_within_7_days",
+      "score": 2.0
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh2",
+      "reason": "created_within_7_days",
+      "score": 2.0
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh1",
+      "reason": "created_within_7_days",
+      "score": 2.0
+     }
+    ],
+    "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1"
+   }
+  },
+  "v2_en_single_message": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-09-20T07:00:00+00:00",
+     "id": "fresh3",
+     "status": "active",
+     "summary": "买了新的笔记本，封面很好看"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-19T20:00:00+00:00",
+     "id": "fresh2",
+     "status": "active",
+     "summary": "周末去了新开的咖啡店"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    },
+    {
+     "bucket": "home",
+     "content": "Assembled it over the weekend",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "id": "bookshelf",
+     "status": "active",
+     "summary": "The new bookshelf came from IKEA"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "fresh_recent": 3,
+     "recent": 1
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 4,
+     "rejected_sampled": 0
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "fresh3",
+     "fresh2",
+     "fresh1",
+     "bookshelf"
+    ],
+    "mode": "relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1:recent7d",
+    "query_empty": false,
+    "query_fingerprint": "5206eb8cca61",
+    "rejected_reasons": {}
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "5206eb8cca61",
+      "source": "current",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 1,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 1,
+       "mode": "bm25",
+       "query_stopwords": 5,
+       "query_tokens": 8,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.604259,
+         "id": "bookshelf",
+         "matched_phrases": [
+          "bookshelf",
+          "new"
+         ],
+         "reason": "bm25_match",
+         "score": 7.076,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     }
+    ],
+    "rejected_sample": [],
+    "selected": [
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh3",
+      "reason": "created_within_7_days",
+      "score": 8.076
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh2",
+      "reason": "created_within_7_days",
+      "score": 8.076
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh1",
+      "reason": "created_within_7_days",
+      "score": 8.076
+     },
+     {
+      "bucket": "recent",
+      "coverage": 0.604259,
+      "id": "bookshelf",
+      "kernel_score": 7.076,
+      "matched_phrases": [
+       "bookshelf",
+       "new"
+      ],
+      "query_source": "current",
+      "reason": "bm25_match",
+      "score": 7.076,
+      "selected": true
+     }
+    ],
+    "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1"
+   }
+  },
+  "v2_legacy_ranker": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-09-20T07:00:00+00:00",
+     "id": "fresh3",
+     "status": "active",
+     "summary": "买了新的笔记本，封面很好看"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-19T20:00:00+00:00",
+     "id": "fresh2",
+     "status": "active",
+     "summary": "周末去了新开的咖啡店"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    },
+    {
+     "bucket": "work",
+     "content": "路上听 Audible",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "id": "commute",
+     "status": "active",
+     "summary": "每天去公司单程 45 分钟",
+     "threads": [
+      "通勤",
+      "工作"
+     ]
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "fresh_recent": 3,
+     "recent": 1
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 4,
+     "rejected_sampled": 8
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "fresh3",
+     "fresh2",
+     "fresh1",
+     "commute"
+    ],
+    "mode": "relevant:unified:legacy-relevance+host:latest-first-v1:recent7d",
+    "query_empty": false,
+    "query_fingerprint": "815fe197e8b7",
+    "rejected_reasons": {
+     "no_overlap": 5,
+     "single_rare_term": 2,
+     "weak_generic_overlap": 1
+    }
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "legacy-relevance",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "9626769b476a",
+      "source": "current",
+      "trace": {
+       "min_relevance": 0.35,
+       "mode": "relevant",
+       "query_rare_terms": [
+        "guitar"
+       ],
+       "query_strong_phrases": [
+        "每天练",
+        "多久",
+        "天练",
+        "每天"
+       ],
+       "query_units": [
+        "guitar",
+        "每天练",
+        "多久",
+        "天练",
+        "每天",
+        "久",
+        "多",
+        "天",
+        "每",
+        "练"
+       ],
+       "query_weak_terms": [
+        "久",
+        "多",
+        "天",
+        "每",
+        "练"
+       ],
+       "rejected_sample": [
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "mixed",
+         "matched_phrases": [],
+         "matched_units": [
+          "guitar"
+         ],
+         "reason": "single_rare_term",
+         "score": 0.28,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "kidney",
+         "matched_phrases": [],
+         "matched_units": [
+          "每"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "turning",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "sister",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh4",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh3",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh2",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "f9",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        }
+       ],
+       "selected": [
+        {
+         "bucket": "recent",
+         "confidence": "strong",
+         "id": "fresh1",
+         "matched_phrases": [
+          "每天练",
+          "天练",
+          "每天"
+         ],
+         "matched_units": [
+          "每天练",
+          "天练",
+          "每天",
+          "天",
+          "每",
+          "练"
+         ],
+         "reason": "phrase_match",
+         "score": 0.77,
+         "selected": true,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "recent",
+         "confidence": "strong",
+         "id": "commute",
+         "matched_phrases": [
+          "每天练",
+          "每天"
+         ],
+         "matched_units": [
+          "每天练",
+          "每天",
+          "天",
+          "每"
+         ],
+         "reason": "phrase_match",
+         "score": 0.74,
+         "selected": true,
+         "title": "",
+         "type": ""
+        }
+       ]
+      }
+     },
+     {
+      "query_fingerprint": "815fe197e8b7",
+      "source": "context",
+      "trace": {
+       "min_relevance": 0.35,
+       "mode": "relevant",
+       "query_rare_terms": [
+        "emily",
+        "guitar"
+       ],
+       "query_strong_phrases": [
+        "哪来着",
+        "每天练",
+        "哪来",
+        "多久",
+        "天练",
+        "妹妹",
+        "来着",
+        "每天"
+       ],
+       "query_units": [
+        "guitar",
+        "emily",
+        "哪来着",
+        "每天练",
+        "哪来",
+        "多久",
+        "天练",
+        "妹妹",
+        "来着",
+        "每天",
+        "久",
+        "住",
+        "哪",
+        "多",
+        "天",
+        "妹",
+        "来",
+        "每",
+        "着",
+        "练"
+       ],
+       "query_weak_terms": [
+        "久",
+        "住",
+        "哪",
+        "多",
+        "天",
+        "妹",
+        "来",
+        "每",
+        "着",
+        "练"
+       ],
+       "rejected_sample": [
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "sister",
+         "matched_phrases": [],
+         "matched_units": [
+          "emily"
+         ],
+         "reason": "single_rare_term",
+         "score": 0.28,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "mixed",
+         "matched_phrases": [],
+         "matched_units": [
+          "guitar"
+         ],
+         "reason": "single_rare_term",
+         "score": 0.28,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "weak",
+         "id": "kidney",
+         "matched_phrases": [],
+         "matched_units": [
+          "每"
+         ],
+         "reason": "weak_generic_overlap",
+         "score": 0.06,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "turning",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh4",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh3",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "fresh2",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "rejected",
+         "confidence": "none",
+         "id": "f9",
+         "matched_phrases": [],
+         "matched_units": [],
+         "reason": "no_overlap",
+         "score": 0.0,
+         "selected": false,
+         "title": "",
+         "type": ""
+        }
+       ],
+       "selected": [
+        {
+         "bucket": "recent",
+         "confidence": "strong",
+         "id": "fresh1",
+         "matched_phrases": [
+          "每天练",
+          "天练",
+          "每天"
+         ],
+         "matched_units": [
+          "每天练",
+          "天练",
+          "每天",
+          "天",
+          "每",
+          "练"
+         ],
+         "reason": "phrase_match",
+         "score": 0.77,
+         "selected": true,
+         "title": "",
+         "type": ""
+        },
+        {
+         "bucket": "recent",
+         "confidence": "strong",
+         "id": "commute",
+         "matched_phrases": [
+          "每天练",
+          "每天"
+         ],
+         "matched_units": [
+          "每天练",
+          "每天",
+          "天",
+          "每"
+         ],
+         "reason": "phrase_match",
+         "score": 0.74,
+         "selected": true,
+         "title": "",
+         "type": ""
+        }
+       ]
+      }
+     }
+    ],
+    "rejected_sample": [
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "sister",
+      "matched_phrases": [],
+      "matched_units": [
+       "emily"
+      ],
+      "reason": "single_rare_term",
+      "score": 0.28,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "mixed",
+      "matched_phrases": [],
+      "matched_units": [
+       "guitar"
+      ],
+      "reason": "single_rare_term",
+      "score": 0.28,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "weak",
+      "id": "kidney",
+      "matched_phrases": [],
+      "matched_units": [
+       "每"
+      ],
+      "reason": "weak_generic_overlap",
+      "score": 0.06,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "turning",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "fresh4",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "fresh3",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "fresh2",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     },
+     {
+      "bucket": "rejected",
+      "confidence": "none",
+      "id": "f9",
+      "matched_phrases": [],
+      "matched_units": [],
+      "reason": "no_overlap",
+      "score": 0.0,
+      "selected": false,
+      "title": "",
+      "type": ""
+     }
+    ],
+    "selected": [
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh3",
+      "reason": "created_within_7_days",
+      "score": 3.54
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh2",
+      "reason": "created_within_7_days",
+      "score": 3.54
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh1",
+      "reason": "created_within_7_days",
+      "score": 3.54
+     },
+     {
+      "bucket": "recent",
+      "confidence": "strong",
+      "id": "commute",
+      "kernel_score": 0.74,
+      "matched_phrases": [
+       "每天练",
+       "每天"
+      ],
+      "matched_units": [
+       "每天练",
+       "每天",
+       "天",
+       "每"
+      ],
+      "query_source": "current",
+      "reason": "phrase_match",
+      "score": 2.51,
+      "selected": true,
+      "title": "",
+      "type": ""
+     }
+    ],
+    "version": "legacy-relevance+host:latest-first-v1"
+   }
+  },
+  "v2_mixed": {
+   "context_memories": [
+    {
+     "content": "",
+     "created_at": "2026-09-20T07:00:00+00:00",
+     "id": "fresh3",
+     "status": "active",
+     "summary": "买了新的笔记本，封面很好看"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-19T20:00:00+00:00",
+     "id": "fresh2",
+     "status": "active",
+     "summary": "周末去了新开的咖啡店"
+    },
+    {
+     "content": "",
+     "created_at": "2026-09-18T09:00:00+00:00",
+     "id": "fresh1",
+     "status": "active",
+     "summary": "刚开始学吉他，每天练三十分钟"
+    },
+    {
+     "content": "30 minutes a day",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "id": "mixed",
+     "status": "active",
+     "summary": "Learning guitar 吉他 fingerpicking 指弹"
+    },
+    {
+     "bucket": "work",
+     "content": "路上听 Audible",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "id": "commute",
+     "status": "active",
+     "summary": "每天去公司单程 45 分钟",
+     "threads": [
+      "通勤",
+      "工作"
+     ]
+    },
+    {
+     "content": "Planning a trip out to see her",
+     "created_at": "2026-01-05T08:00:00+00:00",
+     "id": "sister",
+     "status": "active",
+     "summary": "Sister Emily lives in Denver"
+    }
+   ],
+   "context_memory_log": {
+    "by_bucket": {
+     "fresh_recent": 3,
+     "query": 2,
+     "recent": 1
+    },
+    "counts": {
+     "candidate_pool": 53,
+     "cap": 8,
+     "index_count": 51,
+     "injected": 6,
+     "rejected_sampled": 0
+    },
+    "dur_ms": 0.0,
+    "injected_ids": [
+     "fresh3",
+     "fresh2",
+     "fresh1",
+     "mixed",
+     "commute",
+     "sister"
+    ],
+    "mode": "relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1:recent7d",
+    "query_empty": false,
+    "query_fingerprint": "815fe197e8b7",
+    "rejected_reasons": {}
+   },
+   "context_memory_trace": {
+    "cap": 8,
+    "index_count": 51,
+    "kernel_version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b",
+    "mode": "latest_first",
+    "passes": [
+     {
+      "query_fingerprint": "9626769b476a",
+      "source": "current",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 3,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 3,
+       "mode": "bm25",
+       "query_stopwords": 1,
+       "query_tokens": 5,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.44552,
+         "id": "fresh1",
+         "matched_phrases": [
+          "每天",
+          "练"
+         ],
+         "reason": "bm25_match",
+         "score": 7.7181,
+         "selected": true
+        },
+        {
+         "bucket": "query",
+         "coverage": 0.240052,
+         "id": "mixed",
+         "matched_phrases": [
+          "guitar"
+         ],
+         "reason": "bm25_match",
+         "score": 3.6751,
+         "selected": true
+        },
+        {
+         "bucket": "recent",
+         "coverage": 0.205468,
+         "id": "commute",
+         "matched_phrases": [
+          "每天"
+         ],
+         "reason": "bm25_match",
+         "score": 3.2725,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     },
+     {
+      "query_fingerprint": "815fe197e8b7",
+      "source": "context",
+      "trace": {
+       "below_gate": 0,
+       "below_min_score": 0,
+       "candidates": 51,
+       "cap": 8,
+       "eligible": 4,
+       "evidence_scale": 1.0,
+       "index_count": 51,
+       "matched": 4,
+       "mode": "bm25",
+       "query_stopwords": 4,
+       "query_tokens": 12,
+       "quotas": [
+        [
+         "turning_point",
+         3
+        ],
+        [
+         "recent",
+         2
+        ]
+       ],
+       "rejected_sample": [],
+       "selected": [
+        {
+         "bucket": "recent",
+         "coverage": 0.204055,
+         "id": "fresh1",
+         "matched_phrases": [
+          "每天",
+          "练"
+         ],
+         "reason": "bm25_match",
+         "score": 7.7181,
+         "selected": true
+        },
+        {
+         "bucket": "query",
+         "coverage": 0.109947,
+         "id": "mixed",
+         "matched_phrases": [
+          "guitar"
+         ],
+         "reason": "bm25_match",
+         "score": 3.6751,
+         "selected": true
+        },
+        {
+         "bucket": "query",
+         "coverage": 0.109947,
+         "id": "sister",
+         "matched_phrases": [
+          "emily"
+         ],
+         "reason": "bm25_match",
+         "score": 3.4107,
+         "selected": true
+        },
+        {
+         "bucket": "recent",
+         "coverage": 0.094108,
+         "id": "commute",
+         "matched_phrases": [
+          "每天"
+         ],
+         "reason": "bm25_match",
+         "score": 3.2725,
+         "selected": true
+        }
+       ],
+       "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
+      }
+     }
+    ],
+    "rejected_sample": [],
+    "selected": [
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh3",
+      "reason": "created_within_7_days",
+      "score": 17.4362
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh2",
+      "reason": "created_within_7_days",
+      "score": 17.4362
+     },
+     {
+      "bucket": "fresh_recent",
+      "id": "fresh1",
+      "reason": "created_within_7_days",
+      "score": 17.4362
+     },
+     {
+      "bucket": "query",
+      "coverage": 0.240052,
+      "id": "mixed",
+      "kernel_score": 3.6751,
+      "matched_phrases": [
+       "guitar"
+      ],
+      "query_source": "current",
+      "reason": "bm25_match",
+      "score": 12.3932,
+      "selected": true
+     },
+     {
+      "bucket": "recent",
+      "coverage": 0.205468,
+      "id": "commute",
+      "kernel_score": 3.2725,
+      "matched_phrases": [
+       "每天"
+      ],
+      "query_source": "current",
+      "reason": "bm25_match",
+      "score": 11.9906,
+      "selected": true
+     },
+     {
+      "bucket": "query",
+      "coverage": 0.109947,
+      "id": "sister",
+      "kernel_score": 3.4107,
+      "matched_phrases": [
+       "emily"
+      ],
+      "query_source": "context",
+      "reason": "bm25_match",
+      "score": 3.4107,
+      "selected": true
+     }
+    ],
+    "version": "memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b+host:latest-first-v1"
+   }
+  }
+ },
+ "generated_from": "834c154586b557afc84673253a3b50af22ea22c8",
+ "memgarden": "0.22.0"
+}
