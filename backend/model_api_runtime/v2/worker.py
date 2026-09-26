@@ -79,6 +79,7 @@ from chat import file_display as chat_file_display
 from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_language,
     failure_fallback_reply,
     garden_language_decision,
     infer_garden_language,
@@ -7898,6 +7899,29 @@ async def _emit_thinking_surfaced_trace(
         )
 
 
+def _user_typed_text(row: dict) -> str:
+    """The words the user typed in one prompt row, never a placeholder (T743).
+
+    Attachment rows carry protocol markers, Canvas metadata, vision
+    observations or inlined file bodies in ``content``; only their ``caption``
+    is the user's. An unreadable row's content is a placeholder. Both yield
+    ``""`` (no language signal) rather than a guess.
+    """
+    if row.get("unreadable"):
+        return ""
+    if row.get("has_image") or row.get("has_file"):
+        return str(row.get("caption") or "")
+    return core_util.text_of(row.get("content"))
+
+
+def _latest_user_typed_text(rows: Iterable[dict]) -> str:
+    """Typed text of the newest user row only; an older row never stands in."""
+    for row in reversed(list(rows)):
+        if str(row.get("role") or "").strip().lower() in {"user", "human"}:
+            return _user_typed_text(row)
+    return ""
+
+
 def _latest_user_writing_system(rows: Iterable[dict]) -> str:
     """Find the newest classifiable user-authored text without retaining it."""
 
@@ -14984,9 +15008,27 @@ async def process_job(
             ),
         )
 
+        # The turn's user rows (tail + current batch + rows folded in mid-turn);
+        # also the latest-message source for the failure language below.
+        language_user_rows: list[dict] = []
+
+        def _chat_failure_language():
+            # Seven 2026-09-26 (T743): a failure answers in the language of
+            # the user's latest message, judged by the same function as the
+            # resident lane; no signal falls back to the account language.
+            return failure_fallback_language(
+                user_text=_latest_user_typed_text(
+                    [*tail, *language_user_rows]
+                ),
+                locale=str(temporal_snapshot.get("locale") or ""),
+                archive_language=str(
+                    temporal_snapshot.get("archive_language") or ""
+                ),
+            )
+
         def _chat_failure_fallback() -> str:
             return failure_fallback_reply(
-                chat_reply_language,
+                _chat_failure_language(),
                 zh=_DEGENERATE_REPLY_FALLBACK,
                 en=_DEGENERATE_REPLY_FALLBACK_EN,
             )
@@ -15743,7 +15785,6 @@ async def process_job(
 
         thinking_trace_emitted = False
         language_trace_emitted = False
-        language_user_rows: list[dict] = []
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,

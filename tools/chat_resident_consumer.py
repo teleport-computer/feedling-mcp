@@ -207,6 +207,7 @@ from chat.reply_language import (
     infer_garden_language,
     infer_reply_language,
     reply_language_system_line,
+    text_language,
     user_written_text,
 )
 from core.downloadable_reply import sanitize_downloadable_reply
@@ -702,10 +703,8 @@ def _prefers_english(lang_anchor: Any = "") -> bool:
     这个不带锚点的老签名当场翻成英文,打红 test_consumer_error_classify 三条。
     根因是默认值反了,不是测试过时 —— 别改测试去将就它。)
     """
-    raw = str(lang_anchor or "")
-    if re.search(r"[一-鿿]", raw):
-        return False
-    return bool(re.search(r"[A-Za-z]{2,}", raw))
+    # 判据本体住在 chat.reply_language.text_language,V2 兜底用同一个(T743)。
+    return text_language(lang_anchor) == "en"
 
 
 def _fallback_reply_for(lang_anchor: Any = "") -> str:

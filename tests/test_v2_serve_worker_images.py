@@ -591,3 +591,84 @@ def test_direct_vision_internal_error_is_not_misclassified_as_provider_failure(
         "vision.batch.budget.evaluated",
     ]
     assert "vision_model_failed" not in json.dumps(events)
+
+
+# ---------------------------------------------------------------------------
+# T743: attachment rows expose only what the user typed as `caption`
+# ---------------------------------------------------------------------------
+
+def _stub_caption(monkeypatch, stored_caption):
+    """Stand in for the caption decrypt: the stored caption, or the fallback."""
+    monkeypatch.setattr(
+        serve_worker,
+        "_caption_text",
+        lambda *_a, fallback, **_k: stored_caption or fallback,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored_caption", "content", "caption"),
+    [
+        (None, "[image]", ""),
+        ("look", "look", "look"),
+        # A user who literally typed the marker still typed it.
+        ("[image]", "[image]", "[image]"),
+    ],
+    ids=["no-caption", "caption", "caption-equals-marker"],
+)
+def test_image_row_caption_is_only_the_users_words(monkeypatch, stored_caption, content, caption):
+    _stub_caption(monkeypatch, stored_caption)
+    row = serve_worker._image_row(
+        {}, mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert row["content"] == content
+    assert row["caption"] == caption
+
+
+@pytest.mark.parametrize(
+    ("stored_caption", "display", "caption"),
+    [
+        (None, {}, ""),
+        (None, {"file_display_title": "Q3"}, ""),
+        ("这个报告哪里有问题", {"file_display_title": "Q3"}, "这个报告哪里有问题"),
+        ("[file: report.pdf]", {}, "[file: report.pdf]"),
+    ],
+    ids=["no-caption", "no-caption-canvas", "caption-canvas", "caption-equals-marker"],
+)
+def test_file_row_caption_excludes_marker_and_canvas_metadata(
+    monkeypatch, stored_caption, display, caption
+):
+    _stub_caption(monkeypatch, stored_caption)
+    row = serve_worker._file_row(
+        {"file_name": "report.pdf", **display},
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert row["caption"] == caption
+    assert row["content"].startswith(caption or "[file: report.pdf]")
+    if display:
+        assert "Canvas display metadata" in row["content"]
+
+
+@pytest.mark.parametrize(
+    ("stored", "plaintext", "unreadable"),
+    [
+        ({"body_ct": "ct", "K_enclave": "key"}, b"hello", False),
+        ({"body_ct": "ct", "K_enclave": "key"}, b"  ", True),
+        ({"body_ct": "ct"}, b"never read", True),  # missing K_enclave
+    ],
+    ids=["readable", "empty", "no-key"],
+)
+def test_placeholder_rows_are_marked_unreadable(monkeypatch, stored, plaintext, unreadable):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: plaintext,
+    )
+    rows = serve_worker._decrypt_chat_rows(
+        "u1",
+        [{"id": "m1", "ts": 1.0, "seq": 4, "role": "user", **stored}],
+        user_only=True,
+        preserve_unreadable=True,
+    )
+    assert rows[0].get("unreadable", False) is unreadable
+    if unreadable:
+        assert rows[0]["content"] == serve_worker._UNAVAILABLE_CHAT_MARKER

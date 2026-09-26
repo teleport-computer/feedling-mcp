@@ -4899,3 +4899,143 @@ def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
     protect = seen_child_kwargs[0].get("refresh_protected_extra_tool_names")
     assert callable(protect), "child loop must declare a protected-name source"
     assert set(protect()) == allowed
+
+
+@pytest.mark.parametrize(
+    ("locale", "user_text", "expected_language"),
+    [
+        # T743 (Seven 2026-09-26): the user's latest message decides.
+        ("zh-Hans-CN", "Please try again", "en"),
+        ("en-US", "请再试一次", "zh-Hans"),
+        # No language signal: the account language, as before.
+        ("en-US", "😀 123", "en"),
+        ("zh-Hans-CN", "😀 123", "zh-Hans"),
+    ],
+)
+def test_chat_degenerate_fallback_follows_latest_user_message_language(
+    monkeypatch,
+    locale,
+    user_text,
+    expected_language,
+):
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = (
+        "u_toolloop_fallback_follows_message_"
+        + locale.lower().replace("-", "_")
+        + "_"
+        + expected_language.lower().replace("-", "_")
+    )
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-follows-message")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[
+        {"id": "m-older", "ts": 9.0, "role": "user",
+         "content": "早先那句" if expected_language == "en" else "earlier line"},
+        {"id": "m-latest", "ts": 10.0, "role": "user", "content": user_text},
+    ])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if expected_language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
+
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        # Newest user row decides; placeholders and file bodies are not words.
+        ([{"role": "user", "content": "你好"},
+          {"role": "user", "content": "[image]", "has_image": True, "caption": ""}], ""),
+        ([{"role": "user", "content": "[image]", "has_image": True, "caption": "look"}], "look"),
+        # An enriched file row: content holds the file body, caption the user's words.
+        ([{"role": "user", "content": "[file: a.txt]\nquarterly revenue", "has_file": True,
+           "caption": "这个文件"}], "这个文件"),
+        ([{"role": "user", "content": "[file: a.txt]\nquarterly revenue", "has_file": True}], ""),
+        ([{"role": "user", "content": "[message unavailable]", "unreadable": True}], ""),
+        # A vision observation merged into content is not the user's words either.
+        ([{"role": "user", "content": "[image 1] a red car", "has_image": True,
+           "caption": ""}], ""),
+        ([{"role": "user", "content": "hello"}, {"role": "assistant", "content": "你好"}], "hello"),
+        ([], ""),
+    ],
+    ids=["image-only-newest", "image-caption", "file-caption", "file-no-caption",
+         "unreadable", "vision-observation", "skips-assistant", "empty"],
+)
+def test_latest_user_typed_text_reads_only_the_users_words(rows, expected):
+    assert worker._latest_user_typed_text(rows) == expected
+
+
+@pytest.mark.parametrize(
+    ("locale", "latest", "expected_language"),
+    [
+        ("zh-Hans-CN", {"content": "[image]", "has_image": True, "caption": ""}, "zh-Hans"),
+        ("en-US", {"content": "[image]", "has_image": True, "caption": ""}, "en"),
+        ("en-US", {"content": "[image]", "has_image": True, "caption": "你看这个"}, "zh-Hans"),
+        ("zh-Hans-CN", {"content": "[file: a.txt]", "has_file": True,
+                        "file_name": "a.txt", "caption": ""}, "zh-Hans"),
+    ],
+    ids=["zh-acct-image-only", "en-acct-image-only", "en-acct-zh-caption", "zh-acct-file-only"],
+)
+def test_chat_degenerate_fallback_ignores_attachment_placeholders(
+    monkeypatch, request, locale, latest, expected_language
+):
+    monkeypatch.setattr(
+        worker, "_DEGENERATE_REPLY_FALLBACK", reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    monkeypatch.setattr(
+        worker, "_DEGENERATE_REPLY_FALLBACK_EN", reply_language.DEFAULT_FAILURE_FALLBACK_EN
+    )
+    uid = "u_toolloop_fallback_attachment_" + request.node.callspec.id.replace("-", "_")
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-attachment")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[
+        {"id": "m-older", "ts": 9.0, "role": "user",
+         "content": "早先那句" if expected_language == "en" else "earlier line"},
+        {"id": "m-latest", "ts": 10.0, "role": "user", **latest},
+    ])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if expected_language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
