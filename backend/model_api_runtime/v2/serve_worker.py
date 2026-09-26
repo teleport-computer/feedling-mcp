@@ -467,23 +467,16 @@ _USER_ROLES = frozenset({"user", "human"})
 
 
 def _caption_envelope(m: dict) -> dict | None:
-    """从 `caption_*` 前缀字段重建 caption 信封；无密文时 None。
+    """从 `caption_*` 前缀字段重建 caption 信封；没有 caption 时 None。
 
-    镜像 `enclave/routes/chat.py:79-92`。**必须**用 `caption_id`（不是消息自己的 id）——
-    enclave 的 AEAD additional-data 是 `owner_user_id||v||id`，用错 id 会 AEAD 校验失败。
+    用共用投影 `core_envelope.caption_envelope_from_row`：密文档
+    (`caption_body_ct`)和明文档(`caption_body`)两种都认，`_caption_text` 再经
+    `read_envelope_body` 按形状路由(密文走 enclave，明文本地直读)。
+    T745(2026-09-26):这里原先自己拼、只认 `caption_body_ct`，明文档用户随图片/
+    文件发的话一律变成 `[image]`，模型只看到图(test 实测)。
+    AEAD additional-data 用 `caption_id`(不是消息自己的 id)，投影里已处理。
     """
-    ct = str(m.get("caption_body_ct") or "").strip()
-    if not ct:
-        return None
-    v = m.get("caption_v", m.get("v", 1))
-    return {
-        "id": m.get("caption_id") or m.get("id"),
-        "v": int(v or 1),
-        "body_ct": ct,
-        "nonce": m.get("caption_nonce"),
-        "K_enclave": m.get("caption_K_enclave"),
-        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
-    }
+    return core_envelope.caption_envelope_from_row(m)
 
 
 def _caption_text(m, *, mid, token, caller_user_id: str, fallback: str) -> str:
