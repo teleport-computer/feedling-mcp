@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 now reads the text a user sends with an image or file when that
+  text is stored in plaintext (content encryption off). Previously the model
+  saw only the attachment marker (`[image]` / `[file: name]`) and not the
+  user's words; encrypted captions were unaffected.
+
 - Runtime V2 retry-later failure replies now follow the language of the words
   the user typed in the latest message (or an attachment's caption) instead of
   the account language, using the same language check as resident paths: a

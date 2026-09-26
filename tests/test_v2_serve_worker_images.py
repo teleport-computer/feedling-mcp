@@ -672,3 +672,68 @@ def test_placeholder_rows_are_marked_unreadable(monkeypatch, stored, plaintext, 
     assert rows[0].get("unreadable", False) is unreadable
     if unreadable:
         assert rows[0]["content"] == serve_worker._UNAVAILABLE_CHAT_MARKER
+
+
+# ---------------------------------------------------------------------------
+# T745: plaintext captions (content encryption off) reach the prompt
+# ---------------------------------------------------------------------------
+
+def _no_enclave(monkeypatch):
+    from core import enclave as core_enclave
+
+    def _boom(*_a, **_k):
+        raise AssertionError("a plaintext caption must be read locally")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+
+
+def test_caption_envelope_projects_a_plaintext_caption():
+    env = serve_worker._caption_envelope({
+        "id": "m1", "owner_user_id": "u1", "v": 1,
+        "caption_id": "cap1", "caption_body": "这是我家猫",
+        "caption_owner_user_id": "u1",
+    })
+    assert env is not None
+    assert env["body"] == "这是我家猫"
+    assert env["id"] == "cap1"
+    assert not env.get("body_ct")
+
+
+@pytest.mark.parametrize("builder", ["image", "file"])
+def test_plaintext_caption_reaches_the_row_without_the_enclave(monkeypatch, builder):
+    _no_enclave(monkeypatch)
+    row = {"id": "m1", "owner_user_id": "u1", "caption_id": "cap1",
+           "caption_body": "  look at my bakery logo  ", "caption_owner_user_id": "u1",
+           "file_name": "logo.pdf"}
+    build = serve_worker._image_row if builder == "image" else serve_worker._file_row
+    out = build(row, mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert out["caption"] == "look at my bakery logo"
+    assert out["content"].startswith("look at my bakery logo")
+
+
+def test_plaintext_image_row_through_the_reader_carries_the_caption(monkeypatch):
+    _no_enclave(monkeypatch)
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    rows = serve_worker._decrypt_chat_rows(
+        "u1",
+        [{
+            "id": "m1", "ts": 1.0, "seq": 3, "role": "user", "content_type": "image",
+            "owner_user_id": "u1", "body_key": "r2/k", "image_mime": "image/png",
+            "caption_id": "cap1", "caption_body": "What is my bakery called?",
+            "caption_owner_user_id": "u1",
+        }],
+        user_only=True,
+        preserve_unreadable=True,
+    )
+    assert rows[0]["content"] == "What is my bakery called?"
+    assert rows[0]["caption"] == "What is my bakery called?"
+    assert rows[0]["has_image"] is True
+
+
+def test_image_row_without_any_caption_still_renders_the_marker(monkeypatch):
+    _no_enclave(monkeypatch)
+    out = serve_worker._image_row(
+        {"id": "m1", "owner_user_id": "u1"},
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert out["content"] == "[image]"
+    assert out["caption"] == ""
