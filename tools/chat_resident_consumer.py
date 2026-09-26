@@ -50,8 +50,10 @@ CLI mode:
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
   FEEDLING_CLI_MAX_OUTPUT_BYTES
-                        Combined CLI stdout/stderr limit (default 67108864);
-                        positive bytes, invalid values keep the default.
+                        Combined CLI stdout/stderr limit on retained bytes
+                        (default 67108864); a message_update line superseded
+                        by a parseable one with no less text is dropped.
+                        Positive bytes, invalid values keep the default.
   FEEDLING_AGENT_IMAGE_GENERATION
                         Set true only when the configured resident agent exposes
                         a callable native image-generation capability.
@@ -7216,10 +7218,33 @@ def _runtime_stream_observer(
 class CliOutputTooLarge(RuntimeError):
     """A local capture limit; never retain the captured output on the exception."""
 
-    def __init__(self, limit: int, observed: int):
+    def __init__(self, limit: int, observed: int, raw: int | None = None):
         super().__init__("cli_output_too_large")
         self.limit_bytes = limit
         self.observed_bytes = observed
+        self.raw_bytes = observed if raw is None else raw
+
+
+# pi re-sends the whole message so far on every token, so its raw stdout grows with
+# the square of the reply (T746: a 4.7 KB reply = 9.8 MB). A snapshot line is dropped
+# only when the next one parses and carries at least as much text, so the limit
+# counts what is kept, not what crossed the pipe, while the reply parsers and
+# _pi_stream_shape (parse health, largest text seen) read the same values as on the
+# raw stream: a line that does not parse, or a rewrite to shorter text, is kept.
+_SUPERSEDED_SNAPSHOT_LINE = re.compile(rb'\{\s*"type"\s*:\s*"message_update"')
+
+
+def _snapshot_text_chars(line: bytes) -> int | None:
+    """Usable text size of a message_update line as _pi_stream_shape measures it;
+    None when the line does not parse or is structurally odd (it must then stay in
+    the capture, and must never fail the turn)."""
+    try:
+        obj = json.loads(line)
+        if not isinstance(obj, dict):
+            return None
+        return len(_pi_message_text(obj.get("message")).strip())
+    except Exception:
+        return None
 
 
 def _cli_max_output_bytes() -> int:
@@ -7262,29 +7287,62 @@ def _run_cli_subprocess(
     output_lock = threading.Lock()
     too_large = threading.Event()
     reader_errors: list[Exception] = []
-    observed = 0
+    retained = [0, 0]
+    raw = 0
 
-    def _drain(stream, sink: bytearray, callback=None) -> None:
-        nonlocal observed
+    def _drain(stream, sink: bytearray, index: int, callback=None) -> None:
+        nonlocal raw
         pending: list[str] = []
         decoder = io.IncrementalNewlineDecoder(
             codecs.getincrementaldecoder(encoding)(errors=errors), translate=True,
         ) if callback is not None else None
+        # stdout only: the latest snapshot line waiting to be superseded, and the
+        # line still being read. Both are held in memory, so both count.
+        held = bytearray()
+        held_chars = 0
+        partial = bytearray()
         try:
             while True:
                 chunk = stream.read1(64 * 1024)
                 with output_lock:
                     if too_large.is_set():
                         return
-                    observed += len(chunk)
-                    if observed > limit:
+                    raw += len(chunk)
+                    if index == 0:
+                        pieces = chunk.split(b"\n")
+                        for piece in pieces[:-1]:
+                            partial.extend(piece)
+                            partial.extend(b"\n")
+                            chars = (_snapshot_text_chars(partial)
+                                     if _SUPERSEDED_SNAPSHOT_LINE.match(partial, 0, 64) else None)
+                            if chars is None or not held or chars < held_chars:
+                                sink.extend(held)
+                                held.clear()
+                            if chars is None:
+                                sink.extend(partial)
+                            else:
+                                held[:] = partial
+                                held_chars = chars
+                            partial.clear()
+                        partial.extend(pieces[-1])
+                        if not chunk:
+                            sink.extend(held)
+                            sink.extend(partial)
+                            held.clear()
+                            partial.clear()
+                        retained[0] = len(sink) + len(held) + len(partial)
+                    else:
+                        sink.extend(chunk)
+                        retained[1] = len(sink)
+                    if sum(retained) > limit:
                         too_large.set()
                         for buffer in buffers:
                             buffer.clear()
+                        held.clear()
+                        partial.clear()
                         pending.clear()
                         process.kill()
                         return
-                    sink.extend(chunk)
                 if callback is not None:
                     text = decoder.decode(chunk, final=not chunk)
                     pieces = text.split("\n")
@@ -7307,9 +7365,9 @@ def _run_cli_subprocess(
             stream.close()
 
     threads = [
-        threading.Thread(target=_drain, args=(process.stdout, buffers[0], stdout_line),
+        threading.Thread(target=_drain, args=(process.stdout, buffers[0], 0, stdout_line),
                          name="feedling-agent-stdout", daemon=True),
-        threading.Thread(target=_drain, args=(process.stderr, buffers[1]),
+        threading.Thread(target=_drain, args=(process.stderr, buffers[1], 1),
                          name="feedling-agent-stderr", daemon=True),
     ]
     for thread in threads:
@@ -7344,7 +7402,7 @@ def _run_cli_subprocess(
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             if too_large.is_set():
-                raise CliOutputTooLarge(limit, observed)
+                raise CliOutputTooLarge(limit, sum(retained), raw)
             if reader_errors:
                 raise reader_errors[0]
             if cancellation is not None:
@@ -7363,7 +7421,7 @@ def _run_cli_subprocess(
             for thread in threads:
                 thread.join(timeout=0.05)
         if too_large.is_set():
-            raise CliOutputTooLarge(limit, observed)
+            raise CliOutputTooLarge(limit, sum(retained), raw)
         if reader_errors:
             raise reader_errors[0]
     except BaseException as exc:
@@ -7380,7 +7438,7 @@ def _run_cli_subprocess(
             thread.join(timeout=1.0)
         if too_large.is_set():
             # Discard, do not join/copy the oversized stdout/stderr into an error.
-            raise CliOutputTooLarge(limit, observed) from None
+            raise CliOutputTooLarge(limit, sum(retained), raw) from None
         if isinstance(exc, subprocess.TimeoutExpired):
             exc.stdout, exc.stderr = (_captured(buffer) for buffer in buffers)
         raise
