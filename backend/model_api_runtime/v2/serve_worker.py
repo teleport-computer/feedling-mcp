@@ -514,18 +514,22 @@ def _caption_text(m, *, mid, token, caller_user_id: str, fallback: str) -> str:
 
 def _image_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
-    text = _caption_text(
+    # What the user typed with the picture ("" for none). Kept apart from
+    # content: the marker and later vision observations are not the user's
+    # words, and a caption that happens to read "[image]" still is (T743).
+    caption = _caption_text(
         m,
         mid=mid,
         token=token,
         caller_user_id=caller_user_id,
-        fallback=_IMAGE_MARKER,
+        fallback="",
     )
     row = {
         "id": mid,
         "ts": ts,
         "role": role,
-        "content": text,
+        "content": caption or _IMAGE_MARKER,
+        "caption": caption,
         "has_image": True,
         "image_mime": m.get("image_mime") or "image/jpeg",
     }
@@ -551,13 +555,16 @@ def _file_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     `enclave/routes/chat.py:104-112`）。
     """
     name = str(m.get("file_name") or "file")
-    text = _caption_text(
+    # What the user typed with the file ("" for none); the marker, Canvas
+    # metadata and the file body later inlined into content are not (T743).
+    caption = _caption_text(
         m,
         mid=mid,
         token=token,
         caller_user_id=caller_user_id,
-        fallback=f"[file: {name}]",
+        fallback="",
     )
+    text = caption or f"[file: {name}]"
     display_title = str(m.get("file_display_title") or "").strip()
     display_subtitle = str(m.get("file_display_subtitle") or "").strip()
     if display_title or display_subtitle:
@@ -571,6 +578,7 @@ def _file_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
         "ts": ts,
         "role": role,
         "content": text,
+        "caption": caption,
         "has_file": True,
         "file_name": name,
         "file_display_title": m.get("file_display_title"),
@@ -983,6 +991,7 @@ def _decrypt_chat_rows_inner(
                     "ts": ts,
                     "role": role,
                     "content": _UNAVAILABLE_CHAT_MARKER,
+                    "unreadable": True,
                 }
             else:
                 plaintext = core_envelope.read_envelope_body(
@@ -992,11 +1001,14 @@ def _decrypt_chat_rows_inner(
                     caller_user_id=user_id,
                     runtime_token=token,
                 ).decode("utf-8")
-                if not plaintext.strip():
+                unreadable = not plaintext.strip()
+                if unreadable:
                     if not preserve_unreadable:
                         continue
                     plaintext = _UNAVAILABLE_CHAT_MARKER
                 item = {"id": mid, "ts": ts, "role": role, "content": plaintext}
+                if unreadable:
+                    item["unreadable"] = True
         if m.get("seq") is not None:
             item["seq"] = int(m["seq"])
         if role == "user" and m.get("include_reasoning") is True:

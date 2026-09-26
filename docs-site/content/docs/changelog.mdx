@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 retry-later failure replies now follow the language of the words
+  the user typed in the latest message (or an attachment's caption) instead of
+  the account language, using the same language check as resident paths: a
+  Chinese-language account that writes in English receives the English
+  fallback, and vice versa. Messages without a language signal keep the account
+  language. Actionable error-catalog texts are unchanged.
+
 - Hosted Runtime V2 now gives English reply-language accounts the English
   version of the `aside` guidance (foreground chat, every proactive wake lane,
   and the screen-watch note). Chinese accounts keep the existing Chinese text

@@ -1349,7 +1349,7 @@ def test_seq_reader_preserves_local_only_row_as_safe_placeholder(monkeypatch):
 
     assert out == [{
         "id": "local", "seq": 11, "ts": 100.0, "role": "user",
-        "content": "[message unavailable]",
+        "content": "[message unavailable]", "unreadable": True,
     }]
 
 
@@ -1427,7 +1427,7 @@ def test_chat_reader_does_not_fall_back_to_stale_body_when_enclave_key_is_missin
 
     assert out == [{
         "id": "broken-mixed", "seq": 14, "ts": 103.0, "role": "user",
-        "content": "[message unavailable]",
+        "content": "[message unavailable]", "unreadable": True,
     }]
 
 
@@ -1489,7 +1489,7 @@ def test_read_messages_carries_id_and_ts_and_seq_for_coalesce(client, backend_en
     # enter this read path, because compaction shares it.
     assert messages == [{
         "id": "m_synthetic_1", "ts": 12345.0, "seq": seq, "role": "user", "content": "[image]",
-        "has_image": True, "image_mime": "image/jpeg",
+        "caption": "", "has_image": True, "image_mime": "image/jpeg",
     }]
 
 
