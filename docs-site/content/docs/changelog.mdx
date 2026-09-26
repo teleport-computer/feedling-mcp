@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- The resident CLI output limit (`FEEDLING_CLI_MAX_OUTPUT_BYTES`) now counts the
+  content it keeps rather than raw transfer: pi resends the whole reply so far on
+  every token, so a `message_update` line is dropped once a parseable one with no
+  less text supersedes it. Long
+  pi replies (roughly above 16–20 KB of text) no longer fail with
+  `cli_output_too_large`.
+
 - A resident CLI turn killed at the output limit (`cli_output_too_large`) now also
   drops its resumable agent session, so the next message starts a fresh session
   instead of replaying the same oversized turn every time.
