@@ -27,6 +27,10 @@ async def lifespan(app):
     limiter = anyio.to_thread.current_default_thread_limiter()
     limiter.total_tokens = config.ENCLAVE_THREADS
     await anyio.to_thread.run_sync(jieba_tokenizer.prewarm)
+    # Hybrid recall (T523): background model load, never on a request. No-op
+    # unless FEEDLING_MEMORY_RECALL_HYBRID is on.
+    from enclave import recall_hybrid
+    recall_hybrid.start_warmup()
     yield
     import provider_client
     await backend_client.aclose()

@@ -641,7 +641,13 @@ def test_profile_full_card_reaches_recorded_provider_request(monkeypatch):
     provider_payload = json.dumps(provider_messages, ensure_ascii=False)
     assert content in provider_payload
     assert tail_sentinel in provider_payload
-    assert traces == []
+    # T735: the only traces are the content-free model-call events; the card
+    # body (and its tail sentinel) must never reach the trace plane.
+    assert [row["type"] for row in traces] == [
+        "agent.model.call.start",
+        "agent.model.call.done",
+    ]
+    assert tail_sentinel not in json.dumps(traces, ensure_ascii=False, default=str)
     assert tail_sentinel not in json.dumps(events, ensure_ascii=False)
 
 
@@ -1013,3 +1019,84 @@ def test_profile_flag_is_wired_through_each_phala_deploy_job(job, next_job, pref
     injection = '-e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED"'
     assert mapping in deploy
     assert deploy.count(injection) == 1
+
+
+def _profile_trace_deps(traces):
+    deps = _deps()
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "type": event_type, **fields}
+    )
+    return deps
+
+
+def _profile_failure_harness(monkeypatch, rescheduled, failed):
+    async def _cas(_uid, recompute):
+        return _cas_result(await recompute({}))
+
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "renew_job_lease", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "reschedule_owned_job",
+        lambda job_id, **kwargs: rescheduled.append((job_id, kwargs["error"])) or True,
+    )
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "mark_failed",
+        lambda job_id, *args, **kwargs: failed.append((job_id, args, kwargs)) or True,
+    )
+
+
+def test_profile_provider_failure_emits_closed_model_call_error(monkeypatch):
+    """T735: a failed Profile call leaves status + signature, not only an
+    exception class name, and the job's failure handling is unchanged."""
+    import httpx
+
+    raw_message = "Thinking mode does not support this tool_choice PRIVATE-UPSTREAM-TEXT"
+
+    async def _reject(*_args, **_kwargs):
+        worker.provider_client._raise_for_provider_status(httpx.Response(400, json={
+            "error": {"type": "invalid_request_error", "message": raw_message},
+        }))
+
+    traces, rescheduled, failed = [], [], []
+    _profile_failure_harness(monkeypatch, rescheduled, failed)
+    monkeypatch.setattr(worker.provider_client, "reliable_chat_completion_async", _reject)
+    config = worker.provider_client.ProviderConfig("deepseek", "deepseek-flash", "test-key")
+
+    asyncio.run(
+        worker._run_profile(
+            73, "u", _profile_trace_deps(traces), config, asyncio.Semaphore(1),
+            claimed_by="heavy-0:g5",
+        )
+    )
+
+    types = [row["type"] for row in traces]
+    assert types[:2] == ["agent.model.call.start", "agent.model.call.error"]
+    error = next(row for row in traces if row["type"] == "agent.model.call.error")
+    detail = error["detail"]
+    assert detail["lane"] == "profile"
+    assert "wake_kind" not in detail
+    assert (detail["provider"], detail["model"]) == ("deepseek", "deepseek-flash")
+    assert detail["round"] == 1
+    assert detail["status_code"] == 400
+    assert detail["finish_reason"] == "http_error"
+    assert detail["error_signature"] == "thinking_forced_tool_choice"
+    assert detail["provider_error_type"] == "invalid_request_error"
+    assert error["job_id"] == "73"
+    assert "PRIVATE-UPSTREAM-TEXT" not in json.dumps(traces, ensure_ascii=False, default=str)
+    # Failure handling is exactly what it was before the telemetry existed.
+    outcomes = [err for _job, err in rescheduled] + [
+        (args[0] if args else kwargs.get("error")) for _job, args, kwargs in failed
+    ]
+    assert outcomes and all(
+        code == "profile_generation_failed:providererror" for code in outcomes
+    )
+
+
+def test_profile_model_call_events_are_all_kept_within_the_head_window():
+    """Every Profile call is emitted directly: the per-turn event cap keeps a
+    head of rounds, and Profile's hard call budget must stay inside it or the
+    tail events would be buffered with nobody left to flush them."""
+    assert profile.PROFILE_MAX_PROVIDER_CALLS <= worker._MODEL_CALL_TRACE_HEAD_ROUNDS
