@@ -8066,16 +8066,20 @@ def _provider_attempt_error_class(text: str, *, returncode: int = 0) -> str:
         return "timeout"
     if "429" in lowered or "rate limit" in lowered:
         return "rate_limit"
-    if "insufficient_quota" in lowered or "credit balance" in lowered:
-        return "quota"
+    # A 401/403 is decided by the shared quota/auth boundary, so explicit auth
+    # evidence wins over quota words; bare quota text keeps the old fallback.
     auth_status = re.search(r"(?<!\d)(401|403)(?!\d)", text or "")
     if auth_status is not None:
         status = int(auth_status.group(1))
+        if _error_contract.provider_response_is_quota_exhausted(status, text or ""):
+            return "quota"
         return (
             "provider_auth"
             if _error_contract.provider_response_is_auth_failure(status, text or "")
             else "provider_error"
         )
+    if "insufficient_quota" in lowered or "credit balance" in lowered:
+        return "quota"
     if "invalid key" in lowered:
         return "provider_auth"
     if "connection" in lowered or "network" in lowered or "dns" in lowered:

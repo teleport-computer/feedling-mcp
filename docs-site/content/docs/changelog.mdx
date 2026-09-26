@@ -17,6 +17,11 @@ change must not be interpreted as an API guarantee.
   `failure_reason`, and a model-id prefix). It carries no user data and no
   paths, and is used as deploy-state and capacity evidence for hybrid recall.
 
+- A relay's `403` that explicitly reports an exhausted balance (for example
+  `code: insufficient_user_quota`, 「预扣费额度失败」) is now reported as insufficient
+  quota instead of an invalid API key, on every Model API lane and in credential
+  probes. Other `403` responses keep their existing classification.
+
 - Added disabled-by-default hybrid automatic recall (`FEEDLING_MEMORY_RECALL_HYBRID`).
   When enabled, the enclave encodes the query with the local E5 model, reads the
   caller's current-projection card vectors through a new internal backend route,
