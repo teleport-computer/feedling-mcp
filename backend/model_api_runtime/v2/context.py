@@ -366,7 +366,9 @@ def self_thinking_tag(provider_config: Any = None) -> str:
     )
 
 
-def chat_system_prompt(provider_config: Any = None) -> str:
+def chat_system_prompt(
+    provider_config: Any = None, *, language: str | None = None,
+) -> str:
     """Return the topic-grouped foreground policy for the selected V2 model.
 
     The shared self-thinking instruction remains atomic (one rendering, chosen
@@ -376,7 +378,7 @@ def chat_system_prompt(provider_config: Any = None) -> str:
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return _join_policy_blocks(
             _CHAT_REPLY_POLICY,
-            self_thinking.instruction_for_field(),
+            self_thinking.instruction_for_field(language=language),
             _CHAT_POLICY_AFTER_THINKING,
         )
     return CHAT_SYSTEM_PROMPT

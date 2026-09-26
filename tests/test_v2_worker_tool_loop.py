@@ -1087,6 +1087,61 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     assert self_thinking.instruction_for_field().strip() in system_text
 
 
+@pytest.mark.parametrize(
+    ("locale", "user_text", "language"),
+    [("en-US", "hi", "en"), ("zh-Hans-CN", "你好呀", "zh")],
+)
+def test_chat_aside_copy_follows_account_reply_language(
+    monkeypatch, locale, user_text, language,
+):
+    # T734: English accounts get the English aside copy through the real chat
+    # chain; Chinese accounts keep the Chinese copy.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_t734_aside_" + language
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-t734-aside")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>private summary</think>hello")],
+    )
+    loop_kwargs = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy_loop(**kwargs):
+        loop_kwargs.append(kwargs.get("reply_language"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy_loop)
+    deps = _deps(messages=[{
+        "id": "m-t734", "ts": 10.0, "role": "user", "content": user_text,
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    policy_language = reply_language.infer_reply_language(locale=locale).language
+    assert (policy_language == "en") is (language == "en"), policy_language
+    # The compact delivery round inside the loop renders from this value.
+    assert loop_kwargs == [policy_language]
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
+    other = "zh" if language == "en" else "en"
+    assert self_thinking.instruction_for_field(language=language).strip() in system_text
+    assert self_thinking.instruction_for_field(language=other).strip() not in system_text
+
+
 def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_toolloop_fable_plain_reply"

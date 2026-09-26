@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Runtime V2 now gives English reply-language accounts the English
+  version of the `aside` guidance (foreground chat, every proactive wake lane,
+  and the screen-watch note). Chinese accounts keep the existing Chinese text
+  unchanged. Previously every account got the Chinese guidance, which could
+  pull English conversations into Chinese replies.
+
 - The enclave `/healthz` adds `rss_kb` (the process's current resident memory)
   and `recall_hybrid` (`enabled`, `min_cosine`, `embedder_state`,
   `failure_reason`, and a model-id prefix). It carries no user data and no

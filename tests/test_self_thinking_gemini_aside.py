@@ -325,5 +325,7 @@ def test_compact_delivery_round_renders_the_selected_tag():
     import inspect
     src = inspect.getsource(tool_loop.run_tool_loop)
     compact = src[src.index("def _compact_delivery_system_prompt"):][:600]
-    assert "self_thinking.instruction_for_field()" in compact
+    # T734: the compact round re-attaches the aside copy in the turn's reply
+    # language, not the Chinese default.
+    assert "self_thinking.instruction_for_field(language=reply_language)" in compact
     assert "self_thinking.INSTRUCTION" not in compact
