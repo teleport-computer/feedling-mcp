@@ -577,7 +577,8 @@ def test_flat_recall_events_survive_the_real_durable_detail_sanitizer():
     assert rows["memory.recall.tool_result"]["requested_ids"] == ids
     assert rows["memory.recall.tool_result"]["call_id"] == "fetch23"
     assert rows["memory.context.applied"]["injected_ids"] == ids
-    assert rows["memory.recall.completed"]["tool_result_events"] == 1
+    assert rows["memory.recall.completed"]["counts"]["tool_result_events"] == 1
+    assert rows["memory.recall.completed"]["counts"]["provider_requests"] == 1
     assert rows["memory.recall.completed"]["attempt"] == 1
 
 

@@ -350,13 +350,15 @@ def traced(loop):
             }
             hybrid = (memory_context_observation or {}).get("hybrid")
             if isinstance(hybrid, dict):
-                # Flat scalars only: the durable trace keeps one level (T523).
+                # One nested dict of scalars, not flat keys: the durable trace keeps
+                # only the first 20 detail keys, and flat hybrid_* fields pushed the
+                # worker's turn coordinates past that (T741). selection_mode stays
+                # flat because nested strings are cut to 80 characters.
                 detail["selection_mode"] = (memory_context_observation or {}).get("selection_mode")
-                for key in ("status", "fallback_reason", "encode_ms", "encode_queue_ms",
-                            "encode_compute_ms", "vectors_ms", "vectors_requested",
-                            "vectors_received", "vectors_rejected", "with_vector",
-                            "hash_mismatch"):
-                    detail["hybrid_" + key] = hybrid.get(key)
+                detail["hybrid"] = {key: hybrid.get(key) for key in (
+                    "status", "fallback_reason", "encode_ms", "encode_queue_ms",
+                    "encode_compute_ms", "vectors_ms", "vectors_requested",
+                    "vectors_received", "vectors_rejected", "with_vector", "hash_mismatch")}
             try:
                 result = on_memory_recall_completed(detail)
                 if inspect.isawaitable(result):
