@@ -50,8 +50,10 @@ CLI mode:
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
   FEEDLING_CLI_MAX_OUTPUT_BYTES
-                        Combined CLI stdout/stderr limit (default 67108864);
-                        positive bytes, invalid values keep the default.
+                        Combined CLI stdout/stderr limit on retained bytes
+                        (default 67108864); a message_update line superseded
+                        by a parseable one with no less text is dropped.
+                        Positive bytes, invalid values keep the default.
   FEEDLING_AGENT_IMAGE_GENERATION
                         Set true only when the configured resident agent exposes
                         a callable native image-generation capability.
@@ -207,6 +209,7 @@ from chat.reply_language import (
     infer_garden_language,
     infer_reply_language,
     reply_language_system_line,
+    text_language,
     user_written_text,
 )
 from core.downloadable_reply import sanitize_downloadable_reply
@@ -702,10 +705,8 @@ def _prefers_english(lang_anchor: Any = "") -> bool:
     这个不带锚点的老签名当场翻成英文,打红 test_consumer_error_classify 三条。
     根因是默认值反了,不是测试过时 —— 别改测试去将就它。)
     """
-    raw = str(lang_anchor or "")
-    if re.search(r"[一-鿿]", raw):
-        return False
-    return bool(re.search(r"[A-Za-z]{2,}", raw))
+    # 判据本体住在 chat.reply_language.text_language,V2 兜底用同一个(T743)。
+    return text_language(lang_anchor) == "en"
 
 
 def _fallback_reply_for(lang_anchor: Any = "") -> str:
@@ -7217,10 +7218,33 @@ def _runtime_stream_observer(
 class CliOutputTooLarge(RuntimeError):
     """A local capture limit; never retain the captured output on the exception."""
 
-    def __init__(self, limit: int, observed: int):
+    def __init__(self, limit: int, observed: int, raw: int | None = None):
         super().__init__("cli_output_too_large")
         self.limit_bytes = limit
         self.observed_bytes = observed
+        self.raw_bytes = observed if raw is None else raw
+
+
+# pi re-sends the whole message so far on every token, so its raw stdout grows with
+# the square of the reply (T746: a 4.7 KB reply = 9.8 MB). A snapshot line is dropped
+# only when the next one parses and carries at least as much text, so the limit
+# counts what is kept, not what crossed the pipe, while the reply parsers and
+# _pi_stream_shape (parse health, largest text seen) read the same values as on the
+# raw stream: a line that does not parse, or a rewrite to shorter text, is kept.
+_SUPERSEDED_SNAPSHOT_LINE = re.compile(rb'\{\s*"type"\s*:\s*"message_update"')
+
+
+def _snapshot_text_chars(line: bytes) -> int | None:
+    """Usable text size of a message_update line as _pi_stream_shape measures it;
+    None when the line does not parse or is structurally odd (it must then stay in
+    the capture, and must never fail the turn)."""
+    try:
+        obj = json.loads(line)
+        if not isinstance(obj, dict):
+            return None
+        return len(_pi_message_text(obj.get("message")).strip())
+    except Exception:
+        return None
 
 
 def _cli_max_output_bytes() -> int:
@@ -7263,29 +7287,62 @@ def _run_cli_subprocess(
     output_lock = threading.Lock()
     too_large = threading.Event()
     reader_errors: list[Exception] = []
-    observed = 0
+    retained = [0, 0]
+    raw = 0
 
-    def _drain(stream, sink: bytearray, callback=None) -> None:
-        nonlocal observed
+    def _drain(stream, sink: bytearray, index: int, callback=None) -> None:
+        nonlocal raw
         pending: list[str] = []
         decoder = io.IncrementalNewlineDecoder(
             codecs.getincrementaldecoder(encoding)(errors=errors), translate=True,
         ) if callback is not None else None
+        # stdout only: the latest snapshot line waiting to be superseded, and the
+        # line still being read. Both are held in memory, so both count.
+        held = bytearray()
+        held_chars = 0
+        partial = bytearray()
         try:
             while True:
                 chunk = stream.read1(64 * 1024)
                 with output_lock:
                     if too_large.is_set():
                         return
-                    observed += len(chunk)
-                    if observed > limit:
+                    raw += len(chunk)
+                    if index == 0:
+                        pieces = chunk.split(b"\n")
+                        for piece in pieces[:-1]:
+                            partial.extend(piece)
+                            partial.extend(b"\n")
+                            chars = (_snapshot_text_chars(partial)
+                                     if _SUPERSEDED_SNAPSHOT_LINE.match(partial, 0, 64) else None)
+                            if chars is None or not held or chars < held_chars:
+                                sink.extend(held)
+                                held.clear()
+                            if chars is None:
+                                sink.extend(partial)
+                            else:
+                                held[:] = partial
+                                held_chars = chars
+                            partial.clear()
+                        partial.extend(pieces[-1])
+                        if not chunk:
+                            sink.extend(held)
+                            sink.extend(partial)
+                            held.clear()
+                            partial.clear()
+                        retained[0] = len(sink) + len(held) + len(partial)
+                    else:
+                        sink.extend(chunk)
+                        retained[1] = len(sink)
+                    if sum(retained) > limit:
                         too_large.set()
                         for buffer in buffers:
                             buffer.clear()
+                        held.clear()
+                        partial.clear()
                         pending.clear()
                         process.kill()
                         return
-                    sink.extend(chunk)
                 if callback is not None:
                     text = decoder.decode(chunk, final=not chunk)
                     pieces = text.split("\n")
@@ -7308,9 +7365,9 @@ def _run_cli_subprocess(
             stream.close()
 
     threads = [
-        threading.Thread(target=_drain, args=(process.stdout, buffers[0], stdout_line),
+        threading.Thread(target=_drain, args=(process.stdout, buffers[0], 0, stdout_line),
                          name="feedling-agent-stdout", daemon=True),
-        threading.Thread(target=_drain, args=(process.stderr, buffers[1]),
+        threading.Thread(target=_drain, args=(process.stderr, buffers[1], 1),
                          name="feedling-agent-stderr", daemon=True),
     ]
     for thread in threads:
@@ -7345,7 +7402,7 @@ def _run_cli_subprocess(
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             if too_large.is_set():
-                raise CliOutputTooLarge(limit, observed)
+                raise CliOutputTooLarge(limit, sum(retained), raw)
             if reader_errors:
                 raise reader_errors[0]
             if cancellation is not None:
@@ -7364,7 +7421,7 @@ def _run_cli_subprocess(
             for thread in threads:
                 thread.join(timeout=0.05)
         if too_large.is_set():
-            raise CliOutputTooLarge(limit, observed)
+            raise CliOutputTooLarge(limit, sum(retained), raw)
         if reader_errors:
             raise reader_errors[0]
     except BaseException as exc:
@@ -7381,7 +7438,7 @@ def _run_cli_subprocess(
             thread.join(timeout=1.0)
         if too_large.is_set():
             # Discard, do not join/copy the oversized stdout/stderr into an error.
-            raise CliOutputTooLarge(limit, observed) from None
+            raise CliOutputTooLarge(limit, sum(retained), raw) from None
         if isinstance(exc, subprocess.TimeoutExpired):
             exc.stdout, exc.stderr = (_captured(buffer) for buffer in buffers)
         raise
@@ -8066,16 +8123,20 @@ def _provider_attempt_error_class(text: str, *, returncode: int = 0) -> str:
         return "timeout"
     if "429" in lowered or "rate limit" in lowered:
         return "rate_limit"
-    if "insufficient_quota" in lowered or "credit balance" in lowered:
-        return "quota"
+    # A 401/403 is decided by the shared quota/auth boundary, so explicit auth
+    # evidence wins over quota words; bare quota text keeps the old fallback.
     auth_status = re.search(r"(?<!\d)(401|403)(?!\d)", text or "")
     if auth_status is not None:
         status = int(auth_status.group(1))
+        if _error_contract.provider_response_is_quota_exhausted(status, text or ""):
+            return "quota"
         return (
             "provider_auth"
             if _error_contract.provider_response_is_auth_failure(status, text or "")
             else "provider_error"
         )
+    if "insufficient_quota" in lowered or "credit balance" in lowered:
+        return "quota"
     if "invalid key" in lowered:
         return "provider_auth"
     if "connection" in lowered or "network" in lowered or "dns" in lowered:
@@ -12532,6 +12593,24 @@ def _call_agent_cli_impl(
     return text
 
 
+def _reset_session_after_output_limit(*, trace_id: str, lane: str) -> None:
+    """A turn killed at the output cap never finished: its request (and any partial
+    reply) may already sit in the native session, so resuming it replays the same
+    oversized turn on every later message. Like the hard-timeout path, never resume it.
+    """
+    meta = _load_agent_session_meta(check_bounds=False)
+    if not str(meta.get("session_id") or "").strip():
+        return
+    _emit_agent_session_rotation_trace(
+        meta,
+        trigger_reason="cli_output_too_large",
+        trace_id=trace_id,
+        lane=lane,
+    )
+    _discard_io_cli_catalog_pending_injection()
+    _clear_agent_session_id("CLI output limit invalidated in-flight native session")
+
+
 def call_agent_cli(
     message: str,
     image_paths: list[str] | None = None,
@@ -12572,6 +12651,8 @@ def call_agent_cli(
             _model_call_trace=model_call_trace,
         )
     except Exception as exc:
+        if isinstance(exc, CliOutputTooLarge) and not isolated_session:
+            _reset_session_after_output_limit(trace_id=trace_id, lane=lane)
         result = model_call_trace.get("result")
         cmd = list(model_call_trace.get("cmd") or [])
         if (

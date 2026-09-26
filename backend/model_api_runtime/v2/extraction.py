@@ -199,7 +199,9 @@ def _provider_failure_code(exc: BaseException) -> str:
             if isinstance(candidate, int):
                 status = candidate
                 break
-    if status == 402:
+    if error_contract.provider_response_is_quota_exhausted(
+        status, getattr(exc, "raw_response_body", "")
+    ):
         return "quota_insufficient"
     if status in {401, 403}:
         return (

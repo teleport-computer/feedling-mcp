@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import os
 import time
 from urllib.parse import quote
@@ -26,8 +27,9 @@ from memgarden.scoring import relevance as memory_relevance
 from memory import card_shape
 from memory import jieba_tokenizer
 from memory import recall_metadata
+from memory.embedding import projection as embedding_projection
 from core import chat_images, envelope as core_envelope
-from enclave import auth, backend_client, envelope, readside
+from enclave import auth, backend_client, envelope, readside, recall_hybrid
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 
@@ -50,7 +52,8 @@ def _unified_recall_enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
-def _unified_selection(garden_cards: list[dict], query: str) -> tuple[list[dict], dict]:
+def _unified_selection(garden_cards: list[dict], query: str,
+                       **vector_options) -> tuple[list[dict], dict]:
     """``select_context`` shaped like the legacy selector's result for io consumers.
 
     Consumers (V1 ``_stash_auto_memories``, V2 ``memory_context.render``) read
@@ -58,10 +61,11 @@ def _unified_selection(garden_cards: list[dict], query: str) -> tuple[list[dict]
     are the query tokens the card matched (longest first, the most specific one is
     the one shown). They only travel in the response trace to the caller, which
     already holds the conversation; the persisted ``injection_record`` drops them.
+    ``vector_options`` is empty on the lexical path, so that call is unchanged.
     """
     picked, trace = mg_retrieval.select_context(
         query, garden_cards, tokenizer=jieba_tokenizer.TOKENIZER, cap=_CONTEXT_MEMORY_CAP,
-        **search_contract.RECALL_RANK_OPTIONS)
+        **search_contract.RECALL_RANK_OPTIONS, **vector_options)
     matched = {}
     for card in picked:
         units = list((card.get("selection") or {}).get("matched_units") or [])
@@ -382,6 +386,80 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
         }
 
 
+def _try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query, combined_query):
+    """Hybrid (dense + BM25) pick for one turn, or (None, None, record) to fall back.
+
+    All-or-nothing: every query vector is encoded before any selection runs, and
+    any failure returns no picks so the caller re-runs the unchanged lexical
+    path on the untouched cards. The record is content-free.
+    """
+    record = {"status": "fallback", "fallback_reason": hybrid.get("fallback_reason"),
+              "encode_ms": None, "encode_queue_ms": None, "encode_compute_ms": None,
+              "vectors_ms": hybrid.get("vectors_ms"),
+              "vectors_requested": int(hybrid.get("vectors_requested") or 0),
+              "vectors_received": len(hybrid.get("stored") or {}),
+              "vectors_rejected": int(hybrid.get("vectors_rejected") or 0),
+              "with_vector": 0, "hash_mismatch": 0}
+    if record["fallback_reason"]:
+        return None, None, record
+    if not current_query:
+        record["fallback_reason"] = "empty_query"
+        return None, None, record
+    stored = hybrid.get("stored") or {}
+    card_vectors = {}
+    for card in selectable:
+        mid = str(card.get("id") or "")
+        hit = stored.get(mid)
+        body = inner.get(mid)
+        if not mid or hit is None or not isinstance(body, dict):
+            continue
+        # The backend already served only current-projection rows; re-derive
+        # from the enclave's own decrypted body so a stale or foreign vector
+        # can never stand in for this card.
+        if embedding_projection.body_projection(body)[0] != hit[0]:
+            record["hash_mismatch"] += 1
+            continue
+        card_vectors[mid] = hit[1]
+    record["with_vector"] = len(card_vectors)
+    texts = [current_query] + ([combined_query] if combined_query != current_query else [])
+    started = time.monotonic()
+    timing: dict = {}
+    try:
+        vectors = recall_hybrid.encode_queries(hybrid["embedder"], texts, hybrid["deadline"], timing)
+    except recall_hybrid.Fallback as exc:
+        record["fallback_reason"] = exc.reason
+        return None, None, record
+    finally:
+        # encode_ms is wall time including the wait for the encoder thread;
+        # the split is only known when the job finished in time.
+        record["encode_ms"] = round((time.monotonic() - started) * 1000.0, 1)
+        record.update(timing)
+    by_query = dict(zip(texts, vectors))
+    model_id = hybrid["model_id"]
+    options = {"card_vectors": card_vectors, "min_cosine": recall_hybrid.min_cosine(),
+               "vector_model": model_id,
+               "card_vector_models": {mid: model_id for mid in card_vectors}}
+
+    def selector(cards, query):
+        return _unified_selection(cards, query, query_vector=by_query[query], **options)
+
+    try:
+        picked, trace = _latest_first_selection(
+            copy.deepcopy(garden_cards), current_query, combined_query, selector)
+    except Exception:
+        # memgarden raises (never degrades) on vector-contract errors; this turn
+        # falls back as a whole.
+        record["fallback_reason"] = "vector_contract_error"
+        return None, None, record
+    record["status"] = "active"
+    record["lanes"] = [
+        {"source": p.get("source"),
+         **{k: (p.get("trace", {}).get("hybrid") or {}).get(k)
+            for k in ("with_vector", "vector_eligible", "lexical_eligible", "fused", "vector_only")}}
+        for p in trace.get("passes") or []]
+    return picked, trace, record
+
+
 def _build_context_memories(moments, decrypted, query_args):
     """纯同步 context_memories 选择（在 to_thread 里跑）。
     最新非空用户消息先选卡，再用最近两条补位（不含 AI 回复）。context_mode/
@@ -400,8 +478,16 @@ def _build_context_memories(moments, decrypted, query_args):
     context_memories: list[dict] = []
     context_memory_trace: dict | None = None
 
-    cards = readside.moments_to_cards(
-        moments, query_args["authorized_user_id"], query_args["content_sk"])
+    hybrid = query_args.get("hybrid")
+    inner: dict | None = None
+    if hybrid is None:
+        cards = readside.moments_to_cards(
+            moments, query_args["authorized_user_id"], query_args["content_sk"])
+    else:
+        inner = {}
+        cards = readside.moments_to_cards(
+            moments, query_args["authorized_user_id"], query_args["content_sk"],
+            inner_out=inner)
     # 生命周期过滤归宿主 —— **必须在翻译之前**。
     # 翻译产物里没有 io 的 archive 字段，放到翻译之后就漏了，已归档的卡
     # 会重新进上下文（codex 2026-08-17 指出）。
@@ -432,10 +518,18 @@ def _build_context_memories(moments, decrypted, query_args):
     # 但不再选择不同 policy。
     selector = (_unified_selection if _unified_recall_enabled()
                 else memory_relevance.select_relevant_context_memories_with_trace)
-    picked, selection_trace = _latest_first_selection(
-        garden_cards, current_query, combined_query, selector)
+    hybrid_record: dict | None = None
+    picked = None
+    if hybrid is not None:
+        picked, selection_trace, hybrid_record = _try_hybrid_selection(
+            hybrid, selectable, garden_cards, inner, current_query, combined_query)
+    if picked is None:
+        picked, selection_trace = _latest_first_selection(
+            garden_cards, current_query, combined_query, selector)
     # The persisted label identifies both the kernel and the host merge rule.
     mode = f"relevant:unified:{selection_trace['version']}"
+    if hybrid_record is not None:
+        mode += ":hybrid" if hybrid_record["status"] == "active" else ":hybrid-fallback"
     context_memories = _back_to_original(picked)
     if query_args.get("context_recent"):
         fresh = recall_metadata.recent_cards(selectable)
@@ -467,6 +561,8 @@ def _build_context_memories(moments, decrypted, query_args):
         cap=_CONTEXT_MEMORY_CAP,
         duration_ms=(time.monotonic() - started) * 1000.0,
     )
+    if hybrid_record is not None:
+        context_memory_log["hybrid"] = hybrid_record
     return context_memories, context_memory_trace, context_memory_log
 
 
@@ -519,6 +615,9 @@ async def v1_chat_history(request: Request):
     context_memory_trace: dict | None = None
     listing_task: asyncio.Task | None = None
     quoted_fetch_task: asyncio.Task | None = None
+    # Hybrid recall (T523) is off unless FEEDLING_MEMORY_RECALL_HYBRID is set;
+    # while off this stays None and the path below is unchanged.
+    hybrid_state: dict | None = None
     query_args: dict | None = None
     context_setup_error: Exception | None = None
     # Decrypt-health probes (the resident consumer fires one every
@@ -560,6 +659,8 @@ async def v1_chat_history(request: Request):
             listing_task = asyncio.create_task(backend_client.backend_get(
                 "/v1/memory/list", ctx.forward_headers,
                 params={"limit": str(memory_limit)}))
+            if recall_hybrid.enabled():
+                hybrid_state = recall_hybrid.begin(_unified_recall_enabled())
             quoted_ids = _quoted_memory_ids(hist.get("messages", []))
             if quoted_ids:
                 # User-selected cards are an exact lookup, not part of the
@@ -619,6 +720,16 @@ async def v1_chat_history(request: Request):
         try:
             listing = await listing_task
             moments = listing.get("moments", []) or []
+            if hybrid_state is not None:
+                if hybrid_state["model_id"] and not hybrid_state["fallback_reason"]:
+                    # Only this turn's plaintext candidates: the backend answers
+                    # the intersection with the caller's eligible cards.
+                    ids = recall_hybrid.plaintext_candidate_ids(moments, user_id)
+                    if ids:
+                        await recall_hybrid.fetch_vectors(ctx.forward_headers, hybrid_state, ids)
+                    else:
+                        hybrid_state["stored"] = {}
+                query_args["hybrid"] = hybrid_state
             context_memories, context_memory_trace, context_memory_log = await anyio.to_thread.run_sync(
                 _build_context_memories, moments, decrypted, query_args)
         except Exception as e:

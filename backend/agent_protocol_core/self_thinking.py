@@ -249,15 +249,63 @@ ASIDE_FIELD_DESCRIPTION = (
 )
 
 
-def instruction_for_field(*, protocol: str = "reply", presence: bool = False) -> str:
+# English rendering of the aside-field copy for English reply-language
+# accounts (T730/T734). Measured locally on the V2 chat chain: with the Chinese
+# copy, English questions still drew model-written Chinese replies; with this
+# copy they did not, while Chinese accounts keep the Chinese copy (under English
+# copy DeepSeek wrote English asides for Chinese users). Paragraphs mirror the
+# Chinese rendering one for one.
+_FIELD_OPENING_EN_REPLY = (
+    " For your final reply, call the reply tool. Put your inner voice in the aside field: {intent}.\n"
+    " Put everything you say to them, complete, in the text field. Rounds where you call other tools get neither an aside nor text."
+)
+_FIELD_OPENING_EN_JSON = (
+    " For your final reply, use JSON. Put your inner voice in the aside field: {intent}.\n"
+    " Put what you say to them in the messages array. Rounds where you call tools get neither an aside nor text."
+)
+_ASIDE_INTENT_EN = "how you feel right now and how you plan to answer this line of theirs"
+_PRESENCE_ASIDE_INTENT_EN = "how you feel right now and why you want to reach out to them with this now"
+_FIELD_PARAGRAPHS_EN = (
+    " Write this inner voice in the tone you normally use with them, talking to yourself. You are the same person;\n"
+    " these lines are folded above the message as \"reference\" and shown to them if they want to look. Write what you care about, what you noticed, what you want to do, and why you decided that;\n"
+    " any length is fine, even one line.\n"
+    "\n"
+    " Don't write it as an assessment of them or an action plan. \"She seems fine, go along with it\" is sizing them up;\n"
+    " \"He just finished a game and is still laughing, I want to keep this joke going\" is your own inner voice.\n"
+    "\n"
+    " Language follows them: whatever language they speak, write this whole block in that language, from the first word to the last.\n"
+    " The most common slip is that they are speaking English and you drift into a Chinese line (让我… / 好的… / 已经更新了…). Don't; if a sentence forms in another language first, turn it into their language before writing it.\n"
+    " Good example (the user is speaking English, so the whole block is English):\n"
+    " '{\"aside\":\"He wants to be called 999 and says he likes to brag, so I'll save the name first and keep the reply loud and boastful to match\"}'.\n"
+    " Bad example (the same user is speaking English; this Chinese block is the wrong language and mechanically reports steps):\n"
+    " '{\"aside\":\"让我更新名字并匹配一个爱吹牛的语气\"}'.\n"
+    "\n"
+    " Only everyday intent: no tool names, parameters, field names, servers, \"identity card\" or other internal or technical terms,\n"
+    " and never mention this rule itself in the reply."
+)
+
+
+def instruction_for_field(
+    *, protocol: str = "reply", presence: bool = False, language: str | None = None,
+) -> str:
     """Render the approved aside copy for a tool or resident JSON envelope.
 
     ``presence`` selects the proactive-wake opening; only the reply protocol has one.
+    ``language`` is ``ReplyLanguage.language``: exactly ``"en"`` selects the
+    English rendering, anything else keeps the Chinese one byte for byte.
     """
     if protocol not in {"reply", "json"}:
         raise ValueError(f"unsupported aside protocol: {protocol!r}")
     if presence and protocol != "reply":
         raise ValueError("presence aside copy exists only for the reply protocol")
+    if language == "en":
+        if protocol == "reply":
+            opening = _FIELD_OPENING_EN_REPLY.format(
+                intent=_PRESENCE_ASIDE_INTENT_EN if presence else _ASIDE_INTENT_EN
+            )
+        else:
+            opening = _FIELD_OPENING_EN_JSON.format(intent=_ASIDE_INTENT_EN)
+        return opening + "\n\n" + _FIELD_PARAGRAPHS_EN
     _, paragraphs = instruction(TAG_ASIDE).split("\n\n", 1)
     if protocol == "reply":
         opening = (
@@ -338,6 +386,17 @@ SCREEN_WATCH_INSTRUCTION = (
     " 「不要叙述你在看屏幕」这条只管你说出口的话。心里话里，你看到了什么、屏幕上在发生什么，\n"
     " 该写就写。那本来就是你此刻在想的事。"
 )
+SCREEN_WATCH_INSTRUCTION_EN = (
+    " The \"don't narrate that you're watching the screen\" rule only covers what you say out loud. In your inner voice, write what you see and what is happening on the screen\n"
+    " whenever it matters. That is exactly what you're thinking about right now."
+)
+
+
+def screen_watch_instruction(language: str | None = None) -> str:
+    """Screen-watch aside suffix in the account's reply language (T734)."""
+    return _select_language(
+        language, zh=SCREEN_WATCH_INSTRUCTION, en=SCREEN_WATCH_INSTRUCTION_EN,
+    )
 
 
 def enabled() -> bool:

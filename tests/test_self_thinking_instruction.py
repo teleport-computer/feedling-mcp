@@ -130,3 +130,80 @@ def test_aside_field_instruction_parity(monkeypatch):
     assert "不出现工具名、参数、字段名" in field
     assert tool_loop._REPLY_TOOL_SPEC.parameters["properties"]["aside"]["description"] == st.ASIDE_FIELD_DESCRIPTION
     assert tool_loop._REPLY_TOOL_SPEC.parameters["required"] == ["text"]
+
+
+# T734: aside-field copy in the account's reply language. The Chinese hashes
+# are the pre-T734 renderings (Chinese accounts must not change by a byte); the
+# English chat rendering is the copy measured in T730 (aside_en arm).
+_FIELD_SHA = {
+    ("reply", False, "zh"): "d2bb2e85e47295c15b14ee65d9bb1e141513397f5bcfa46891364c1bc9204387",
+    ("reply", True, "zh"): "401f00b17cb5cc69e1c6e091293df7ef6e85e35a6e5103002d11a9407a75a907",
+    ("json", False, "zh"): "9f046a90662a1fea9308923e3404900811e5279942b391639725e0fa6adf5389",
+    ("reply", False, "en"): "ea7e130f0f1e9f87fc2e16a505d56155bdd38a99fb328c5c66a811ca3d852399",
+    ("reply", True, "en"): "b1cd6c70002c38d9a0ea45079a3810425dd5f5b32001a9d00d01a98f4dde2f4c",
+    ("json", False, "en"): "460e9f233573f1d399671fb5f12d200e23019f4a317bd5ea49f0449e6b587d89",
+}
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_field_copy_is_pinned_per_reply_language():
+    for (protocol, presence, language), digest in _FIELD_SHA.items():
+        rendered = st.instruction_for_field(
+            protocol=protocol, presence=presence, language=language,
+        )
+        assert _sha(rendered) == digest, (protocol, presence, language)
+
+
+def test_field_copy_selection_mirrors_reply_language_policy_branch():
+    for protocol, presence in (("reply", False), ("reply", True), ("json", False)):
+        zh = st.instruction_for_field(protocol=protocol, presence=presence)
+        en = st.instruction_for_field(protocol=protocol, presence=presence, language="en")
+        assert en != zh
+        assert en.startswith(" For your final reply")
+        # Same paragraph structure as the Chinese rendering it mirrors.
+        assert en.count("\n\n") == zh.count("\n\n")
+        for language in (None, "", "zh", "zh-Hans", "EN", "ja"):
+            assert st.instruction_for_field(
+                protocol=protocol, presence=presence, language=language,
+            ) == zh
+    # Outside the quoted bad example and the slip list, the English copy has no Han.
+    en = st.instruction_for_field(language="en")
+    body = "\n".join(
+        line for line in en.split("\n")
+        if "让我" not in line
+    )
+    assert re.search(r"[㐀-鿿]", body) is None
+
+
+def test_screen_watch_suffix_follows_reply_language():
+    assert st.screen_watch_instruction("en") == st.SCREEN_WATCH_INSTRUCTION_EN
+    assert _sha(st.SCREEN_WATCH_INSTRUCTION_EN) == (
+        "6eb1c52a911b70b983f55a749c743a2ed17893e7f39cd24b87874ef254fcdfc2"
+    )
+    for language in (None, "", "zh-Hans", "EN"):
+        assert st.screen_watch_instruction(language) is st.SCREEN_WATCH_INSTRUCTION
+
+
+def test_host_prompts_render_the_account_language(monkeypatch):
+    from model_api_runtime.v2 import context, worker
+
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    for language in ("en", "zh"):
+        field = st.instruction_for_field(language=language).strip()
+        other = st.instruction_for_field(language="zh" if language == "en" else "en").strip()
+        chat = context.chat_system_prompt(language=language)
+        assert field in chat and other not in chat
+        for lane in ("scheduled", "screen_watch"):
+            prompt = worker._wake_system_prompt_for_lane(lane, "base", language=language)
+            assert field in prompt and other not in prompt
+        presence = st.instruction_for_field(presence=True, language=language).strip()
+        for lane in sorted(worker._PRESENCE_WAKE_LANES):
+            assert presence in worker._wake_system_prompt_for_lane(
+                lane, "base", language=language,
+            )
+    screen = worker._wake_system_prompt_for_lane("screen_watch", "base", language="en")
+    assert st.SCREEN_WATCH_INSTRUCTION_EN.strip() in screen
+    assert st.SCREEN_WATCH_INSTRUCTION.strip() not in screen

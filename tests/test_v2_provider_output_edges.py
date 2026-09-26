@@ -192,32 +192,38 @@ def test_orphan_tail_detector_has_no_false_positives(text):
 # 手写测试清单会复制手写词表的同一个盲点,那正是这次漏掉的原因。
 # 词表以后加词,这里自动覆盖。
 # ---------------------------------------------------------------------------
-try:  # PR#193 引入;未合入时跳过整组,不拖累当前分支
-    from core import tool_markup_leak as _tml  # noqa: E402
-
-    _HAS_TML = True
-except Exception:  # pragma: no cover - 合入前的正常状态
-    _HAS_TML = False
+from core import tool_markup_leak as _tml  # noqa: E402
 
 
 def _derived_tag_forms():
-    """从 _TAG_NAMES 派生单数 + 复数两种数形。"""
-    if not _HAS_TML:
-        return []
+    """从 TOOL_TAG_STEMS 派生单数 + 复数两种数形。
+
+    直接读模块真名、不给 getattr 默认值:词表改名时这里应当报错,而不是
+    静默派生出空集、让下面的参数化用例一条都不生成(T731:原先读的
+    ``_TAG_NAMES`` 在模块里不存在,整组恒被跳过)。
+    """
     out = []
-    for name in getattr(_tml, "_TAG_NAMES", ()):
-        out.append(name)
-        out.append(name + "s" if not name.endswith("s") else name[:-1])
+    for stem in _tml.TOOL_TAG_STEMS:
+        out.append(stem)
+        out.append(stem + "s")
     return sorted(set(out))
 
 
-@pytest.mark.skipif(not _HAS_TML, reason="core.tool_markup_leak 尚未合入(PR#193)")
+def test_derived_tag_forms_cover_the_whole_vocabulary():
+    """派生集必须非空且逐个覆盖词表——空集会让下面的参数化用例静默消失。"""
+    forms = _derived_tag_forms()
+    assert forms, "从 TOOL_TAG_STEMS 派生出空集:参数化用例会一条都不生成"
+    assert len(forms) == 2 * len(_tml.TOOL_TAG_STEMS)
+    for stem in _tml.TOOL_TAG_STEMS:
+        assert stem in forms and stem + "s" in forms
+
+
 @pytest.mark.parametrize("tag", _derived_tag_forms())
 def test_every_tag_form_in_vocabulary_is_stripped(tag):
     """词表里每个标记的**两种数形**都必须被清掉,正文必须活下来。
 
     这条测试的价值不在它今天抓到什么,而在于:
-    以后有人往 _TAG_NAMES 加一个词,这里立刻多两条用例把两种数形都钉住。
+    以后有人往 TOOL_TAG_STEMS 加一个词,这里立刻多两条用例把两种数形都钉住。
     """
     body = "这是用户真正要看的话"
     raw = f'<{tag} name="x">y</{tag}>{body}'

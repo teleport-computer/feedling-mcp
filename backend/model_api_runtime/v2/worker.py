@@ -79,6 +79,7 @@ from chat import file_display as chat_file_display
 from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_language,
     failure_fallback_reply,
     garden_language_decision,
     infer_garden_language,
@@ -1070,24 +1071,28 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 
 def _wake_system_prompt_for_lane(
     lane: str, base_prompt: str, *, tag: str = self_thinking.TAG_THINK,
+    language: str | None = None,
 ) -> str:
     """Attach the shared aside-field contract and lane-specific suffixes.
 
     The legacy tag argument is accepted for callers but no longer selects copy.
+    ``language`` (``ReplyLanguage.language``) selects the zh/en aside copy.
     """
     if not self_thinking.enabled():
         return base_prompt
     blocks = [base_prompt]
     if lane == "scheduled":
-        blocks.append(self_thinking.instruction_for_field())
+        blocks.append(self_thinking.instruction_for_field(language=language))
     elif lane in _PRESENCE_WAKE_LANES:
         blocks.append(_PRESENCE_WAKE_SELF_THINKING_INSTRUCTION)
-        blocks.append(self_thinking.instruction_for_field(presence=True))
+        blocks.append(
+            self_thinking.instruction_for_field(presence=True, language=language)
+        )
     else:
         blocks.append(_OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
-        blocks.append(self_thinking.instruction_for_field())
+        blocks.append(self_thinking.instruction_for_field(language=language))
     if lane == "screen_watch":
-        blocks.append(self_thinking.SCREEN_WATCH_INSTRUCTION)
+        blocks.append(self_thinking.screen_watch_instruction(language))
     return context._join_policy_blocks(*blocks)
 
 
@@ -3100,7 +3105,7 @@ class _ProviderRoundtripTrace:
             "lane": self.lane,
             "round": round_number,
         }
-        if self.lane != "chat":
+        if self.lane not in {"chat", "profile"}:
             safe["wake_kind"] = self.lane
         finish_reason = str(detail.get("finish_reason") or "")
         if finish_reason in (
@@ -3434,20 +3439,25 @@ def _memory_recall_callback(deps, user_id, job, lane):
                     log.warning("[v2.memory] observation trace failed: %s", type(exc).__name__)
         terminal_detail = {k: v for k, v in detail.items()
                            if k not in {"tool_results", "prompt_observations"}}
+        # The event tallies ride inside counts: _safe_detail keeps only the first
+        # 20 top-level keys, and every key past that is dropped without a marker.
+        counts = {**(detail.get("counts") or {}),
+                  "tool_result_events": len(detail.get("tool_results", [])),
+                  "provider_requests": len(detail.get("prompt_observations", []))}
         await asyncio.to_thread(
             deps.emit_debug_trace, user_id, "memory.recall.completed",
             status="ok", trace_id=trace_id, turn_id=turn_id, job_id=job_id,
             summary=memory_recall.summary(detail["counts"]),
-            detail={**terminal_detail, **coordinates,
-                    "tool_result_events": len(detail.get("tool_results", [])),
-                    "provider_requests": len(detail.get("prompt_observations", []))},
+            detail={**terminal_detail, "counts": counts, **coordinates},
         )
     return emit
 
 
 def _normalize_provider_trace_lane(lane: object) -> str:
     raw_lane = str(lane or "").strip()
-    return raw_lane if raw_lane == "chat" or raw_lane in _WAKE_LANES else "other"
+    if raw_lane in {"chat", "profile"} or raw_lane in _WAKE_LANES:
+        return raw_lane
+    return "other"
 
 
 def _normalize_provider_trace_reason(
@@ -7889,6 +7899,29 @@ async def _emit_thinking_surfaced_trace(
         )
 
 
+def _user_typed_text(row: dict) -> str:
+    """The words the user typed in one prompt row, never a placeholder (T743).
+
+    Attachment rows carry protocol markers, Canvas metadata, vision
+    observations or inlined file bodies in ``content``; only their ``caption``
+    is the user's. An unreadable row's content is a placeholder. Both yield
+    ``""`` (no language signal) rather than a guess.
+    """
+    if row.get("unreadable"):
+        return ""
+    if row.get("has_image") or row.get("has_file"):
+        return str(row.get("caption") or "")
+    return core_util.text_of(row.get("content"))
+
+
+def _latest_user_typed_text(rows: Iterable[dict]) -> str:
+    """Typed text of the newest user row only; an older row never stands in."""
+    for row in reversed(list(rows)):
+        if str(row.get("role") or "").strip().lower() in {"user", "human"}:
+            return _user_typed_text(row)
+    return ""
+
+
 def _latest_user_writing_system(rows: Iterable[dict]) -> str:
     """Find the newest classifiable user-authored text without retaining it."""
 
@@ -11282,6 +11315,11 @@ async def _run_wake(
         )
         turn_memory_observation: dict = {}
 
+        wake_reply_language = infer_reply_language(
+            locale=str(temporal_snapshot.get("locale") or ""),
+            archive_language=str(temporal_snapshot.get("archive_language") or ""),
+        )
+
         def _wake_builder():
             _wake_sys = (
                 _SCREEN_WATCH_SYSTEM_PROMPT
@@ -11293,16 +11331,11 @@ async def _run_wake(
             # self-authored thought instead of raw native reasoning.
             _wake_sys = _wake_system_prompt_for_lane(
                 lane, _wake_sys, tag=context.self_thinking_tag(provider_config),
-            )
-            reply_language = infer_reply_language(
-                locale=str(temporal_snapshot.get("locale") or ""),
-                archive_language=str(
-                    temporal_snapshot.get("archive_language") or ""
-                ),
+                language=wake_reply_language.language,
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(reply_language),
+                reply_language_system_line(wake_reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
@@ -11443,6 +11476,7 @@ async def _run_wake(
                 ),
                 build_messages=build_messages,
                 suppress_native_reasoning=_st_wake_loop.enabled(),
+                reply_language=wake_reply_language.language,
                 disabled_tool_names=wake_disabled_tool_names,
                 extra_tool_specs=offered_mcp_tool_specs,
                 refresh_extra_tool_specs=_current_offered_mcp_tool_specs,
@@ -12192,6 +12226,25 @@ async def _run_profile(
                 },
             )
         provider_call_ordinal = 0
+        # Content-free model-call events (T735): the same closed projection
+        # Chat/Wake use, so a failed Profile call leaves its HTTP status and
+        # error signature instead of only "providererror". Telemetry never
+        # changes the call's result or its retry/cancel behaviour.
+        model_call_trace = _provider_tool_surface_callback(
+            deps, user_id, "profile", job_id=job_id
+        )
+        call_route = {
+            "provider": str(getattr(provider_config, "provider", "") or "unknown"),
+            "model": str(getattr(provider_config, "model", "") or "unknown"),
+        }
+
+        async def _record_profile_call(event_kind: str, detail: dict) -> None:
+            if model_call_trace is None:
+                return
+            try:
+                await model_call_trace.record_model_call(event_kind, detail)
+            except Exception:  # noqa: BLE001 -- telemetry is best-effort
+                pass
 
         async def _profile_llm(*args, **kwargs):
             nonlocal provider_call_ordinal
@@ -12207,8 +12260,39 @@ async def _run_profile(
             # Profile shares heavy-0 with Capture/Dream, but retains its own
             # 90s wire ceiling when Dream receives a larger budget.
             kwargs.setdefault("wire_deadline_sec", v2_extraction.WIRE_DEADLINE_SEC)
-            result = await provider_client.reliable_chat_completion_async(
-                *args, **kwargs
+            await _record_profile_call("start", {**call_route, "round": ordinal})
+            started = time.monotonic()
+            try:
+                result = await provider_client.reliable_chat_completion_async(
+                    *args, **kwargs
+                )
+            except Exception as exc:
+                try:
+                    facts = v2_tool_loop._provider_error_facts(exc)
+                except Exception:  # noqa: BLE001 -- never replace the real failure
+                    facts = {"exception_type": type(exc).__name__}
+                await _record_profile_call(
+                    "error",
+                    {
+                        **call_route,
+                        "round": ordinal,
+                        "dur_ms": (time.monotonic() - started) * 1000.0,
+                        **facts,
+                    },
+                )
+                raise
+            await _record_profile_call(
+                "done",
+                {
+                    **call_route,
+                    "round": ordinal,
+                    "dur_ms": (time.monotonic() - started) * 1000.0,
+                    "finish_reason": (
+                        str(result.get("finish_reason") or "")
+                        if isinstance(result, dict)
+                        else ""
+                    ),
+                },
             )
             _report_turn_progress(f"profile_provider_response:{ordinal}")
             return result
@@ -14924,9 +15008,27 @@ async def process_job(
             ),
         )
 
+        # The turn's user rows (tail + current batch + rows folded in mid-turn);
+        # also the latest-message source for the failure language below.
+        language_user_rows: list[dict] = []
+
+        def _chat_failure_language():
+            # Seven 2026-09-26 (T743): a failure answers in the language of
+            # the user's latest message, judged by the same function as the
+            # resident lane; no signal falls back to the account language.
+            return failure_fallback_language(
+                user_text=_latest_user_typed_text(
+                    [*tail, *language_user_rows]
+                ),
+                locale=str(temporal_snapshot.get("locale") or ""),
+                archive_language=str(
+                    temporal_snapshot.get("archive_language") or ""
+                ),
+            )
+
         def _chat_failure_fallback() -> str:
             return failure_fallback_reply(
-                chat_reply_language,
+                _chat_failure_language(),
                 zh=_DEGENERATE_REPLY_FALLBACK,
                 en=_DEGENERATE_REPLY_FALLBACK_EN,
             )
@@ -15683,7 +15785,6 @@ async def process_job(
 
         thinking_trace_emitted = False
         language_trace_emitted = False
-        language_user_rows: list[dict] = []
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -16576,7 +16677,9 @@ async def process_job(
 
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
-                context.chat_system_prompt(provider_config),
+                context.chat_system_prompt(
+                    provider_config, language=chat_reply_language.language,
+                ),
                 reply_language_system_line(chat_reply_language),
             )
             return _make_build_messages_fn(
@@ -16716,6 +16819,7 @@ async def process_job(
             on_memory_recall_completed=_memory_recall_callback(deps, user_id, job, lane),
             include_reasoning=turn_include_reasoning,
             suppress_native_reasoning=_self_thinking_v2.enabled(),
+            reply_language=chat_reply_language.language,
             memory_delete_allowed=True,
             reply_tool_enabled=_self_thinking_v2.enabled(),
             allow_image_output=True,

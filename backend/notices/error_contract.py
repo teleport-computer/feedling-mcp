@@ -178,6 +178,15 @@ _EXPLICIT_PROVIDER_AUTH = re.compile(
     r"invalid ?(?:x-)?api.?key|unauthorized|authentication",
     re.IGNORECASE,
 )
+# Relays (new-api/one-api family) answer an exhausted balance with 403, e.g.
+# {"error":{"message":"预扣费额度失败, 用户剩余额度: ¥0.44, 需要预扣费额度: ¥0.50",
+#  "code":"insufficient_user_quota"}} (T729). Only this explicit evidence moves a
+# 403 off the fail-closed authentication default. Each marker states a shortfall
+# by itself; a bare balance field (e.g. 用户剩余额度) does not.
+_EXPLICIT_PROVIDER_QUOTA_403 = re.compile(
+    r"insufficient_user_quota|insufficient_quota|预扣费额度失败|余额不足",
+    re.IGNORECASE,
+)
 
 
 def _contains_generic_upstream_403_object(value: object) -> bool:
@@ -251,7 +260,31 @@ def provider_response_is_auth_failure(status_code: object, raw_body: object) -> 
     candidate = str(raw_body or "")
     if _EXPLICIT_PROVIDER_AUTH.search(candidate):
         return True
+    if _EXPLICIT_PROVIDER_QUOTA_403.search(candidate):
+        return False
     return not _is_generic_upstream_403_body(candidate)
+
+
+def provider_response_is_quota_exhausted(status_code: object, raw_body: object) -> bool:
+    """402, or a 403 whose original body explicitly reports an exhausted balance.
+
+    Explicit authentication evidence in the same body keeps the auth reading.
+    """
+    if isinstance(status_code, bool):
+        return False
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if status == 402:
+        return True
+    if status != 403:
+        return False
+    candidate = str(raw_body or "")
+    return bool(
+        _EXPLICIT_PROVIDER_QUOTA_403.search(candidate)
+        and not _EXPLICIT_PROVIDER_AUTH.search(candidate)
+    )
 
 
 def _chat_specs() -> tuple[ErrorSpec, ...]:

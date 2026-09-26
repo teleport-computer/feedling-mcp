@@ -1148,9 +1148,10 @@ service readiness.
 A serve-worker-only maintenance pass can prepare vectors for active shared
 plaintext memories. It defaults off and has no model files or inference
 libraries added to the default image by this change. A provisioned local ONNX
-CPU model is loaded lazily in serve-worker; backend request workers and enclave
-routes do not load it. No external embedding API or runtime model download is
-used. Encrypted memories remain outside this preparation pass.
+CPU model is loaded lazily in serve-worker; backend request workers do not load
+it, and the enclave loads it only when hybrid recall (below) is enabled. No
+external embedding API or runtime model download is used. Encrypted memories
+remain outside this preparation pass.
 
 `memory_vectors` stores sensitive derived data in the configured primary
 database, in plaintext float32 form, under user/card/model keys and a projection
@@ -1158,6 +1159,35 @@ hash. Both database migration chains define the table. There are no card write
 hooks or vector job queues: bounded periodic scans detect changes and prune
 ineligible rows. This is a rebuildable index, not a source of truth. Future
 readers must check current authorization, lifecycle and projection hash rather
-than treating a stored row as proof of eligibility. No retrieval reader uses
-this table yet. Normal database trust and backup protections apply to these
-vectors; the additional enclave encryption path is not used.
+than treating a stored row as proof of eligibility. Normal database trust and
+backup protections apply to these vectors; the additional enclave encryption
+path is not used.
+
+### Optional hybrid automatic recall
+
+Automatic recall (the context memories attached to `GET /v1/chat/history` in the
+enclave) can fuse dense vectors with the lexical ranker. It is disabled by
+default (`FEEDLING_MEMORY_RECALL_HYBRID=0`); while disabled the enclave loads no
+model, performs no vector read and recall output is unchanged. When enabled:
+
+- The enclave loads the same local E5 model in a background thread at startup
+  (never on a request) and encodes the query text inside the enclave. The query
+  text never leaves the enclave for this purpose.
+- After its memory list read, the enclave asks the backend for the vectors of
+  this turn's plaintext-tier candidates only (their ids; never enclave-encrypted
+  or `local_only` cards), with the same forwarded end-user credentials, through
+  an internal route (`POST /v1/memory/vectors`, not part of the public API). The
+  backend identifies the user only from those credentials, re-derives the
+  eligible set from the user's current cards on every request, and returns the
+  intersection of the requested ids with that set, only for rows whose
+  projection hash matches the current card; it never returns a user's whole
+  vector set. The enclave recomputes each
+  hash from its own decrypted card and drops any vector that does not match.
+  This path therefore carries plaintext derived vectors from the primary
+  database into the enclave; the vectors are derived only from plaintext-tier
+  cards.
+- One turn has one bounded budget (default 2 seconds) for the vector read and
+  query encoding. A missing model, busy encoder, timeout, read failure or
+  vector-contract error makes the whole turn use the unchanged lexical path; the
+  content-free selection record carries the fallback reason and timings, never
+  text or vectors.

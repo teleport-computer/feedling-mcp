@@ -182,8 +182,13 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
     assert result.provider_calls == 1
     assert result.overlap is not None and result.overlap.would_reject is True
     assert len(calls) == 1
-    assert calls[0][2]["response_format"] == {"type": "json_object"}
-    assert calls[0][2]["tool_choice"]["function"]["name"] == "emit_profile"
+    # T735: structure comes from the forced emit_profile call; JSON response
+    # mode is not sent alongside it (Gemini rejects the combination).
+    assert "response_format" not in calls[0][2]
+    assert calls[0][2]["tool_choice"] == {
+        "type": "function", "function": {"name": "emit_profile"},
+    }
+    assert [tool.name for tool in calls[0][2]["tools"]] == ["emit_profile"]
     assert usages == [{"input_tokens": 10}]
     assert events == [
         (
@@ -235,6 +240,37 @@ def test_generate_profile_accepts_forced_tool_output_without_text_reply():
 
     assert result.fields == {"memory": "长期事实", "style": "沟通方式"}
     assert result.provider_calls == 1
+
+
+@pytest.mark.parametrize(
+    "bad_call",
+    [
+        {"id": "t", "name": "emit_profile", "args": {"memory": "长期事实"}, "args_ok": True},
+        {"id": "t", "name": "emit_profile", "args": {"memory": "长期事实", "style": 7}, "args_ok": True},
+        {"id": "t", "name": "emit_profile", "args": {}, "args_ok": False},
+    ],
+    ids=["missing_style", "style_wrong_type", "malformed_args"],
+)
+def test_forced_tool_output_contract_still_rejects_invalid_args(bad_call):
+    """Dropping JSON response mode (T735) must not loosen the output contract."""
+    calls = []
+
+    async def _llm(_config, _messages, **kwargs):
+        calls.append(kwargs)
+        return {"reply": "", "tool_calls": [dict(bad_call)], "stop_reason": "tool_use"}
+
+    result = asyncio.run(
+        profile.generate_profile(provider_config=object(), rendered_cards="cards", llm=_llm)
+    )
+
+    assert result.fields is None
+    assert result.reject_code
+    assert calls, "the final call must have been made"
+    for kwargs in calls:
+        assert "response_format" not in kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "function", "function": {"name": "emit_profile"},
+        }
 
 
 def test_shape_error_bounces_once_with_content_free_correction():

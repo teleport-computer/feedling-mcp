@@ -17,9 +17,12 @@ io 读不到它的源文件，也不该越俎代庖。
 """
 from __future__ import annotations
 
+import importlib.metadata
 import pathlib
+import re
 
 import pytest
+from packaging.requirements import Requirement
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -101,6 +104,50 @@ def test_the_kernel_brings_nothing_else_along():
         "agent-protocol-core 又回到锁文件里了 —— 它是 io 的东西，"
         "不该作为 memgarden 的依赖被装进来"
     )
+    # T738: the lock only rules out one known package. The package's own
+    # metadata is what decides what ``pip install memgarden`` pulls in.
+    runtime = _runtime_requirements(importlib.metadata.requires("memgarden"))
+    assert runtime == [], (
+        f"memgarden 声明了运行时依赖 {runtime} —— 装内核会连带装上别的包"
+    )
+
+
+def _runtime_requirements(requires):
+    """Requirements an ordinary ``pip install`` would install.
+
+    Only an entry whose marker refers to ``extra`` is optional. An entry with
+    no marker, or a marker on anything else (``python_version < "3.11"``), is
+    a runtime dependency somewhere — judged by the marker's text, not by
+    evaluating it on the interpreter running this test, which would let a
+    dependency that only installs on another Python version through.
+    """
+    runtime = []
+    for line in requires or ():
+        requirement = Requirement(line)
+        marker = str(requirement.marker) if requirement.marker else ""
+        variables = re.sub(r"""(["'])(?:(?!\1).)*\1""", "", marker)
+        if not re.search(r"\bextra\b", variables):
+            runtime.append(line)
+    return runtime
+
+
+@pytest.mark.parametrize(
+    ("requires", "runtime"),
+    [
+        (None, []),
+        ([], []),
+        (["pytest>=8.0; extra == 'dev'"], []),
+        (["tomli>=2.0; (python_version < '3.11') and extra == 'dev'"], []),
+        (["requests>=2"], ["requests>=2"]),
+        (["tomli>=2.0; python_version < '3.11'"], ["tomli>=2.0; python_version < '3.11'"]),
+        (["x; platform_machine == 'extra'"], ["x; platform_machine == 'extra'"]),
+    ],
+    ids=["none", "empty", "dev_extra", "dev_extra_with_python_marker",
+         "unconditional", "python_version_only", "value_named_extra"],
+)
+def test_runtime_requirement_classifier(requires, runtime):
+    """Pin the classifier the zero-dependency guard relies on (T738)."""
+    assert _runtime_requirements(requires) == runtime
 
 
 @pytest.mark.parametrize("mod", ["memgarden"])

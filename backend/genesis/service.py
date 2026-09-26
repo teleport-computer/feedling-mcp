@@ -302,6 +302,10 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
                 or getattr(exc, "response_detail", "")
                 or str(exc or "")
             )
+            if error_contract.provider_response_is_quota_exhausted(
+                status_code, raw_body
+            ):
+                return "provider_quota"
             if error_contract.provider_response_is_auth_failure(
                 status_code, raw_body
             ):
@@ -327,6 +331,8 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         code = int(status_match.group(1))
         if code in _BAD_API_KEY_STATUS:
             detail = text[status_match.end() :].lstrip(" :")
+            if error_contract.provider_response_is_quota_exhausted(code, detail):
+                return "provider_quota"
             if error_contract.provider_response_is_auth_failure(code, detail):
                 return "bad_api_key"
             return "internal"

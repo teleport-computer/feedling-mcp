@@ -43,6 +43,10 @@ EXCLUDED_OPERATIONS = {
     ("post", "/v1/copytext"),
     # User-authenticated implementation diagnostics, not a product API.
     ("get", "/v1/proactive/debug"),
+    # Internal read for enclave hybrid recall (T523): the enclave forwards the
+    # user's own credentials; derived vectors are an implementation detail,
+    # documented in the architecture page, not a product API.
+    ("post", "/v1/memory/vectors"),
 }
 
 PUBLIC_OPERATIONS = {

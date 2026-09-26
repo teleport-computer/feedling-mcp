@@ -560,11 +560,14 @@ async def generate_profile(
                 "timeout": 90.0,
             }
             if json_object:
-                # Use the provider adapter's native JSON mode when available;
-                # adapters without one append the same strict JSON-only
-                # instruction.  This is intentionally limited to the final
-                # two-field response: map summaries are bullet text.
-                call_kwargs["response_format"] = {"type": "json_object"}
+                # Structure comes from the forced ``emit_profile`` call and its
+                # argument schema, not from a JSON response mode. Sending both
+                # is rejected by some routes (T735: a Gemini endpoint returns
+                # 400 "Forced function calling (ANY mode) with a response mime
+                # type 'application/json' is unsupported"), and relays forward
+                # ``response_format`` verbatim, so dropping it here covers the
+                # native and openai_compatible paths alike. This is limited to
+                # the final two-field response: map summaries are bullet text.
                 call_kwargs["tools"] = [_PROFILE_OUTPUT_TOOL]
                 call_kwargs["tool_choice"] = {
                     "type": "function",

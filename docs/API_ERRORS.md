@@ -196,6 +196,8 @@ canonical_owner: self
 | `title_required` | 400 | — | | |
 | `description_required` | 400 | — | | |
 | `memory_id_required` | 400 | — | | |
+| `invalid_model_id` | 400 | — | 仅内部 `POST /v1/memory/vectors`(enclave 混合召回,T523):model_id 缺失、非字符串或超过 300 字符 | |
+| `invalid_ids` | 400 | — | 仅内部 `POST /v1/memory/vectors`:ids 不是字符串列表、含空串或超过 200 字符的 id、或超过 2000 个;detail `max` 为上限 | |
 | `patch_required` | 400 | — | | |
 | `summary_required` | 400 | — | | |
 | `supersedes_required` | 400 | — | | |

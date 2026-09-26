@@ -1,6 +1,7 @@
 """Pure regression tests for leaked tool-call markup sanitization."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -556,3 +557,96 @@ def test_dsml_body_must_be_a_direct_text_child_of_a_top_level_reply(markup, expe
     assert removed is True
     assert clean == expected
     assert "INTERNAL_ONLY" not in clean and "DSML" not in clean
+
+
+# T733: the generic XML reply path and whole-message reply JSON must never show
+# the aside. Only the case where whole-block removal leaves nothing (the old
+# marker-only fallback) changes; block removal with prose outside is unchanged.
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param(
+            '<invoke name="reply"><parameter name="aside">INTERNAL_ASIDE</parameter>'
+            '<parameter name="text">真正的回复</parameter></invoke>',
+            "真正的回复", id="reply-with-aside",
+        ),
+        pytest.param(
+            '<function_calls><invoke name="reply"><parameter name="aside">INTERNAL_ASIDE</parameter>'
+            '<parameter name="text">回复正文</parameter></invoke></function_calls>',
+            "回复正文", id="function-calls-wrapper",
+        ),
+        pytest.param(
+            '<invoke name="reply"><parameter name="aside"><parameter name="text">INTERNAL_ASIDE</parameter>'
+            '</parameter><parameter name="text">VISIBLE</parameter></invoke>',
+            "VISIBLE", id="text-nested-under-aside",
+        ),
+        pytest.param(
+            '<invoke name="reply"><parameter name="aside">INTERNAL_ASIDE</parameter></invoke>',
+            "", id="aside-only-falls-to-fallback",
+        ),
+    ],
+)
+def test_xml_reply_call_never_exposes_its_aside(raw, expected):
+    clean, removed = tool_markup_leak.strip_tool_markup(raw)
+
+    assert removed is True
+    assert clean == expected
+    assert "INTERNAL_ASIDE" not in clean and "<" not in clean
+
+
+def test_prose_outside_a_reply_block_still_wins_over_the_block():
+    """Unchanged deliberate behavior: with prose outside, the whole block goes."""
+    raw = '开头一句话。<invoke name="reply"><parameter name="aside">INTERNAL_ASIDE</parameter>' \
+          '<parameter name="text">块里的正文</parameter></invoke>'
+
+    assert tool_markup_leak.strip_tool_markup(raw) == ("开头一句话。", True)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param('{"aside":"INTERNAL_ASIDE","text":"旅行杯盖子的维修单号是 LK-7319。"}',
+                     ("旅行杯盖子的维修单号是 LK-7319。", True), id="aside-and-text"),
+        pytest.param('  {"text": "only text"}\n', ("only text", True), id="text-only"),
+        pytest.param('{"aside":"INTERNAL_ASIDE"}', ("", True), id="aside-only"),
+        pytest.param('{"name":"x","text":"y"}', ('{"name":"x","text":"y"}', False), id="other-keys-untouched"),
+        pytest.param('{"aside": 1, "text": "y"}', ('{"aside": 1, "text": "y"}', False), id="non-string-untouched"),
+        pytest.param('```json\n{"aside":"a","text":"b"}\n```', ('```json\n{"aside":"a","text":"b"}\n```', False),
+                     id="fenced-example-untouched"),
+    ],
+)
+def test_whole_message_reply_json_keeps_only_text(raw, expected):
+    assert tool_markup_leak.strip_tool_markup(raw) == expected
+
+
+def test_reply_json_text_still_goes_through_the_whole_chain():
+    """codex2 T733 review: the JSON entry must not bypass DSML/XML cleaning."""
+    raw = json.dumps({
+        "aside": "OUTER_ASIDE",
+        "text": '<｜｜DSML｜｜ invoke name="reply"><｜｜DSML｜｜ parameter name="aside">INTERNAL_ONLY'
+                '</｜｜DSML｜｜ parameter><｜｜DSML｜｜ parameter name="text">VISIBLE</｜｜DSML｜｜ parameter>'
+                "</｜｜DSML｜｜ invoke>",
+    })
+
+    assert tool_markup_leak.strip_tool_markup(raw) == ("VISIBLE", True)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param('<｜｜DSML｜｜ invoke name="reply"><｜｜DSML｜｜ parameter name="aside"/>INTERNAL_ONLY'
+                     "</｜｜DSML｜｜ invoke>", "", id="dsml-self-closing-child-then-body"),
+        pytest.param('<｜｜DSML｜｜ invoke name="reply">INTERNAL_ONLY</｜｜DSML｜｜ invoke>', "",
+                     id="dsml-bare-body-is-not-a-reply-text"),
+        pytest.param('<invoke name="reply"><parameter name="aside"/>INTERNAL_ONLY</invoke>', "",
+                     id="xml-self-closing-child-cancels-bare-body"),
+        pytest.param('<invoke name="reply">好</invoke>', "好", id="xml-legacy-bare-body-kept"),
+    ],
+)
+def test_bare_reply_body_is_xml_only_and_needs_no_child_marker(raw, expected):
+    """codex2 T733 review: DSML keeps T727's closed-text-only boundary; XML keeps
+    the legacy bare body only when the reply has no child marker at all."""
+    clean, removed = tool_markup_leak.strip_tool_markup(raw)
+
+    assert removed is True
+    assert clean == expected

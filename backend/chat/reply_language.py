@@ -195,6 +195,46 @@ def user_written_text(messages, *, limit: int = USER_WRITING_SAMPLE_MESSAGES) ->
     return "\n".join(out)
 
 
+#: A Han character anywhere means Chinese; otherwise two consecutive Latin
+#: letters mean English. Emoji, digits, punctuation or an empty string carry no
+#: language signal. This is the single judge for "what language did the user
+#: just write in", shared by the resident consumer and Runtime V2.
+_HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def text_language(text: Any) -> str:
+    """``"zh-Hans"`` / ``"en"`` for text with a signal, ``""`` when there is none.
+
+    No signal must stay distinguishable from Chinese: callers fall back to the
+    account language rather than guessing (T743).
+    """
+    raw = str(text or "")
+    if _HAN_RE.search(raw):
+        return "zh-Hans"
+    if _LATIN_WORD_RE.search(raw):
+        return "en"
+    return ""
+
+
+def failure_fallback_language(
+    *,
+    user_text: Any = "",
+    locale: str = "",
+    archive_language: str = "",
+) -> ReplyLanguage:
+    """Language of a failure fallback (Seven 2026-09-26: 按用户这句话的语言选).
+
+    The user's latest message decides. When it carries no language signal (or
+    could not be read), the account's locale/archive language applies, exactly
+    as before.
+    """
+    spoken = text_language(user_text)
+    if spoken:
+        return ReplyLanguage(spoken)
+    return infer_reply_language(locale=locale, archive_language=archive_language)
+
+
 def infer_garden_language(
     identity: dict | None,
     *,

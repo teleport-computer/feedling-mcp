@@ -55,13 +55,9 @@ def _eligible(moments: list, user_id: str) -> tuple[dict, int]:
                 continue
         if not isinstance(body, dict) or card_shape.is_retired(body):
             continue
-        garden = card_shape.to_garden_card(body)
-        # IO's shape adapter currently carries cues only in lexical search_text.
-        # Copy the structured field explicitly for this independent projection.
-        garden["retrieval_cues"] = body.get("retrieval_cues")
-        text = projection.card_projection_text(garden)
+        digest, text = projection.body_projection(body)
         if text:
-            result[str(card["id"])] = (projection.projection_hash(garden), text)
+            result[str(card["id"])] = (digest, text)
     return result, encrypted
 
 

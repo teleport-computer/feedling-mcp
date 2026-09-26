@@ -1012,5 +1012,21 @@ identity includes the artifact digest, precision and IO projection version.
 Updated cards are re-encoded on a later scan; deleted, retired or private cards
 are pruned by that scan. Account deletion and reset remove the derived rows.
 The worker checks the current card projection again before saving an encoding.
-This preparation pass does not yet change search, context selection or query
-encoding, and its batch size is not a latency guarantee.
+This preparation pass does not change search, and its batch size is not a
+latency guarantee.
+
+### Optional hybrid automatic recall
+
+Automatic context selection can additionally use these vectors. It is disabled
+by default (`FEEDLING_MEMORY_RECALL_HYBRID=0`) and, while disabled, selection is
+the lexical ranker described above with no change in output. When enabled, the
+enclave encodes the latest user message (and the two-message context when it
+differs) with the local model and fuses a cosine lane with the lexical lane by
+weighted reciprocal-rank fusion; a card qualifies through either lane, cards
+without a current vector are ranked lexically only, and the existing quotas,
+seat rules and fresh-card insertion are unchanged. The cosine threshold
+(`FEEDLING_MEMORY_RECALL_MIN_COSINE`) has no default: without a calibrated value
+the turn stays lexical. Any failure inside the per-turn budget
+(`FEEDLING_MEMORY_RECALL_HYBRID_BUDGET_MS`, default 2000) makes the whole turn
+use the lexical result, and the selection record's `hybrid` entry names the
+reason. `memory_search` and `memory_index` are unaffected.

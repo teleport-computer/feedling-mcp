@@ -16766,3 +16766,15 @@ def test_resident_aside_display_switch_off_does_not_restore_native(monkeypatch):
     assert turn.messages == ["正文"]
     assert turn.thinking_summary == ""
     assert turn.thinking_kind == ""
+
+
+def test_prefers_english_is_the_shared_text_language_judge():
+    """T743: resident and V2 failure fallbacks share one language judge."""
+    from chat import reply_language
+
+    corpus = ["", "a", "hi", "你好", "ok 好的", "😀", "123", "good night",
+              "Hello, 世界", "é", "ÀB", None]
+    for text in corpus:
+        assert crc._prefers_english(text) == (
+            reply_language.text_language(text) == "en"
+        ), text

@@ -4528,6 +4528,72 @@ def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
     assert system_text.count(expected) == 1
 
 
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
+)
+@pytest.mark.parametrize(
+    ("locale", "archive_language", "language"),
+    [("en-US", "en", "en"), ("zh-CN", "zh-Hans", "zh")],
+)
+def test_wake_aside_copy_follows_account_reply_language(
+    monkeypatch, lane, locale, archive_language, language,
+):
+    # T734: every wake lane renders the aside copy in the account's language.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = f"u_wake_t734_aside_{lane}_{language}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    loop_kwargs = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy_loop(**kwargs):
+        loop_kwargs.append(kwargs.get("reply_language"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy_loop)
+
+    async def _empty_cap(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(worker, "_cap_data", _empty_cap)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": archive_language,
+    }
+
+    asyncio.run(
+        worker._run_wake(
+            job_id, uid, lane, deps, _BYOK, asyncio.Semaphore(4), claimed_by,
+        )
+    )
+
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    # The compact delivery round inside the loop renders from this value.
+    assert [value == "en" for value in loop_kwargs] == [language == "en"]
+    presence = lane in worker._PRESENCE_WAKE_LANES
+    other = "zh" if language == "en" else "en"
+    field = self_thinking.instruction_for_field(presence=presence, language=language)
+    other_field = self_thinking.instruction_for_field(presence=presence, language=other)
+    assert field.strip() in system_text
+    assert other_field.strip() not in system_text
+    if lane == "screen_watch":
+        assert self_thinking.screen_watch_instruction(language).strip() in system_text
+        assert self_thinking.screen_watch_instruction(other).strip() not in system_text
+
+
 def test_heartbeat_prefetch_injects_v1_facts_without_a_tool_round(monkeypatch):
     uid = "u_wake_v1_factual_board"
     conftest.seed_user(uid)

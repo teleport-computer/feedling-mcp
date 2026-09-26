@@ -53,6 +53,16 @@ copy. These rejection counters are best-effort diagnostics: if persistence
 fails, Feedling records a content-free warning in service logs, so dashboard
 totals can be lower than the actual number of rejected values.
 
+A provider `403` whose original body explicitly reports an exhausted balance
+(`insufficient_user_quota`, `insufficient_quota`, `预扣费额度失败`, or `余额不足`,
+as returned by new-api/one-api style relays; a remaining-balance field alone does
+not count) is classified as
+quota exhaustion, with the existing quota notice, on chat and wake turns, memory
+extraction, vision, image generation, genesis import, credential probes, and
+resident provider-attempt telemetry.
+Explicit authentication wording in the same body keeps `auth_invalid`, and a `403`
+without either kind of evidence keeps the fail-closed `auth_invalid` default.
+
 Resident CLI failures reporting Codex's `hit your usage limit` message are
 classified as `quota_insufficient` with `blame: "user_provider"` and the existing
 quota notice. This applies with either straight or curly apostrophes in
@@ -71,8 +81,8 @@ changing the existing `detail` or upstream `status_code` fields:
 
 | Upstream evidence | `failure_class` |
 | --- | --- |
-| 401 or 403 | `auth_invalid` |
-| 402, including insufficient credit for OpenRouter's output reservation | `quota_insufficient` |
+| 401, or 403 without explicit balance evidence | `auth_invalid` |
+| 402, including insufficient credit for OpenRouter's output reservation, or a 403 whose body reports an exhausted balance (for example `insufficient_user_quota` / `预扣费额度失败`) | `quota_insufficient` |
 | 404 | `model_not_found` |
 | 429 | `rate_limited` |
 | 408, 5xx, or a provider network failure | `upstream_unavailable` |
