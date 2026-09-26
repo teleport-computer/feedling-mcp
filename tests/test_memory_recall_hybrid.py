@@ -768,3 +768,57 @@ def test_route_real_crypto_requests_plaintext_ids_and_rejects_encrypted_vector(m
     assert "plain" in log["injected_ids"]
     blob = json.dumps(log, ensure_ascii=False)
     assert "green sofa" not in blob and "Encrypted diary" not in blob and "feline" not in blob
+
+
+# --------------------------------------------------------------------------- #
+# 10. /healthz deploy-state evidence (T739): flag values, model state, RSS
+# --------------------------------------------------------------------------- #
+
+def test_healthz_reports_flag_off_and_model_not_loaded(monkeypatch):
+    from enclave.routes import health
+    monkeypatch.delenv(recall_hybrid.HYBRID_ENV, raising=False)
+    monkeypatch.delenv(recall_hybrid.MIN_COSINE_ENV, raising=False)
+    monkeypatch.setattr(recall_hybrid, "_embedder_state", "idle")
+    monkeypatch.setattr(recall_hybrid, "_embedder", None)
+    body = health._health_body()
+    assert body["recall_hybrid"] == {"enabled": False, "min_cosine": None,
+                                     "embedder_state": "not_loaded", "failure_reason": None,
+                                     "model_id": None}
+    assert body["rss_kb"] is None or (isinstance(body["rss_kb"], int) and body["rss_kb"] > 0)
+
+
+@pytest.mark.parametrize("state,reason,label,expect_reason", [
+    ("loading", "loading", "loading", None),
+    ("unavailable", "model_directory_missing", "failed", "model_directory_missing"),
+])
+def test_healthz_embedder_state_labels(monkeypatch, state, reason, label, expect_reason):
+    from enclave.routes import health
+    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.80")
+    monkeypatch.setattr(recall_hybrid, "_embedder_state", state)
+    monkeypatch.setattr(recall_hybrid, "_embedder_reason", reason)
+    monkeypatch.setattr(recall_hybrid, "_embedder", None)
+    snap = health._health_body()["recall_hybrid"]
+    assert snap["enabled"] is True and snap["min_cosine"] == 0.80
+    assert snap["embedder_state"] == label and snap["failure_reason"] == expect_reason
+
+
+def test_healthz_loaded_model_id_is_a_bounded_prefix_without_paths(monkeypatch):
+    from enclave.routes import health
+    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
+    embedder = _embedder()
+    monkeypatch.setattr(recall_hybrid, "_embedder_state", "ready")
+    monkeypatch.setattr(recall_hybrid, "_embedder", embedder)
+    snap = health._health_body()["recall_hybrid"]
+    assert snap["embedder_state"] == "loaded"
+    assert snap["model_id"] == embedder.model_id[:48] and len(snap["model_id"]) <= 48
+    assert "/opt" not in json.dumps(snap) and "models/" not in json.dumps(snap)
+
+
+def test_rss_kb_reads_vmrss(monkeypatch, tmp_path):
+    from enclave.routes import health
+    status = tmp_path / "status"
+    status.write_text("Name:\tpython\nVmPeak:\t 999 kB\nVmRSS:\t  123456 kB\n")
+    real_open = open
+    monkeypatch.setattr("builtins.open", lambda p, *a, **k: real_open(status if p == "/proc/self/status" else p, *a, **k))
+    assert health._rss_kb() == 123456

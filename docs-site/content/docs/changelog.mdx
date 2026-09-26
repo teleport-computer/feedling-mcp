@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- The enclave `/healthz` adds `rss_kb` (the process's current resident memory)
+  and `recall_hybrid` (`enabled`, `min_cosine`, `embedder_state`,
+  `failure_reason`, and a model-id prefix). It carries no user data and no
+  paths, and is used as deploy-state and capacity evidence for hybrid recall.
+
 - Added disabled-by-default hybrid automatic recall (`FEEDLING_MEMORY_RECALL_HYBRID`).
   When enabled, the enclave encodes the query with the local E5 model, reads the
   caller's current-projection card vectors through a new internal backend route,

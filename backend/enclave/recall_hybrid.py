@@ -122,6 +122,29 @@ def embedder_status():
         return None, reason
 
 
+_STATE_LABELS = {"idle": "not_loaded", "loading": "loading", "ready": "loaded",
+                 "unavailable": "failed"}
+MODEL_ID_PREFIX_CHARS = 48
+
+
+def status_snapshot() -> dict:
+    """Deploy-state evidence for /healthz: flag values and model load state.
+
+    No user data and no paths; ``failure_reason`` comes from the embedder's
+    fixed vocabulary; the model id is truncated to its name/precision/digest
+    prefix.
+    """
+    with _holder_lock:
+        state, reason, embedder = _embedder_state, _embedder_reason, _embedder
+    return {
+        "enabled": enabled(),
+        "min_cosine": min_cosine(),
+        "embedder_state": _STATE_LABELS.get(state, "unknown"),
+        "failure_reason": reason if state == "unavailable" else None,
+        "model_id": (str(embedder.model_id)[:MODEL_ID_PREFIX_CHARS] if embedder is not None else None),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # bounded query encoding
 # --------------------------------------------------------------------------- #
