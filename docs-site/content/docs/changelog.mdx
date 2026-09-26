@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- A resident CLI turn killed at the output limit (`cli_output_too_large`) now also
+  drops its resumable agent session, so the next message starts a fresh session
+  instead of replaying the same oversized turn every time.
+
 - Runtime V2 now reads the text a user sends with an image or file when that
   text is stored in plaintext (content encryption off). Previously the model
   saw only the attachment marker (`[image]` / `[file: name]`) and not the

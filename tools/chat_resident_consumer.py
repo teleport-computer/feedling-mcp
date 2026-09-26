@@ -12535,6 +12535,24 @@ def _call_agent_cli_impl(
     return text
 
 
+def _reset_session_after_output_limit(*, trace_id: str, lane: str) -> None:
+    """A turn killed at the output cap never finished: its request (and any partial
+    reply) may already sit in the native session, so resuming it replays the same
+    oversized turn on every later message. Like the hard-timeout path, never resume it.
+    """
+    meta = _load_agent_session_meta(check_bounds=False)
+    if not str(meta.get("session_id") or "").strip():
+        return
+    _emit_agent_session_rotation_trace(
+        meta,
+        trigger_reason="cli_output_too_large",
+        trace_id=trace_id,
+        lane=lane,
+    )
+    _discard_io_cli_catalog_pending_injection()
+    _clear_agent_session_id("CLI output limit invalidated in-flight native session")
+
+
 def call_agent_cli(
     message: str,
     image_paths: list[str] | None = None,
@@ -12575,6 +12593,8 @@ def call_agent_cli(
             _model_call_trace=model_call_trace,
         )
     except Exception as exc:
+        if isinstance(exc, CliOutputTooLarge) and not isolated_session:
+            _reset_session_after_output_limit(trace_id=trace_id, lane=lane)
         result = model_call_trace.get("result")
         cmd = list(model_call_trace.get("cmd") or [])
         if (

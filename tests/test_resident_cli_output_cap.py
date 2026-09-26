@@ -120,3 +120,54 @@ def test_cli_limit_registered_with_existing_generic_copy():
 def test_timeout_still_interrupts_a_child_that_does_not_read_stdin():
     with pytest.raises(subprocess.TimeoutExpired):
         run('import time; time.sleep(30)', input='x' * 200000, timeout=0.2)
+
+
+# T746: a turn killed at the output cap never finished, so its native session must
+# not be resumed (prod usr_1baf… replayed the same oversized HTML turn every message).
+@pytest.fixture
+def stored_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(c, 'AGENT_SESSION_FILE_TEMPLATE', str(tmp_path / 'session_{user_id}.txt'))
+    monkeypatch.setitem(c._whoami_cache, 'user_id', 'usr_t746')
+    c._agent_session_id_cache.pop('usr_t746', None)
+    c._agent_session_meta_cache.pop('usr_t746', None)
+    c._save_agent_session_id('sid-before')
+    traces = []
+    monkeypatch.setattr(c, '_emit_debug_trace', lambda *a, **k: traces.append((a, k)))
+    assert c._load_agent_session_meta(check_bounds=False)['session_id'] == 'sid-before'
+    return traces
+
+
+def _raise(exc):
+    def impl(*_a, **_k):
+        raise exc
+    return impl
+
+
+def _rotations(traces):
+    return [k.get('detail', {}).get('trigger_reason') for a, k in traces
+            if len(a) > 1 and a[1] == 'agent.session.rotated']
+
+
+def test_output_limit_clears_the_resumable_session(monkeypatch, stored_session):
+    monkeypatch.setattr(c, '_call_agent_cli_impl', _raise(c.CliOutputTooLarge(8192, 9000)))
+    with pytest.raises(c.CliOutputTooLarge):
+        c.call_agent_cli('make an html page', lane='chat', trace_id='t746')
+    assert c._load_agent_session_meta(check_bounds=False)['session_id'] == ''
+    assert not c._agent_session_file_for_user().exists()
+    assert _rotations(stored_session) == ['cli_output_too_large']
+
+
+def test_output_limit_in_an_isolated_call_keeps_the_main_session(monkeypatch, stored_session):
+    monkeypatch.setattr(c, '_call_agent_cli_impl', _raise(c.CliOutputTooLarge(8192, 9000)))
+    with pytest.raises(c.CliOutputTooLarge):
+        c.call_agent_cli('x', lane='background', isolated_session=True)
+    assert c._load_agent_session_meta(check_bounds=False)['session_id'] == 'sid-before'
+    assert _rotations(stored_session) == []
+
+
+def test_other_failures_keep_the_session(monkeypatch, stored_session):
+    monkeypatch.setattr(c, '_call_agent_cli_impl', _raise(RuntimeError('provider 500')))
+    with pytest.raises(RuntimeError):
+        c.call_agent_cli('x', lane='chat')
+    assert c._load_agent_session_meta(check_bounds=False)['session_id'] == 'sid-before'
+    assert _rotations(stored_session) == []
