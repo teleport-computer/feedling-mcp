@@ -171,6 +171,18 @@ services:
         # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
         # max 47.7s → 34s chat replies of which pi was only 3.1s.
         FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+        # Hybrid automatic recall (T523 step 4, T739): dense E5 lane fused with
+        # the lexical ranker in this enclave's /v1/chat/history selection. test
+        # only; prod stays off. Both enclave services share this anchor so the
+        # direct (:5003) and custom-domain (:5004) entrypoints recall alike.
+        # MIN_COSINE 0.80 = positive 5th percentile of the dev-set calibration
+        # (reports/T523-calib, disjoint from the T557 acceptance set). The model
+        # is the same baked, SHA-pinned E5 the serve-worker sweep uses; loaded in
+        # a background thread at startup, never on a request; never downloads.
+        FEEDLING_MEMORY_RECALL_HYBRID: "1"
+        FEEDLING_MEMORY_RECALL_MIN_COSINE: "0.80"
+        FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+        HF_HUB_OFFLINE: "1"
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it
