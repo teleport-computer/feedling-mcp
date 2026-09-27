@@ -17,6 +17,13 @@ change must not be interpreted as an API guarantee.
   add some detail, instead of telling them to switch models. It still counts
   as a failed import and writes no cards.
 
+- The provider test that runs when adding or switching a Model API route now
+  uses a 90-second HTTP timeout (was 30), giving slow relay channels more time
+  before `provider network error: ReadTimeout`. It is not a deadline for the
+  whole test and does not guarantee the route can be added. Clients must wait
+  longer than this; iOS app versions that still use the 60-second system
+  default give up first.
+
 - Genesis import's first model call (the "model too slow" check) now allows
   120 seconds on `openai_compatible` relay routes instead of 60; other routes
   keep 60 seconds. Each import model call's content-free record now includes

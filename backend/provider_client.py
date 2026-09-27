@@ -5517,6 +5517,15 @@ def model_catalog_error_slug(exc: BaseException) -> str:
     return "model_catalog_invalid_response"
 
 
+# HTTP timeout for setup's live probe (T754, Seven 09-28: raised from 30 s so
+# slow relay channels such as reverse-proxied "anti"/AG pools can answer).
+# httpx applies it per phase (connect/read/write/pool), not as a deadline for
+# the whole probe, and bounded compatibility retries may add attempts, so the
+# probe can take longer than this in total. The iOS requests that trigger the
+# probe must wait longer than this, or the app gives up first.
+SETUP_PROBE_TIMEOUT_S = 90.0
+
+
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
     # Validates that the key is usable for this model. We deliberately do NOT
     # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-
@@ -5542,7 +5551,7 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
         # since only some upstream channels behind a model id reject it), which read
         # to the user as "sometimes I can add this model, sometimes I can't".
         temperature=None,
-        timeout=30.0,
+        timeout=SETUP_PROBE_TIMEOUT_S,
         require_reply=False,
     )
 
