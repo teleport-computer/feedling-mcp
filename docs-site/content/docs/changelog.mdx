@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Identity profile generation accepts more well-formed replies: reasoning a
+  relay inlines in `<think>` is stripped first (the same stripper memory-card
+  parsing uses), every `{` in the reply is tried in turn, and extra keys next to
+  `memory` and `style` are ignored and discarded rather than failing the whole
+  reply. Truncated or non-object replies and missing or empty fields still fail.
+
 - Genesis import failures now name the actual cause more often. An identity
   profile the model returned in an unusable shape is reported as
   `model_bad_json` and an empty reply as `model_empty_output` (both were an

@@ -1100,3 +1100,139 @@ def test_profile_model_call_events_are_all_kept_within_the_head_window():
     head of rounds, and Profile's hard call budget must stay inside it or the
     tail events would be buffered with nobody left to flush them."""
     assert profile.PROFILE_MAX_PROVIDER_CALLS <= worker._MODEL_CALL_TRACE_HEAD_ROUNDS
+
+
+
+def test_profile_ignores_a_draft_inside_inline_thinking(monkeypatch):
+    """T750: a relay's inline <think> draft must not become the stored profile."""
+    captured = {}
+
+    async def _llm(_config, _messages, **_kwargs):
+        return {
+            "reply": '<think>先写个草稿 {"memory":"草稿记忆","style":"草稿方式"}</think>'
+            '{"memory":"最终记忆","style":"最终方式"}'
+        }
+
+    async def _cas(_uid, recompute):
+        return _cas_result(await recompute({}))
+
+    build_document = profile_store.build_profile_document
+
+    def _build_document(user_id, **kwargs):
+        captured.update(kwargs)
+        return build_document(
+            user_id,
+            **kwargs,
+            seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+        )
+
+    monkeypatch.setattr(worker.provider_client, "reliable_chat_completion_async", _llm)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(profile_store, "build_profile_document", _build_document)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "mark_completed", lambda *_a, **_kw: True)
+    rendered = serve_worker._render_profile_card({"id": "m1", "content": "一张卡"})
+    deps = _deps(cards=(rendered, 1, {"lane": "profile", "profile_cards_truncated": False}))
+
+    status = asyncio.run(
+        worker._run_profile(11, "u", deps, object(), asyncio.Semaphore(1))
+    )
+
+    assert status == "completed"
+    assert captured["memory_text"] == "最终记忆"
+    assert captured["style_text"] == "最终方式"
+
+
+def test_profile_extra_keys_are_dropped_before_anything_is_stored(monkeypatch):
+    """T750 (督导 20:34): extra keys are ignored only because they are discarded —
+    nothing from them may reach the stored profile document."""
+    sentinel = "T750_EXTRA_KEY_SENTINEL_MUST_NOT_PERSIST"
+    captured = {}
+
+    async def _llm(_config, _messages, **_kwargs):
+        return {"reply": json.dumps({
+            "memory": "最终记忆",
+            "style": "最终方式",
+            "instructions": sentinel,
+            "reasoning": {"nested": sentinel},
+        }, ensure_ascii=False)}
+
+    async def _cas(_uid, recompute):
+        return _cas_result(await recompute({}))
+
+    build_document = profile_store.build_profile_document
+
+    def _build_document(user_id, **kwargs):
+        captured["kwargs"] = kwargs
+        document = build_document(
+            user_id,
+            **kwargs,
+            seal_text=lambda _uid, text: {"body_ct": text, "nonce": "n"},
+        )
+        captured["document"] = document
+        return document
+
+    monkeypatch.setattr(worker.provider_client, "reliable_chat_completion_async", _llm)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(profile_store, "build_profile_document", _build_document)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "mark_completed", lambda *_a, **_kw: True)
+    rendered = serve_worker._render_profile_card({"id": "m1", "content": "一张卡"})
+    deps = _deps(cards=(rendered, 1, {"lane": "profile", "profile_cards_truncated": False}))
+
+    status = asyncio.run(
+        worker._run_profile(11, "u", deps, object(), asyncio.Semaphore(1))
+    )
+
+    assert status == "completed"
+    assert captured["kwargs"]["memory_text"] == "最终记忆"
+    assert captured["kwargs"]["style_text"] == "最终方式"
+    # The seal stub stores plaintext as body_ct, so any leak would be visible here.
+    persisted = json.dumps(
+        [captured["kwargs"], captured["document"]], ensure_ascii=False, default=str
+    )
+    assert sentinel not in persisted
+
+
+def test_profile_long_material_map_summary_with_braces_still_reaches_final(monkeypatch):
+    """T750 review: map bullets with braces pass through the V2 wrapper untouched."""
+    captured = {}
+    map_calls = []
+
+    async def _llm(_config, messages, **_kwargs):
+        if messages[0]["content"] == profile._PROFILE_MAP_SYSTEM_PROMPT:
+            map_calls.append(True)
+            return {"reply": "- 用户偏好 {简短} 回复"}
+        return {"reply": '{"memory":"最终记忆","style":"最终方式"}'}
+
+    async def _cas(_uid, recompute):
+        return _cas_result(await recompute({}))
+
+    build_document = profile_store.build_profile_document
+
+    def _build_document(user_id, **kwargs):
+        captured.update(kwargs)
+        return build_document(
+            user_id,
+            **kwargs,
+            seal_text=lambda _uid, _text: {"body_ct": "ct", "nonce": "n"},
+        )
+
+    monkeypatch.setattr(worker.provider_client, "reliable_chat_completion_async", _llm)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(profile_store, "build_profile_document", _build_document)
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "mark_completed", lambda *_a, **_kw: True)
+    rendered = serve_worker._render_profile_card({
+        "id": "m1", "content": "甲" * (profile.PROFILE_SINGLE_CALL_MAX_CHARS + 1),
+    })
+    deps = _deps(cards=(rendered, 1, {"lane": "profile", "profile_cards_truncated": False}))
+
+    status = asyncio.run(
+        worker._run_profile(11, "u", deps, object(), asyncio.Semaphore(1))
+    )
+
+    assert map_calls, "the long material did not take the map path"
+    assert status == "completed"
+    assert captured["memory_text"] == "最终记忆"
+    assert captured["style_text"] == "最终方式"

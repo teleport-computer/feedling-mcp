@@ -1414,3 +1414,25 @@ def test_chunked_import_with_region_tagged_archive_language_writes_cards(monkeyp
     assert result["processed"] == 1
     assert [a["memory"]["summary"] for a in writes["actions"]] == ["喜欢直接反馈"]
     assert apply_payloads[0]["reducer_output"]["garden_import"]["cards_written"] == 1
+
+
+
+# T750: Genesis finds the profile JSON with the memory-card parser's public
+# extractor (card_text.extract_json_block), which drops inline <think> first.
+def test_profile_json_reply_drops_a_draft_inside_think():
+    from genesis import worker as genesis_worker
+
+    raw = '<think>草稿 {"memory":"错的","style":"错的"}</think>{"memory":"对的","style":"对的"}'
+    out = genesis_worker._profile_json_reply(raw)
+    assert "错的" not in out
+    assert '"对的"' in out
+
+
+@pytest.mark.parametrize("raw", [
+    '{"memory":"a","style":"b"}',          # nothing to strip
+    "<think>没有闭合 {\"memory\":\"a\"",  # malformed thinking: keep the original
+])
+def test_profile_json_reply_keeps_text_it_cannot_improve(raw):
+    from genesis import worker as genesis_worker
+
+    assert genesis_worker._profile_json_reply(raw) == raw

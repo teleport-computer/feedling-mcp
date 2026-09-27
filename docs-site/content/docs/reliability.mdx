@@ -279,7 +279,9 @@ Malformed JSON response bodies are reported as `model_bad_json`. An identity
 profile the model returned but that fails validation (not JSON, a missing or
 empty field, a placeholder, or over its length budget) is also reported as
 `model_bad_json`, and an empty profile or provider reply as `model_empty_output`,
-instead of an internal error. Other provider
+instead of an internal error. Before a profile reply is validated, reasoning inlined in
+`<think>` is stripped, each `{` is tried in turn, and keys other than `memory`
+and `style` are discarded. Other provider
 configuration failures retain their specific error class and remediation
 guidance.
 For a non-empty long-term-memory (`keep_all`) import, producing zero memory
