@@ -27,6 +27,7 @@ from genesis.llm_client import GenesisLLMClient
 from identity.user_naming import rewrite_user_reference
 from notices import catalog as notices_catalog, core as notices_core
 from model_api_runtime.v2 import profile as v2_profile
+from memgarden.text.card_text import extract_json_block
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
 AI_PERSONA_SOURCE_KINDS = {
@@ -828,6 +829,20 @@ def _fact_write_output_empty(output: dict) -> bool:
     return not str(output.get("relationship_anchor_evidence") or "").strip()
 
 
+def _profile_json_reply(text: str) -> str:
+    """The JSON object of the final profile reply, found the way memory cards find it (T750).
+
+    Only for the JSON request: map summaries are bullet text, and a bullet
+    such as ``- 偏好 {简短} 回复`` must not be cut down to ``{简短}``.
+
+    ``card_text.extract_json_block`` is the memory-card parser's extractor: it
+    drops inline ``<think>`` blocks first, so a relay thinking model's draft
+    object is not read as the answer. When it finds no object at all the
+    original text is passed on unchanged for profile.py to judge.
+    """
+    return extract_json_block(str(text or "")) or text
+
+
 def _complete_text(
     llm: GenesisLLMClient,
     *,
@@ -1573,6 +1588,9 @@ def build_profile_output_from_sources(
         # forced ``emit_profile`` tool (some routes reject tool + JSON mode);
         # dropping that tool here must bring JSON mode back, or Genesis would
         # send neither.
+        # The final two-field request is the only one that carries the forced
+        # emit_profile tool; map requests return bullet text (T750).
+        json_request = bool(tools)
         if tools and response_format is None:
             response_format = {"type": "json_object"}
         del timeout, tools, tool_choice
@@ -1590,7 +1608,7 @@ def build_profile_output_from_sources(
             response_format=response_format,
             idempotency_key=f"{prefix}:profile:{call_number}",
         )
-        return {"reply": reply}
+        return {"reply": _profile_json_reply(reply) if json_request else reply}
 
     try:
         result = asyncio.run(v2_profile.generate_profile(

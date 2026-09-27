@@ -76,6 +76,7 @@ from capabilities import result_budget as cap_result_budget
 from capabilities import tool_schema as cap_tool_schema
 from capabilities import web as cap_web
 from chat import file_display as chat_file_display
+from memgarden.text.card_text import extract_json_block
 from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
@@ -12295,6 +12296,18 @@ async def _run_profile(
                 },
             )
             _report_turn_progress(f"profile_provider_response:{ordinal}")
+            # T750: for the final JSON request only (it alone carries the
+            # forced emit_profile tool), find the object the way memory cards
+            # do (inline <think> dropped first). Map summaries are bullet text
+            # and must reach profile.py untouched.
+            if (
+                kwargs.get("tools")
+                and isinstance(result, dict)
+                and isinstance(result.get("reply"), str)
+            ):
+                block = extract_json_block(result["reply"])
+                if block:
+                    result = {**result, "reply": block}
             return result
 
         generated = await v2_profile.generate_profile(
