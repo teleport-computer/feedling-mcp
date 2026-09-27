@@ -348,6 +348,19 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     ):
         return "model_bad_json"
 
+    # T750: the identity profile's own validation codes
+    # (worker `genesis_profile_invalid:<reject_code>`, profile.py) and
+    # provider_client's empty-reply error used to fall through to "internal",
+    # telling the user our system broke when the model's output was unusable.
+    # prod 30d: 4 profile_invalid + 1 empty reply, all shown as internal.
+    profile_invalid = re.search(r"genesis_profile_invalid:([a-z_]+)", lower)
+    if profile_invalid:
+        if profile_invalid.group(1) in {"reply_empty", "map_reply_empty"}:
+            return "model_empty_output"
+        return "model_bad_json"
+    if "provider response had no usable reply text" in lower:
+        return "model_empty_output"
+
     # I6: worker._classify_fact_map_failures appends the real cause it picked
     # (by priority across every fact-map exception in the batch) as a third
     # colon-segment — check that BEFORE the bare-string fallback below so a

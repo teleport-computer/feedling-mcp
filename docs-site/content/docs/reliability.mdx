@@ -275,7 +275,11 @@ jobs release the account slot.
 The worker uses the first real model request as a canary with a default
 60-second timeout. A timed-out canary ends the job with
 `distill_model_too_slow`; changing to a faster model is required before retry.
-Malformed JSON response bodies are reported as `model_bad_json`. Other provider
+Malformed JSON response bodies are reported as `model_bad_json`. An identity
+profile the model returned but that fails validation (not JSON, a missing or
+empty field, a placeholder, or over its length budget) is also reported as
+`model_bad_json`, and an empty profile or provider reply as `model_empty_output`,
+instead of an internal error. Other provider
 configuration failures retain their specific error class and remediation
 guidance.
 For a non-empty long-term-memory (`keep_all`) import, producing zero memory
