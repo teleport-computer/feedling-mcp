@@ -139,3 +139,149 @@ def test_plaintext_genesis_all_rejected_batch_fails_job_instead_of_done_zero(mon
     assert job["memory_action_count"] == 0
     assert "capture_mode_invalid" in job["error"]
     assert db.memory_load(user_id) == []
+
+
+# ---------------------------------------------------------------------------
+# T750-B: very short material the model finds nothing in (Seven 2026-09-28:
+# copy approved verbatim, still a failed import)
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from genesis import plaintext_garden  # noqa: E402
+
+APPROVED_ZH = "这份材料太短,没找到可以记下的内容。补充一些细节后再导入试试。"
+APPROVED_EN = (
+    "This material is too short — nothing worth remembering was found. "
+    "Add some detail and import it again."
+)
+
+
+def _run_add_memory_with(monkeypatch, *, text: str, reply: str, strategy: str = "single_pass"):
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    user_id, store = _setup_plaintext_job(monkeypatch, job_id=job_id)
+    if strategy == "two_pass":
+        # Production default: the fixture pins single_pass, undo it.
+        monkeypatch.delenv("FEEDLING_GARDEN_IMPORT_STRATEGY", raising=False)
+    calls = []
+
+    class _ReplyLLM:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, **kwargs):
+            calls.append(kwargs.get("idempotency_key"))
+            return types.SimpleNamespace(text=reply, stop_reason="stop")
+
+    monkeypatch.setattr(plaintext, "GenesisLLMClient", _ReplyLLM)
+    plaintext._run_plaintext_genesis_job(
+        store, "api_key", job_id, mode="add_memory",
+        source_groups=[{
+            "source_kind": "memory_summary_import",
+            "source_family": "memory_summary",
+            "chunk_texts": [text],
+        }],
+    )
+    assert calls, "the model was never called"
+    return user_id, db.genesis_get_job(user_id, job_id)
+
+
+_EMPTY = {"single_pass": json.dumps({"cards": []}), "two_pass": json.dumps({"candidates": []})}
+_MALFORMED = {"single_pass": json.dumps({"cards": [17]}),
+              "two_pass": json.dumps({"candidates": [17]})}
+
+
+@pytest.mark.parametrize("strategy", ["single_pass", "two_pass"])
+def test_short_material_with_nothing_to_remember_fails_with_the_approved_copy(
+    monkeypatch, strategy
+):
+    text = "我喜欢猫。"
+    assert len(text) <= plaintext_garden.SHORT_MATERIAL_MAX_CHARS
+    user_id, job = _run_add_memory_with(
+        monkeypatch, text=text, reply=_EMPTY[strategy], strategy=strategy)
+
+    assert job["status"] == "failed", job
+    assert job["memory_action_count"] == 0
+    assert db.memory_load(user_id) == []
+    assert "distill_material_too_short" in job["error"]
+    assert service.classify_genesis_error(job["error"]) == "distill_material_too_short"
+    copy = service.genesis_failure_required_text(job["error"], ingest="plaintext")
+    assert APPROVED_ZH in copy
+    assert APPROVED_EN in copy
+    # The zh-only error_hint field (read by the app when friendly_copy is absent)
+    # carries the same approved sentences, the final full stop left to the UI.
+    assert service.GENESIS_ERROR_HINTS["distill_material_too_short"] + "。" == APPROVED_ZH
+    assert service.GENESIS_ERROR_HINTS_EN["distill_material_too_short"] + "." == APPROVED_EN
+
+
+@pytest.mark.parametrize("strategy", ["single_pass", "two_pass"])
+def test_short_material_with_a_malformed_nonempty_list_is_not_too_short(monkeypatch, strategy):
+    """T752 review: the parser silently skips malformed entries, so this also ends
+    with zero cards and nothing dropped — but the model did not say "nothing"."""
+    _user_id, job = _run_add_memory_with(
+        monkeypatch, text="我喜欢猫。", reply=_MALFORMED[strategy], strategy=strategy)
+
+    assert job["status"] == "failed", job
+    assert service.classify_genesis_error(job["error"]) != "distill_material_too_short"
+
+
+@pytest.mark.parametrize("strategy", ["single_pass", "two_pass"])
+def test_long_material_with_zero_cards_keeps_the_switch_model_copy(monkeypatch, strategy):
+    text = "我喜欢猫。" * (plaintext_garden.SHORT_MATERIAL_MAX_CHARS // 5 + 1)
+    assert len(text) > plaintext_garden.SHORT_MATERIAL_MAX_CHARS
+    _user_id, job = _run_add_memory_with(
+        monkeypatch, text=text, reply=_EMPTY[strategy], strategy=strategy)
+
+    assert job["status"] == "failed", job
+    assert service.classify_genesis_error(job["error"]) == "distill_empty_output"
+    copy = service.genesis_failure_required_text(job["error"], ingest="plaintext")
+    assert APPROVED_ZH not in copy and APPROVED_EN not in copy
+
+
+def test_short_material_where_the_model_failed_keeps_the_switch_model_copy(monkeypatch):
+    """Nothing usable because the model's output was broken is not "too short"."""
+    _user_id, job = _run_add_memory_with(
+        monkeypatch, text="我喜欢猫。", reply="这不是 JSON")
+
+    assert job["status"] == "failed", job
+    assert service.classify_genesis_error(job["error"]) != "distill_material_too_short"
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ('{"cards": []}', True),
+        ('{"candidates": []}', True),
+        ('<think>先想想 {"cards":[1]}</think>{"cards": []}', True),
+        ('{"cards": [17]}', False),
+        ('{"cards": [], "extra": [1]}', False),
+        ('{"note": "nothing"}', False),    # no list at all
+        ("[]", False),                     # not an object
+        ("这不是 JSON", False),
+        ("", False),
+    ],
+)
+def test_explicit_empty_reply_rule(reply, expected):
+    assert plaintext_garden._reply_is_explicit_empty(reply) is expected
+
+
+@pytest.mark.parametrize(
+    ("chars", "dropped", "skipped", "replies", "empty", "expected"),
+    [
+        (1, 0, 0, 1, 1, True),
+        (plaintext_garden.SHORT_MATERIAL_MAX_CHARS, 0, 0, 2, 2, True),
+        (plaintext_garden.SHORT_MATERIAL_MAX_CHARS + 1, 0, 0, 1, 1, False),
+        (10, 1, 0, 1, 1, False),   # a candidate was proposed and dropped
+        (10, 0, 1, 1, 1, False),   # a batch failed and was skipped
+        (0, 0, 0, 1, 1, False),    # no material at all is not "too short"
+        (10, 0, 0, 0, 0, False),   # no model reply seen: no evidence
+        (10, 0, 0, 2, 1, False),   # one reply was not an explicit empty list
+    ],
+)
+def test_too_short_rule(chars, dropped, skipped, replies, empty, expected):
+    source = types.SimpleNamespace(family="memory_summary", windows=["字" * chars])
+    other = types.SimpleNamespace(family="history", windows=["字" * 10_000])
+    result = types.SimpleNamespace(dropped=dropped, batches_skipped=skipped)
+    importer = types.SimpleNamespace(model_replies=replies, explicit_empty_replies=empty)
+    assert plaintext_garden._too_short_and_nothing_proposed(
+        [source, other], result, importer) is expected
