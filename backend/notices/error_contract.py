@@ -183,8 +183,14 @@ _EXPLICIT_PROVIDER_AUTH = re.compile(
 #  "code":"insufficient_user_quota"}} (T729). Only this explicit evidence moves a
 # 403 off the fail-closed authentication default. Each marker states a shortfall
 # by itself; a bare balance field (e.g. 用户剩余额度) does not.
+# T750 (prod 30d): relays also answer "用户额度不足, 剩余额度: ¥-0.0003" and
+# "This premium model requires an active paid plan or real deposited balance",
+# both of which were reported to the user as an invalid API key. Only the
+# shortfall phrase counts: a bare "real deposited balance" is a balance noun,
+# like 用户剩余额度 above, and must not turn an unknown 403 into a top-up hint.
 _EXPLICIT_PROVIDER_QUOTA_403 = re.compile(
-    r"insufficient_user_quota|insufficient_quota|预扣费额度失败|余额不足",
+    r"insufficient_user_quota|insufficient_quota|预扣费额度失败|余额不足|额度不足"
+    r"|requires an active paid plan",
     re.IGNORECASE,
 )
 

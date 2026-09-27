@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Genesis import failures now name the actual cause more often. An identity
+  profile the model returned in an unusable shape is reported as
+  `model_bad_json` and an empty reply as `model_empty_output` (both were an
+  internal error), and relay `403` responses reporting `额度不足` or a required
+  paid plan / deposited balance are reported as quota exhaustion instead of an
+  invalid API key — on every lane that uses the shared classification.
+
 - The resident CLI output limit (`FEEDLING_CLI_MAX_OUTPUT_BYTES`) now counts the
   content it keeps rather than raw transfer: pi resends the whole reply so far on
   every token, so a `message_update` line is dropped once a parseable one with no
