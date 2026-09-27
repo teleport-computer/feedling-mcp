@@ -16,7 +16,10 @@
 """
 from __future__ import annotations
 
+import json
+
 import distillation_ledger
+from memgarden.text.card_text import extract_json_block
 from genesis import foreground_identity, import_engine, lightweight_identity, service, worker
 from genesis import plaintext as pt
 from hosted import history_import
@@ -42,8 +45,24 @@ class HostedImport:
         self.job_id = job_id
         self.progress = progress
         self.state = progress.garden_state(locale=language, user_name=user_name)
-        self._complete = import_engine.llm_complete(
+        model_complete = import_engine.llm_complete(
             llm, user_id=store.user_id, job_id=job_id, runtime=runtime)
+        #: Content-free reply evidence for T750-B: how many model replies this
+        #: run saw, and how many were an explicitly empty list (e.g.
+        #: {"cards": []} / {"candidates": []}). The shared parser silently
+        #: skips malformed entries, so "zero cards, nothing dropped" alone does
+        #: not prove the model said there was nothing to remember.
+        self.model_replies = 0
+        self.explicit_empty_replies = 0
+
+        def complete(prompt: str, purpose: str):
+            text, truncated = model_complete(prompt, purpose)
+            self.model_replies += 1
+            if not truncated and _reply_is_explicit_empty(text):
+                self.explicit_empty_replies += 1
+            return text, truncated
+
+        self._complete = complete
         self._write = import_engine.store_writer(store, api_key)
         self._known: list[dict] | None = None
 
@@ -92,6 +111,47 @@ def _prompt_card(card: dict) -> dict:
     return {k: v for k, v in dict(card).items() if k not in {"id", "_source_family"}}
 
 
+#: Material at or under this many characters, from which the model proposed no
+#: card at all, is "too short" rather than a model failure (T750-B). Prod, last
+#: 30 days: the three such failures had 125/343/392 bytes of material (a
+#: sentence or two); the zero-card failures on real material had 6.5–14 KB.
+SHORT_MATERIAL_MAX_CHARS = 500
+
+
+def _reply_is_explicit_empty(text: str) -> bool:
+    """The reply is a JSON object whose lists are all present and empty."""
+    block = extract_json_block(str(text or ""))
+    try:
+        payload = json.loads(block) if block else None
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    lists = [value for value in payload.values() if isinstance(value, list)]
+    return bool(lists) and all(not value for value in lists)
+
+
+def _too_short_and_nothing_proposed(sources, result, importer) -> bool:
+    """True only when the model explicitly answered "nothing" on tiny material.
+
+    Every model reply of this run must be an explicitly empty list — a
+    malformed list the parser filtered to nothing is not "nothing to
+    remember". Any dropped candidate or skipped batch also keeps
+    ``distill_empty_output`` (switch models).
+    """
+    if result.dropped or result.batches_skipped:
+        return False
+    if not importer.model_replies or importer.explicit_empty_replies != importer.model_replies:
+        return False
+    chars = sum(
+        len(window or "")
+        for source in sources
+        if source.family == "memory_summary"
+        for window in source.windows
+    )
+    return 0 < chars <= SHORT_MATERIAL_MAX_CHARS
+
+
 def _emit_partial(store, job_id: str, dropped: int) -> None:
     if dropped > 0:
         notices_core.emit(store, source="genesis", error_class="genesis_partial",
@@ -132,6 +192,22 @@ def run_add_memory(store, api_key: str | None, job_id: str, *, runtime, source_g
     progress.publish(stage="plaintext_add_memory", status="processing")
     result = runner.run(sources, stage="plaintext_add_memory")
     keep_all_job = any(s.family == "memory_summary" for s in sources)
+    if keep_all_job and result.cards_written == 0 and _too_short_and_nothing_proposed(
+        sources, result, runner
+    ):
+        # T750-B (Seven 2026-09-28: 仍算失败): a sentence or two of material where
+        # the model cleanly proposed nothing. Still a failed import — no cards,
+        # never "done" — but telling this user to switch models is wrong.
+        progress.publish(stage="plaintext_add_memory_failed", status="processing", extra={
+            "distill_diagnostics": {
+                "reason": "keep_all_material_too_short",
+                "raw_memory_count": 0,
+                "batches_skipped": 0,
+                "model_replies": runner.model_replies,
+                "explicit_empty_replies": runner.explicit_empty_replies,
+            }})
+        raise worker.GenesisWorkerError(
+            "distill_material_too_short:keep_all_nonempty:zero_memory_cards")
     if keep_all_job and result.cards_written == 0:
         # 与切换前同一个失败码：长期记忆档案一张卡都没落，不能以「完成」收尾。
         progress.publish(stage="plaintext_add_memory_failed", status="processing", extra={

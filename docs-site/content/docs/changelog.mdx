@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- A long-term-memory import of a sentence or two, where the model finds nothing
+  to remember, now fails as `distill_material_too_short` and asks the user to
+  add some detail, instead of telling them to switch models. It still counts
+  as a failed import and writes no cards.
+
 - Genesis import's first model call (the "model too slow" check) now allows
   120 seconds on `openai_compatible` relay routes instead of 60; other routes
   keep 60 seconds. Each import model call's content-free record now includes

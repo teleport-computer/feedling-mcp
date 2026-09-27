@@ -289,6 +289,10 @@ configuration failures retain their specific error class and remediation
 guidance.
 For a non-empty long-term-memory (`keep_all`) import, producing zero memory
 cards fails the job as `distill_empty_output` instead of publishing `done`.
+When the material is at most 500 characters and the model cleanly proposed
+nothing (no candidate dropped, no batch failed), the job still fails, as
+`distill_material_too_short`, with copy asking for more detail instead of a
+different model.
 Discarded map attempts add at most six diagnostics to the user-owned job
 output. Each diagnostic includes a discard reason and at most 500 characters
 of the model reply, plus its original length and truncation flag. Empty map
