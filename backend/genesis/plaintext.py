@@ -832,6 +832,21 @@ class _PlaintextCheckpointProgress:
     def processed_chunks(self) -> int:
         return sum(item["windows_done"] for item in self.materials())
 
+    def done_output(self, stage: str, **extra: Any) -> dict[str, Any]:
+        """The final output a completion writes, in the shape ``publish`` writes.
+
+        ``db.genesis_complete_job`` replaces the whole output column and marks
+        the job done in the same statement. Completing with an output that
+        lacks ``materials`` left a window (until the following ``publish``)
+        in which the status read showed done with no materials (T757/T758).
+        """
+        return {
+            **extra,
+            "stage": stage,
+            "materials": self.materials(),
+            "identity_ready": True,
+        }
+
     def publish(
         self,
         *,
@@ -1538,16 +1553,20 @@ def _run_plaintext_update_identity_job(
         for source_pass, group in enumerate(progress.source_groups, start=1):
             family = str(group.get("source_family") or "ai_persona")
             progress.record_non_map_group(source_pass, family, cards=2)
+    identity_output = {
+        "identity_field_lock": identity_field_lock,
+        "profile_ref": profile_ref,
+        "profile_sha256": profile_sha,
+        "profile_status": profile_status,
+    }
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
-        output={
-            "stage": "plaintext_update_identity_done",
-            "identity_field_lock": identity_field_lock,
-            "profile_ref": profile_ref,
-            "profile_sha256": profile_sha,
-            "profile_status": profile_status,
-        },
+        output=(
+            progress.done_output("plaintext_update_identity_done", **identity_output)
+            if progress
+            else {"stage": "plaintext_update_identity_done", **identity_output}
+        ),
         memory_action_count=0,
         identity_status=status,
         persona_ref=persona_ref,
