@@ -3509,3 +3509,44 @@ def test_bracketed_non_address_never_escapes_as_a_valueerror():
             pass
         except ValueError as exc:  # pragma: no cover - the regression itself
             raise AssertionError(f"ValueError escaped for {base_url!r}: {exc}") from exc
+
+
+
+# (provider, model, base_url, 2xx body) — one case per chat_completion dispatch
+# branch: anthropic, bedrock, gemini, openai Responses (gpt-5*/o-series),
+# openai chat, and the openai-compatible fallthrough (openai_compatible/deepseek).
+_PROBE_CASES = [
+    ("anthropic", "some-model", "", {"content": [{"type": "text", "text": "ok"}]}),
+    ("bedrock", "some-model", "https://bedrock.example",
+     {"output": {"message": {"content": [{"text": "ok"}]}}}),
+    ("gemini", "some-model", "", {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+    ("openai", "gpt-5.2", "",
+     {"output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}),
+    ("openai", "gpt-4o-mini", "", {"choices": [{"message": {"content": "ok"}}]}),
+    ("openai_compatible", "some-model", "https://relay.example/v1",
+     {"choices": [{"message": {"content": "ok"}}]}),
+    ("deepseek", "some-model", "", {"choices": [{"message": {"content": "ok"}}]}),
+]
+
+
+@pytest.mark.parametrize(("provider", "model", "base_url", "body"), _PROBE_CASES)
+def test_setup_probe_http_timeout_is_90_seconds(monkeypatch, provider, model, base_url, body):
+    # T754 (Seven 09-28): setup's probe passes 90 s as the HTTP timeout (httpx
+    # applies it per phase, not as a whole-call deadline; bounded compatibility
+    # retries may add attempts). Pin the value on every request each dispatch
+    # branch sends.
+    seen: list = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, *, headers=None, json=None, timeout=None):
+            seen.append(timeout)
+            return FakeResponse(200, body)
+
+    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+    pc.test_provider_key(pc.ProviderConfig(provider, model, "sk-x", base_url=base_url))
+    assert seen and all(t == 90.0 for t in seen), seen
+    assert pc.SETUP_PROBE_TIMEOUT_S == 90.0
