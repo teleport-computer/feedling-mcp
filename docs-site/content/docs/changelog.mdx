@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- A long-term-memory import of a sentence or two, where the model finds nothing
+  to remember, now fails as `distill_material_too_short` and asks the user to
+  add some detail, instead of telling them to switch models. It still counts
+  as a failed import and writes no cards.
+
 - The provider test that runs when adding or switching a Model API route now
   uses a 90-second HTTP timeout (was 30), giving slow relay channels more time
   before `provider network error: ReadTimeout`. It is not a deadline for the
