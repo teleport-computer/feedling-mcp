@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Genesis import's first model call (the "model too slow" check) now allows
+  120 seconds on `openai_compatible` relay routes instead of 60; other routes
+  keep 60 seconds. Each import model call's content-free record now includes
+  its elapsed time.
+
 - Identity profile generation accepts more well-formed replies: reasoning a
   relay inlines in `<think>` is stripped first (the same stripper memory-card
   parsing uses), every `{` in the reply is tried in turn, and extra keys next to
