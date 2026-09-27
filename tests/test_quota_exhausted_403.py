@@ -40,7 +40,11 @@ def test_exhausted_balance_403_is_quota_not_auth(body):
     assert error_contract.provider_response_is_auth_failure(403, body) is False
 
 
-QUOTA_MARKERS = ["insufficient_user_quota", "insufficient_quota", "预扣费额度失败", "余额不足"]
+QUOTA_MARKERS = [
+    "insufficient_user_quota", "insufficient_quota", "预扣费额度失败", "余额不足",
+    # T750 (prod 30d, both reported to the user as an invalid API key)
+    "额度不足", "requires an active paid plan",
+]
 
 
 @pytest.mark.parametrize("marker", QUOTA_MARKERS)
@@ -182,3 +186,40 @@ def test_every_lane_keeps_real_auth_failures(name, classify, quota_code, auth_co
     exc = _ProviderError(403, AUTH_403_BODY, "Invalid API key")
     assert classify(exc) == auth_code
     assert classify(_ProviderError(401, "", "unauthorized")) == auth_code
+
+
+# T750: the two prod identity-card failures that were shown as "API key invalid",
+# as the genesis error string carries them (request ids and amounts altered).
+T750_GENESIS_403_ERRORS = [
+    "update_identity_failed:provider_identity_failed:ProviderError:provider_http_403: "
+    "用户额度不足, 剩余额度: ¥-0.000100 (request id: 20260101000000000000000000000000)",
+    "update_identity_failed:provider_identity_failed:ProviderError:provider_http_403: "
+    "This premium model requires an active paid plan or real deposited balance. "
+    "Subscribe to a plan or top up your wallet to use it",
+]
+
+
+@pytest.mark.parametrize("error", T750_GENESIS_403_ERRORS)
+def test_genesis_reports_relay_balance_403_as_quota(error):
+    from genesis import service
+
+    assert service.classify_genesis_error(error) == "provider_quota"
+
+
+def test_genesis_still_reports_an_invalid_key_403_as_bad_key():
+    from genesis import service
+
+    assert service.classify_genesis_error(
+        "update_identity_failed:provider_identity_failed:ProviderError:"
+        "provider_http_403: Invalid API key provided"
+    ) == "bad_api_key"
+
+
+
+@pytest.mark.parametrize("body", [
+    # T750 review: a balance noun alone states no shortfall (same rule as 用户剩余额度).
+    "Forbidden for this model; real deposited balance: 100",
+    '{"error":{"message":"real deposited balance: 100","code":"forbidden"}}',
+])
+def test_a_bare_deposited_balance_field_is_not_quota(body):
+    assert error_contract.provider_response_is_quota_exhausted(403, body) is False

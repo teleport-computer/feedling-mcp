@@ -26,10 +26,6 @@ def _reply(memory: str = "共同经历与承诺", style: str = "偏好直接温�
         ('{"style":"只有一边"}', "missing_field:memory"),
         ('{"memory":"","style":"有效"}', "field_empty:memory"),
         ('{"memory":"有效","style":17}', "field_empty:style"),
-        (
-            '{"memory":"有效","style":"有效","extra":"不允许"}',
-            "reply_not_json",
-        ),
     ],
 )
 def test_validate_profile_reject_matrix_is_all_or_nothing(raw, expected):
@@ -524,3 +520,47 @@ def test_fragmentation_prefers_newlines_without_loss_or_reordering():
     assert "".join(fragments) == source
     assert "".join(piece for group in groups for piece in group) == source
     assert all(len(fragment) <= 6 for fragment in fragments)
+
+
+# ---------------------------------------------------------------------------
+# T750: tolerant parsing, with the truly broken twin of every case still failing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Extra keys are ignored (prod: relay models add fields such as "reasoning").
+        '{"memory":"有效","style":"有效","extra":"忽略"}',
+        '{"reasoning":"先想一下","memory":"有效","style":"有效"}',
+        # Prose with a brace before the object used to fail the whole reply.
+        '好的 {这里是说明} 如下:\n{"memory":"有效","style":"有效"}',
+        # A draft object missing a field, then the full answer: the full one wins.
+        '{"memory":"草稿"} 修改后: {"memory":"有效","style":"有效"}',
+        # Fence still accepted.
+        '```json\n{"memory":"有效","style":"有效","note":"x"}\n```',
+    ],
+)
+def test_validate_profile_tolerates_prose_braces_and_extra_keys(raw):
+    fields, reject = profile._validate_profile(raw)
+    assert reject == ""
+    assert fields == {"memory": "有效", "style": "有效"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Truncated / malformed objects are still not JSON.
+        ('{"memory":"有效","style":"有', "reply_not_json"),
+        ('好的 {这里是说明} 但没有答案', "reply_not_json"),
+        ('["memory","style"]', "reply_not_json"),
+        # Only a partial object anywhere: the field check names what is missing.
+        ('说明 {"memory":"有效"} 结束', "missing_field:style"),
+        ('{"memory":"有效","extra":"x"}', "missing_field:style"),
+        # Extra keys never rescue an empty required field.
+        ('{"memory":"有效","style":"","extra":"x"}', "field_empty:style"),
+    ],
+)
+def test_validate_profile_still_rejects_truly_broken_replies(raw, expected):
+    fields, reject = profile._validate_profile(raw)
+    assert fields is None
+    assert reject == expected

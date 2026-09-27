@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -47,6 +48,22 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return default
+
+
+def _canary_timeout_sec(runtime) -> float:
+    """Budget for a job's first model call (the "model too slow" canary).
+
+    T750, prod last 30 days: 7 of the 8 jobs failed as distill_model_too_slow
+    ran through ``openai_compatible`` relays (Claude opus/sonnet/haiku, one
+    DeepSeek). Upper bounds for a successful job's first call, measured from
+    job timestamps: official DeepSeek p50 4.8s / p90 12.7s; relay Claude p50
+    26s / p90 114s. A single 60s attempt fails the tail of healthy relay
+    calls, so relays get 120s; every other route keeps 60s. Still one
+    attempt: the canary exists to fail a truly slow model fast.
+    """
+    if str(getattr(runtime, "provider", "") or "") == "openai_compatible":
+        return float(_env_int("FEEDLING_GENESIS_RELAY_CANARY_TIMEOUT_SEC", 120))
+    return float(_env_int("FEEDLING_GENESIS_CANARY_TIMEOUT_SEC", 60))
 
 
 def _per_user_concurrency() -> int:
@@ -131,7 +148,7 @@ class GenesisLLMClient:
         # here — it would multiply one blip into N×M upstream calls.
         canary_call = self._canary_pending
         effective_timeout = (
-            float(_env_int("FEEDLING_GENESIS_CANARY_TIMEOUT_SEC", 60))
+            _canary_timeout_sec(runtime)
             if canary_call
             else timeout
         )
@@ -147,6 +164,7 @@ class GenesisLLMClient:
             # a single attempt by design: a slow first real call fails the job fast.
             completion_kwargs["max_attempts"] = 1 if canary_call else 3
             completion_kwargs["max_timeout_attempts"] = 1 if canary_call else 2
+        started = time.monotonic()
         try:
             with _user_slot(user_id):
                 result = self._completion_fn(runtime, messages, **completion_kwargs)
@@ -176,6 +194,11 @@ class GenesisLLMClient:
             "response_chars": len(text),
             "max_tokens": capped_max_tokens,
             "timeout": effective_timeout,
+            # T750: wall time of this call (slot wait + provider round trips
+            # and retries), so "is the first-call budget right" can be
+            # measured instead of bounded from job timestamps.
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "canary": bool(canary_call),
             "budget_label": budget_label,
             "plaintext_stored": False,
             "stop_reason": stop_reason,

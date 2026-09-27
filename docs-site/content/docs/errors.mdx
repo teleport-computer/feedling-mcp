@@ -54,9 +54,9 @@ fails, Feedling records a content-free warning in service logs, so dashboard
 totals can be lower than the actual number of rejected values.
 
 A provider `403` whose original body explicitly reports an exhausted balance
-(`insufficient_user_quota`, `insufficient_quota`, `预扣费额度失败`, or `余额不足`,
-as returned by new-api/one-api style relays; a remaining-balance field alone does
-not count) is classified as
+(`insufficient_user_quota`, `insufficient_quota`, `预扣费额度失败`, `余额不足`,
+`额度不足`, or `requires an active paid plan`, as returned by relays; a remaining-balance field alone does not count, and explicit
+invalid-key wording in the same body keeps the authentication reading) is classified as
 quota exhaustion, with the existing quota notice, on chat and wake turns, memory
 extraction, vision, image generation, genesis import, credential probes, and
 resident provider-attempt telemetry.

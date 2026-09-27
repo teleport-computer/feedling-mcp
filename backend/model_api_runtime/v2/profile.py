@@ -149,22 +149,36 @@ def _finite_ratio(value: Any, *, name: str) -> float:
 
 
 def _extract_json_block(raw: str) -> str:
-    """Extract the first complete JSON object, accepting an optional fence."""
+    """Extract the profile JSON object, accepting an optional fence.
+
+    Every ``{`` is tried in order (T750): a model may write prose, or a relay
+    may inline its reasoning, before the object, and a brace in that text used
+    to fail the whole reply. The first object carrying both profile fields
+    wins; failing that, the first object at all, so the field checks below
+    still name what is missing. Callers strip ``<think>`` blocks before this
+    point (this module stays stdlib-only).
+    """
 
     text = (raw or "").strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
         if text.lstrip().lower().startswith("json"):
             text = text.lstrip()[4:]
-    start = text.find("{")
-    if start < 0:
-        return ""
     decoder = json.JSONDecoder()
-    try:
-        _value, end = decoder.raw_decode(text[start:])
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return ""
-    return text[start : start + end]
+    first_object = ""
+    start = text.find("{")
+    while start >= 0:
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value, end = None, 0
+        if isinstance(value, dict):
+            block = text[start : start + end]
+            if {"memory", "style"} <= set(value):
+                return block
+            first_object = first_object or block
+        start = text.find("{", start + 1)
+    return first_object
 
 
 def _looks_like_placeholder(text: str) -> bool:
@@ -254,8 +268,9 @@ def _validate_profile_with_observation(
     for field_name in ("memory", "style"):
         if field_name not in payload:
             return None, f"missing_field:{field_name}", None
-    if set(payload) != {"memory", "style"}:
-        return None, "reply_not_json", None
+    # Extra keys are ignored (T750): only the two fields below are ever used,
+    # and relays' models add fields such as "reasoning" that used to fail an
+    # otherwise valid profile as "not JSON".
 
     required = {
         "memory": bool(require_memory),

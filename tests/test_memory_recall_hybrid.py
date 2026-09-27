@@ -1,7 +1,7 @@
 """T523 hybrid automatic recall: default-off byte identity, fusion, whole-turn fallback,
 bounded encoding, vector authorization, and sweep/recall projection parity.
 
-Run with the pinned memgarden (0.22.0):
+Run with the pinned memgarden (backend/requirements.txt):
     python -m pytest tests/test_memory_recall_hybrid.py -q
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ import base64
 import importlib.metadata
 import json
 import math
+import re
 import struct
 import sys
 import threading
@@ -22,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import pytest  # noqa: E402
 
 import recall_golden_cases as golden  # noqa: E402
+
+REQUIREMENTS = Path(__file__).parent.parent / "backend" / "requirements.txt"
 from enclave import recall_hybrid  # noqa: E402
 from enclave.routes import chat  # noqa: E402
 from memory import card_shape, recall_metadata  # noqa: E402
@@ -44,7 +47,12 @@ def _recent_original():
 
 def test_golden_provenance_is_the_pre_change_baseline():
     assert GOLDEN["generated_from"] == BASELINE_SHA
-    assert GOLDEN["memgarden"] == importlib.metadata.version("memgarden") == "0.22.0"
+    # The golden was captured under 0.22.0 and stays that record. The installed
+    # package must be the pinned one; a bump that changes lexical selection
+    # fails the byte-for-byte cases below, not this line.
+    assert GOLDEN["memgarden"] == "0.22.0"
+    pinned = re.search(r"^memgarden==(\S+)$", REQUIREMENTS.read_text(), re.M).group(1)
+    assert importlib.metadata.version("memgarden") == pinned
     assert set(GOLDEN["cases"]) == {name for name, *_ in golden.SCENARIOS}
 
 

@@ -12,6 +12,38 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Updated memgarden from 0.22.0 to 0.23.0 (#10, 3e5da470; release preparation #11, fc872478). History import and daily memory capture now keep concrete one-time details of a person's life (what they bought, saw or attended; names, numbers, dates, places) instead of dropping them as one-off events, and are told not to record the companion's own suggestions as the person's facts or to supply a missing year. Dream merges are asked to keep those values. The resident memory recheck pass follows the same rule.
+
+- A long-term-memory import of a sentence or two, where the model finds nothing
+  to remember, now fails as `distill_material_too_short` and asks the user to
+  add some detail, instead of telling them to switch models. It still counts
+  as a failed import and writes no cards.
+
+- The provider test that runs when adding or switching a Model API route now
+  uses a 90-second HTTP timeout (was 30), giving slow relay channels more time
+  before `provider network error: ReadTimeout`. It is not a deadline for the
+  whole test and does not guarantee the route can be added. Clients must wait
+  longer than this; iOS app versions that still use the 60-second system
+  default give up first.
+
+- Genesis import's first model call (the "model too slow" check) now allows
+  120 seconds on `openai_compatible` relay routes instead of 60; other routes
+  keep 60 seconds. Each import model call's content-free record now includes
+  its elapsed time.
+
+- Identity profile generation accepts more well-formed replies: reasoning a
+  relay inlines in `<think>` is stripped first (the same stripper memory-card
+  parsing uses), every `{` in the reply is tried in turn, and extra keys next to
+  `memory` and `style` are ignored and discarded rather than failing the whole
+  reply. Truncated or non-object replies and missing or empty fields still fail.
+
+- Genesis import failures now name the actual cause more often. An identity
+  profile the model returned in an unusable shape is reported as
+  `model_bad_json` and an empty reply as `model_empty_output` (both were an
+  internal error), and relay `403` responses reporting `额度不足` or a required
+  paid plan / deposited balance are reported as quota exhaustion instead of an
+  invalid API key — on every lane that uses the shared classification.
+
 - The resident CLI output limit (`FEEDLING_CLI_MAX_OUTPUT_BYTES`) now counts the
   content it keeps rather than raw transfer: pi resends the whole reply so far on
   every token, so a `message_update` line is dropped once a parseable one with no

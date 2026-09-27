@@ -44,10 +44,13 @@ def test_curated_archive_keeps_everything():
     assert "When in doubt, keep it" in p.selection_rubric
 
 
-def test_history_import_filters_one_off_events():
+def test_history_import_keeps_one_off_specifics():
+    """memgarden 0.23.0 (#10): a one-time concrete detail of the person's own life is
+    kept, not filtered as a "one-off event"; the companion's own words are not."""
     p = get_policy("history_import")
-    assert "one-off events" in p.selection_rubric
-    assert "small talk" in p.selection_rubric
+    assert "one-off events" not in p.selection_rubric
+    assert "DO keep the concrete specifics of this person's own life" in p.selection_rubric
+    assert "what the companion itself said or suggested" in p.selection_rubric
 
 
 def test_rubrics_are_all_different():
@@ -260,9 +263,11 @@ def test_history_import_is_also_single_source_now():
 #: 所以这里用完整哈希（codex review 2026-08-14 指出原守卫不够）。
 #: **有意改 prompt 时更新这些值，并在提交说明里写清改了什么、为什么。**
 #: 2026-08-23 提示词英文化后重算。上一代摘要对应的是中文版本。
+#: 2026-09-28 memgarden 0.22.0 → 0.23.0 重算（#10）：导入尺子的开场与过滤句改成「本人生活里的
+#: 具体事即使只发生一次也记；AI 自己说的/建议的不记」—— 两份 prompt 的差异只有这几行。
 _GENESIS_PROMPT_GOLDEN = {
-    "FACT_MAP_PROMPT": "8a666759e592a301",
-    "COMBINED_MAP_PROMPT": "39fac759f4115bba",
+    "FACT_MAP_PROMPT": "a59f075a7fa06286",
+    "COMBINED_MAP_PROMPT": "a6a1f312257aba72",
 }
 
 
