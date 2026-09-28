@@ -918,6 +918,19 @@ def test_sleep_is_refused_out_loud_rather_than_silently_doing_nothing(clean):
     assert any("health_sleep" in w for w in out["warnings"]), out["warnings"]
 
 
+def test_every_healthkit_point_fact_with_a_sample_id_is_retractable():
+    """生产者给了稳定 sample id 的单样本事实，删除监听必须能走到 Kit。"""
+    from perception.perceptkit_adapter.shadow import RETRACTABLE_SIGNALS
+
+    assert RETRACTABLE_SIGNALS == frozenset({
+        "health_weight", "health_bmi", "health_body_fat", "health_height",
+        "health_glucose", "health_blood_pressure",
+        "health_resting_hr", "health_current_hr", "health_hrv",
+        "health_respiratory", "health_oxygen", "health_vo2max",
+        "health_workout",
+    })
+
+
 def test_a_partly_malformed_deletion_batch_is_not_acknowledged_as_complete(clean):
     """有效项可幂等执行，但整批必须明确非 accepted，客户端才不会推进所有锚点。"""
     from unittest.mock import patch

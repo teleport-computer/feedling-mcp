@@ -586,7 +586,7 @@ __all__ = [
 #:
 #: 判据只有一条：**一条上游样本是不是就等于一条事实。**
 #:
-#:     是   体重 / BMI / 体脂 / 身高 / 血糖 / 血压 / 运动
+#:     是   体重 / BMI / 体脂 / 身高 / 血糖 / 血压 / 单点生命体征 / 运动
 #:          删掉那条样本 = 那条事实不作数了 → 撤回
 #:     否   睡眠：一夜由几十条 HealthKit 样本聚成一条事实。删掉其中一条，
 #:          "那一夜"这件事没有消失、只是数字变了 —— 那是**修订**，
@@ -595,7 +595,10 @@ __all__ = [
 #:          而我们存的是从锚点样本派生的子 id。
 RETRACTABLE_SIGNALS = frozenset({
     "health_weight", "health_bmi", "health_body_fat", "health_height",
-    "health_glucose", "health_blood_pressure", "health_workout",
+    "health_glucose", "health_blood_pressure",
+    "health_resting_hr", "health_current_hr", "health_hrv",
+    "health_respiratory", "health_oxygen", "health_vo2max",
+    "health_workout",
 })
 
 
