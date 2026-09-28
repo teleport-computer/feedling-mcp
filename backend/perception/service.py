@@ -985,7 +985,7 @@ def _live_wake_yields_to_kit(user_id: str, trigger: str) -> bool:
     return True
 
 
-def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
+def _submit_wake_event_v2_compat(event, *, from_kit: bool = False):
     """Compatibility output: V2 differ event -> old proactive job queue.
 
     The wake has already been mechanically selected by PerceptionDifferV2. This
@@ -999,9 +999,11 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
 
     挡在这里而不是挡在 differ：差异要继续算、继续记，只是不投递。
     """
+    from .perceptkit_adapter.wake_port import RuntimeEnqueueResult
+
     if not from_kit and _live_wake_yields_to_kit(
             getattr(event, "user_id", ""), getattr(event, "trigger", "")):
-        return False
+        return RuntimeEnqueueResult(False, reason="perceptkit_owns_wakes")
 
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
 
@@ -1024,7 +1026,7 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return False
+        return RuntimeEnqueueResult(False, reason="activation_pending")
     if not decision.accepted:
         store.append_event(event.user_id, {
             "cap": "runtime_v2",
@@ -1036,7 +1038,7 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return False
+        return RuntimeEnqueueResult(False, reason=str(decision.reason or "host_gate"))
     wake_capability = _RUNTIME_V2_WAKE_CAPABILITY_BY_TRIGGER.get(
         str(event.trigger or "").strip().lower(), ""
     )
@@ -1064,7 +1066,7 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
             "origin_refs": list(event.origin_refs or ()),
             "ts": now,
         }, now)
-        return False
+        return RuntimeEnqueueResult(False, reason="capability_debounce")
     store.append_event(event.user_id, {
         "cap": "runtime_v2",
         "type": "wake",
@@ -1077,92 +1079,124 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
         "presence_hints": dict(event.presence_hints or {}),
         "ts": now,
     }, now)
-    _fire_wake_event_v2(event)
-    return True
+    return _fire_wake_event_v2(event)
 
 
-def _fire_wake_event_v2(event) -> None:
+def _fire_wake_event_v2(event):
+    from .perceptkit_adapter.wake_port import RuntimeEnqueueResult
+
     if not event.change_digest or not event.origin_refs:
-        log.error("drop v2 perception wake without digest/origin_refs: %s", event)
-        return
-    try:
-        from core import store as core_store  # lazy
-        from core import util as core_util  # lazy
-        from core import wake_bus as core_wake_bus  # lazy
-        from hosted import config_store as hosted_config_store  # lazy
-        from model_api_runtime.v2 import jobs_store  # lazy
-        from proactive import service as proactive_service  # lazy
-        s = core_store.get_store_per_load_mode(
-            event.user_id, reason="V2 perception enqueue uses durable helpers"
+        raise ValueError("v2 perception wake requires digest and origin_refs")
+    from core import store as core_store  # lazy
+    from core import wake_bus as core_wake_bus  # lazy
+    from hosted import config_store as hosted_config_store  # lazy
+    from model_api_runtime.v2 import jobs_store  # lazy
+    from proactive import service as proactive_service  # lazy
+    s = core_store.get_store_per_load_mode(
+        event.user_id, reason="V2 perception enqueue uses durable helpers"
+    )
+    if not event.manual and not s.proactive_activation_ready():
+        return RuntimeEnqueueResult(False, reason="activation_pending")
+    # Strict fence before selecting the queue. A failed control-plane read
+    # must not silently strand a V2 event in resident ``proactive_jobs``.
+    runtime_mode = hosted_config_store.get_hosted_runtime_mode_strict(s)
+    if runtime_mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        photo = (
+            event.payload.get("photo")
+            if isinstance(event.payload, dict)
+            and isinstance(event.payload.get("photo"), dict)
+            else {}
         )
-        if not event.manual and not s.proactive_activation_ready():
-            return
-        # Strict fence before selecting the queue. A failed control-plane read
-        # must not silently strand a V2 event in resident ``proactive_jobs``.
-        runtime_mode = hosted_config_store.get_hosted_runtime_mode_strict(s)
-        if runtime_mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
-            photo = (
-                event.payload.get("photo")
-                if isinstance(event.payload, dict)
-                and isinstance(event.payload.get("photo"), dict)
-                else {}
-            )
-            context_doc = {
-                "wake_id": str(event.wake_id or "")[:160],
-                "source": str(event.source or "")[:120],
-                "trigger": str(event.trigger or "")[:120],
-                "change_digest": str(event.change_digest or "")[:2000],
-                "origin_refs": [
-                    str(ref)[:200]
-                    for ref in list(event.origin_refs or ())[:10]
-                ],
-                "presence_hints": dict(event.presence_hints or {}),
-                "created_at": float(event.created_at or _now()),
-            }
-            if str(event.trigger or "") == "photo_added":
-                context_doc.update({
-                    "photo_id": str(photo.get("photo_id") or "")[:160],
-                    "scene": str(photo.get("scene") or "")[:200],
-                    "time_of_day": str(photo.get("time_of_day") or "")[:80],
-                })
-            job_id, _ = jobs_store.enqueue_job_with_context_log(
-                event.user_id,
-                "heartbeat",
-                reason=str(event.trigger or event.source or "perception_event")[:120],
-                trace_id=str(event.wake_id or "")[:160] or None,
-                context_stream=store.V2_WAKE_CONTEXT_STREAM,
-                context_doc=context_doc,
-                context_ts=float(event.created_at or _now()),
-            )
-            store.trim_v2_wake_context(event.user_id)
-            # A coalesced pending job may have been discovered only through a
-            # slow poll. Notify after every successful association so the new
-            # context is visible promptly; duplicate NOTIFY is harmless.
-            core_wake_bus.notify("v2_jobs", event.user_id)
-            return
-        job = {
-            "job_id": core_util._new_public_id("pj"),
-            "ts": float(event.created_at or _now()),
-            "created_at": datetime.fromtimestamp(float(event.created_at or _now())).isoformat(),
-            "source": proactive_service.PROACTIVE_JOB_SOURCE,
-            "status": "pending",
-            "intent_label": str(event.trigger or event.source)[:120],
-            "trigger": str(event.trigger or event.source)[:120],
-            "wake_kind": str(event.source or "perception_event")[:120],
-            "context_hint": str(event.change_digest or "")[:2000],
+        context_doc = {
+            "wake_id": str(event.wake_id or "")[:160],
+            "source": str(event.source or "")[:120],
+            "trigger": str(event.trigger or "")[:120],
             "change_digest": str(event.change_digest or "")[:2000],
+            "origin_refs": [
+                str(ref)[:200]
+                for ref in list(event.origin_refs or ())[:10]
+            ],
             "presence_hints": dict(event.presence_hints or {}),
-            "origin_refs": list(event.origin_refs or ()),
-            "connections": [],
-            "connection": {},
-            "frame_ids": [],
-            "device_event_ids": [],
-            "current_app": "",
-            "payload": {"v2_wake": dict(event.payload or {})},
+            "created_at": float(event.created_at or _now()),
         }
-        s.append_proactive_job(job)
-    except Exception as e:
-        log.error("fire_wake_event_v2(%s,%s) failed: %s", event.user_id, event.trigger, e)
+        if str(event.trigger or "") == "photo_added":
+            context_doc.update({
+                "photo_id": str(photo.get("photo_id") or "")[:160],
+                "scene": str(photo.get("scene") or "")[:200],
+                "time_of_day": str(photo.get("time_of_day") or "")[:80],
+            })
+        job_id, _ = jobs_store.enqueue_job_with_context_log(
+            event.user_id,
+            "heartbeat",
+            reason=str(event.trigger or event.source or "perception_event")[:120],
+            trace_id=str(event.wake_id or "")[:160] or None,
+            context_stream=store.V2_WAKE_CONTEXT_STREAM,
+            context_doc=context_doc,
+            context_ts=float(event.created_at or _now()),
+        )
+        store.trim_v2_wake_context(event.user_id)
+        # A coalesced pending job may have been discovered only through a slow
+        # poll. The authoritative enqueue already committed before this notify.
+        core_wake_bus.notify("v2_jobs", event.user_id)
+        return RuntimeEnqueueResult(True, runtime_ref=f"v2-job:{job_id}")
+    job_id = f"pk_{str(event.wake_id or '')}"[:180]
+    job = {
+        "job_id": job_id,
+        "wake_id": str(event.wake_id or "")[:160],
+        "ts": float(event.created_at or _now()),
+        "created_at": datetime.fromtimestamp(float(event.created_at or _now())).isoformat(),
+        "source": proactive_service.PROACTIVE_JOB_SOURCE,
+        "status": "pending",
+        "intent_label": str(event.trigger or event.source)[:120],
+        "trigger": str(event.trigger or event.source)[:120],
+        "wake_kind": str(event.source or "perception_event")[:120],
+        "context_hint": str(event.change_digest or "")[:2000],
+        "change_digest": str(event.change_digest or "")[:2000],
+        "presence_hints": dict(event.presence_hints or {}),
+        "origin_refs": list(event.origin_refs or ()),
+        "connections": [],
+        "connection": {},
+        "frame_ids": [],
+        "device_event_ids": [],
+        "current_app": "",
+        "payload": {"v2_wake": dict(event.payload or {})},
+    }
+    stored = s.append_proactive_job(job)
+    if not isinstance(stored, dict) or stored.get("job_id") != job_id:
+        raise RuntimeError("resident queue did not return its durable job identity")
+    return RuntimeEnqueueResult(True, runtime_ref=f"resident-job:{job_id}")
+
+
+def _lookup_wake_event_v2(event):
+    """Find durable Runtime evidence for one stable Kit event identity."""
+    from .perceptkit_adapter.wake_port import RuntimeEnqueueResult
+    from core import store as core_store
+    from model_api_runtime.v2 import jobs_store
+
+    user_id = str(getattr(event, "user_id", None)
+                  or getattr(event, "subject_id", ""))
+    wake_id = str(getattr(event, "wake_id", None)
+                  or getattr(event, "event_id", ""))
+    change_digest = str(getattr(event, "change_digest", None) or wake_id)
+    refs = {
+        f"v2-job:{job_id}"
+        for job_id in jobs_store.find_jobs_by_context_wake_id(
+            user_id, context_stream=store.V2_WAKE_CONTEXT_STREAM,
+            wake_id=wake_id,
+        )
+    }
+    s = core_store.get_store_per_load_mode(
+        user_id, reason="PerceptKit unknown delivery reconciliation"
+    )
+    for job in s.list_proactive_jobs(since_epoch=0, limit=0):
+        if (str(job.get("wake_id") or "") == wake_id
+                or str(job.get("change_digest") or "") == change_digest):
+            job_id = str(job.get("job_id") or "")
+            if job_id:
+                refs.add(f"resident-job:{job_id}")
+    if len(refs) != 1:
+        return None
+    return RuntimeEnqueueResult(True, runtime_ref=next(iter(refs)))
 
 
 def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:

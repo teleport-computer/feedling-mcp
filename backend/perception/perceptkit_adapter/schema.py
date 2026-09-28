@@ -125,6 +125,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_rule_state (
   PRIMARY KEY (subject_id, definition_id, scope_key)
 );
 
+CREATE TABLE IF NOT EXISTS perceptkit_definition_history (
+  definition_id TEXT NOT NULL, version INT NOT NULL,
+  definition JSONB NOT NULL, archived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (definition_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
   event_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL,
   definition_id TEXT NOT NULL, definition_version INT NOT NULL,
@@ -205,6 +211,7 @@ TABLES = (
     "perceptkit_daily_aggregate", "perceptkit_active_aggregate_generation",
     "perceptkit_aggregate_generation", "perceptkit_dedupe_identity",
     "perceptkit_conflict", "perceptkit_rule_state", "perceptkit_event_outbox",
+    "perceptkit_definition_history",
     "perceptkit_wake_receipt", "perceptkit_calendar_mirror",
     "perceptkit_reminder_mirror", "perceptkit_sync_state",
     "perceptkit_shadow_divergence", "perceptkit_retraction",

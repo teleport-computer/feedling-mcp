@@ -118,13 +118,22 @@ def _kit(storage):
 
     from .wake_port import FeedlingWakePort
     from .wake_rules import wake_definitions
+    from .definitions import PostgresDefinitionProvider
 
     on = wakes_enabled()
+    definitions = (
+        PostgresDefinitionProvider(
+            storage.conn,
+            lambda _subject: wake_definitions() if on else (),
+        )
+        if hasattr(storage, "conn")
+        else (wake_definitions() if on else ())
+    )
     return PerceptionKit(
         storage=storage,
         signals=MINIMAL_SIGNALS,
         wake=FeedlingWakePort() if on else None,
-        definitions=wake_definitions() if on else (),
+        definitions=definitions,
     )
 
 
@@ -165,12 +174,8 @@ def observe(
 
     started = time.monotonic()
     try:
-        import psycopg
         from perceptkit.contracts import IngestContext
-        from perceptkit.kit import PerceptionKit
-        from perceptkit.manifest.minimal import MINIMAL_SIGNALS
 
-        from .. import perceptkit_adapter as _pkg  # noqa: F401
         from .ios_report import to_envelope
         from .storage import PostgresStorage
 
@@ -254,8 +259,6 @@ def _run(user_id: str, envelope: Mapping[str, Any], *,
     one they were written on.
     """
     from perceptkit.contracts import IngestContext
-    from perceptkit.kit import PerceptionKit
-    from perceptkit.manifest.minimal import MINIMAL_SIGNALS
 
     from . import compare as _compare
     from .storage import PostgresStorage
@@ -568,7 +571,6 @@ def apply_deletions(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         import db
         from datetime import datetime, timezone
         from perceptkit.contracts.retraction import Retraction
-        from perceptkit.kit import PerceptionKit
         from .storage import PostgresStorage
 
         raw = payload.get("deleted")
@@ -601,7 +603,7 @@ def apply_deletions(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if wanted:
             with db.get_pool().connection() as conn:
                 conn.autocommit = True
-                kit = PerceptionKit(storage=PostgresStorage(conn))
+                kit = _kit(PostgresStorage(conn))
                 outcome = kit.apply_retractions(wanted, now=now)
             recorded = outcome.recorded
             reselected = outcome.reselected

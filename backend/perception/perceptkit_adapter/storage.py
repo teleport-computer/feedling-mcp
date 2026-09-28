@@ -1196,6 +1196,14 @@ class PostgresStorage:
         sql.append("ORDER BY detected_at,event_id LIMIT %s"); params.append(limit)
         return [self._outbox(r) for r in self._q(" ".join(sql), params)]
 
+    def list_unknown_events(self, *, limit=100):
+        return [self._outbox(r) for r in self._q(
+            f"SELECT {self._outbox_columns()} FROM perceptkit_event_outbox "
+            "WHERE delivery_state='unknown' AND dispatch_started_at IS NOT NULL "
+            "ORDER BY detected_at,event_id LIMIT %s",
+            (limit,),
+        )]
+
     def list_events(self, *, subject_id, delivery_states=None, event_type=None,
                     start=None, end=None, limit=50, offset=0):
         sql = [f"SELECT {self._outbox_columns()} FROM perceptkit_event_outbox WHERE subject_id=%s"]
@@ -1395,7 +1403,8 @@ class PostgresStorage:
                     (subject_id,))
                 counts["perceptkit_wake_receipt"] = cur.rowcount
             for table in _schema.TABLES:
-                if table == "perceptkit_wake_receipt":
+                if table in {"perceptkit_wake_receipt",
+                             "perceptkit_definition_history"}:
                     continue
                 with self.conn.cursor() as cur:
                     self._fence()

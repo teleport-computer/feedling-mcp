@@ -451,9 +451,13 @@ def test_v2_photo_wake_carries_id_scene_and_time_into_context(monkeypatch):
 
 def test_resident_perception_wake_keeps_legacy_queue(monkeypatch):
     legacy_jobs = []
+    def append_proactive_job(job):
+        legacy_jobs.append(job)
+        return job
+
     user_store = types.SimpleNamespace(
         proactive_activation_ready=lambda: True,
-        append_proactive_job=lambda job: legacy_jobs.append(job),
+        append_proactive_job=append_proactive_job,
     )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(
@@ -511,6 +515,10 @@ def test_v2_wake_context_store_keeps_coalesced_events_in_order():
 
     assert [row["wake_id"] for row in rows] == ["w1", "w2"]
     assert all(row["agent_job_id"] == 321 for row in rows)
+    assert jobs_store.find_jobs_by_context_wake_id(
+        uid, context_stream=perception_store.V2_WAKE_CONTEXT_STREAM,
+        wake_id="w2",
+    ) == (321,)
 
 
 # ---------------------------------------------------------------------------

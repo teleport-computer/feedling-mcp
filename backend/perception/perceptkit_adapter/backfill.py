@@ -25,8 +25,10 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 log = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ BATCH = 500
 #: 聚合版本。搬进来的这批和管线现算的是同一套算法，所以用同一个版本号 ——
 #: 标成别的版本会让「重算」逻辑以为它们需要被重算。
 AGGREGATION_VERSION = 1
+CONVERTER_REVISION = "v010-1"
 
 
 @dataclass
@@ -73,10 +76,58 @@ class BackfillPlan:
     reasons: dict[str, str] = field(default_factory=dict)
     rows_read: int = 0
     applied: bool = False
+    subject_scope: str | None = None
+    generation_ids: dict[str, str] = field(default_factory=dict)
+    active_generations: int = 0
+    reused_generations: int = 0
+    incomplete_generations: int = 0
+    incomplete_dates: dict[str, list[str]] = field(default_factory=dict)
+    unconvertible_rows: list[dict[str, str]] = field(default_factory=list)
+    failed_keys: list[dict[str, str]] = field(default_factory=list)
+    legacy_reports_without_v2_digest: int = 0
+    legacy_identities_missing_fact_evidence: int = 0
+    legacy_outbox_missing_provenance: int = 0
+    unknown_runtime_attempts: int = 0
+    rerun_identity: str = ""
 
     @property
     def total(self) -> int:
         return sum(self.migrated.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "applied": self.applied,
+            "subject_scope": (
+                None if self.subject_scope is None else {
+                    "subject_hash": hashlib.sha256(
+                        self.subject_scope.encode()).hexdigest()[:12],
+                }
+            ),
+            "rows_read": self.rows_read,
+            "recoverable_rows": self.total,
+            "migrated": dict(sorted(self.migrated.items())),
+            "skipped": dict(sorted(self.skipped.items())),
+            "reasons": dict(sorted(self.reasons.items())),
+            "generation_ids": dict(sorted(self.generation_ids.items())),
+            "active_generations": self.active_generations,
+            "reused_generations": self.reused_generations,
+            "incomplete_generations": self.incomplete_generations,
+            "incomplete_date_count": sum(
+                len(days) for days in self.incomplete_dates.values()),
+            "incomplete_dates": dict(sorted(self.incomplete_dates.items())),
+            "unconvertible_rows": self.unconvertible_rows,
+            "legacy_reports_without_v2_digest": self.legacy_reports_without_v2_digest,
+            "legacy_identities_missing_fact_evidence": self.legacy_identities_missing_fact_evidence,
+            "legacy_outbox_missing_provenance": self.legacy_outbox_missing_provenance,
+            "unknown_runtime_attempts": self.unknown_runtime_attempts,
+            "failed_keys": self.failed_keys,
+            "rerun_identity": self.rerun_identity,
+            "converter_revision": CONVERTER_REVISION,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +299,9 @@ def _split_by_metric(old_signal: str,
     """
     from .ios_report import SPLIT_OFF
     grouped: dict[str, dict[str, Any]] = {}
-    for _src, (target, field) in SPLIT_OFF.get(old_signal, {}).items():
-        if field in doc:
-            grouped.setdefault(target, {})[field] = doc[field]
+    for _src, (target, metric_field) in SPLIT_OFF.get(old_signal, {}).items():
+        if metric_field in doc:
+            grouped.setdefault(target, {})[metric_field] = doc[metric_field]
     return sorted(grouped.items())
 
 
@@ -265,37 +316,23 @@ WHERE (%s::text IS NULL OR user_id = %s)
 ORDER BY user_id, date, signal
 """
 
-#: 覆盖写。**可重复跑的关键就是这一句** —— 跑到一半断了、映射改了重跑，
-#: 结果都一样。不可重跑的搬迁没人敢跑第二次。
-_WRITE = """
-INSERT INTO perceptkit_daily_aggregate
-  (subject_id, signal, local_date, aggregation_kind, aggregation_version,
-   typed_aggregate, timezone_attribution, source_coverage, updated_at)
-VALUES (%s, %s, %s, 'daily', %s, %s, NULL, %s, %s)
-ON CONFLICT (subject_id, signal, local_date, aggregation_kind, aggregation_version)
-DO UPDATE SET typed_aggregate = EXCLUDED.typed_aggregate,
-              source_coverage = EXCLUDED.source_coverage,
-              updated_at = EXCLUDED.updated_at
-"""
-
-
 def run(conn: Any, *, subject_id: str | None = None,
         dry_run: bool = True, now: datetime | None = None) -> BackfillPlan:
-    """搬。``dry_run=True``（默认）只数，不写。
+    """Classify legacy rows, then publish immutable aggregate generations."""
+    from perceptkit.contracts.mutation import aggregate_generation_key
+    from perceptkit.contracts.records import AggregateGeneration, DailyAggregate
+    from .storage import PostgresStorage
 
-    默认只数不写，理由和保留期清理那边一样：先看一眼数字，再决定要不要真跑。
-    这一个不删任何东西，所以比那个安全得多 —— 但「先看再做」的习惯值得保持。
-    """
-    from psycopg.types.json import Jsonb
-
-    plan = BackfillPlan(applied=not dry_run)
+    plan = BackfillPlan(applied=not dry_run, subject_scope=subject_id)
     stamp = now or datetime.now(timezone.utc)
-    # 标出这批是搬来的。哪天发现某个转换写错了，靠它能精确找回受影响的行，
-    # 而不用重扫全表猜哪些是搬的、哪些是管线自己算的。
-    coverage = Jsonb({"backfilled_from": "perception_daily",
-                      "backfilled_at": stamp.isoformat()})
     known = _key_map()
-    pending: list[tuple] = []
+    groups: dict[tuple[str, str], dict[date, dict[str, Any]]] = {}
+    blocked_groups: set[tuple[str, str]] = set()
+
+    def safe_key(user_id: str, old_signal: str, day: date) -> dict[str, str]:
+        subject_hash = hashlib.sha256(user_id.encode()).hexdigest()[:12]
+        return {"subject_hash": subject_hash, "signal": old_signal,
+                "local_date": day.isoformat()}
 
     with conn.cursor() as cur:
         cur.execute(_READ, (subject_id, subject_id))
@@ -304,37 +341,203 @@ def run(conn: Any, *, subject_id: str | None = None,
             if signal in UNCONVERTIBLE:
                 plan.skipped[signal] = plan.skipped.get(signal, 0) + 1
                 plan.reasons.setdefault(signal, UNCONVERTIBLE[signal])
+                plan.unconvertible_rows.append({
+                    **safe_key(user_id, signal, day), "reason": UNCONVERTIBLE[signal],
+                })
                 continue
             if signal not in known:
                 plan.skipped[signal] = plan.skipped.get(signal, 0) + 1
                 plan.reasons.setdefault(
                     signal, "kit 的 manifest 里没有这个信号 —— 不猜，跳过")
+                plan.unconvertible_rows.append({
+                    **safe_key(user_id, signal, day),
+                    "reason": "signal_not_in_manifest",
+                })
                 continue
-            produced = convert(signal, doc if isinstance(doc, Mapping) else {})
+            try:
+                produced = convert(signal, doc if isinstance(doc, Mapping) else {})
+            except Exception as exc:  # one bad legacy row must be reportable/rerunnable
+                plan.failed_keys.append({
+                    **safe_key(user_id, signal, day),
+                    "reason": f"converter_error:{type(exc).__name__}",
+                })
+                continue
             if not produced:
                 plan.skipped[signal] = plan.skipped.get(signal, 0) + 1
                 plan.reasons.setdefault(
                     signal, "这一行转换后是空的（老记录里没有可搬的数字）")
+                plan.unconvertible_rows.append({
+                    **safe_key(user_id, signal, day), "reason": "empty_conversion",
+                })
                 continue
             for kit_signal, aggregate in produced:
                 plan.migrated[kit_signal] = plan.migrated.get(kit_signal, 0) + 1
-                if not dry_run:
-                    pending.append((user_id, kit_signal, day, AGGREGATION_VERSION,
-                                    Jsonb(aggregate), coverage, stamp))
-            if len(pending) >= BATCH:
-                _flush(conn, pending)
-                pending = []
-    if pending:
-        _flush(conn, pending)
+                key = (user_id, kit_signal)
+                old = groups.setdefault(key, {}).get(day)
+                if old is not None and old != aggregate:
+                    blocked_groups.add(key)
+                    plan.failed_keys.append({
+                        **safe_key(user_id, signal, day),
+                        "reason": "multiple_legacy_rows_map_to_one_aggregate_day",
+                    })
+                    continue
+                groups[key][day] = aggregate
+
+    storage = PostgresStorage(conn)
+    all_generation_ids: list[str] = []
+    for (user_id, kit_signal), rows in sorted(groups.items()):
+        if not rows:
+            continue
+        days = sorted(rows)
+        start, end = days[0], days[-1]
+        required = {start + timedelta(days=i) for i in range((end - start).days + 1)}
+        missing = sorted(required - set(days))
+        material = {
+            "converter_revision": CONVERTER_REVISION,
+            "subject_id": user_id,
+            "signal": kit_signal,
+            "rows": [(day.isoformat(), rows[day]) for day in days],
+        }
+        digest = hashlib.sha256(json.dumps(
+            material, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str,
+        ).encode()).hexdigest()
+        generation_id = f"legacybf_{digest[:24]}"
+        report_key = f"{hashlib.sha256(user_id.encode()).hexdigest()[:12]}:{kit_signal}"
+        plan.generation_ids[report_key] = generation_id
+        all_generation_ids.append(generation_id)
+        if missing:
+            plan.incomplete_dates[report_key] = [day.isoformat() for day in missing]
+        conversion_blocked = (user_id, kit_signal) in blocked_groups
+        if missing or conversion_blocked:
+            plan.incomplete_generations += 1
+
+        active = storage.get_active_aggregate_generation(
+            subject_id=user_id, signal=kit_signal, aggregation_kind="daily")
+        cutover_blocked = bool(
+            active is not None
+            and (start > active.requested_start_date or end < active.requested_end_date)
+        )
+        if cutover_blocked:
+            plan.failed_keys.append({
+                "subject_hash": report_key.split(":", 1)[0],
+                "signal": kit_signal,
+                "local_date": f"{start.isoformat()}..{end.isoformat()}",
+                "reason": "candidate_does_not_cover_active_generation",
+            })
+        if dry_run:
+            if not missing and not conversion_blocked and not cutover_blocked:
+                plan.active_generations += 1
+            continue
+
+        existing = storage.get_aggregate_generation(
+            subject_id=user_id, signal=kit_signal, aggregation_kind="daily",
+            generation_id=generation_id,
+        )
+        if existing is not None and existing.status in {"active", "complete", "incomplete"}:
+            plan.reused_generations += 1
+            if existing.status == "active":
+                plan.active_generations += 1
+            elif (existing.status == "complete" and not missing
+                  and not conversion_blocked and not cutover_blocked):
+                with storage.mutation_transaction() as owner:
+                    owner.acquire((aggregate_generation_key(
+                        user_id, kit_signal, "daily"),))
+                    if storage.activate_aggregate_generation(
+                        subject_id=user_id, signal=kit_signal,
+                        aggregation_kind="daily", generation_id=generation_id,
+                        expected_active_generation_id=(
+                            active.generation_id if active is not None else None),
+                        activated_at=stamp,
+                    ):
+                        plan.active_generations += 1
+            continue
+        if existing is not None and existing.status == "failed":
+            plan.failed_keys.append({
+                "subject_hash": report_key.split(":", 1)[0],
+                "signal": kit_signal,
+                "local_date": f"{start.isoformat()}..{end.isoformat()}",
+                "reason": "matching_generation_already_failed",
+            })
+            continue
+
+        with storage.mutation_transaction() as owner:
+            owner.acquire((aggregate_generation_key(user_id, kit_signal, "daily"),))
+            building = AggregateGeneration(
+                generation_id, user_id, kit_signal, "daily", AGGREGATION_VERSION,
+                start, end, status="building", completeness="unknown",
+                created_at=stamp, updated_at=stamp,
+            )
+            storage.put_aggregate_generation(building)
+            coverage = {
+                "backfilled_from": "perception_daily",
+                "converter_revision": CONVERTER_REVISION,
+                "rerun_identity": generation_id,
+                "accounted_dates": [day.isoformat() for day in days],
+            }
+            for day in days:
+                storage.put_aggregate(DailyAggregate(
+                    user_id, kit_signal, day, "daily", AGGREGATION_VERSION,
+                    rows[day], generation_id=generation_id,
+                    source_coverage=coverage, updated_at=stamp,
+                ))
+            final = AggregateGeneration(
+                generation_id, user_id, kit_signal, "daily", AGGREGATION_VERSION,
+                start, end,
+                status="incomplete" if missing or conversion_blocked else "complete",
+                completeness=("incomplete"
+                              if missing or conversion_blocked else "complete"),
+                accounted_dates=tuple(days), incomplete_dates=tuple(missing),
+                incomplete_reasons=tuple(
+                    reason for reason, applies in (
+                        ("legacy_sparse_coverage_unverified", bool(missing)),
+                        ("legacy_conversion_conflict", conversion_blocked),
+                    ) if applies
+                ),
+                created_at=stamp, updated_at=stamp,
+            )
+            storage.update_aggregate_generation(final)
+            if not missing and not conversion_blocked and not cutover_blocked:
+                expected = active.generation_id if active is not None else None
+                if storage.activate_aggregate_generation(
+                    subject_id=user_id, signal=kit_signal,
+                    aggregation_kind="daily", generation_id=generation_id,
+                    expected_active_generation_id=expected, activated_at=stamp,
+                ):
+                    plan.active_generations += 1
+
+    plan.rerun_identity = "legacybf_run_" + hashlib.sha256(json.dumps(
+        {"subject_scope": subject_id, "generations": sorted(all_generation_ids),
+         "converter_revision": CONVERTER_REVISION},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()[:24]
+    plan.legacy_reports_without_v2_digest = conn.execute(
+        "SELECT count(*) FROM perceptkit_ingest_receipt "
+        "WHERE LEFT(payload_digest, 3) <> 'v2:'"
+        + (" AND subject_id=%s" if subject_id else ""),
+        ((subject_id,) if subject_id else ()),
+    ).fetchone()[0]
+    plan.legacy_identities_missing_fact_evidence = conn.execute(
+        "SELECT count(*) FROM perceptkit_dedupe_identity "
+        "WHERE (fact_key IS NULL OR semantic_digest IS NULL)"
+        + (" AND subject_id=%s" if subject_id else ""),
+        ((subject_id,) if subject_id else ()),
+    ).fetchone()[0]
+    plan.legacy_outbox_missing_provenance = conn.execute(
+        "SELECT count(*) FROM perceptkit_event_outbox "
+        "WHERE (legacy_scope_unknown OR NOT fact_dependencies_complete)"
+        + (" AND subject_id=%s" if subject_id else ""),
+        ((subject_id,) if subject_id else ()),
+    ).fetchone()[0]
+    plan.unknown_runtime_attempts = conn.execute(
+        "SELECT count(*) FROM perceptkit_event_outbox WHERE delivery_state='unknown'"
+        + (" AND subject_id=%s" if subject_id else ""),
+        ((subject_id,) if subject_id else ()),
+    ).fetchone()[0]
     log.info("perceptkit backfill %s: read=%s migrated=%s skipped=%s",
              "applied" if plan.applied else "dry-run",
              plan.rows_read, plan.total, sum(plan.skipped.values()))
     return plan
-
-
-def _flush(conn: Any, rows: list[tuple]) -> None:
-    with conn.cursor() as cur:
-        cur.executemany(_WRITE, rows)
 
 
 def format_plan(plan: BackfillPlan) -> str:
@@ -346,8 +549,21 @@ def format_plan(plan: BackfillPlan) -> str:
         lines.append("跳过：")
         for signal, n in sorted(plan.skipped.items(), key=lambda kv: -kv[1]):
             lines.append(f"  {signal:22} {n:>7} 行 — {plan.reasons.get(signal, '')}")
+    lines.extend([
+        f"generation：{len(plan.generation_ids)} 个，active={plan.active_generations}，"
+        f"reused={plan.reused_generations}",
+        f"incomplete generations：{plan.incomplete_generations}",
+        f"incomplete dates：{sum(len(v) for v in plan.incomplete_dates.values())}",
+        f"legacy reports without v2 digest：{plan.legacy_reports_without_v2_digest}",
+        f"legacy identities missing fact evidence："
+        f"{plan.legacy_identities_missing_fact_evidence}",
+        f"legacy outbox missing provenance：{plan.legacy_outbox_missing_provenance}",
+        f"unknown runtime attempts：{plan.unknown_runtime_attempts}",
+        f"failed keys：{len(plan.failed_keys)}",
+        f"rerun identity：{plan.rerun_identity}",
+    ])
     return "\n".join(lines)
 
 
-__all__ = ["BackfillPlan", "AGGREGATION_VERSION", "UNCONVERTIBLE",
+__all__ = ["BackfillPlan", "AGGREGATION_VERSION", "CONVERTER_REVISION", "UNCONVERTIBLE",
            "convert", "run", "format_plan"]

@@ -6021,6 +6021,30 @@ def get_job_status(
     return str(row[0]) if row is not None else None
 
 
+def find_jobs_by_context_wake_id(
+    user_id: str,
+    *,
+    context_stream: str,
+    wake_id: str,
+) -> tuple[int, ...]:
+    """Return authoritative jobs whose durable input names this wake.
+
+    Heartbeat enqueue can coalesce into an existing job, so ``agent_jobs.trace_id``
+    is not the identity of every attached wake. The atomically inserted context
+    row is the durable per-wake evidence and carries the actual job id.
+    """
+    if not str(wake_id).strip():
+        return ()
+    with _pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT (doc->>'agent_job_id')::bigint FROM user_logs "
+            "WHERE user_id=%s AND stream=%s AND doc->>'wake_id'=%s "
+            "AND doc->>'agent_job_id' ~ '^[0-9]+$' ORDER BY 1",
+            (str(user_id), str(context_stream), str(wake_id)),
+        ).fetchall()
+    return tuple(int(row[0]) for row in rows)
+
+
 def get_expected_runtime_generation(
     job_id,
     *,

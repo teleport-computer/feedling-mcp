@@ -879,8 +879,10 @@ def test_deleting_a_weight_sample_stops_it_from_being_the_current_value(clean):
                                       "source_event_id": oid,
                                       "value": {"weight_kg": kg}}]},
                    context=IngestContext("u1", at))
-    now = kit.get_current(subject_id="u1", signals=["health_weight"],
-                          now=T0 + timedelta(hours=2))["health_weight"]
+    now_entries = kit.get_current(subject_id="u1", signals=["health_weight"],
+                                  now=T0 + timedelta(hours=2))["health_weight"]
+    assert [entry.dimension_key for entry in now_entries] == ["health_weight"]
+    now = now_entries[0]
     assert now.value["weight_kg"] == 69.8
 
     with patch("db.get_pool", return_value=_pool(conn)), \
@@ -889,9 +891,11 @@ def test_deleting_a_weight_sample_stops_it_from_being_the_current_value(clean):
             {"signal": "health_weight", "sample_id": "w2"}]})
     assert out["ran"] and out["applied"] == 1, out
 
-    after = PerceptionKit(storage=store(conn)).get_current(
+    after_entries = PerceptionKit(storage=store(conn)).get_current(
         subject_id="u1", signals=["health_weight"],
         now=T0 + timedelta(hours=2))["health_weight"]
+    assert [entry.dimension_key for entry in after_entries] == ["health_weight"]
+    after = after_entries[0]
     assert after.value["weight_kg"] == 70.5, \
         f"删掉之后当前值应该重选到上一条，实际是 {after.value}"
 

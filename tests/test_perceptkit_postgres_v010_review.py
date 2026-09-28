@@ -148,10 +148,11 @@ def test_activation_scans_all_generation_rows_for_out_of_range_data(clean_v010_r
     ) is False
 
 
-def test_0116_matches_fresh_indexes_and_constraints():
+def test_0117_head_matches_fresh_indexes_and_constraints():
     legacy_schema = f"legacy_review_{uuid.uuid4().hex[:8]}"
     fresh_schema = f"fresh_review_{uuid.uuid4().hex[:8]}"
     migration = migration_module("0116_perceptkit_v010_storage")
+    definitions_migration = migration_module("0117_perceptkit_definition_history")
     with connect() as conn:
         conn.execute(f'CREATE SCHEMA "{legacy_schema}"')
         conn.execute(f'CREATE SCHEMA "{fresh_schema}"')
@@ -159,6 +160,7 @@ def test_0116_matches_fresh_indexes_and_constraints():
             conn.execute(f'SET search_path TO "{legacy_schema}"')
             apply_0115_shape(conn)
             conn.execute(migration._UP)
+            conn.execute(definitions_migration._UP)
             conn.execute(f'SET search_path TO "{fresh_schema}"')
             conn.execute(schema.DDL)
             assert normalized_database_shape(conn, legacy_schema) == \
@@ -172,6 +174,7 @@ def test_0116_matches_fresh_indexes_and_constraints():
 def test_actual_0115_unknown_signal_event_cannot_race_past_scrub():
     legacy_schema = f"legacy_event_{uuid.uuid4().hex[:8]}"
     migration = migration_module("0116_perceptkit_v010_storage")
+    definitions_migration = migration_module("0117_perceptkit_definition_history")
     setup = connect()
     claimant_conn = connect()
     scrubber_conn = connect()
@@ -189,6 +192,7 @@ def test_actual_0115_unknown_signal_event_cannot_race_past_scrub():
             (T0, T0),
         )
         setup.execute(migration._UP)
+        setup.execute(definitions_migration._UP)
         claimant_conn.execute(f'SET search_path TO "{legacy_schema}"')
         scrubber_conn.execute(f'SET search_path TO "{legacy_schema}"')
         claimant = storage(claimant_conn)

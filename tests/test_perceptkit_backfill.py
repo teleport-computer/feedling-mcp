@@ -153,26 +153,35 @@ def test_running_it_twice_does_not_duplicate(conn):
     rows = conn.execute("SELECT typed_aggregate FROM perceptkit_daily_aggregate"
                         ).fetchall()
     assert len(rows) == 1 and rows[0][0] == {"temperature_c": {"max": 28.0}}
+    assert conn.execute("SELECT count(*) FROM perceptkit_aggregate_generation"
+                        ).fetchone() == (1,)
+    assert conn.execute("SELECT count(*) FROM perceptkit_active_aggregate_generation"
+                        ).fetchone() == (1,)
 
 
 @needs_pg
 def test_rerunning_after_a_fix_overwrites_the_old_value(conn):
-    """**这才是可重复跑的意义所在。**
-
-    「跑两遍结果一样」用 `ON CONFLICT DO NOTHING` 也满足 —— 但那种写法下，
-    发现某个转换写错了、修好重跑之后，**库里留的还是那批错值**，而且不报错。
-    真正要保证的是：第二遍的结果覆盖第一遍。
-    """
+    """修正后的结果走新 candidate 并原子切 active，不改写旧审计行。"""
     from psycopg.types.json import Jsonb
     _old_row(conn, "weather", {"temperature_c": {"max": 28.0}})
     backfill.run(conn, dry_run=False)
+    first = conn.execute(
+        "SELECT generation_id FROM perceptkit_active_aggregate_generation"
+    ).fetchone()[0]
     conn.execute("UPDATE perception_daily SET doc = %s",
                  (Jsonb({"temperature_c": {"max": 31.5}}),))
     backfill.run(conn, dry_run=False)
-    rows = conn.execute("SELECT typed_aggregate FROM perceptkit_daily_aggregate"
+    rows = conn.execute(
+        "SELECT generation_id,typed_aggregate FROM perceptkit_daily_aggregate "
+        "ORDER BY generation_id"
                         ).fetchall()
-    assert len(rows) == 1
-    assert rows[0][0] == {"temperature_c": {"max": 31.5}}, "重跑必须覆盖，不能保留旧值"
+    assert len(rows) == 2
+    active = conn.execute(
+        "SELECT generation_id FROM perceptkit_active_aggregate_generation"
+    ).fetchone()[0]
+    assert active != first
+    assert dict(rows)[active] == {"temperature_c": {"max": 31.5}}
+    assert dict(rows)[first] == {"temperature_c": {"max": 28.0}}
 
 
 @needs_pg
@@ -195,6 +204,10 @@ def test_migrated_rows_are_marked_as_migrated(conn):
     coverage = conn.execute("SELECT source_coverage FROM perceptkit_daily_aggregate"
                             ).fetchone()[0]
     assert coverage["backfilled_from"] == "perception_daily"
+    assert coverage["rerun_identity"].startswith("legacybf_")
+    assert conn.execute(
+        "SELECT status,completeness FROM perceptkit_aggregate_generation"
+    ).fetchone() == ("active", "complete")
 
 
 @needs_pg
@@ -205,3 +218,77 @@ def test_it_can_be_scoped_to_one_person(conn):
     subjects = [r[0] for r in conn.execute(
         "SELECT subject_id FROM perceptkit_daily_aggregate").fetchall()]
     assert subjects == ["u1"]
+
+
+@needs_pg
+def test_sparse_legacy_rows_are_explicitly_incomplete_and_not_activated(conn):
+    _old_row(conn, "weather", {"temperature_c": {"max": 28.0}}, day="2026-08-01")
+    _old_row(conn, "weather", {"temperature_c": {"max": 30.0}}, day="2026-08-03")
+    plan = backfill.run(conn, dry_run=False)
+    assert next(iter(plan.incomplete_dates.values())) == ["2026-08-02"]
+    assert conn.execute(
+        "SELECT status,completeness,incomplete_dates "
+        "FROM perceptkit_aggregate_generation"
+    ).fetchone() == ("incomplete", "incomplete", ["2026-08-02"])
+    assert conn.execute(
+        "SELECT count(*) FROM perceptkit_active_aggregate_generation"
+    ).fetchone() == (0,)
+
+
+@needs_pg
+def test_conflicting_legacy_rows_never_publish_a_partial_generation(conn,
+                                                                    monkeypatch):
+    _old_row(conn, "weather", {"temperature_c": {"max": 28.0}})
+    monkeypatch.setattr(
+        backfill, "convert",
+        lambda _signal, _doc: [("weather", {"value": 1}),
+                               ("weather", {"value": 2})],
+    )
+    plan = backfill.run(conn, dry_run=False)
+    assert any(item["reason"] == "multiple_legacy_rows_map_to_one_aggregate_day"
+               for item in plan.failed_keys)
+    assert conn.execute(
+        "SELECT status,completeness,incomplete_reasons "
+        "FROM perceptkit_aggregate_generation"
+    ).fetchone() == (
+        "incomplete", "incomplete", ["legacy_conversion_conflict"],
+    )
+    assert conn.execute(
+        "SELECT count(*) FROM perceptkit_active_aggregate_generation"
+    ).fetchone() == (0,)
+
+
+@needs_pg
+def test_a_complete_reused_candidate_finishes_its_cutover(conn):
+    _old_row(conn, "weather", {"temperature_c": {"max": 28.0}})
+    backfill.run(conn, dry_run=False)
+    generation_id = conn.execute(
+        "DELETE FROM perceptkit_active_aggregate_generation RETURNING generation_id"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE perceptkit_aggregate_generation SET status='complete' "
+        "WHERE generation_id=%s", (generation_id,),
+    )
+    plan = backfill.run(conn, dry_run=False)
+    assert plan.reused_generations == 1 and plan.active_generations == 1
+    assert conn.execute(
+        "SELECT generation_id FROM perceptkit_active_aggregate_generation"
+    ).fetchone() == (generation_id,)
+
+
+@needs_pg
+def test_dry_run_and_apply_have_the_same_classification_and_json_report(conn):
+    _old_row(conn, "weather", {"temperature_c": {"max": 28.0}})
+    _old_row(conn, "location_signal", {"place_label": "home"}, day="2026-08-02")
+    dry = backfill.run(conn, dry_run=True)
+    applied = backfill.run(conn, dry_run=False)
+    for field in ("rows_read", "migrated", "skipped", "reasons", "generation_ids",
+                  "incomplete_dates", "unconvertible_rows", "failed_keys",
+                  "rerun_identity"):
+        assert getattr(dry, field) == getattr(applied, field)
+    payload = applied.to_dict()
+    assert payload["schema_version"] == 1
+    assert payload["rerun_identity"].startswith("legacybf_run_")
+    assert payload["incomplete_generations"] == 0
+    assert payload["incomplete_date_count"] == 0
+    assert "location_signal" in applied.to_json()
