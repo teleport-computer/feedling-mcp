@@ -290,6 +290,35 @@ def convert(old_signal: str, doc: Mapping[str, Any]) -> list[tuple[str, dict[str
     return out
 
 
+def _expected_target_signals(old_signal: str, doc: Mapping[str, Any]) -> set[str]:
+    """Declare the target scope before converter execution can fail.
+
+    Multi-metric iOS rows only expect targets represented by fields in that
+    legacy row. A known but empty/malformed singleton row still expects its
+    primary target, so a converter returning nothing cannot erase a boundary
+    date from the candidate generation.
+    """
+    primary = _key_map()[old_signal]
+    from .ios_report import SPLIT_OFF
+
+    normalized_fields = {
+        _FIELD_RENAMES.get(old_signal, {}).get(name, name)
+        for name in doc
+    }
+    split_rules = SPLIT_OFF.get(old_signal, {})
+    moved_fields = {target_field for _source, target_field in split_rules.values()}
+    targets = {
+        target_signal
+        for _source, (target_signal, target_field) in split_rules.items()
+        if target_field in normalized_fields
+    }
+    if not split_rules or normalized_fields - moved_fields:
+        targets.add(primary)
+    if not targets:
+        targets.add(primary)
+    return targets
+
+
 def _split_by_metric(old_signal: str,
                      doc: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """按 adapter 的拆分表，把已经归一过的文档分到各自的 kit 信号上。
@@ -327,12 +356,25 @@ def run(conn: Any, *, subject_id: str | None = None,
     stamp = now or datetime.now(timezone.utc)
     known = _key_map()
     groups: dict[tuple[str, str], dict[date, dict[str, Any]]] = {}
-    blocked_groups: set[tuple[str, str]] = set()
+    expected_dates: dict[tuple[str, str], set[date]] = {}
+    failed_dates: dict[tuple[str, str], dict[date, set[str]]] = {}
 
     def safe_key(user_id: str, old_signal: str, day: date) -> dict[str, str]:
         subject_hash = hashlib.sha256(user_id.encode()).hexdigest()[:12]
         return {"subject_hash": subject_hash, "signal": old_signal,
                 "local_date": day.isoformat()}
+
+    def mark_failed(user_id: str, old_signal: str, target_signal: str,
+                    day: date, reason: str) -> None:
+        key = (user_id, target_signal)
+        expected_dates.setdefault(key, set()).add(day)
+        failed_dates.setdefault(key, {}).setdefault(day, set()).add(reason)
+        groups.setdefault(key, {}).pop(day, None)
+        plan.failed_keys.append({
+            **safe_key(user_id, old_signal, day),
+            "target_signal": target_signal,
+            "reason": reason,
+        })
 
     with conn.cursor() as cur:
         cur.execute(_READ, (subject_id, subject_id))
@@ -354,13 +396,18 @@ def run(conn: Any, *, subject_id: str | None = None,
                     "reason": "signal_not_in_manifest",
                 })
                 continue
+            source_doc = doc if isinstance(doc, Mapping) else {}
+            targets = _expected_target_signals(signal, source_doc)
+            for target_signal in targets:
+                expected_dates.setdefault((user_id, target_signal), set()).add(day)
             try:
-                produced = convert(signal, doc if isinstance(doc, Mapping) else {})
+                produced = convert(signal, source_doc)
             except Exception as exc:  # one bad legacy row must be reportable/rerunnable
-                plan.failed_keys.append({
-                    **safe_key(user_id, signal, day),
-                    "reason": f"converter_error:{type(exc).__name__}",
-                })
+                for target_signal in targets:
+                    mark_failed(
+                        user_id, signal, target_signal, day,
+                        f"converter_error:{type(exc).__name__}",
+                    )
                 continue
             if not produced:
                 plan.skipped[signal] = plan.skipped.get(signal, 0) + 1
@@ -369,33 +416,54 @@ def run(conn: Any, *, subject_id: str | None = None,
                 plan.unconvertible_rows.append({
                     **safe_key(user_id, signal, day), "reason": "empty_conversion",
                 })
+                for target_signal in targets:
+                    mark_failed(
+                        user_id, signal, target_signal, day, "empty_conversion")
                 continue
+            produced_targets: set[str] = set()
             for kit_signal, aggregate in produced:
-                plan.migrated[kit_signal] = plan.migrated.get(kit_signal, 0) + 1
+                produced_targets.add(kit_signal)
                 key = (user_id, kit_signal)
+                expected_dates.setdefault(key, set()).add(day)
+                if day in failed_dates.get(key, {}):
+                    continue
                 old = groups.setdefault(key, {}).get(day)
                 if old is not None and old != aggregate:
-                    blocked_groups.add(key)
-                    plan.failed_keys.append({
-                        **safe_key(user_id, signal, day),
-                        "reason": "multiple_legacy_rows_map_to_one_aggregate_day",
-                    })
+                    mark_failed(
+                        user_id, signal, kit_signal, day,
+                        "multiple_legacy_rows_map_to_one_aggregate_day",
+                    )
                     continue
                 groups[key][day] = aggregate
+            for target_signal in targets - produced_targets:
+                mark_failed(
+                    user_id, signal, target_signal, day,
+                    "expected_target_not_produced",
+                )
 
     storage = PostgresStorage(conn)
     all_generation_ids: list[str] = []
-    for (user_id, kit_signal), rows in sorted(groups.items()):
-        if not rows:
-            continue
+    for user_id, kit_signal in sorted(expected_dates):
+        key = (user_id, kit_signal)
+        rows = groups.get(key, {})
+        scope_days = expected_dates[key]
+        if rows:
+            plan.migrated[kit_signal] = plan.migrated.get(kit_signal, 0) + len(rows)
         days = sorted(rows)
-        start, end = days[0], days[-1]
+        start, end = min(scope_days), max(scope_days)
         required = {start + timedelta(days=i) for i in range((end - start).days + 1)}
         missing = sorted(required - set(days))
+        source_failures = failed_dates.get(key, {})
+        sparse_dates = required - scope_days
         material = {
             "converter_revision": CONVERTER_REVISION,
             "subject_id": user_id,
             "signal": kit_signal,
+            "expected_dates": sorted(day.isoformat() for day in scope_days),
+            "failed_dates": [
+                (day.isoformat(), sorted(reasons))
+                for day, reasons in sorted(source_failures.items())
+            ],
             "rows": [(day.isoformat(), rows[day]) for day in days],
         }
         digest = hashlib.sha256(json.dumps(
@@ -408,7 +476,11 @@ def run(conn: Any, *, subject_id: str | None = None,
         all_generation_ids.append(generation_id)
         if missing:
             plan.incomplete_dates[report_key] = [day.isoformat() for day in missing]
-        conversion_blocked = (user_id, kit_signal) in blocked_groups
+        conversion_blocked = bool(source_failures)
+        conversion_conflict = any(
+            "multiple_legacy_rows_map_to_one_aggregate_day" in reasons
+            for reasons in source_failures.values()
+        )
         if missing or conversion_blocked:
             plan.incomplete_generations += 1
 
@@ -490,8 +562,10 @@ def run(conn: Any, *, subject_id: str | None = None,
                 accounted_dates=tuple(days), incomplete_dates=tuple(missing),
                 incomplete_reasons=tuple(
                     reason for reason, applies in (
-                        ("legacy_sparse_coverage_unverified", bool(missing)),
-                        ("legacy_conversion_conflict", conversion_blocked),
+                        ("legacy_sparse_coverage_unverified", bool(sparse_dates)),
+                        ("legacy_conversion_conflict", conversion_conflict),
+                        ("legacy_source_conversion_failed",
+                         conversion_blocked and not conversion_conflict),
                     ) if applies
                 ),
                 created_at=stamp, updated_at=stamp,
@@ -562,6 +636,10 @@ def format_plan(plan: BackfillPlan) -> str:
         f"failed keys：{len(plan.failed_keys)}",
         f"rerun identity：{plan.rerun_identity}",
     ])
+    if plan.incomplete_dates:
+        lines.append("incomplete date scopes：")
+        for scope, days in sorted(plan.incomplete_dates.items()):
+            lines.append(f"  {scope}: {', '.join(days)}")
     return "\n".join(lines)
 
 

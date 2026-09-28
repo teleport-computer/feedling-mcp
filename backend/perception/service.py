@@ -1079,7 +1079,14 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False):
         "presence_hints": dict(event.presence_hints or {}),
         "ts": now,
     }, now)
-    return _fire_wake_event_v2(event)
+    try:
+        return _fire_wake_event_v2(event)
+    except Exception as exc:
+        if from_kit:
+            raise
+        log.error("fire_wake_event_v2(%s,%s) failed: %s",
+                  event.user_id, event.trigger, exc)
+        return RuntimeEnqueueResult(False, reason="enqueue_uncertain")
 
 
 def _fire_wake_event_v2(event):
@@ -1161,7 +1168,7 @@ def _fire_wake_event_v2(event):
         "current_app": "",
         "payload": {"v2_wake": dict(event.payload or {})},
     }
-    stored = s.append_proactive_job(job)
+    stored = s.append_proactive_job_strict(job)
     if not isinstance(stored, dict) or stored.get("job_id") != job_id:
         raise RuntimeError("resident queue did not return its durable job identity")
     return RuntimeEnqueueResult(True, runtime_ref=f"resident-job:{job_id}")

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -182,6 +182,10 @@ def test_rerunning_after_a_fix_overwrites_the_old_value(conn):
     assert active != first
     assert dict(rows)[active] == {"temperature_c": {"max": 31.5}}
     assert dict(rows)[first] == {"temperature_c": {"max": 28.0}}
+    assert conn.execute(
+        "SELECT status FROM perceptkit_aggregate_generation WHERE generation_id=%s",
+        (first,),
+    ).fetchone() == ("complete",)
 
 
 @needs_pg
@@ -233,6 +237,49 @@ def test_sparse_legacy_rows_are_explicitly_incomplete_and_not_activated(conn):
     assert conn.execute(
         "SELECT count(*) FROM perceptkit_active_aggregate_generation"
     ).fetchone() == (0,)
+
+
+@needs_pg
+@pytest.mark.parametrize(("failed_day", "failure_mode"), [
+    ("2026-08-01", "exception"),
+    ("2026-08-02", "empty"),
+])
+def test_failed_boundary_date_keeps_full_scope_and_blocks_cutover(
+        conn, monkeypatch, failed_day, failure_mode):
+    original = backfill.convert
+
+    def flaky(signal, doc):
+        if doc.get("failure_mode") == "exception":
+            raise RuntimeError("broken legacy row")
+        if doc.get("failure_mode") == "empty":
+            return []
+        return original(signal, doc)
+
+    monkeypatch.setattr(backfill, "convert", flaky)
+    good_day = "2026-08-02" if failed_day == "2026-08-01" else "2026-08-01"
+    _old_row(conn, "weather", {"failure_mode": failure_mode}, day=failed_day)
+    _old_row(conn, "weather", {"temperature_c": {"max": 28.0}}, day=good_day)
+
+    plan = backfill.run(conn, dry_run=False)
+    report_key = next(iter(plan.generation_ids))
+    payload = plan.to_dict()
+    text = backfill.format_plan(plan)
+    generation = conn.execute(
+        "SELECT requested_start_date,requested_end_date,status,completeness,"
+        "accounted_dates,incomplete_dates FROM perceptkit_aggregate_generation"
+    ).fetchone()
+
+    assert generation == (
+        date(2026, 8, 1), date(2026, 8, 2), "incomplete", "incomplete",
+        [good_day], [failed_day],
+    )
+    assert conn.execute(
+        "SELECT count(*) FROM perceptkit_active_aggregate_generation"
+    ).fetchone() == (0,)
+    assert plan.migrated == {"weather": 1} and plan.total == 1
+    assert payload["incomplete_dates"][report_key] == [failed_day]
+    assert payload["recoverable_rows"] == 1
+    assert failed_day in text
 
 
 @needs_pg

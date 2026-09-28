@@ -458,6 +458,7 @@ def test_resident_perception_wake_keeps_legacy_queue(monkeypatch):
     user_store = types.SimpleNamespace(
         proactive_activation_ready=lambda: True,
         append_proactive_job=append_proactive_job,
+        append_proactive_job_strict=append_proactive_job,
     )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(
@@ -487,6 +488,40 @@ def test_resident_perception_wake_keeps_legacy_queue(monkeypatch):
 
     assert len(legacy_jobs) == 1
     assert legacy_jobs[0]["trigger"] == "photo_added"
+
+
+@pytest.mark.parametrize("failure_mode", ["false", "exception"])
+def test_resident_perceptkit_enqueue_requires_a_durable_primary_row(
+        monkeypatch, failure_mode):
+    user_store = core_store.UserStore("u_resident_durable_failure")
+    user_store.proactive_activation_ready = lambda: True
+    monkeypatch.setattr(
+        core_store, "get_store_per_load_mode", lambda _uid, **_kw: user_store)
+    monkeypatch.setattr(
+        hosted_config_store, "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+    )
+    monkeypatch.setattr(db, "log_trim", lambda *_a, **_kw: None)
+    monkeypatch.setattr(user_store, "notify_proactive_job_waiters", lambda: None)
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_a, **_kw: None)
+
+    if failure_mode == "false":
+        monkeypatch.setattr(db, "log_append", lambda *_a, **_kw: False)
+        expected = RuntimeError
+    else:
+        def fail(*_args, **_kwargs):
+            raise OSError("primary unavailable")
+        monkeypatch.setattr(db, "log_append", fail)
+        expected = OSError
+
+    event = types.SimpleNamespace(
+        user_id="u_resident_durable_failure", wake_id="wake-durable-failure",
+        source="perception_event", trigger="photo_added",
+        change_digest="photo changed", origin_refs=("photo:1",),
+        presence_hints={}, payload={}, created_at=100.0, manual=False,
+    )
+    with pytest.raises(expected):
+        service._fire_wake_event_v2(event)
 
 
 def test_v2_wake_context_store_keeps_coalesced_events_in_order():

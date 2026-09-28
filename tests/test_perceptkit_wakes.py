@@ -369,6 +369,7 @@ def _drive_real_enqueue(monkeypatch, runtime_mode):
     user_store = types.SimpleNamespace(
         proactive_activation_ready=lambda: True,
         append_proactive_job=append_proactive_job,
+        append_proactive_job_strict=append_proactive_job,
     )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(core_store, "get_store_per_load_mode",

@@ -190,6 +190,32 @@ def test_broadcast_edges_wake_without_frames(monkeypatch):
     assert fired == ["broadcast_opened", "broadcast_closed"]
 
 
+def test_enqueue_exception_propagates_for_kit_but_legacy_stays_fail_open(
+        monkeypatch, caplog):
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda _uid: None)
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda _uid: True)
+    monkeypatch.setattr(service, "_last_v2_capability_wake_ts", lambda *_a: 0.0)
+
+    def fail(_event):
+        raise RuntimeError("durable enqueue unavailable")
+
+    monkeypatch.setattr(service, "_fire_wake_event_v2", fail)
+    with pytest.raises(RuntimeError, match="durable enqueue unavailable"):
+        service._submit_wake_event_v2_compat(
+            _broadcast_wake("u_kit_failure", "broadcast_opened", 1_000.0),
+            from_kit=True,
+        )
+
+    result = service._submit_wake_event_v2_compat(
+        _broadcast_wake("u_legacy_failure", "broadcast_opened", 1_000.0),
+        from_kit=False,
+    )
+    assert result.accepted is False and result.reason == "enqueue_uncertain"
+    assert "durable enqueue unavailable" in caplog.text
+
+
 def test_broadcast_wake_respects_activation_and_screen_watch_switch(monkeypatch):
     fake = _Store()
     fired = []

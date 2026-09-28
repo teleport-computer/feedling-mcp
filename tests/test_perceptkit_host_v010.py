@@ -46,9 +46,10 @@ def _rule(value: int = 10) -> EventDefinition:
     })
 
 
-def _event(event_id: str = "evt-host") -> EventOutboxEntry:
+def _event(event_id: str = "evt-host", subject_id: str = "u1") -> EventOutboxEntry:
     return EventOutboxEntry(
-        event_id=event_id, subject_id="u1", definition_id="io.test", definition_version=1,
+        event_id=event_id, subject_id=subject_id,
+        definition_id="io.test", definition_version=1,
         event_type="io.test", occurred_at=T0, detected_at=T0,
         delivery_state="pending", fact_snapshot={"signal": "steps"},
     )
@@ -185,3 +186,96 @@ def test_missing_runtime_evidence_leaves_the_attempt_unknown(clean_host):
             "SELECT delivery_state FROM perceptkit_event_outbox "
             "WHERE event_id='evt-no-evidence'"
         ).fetchone() == ("unknown",)
+
+
+def test_resident_false_write_becomes_unknown_without_an_accepted_receipt(
+        clean_host, monkeypatch):
+    import db
+    from core import store as core_store
+    from core import wake_bus as core_wake_bus
+    from hosted import config_store as hosted_config_store
+    from perception import service
+    from perception.perceptkit_adapter.wake_port import FeedlingWakePort
+
+    user_store = core_store.UserStore("u1")
+    user_store.proactive_activation_ready = lambda: True
+    monkeypatch.setattr(
+        core_store, "get_store_per_load_mode", lambda _uid, **_kw: user_store)
+    monkeypatch.setattr(
+        hosted_config_store, "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+    )
+    monkeypatch.setattr(db, "log_append", lambda *_a, **_kw: False)
+    monkeypatch.setattr(db, "log_trim", lambda *_a, **_kw: None)
+    monkeypatch.setattr(user_store, "notify_proactive_job_waiters", lambda: None)
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_a, **_kw: None)
+
+    with connect() as conn:
+        store = PostgresStorage(conn)
+        store.enqueue_event(_event("evt-resident-false"))
+        outcome = worker.run_once(
+            storage_factory=lambda: store,
+            wake=FeedlingWakePort(submit=service._fire_wake_event_v2),
+            worker_id="w1", now=T0,
+        )
+        assert outcome.unknown == ["evt-resident-false"]
+        assert conn.execute(
+            "SELECT count(*) FROM perceptkit_wake_receipt "
+            "WHERE event_id='evt-resident-false' AND status='accepted'"
+        ).fetchone() == (0,)
+
+
+def test_real_resident_evidence_reconciles_the_same_wake_without_resend(
+        clean_host, monkeypatch):
+    import conftest
+    from core import store as core_store
+    from core import wake_bus as core_wake_bus
+    from hosted import config_store as hosted_config_store
+    from perception import service
+    from perception.perceptkit_adapter.wake_port import FeedlingWakePort
+
+    user_id = "usr_task7b_resident_reconcile"
+    conftest.seed_user(user_id)
+    user_store = core_store.UserStore(user_id)
+    user_store.proactive_activation_ready = lambda: True
+    monkeypatch.setattr(
+        core_store, "get_store_per_load_mode", lambda _uid, **_kw: user_store)
+    monkeypatch.setattr(
+        hosted_config_store, "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+    )
+    monkeypatch.setattr(user_store, "notify_proactive_job_waiters", lambda: None)
+    monkeypatch.setattr(core_wake_bus, "notify", lambda *_a, **_kw: None)
+    calls = []
+
+    def commit_then_disconnect(event):
+        calls.append(event.wake_id)
+        result = service._fire_wake_event_v2(event)
+        assert result.runtime_ref == "resident-job:pk_evt-resident-evidence"
+        raise ConnectionError("connection lost after durable resident append")
+
+    with connect() as conn:
+        store = PostgresStorage(conn)
+        store.enqueue_event(_event("evt-resident-evidence", user_id))
+        first = worker.run_once(
+            storage_factory=lambda: store,
+            wake=FeedlingWakePort(submit=commit_then_disconnect),
+            worker_id="w1", now=T0,
+        )
+        jobs = [job for job in user_store.list_proactive_jobs(since_epoch=0, limit=0)
+                if job.get("wake_id") == "evt-resident-evidence"]
+        assert first.unknown == ["evt-resident-evidence"] and len(jobs) == 1
+
+        reconciled = worker.reconcile_unknown(
+            storage_factory=lambda: store,
+            lookup=service._lookup_wake_event_v2,
+            now=T0,
+        )
+        assert reconciled.delivered == ["evt-resident-evidence"]
+        assert calls == ["evt-resident-evidence"]
+        assert conn.execute(
+            "SELECT status,runtime_ref FROM perceptkit_wake_receipt "
+            "WHERE event_id='evt-resident-evidence'"
+        ).fetchone() == (
+            "accepted", "resident-job:pk_evt-resident-evidence",
+        )

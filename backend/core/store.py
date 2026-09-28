@@ -2211,16 +2211,26 @@ class UserStore:
     def list_tracking_events(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
         return db.log_read(self.user_id, "tracking_events", limit=limit, since_epoch=since_epoch)
 
-    def append_proactive_job(self, job: dict) -> dict:
-        db.log_append(
+    def _append_proactive_job(self, job: dict, *, require_durable: bool) -> dict:
+        persisted = db.log_append(
             self.user_id, "proactive_jobs", job,
             ts=self._entry_epoch(job),
             item_key=(str(job.get("job_id") or "") or None),
         )
+        if require_durable and persisted is not True:
+            raise RuntimeError("proactive job was not durably appended")
         db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
         self.notify_proactive_job_waiters()
         wake_bus.notify("proactive", self.user_id)  # wake other workers' pollers
         return job
+
+    def append_proactive_job(self, job: dict) -> dict:
+        """Legacy fail-open append retained for existing non-Kit callers."""
+        return self._append_proactive_job(job, require_durable=False)
+
+    def append_proactive_job_strict(self, job: dict) -> dict:
+        """Return only after the primary proactive_jobs row is durable."""
+        return self._append_proactive_job(job, require_durable=True)
 
     def append_skipped_proactive_job(self, job: dict) -> dict:
         """Record a gate rejection without waking consumers or trimming pending work."""
