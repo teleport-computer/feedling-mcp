@@ -3,8 +3,9 @@
 
 Open rate = spoke / (spoke + model-chosen silence) over heartbeat jobs. Only
 turns where the model actually chose count: failed jobs, system-written sleeps
-(provider circuit open, a reply the system emptied), superseded and expired
-jobs are excluded and itemised, never dropped.
+(provider circuit open, a reply the system emptied), heartbeats skipped before
+any provider call (``wake_result='skipped'``), superseded and expired jobs are
+excluded and itemised, never dropped.
 
 Always read it per model family: on prod 2026-09-17..24 one family was 46% of
 decisions at 7%, so a working prompt change (33% -> 44% elsewhere) showed as a
@@ -34,6 +35,11 @@ SYSTEM_SLEEP_REASONS = {
     "empty_visible_reply_suppressed": "empty_reply_suppressed",
 }
 CIRCUIT_SLEEP_REASON = "provider_circuit_open"
+# ``wake_result='skipped'``: the heartbeat ended before any provider call (no
+# genuine user history, or it yielded to newer chat input). Not a model choice,
+# so it is itemised, never counted as spoke. Pinned against the worker's
+# HEARTBEAT_SKIP_* constants by tests/test_wake_open_rate_report.py (T773).
+HEARTBEAT_SKIP_REASONS = {"no_user_history", "yielded_to_chat"}
 LANE = "heartbeat"
 
 # Order matters: the first matching needle names the family.
@@ -82,6 +88,8 @@ def classify(status: str, wake_result: str | None, reason: str) -> str:
     if wake_result == "sleep":
         system = SYSTEM_SLEEP_REASONS.get(reason)
         return f"excluded:{system}" if system else "silent"
+    if wake_result == "skipped":
+        return f"excluded:skipped_{reason or 'unknown'}"
     if status == "completed" and wake_result is None:
         return "spoke"
     if status in {"failed", "superseded", "expired"}:
