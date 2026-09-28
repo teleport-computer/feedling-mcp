@@ -5424,8 +5424,11 @@ _LANE_ROLLUP_V2_SPOKE_JOIN = """
 # dream 的「真成功」= completed - silent_declared，读侧据此算成功率。
 # 不能把真跑的完成塞进 spoke_completed：0093 的 CHECK 要求 spoke_completed <= spoke，
 # 而 spoke 锚的是用户可见产出，为 dream 伪造 spoke 等于污染说话率。
-# 只认 lane='dream'：wake_result='skipped' 目前只有 dream 会写；别的 lane 将来若
-# 写了同一个词，语义要另行拍板，不能被这里静默吸收成「声明沉默」。
+# 只认 lane='dream'。2026-09-28 起（T773）heartbeat 也写 wake_result='skipped'
+# （没有真实用户历史 no_user_history / 让位给新聊天 yielded_to_chat，都是一次模型
+# 都没问）。这里**刻意没改**：heartbeat 的 skipped 仍落 silent_undeclared，和改前
+# （wake_result 为 NULL 时）完全一样，冻结数不变。要不要把它算成声明沉默，语义
+# 另行拍板，不能被这里静默吸收。
 _LANE_ROLLUP_V2_DECLARED_SILENCE = (
     "(j.wake_result IS NOT DISTINCT FROM 'sleep' "
     "OR (j.lane = 'dream' AND j.wake_result IS NOT DISTINCT FROM 'skipped'))"

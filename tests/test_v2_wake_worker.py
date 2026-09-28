@@ -97,6 +97,14 @@ def _job_status(job_id):
     return row
 
 
+def _wake_outcome(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+
 def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
 
@@ -2033,6 +2041,9 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
     assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    # T773: no model ran, so this must not read as "spoke" (wake_result NULL).
+    assert _wake_outcome(job_id) == (
+        "completed", worker.HEARTBEAT_SKIPPED, worker.HEARTBEAT_SKIP_NO_USER_HISTORY)
     assert len(shadow) == 1
     assert shadow[0][1]["decision_allowed"] is False
     assert shadow[0][1]["apns_alert_sent"] is False
@@ -2080,7 +2091,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert status == "completed"
     assert provider_calls == []
     assert workspace_calls == []
-    assert _job_status(job_id)[0] == "completed"
+    assert _wake_outcome(job_id) == ("completed", "skipped", "no_user_history")
 
 
 def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():

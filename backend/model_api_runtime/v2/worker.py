@@ -672,6 +672,13 @@ if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
         "and FEEDLING_V2_WAKE_TAIL_MAX_TURNS for prompt replay depth"
     )
 _CAPTURE_BATCH_LIMIT = 60
+#: Heartbeats that end before any provider call are recorded as
+#: ``wake_result='skipped'`` with one of these reasons (T773). Without it they
+#: completed with ``wake_result`` NULL, which open-rate reports read as "spoke"
+#: although no model ran and nothing was sent.
+HEARTBEAT_SKIPPED = "skipped"
+HEARTBEAT_SKIP_NO_USER_HISTORY = "no_user_history"
+HEARTBEAT_SKIP_YIELDED_TO_CHAT = "yielded_to_chat"
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
 # MUST stay a superset-compatible mirror of
 # capture_scheduler.CAPTURE_LIVE_SOURCES (locked by
@@ -9492,6 +9499,8 @@ async def _run_wake(
                     context_stream="v2_perception_wake_context",
                     consumed_context_seq=consumed_context_seq,
                     clear_wake_backoff=True,
+                    wake_result=HEARTBEAT_SKIPPED,
+                    wake_result_reason=HEARTBEAT_SKIP_NO_USER_HISTORY,
                 )
             else:
                 successor_id = None
@@ -9500,6 +9509,8 @@ async def _run_wake(
                     job_id,
                     claimed_by=claimed_by,
                     clear_wake_backoff=True,
+                    wake_result=HEARTBEAT_SKIPPED,
+                    wake_result_reason=HEARTBEAT_SKIP_NO_USER_HISTORY,
                 )
             if not completed:
                 raise LostJobLease(
@@ -9727,6 +9738,13 @@ async def _run_wake(
             )
             if base_prompt_user_frontier > wake_reply_cursor_seq:
                 successor_id = None
+                # Only heartbeats are re-labelled: other wake lanes keep their
+                # existing record until their own semantics are decided.
+                yield_result = (
+                    {"wake_result": HEARTBEAT_SKIPPED,
+                     "wake_result_reason": HEARTBEAT_SKIP_YIELDED_TO_CHAT}
+                    if lane == "heartbeat" else {}
+                )
                 if (
                     lane == "heartbeat"
                     and deps.read_perception_wake_context is not None
@@ -9738,12 +9756,14 @@ async def _run_wake(
                         observed_generation=observed_generation,
                         context_stream="v2_perception_wake_context",
                         consumed_context_seq=0,
+                        **yield_result,
                     )
                 else:
                     completed = await asyncio.to_thread(
                         jobs_store.mark_completed,
                         job_id,
                         claimed_by=claimed_by,
+                        **yield_result,
                     )
                 if not completed:
                     raise LostJobLease(
