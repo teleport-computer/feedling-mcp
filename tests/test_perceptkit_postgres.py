@@ -918,6 +918,24 @@ def test_sleep_is_refused_out_loud_rather_than_silently_doing_nothing(clean):
     assert any("health_sleep" in w for w in out["warnings"]), out["warnings"]
 
 
+def test_a_partly_malformed_deletion_batch_is_not_acknowledged_as_complete(clean):
+    """有效项可幂等执行，但整批必须明确非 accepted，客户端才不会推进所有锚点。"""
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import shadow
+    conn = connect()
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        out = shadow.apply_deletions("u1", {"deleted": [
+            {"signal": "health_weight", "sample_id": "w1"},
+            {"signal": "health_bmi"},
+            "not-an-object",
+        ]})
+    assert out["ran"] is True
+    assert out["applied"] == 1
+    assert out["rejected"] == 2
+    assert any("2 条删除" in warning for warning in out["warnings"])
+
+
 def test_a_deletion_never_takes_out_another_sources_same_id(clean):
     """同一个 id 在两个来源下是两件事。撤回只该命中它指名的那个来源。"""
     from unittest.mock import patch
@@ -948,11 +966,17 @@ def test_the_deletion_key_is_encrypted_and_routed_but_not_expected_in_every_repo
                         （删除只在真有删除时才发）
     """
     from perception.ios_contract_v2 import (
-        ENCRYPTED_SIGNAL_KEYS_V2, EXPECTED_REPORT_KEYS_V2)
+        DIFFER_INPUTS_BY_IOS_KEY_V2,
+        ENCRYPTED_SIGNAL_KEYS_V2,
+        EXPECTED_REPORT_KEYS_V2,
+        WAKE_POLICY_BY_IOS_KEY_V2,
+    )
     from perception.service import _PERCEPTKIT_DECRYPTED_ENTRIES
     assert "health_deleted" in ENCRYPTED_SIGNAL_KEYS_V2
     assert _PERCEPTKIT_DECRYPTED_ENTRIES.get("health_deleted") == "apply_deletions"
     assert "health_deleted" not in EXPECTED_REPORT_KEYS_V2
+    assert DIFFER_INPUTS_BY_IOS_KEY_V2["health_deleted"] == ()
+    assert WAKE_POLICY_BY_IOS_KEY_V2["health_deleted"] == "retraction_only_after_decrypt"
 
 
 def test_every_routed_shadow_entry_actually_exists():
@@ -1053,6 +1077,79 @@ def test_a_client_that_sends_no_window_never_deletes(clean):
     _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
     _mirror(conn, _cal_payload([_event("e1")], window=False))
     assert _titles(conn) == ["e1", "e2"]
+
+
+def test_a_full_calendar_batch_with_an_invalid_identity_never_deletes(clean):
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
+    broken = _event("e1")
+    broken["source_account_id"] = None  # opts into strict identity, but incomplete
+    _mirror(conn, _cal_payload([broken]))
+    assert _titles(conn) == ["e1", "e2"]
+
+
+def _reminder_payload(items, *, deleted=(), truncated=False, window=True):
+    out = {
+        "reminders": items,
+        "reminder_deleted_items": list(deleted),
+        "reminders_truncated": truncated,
+    }
+    if window:
+        out["reminder_window_start"] = "2026-08-01T00:00:00+08:00"
+        out["reminder_window_end"] = "2026-10-01T00:00:00+08:00"
+    return out
+
+
+def _reminder(rid, *, due="2026-09-01T09:00:00+08:00"):
+    return {
+        "source_account_id": "icloud",
+        "list_id": "inbox",
+        "reminder_id": rid,
+        "title": rid,
+        "due_time": due,
+    }
+
+
+def _mirror_reminders(conn, payload):
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import shadow
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        return shadow.mirror_reminders("u1", payload)
+
+
+def _reminder_ids(conn):
+    return sorted(r.source_reminder_id for r in
+                  store(conn).list_reminders(subject_id="u1", limit=50))
+
+
+def test_reminder_full_window_can_delete_the_last_dated_item(clean):
+    conn = connect()
+    _mirror_reminders(conn, _reminder_payload([_reminder("r1")]))
+    assert _reminder_ids(conn) == ["r1"]
+    _mirror_reminders(conn, _reminder_payload([]))
+    assert _reminder_ids(conn) == []
+
+
+def test_reminder_tombstone_deletes_undated_item_and_replay_is_idempotent(clean):
+    conn = connect()
+    _mirror_reminders(conn, _reminder_payload([_reminder("r1", due=None)]))
+    assert _reminder_ids(conn) == ["r1"]
+    tombstone = {"source_account_id": "icloud", "list_id": "inbox",
+                 "reminder_id": "r1"}
+    _mirror_reminders(conn, _reminder_payload([], deleted=[tombstone]))
+    assert _reminder_ids(conn) == []
+    _mirror_reminders(conn, _reminder_payload([], deleted=[tombstone]))
+    assert _reminder_ids(conn) == []
+
+
+def test_a_full_reminder_batch_with_an_invalid_identity_never_deletes(clean):
+    conn = connect()
+    _mirror_reminders(conn, _reminder_payload([_reminder("r1"), _reminder("r2")]))
+    broken = _reminder("r1")
+    broken["source_account_id"] = None
+    _mirror_reminders(conn, _reminder_payload([broken]))
+    assert _reminder_ids(conn) == ["r1", "r2"]
 
 
 def test_the_real_ios_per_segment_payload_lands_with_its_own_intervals(clean):

@@ -1355,8 +1355,8 @@ class PostgresStorage:
             for r in self._q(" ".join(sql), params)]
 
     def delete_source_items(self, *, subject_id, source, collection_kind, deleted_items):
-        if collection_kind not in ("calendar", "reminder"):
-            raise ValueError("collection_kind must be calendar or reminder")
+        if collection_kind not in ("calendar", "reminders"):
+            raise ValueError("collection_kind must be calendar or reminders")
         if not deleted_items:
             return 0
         if collection_kind == "calendar":
@@ -1383,10 +1383,10 @@ class PostgresStorage:
             return 0
         if collection_kind == "calendar":
             table, key, fields = "perceptkit_calendar_mirror", "start_at", "event_fields"
-        elif collection_kind == "reminder":
+        elif collection_kind == "reminders":
             table, key, fields = "perceptkit_reminder_mirror", "due_at", "reminder_fields"
         else:
-            raise ValueError("collection_kind must be calendar or reminder")
+            raise ValueError("collection_kind must be calendar or reminders")
         with self.conn.cursor() as cur:
             self._fence()
             cur.execute(

@@ -335,6 +335,50 @@ def _music_fields(value: Mapping[str, Any], *, reason: str | None) -> dict[str, 
     return out
 
 
+#: iOS 的健康快照一个 payload 里会装入多个独立 HealthKit 样本；每个样本
+#: 都有自己的身份和测量时间。映射按 ``iOS key -> Kit signal`` 精确登记，
+#: 不能把整份快照的 received_at 或另一个指标的 sample id 借给它。
+_MEASUREMENT_META: dict[str, dict[str, tuple[str, str]]] = {
+    "health_body": {
+        "health_weight": ("weight_kg_sample_id", "weight_kg_measured_at"),
+        "health_bmi": ("bmi_sample_id", "bmi_measured_at"),
+        "health_body_fat": ("body_fat_pct_sample_id", "body_fat_pct_measured_at"),
+        "health_height": ("height_cm_sample_id", "height_cm_measured_at"),
+    },
+    "health_vitals": {
+        "health_resting_hr": (
+            "resting_heart_rate_sample_id", "resting_heart_rate_measured_at"),
+        "health_current_hr": (
+            "current_heart_rate_sample_id", "current_heart_rate_measured_at"),
+        "health_hrv": ("hrv_sdnn_ms_sample_id", "hrv_sdnn_ms_measured_at"),
+        "health_respiratory": (
+            "respiratory_rate_sample_id", "respiratory_rate_measured_at"),
+        "health_oxygen": (
+            "oxygen_saturation_pct_sample_id", "oxygen_saturation_pct_measured_at"),
+        "health_vo2max": ("vo2_max_sample_id", "vo2_max_measured_at"),
+    },
+    "health_metabolic": {
+        "health_glucose": (
+            "blood_glucose_mmol_l_sample_id", "blood_glucose_mmol_l_measured_at"),
+        "health_blood_pressure": (
+            "blood_pressure_sample_id", "blood_pressure_measured_at"),
+    },
+    "health_sleep": {
+        "health_sleep": ("sleep_sample_id", "sleep_end"),
+    },
+    "health_workout": {
+        "health_workout": ("workout_sample_id", "workout_end"),
+    },
+}
+
+_MEASUREMENT_WIRE_FIELDS = frozenset(
+    field
+    for by_signal in _MEASUREMENT_META.values()
+    for pair in by_signal.values()
+    for field in pair
+) | frozenset({"sleep_start", "workout_start"})
+
+
 def _rename(signal: str, value: Mapping[str, Any]) -> dict[str, Any]:
     """iOS field names -> manifest field names.
 
@@ -348,7 +392,7 @@ def _rename(signal: str, value: Mapping[str, Any]) -> dict[str, Any]:
     values_map = VALUE_MAPS.get(signal, {})
     out: dict[str, Any] = {}
     for k, v in value.items():
-        if v is None or k in dropped:
+        if v is None or k in dropped or k in _MEASUREMENT_WIRE_FIELDS:
             continue
         name = alias.get(k, k)
         fn = transforms.get(name)
@@ -361,11 +405,8 @@ def _rename(signal: str, value: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-#: iOS 送的样本身份字段。**现在 iOS 一个都不送** —— 这条通路是先接上，
-#: 等 anchored query 那批上线就能直接用（后端先兼容、producer 不启用）。
-#:
-#: 没有它，健康信号的身份会退回确定性摘要（subject+source+signal+occurred_at），
-#: 于是"删掉那条体重"在本地没有任何指向，修订也认不出是同一件事。
+#: 通用 producer 可直接发送的顶层样本身份字段。IO iOS 的组合健康 payload
+#: 还会发送逐指标 ``*_sample_id`` / ``*_measured_at``，由下方显式映射提升。
 _IDENTITY_KEYS = ("source_event_id", "source_revision")
 
 
@@ -383,6 +424,24 @@ def _sample_identity(data: Any) -> dict[str, Any]:
         if raw is not None and str(raw).strip():
             out[key] = raw
     return out
+
+
+def _apply_measurement_metadata(
+    observation: dict[str, Any], *, ios_key: str, signal: str, data: Any,
+) -> None:
+    """把组合健康载荷里属于这条 Kit Fact 的身份和时间提升到顶层。"""
+    if not isinstance(data, Mapping):
+        return
+    fields = _MEASUREMENT_META.get(ios_key, {}).get(signal)
+    if fields is None:
+        return
+    identity_field, occurred_field = fields
+    identity = data.get(identity_field)
+    if identity is not None and str(identity).strip():
+        observation["source_event_id"] = str(identity).strip()
+    occurred_at = data.get(occurred_field)
+    if isinstance(occurred_at, str) and occurred_at.strip():
+        observation["occurred_at"] = occurred_at.strip()
 
 
 #: 睡眠：iOS 送的是**当天各阶段的分钟总数**，manifest 要的是
@@ -536,24 +595,31 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
             stages = _sleep_observations(data)
             if stages:
                 ident = _sample_identity(data)
-                base_id = ident.get("source_event_id")
+                parent_meta: dict[str, Any] = {"occurred_at": occurred_at}
+                _apply_measurement_metadata(
+                    parent_meta, ios_key=key, signal=signal, data=data)
+                base_id = parent_meta.get("source_event_id") or ident.get("source_event_id")
                 for one in stages:
                     stage_obs: dict[str, Any] = {
                         "signal": signal,
                         "signal_schema_version": 1,
-                        "occurred_at": occurred_at,
+                        "occurred_at": parent_meta["occurred_at"],
                         "availability": "observed",
                         # 段自己的 id 只是用来算身份的，不是 manifest 声明的
                         # 字段 —— 留在 value 里会被当未声明字段静默丢掉。
                         "value": {k: v for k, v in one.items()
-                                  if k != "source_event_id"},
+                                  if k not in _IDENTITY_KEYS},
                     }
                     if timezone_id:
                         stage_obs["timezone"] = timezone_id
                     stage_obs.update(ident)
+                    stage_obs.update(_sample_identity(one))
                     if base_id:
                         stage_obs["source_event_id"] = sleep_child_event_id(
                             base_id, one)
+                    end_at = one.get("end_at")
+                    if isinstance(end_at, str) and end_at.strip():
+                        stage_obs["occurred_at"] = end_at.strip()
                     observations.append(stage_obs)
                 continue
 
@@ -577,6 +643,8 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
                 emit_main = False
             obs["value"] = value
         if emit_main:
+            _apply_measurement_metadata(
+                obs, ios_key=key, signal=signal, data=data)
             observations.append(obs)
 
         # Fields that belong to a signal of their own. Emitted as separate
@@ -617,6 +685,8 @@ def to_envelope(payload: Mapping[str, Any], *, occurred_at: str,
             # 撤回和修订就永远落不到这些信号头上。血压那组两个字段
             # 共用同一个样本身份（来源侧它们本来就是一次读数）。
             split_obs.update(_sample_identity(data))
+            _apply_measurement_metadata(
+                split_obs, ios_key=key, signal=target, data=data)
             observations.append(split_obs)
 
     return {

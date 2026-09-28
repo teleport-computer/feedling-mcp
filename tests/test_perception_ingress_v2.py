@@ -582,6 +582,71 @@ def test_calendar_encrypted_body_missing_next_event_clears_old_next_event(monkey
     assert state["calendar_events_truncated"]["v"] is False
 
 
+@pytest.mark.parametrize("ran,status", [(True, "accepted"), (False, "retryable")])
+def test_reminder_identity_ledger_gets_a_distinct_kit_receipt(monkeypatch, ran, status):
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: None)
+
+    def shadow_call(entry, *args, **kwargs):
+        if entry == "mirror_reminders":
+            return {"ran": ran, "rejected": 0}
+        return {"ran": True, "rejected": 0}
+
+    monkeypatch.setattr(service, "_perceptkit_shadow_call", shadow_call)
+    plaintext = {"values": {
+        "reminders": [],
+        "reminders_truncated": False,
+        "reminder_window_start": "2026-09-01T00:00:00+08:00",
+        "reminder_window_end": "2026-10-01T00:00:00+08:00",
+        "reminder_deleted_items": [],
+    }, "message": "reminders"}
+
+    results = service.ingest_snapshot_v2(
+        "u_reminder_receipt",
+        [{"key": "reminders", "envelope": {"id": "reminders-1", "body_ct": "Y3Q="},
+          "changed": True}],
+        client_ts=300.0,
+        api_key="api-key",
+        decrypt_envelope=lambda *a, **k: json.dumps(plaintext).encode(),
+    )
+
+    assert results["reminders"] == "accepted"
+    assert results["reminders_perceptkit"] == status
+
+
+@pytest.mark.parametrize(
+    "summary,status",
+    [({"ran": True, "rejected": 0}, "accepted"),
+     ({"ran": True, "rejected": 1}, "rejected"),
+     ({"ran": False}, "retryable")],
+)
+def test_health_deletion_anchor_gets_a_distinct_kit_receipt(monkeypatch, summary, status):
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: None)
+
+    def shadow_call(entry, *args, **kwargs):
+        return summary if entry == "apply_deletions" else {"ran": True, "rejected": 0}
+
+    monkeypatch.setattr(service, "_perceptkit_shadow_call", shadow_call)
+    plaintext = {"values": {"deleted": [
+        {"signal": "health_weight", "sample_id": "weight-1"}
+    ]}, "message": "deletion"}
+
+    results = service.ingest_snapshot_v2(
+        "u_health_delete_receipt",
+        [{"key": "health_deleted", "envelope": {"id": "delete-1", "body_ct": "Y3Q="},
+          "changed": True}],
+        client_ts=301.0,
+        api_key="api-key",
+        decrypt_envelope=lambda *a, **k: json.dumps(plaintext).encode(),
+    )
+
+    assert results["health_deleted"] == "accepted"
+    assert results["health_deleted_perceptkit"] == status
+
+
 def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     user_id = "u_wifi_anchor_decrypt"
     observe_state = _scripted_state_observer(

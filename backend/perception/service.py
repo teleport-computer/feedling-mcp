@@ -467,11 +467,16 @@ def _ingest_snapshot_v2_inner(
                         plaintext,
                         fallback_message=signal.message,
                     )
-                    storage_items.append({
-                        "key": key,
-                        "data": json.dumps(_storage_value_for_decrypted_signal_v2(key, values)),
-                        "message": msg,
-                    })
+                    # health_deleted is an encrypted operation, not a live
+                    # snapshot cell. Feeding it through catalog storage would
+                    # overwrite its accepted result with unknown_signal.
+                    if key in catalog.SIGNALS:
+                        storage_items.append({
+                            "key": key,
+                            "data": json.dumps(
+                                _storage_value_for_decrypted_signal_v2(key, values)),
+                            "message": msg,
+                        })
                     # The client flag is only an upload hint. Every decrypted,
                     # nonempty anchor must reach the durable decision boundary
                     # so a first `changed=false` report still establishes the
@@ -508,9 +513,21 @@ def _ingest_snapshot_v2_inner(
         # enclave calls. Nothing below reads its result.
         _perceptkit_shadow(user_id, storage_items, client_ts=client_ts)
     for key, values in shadow_decrypted:
-        _perceptkit_shadow_call(_PERCEPTKIT_DECRYPTED_ENTRIES[key], user_id,
-                                values, **({"occurred_at": now}
-                                           if key == "location_signal" else {}))
+        summary = _perceptkit_shadow_call(
+            _PERCEPTKIT_DECRYPTED_ENTRIES[key], user_id, values,
+            **({"occurred_at": now} if key == "location_signal" else {}),
+        )
+        # These producers advance an irreversible local cursor/identity ledger.
+        # The live snapshot being accepted is not proof that Kit committed the
+        # retraction/source sync, so return a separate explicit receipt.
+        if key in ("health_deleted", "reminders"):
+            receipt_key = f"{key}_perceptkit"
+            if not isinstance(summary, Mapping) or not summary.get("ran"):
+                results[receipt_key] = "retryable"
+            elif int(summary.get("rejected") or 0):
+                results[receipt_key] = "rejected"
+            else:
+                results[receipt_key] = "accepted"
     for key, plaintext in location_anchor_observations:
         if results.get(key) != "accepted":
             continue
@@ -556,7 +573,7 @@ def _perceptkit_shadow(user_id: str, storage_items: list, *, client_ts=None) -> 
     _perceptkit_shadow_call("observe", user_id, storage_items, client_ts=client_ts)
 
 
-def _perceptkit_shadow_call(entry: str, *args, **kwargs) -> None:
+def _perceptkit_shadow_call(entry: str, *args, **kwargs) -> dict[str, Any] | None:
     """Call one shadow entry point. Import is local and failure is swallowed.
 
     Local import keeps the kit off the module-import path of the live service:
@@ -569,13 +586,15 @@ def _perceptkit_shadow_call(entry: str, *args, **kwargs) -> None:
     """
     try:
         from .perceptkit_adapter import shadow
-        getattr(shadow, entry)(*args, **kwargs)
+        result = getattr(shadow, entry)(*args, **kwargs)
+        return result if isinstance(result, dict) else None
     except Exception as exc:                       # noqa: BLE001 -- deliberate
         # Swallowed, but never silently: a shadow that stops running and says
         # nothing is indistinguishable from a shadow that runs and finds
         # nothing, and the second one is the whole point of having it.
         _log.warning("perceptkit shadow %s could not start (request unaffected): %s",
                      entry, exc)
+        return None
 
 
 def ingest_device_event_v2(user_id: str, event: dict) -> dict:

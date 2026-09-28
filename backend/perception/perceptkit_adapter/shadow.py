@@ -416,8 +416,37 @@ def _coverage_window(payload: Mapping[str, Any]) -> tuple[Any, Any] | None:
         return None
 
 
+def _reminder_coverage_window(payload: Mapping[str, Any]) -> tuple[Any, Any] | None:
+    """The due-date range that the EventKit producer explicitly enumerated."""
+    from datetime import datetime
+    start = payload.get("reminder_window_start")
+    end = payload.get("reminder_window_end")
+    if not start or not end:
+        return None
+    try:
+        return datetime.fromisoformat(str(start)), datetime.fromisoformat(str(end))
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_item_count(payload: Mapping[str, Any], primary: str, *,
+                        legacy: str | None = None, single: str | None = None) -> int:
+    """Count producer rows before identity validation.
+
+    A full snapshot with one malformed identity is not complete: declaring it
+    full would delete the skipped item from the mirror.
+    """
+    for key in (primary, legacy):
+        if not key:
+            continue
+        values = payload.get(key)
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            return len(values)
+    return int(bool(single and isinstance(payload.get(single), Mapping)))
+
+
 def _sync_mirror(user_id: str, collection_kind: str, items, received,
-                 coverage: tuple[Any, Any] | None = None):
+                 coverage: tuple[Any, Any] | None = None, deleted_items=()):
     """Write a mirror batch through the kit's own orchestration.
 
     Not ``upsert_*`` directly. The kit's entry is what stamps the batch's
@@ -461,6 +490,7 @@ def _sync_mirror(user_id: str, collection_kind: str, items, received,
         coverage_start=coverage[0] if coverage else None,
         coverage_end=coverage[1] if coverage else None,
         attempted_at=received, completed_at=received,
+        deleted_items=deleted_items,
     )
     with db.get_pool().connection() as conn:
         conn.autocommit = True
@@ -485,8 +515,10 @@ def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         rows = calendar_rows(payload)
         # ⚠️ 被截断（事件数超过客户端上限）时**不能**声明全量：那批不是窗口
         # 内的全部，被截掉的会被当成"已删除"删掉。截断时 coverage 传 None。
-        coverage = None if payload.get("calendar_events_truncated") else \
-            _coverage_window(payload)
+        row_count = _payload_item_count(
+            payload, "calendar_events", legacy="events", single="calendar_next_event")
+        coverage = None if (payload.get("calendar_events_truncated")
+                            or len(rows) != row_count) else _coverage_window(payload)
         # 🔴 **空的全量快照要照常走下去** —— 那是"用户把这个窗口里的日程都删光了"。
         #
         #    原来在这之前就 `if not rows: return None`，于是删到只剩一个、再把
@@ -515,16 +547,23 @@ def mirror_calendar(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
 def mirror_reminders(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """See ``mirror_calendar``."""
     def build():
-        from .events import reminder_rows
+        from .events import reminder_deleted_rows, reminder_rows
         from perceptkit.contracts.records import ReminderItemMirror
+        from perceptkit.processing.source_sync import DeletedItem
         rows = reminder_rows(payload)
-        if not rows:
+        deleted = [DeletedItem(**row) for row in reminder_deleted_rows(payload)]
+        row_count = _payload_item_count(payload, "reminders")
+        coverage = None if (payload.get("reminders_truncated")
+                            or len(rows) != row_count) else \
+            _reminder_coverage_window(payload)
+        if not rows and not deleted and coverage is None:
             return None
         received = datetime.now(timezone.utc)
         items = [ReminderItemMirror(subject_id=user_id, source=_MIRROR_SOURCE,
                                     updated_at=received, **row)
                  for row in rows]
-        return _sync_mirror(user_id, "reminders", items, received) or {
+        return _sync_mirror(user_id, "reminders", items, received,
+                            coverage=coverage, deleted_items=deleted) or {
                 "ran": True, "producer": "ios_reminder_mirror",
                 "report_id": "-", "observations": len(rows), "applied": len(rows),
                 "rejected": 0, "duplicates": 0, "events": 0,
@@ -580,12 +619,15 @@ def apply_deletions(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         wanted: list[Retraction] = []
         skipped: list[str] = []
+        malformed = 0
         for item in raw:
             if not isinstance(item, Mapping):
+                malformed += 1
                 continue
             signal = str(item.get("signal") or "").strip()
             sample_id = str(item.get("sample_id") or "").strip()
             if not signal or not sample_id:
+                malformed += 1
                 continue
             if signal not in RETRACTABLE_SIGNALS:
                 # 明确记下来而不是安静丢掉：睡眠走的是重述那条路，
@@ -595,7 +637,7 @@ def apply_deletions(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
             wanted.append(Retraction(subject_id=user_id, signal=signal,
                                      source_event_id=sample_id,
                                      source=_MIRROR_SOURCE, observed_at=now))
-        if not wanted and not skipped:
+        if not wanted and not skipped and not malformed:
             return None
 
         recorded = reselected = 0
@@ -610,10 +652,14 @@ def apply_deletions(user_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
             days = len(outcome.affected_days)
         return {"ran": True, "producer": "ios_health_deletion",
                 "report_id": "-", "observations": len(raw),
-                "applied": recorded, "rejected": len(skipped),
+                "applied": recorded, "rejected": len(skipped) + malformed,
                 "duplicates": 0, "events": 0,
-                "warnings": ([f"这些信号不走撤回（走重述）：{sorted(set(skipped))}"]
-                             if skipped else []),
+                "warnings": (
+                    ([f"这些信号不走撤回（走重述）：{sorted(set(skipped))}"]
+                     if skipped else [])
+                    + ([f"{malformed} 条删除缺少完整 signal/sample_id"]
+                       if malformed else [])
+                ),
                 "rejections": [], "verdicts": {},
                 "reselected": reselected, "affected_days": days}
     return _guarded("health_deletion", build, user_id)
