@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- A plaintext Genesis import that finishes now reports its final `stage` and
+  per-material `materials` in the same update that marks it `done`.
+  Previously a status read in the brief moment after completion could see
+  `done` with an empty `materials` list (add-memory imports and the full
+  one-pass onboarding path).
+
 - Updated memgarden from 0.22.0 to 0.23.0 (#10, 3e5da470; release preparation #11, fc872478). History import and daily memory capture now keep concrete one-time details of a person's life (what they bought, saw or attended; names, numbers, dates, places) instead of dropping them as one-off events, and are told not to record the companion's own suggestions as the person's facts or to supply a missing year. Dream merges are asked to keep those values. The resident memory recheck pass follows the same rule.
 
 - A long-term-memory import of a sentence or two, where the model finds nothing
