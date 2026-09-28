@@ -85,6 +85,7 @@ from chat.reply_language import (
     garden_language_decision,
     infer_garden_language,
     infer_reply_language,
+    proactive_language_system_line,
     reply_language_system_line,
     user_written_text,
 )
@@ -11523,7 +11524,7 @@ async def _run_wake(
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(wake_reply_language),
+                proactive_language_system_line(wake_reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,

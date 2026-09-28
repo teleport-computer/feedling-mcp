@@ -4488,7 +4488,7 @@ def test_only_scheduled_wake_demands_a_reply(
 @pytest.mark.parametrize(
     "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
 )
-def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
+def test_all_wake_lanes_receive_soft_language_nudge_not_hard_rule(monkeypatch, lane):
     uid = f"u_wake_language_{lane}"
     conftest.seed_user(uid)
     _reset(uid)
@@ -4529,14 +4529,13 @@ def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    expected = (
-        "回复语言规则：\n"
-        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
-        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
-        "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
-    )
-    assert expected in system_text
+    # T769 (Seven 2026-09-29): proactive turns get one soft nudge and the model
+    # picks the language itself; the hard reply-language rule must not come back.
+    expected = "语言：用用户使用的语言跟他说话。"
     assert system_text.count(expected) == 1
+    assert "回复语言规则" not in system_text
+    assert "Reply language rule" not in system_text
+    assert "主动/后台回复也使用本规则所用的语言" not in system_text
 
 
 @pytest.mark.parametrize(

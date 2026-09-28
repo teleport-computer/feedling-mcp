@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 proactive messages (heartbeat, scheduled, manual wake, and screen
+  watch) no longer receive the fixed reply-language rule tied to the account
+  locale or archive language. They get one soft line asking the model to talk
+  to the user in the language the user uses, and the model chooses the language
+  from the conversation. Chat replies, memory-garden language, and failure
+  fallback copy are unchanged.
+
 - The Runtime V2 debug trace now records, for a chat turn that includes images or
   files, whether the text the user typed with them reached the model request:
   `v2.prompt_frontier.budget` gains an `attachment_captions` object with counts
