@@ -100,7 +100,12 @@ class _PostgresMutationOwner:
         self.failed = False
 
     def _fail(self, reason: str) -> None:
-        self.failed = True
+        # A nested owner shares the ambient database transaction.  Failing
+        # only the inner Python object would let a caller catch the exception
+        # and commit writes made by the outer owner without a valid fence.
+        for owner in self.storage._mutation_owners:
+            if owner.active:
+                owner.failed = True
         raise RetryableMutationError(reason)
 
     def validate(self) -> None:
@@ -589,7 +594,13 @@ class PostgresStorage:
         elif (old.subject_id, old.signal, old.aggregation_kind, old.aggregation_version) != (
                 a.subject_id, a.signal, a.aggregation_kind, a.aggregation_version):
             raise ValueError("aggregate generation scope/version mismatch")
-        elif old.status == "active" and a.local_date not in old.accounted_dates:
+        elif not old.requested_start_date <= a.local_date <= old.requested_end_date:
+            # ``legacy-vN`` is the adapter's compatibility generation for old
+            # callers that never declared a rebuild range.  It alone may grow
+            # while active; an explicit generation's requested range is an
+            # immutable publication boundary.
+            if old.status != "active" or gid != f"legacy-v{a.aggregation_version}":
+                raise ValueError("aggregate row falls outside generation requested range")
             start = min(old.requested_start_date, a.local_date)
             end = max(old.requested_end_date, a.local_date)
             required = {start + timedelta(days=i) for i in range((end - start).days + 1)}
@@ -706,11 +717,18 @@ class PostgresStorage:
                 if old is None or g.requested_start_date > old.requested_start_date \
                         or g.requested_end_date < old.requested_end_date:
                     return False
-            rows = self.get_aggregate(subject_id=subject_id, signal=signal,
-                                      start_date=g.requested_start_date,
-                                      end_date=g.requested_end_date,
-                                      aggregation_kind=aggregation_kind)
-            candidate_rows = [r for r in rows if r.generation_id == generation_id]
+            # Scan the generation's entire durable row set.  A range-bounded
+            # read would hide a corrupt/out-of-contract row just outside the
+            # candidate window and incorrectly allow publication.
+            candidate_rows = [self._aggregate(r) for r in self._q(
+                """SELECT subject_id,signal,local_date,aggregation_kind,
+                          aggregation_version,generation_id,typed_aggregate,completeness,
+                          incomplete_reasons,timezone_attribution,source_coverage,updated_at,
+                          version FROM perceptkit_daily_aggregate
+                   WHERE subject_id=%s AND signal=%s AND aggregation_kind=%s
+                     AND generation_id=%s ORDER BY local_date,aggregation_version""",
+                (subject_id, signal, aggregation_kind, generation_id),
+            )]
             if ({r.local_date for r in candidate_rows} != required
                     or any(r.completeness != "complete"
                            or r.aggregation_version != g.aggregation_version
@@ -796,24 +814,32 @@ class PostgresStorage:
 
     def delete_aggregates(self, *, subject_id, signal, before) -> int:
         with self.transaction():
-            with self.conn.cursor() as cur:
-                self._fence()
-                cur.execute(
-                    "DELETE FROM perceptkit_daily_aggregate WHERE ctid IN ("
-                    " SELECT ctid FROM perceptkit_daily_aggregate WHERE subject_id=%s"
-                    " AND signal=%s AND local_date < %s LIMIT %s)",
-                    (subject_id, signal, before, _SWEEP_MAX_ROWS))
-                removed = cur.rowcount
+            removed = 0
+            while True:
+                with self.conn.cursor() as cur:
+                    self._fence()
+                    cur.execute(
+                        "DELETE FROM perceptkit_daily_aggregate WHERE ctid IN ("
+                        " SELECT ctid FROM perceptkit_daily_aggregate WHERE subject_id=%s"
+                        " AND signal=%s AND local_date < %s LIMIT %s)",
+                        (subject_id, signal, before, _SWEEP_MAX_ROWS))
+                    batch = cur.rowcount
+                removed += batch
+                if batch < _SWEEP_MAX_ROWS:
+                    break
             active_rows = self._q(
                 "SELECT aggregation_kind,generation_id FROM perceptkit_active_aggregate_generation "
                 "WHERE subject_id=%s AND signal=%s FOR UPDATE", (subject_id, signal))
             for kind, gid in active_rows:
                 g = self.get_aggregate_generation(subject_id=subject_id, signal=signal,
                                                   aggregation_kind=kind, generation_id=gid)
-                retained = tuple(day for day in g.accounted_dates if day >= before)
-                incomplete = tuple(day for day in g.incomplete_dates if day >= before)
-                scope = tuple(sorted(set(retained) | set(incomplete)))
-                if not scope:
+                remaining = self._q(
+                    """SELECT local_date,BOOL_OR(completeness='incomplete')
+                       FROM perceptkit_daily_aggregate
+                       WHERE subject_id=%s AND signal=%s AND aggregation_kind=%s
+                         AND generation_id=%s GROUP BY local_date ORDER BY local_date""",
+                    (subject_id, signal, kind, gid))
+                if not remaining:
                     self._q(
                         "DELETE FROM perceptkit_active_aggregate_generation WHERE subject_id=%s "
                         "AND signal=%s AND aggregation_kind=%s", (subject_id, signal, kind))
@@ -822,15 +848,27 @@ class PostgresStorage:
                         "subject_id=%s AND signal=%s AND aggregation_kind=%s AND generation_id=%s",
                         (subject_id, signal, kind, gid))
                     continue
+                retained = tuple(row[0] for row in remaining)
+                start, end = retained[0], retained[-1]
+                required = {start + timedelta(days=i)
+                            for i in range((end - start).days + 1)}
+                incomplete = tuple(sorted(
+                    {day for day in g.incomplete_dates if start <= day <= end}
+                    | {row[0] for row in remaining if row[1]}
+                    | (required - set(retained))))
+                reasons = set(g.incomplete_reasons) if incomplete else set()
+                if required - set(retained):
+                    reasons.add("retention_remaining_gap")
                 self._q(
                     """UPDATE perceptkit_aggregate_generation SET requested_start_date=%s,
+                       requested_end_date=%s,
                        accounted_dates=%s::jsonb,incomplete_dates=%s::jsonb,completeness=%s,
                        incomplete_reasons=%s::jsonb WHERE subject_id=%s AND signal=%s
                        AND aggregation_kind=%s AND generation_id=%s""",
-                    (min(scope), _j([d.isoformat() for d in retained]),
+                    (start, end, _j([d.isoformat() for d in retained]),
                      _j([d.isoformat() for d in incomplete]),
                      "incomplete" if incomplete else "complete",
-                     _j(g.incomplete_reasons if incomplete else ()),
+                     _j(sorted(reasons)),
                      subject_id, signal, kind, gid))
             return removed
 
@@ -992,7 +1030,8 @@ class PostgresStorage:
                      AND claim_expires_at <= %s""", (now,))
             rows = self._q(
                 """SELECT event_id,subject_id,signal FROM perceptkit_event_outbox
-                   WHERE invalidated_at IS NULL AND dispatch_started_at IS NULL AND (
+                   WHERE legacy_scope_unknown=FALSE
+                     AND invalidated_at IS NULL AND dispatch_started_at IS NULL AND (
                      (delivery_state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=%s))
                      OR (delivery_state='claimed' AND claim_expires_at<=%s))
                    ORDER BY detected_at,event_id LIMIT 1""", (now, now))
@@ -1003,6 +1042,7 @@ class PostgresStorage:
                 return None
             live = self._q(
                 """SELECT 1 FROM perceptkit_event_outbox WHERE event_id=%s
+                   AND legacy_scope_unknown=FALSE
                    AND invalidated_at IS NULL AND dispatch_started_at IS NULL AND (
                      (delivery_state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=%s))
                      OR (delivery_state='claimed' AND claim_expires_at<=%s)) FOR UPDATE""",
@@ -1021,9 +1061,11 @@ class PostgresStorage:
 
     def begin_event_dispatch(self, *, event_id, claim_token, now):
         with self.transaction():
-            scope = self._q("SELECT subject_id,signal FROM perceptkit_event_outbox WHERE event_id=%s",
-                            (event_id,))
-            if not scope or not self._try_internal_lock(event_key(scope[0][0], scope[0][1])):
+            scope = self._q(
+                "SELECT subject_id,signal,legacy_scope_unknown "
+                "FROM perceptkit_event_outbox WHERE event_id=%s", (event_id,))
+            if (not scope or scope[0][2]
+                    or not self._try_internal_lock(event_key(scope[0][0], scope[0][1]))):
                 return None
             rows = self._q(
                 f"""UPDATE perceptkit_event_outbox SET dispatch_started_at=%s
@@ -1053,13 +1095,17 @@ class PostgresStorage:
             if not self._try_internal_lock(event_key(subject_id, signal)):
                 raise RetryableMutationError("event scope is owned by another operation")
             rows = self._q(
-                f"SELECT {self._outbox_columns()} FROM perceptkit_event_outbox "
-                "WHERE subject_id=%s AND signal=%s AND invalidated_at IS NULL FOR UPDATE",
+                f"SELECT {self._outbox_columns()},legacy_scope_unknown "
+                "FROM perceptkit_event_outbox "
+                "WHERE subject_id=%s AND invalidated_at IS NULL "
+                "AND (signal=%s OR legacy_scope_unknown=TRUE) FOR UPDATE",
                 (subject_id, signal))
             hit = 0
             for raw in rows:
                 entry = self._outbox(raw)
-                matches = (not entry.fact_dependencies_complete or not entry.fact_dependencies
+                legacy_scope_unknown = raw[24]
+                matches = (legacy_scope_unknown
+                           or not entry.fact_dependencies_complete or not entry.fact_dependencies
                            or any(
                                (ref.get("subject_id"), ref.get("signal"), ref.get("source"),
                                 ref.get("source_event_id")) ==
@@ -1210,7 +1256,9 @@ class PostgresStorage:
             sql.append(f"AND ({_CAL_AT} IS NULL OR {_CAL_AT} >= %s)"); params.append(start)
         if end is not None:
             sql.append(f"AND ({_CAL_AT} IS NULL OR {_CAL_AT} <= %s)"); params.append(end)
-        sql.append(f"ORDER BY {_CAL_AT} NULLS LAST,source_event_id LIMIT %s OFFSET %s")
+        sql.append(
+            f"ORDER BY {_CAL_AT} NULLS LAST,source,source_account_id,"
+            "source_calendar_id,source_event_id LIMIT %s OFFSET %s")
         params.extend((limit, offset))
         out = []
         for r in self._q(" ".join(sql), params):
@@ -1233,7 +1281,9 @@ class PostgresStorage:
         params: list[Any] = [subject_id]
         if not include_completed:
             sql.append("AND COALESCE((reminder_fields->>'is_completed')::bool,false)=false")
-        sql.append(f"ORDER BY {_REM_AT} NULLS LAST,source_reminder_id LIMIT %s OFFSET %s")
+        sql.append(
+            f"ORDER BY {_REM_AT} NULLS LAST,source,source_account_id,"
+            "source_list_id,source_reminder_id LIMIT %s OFFSET %s")
         params.extend((limit, offset))
         return [ReminderItemMirror(
             subject_id=r[0], source=r[1], source_account_id=r[2], source_list_id=r[3],

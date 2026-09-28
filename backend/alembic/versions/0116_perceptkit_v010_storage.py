@@ -131,10 +131,17 @@ ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS budget_reservation_
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS fact_dependencies JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS fact_dependencies_complete BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS legacy_scope_unknown BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS dispatch_started_at TIMESTAMPTZ;
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS invalidated_at TIMESTAMPTZ;
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS invalidation_reason TEXT;
 ALTER TABLE perceptkit_event_outbox ADD COLUMN IF NOT EXISTS signal TEXT NOT NULL DEFAULT '';
+UPDATE perceptkit_event_outbox SET legacy_scope_unknown=TRUE
+ WHERE signal='' AND fact_dependencies_complete=FALSE;
+DROP INDEX IF EXISTS perceptkit_event_outbox_claimable;
+CREATE INDEX perceptkit_event_outbox_claimable
+  ON perceptkit_event_outbox (delivery_state, next_attempt_at, detected_at, event_id)
+  WHERE delivery_state IN ('pending', 'claimed');
 DROP INDEX IF EXISTS perceptkit_event_outbox_source;
 CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_source
   ON perceptkit_event_outbox (subject_id, signal, source, source_event_id);

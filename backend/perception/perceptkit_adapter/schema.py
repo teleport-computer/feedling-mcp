@@ -136,9 +136,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
   dedupe_key TEXT, budget_reservation_id TEXT, created_at TIMESTAMPTZ,
   fact_dependencies JSONB NOT NULL DEFAULT '[]'::jsonb,
   fact_dependencies_complete BOOLEAN NOT NULL DEFAULT FALSE,
+  legacy_scope_unknown BOOLEAN NOT NULL DEFAULT FALSE,
   dispatch_started_at TIMESTAMPTZ, invalidated_at TIMESTAMPTZ,
   invalidation_reason TEXT, signal TEXT NOT NULL DEFAULT ''
 );
+ALTER TABLE perceptkit_event_outbox
+  ADD COLUMN IF NOT EXISTS legacy_scope_unknown BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_claimable
   ON perceptkit_event_outbox (delivery_state, next_attempt_at, detected_at, event_id)
   WHERE delivery_state IN ('pending', 'claimed');
