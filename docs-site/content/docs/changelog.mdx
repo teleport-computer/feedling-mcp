@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- The Runtime V2 debug trace now records, for a chat turn that includes images or
+  files, whether the text the user typed with them reached the model request:
+  `v2.prompt_frontier.budget` gains an `attachment_captions` object with counts
+  and character lengths only, never the caption text: `images`, `files`,
+  `with_caption` (attachments that had typed text), `delivered` (their text is
+  in the attachment's own message in the request), `undetermined` (the text is
+  in the request but that message could equally belong to an earlier one), and
+  the matching `caption_chars`, `delivered_chars`, `undetermined_chars`.
+  Missing = `with_caption` − `delivered` − `undetermined`.
+
 - A plaintext Genesis import that finishes now reports its final `stage` and
   per-material `materials` in the same update that marks it `done`.
   Previously a status read in the brief moment after completion could see
