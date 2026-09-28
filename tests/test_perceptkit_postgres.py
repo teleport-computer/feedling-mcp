@@ -275,7 +275,7 @@ def test_the_dead_worker_cannot_overwrite_the_new_owners_state(clean):
                             received_at=T0 + timedelta(seconds=200)),
         next_state="delivered", claim_token=alive.claim_token,
     )
-    assert fresh_write is True
+    assert fresh_write == "delivered"
 
 
 def test_a_crash_between_accept_and_receipt_does_not_lose_the_event(clean):
@@ -303,7 +303,7 @@ def test_a_receipt_written_twice_does_not_double_advance(clean):
                           received_at=T0 + timedelta(seconds=5))
     s = store()
     assert s.record_wake_receipt(receipt=receipt, next_state="delivered",
-                                 claim_token=claimed.claim_token) is True
+                                 claim_token=claimed.claim_token) == "delivered"
     # 重放同一条回执：不该报错，也不该把状态再推一次
     s.record_wake_receipt(receipt=receipt, next_state="delivered",
                           claim_token=claimed.claim_token)
@@ -327,7 +327,7 @@ def test_purge_subject_removes_wake_receipt_before_its_outbox_owner(clean):
         ),
         next_state="delivered",
         claim_token=claimed.claim_token,
-    ) is True
+    ) == "delivered"
     assert s._q(
         "SELECT count(*) FROM perceptkit_wake_receipt WHERE event_id=%s",
         (event_id,),
@@ -917,8 +917,6 @@ def test_sleep_is_refused_out_loud_rather_than_silently_doing_nothing(clean):
 def test_a_deletion_never_takes_out_another_sources_same_id(clean):
     """同一个 id 在两个来源下是两件事。撤回只该命中它指名的那个来源。"""
     from unittest.mock import patch
-    from perceptkit.kit import PerceptionKit
-    from perceptkit.contracts import IngestContext
     from perception.perceptkit_adapter import shadow
     conn = connect()
     st = store(conn)
@@ -1135,12 +1133,12 @@ def test_retracting_a_fact_scrubs_the_value_from_the_alert_it_triggered(clean):
         event_id="evt-1", subject_id="u1", definition_id="weight_over",
         definition_version=1, event_type="health.weight_over",
         occurred_at=now, detected_at=now,
-        fact_snapshot={"current": 72.0, "previous": 70.0},
+        fact_snapshot={"signal": "health_weight", "current": 72.0, "previous": 70.0},
         source="ios", source_event_id="hk-B",
     ))
 
     hit = s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
-                                  source="ios", source_event_id="hk-B")
+                                  source="ios", source_event_id="hk-B", now=now)
     assert hit == 1, "没找到那条提醒"
 
     raw = conn.execute(
@@ -1170,11 +1168,15 @@ def test_scrubbing_leaves_other_alerts_alone(clean):
             event_id=eid, subject_id=subject, definition_id="weight_over",
             definition_version=1, event_type="health.weight_over",
             occurred_at=now, detected_at=now,
-            fact_snapshot={"current": 72.0}, source="ios", source_event_id=src_id,
+            fact_snapshot={"signal": "health_weight", "current": 72.0},
+            source="ios", source_event_id=src_id,
+            fact_dependencies=({"subject_id": subject, "signal": "health_weight",
+                                "source": "ios", "source_event_id": src_id},),
+            fact_dependencies_complete=True,
         ))
 
     assert s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
-                                   source="ios", source_event_id="hk-B") == 1
+                                   source="ios", source_event_id="hk-B", now=now) == 1
     kept = conn.execute(
         "SELECT event_id FROM perceptkit_event_outbox "
         "WHERE fact_snapshot->>'current' IS NOT NULL ORDER BY event_id"

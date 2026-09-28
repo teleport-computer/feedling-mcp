@@ -1,313 +1,212 @@
-"""DDL for PerceptKit's logical storage objects.
+"""PostgreSQL schema for the PerceptKit v0.10 storage contract.
 
-The single source of truth for these tables. Both migration chains and the
-conformance tests reference this constant, so the tables the tests exercise
-cannot drift from the tables production creates -- a drift there means the
-suite runs green while production is still wrong, which is the exact failure
-the suite exists to prevent.
-
-Three choices are load-bearing.
-
-``subject_id`` leads every primary key. Cross-tenant isolation lives in the
-key rather than in each query remembering a WHERE clause; one forgotten
-clause files one person's data under another and raises nothing.
-
-Dedupe identities get their own table. Details expire while aggregates can be
-permanent, so a dedupe record has to outlive the details it guards. Sharing a
-table would let a retention sweep take it along, after which replayed data
-counts twice into a permanent aggregate with no way back.
-
-The outbox carries a ``claim_token`` fence. A worker returning from an
-expired lease must not overwrite the state of whoever holds the row now --
-comparing only the state, not the token, lets a revived worker undo the
-progress of the live one.
-
-One table here is not the kit's: ``perceptkit_shadow_divergence`` is where the
-shadow records how the kit's conclusions compare with the live path's. It
-lives in this file so it is created by the same migration and removed by the
-same ``purge_subject`` as everything else -- it holds real readings, and a
-diagnostic table that account deletion forgets about is a leak.
+``DDL`` is the fresh-database shape. Existing installations reach the same
+shape through Alembic revision 0116; historical migrations remain immutable.
 """
 from __future__ import annotations
 
-#: Create the tables. Idempotent -- every statement is IF NOT EXISTS, so
-#: re-running is safe.
-DDL = """
+
+DDL = r"""
 CREATE TABLE IF NOT EXISTS perceptkit_ingest_receipt (
-  subject_id      TEXT        NOT NULL,
-  producer        TEXT        NOT NULL,
-  report_id       TEXT        NOT NULL,
-  payload_digest  TEXT        NOT NULL,
-  received_at     TIMESTAMPTZ NOT NULL,
-  status          TEXT        NOT NULL,
+  subject_id TEXT NOT NULL, producer TEXT NOT NULL, report_id TEXT NOT NULL,
+  payload_digest TEXT NOT NULL, received_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL, error_code TEXT, observations_applied INT NOT NULL DEFAULT 0,
   PRIMARY KEY (subject_id, producer, report_id)
 );
 
 CREATE TABLE IF NOT EXISTS perceptkit_observation (
-  subject_id            TEXT        NOT NULL,
-  observation_id        TEXT        NOT NULL,
-  signal                TEXT        NOT NULL,
-  signal_schema_version INT         NOT NULL,
-  source                TEXT        NOT NULL,
-  occurred_at           TIMESTAMPTZ NOT NULL,
-  received_at           TIMESTAMPTZ NOT NULL,
-  availability          TEXT        NOT NULL,
-  effective_local_date  DATE        NOT NULL,
-  typed_value           JSONB,
-  timezone              TEXT,
-  source_event_id       TEXT,
-  source_revision       TEXT,
-  created_at            TIMESTAMPTZ,
+  subject_id TEXT NOT NULL, observation_id TEXT NOT NULL, signal TEXT NOT NULL,
+  signal_schema_version INT NOT NULL, source TEXT NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL, received_at TIMESTAMPTZ NOT NULL,
+  availability TEXT NOT NULL, effective_local_date DATE NOT NULL,
+  typed_value JSONB, timezone TEXT, source_event_id TEXT,
+  source_revision TEXT, source_revision_value JSONB, created_at TIMESTAMPTZ,
+  source_units JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_values JSONB NOT NULL DEFAULT '{}'::jsonb,
+  timezone_source TEXT NOT NULL DEFAULT 'legacy_unknown',
   PRIMARY KEY (subject_id, observation_id)
 );
-
--- Timeline reads go by (subject, signal, occurred_at); retention sweeps scan
--- occurred_at.
 CREATE INDEX IF NOT EXISTS perceptkit_observation_timeline
   ON perceptkit_observation (subject_id, signal, occurred_at, observation_id);
 
 CREATE TABLE IF NOT EXISTS perceptkit_current (
-  subject_id            TEXT        NOT NULL,
-  signal                TEXT        NOT NULL,
-  dimension_key         TEXT        NOT NULL,
-  typed_value           JSONB,
-  availability          TEXT        NOT NULL,
-  observed_at           TIMESTAMPTZ NOT NULL,
-  received_at           TIMESTAMPTZ NOT NULL,
-  expires_at            TIMESTAMPTZ,
-  source_observation_id TEXT,
-  source_revision       TEXT,
-  -- 🔴 这条当前值来自**上游的哪条事实**。撤回按 (source, source_event_id)
-  -- 精确匹配找它 —— 少了这两列，撤回记下来了、当前值却一条都重选不了，
-  -- 而且不报错。迁移 0108 给已有库补了这两列；新建的库走的是这份 DDL，
-  -- 两边必须一致。
-  source                TEXT,
-  source_event_id       TEXT,
-  version               INT         NOT NULL DEFAULT 0,
-  content_digest        TEXT,
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, dimension_key TEXT NOT NULL,
+  typed_value JSONB, availability TEXT NOT NULL,
+  observed_at TIMESTAMPTZ NOT NULL, received_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ, source_observation_id TEXT,
+  source_revision TEXT, source_revision_value JSONB,
+  source TEXT, source_event_id TEXT, version INT NOT NULL DEFAULT 0,
+  content_digest TEXT, timezone TEXT,
+  timezone_source TEXT NOT NULL DEFAULT 'legacy_unknown',
+  source_units JSONB NOT NULL DEFAULT '{}'::jsonb,
+  source_values JSONB NOT NULL DEFAULT '{}'::jsonb,
   PRIMARY KEY (subject_id, signal, dimension_key)
 );
 
-CREATE TABLE IF NOT EXISTS perceptkit_daily_aggregate (
-  subject_id           TEXT        NOT NULL,
-  signal               TEXT        NOT NULL,
-  local_date           DATE        NOT NULL,
-  aggregation_kind     TEXT        NOT NULL,
-  aggregation_version  INT         NOT NULL,
-  typed_aggregate      JSONB       NOT NULL,
-  timezone_attribution TEXT,
-  source_coverage      JSONB       NOT NULL DEFAULT '{}'::jsonb,
-  updated_at           TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, signal, local_date, aggregation_kind, aggregation_version)
+CREATE TABLE IF NOT EXISTS perceptkit_aggregate_generation (
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, aggregation_kind TEXT NOT NULL,
+  generation_id TEXT NOT NULL, aggregation_version INT NOT NULL,
+  requested_start_date DATE NOT NULL, requested_end_date DATE NOT NULL,
+  status TEXT NOT NULL, completeness TEXT NOT NULL,
+  accounted_dates JSONB NOT NULL DEFAULT '[]'::jsonb,
+  incomplete_dates JSONB NOT NULL DEFAULT '[]'::jsonb,
+  incomplete_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+  failure_reason TEXT, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ,
+  activated_at TIMESTAMPTZ,
+  PRIMARY KEY (subject_id, signal, aggregation_kind, generation_id),
+  CHECK (requested_end_date >= requested_start_date)
+);
+CREATE INDEX IF NOT EXISTS perceptkit_aggregate_generation_window
+  ON perceptkit_aggregate_generation
+    (subject_id, signal, aggregation_kind, requested_start_date, requested_end_date,
+     created_at, generation_id);
+
+CREATE TABLE IF NOT EXISTS perceptkit_active_aggregate_generation (
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, aggregation_kind TEXT NOT NULL,
+  generation_id TEXT NOT NULL, activated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (subject_id, signal, aggregation_kind),
+  FOREIGN KEY (subject_id, signal, aggregation_kind, generation_id)
+    REFERENCES perceptkit_aggregate_generation
+      (subject_id, signal, aggregation_kind, generation_id)
+    ON DELETE CASCADE
 );
 
--- When details expire but aggregates are permanent, this has to outlive the
--- details. A separate table is what makes a detail sweep physically unable to
--- touch it.
+CREATE TABLE IF NOT EXISTS perceptkit_daily_aggregate (
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, local_date DATE NOT NULL,
+  aggregation_kind TEXT NOT NULL, aggregation_version INT NOT NULL,
+  generation_id TEXT NOT NULL, typed_aggregate JSONB NOT NULL,
+  completeness TEXT NOT NULL DEFAULT 'complete',
+  incomplete_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+  timezone_attribution TEXT, source_coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMPTZ, version INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (subject_id, signal, local_date, aggregation_kind,
+               aggregation_version, generation_id),
+  FOREIGN KEY (subject_id, signal, aggregation_kind, generation_id)
+    REFERENCES perceptkit_aggregate_generation
+      (subject_id, signal, aggregation_kind, generation_id)
+    ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS perceptkit_daily_aggregate_window
+  ON perceptkit_daily_aggregate
+    (subject_id, signal, aggregation_kind, local_date, aggregation_version, generation_id);
+
 CREATE TABLE IF NOT EXISTS perceptkit_dedupe_identity (
-  subject_id   TEXT        NOT NULL,
-  signal       TEXT        NOT NULL,
-  source       TEXT        NOT NULL,
-  digest          TEXT        NOT NULL,
-  first_applied_at TIMESTAMPTZ NOT NULL,
-  -- Which permanent aggregate this identity guards. A retention sweep reads it
-  -- to know this row is not yet removable.
-  aggregate_scope TEXT,
-  retain_until    TIMESTAMPTZ,
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, source TEXT NOT NULL,
+  digest TEXT NOT NULL, first_applied_at TIMESTAMPTZ NOT NULL,
+  aggregate_scope TEXT, retain_until TIMESTAMPTZ, fact_key TEXT,
+  source_revision_value JSONB, semantic_digest TEXT, legacy_content_digest TEXT,
+  effective_local_date DATE, dimension_key TEXT,
   PRIMARY KEY (subject_id, signal, source, digest)
 );
+CREATE INDEX IF NOT EXISTS perceptkit_identity_fact
+  ON perceptkit_dedupe_identity (subject_id, signal, source, fact_key);
+CREATE INDEX IF NOT EXISTS perceptkit_identity_legacy
+  ON perceptkit_dedupe_identity (subject_id, signal, source)
+  WHERE fact_key IS NULL;
+
+CREATE TABLE IF NOT EXISTS perceptkit_conflict (
+  subject_id TEXT NOT NULL, conflict_id TEXT NOT NULL, signal TEXT NOT NULL,
+  source TEXT NOT NULL, fact_key TEXT NOT NULL, candidate_revision JSONB,
+  semantic_digest TEXT NOT NULL, content_digest TEXT NOT NULL,
+  kind TEXT NOT NULL, reason TEXT NOT NULL, candidate JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', resolved_at TIMESTAMPTZ,
+  resolution_revision JSONB, resolution_semantic_digest TEXT,
+  resolution_observation_id TEXT,
+  PRIMARY KEY (subject_id, conflict_id)
+);
+CREATE INDEX IF NOT EXISTS perceptkit_conflict_query
+  ON perceptkit_conflict
+    (subject_id, status, signal, source, fact_key, created_at, conflict_id);
 
 CREATE TABLE IF NOT EXISTS perceptkit_rule_state (
-  subject_id    TEXT  NOT NULL,
-  definition_id TEXT  NOT NULL,
-  scope_key     TEXT  NOT NULL,
-  state         JSONB NOT NULL,
+  subject_id TEXT NOT NULL, definition_id TEXT NOT NULL, scope_key TEXT NOT NULL,
+  state JSONB NOT NULL,
   PRIMARY KEY (subject_id, definition_id, scope_key)
 );
 
 CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
-  event_id           TEXT        PRIMARY KEY,
-  subject_id         TEXT        NOT NULL,
-  definition_id      TEXT        NOT NULL,
-  definition_version INT         NOT NULL,
-  event_type         TEXT        NOT NULL,
-  occurred_at        TIMESTAMPTZ NOT NULL,
-  detected_at        TIMESTAMPTZ NOT NULL,
-  delivery_state     TEXT        NOT NULL,
-  attempt_count      INT         NOT NULL DEFAULT 0,
-  fact_snapshot      JSONB       NOT NULL DEFAULT '{}'::jsonb,
-  next_attempt_at    TIMESTAMPTZ,
-  claim_token        TEXT,
-  claimed_by         TEXT,
-  claim_expires_at   TIMESTAMPTZ,
-  -- 这条事件是被哪条源事实触发的。用户删掉那条数据时，靠它找到这条记录、
-  -- 把快照里的原值抹掉（只留"有过一条已被删除的数据触发过"）。
-  -- 可空：这之前落库的事件没有这个信息，编一个比留空更坏。
-  source             TEXT,
-  source_event_id    TEXT
+  event_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL,
+  definition_id TEXT NOT NULL, definition_version INT NOT NULL,
+  event_type TEXT NOT NULL, occurred_at TIMESTAMPTZ NOT NULL,
+  detected_at TIMESTAMPTZ NOT NULL, delivery_state TEXT NOT NULL,
+  attempt_count INT NOT NULL DEFAULT 0, fact_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+  next_attempt_at TIMESTAMPTZ, claim_token TEXT, claimed_by TEXT,
+  claim_expires_at TIMESTAMPTZ, source TEXT, source_event_id TEXT,
+  dedupe_key TEXT, budget_reservation_id TEXT, created_at TIMESTAMPTZ,
+  fact_dependencies JSONB NOT NULL DEFAULT '[]'::jsonb,
+  fact_dependencies_complete BOOLEAN NOT NULL DEFAULT FALSE,
+  dispatch_started_at TIMESTAMPTZ, invalidated_at TIMESTAMPTZ,
+  invalidation_reason TEXT, signal TEXT NOT NULL DEFAULT ''
 );
-
--- How a worker picks up work: by state and due time. Ordering within one
--- subject does not matter.
 CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_claimable
-  ON perceptkit_event_outbox (delivery_state, next_attempt_at)
+  ON perceptkit_event_outbox (delivery_state, next_attempt_at, detected_at, event_id)
   WHERE delivery_state IN ('pending', 'claimed');
-
--- 抹值是按 (人, 信号, 来源, 样本id) 找行；没有这个索引就是全表扫，
--- 而撤回发生在用户点"删除"的那一刻，是同步路径。
 CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_source
-  ON perceptkit_event_outbox (subject_id, source, source_event_id);
+  ON perceptkit_event_outbox (subject_id, signal, source, source_event_id);
+CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_subject_event
+  ON perceptkit_event_outbox (subject_id, event_id);
 
 CREATE TABLE IF NOT EXISTS perceptkit_wake_receipt (
-  event_id    TEXT        NOT NULL,
-  attempt_id  TEXT        NOT NULL,
-  status      TEXT        NOT NULL,
-  received_at TIMESTAMPTZ NOT NULL,
-  runtime_ref TEXT,
-  reason      TEXT,
+  event_id TEXT NOT NULL, attempt_id TEXT NOT NULL, status TEXT NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL, runtime_ref TEXT, reason TEXT,
   PRIMARY KEY (event_id, attempt_id)
 );
 
--- `source` is part of the identity, not a label. Without it a full sync
--- declaring source='ios' deletes rows that belong to Google: the snapshot
--- step removes "everything in coverage this round did not mention", and
--- another source's rows were of course not in this round. The user finds
--- their other calendar account emptied, irreversibly.
 CREATE TABLE IF NOT EXISTS perceptkit_calendar_mirror (
-  subject_id          TEXT        NOT NULL,
-  source              TEXT        NOT NULL,
-  source_account_id   TEXT        NOT NULL,
-  source_calendar_id  TEXT        NOT NULL,
-  source_event_id     TEXT        NOT NULL,
-  event_fields        JSONB       NOT NULL,
-  source_revision     TEXT,
-  recurrence_identity TEXT,
-  source_created_at   TIMESTAMPTZ,
-  source_updated_at   TIMESTAMPTZ,
-  last_seen_sync_id   TEXT,
-  updated_at          TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, source, source_account_id, source_calendar_id,
-               source_event_id)
+  subject_id TEXT NOT NULL, source TEXT NOT NULL, source_account_id TEXT NOT NULL,
+  source_calendar_id TEXT NOT NULL, source_event_id TEXT NOT NULL,
+  event_fields JSONB NOT NULL, source_revision TEXT,
+  recurrence_identity TEXT, source_created_at TIMESTAMPTZ,
+  source_updated_at TIMESTAMPTZ, last_seen_sync_id TEXT, updated_at TIMESTAMPTZ,
+  PRIMARY KEY (subject_id, source, source_account_id, source_calendar_id, source_event_id)
 );
 
--- `source` in the key for the same reason as the calendar mirror above.
 CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
-  subject_id         TEXT        NOT NULL,
-  source             TEXT        NOT NULL,
-  source_account_id  TEXT        NOT NULL,
-  source_list_id     TEXT        NOT NULL,
-  source_reminder_id TEXT        NOT NULL,
-  reminder_fields    JSONB       NOT NULL,
-  source_revision    TEXT,
-  source_created_at  TIMESTAMPTZ,
-  source_updated_at  TIMESTAMPTZ,
-  last_seen_sync_id  TEXT,
-  updated_at         TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, source, source_account_id, source_list_id,
-               source_reminder_id)
+  subject_id TEXT NOT NULL, source TEXT NOT NULL, source_account_id TEXT NOT NULL,
+  source_list_id TEXT NOT NULL, source_reminder_id TEXT NOT NULL,
+  reminder_fields JSONB NOT NULL, source_revision TEXT,
+  source_created_at TIMESTAMPTZ, source_updated_at TIMESTAMPTZ,
+  last_seen_sync_id TEXT, updated_at TIMESTAMPTZ,
+  PRIMARY KEY (subject_id, source, source_account_id, source_list_id, source_reminder_id)
 );
 
--- Column names track `SourceSyncState` exactly. They drifted once: the table
--- said `last_sync_id`/`cursor` while the record said `sync_cursor`, and the
--- reader passed a keyword the record does not have -- so every read raised.
--- Nothing called it, so nothing noticed until the sync entry landed.
---
--- The failure columns are not optional bookkeeping. Without `last_error_code`
--- and `last_attempted_at` a failed sync is indistinguishable from one that
--- never ran, and "the calendar has been failing for three days" cannot be
--- answered at all.
--- Facts the source withdrew. Append-only: the observation stays so "why is
--- there a gap on that day" remains answerable; this table is what keeps the
--- withdrawn value out of the current projection and the day's aggregate.
---
--- `source` is in the key because two sources routinely reuse a
--- source_event_id, and they are different facts.
 CREATE TABLE IF NOT EXISTS perceptkit_retraction (
-  subject_id      TEXT        NOT NULL,
-  signal          TEXT        NOT NULL,
-  source          TEXT        NOT NULL,
-  source_event_id TEXT        NOT NULL,
-  observed_at     TIMESTAMPTZ NOT NULL,
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, source TEXT NOT NULL,
+  source_event_id TEXT NOT NULL, observed_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (subject_id, signal, source, source_event_id)
 );
 
 CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
-  subject_id              TEXT        NOT NULL,
-  source                  TEXT        NOT NULL,
-  collection_kind         TEXT        NOT NULL,
-  sync_cursor             TEXT,
-  coverage_start          TIMESTAMPTZ,
-  coverage_end            TIMESTAMPTZ,
-  snapshot_kind           TEXT,
-  last_attempted_at       TIMESTAMPTZ,
-  last_successful_sync_at TIMESTAMPTZ,
-  last_error_code         TEXT,
+  subject_id TEXT NOT NULL, source TEXT NOT NULL, collection_kind TEXT NOT NULL,
+  sync_cursor TEXT, coverage_start TIMESTAMPTZ, coverage_end TIMESTAMPTZ,
+  snapshot_kind TEXT, last_attempted_at TIMESTAMPTZ,
+  last_successful_sync_at TIMESTAMPTZ, last_error_code TEXT,
   PRIMARY KEY (subject_id, source, collection_kind)
 );
 
--- Host-side, not part of the kit's model. The shadow writes one row per
--- (field, verdict) and bumps a counter, rather than one row per report: the
--- question it answers is "does this field ever disagree, and what did it look
--- like the last time", and that needs a running tally, not a log. Bounded by
--- construction -- subjects x fields x verdicts -- so it needs no sweep.
---
--- Sample values are stored only for the verdicts that need diagnosing. An
--- `agree` row carries counts and nothing else; there is nothing to debug and
--- no reason to keep a copy of the reading.
 CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
-  subject_id     TEXT        NOT NULL,
-  signal         TEXT        NOT NULL,
-  field          TEXT        NOT NULL,
-  verdict        TEXT        NOT NULL,
-  occurrences    BIGINT      NOT NULL DEFAULT 0,
-  first_seen_at  TIMESTAMPTZ NOT NULL,
-  last_seen_at   TIMESTAMPTZ NOT NULL,
-  last_live      TEXT,
-  last_kit       TEXT,
-  last_report_id TEXT,
-  note           TEXT,
-  -- How far apart the two sides' readings were taken, seconds, for the most
-  -- recent occurrence; and the running max.
-  --
-  -- Without this a `differ` row is unreadable: two paths hold different
-  -- values either because one read the sensor later than the other, or
-  -- because one is wrong -- and the values alone cannot separate those. The
-  -- first is expected on anything that changes by the second; only the
-  -- second is worth acting on. 0.09% of prod comparisons came back `differ`
-  -- with no way to tell which, and that is what blocks retiring the live path.
-  last_skew_sec  DOUBLE PRECISION,
-  max_skew_sec   DOUBLE PRECISION,
-  -- 🔴 两边**各自的**取值时刻，不只是它们的差。
-  --
-  -- 差值回答了「谁读得晚多久」，但丢了两件事：谁更晚（skew 取了绝对值），
-  -- 以及绝对时间（没法和别的东西对时间线）。外部复核要的就是这两格 ——
-  -- 「取值时刻不同」和「其中一条路算错了」，光看值和次数分不开，
-  -- 而分不开就不能下线老路。
-  last_live_at   TIMESTAMPTZ,
-  last_kit_at    TIMESTAMPTZ,
+  subject_id TEXT NOT NULL, signal TEXT NOT NULL, field TEXT NOT NULL,
+  verdict TEXT NOT NULL, occurrences BIGINT NOT NULL DEFAULT 0,
+  first_seen_at TIMESTAMPTZ NOT NULL, last_seen_at TIMESTAMPTZ NOT NULL,
+  last_live TEXT, last_kit TEXT, last_report_id TEXT, note TEXT,
+  last_skew_sec DOUBLE PRECISION, max_skew_sec DOUBLE PRECISION,
+  last_live_at TIMESTAMPTZ, last_kit_at TIMESTAMPTZ,
   PRIMARY KEY (subject_id, signal, field, verdict)
 );
 """
 
-#: Empty every table. Tests only. Production deletion goes through
-#: purge_subject or a retention sweep, both of which bound what they touch by
-#: subject or by time.
-TRUNCATE = """
-TRUNCATE perceptkit_ingest_receipt, perceptkit_observation, perceptkit_current,
-         perceptkit_daily_aggregate, perceptkit_dedupe_identity,
-         perceptkit_rule_state, perceptkit_event_outbox, perceptkit_wake_receipt,
-         perceptkit_calendar_mirror, perceptkit_reminder_mirror,
-         perceptkit_sync_state, perceptkit_shadow_divergence,
-         perceptkit_retraction;
-"""
 
 TABLES = (
     "perceptkit_ingest_receipt", "perceptkit_observation", "perceptkit_current",
-    "perceptkit_daily_aggregate", "perceptkit_dedupe_identity",
-    "perceptkit_rule_state", "perceptkit_event_outbox", "perceptkit_wake_receipt",
-    "perceptkit_calendar_mirror", "perceptkit_reminder_mirror",
-    "perceptkit_sync_state", "perceptkit_shadow_divergence",
-    "perceptkit_retraction",
+    "perceptkit_daily_aggregate", "perceptkit_active_aggregate_generation",
+    "perceptkit_aggregate_generation", "perceptkit_dedupe_identity",
+    "perceptkit_conflict", "perceptkit_rule_state", "perceptkit_event_outbox",
+    "perceptkit_wake_receipt", "perceptkit_calendar_mirror",
+    "perceptkit_reminder_mirror", "perceptkit_sync_state",
+    "perceptkit_shadow_divergence", "perceptkit_retraction",
 )
+
+TRUNCATE = "TRUNCATE " + ", ".join(TABLES) + " CASCADE;"
 
 __all__ = ["DDL", "TRUNCATE", "TABLES"]
