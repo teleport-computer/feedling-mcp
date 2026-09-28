@@ -146,3 +146,26 @@ def test_sql_joins_model_on_trace_id_and_respects_window():
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
         db.delete_trace_events_for_user(uid)
+
+
+def test_skipped_heartbeats_are_itemised_never_counted_as_spoke():
+    """T773: a heartbeat that ended before any provider call is not a model choice."""
+    rows = [
+        ("completed", None, "", "glm-5.3"),
+        ("completed", "sleep", "no news", "glm-5.3"),
+        ("completed", "skipped", "no_user_history", None),
+        ("completed", "skipped", "yielded_to_chat", "glm-5.3"),
+    ]
+    out = report.summarize(rows)
+    assert out["total"]["spoke"] == 1 and out["total"]["silent"] == 1
+    assert out["total"]["open_rate"] == 0.5
+    assert out["total"]["excluded"] == {
+        "skipped_no_user_history": 1, "skipped_yielded_to_chat": 1}
+
+
+def test_heartbeat_skip_reasons_match_the_worker():
+    """Every reason the worker writes with wake_result='skipped' is known here."""
+    from model_api_runtime.v2 import worker
+    reasons = {v for k, v in vars(worker).items() if k.startswith("HEARTBEAT_SKIP_")}
+    assert reasons == report.HEARTBEAT_SKIP_REASONS
+    assert worker.HEARTBEAT_SKIPPED == "skipped"

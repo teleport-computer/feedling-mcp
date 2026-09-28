@@ -22,6 +22,12 @@ change must not be interpreted as an API guarantee.
   the matching `caption_chars`, `delivered_chars`, `undetermined_chars`.
   Missing = `with_caption` − `delivered` − `undetermined`.
 
+- A Runtime V2 heartbeat or manual wake that looks something up in its first
+  call is now reminded in the next call to end the wake with `reply` or
+  `stay_silent`. Some models answered the lookup result as plain text instead,
+  and the wake then failed as `wake_failed:choice_invalid` without reaching the
+  user.
+
 - A plaintext Genesis import that finishes now reports its final `stage` and
   per-material `materials` in the same update that marks it `done`.
   Previously a status read in the brief moment after completion could see
