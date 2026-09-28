@@ -1,7 +1,7 @@
 """PostgreSQL schema for the PerceptKit v0.10 storage contract.
 
 ``DDL`` is the fresh-database shape. Existing installations reach the same
-shape through Alembic revision 0116; historical migrations remain immutable.
+shape through Alembic revision 0118; historical migrations remain immutable.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS perceptkit_ingest_receipt (
   subject_id TEXT NOT NULL, producer TEXT NOT NULL, report_id TEXT NOT NULL,
   payload_digest TEXT NOT NULL, received_at TIMESTAMPTZ NOT NULL,
   status TEXT NOT NULL, error_code TEXT, observations_applied INT NOT NULL DEFAULT 0,
+  observations_rejected JSONB NOT NULL DEFAULT '[]'::jsonb,
   PRIMARY KEY (subject_id, producer, report_id)
 );
 

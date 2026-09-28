@@ -26,6 +26,7 @@ from perceptkit.contracts.receipt import (
     INGEST_CONFLICT,
     INGEST_DUPLICATE,
     IngestReceipt,
+    ObservationRejection,
     WakeReceipt,
 )
 from perceptkit.contracts.records import (
@@ -90,6 +91,47 @@ def _observation_from_payload(raw: dict[str, Any]) -> StoredObservation:
     if isinstance(value.get("effective_local_date"), str):
         value["effective_local_date"] = date.fromisoformat(value["effective_local_date"])
     return StoredObservation(**value)
+
+
+def _report_issues_payload(
+        issues: Sequence[ObservationRejection]) -> list[dict[str, Any]]:
+    """Return the one public JSON shape for durable per-item outcomes."""
+    return [
+        {"index": issue.index, "code": issue.code, "problems": list(issue.problems)}
+        for issue in issues
+    ]
+
+
+def _report_issues_from_payload(raw: Any) -> tuple[ObservationRejection, ...]:
+    """Decode durable outcomes strictly; corrupt audit state must not be guessed."""
+    if not isinstance(raw, list):
+        raise ValueError("observations_rejected must be a JSON array")
+    issues: list[ObservationRejection] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"index", "code", "problems"}:
+            raise ValueError(
+                "observations_rejected entries require index, code and problems")
+        problems = item["problems"]
+        if (not isinstance(item["index"], int) or isinstance(item["index"], bool)
+                or not isinstance(item["code"], str)
+                or not isinstance(problems, list)
+                or not problems
+                or any(not isinstance(problem, str) for problem in problems)):
+            raise ValueError("observations_rejected entry has invalid field types")
+        try:
+            issue = ObservationRejection(
+                index=item["index"], code=item["code"], problems=tuple(problems))
+        except Exception as exc:
+            raise ValueError("observations_rejected entry violates Kit contract") from exc
+        # Reading must not silently repair a value that should never have been
+        # persisted (unbounded/raw diagnostics included).
+        if issue.problems != tuple(problems):
+            raise ValueError("observations_rejected contains unsanitized diagnostics")
+        issues.append(issue)
+    indexes = tuple(issue.index for issue in issues)
+    if indexes != tuple(sorted(indexes)) or len(indexes) != len(set(indexes)):
+        raise ValueError("observations_rejected is unordered or has duplicate indexes")
+    return tuple(issues)
 
 
 class _PostgresMutationOwner:
@@ -268,32 +310,41 @@ class PostgresStorage:
             return IngestReceipt(subject_id, producer, report_id, payload_digest,
                                  received_at, INGEST_ACCEPTED)
         prior = self._q(
-            "SELECT payload_digest,received_at,status,error_code,observations_applied "
+            "SELECT payload_digest,received_at,status,error_code,observations_applied,"
+            "observations_rejected "
             "FROM perceptkit_ingest_receipt WHERE subject_id=%s AND producer=%s AND report_id=%s",
             (subject_id, producer, report_id))[0]
+        issues = _report_issues_from_payload(prior[5])
         if prior[0] == payload_digest and prior[2] != INGEST_ACCEPTED:
             return IngestReceipt(subject_id, producer, report_id, prior[0], prior[1],
-                                 prior[2], prior[3], 0)
+                                 prior[2], prior[3], 0, issues)
         status = INGEST_DUPLICATE if prior[0] == payload_digest else INGEST_CONFLICT
         return IngestReceipt(subject_id, producer, report_id, prior[0], prior[1], status,
-                             None if status == INGEST_DUPLICATE else "digest_mismatch", 0)
+                             None if status == INGEST_DUPLICATE
+                             else "report_digest_conflict",
+                             0, issues if status == INGEST_DUPLICATE else ())
 
     def finalize_report(self, receipt: IngestReceipt) -> None:
         rows = self._q(
-            "SELECT payload_digest,status,error_code,observations_applied FROM "
+            "SELECT payload_digest,status,error_code,observations_applied,"
+            "observations_rejected FROM "
             "perceptkit_ingest_receipt WHERE subject_id=%s AND producer=%s AND report_id=%s FOR UPDATE",
             (receipt.subject_id, receipt.producer, receipt.report_id))
         if not rows or rows[0][0] != receipt.payload_digest:
             raise ValueError("report finalization requires matching claim")
         prior = rows[0]
+        prior_issues = _report_issues_from_payload(prior[4])
         if prior[1] != INGEST_ACCEPTED and (
-                prior[1], prior[2], prior[3]) != (
-                    receipt.status, receipt.error_code, receipt.observations_applied):
+                prior[1], prior[2], prior[3], prior_issues) != (
+                    receipt.status, receipt.error_code, receipt.observations_applied,
+                    receipt.observations_rejected):
             raise ValueError("cannot overwrite a terminal report failure")
         self._q(
-            "UPDATE perceptkit_ingest_receipt SET status=%s,error_code=%s,observations_applied=%s "
+            "UPDATE perceptkit_ingest_receipt SET status=%s,error_code=%s,observations_applied=%s,"
+            "observations_rejected=%s::jsonb "
             "WHERE subject_id=%s AND producer=%s AND report_id=%s AND payload_digest=%s",
             (receipt.status, receipt.error_code, receipt.observations_applied,
+             _j(_report_issues_payload(receipt.observations_rejected)),
              receipt.subject_id, receipt.producer, receipt.report_id, receipt.payload_digest))
 
     def backfill_report_digest(self, *, subject_id, producer, report_id,

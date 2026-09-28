@@ -91,11 +91,20 @@ UPDATE perceptkit_daily_aggregate
  SET completeness='incomplete',
      incomplete_reasons='["legacy_coverage_unverified"]'::jsonb
  WHERE generation_id LIKE 'legacy-v%';
-ALTER TABLE perceptkit_daily_aggregate
-  ADD CONSTRAINT perceptkit_daily_aggregate_generation_fk
-  FOREIGN KEY (subject_id, signal, aggregation_kind, generation_id)
-  REFERENCES perceptkit_aggregate_generation
-    (subject_id, signal, aggregation_kind, generation_id) ON DELETE CASCADE;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conname='perceptkit_daily_aggregate_generation_fk'
+       AND conrelid='perceptkit_daily_aggregate'::regclass
+  ) THEN
+    ALTER TABLE perceptkit_daily_aggregate
+      ADD CONSTRAINT perceptkit_daily_aggregate_generation_fk
+      FOREIGN KEY (subject_id, signal, aggregation_kind, generation_id)
+      REFERENCES perceptkit_aggregate_generation
+        (subject_id, signal, aggregation_kind, generation_id) ON DELETE CASCADE;
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS perceptkit_daily_aggregate_window
   ON perceptkit_daily_aggregate
     (subject_id, signal, aggregation_kind, local_date, aggregation_version, generation_id);

@@ -26,7 +26,7 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0115_outbox_source_fact"]
+    assert script.get_heads() == ["0118_perceptkit_report_outcomes"]
     assert (
         script.get_revision("0115_outbox_source_fact").down_revision
         == "0114_agent_canvas_cards"
@@ -291,13 +291,17 @@ def test_tee_migrations_reuse_the_rds_contract_sql():
         tee.get_revision("0043_divergence_skew").module._UP
         == rds.get_revision("0109_divergence_skew").module._UP
     ), "the mirror-source migration must be byte-identical on both chains"
-    # The adapter and its conformance tests run against schema.DDL. If the
-    # migration drifts from it, the suite goes green against tables production
-    # never creates -- which is the one failure the suite exists to prevent.
+    # 0106/0040 are immutable shared baselines. schema.DDL is intentionally the
+    # current fresh-head shape after the RDS-only 0116-0118 additions (the
+    # PerceptKit tables are still SKIP on the TEE lane). Real PostgreSQL
+    # upgrade/fresh columns+indexes+constraints parity is covered by
+    # test_perceptkit_postgres_v010_review; keep a static guard for this head's
+    # public receipt field here as well.
     from perception.perceptkit_adapter import schema as _pk_schema
-    assert (
-        rds.get_revision("0106_perceptkit_objects").module._UP == _pk_schema.DDL
-    ), "the migration drifted from the DDL the adapter and its tests use"
+    outcomes = rds.get_revision("0118_perceptkit_report_outcomes").module
+    assert outcomes.down_revision == "0117_perceptkit_def_history"
+    assert "observations_rejected JSONB NOT NULL DEFAULT '[]'::jsonb" in outcomes._UP
+    assert "observations_rejected JSONB NOT NULL DEFAULT '[]'::jsonb" in _pk_schema.DDL
     assert (
         tee.get_revision("0039_distill_artifact_ledger").module._UP
         == rds.get_revision("0104_distill_artifact_ledger").module._UP

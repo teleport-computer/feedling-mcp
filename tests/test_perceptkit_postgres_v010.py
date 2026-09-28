@@ -90,7 +90,7 @@ def migration_module(name):
     return module
 
 
-def test_upgrade_through_0117_matches_fresh_columns_and_marks_legacy_incomplete():
+def test_upgrade_through_0118_matches_fresh_columns_and_marks_legacy_incomplete():
     legacy_schema = f"legacy_{uuid.uuid4().hex[:10]}"
     fresh_schema = f"fresh_{uuid.uuid4().hex[:10]}"
     modules = [
@@ -100,6 +100,7 @@ def test_upgrade_through_0117_matches_fresh_columns_and_marks_legacy_incomplete(
     ]
     migration = migration_module("0116_perceptkit_v010_storage")
     definitions_migration = migration_module("0117_perceptkit_definition_history")
+    outcomes_migration = migration_module("0118_perceptkit_report_outcomes")
     with connect() as conn:
         conn.execute(f'CREATE SCHEMA "{legacy_schema}"')
         conn.execute(f'CREATE SCHEMA "{fresh_schema}"')
@@ -114,8 +115,11 @@ def test_upgrade_through_0117_matches_fresh_columns_and_marks_legacy_incomplete(
                     typed_aggregate,source_coverage)
                    VALUES ('u','steps','2026-09-01','daily',2,'{"n":1}','{}')""")
             conn.execute(migration._UP)
+            conn.execute(migration._UP)  # unpublished v0.10 migration is retry-safe
             conn.execute(definitions_migration._UP)
             conn.execute(definitions_migration._UP)  # head upgrade is retry-safe
+            conn.execute(outcomes_migration._UP)
+            conn.execute(outcomes_migration._UP)  # head upgrade is retry-safe
             legacy = conn.execute(
                 "SELECT status,completeness,incomplete_reasons FROM "
                 "perceptkit_aggregate_generation").fetchone()
