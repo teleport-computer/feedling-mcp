@@ -4038,6 +4038,7 @@ def _emit_prompt_frontier_trace(
     observation: Any,
     *,
     lane: str,
+    attachment_captions: dict[str, int] | None = None,
 ) -> None:
     """Best-effort final debug-trace boundary for one prompt budget decision."""
 
@@ -4048,6 +4049,8 @@ def _emit_prompt_frontier_trace(
             observation,
             lane=lane,
         )
+        if attachment_captions and event_type == "v2.prompt_frontier.budget":
+            detail["attachment_captions"] = dict(attachment_captions)
         deps.emit_debug_trace(
             user_id,
             event_type,
@@ -5175,6 +5178,7 @@ def _ledger_tapped_sink(
     lane: str = "chat",
     trace_id: str = "",
     job_id: str = "",
+    caption_probe: "_AttachmentCaptionProbe | None" = None,
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -5193,13 +5197,25 @@ def _ledger_tapped_sink(
         if recorder is not None:
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
+        if event_kind == "late_input_fold" and caption_probe is not None:
+            try:
+                caption_probe.expect(payload.get("messages") or ())
+            except Exception:  # noqa: BLE001 — observability cannot fail a turn
+                pass
         if event_kind == "provider_request" and deps is not None:
+            attachment_captions = None
+            if caption_probe is not None:
+                try:
+                    attachment_captions = caption_probe.observe(payload)
+                except Exception:  # noqa: BLE001 — observability cannot fail a turn
+                    attachment_captions = None
             await asyncio.to_thread(
                 _emit_prompt_frontier_trace,
                 deps,
                 user_id,
                 payload.get("prompt_frontier"),
                 lane=lane,
+                attachment_captions=attachment_captions,
             )
             await asyncio.to_thread(
                 _emit_context_truncation_trace,
@@ -5240,6 +5256,146 @@ def _ledger_tapped_sink(
                         )
 
     return _record
+
+
+_ATTACHMENT_CAPTION_TEXT_KEYS = ("content", "text")
+_ATTACHMENT_CAPTION_WALK_DEPTH = 6
+
+
+def _carrier_text(value: Any, out: list[str], depth: int = 0) -> None:
+    # Only text-bearing keys are walked, so image bytes are never scanned.
+    if depth > _ATTACHMENT_CAPTION_WALK_DEPTH:
+        return
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key in _ATTACHMENT_CAPTION_TEXT_KEYS:
+            if key in value:
+                _carrier_text(value[key], out, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _carrier_text(item, out, depth + 1)
+
+
+class _AttachmentCaptionProbe:
+    """Did the words typed with this turn's images/files reach the provider? (T768)
+
+    The prompt builder reports every conversation row it renders together with
+    the message it created. Messages reach the request as shallow copies (e.g.
+    ``tool_loop._with_system_suffix``), so the message dict itself cannot be the
+    token; the rendered content object is, disambiguated by ownership: a content
+    object rendered by one row belongs to that row. When several rows rendered
+    the same object (a shared or interned string), the sent message is assigned
+    by its position between unambiguous neighbours; if another row could still
+    own it, this turn's candidates are reported as ``undetermined`` rather than
+    delivered or missing (missing = with_caption - delivered - undetermined).
+    Equal text in a different object never counts. Captions and ids
+    stay in memory; only integer counts reach telemetry.
+    """
+
+    def __init__(self) -> None:
+        self._rows: dict[str, tuple[str, str]] = {}
+        # id(content) -> [(order, row_id, content)]; content kept so ids stay live.
+        self._owners: dict[int, list[tuple[float, str, Any]]] = {}
+        self._noted = 0
+
+    def expect(self, rows: Iterable[Any]) -> None:
+        for row in rows or ():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role") or "user") not in {"user", "human"}:
+                continue
+            kind = "image" if row.get("has_image") else "file" if row.get("has_file") else ""
+            row_id = str(row.get("id") or "")
+            if kind and row_id and row_id not in self._rows:
+                self._rows[row_id] = (kind, str(row.get("caption") or "").strip())
+
+    def note_message(self, row: Any, message: Any) -> None:
+        if not isinstance(row, dict) or not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if content is None:
+            return
+        self._noted += 1
+        row_id = str(row.get("id") or "") or f"anon:{id(row)}"
+        try:
+            order = float(row.get("seq"))
+        except (TypeError, ValueError):
+            order = 1e18 + self._noted
+        owners = self._owners.setdefault(id(content), [])
+        if not any(owner == row_id and known is content for _o, owner, known in owners):
+            owners.append((order, row_id, content))
+
+    def _candidates(self, content: Any) -> list[tuple[float, str]]:
+        found: dict[str, float] = {}
+        for order, row_id, known in self._owners.get(id(content), ()):
+            if known is content:
+                found[row_id] = min(order, found.get(row_id, order))
+        return sorted((order, row_id) for row_id, order in found.items())
+
+    def observe(self, provider_request: dict) -> dict[str, int] | None:
+        if not self._rows:
+            return None
+        sent = [
+            message.get("content")
+            for message in provider_request.get("messages") or ()
+            if isinstance(message, dict) and message.get("content") is not None
+        ]
+        candidates = [self._candidates(content) for content in sent]
+        anchors = [cands[0][0] if len(cands) == 1 else None for cands in candidates]
+        owned: dict[str, list[Any]] = {}
+        unresolved: dict[str, list[Any]] = {}
+        for index, cands in enumerate(candidates):
+            if not cands:
+                continue
+            if len(cands) > 1:
+                before = max((a for a in anchors[:index] if a is not None), default=float("-inf"))
+                after = min((a for a in anchors[index + 1:] if a is not None), default=float("inf"))
+                cands = [c for c in cands if before < c[0] < after] or cands
+            if len(cands) > 1:
+                if any(row_id not in self._rows for _o, row_id in cands):
+                    # Another row could own it: this turn's rows among the
+                    # candidates are undetermined, never delivered or missing.
+                    for _o, row_id in cands:
+                        if row_id in self._rows:
+                            unresolved.setdefault(row_id, []).append(sent[index])
+                    continue
+                free = [c for c in cands if c[1] not in owned]
+                cands = free[:1] or cands[:1]
+            owned.setdefault(cands[0][1], []).append(sent[index])
+        def carries(contents: Iterable[Any], caption: str) -> bool:
+            for content in contents:
+                fragments: list[str] = []
+                _carrier_text(content, fragments)
+                if any(caption in fragment for fragment in fragments):
+                    return True
+            return False
+
+        with_caption = delivered = caption_chars = delivered_chars = 0
+        undetermined = undetermined_chars = 0
+        for row_id, (_kind, caption) in self._rows.items():
+            if not caption:
+                continue
+            with_caption += 1
+            caption_chars += len(caption)
+            if carries(owned.get(row_id, ()), caption):
+                delivered += 1
+                delivered_chars += len(caption)
+            elif carries(unresolved.get(row_id, ()), caption):
+                undetermined += 1
+                undetermined_chars += len(caption)
+        kinds = [kind for kind, _ in self._rows.values()]
+        # missing = with_caption - delivered - undetermined
+        return {
+            "images": kinds.count("image"),
+            "files": kinds.count("file"),
+            "with_caption": with_caption,
+            "delivered": delivered,
+            "undetermined": undetermined,
+            "caption_chars": caption_chars,
+            "delivered_chars": delivered_chars,
+            "undetermined_chars": undetermined_chars,
+        }
 
 
 def _worldbook_context_observation(provider_request: dict) -> dict | None:
@@ -6270,6 +6426,7 @@ def _make_build_messages_fn(
     proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
+    caption_probe: "_AttachmentCaptionProbe | None" = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -6330,6 +6487,14 @@ def _make_build_messages_fn(
             ),
         )
 
+    def _note_caption_message(row: dict, message: dict) -> None:
+        if caption_probe is None:
+            return
+        try:
+            caption_probe.note_message(row, message)
+        except Exception:  # noqa: BLE001 — observability cannot fail a turn
+            pass
+
     def _base(
         selected_turns: list[list[dict]],
         *,
@@ -6364,6 +6529,7 @@ def _make_build_messages_fn(
             proactive_turn_boundary=proactive_turn_boundary,
             manual_wake=manual_wake,
             screen_frame_message=screen_frame_message,
+            on_tail_message=_note_caption_message,
         )
 
     base_messages = _base(optional_turns)
@@ -6377,6 +6543,7 @@ def _make_build_messages_fn(
             content = item.get("content")
             if context._has_payload(content):
                 rendered.append({"role": "user", "content": content})
+                _note_caption_message(item, rendered[-1])
         return list(base_messages) + rendered
 
     if target_turns is not None:
@@ -16708,6 +16875,12 @@ async def process_job(
         )
         turn_memory_observation: dict = {}
 
+        caption_probe = _AttachmentCaptionProbe()
+        try:
+            caption_probe.expect(coalesced)
+        except Exception:  # noqa: BLE001 — observability cannot fail a turn
+            pass
+
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
                 context.chat_system_prompt(
@@ -16739,6 +16912,7 @@ async def process_job(
                 tail_lane=lane,
                 tail_anchor_seq=optional_anchor_seq,
                 screen_frame_message=screen_frame_message,
+                caption_probe=caption_probe,
             )
 
         build_messages = _chat_builder()
@@ -16912,6 +17086,7 @@ async def process_job(
                 lane=lane,
                 trace_id=str(job.get("trace_id") or ""),
                 job_id=str(job_id),
+                caption_probe=caption_probe,
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,

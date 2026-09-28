@@ -3048,3 +3048,71 @@ def test_official_route_chat_turn_also_pins_the_exact_model_id(monkeypatch):
     system = calls[0]["messages"][0]["content"]
     assert _BYOK.model in system        # claude-sonnet-4-test，钉死精确型号
     assert "官方直连" in system          # 走官方文案，不是第三方那套
+
+
+_T768_CAPTION = "PRIVATE_CAPTION_看我的猫"
+
+
+def _t768_deps(rows_after, events, *, ordered=False):
+    """Seq-native deps; ``rows_after()`` decides what is visible. ``ordered`` is
+    production's chat setting (serve_worker passes ordered_chat_replies=True)."""
+    def read_after(_uid, after_seq, *args, **kwargs):
+        return [r for r in rows_after() if int(r["seq"]) > int(after_seq)]
+
+    def read_tail(_uid, after_seq, limit, *, through_seq=None):
+        return [r for r in rows_after() if int(r["seq"]) > int(after_seq)
+                and (through_seq is None or int(r["seq"]) <= int(through_seq))]
+
+    return worker.TurnDeps(
+        read_messages=lambda _uid: rows_after(),
+        read_messages_after_seq=read_after,
+        read_tail_after_seq=read_tail,
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        read_images=lambda _uid, ids: {
+            mid: {"image_mime": "image/png", "image_b64": "iVBORw0KGgo="} for mid in ids},
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        emit_debug_trace=lambda _uid, kind, **kwargs: events.append((kind, kwargs)),
+        apply_pending_effects=_apply_effects,
+        ordered_chat_replies=ordered,
+    )
+
+
+def _t768_budgets(events):
+    return [e["detail"] for kind, e in events if kind == "v2.prompt_frontier.budget"]
+
+
+def test_t768_attachment_folded_in_mid_turn_is_counted_once(monkeypatch):
+    """First round text only; an image with a caption arrives between rounds and is
+    folded into the second request; the third round must not count it twice."""
+    uid = "u_t768_fold"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("t768")
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r1"})
+    text_row = {"id": "t1", "seq": 1, "ts": 1.0, "role": "user", "content": "hi"}
+    image_row = {"id": "img2", "seq": 2, "ts": 2.0, "role": "user", "content": _T768_CAPTION,
+                 "caption": _T768_CAPTION, "has_image": True, "image_mime": "image/png"}
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("c1", "memory_index")),
+        _tool_round(_tc("c2", "memory_index")),
+        _text_round("MODEL REPLY"),
+    ])
+    visible = lambda: [text_row, image_row] if len(calls) >= 1 else [text_row]  # noqa: E731
+    events = []
+
+    asyncio.run(worker.process_job(
+        job, _t768_deps(visible, events),
+        provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert len(calls) >= 3
+    assert _T768_CAPTION not in repr(calls[0]["messages"])
+    assert _T768_CAPTION in repr(calls[1]["messages"])
+    budgets = _t768_budgets(events)
+    assert "attachment_captions" not in budgets[0]
+    expected = {"images": 1, "files": 0, "with_caption": 1, "delivered": 1, "undetermined": 0,
+                "caption_chars": len(_T768_CAPTION), "delivered_chars": len(_T768_CAPTION), "undetermined_chars": 0}
+    assert budgets[1]["attachment_captions"] == expected
+    assert budgets[2]["attachment_captions"] == expected

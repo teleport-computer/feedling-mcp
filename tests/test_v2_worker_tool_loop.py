@@ -5039,3 +5039,68 @@ def test_chat_degenerate_fallback_ignores_attachment_placeholders(
     )
     assert status == "completed"
     assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
+
+
+_T768_CAPTION = "PRIVATE_CAPTION_看我的猫"
+
+
+@pytest.mark.parametrize("prompt_content,delivered", [
+    (_T768_CAPTION, 1),
+    ("[image]", 0),  # T745 shape: the row knows the caption, the prompt got the marker
+])
+def test_t768_first_round_image_caption_delivery_matches_the_real_request(
+    monkeypatch, prompt_content, delivered,
+):
+    """T768 on the production-shaped seq path (real append+enqueue, ordered chat
+    replies): the budget trace's caption count agrees with the actual request."""
+    uid = f"u_toolloop_t768_caption_{delivered}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_doc = {**_user_doc("image-parent", _T768_CAPTION),
+                 "content_type": "image", "image_mime": "image/png"}
+    _seq, job_id = db.chat_append_and_enqueue(
+        uid, "image-parent", 10.0, input_doc, 5000, "chat",
+        expected_generation=generation)
+    job = jobs_store.claim_next_job("w-t768")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+    _patch_real_write(monkeypatch)
+
+    def _read_after_seq(_user_id, after_seq):
+        return [{
+            "id": row["id"], "seq": int(row["seq"]), "ts": float(row.get("ts") or 0),
+            "role": row.get("role"), "content": prompt_content,
+            "caption": _T768_CAPTION, "has_image": True,
+            "image_mime": row.get("image_mime") or "",
+        } for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"]
+
+    calls = _script_provider(monkeypatch, [_text_round("MODEL REPLY")])
+    events = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _u: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        read_tail_after_seq=lambda _u, after_seq, limit, *, through_seq=None:
+            _read_after_seq(uid, after_seq),
+        read_images=lambda _u, ids: {
+            mid: {"image_b64": "iVBORw0KGgo=", "image_mime": "image/png"} for mid in ids},
+        read_summary_with_seq=lambda _u: ("", 0.0, 0, 0),
+        resolve_provider=lambda _u: (_BYOK, {}),
+        mint_enclave_token=lambda _u: "rt",
+        emit_debug_trace=lambda _u, kind, **kw: events.append((kind, kw)),
+        ordered_chat_replies=True,
+    )
+
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert calls, "provider never called"
+    assert (_T768_CAPTION in repr(calls[0]["messages"])) is bool(delivered)
+    budgets = [e["detail"] for kind, e in events if kind == "v2.prompt_frontier.budget"]
+    assert budgets[0]["attachment_captions"] == {
+        "images": 1, "files": 0, "with_caption": 1, "delivered": delivered, "undetermined": 0,
+        "caption_chars": len(_T768_CAPTION),
+        "delivered_chars": len(_T768_CAPTION) * delivered, "undetermined_chars": 0,
+    }
+    assert _T768_CAPTION not in repr(budgets)
