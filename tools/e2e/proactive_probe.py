@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import os
 import time
 import uuid
@@ -479,10 +480,15 @@ def _install_quality_identity(c) -> None:
     }, action="proactive quality")
 
 
-def _admin_user(c) -> dict:
+def _require_admin_token() -> str:
     token = os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
     if not token:
         raise _ProbeIssue("BLOCKED_CREDENTIAL", "FEEDLING_ADMIN_TOKEN is unavailable")
+    return token
+
+
+def _admin_user(c) -> dict:
+    token = _require_admin_token()
     try:
         response = httpx.get(
             f"{c.api_url}/v1/admin/data-track/users/{c.user_id}",
@@ -506,6 +512,10 @@ def _admin_user(c) -> dict:
 
 
 def _case_user_turn_priority(c) -> str:
+    # _wait_for_wake_delivery reads the admin surface when no bubble arrives.
+    # Check the token BEFORE enqueuing: blocking mid-wait leaves this manual_wake
+    # in flight and a later case (wake_coalescing) folds into it — T751/T774.
+    _require_admin_token()
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
     collision_wait = _wait_out_chat_collision(c)
@@ -588,6 +598,11 @@ def _server_response_time(response) -> float:
         raise _ProbeIssue("BLOCKED_EVIDENCE", "quality wake omitted a valid server Date") from exc
 
 
+#: What may follow 「周X早」 for it to read as the greeting itself: end of text,
+#: whitespace or punctuation. A positive list, so no new compound can slip in.
+_WEEKDAY_EARLY_END = r"早(?=$|[\s，,。.！!？?、；;：:…~～—\-])"
+
+
 def _assert_timezone_grounding(text: str, server_started: float, server_finished: float) -> str:
     """Check a weekday/day-period pair in Shanghai during the measured wake.
 
@@ -633,13 +648,23 @@ def _assert_timezone_grounding(text: str, server_started: float, server_finished
             periods += ("深夜", "半夜")
         if hour == 23 or hour < 6:
             periods += ("午夜",)
-        if any(word in text for word in weekdays) and any(word in text for word in periods):
+        # A bare 「早」 glued to the weekday and ending the phrase (「周日早，……」)
+        # is a morning greeting. It must be followed by the end, whitespace or
+        # punctuation: 早退/早餐/早起/早就/早点 are words, not a period — T774.
+        weekday_early = 5 <= hour < 12 and any(
+            re.search(re.escape(w) + _WEEKDAY_EARLY_END, text) for w in weekdays)
+        if any(word in text for word in weekdays) and (
+                weekday_early or any(word in text for word in periods)):
             return f"Asia/Shanghai server_interval={start.isoformat()}..{end.isoformat()}"
         cursor += timedelta(hours=1)
     raise _ProbeIssue("PRODUCT_FAIL", f"timezone weekday/day-period mismatch; head={text[:160]!r}")
 
 
 def _case_proactive_message_quality(c) -> str:
+    # _wait_for_wake_delivery reads the admin surface when no bubble arrives.
+    # Check the token BEFORE enqueuing: blocking mid-wait leaves this manual_wake
+    # in flight and a later case (wake_coalescing) folds into it — T751/T774.
+    _require_admin_token()
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
     collision_wait = _wait_out_chat_collision(c)
