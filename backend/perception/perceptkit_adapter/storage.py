@@ -839,7 +839,11 @@ class PostgresStorage:
                        WHERE subject_id=%s AND signal=%s AND aggregation_kind=%s
                          AND generation_id=%s GROUP BY local_date ORDER BY local_date""",
                     (subject_id, signal, kind, gid))
-                if not remaining:
+                actual_dates = {row[0] for row in remaining}
+                retained_accounted = {day for day in g.accounted_dates if day >= before}
+                retained_incomplete = {day for day in g.incomplete_dates if day >= before}
+                scope = actual_dates | retained_accounted | retained_incomplete
+                if not scope:
                     self._q(
                         "DELETE FROM perceptkit_active_aggregate_generation WHERE subject_id=%s "
                         "AND signal=%s AND aggregation_kind=%s", (subject_id, signal, kind))
@@ -848,16 +852,16 @@ class PostgresStorage:
                         "subject_id=%s AND signal=%s AND aggregation_kind=%s AND generation_id=%s",
                         (subject_id, signal, kind, gid))
                     continue
-                retained = tuple(row[0] for row in remaining)
-                start, end = retained[0], retained[-1]
+                start, end = min(scope), max(scope)
+                accounted = actual_dates | retained_accounted
                 required = {start + timedelta(days=i)
                             for i in range((end - start).days + 1)}
                 incomplete = tuple(sorted(
-                    {day for day in g.incomplete_dates if start <= day <= end}
+                    retained_incomplete
                     | {row[0] for row in remaining if row[1]}
-                    | (required - set(retained))))
+                    | (required - accounted - retained_incomplete)))
                 reasons = set(g.incomplete_reasons) if incomplete else set()
-                if required - set(retained):
+                if required - accounted - retained_incomplete:
                     reasons.add("retention_remaining_gap")
                 self._q(
                     """UPDATE perceptkit_aggregate_generation SET requested_start_date=%s,
@@ -865,7 +869,7 @@ class PostgresStorage:
                        accounted_dates=%s::jsonb,incomplete_dates=%s::jsonb,completeness=%s,
                        incomplete_reasons=%s::jsonb WHERE subject_id=%s AND signal=%s
                        AND aggregation_kind=%s AND generation_id=%s""",
-                    (start, end, _j([d.isoformat() for d in retained]),
+                    (start, end, _j([d.isoformat() for d in sorted(accounted)]),
                      _j([d.isoformat() for d in incomplete]),
                      "incomplete" if incomplete else "complete",
                      _j(sorted(reasons)),

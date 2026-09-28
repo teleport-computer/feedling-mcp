@@ -287,6 +287,69 @@ def test_retention_drains_more_than_one_batch_and_reconciles_actual_rows(
         subject_id="u1", signal="steps", aggregation_kind="daily") is None
 
 
+def test_retention_preserves_no_row_incomplete_scope_when_nothing_is_deleted(
+        clean_v010_review):
+    store = storage()
+    missing = DAY + timedelta(days=1)
+    candidate = AggregateGeneration(
+        "sparse-retained", "u1", "steps", "daily", 2, DAY, missing,
+        status="active", completeness="incomplete", accounted_dates=(DAY,),
+        incomplete_dates=(missing,), incomplete_reasons=("fact_retracted",),
+        created_at=T0, updated_at=T0, activated_at=T0,
+    )
+    store.put_aggregate_generation(candidate)
+    store.put_aggregate(aggregate(DAY, "sparse-retained"))
+    store._q(
+        """INSERT INTO perceptkit_active_aggregate_generation
+           (subject_id,signal,aggregation_kind,generation_id,activated_at)
+           VALUES ('u1','steps','daily','sparse-retained',%s)""", (T0,))
+
+    assert store.delete_aggregates(subject_id="u1", signal="steps", before=DAY) == 0
+    active = store.get_active_aggregate_generation(
+        subject_id="u1", signal="steps", aggregation_kind="daily")
+    assert active.requested_start_date == DAY
+    assert active.requested_end_date == missing
+    assert active.accounted_dates == (DAY,)
+    assert active.incomplete_dates == (missing,)
+    assert active.completeness == "incomplete"
+    assert active.incomplete_reasons == ("fact_retracted",)
+
+
+def test_retention_truncates_left_boundary_but_keeps_right_durable_scope(
+        clean_v010_review):
+    store = storage()
+    old = DAY - timedelta(days=1)
+    missing = DAY + timedelta(days=1)
+    candidate = AggregateGeneration(
+        "bounded-retention", "u1", "steps", "daily", 2, old, missing,
+        status="active", completeness="incomplete", accounted_dates=(old, DAY),
+        incomplete_dates=(missing,), incomplete_reasons=("fact_retracted",),
+        created_at=T0, updated_at=T0, activated_at=T0,
+    )
+    store.put_aggregate_generation(candidate)
+    store.put_aggregate(aggregate(old, "bounded-retention"))
+    store.put_aggregate(aggregate(DAY, "bounded-retention"))
+    store._q(
+        """INSERT INTO perceptkit_active_aggregate_generation
+           (subject_id,signal,aggregation_kind,generation_id,activated_at)
+           VALUES ('u1','steps','daily','bounded-retention',%s)""", (T0,))
+
+    assert store.delete_aggregates(subject_id="u1", signal="steps", before=DAY) == 1
+    active = store.get_active_aggregate_generation(
+        subject_id="u1", signal="steps", aggregation_kind="daily")
+    assert active.requested_start_date == DAY
+    assert active.requested_end_date == missing
+    assert active.accounted_dates == (DAY,)
+    assert active.incomplete_dates == (missing,)
+    assert active.completeness == "incomplete"
+    assert active.incomplete_reasons == ("fact_retracted",)
+
+    assert store.delete_aggregates(
+        subject_id="u1", signal="steps", before=missing + timedelta(days=1)) == 1
+    assert store.get_active_aggregate_generation(
+        subject_id="u1", signal="steps", aggregation_kind="daily") is None
+
+
 def test_calendar_pages_have_total_primary_key_order(clean_v010_review):
     store = storage()
     identities = [
