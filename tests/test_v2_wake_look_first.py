@@ -94,10 +94,26 @@ def test_presence_wake_first_call_withholds_the_decision(monkeypatch, lane):
     assert status == "completed"
     assert calls[0]["names"] and not calls[0]["names"] & DECISION
     assert DECISION <= calls[1]["names"]
-    # A real lookup needs no decide instruction and no draft.
+    # T770: after a real lookup the next round is the decision round, so it
+    # carries the choice instruction (prod GLM otherwise answered the lookup
+    # result in plain text); there is no draft to correct.
     second = str(calls[1]["messages"])
     assert tool_loop._WAKE_DIRECT_TEXT_CORRECTION not in second
-    assert tool_loop._WAKE_CHOICE_INSTRUCTION not in second
+    assert tool_loop._WAKE_CHOICE_INSTRUCTION in second
+    assert delivered == []
+
+
+def test_choice_instruction_follows_a_lookup_for_one_round_only(monkeypatch):
+    status, calls, delivered, _ = _run(
+        monkeypatch, "heartbeat", [_lookup(), _lookup(), _silent()], uid_suffix="lookup_twice")
+    assert status == "completed"
+    assert len(calls) == 3
+    # Not forced: the decision round keeps the ordinary tool surface.
+    assert calls[1]["names"] - DECISION
+    assert calls[1]["tool_choice"] != "required"
+    assert tool_loop._WAKE_CHOICE_INSTRUCTION in str(calls[1]["messages"])
+    # The instruction is transient: a later ordinary round does not carry it.
+    assert tool_loop._WAKE_CHOICE_INSTRUCTION not in str(calls[2]["messages"])
     assert delivered == []
 
 

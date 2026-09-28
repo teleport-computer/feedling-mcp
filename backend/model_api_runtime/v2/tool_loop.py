@@ -3246,6 +3246,11 @@ async def run_tool_loop(
                 seen_reasoning_fragments.clear()
                 _progress("wake_look_first_decide_boundary")
                 continue
+            # A real lookup: the next round still decides, so it carries the same
+            # choice instruction (no draft). Prod 2026-09-25..28: every GLM
+            # choice_invalid heartbeat looked something up here and then answered
+            # the lookup result in plain text; none took the draft path (T770).
+            wake_look_first_decide = True
         if (
             regular_wake_choice_required and not wake_direct_text_seen
             and not pr.tool_calls and not pr.media and pr.text.strip()
