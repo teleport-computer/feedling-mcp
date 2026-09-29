@@ -273,6 +273,11 @@ class ChildSupervisor:
         with self._lock:
             return self._snapshot
 
+    def child_pid(self) -> int | None:
+        """The live child's pid for read-only diagnostics, or None."""
+        proc = self._proc
+        return proc.pid if proc is not None and proc.is_alive() else None
+
     def kill(
         self, *, join_timeout: float = 5.0
     ) -> slot_protocol.ActiveJobIdentity | None:

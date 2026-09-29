@@ -1949,8 +1949,8 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
         raise provider_client.ProviderError("fixture authentication failure", status_code=401)
     monkeypatch.setattr(provider_client, "chat_completion_async", failing_provider)
     reads, events = [], []
-    def select(user_id, *, through_seq):
-        reads.append((user_id, through_seq))
+    def select(user_id, *, through_seq, coordinates=None):
+        reads.append((user_id, through_seq, coordinates))
         if selection_fails:
             raise RuntimeError("selection unavailable")
         return {"context_memories": [{"id": "chat-memory", "summary": "露营灯编号 NP-4286"}],
@@ -1967,7 +1967,7 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
     status = asyncio.run(worker.process_job(job, deps, provider_config=_BYOK,
                                            api_key=None, runtime_token="rt"))
     assert status == "failed" and len(provider_calls) == 1
-    assert reads == [(uid, 1)]
+    assert [r[:2] for r in reads] == [(uid, 1)]
     blocks = [m["content"] for m in provider_calls[0]["messages"]
               if isinstance(m, dict) and str(m.get("content", "")).startswith("# 相关记忆")]
     assert len(blocks) == (0 if selection_fails else 1)
@@ -1975,6 +1975,10 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
     assert len(completed) == 1
     assert completed[0]["counts"]["injected"] == (0 if selection_fails else 1)
     assert completed[0]["counts"]["selected"] == (None if selection_fails else 1)
+    # T779 step 2c: the read is labelled with the same turn as memory.recall.completed.
+    coords = reads[0][2]
+    assert set(coords) == {"lane", "turn_id", "job_id", "attempt"}
+    assert {k: completed[0][k] for k in coords} == coords
 
 
 def test_process_job_records_failed_whole_turn_metric_on_provider_error(monkeypatch):
@@ -2036,9 +2040,10 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
-    selection_reads = []
-    def read_memories(user_id, *, through_seq):
+    selection_reads, wake_coordinates = [], []
+    def read_memories(user_id, *, through_seq, coordinates=None):
         selection_reads.append((user_id, through_seq))
+        wake_coordinates.append(coordinates)
         return {"context_memories": [{"id": "wake-memory", "summary": "露营灯保修码 NP-4286"}],
                 "context_memory_log": {"mode": "default"}}
 
@@ -2060,6 +2065,9 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
 
     assert status == "completed"
     assert selection_reads == [(uid, 1)]
+    assert wake_coordinates == [worker._turn_coordinates(
+        "heartbeat", job["id"], job.get("trace_id"), job.get("attempt_count"))]
+    assert wake_coordinates[0]["lane"] == "wake" and wake_coordinates[0]["job_id"] == str(job_id)
     assert any(m.get("role") == "assistant" and "NP-4286" in str(m.get("content"))
                for m in provider_calls[0]["messages"] if isinstance(m, dict))
     with db.get_pool().connection() as c:
