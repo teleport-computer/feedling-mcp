@@ -92,6 +92,19 @@ class _Job:
     done: threading.Event = field(default_factory=threading.Event)
 
 
+_STAT_SAMPLES = 500
+
+
+def _summary(values) -> dict:
+    """p50 / p95 / max of a bounded sample, or all None when empty."""
+    ordered = sorted(values)
+    if not ordered:
+        return {"n": 0, "p50": None, "p95": None, "max": None}
+    pick = lambda q: ordered[min(len(ordered) - 1, int(q * (len(ordered) - 1) + 0.5))]  # noqa: E731
+    return {"n": len(ordered), "p50": round(pick(0.5), 1), "p95": round(pick(0.95), 1),
+            "max": round(ordered[-1], 1)}
+
+
 class Scheduler:
     def __init__(self, embedder):
         self._embedder = embedder
@@ -99,6 +112,13 @@ class Scheduler:
         self._queries: collections.deque = collections.deque()
         self._segments: collections.deque = collections.deque()
         self._closed = False
+        # Content-free counters for step 2c measurement. Waits cover every query
+        # that reached the worker (including ones dropped as expired), not only
+        # successful answers, so their max is a real worst case for that window.
+        self._running_kind: str | None = None
+        self._counts = collections.Counter()
+        self._query_wait_ms: collections.deque = collections.deque(maxlen=_STAT_SAMPLES)
+        self._segment_ms: collections.deque = collections.deque(maxlen=_STAT_SAMPLES)
         self._thread = threading.Thread(target=self._run, name="query-encoder", daemon=True)
         self._thread.start()
 
@@ -114,12 +134,28 @@ class Scheduler:
         job = _Job("query", list(texts), deadline)
         with self._cv:
             if self._closed:
+                self._counts["query_refused_closed"] += 1
                 raise Refused("encoder_service_unavailable")
             if len(self._queries) >= MAX_QUEUED_QUERIES:
+                self._counts["query_refused_busy"] += 1
                 raise Refused("encoder_busy")
+            self._counts["query_submitted"] += 1
+            if self._running_kind == "segment":
+                self._counts["query_behind_segment"] += 1
             self._queries.append(job)
             self._cv.notify()
         return job
+
+    def stats(self) -> dict:
+        """Content-free snapshot for the parent heartbeat (T779 step 2c)."""
+        with self._cv:
+            return {
+                "counts": dict(self._counts),
+                "queued": len(self._queries),
+                "segments_queued": len(self._segments),
+                "query_wait_ms": _summary(list(self._query_wait_ms)),
+                "segment_ms": _summary(list(self._segment_ms)),
+            }
 
     def encode_segment(self, texts: list) -> list:
         job = _Job("segment", list(texts))
@@ -151,7 +187,11 @@ class Scheduler:
             if self._closed:
                 return None
             # A waiting query always goes before the next sweep segment.
-            return self._queries.popleft() if self._queries else self._segments.popleft()
+            job = self._queries.popleft() if self._queries else self._segments.popleft()
+            self._running_kind = job.kind
+            if job.kind == "query":
+                self._query_wait_ms.append((time.monotonic() - job.submitted) * 1000.0)
+            return job
 
     def _run(self) -> None:
         while True:
@@ -160,6 +200,9 @@ class Scheduler:
                 return
             if job.kind == "query" and job.deadline is not None and time.monotonic() >= job.deadline:
                 job.error = "deadline_exceeded"
+                with self._cv:
+                    self._counts["query_expired_dropped"] += 1
+                    self._running_kind = None
                 job.done.set()
                 continue
             job.started = time.monotonic()
@@ -171,6 +214,13 @@ class Scheduler:
             except Exception:
                 job.error = "encode_failed"
             job.finished = time.monotonic()
+            with self._cv:
+                self._running_kind = None
+                if job.kind == "segment":
+                    self._counts["segments"] += 1
+                    self._segment_ms.append((job.finished - job.started) * 1000.0)
+                else:
+                    self._counts["query_failed" if job.error else "query_served"] += 1
             job.done.set()
 
 
@@ -180,6 +230,19 @@ _server: http.server.ThreadingHTTPServer | None = None
 
 def active_scheduler() -> Scheduler | None:
     return _scheduler
+
+
+def status() -> dict:
+    """Parent-side readiness + scheduler counters for the heartbeat (content-free)."""
+    scheduler = _scheduler
+    return {
+        "owner_pid": os.environ.get(OWNER_ENV) or None,
+        "reserved": _reserved is not None,
+        "loader_started": _loader is not None,
+        "serving": scheduler is not None,
+        "model_id": (str(scheduler.model_id)[:200] if scheduler is not None else None),
+        "scheduler": scheduler.stats() if scheduler is not None else None,
+    }
 
 
 def encode_passages(embedder, texts: list) -> list:

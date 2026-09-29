@@ -3415,14 +3415,29 @@ def _schema_surface_trace_callback(
     return _emit
 
 
-async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem):
-    """Best-effort selection with an explicit unavailable state, never fake 0."""
+def _turn_coordinates(lane, job_id, trace_id, attempt) -> dict:
+    """The coordinates _memory_recall_callback puts on memory.recall.completed,
+    so other per-turn diagnostics can be joined to the same turn."""
+    job_id = str(job_id)
+    return {"lane": "chat" if lane == "chat" else "wake",
+            "turn_id": str(trace_id or "") or f"{lane}:{job_id}", "job_id": job_id,
+            "attempt": int(attempt or 0)}
+
+
+async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None):
+    """Best-effort selection with an explicit unavailable state, never fake 0.
+
+    ``coordinates`` (optional) only labels diagnostics about this read; the
+    selection itself does not depend on it."""
     if deps.read_context_memories is None or int(through_seq or 0) < 1:
         return {}
+    kwargs = {"through_seq": int(through_seq)}
+    if coordinates is not None:
+        kwargs["coordinates"] = coordinates
     try:
         async with enclave_sem:
             payload = await asyncio.to_thread(
-                deps.read_context_memories, user_id, through_seq=int(through_seq)
+                deps.read_context_memories, user_id, **kwargs
             )
         if not isinstance(payload, dict):
             raise ValueError("context_memory_response_not_object")
@@ -11514,6 +11529,7 @@ async def _run_wake(
 
         turn_memory_payload = await _load_turn_memory_context(
             deps, user_id, wake_snapshot_seq, enclave_sem,
+            coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
         )
         turn_memory_observation: dict = {}
 
@@ -16887,6 +16903,8 @@ async def process_job(
 
         turn_memory_payload = await _load_turn_memory_context(
             deps, user_id, cursor_seq, enclave_sem,
+            coordinates=_turn_coordinates(
+                lane, job["id"], job.get("trace_id"), job.get("attempt_count")),
         )
         turn_memory_observation: dict = {}
 

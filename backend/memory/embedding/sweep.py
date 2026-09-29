@@ -21,6 +21,8 @@ log = logging.getLogger("feedling.memory.embedding")
 MAX_CARDS_PER_TICK = 32
 _embedder = None
 _embedder_lock = threading.Lock()
+_loading = False
+_load_error: str | None = None
 _unavailable_logged = False
 
 
@@ -29,14 +31,42 @@ def enabled() -> bool:
 
 
 def get_embedder():
-    global _embedder
+    global _embedder, _loading, _load_error
     # Only the process that claimed the model may build it (Runtime V2 slot
     # processes never do; T779 step 2b).
     query_service.assert_embedder_owner()
     with _embedder_lock:
         if _embedder is None:
-            _embedder = e5_onnx.E5SmallOnnxEmbedder()
+            _loading = True
+            try:
+                _embedder = e5_onnx.E5SmallOnnxEmbedder()
+                _load_error = None
+            except Exception as exc:
+                _load_error = type(exc).__name__[:40]
+                raise
+            finally:
+                _loading = False
         return _embedder
+
+
+def model_state() -> dict:
+    """Content-free state of this process's model, for the heartbeat (T779 step 2c).
+
+    Never builds the model and never waits on the load lock: it only reads what
+    get_embedder() has already left behind, so it is safe while a load is in
+    progress and in mode off (where the sweep alone may have loaded it)."""
+    embedder = _embedder
+    if embedder is None:
+        if _loading:
+            return {"state": "loading", "owner_pid": os.getpid(), "model_id": None,
+                    "load_seconds": None, "reason": None}
+        return {"state": "failed" if _load_error else "not_loaded", "owner_pid": None,
+                "model_id": None, "load_seconds": None, "reason": _load_error}
+    available = bool(getattr(embedder, "available", False))
+    return {"state": "ready" if available else "unavailable", "owner_pid": os.getpid(),
+            "model_id": str(getattr(embedder, "model_id", "") or "")[:200],
+            "load_seconds": round(float(getattr(embedder, "load_seconds", 0.0) or 0.0), 2),
+            "reason": None if available else str(getattr(embedder, "unavailable_reason", ""))[:40]}
 
 
 def _eligible(moments: list, user_id: str) -> tuple[dict, int]:

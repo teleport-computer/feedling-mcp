@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -107,6 +108,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import pool_config as v2_pool_config
 from model_api_runtime.v2 import pool_supervisor as v2_pool_supervisor
+from model_api_runtime.v2 import process_memory as v2_process_memory
 from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
@@ -4889,7 +4891,7 @@ def _read_capture_state(user_id: str) -> dict:
     )
 
 
-def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
+def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict | None = None) -> dict:
     """Pick this turn's context cards.
 
     ``FEEDLING_V2_PLAINTEXT_RECALL`` (T779 step 2b): ``off`` (default) is the
@@ -4909,10 +4911,14 @@ def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
             log.warning("[v2.memory] local recall failed: %s", type(value).__name__)
         elif status in {"timeout", "busy"}:
             log.warning("[v2.memory] local recall %s; this turn uses the enclave", status)
+    rpc_started = time.monotonic()
     payload, diagnostics = _read_context_memories_enclave(
         user_id, through_seq=through_seq, input_fp=(mode == "shadow"))
     if mode == "shadow":
-        _submit_recall_shadow(user_id, through_seq, diagnostics)
+        _submit_recall_shadow(
+            user_id, through_seq, diagnostics, coordinates=coordinates,
+            enclave_rpc_ms=round((time.monotonic() - rpc_started) * 1000.0, 1),
+            enclave_select_ms=(payload.get("context_memory_log") or {}).get("dur_ms"))
     return payload
 
 
@@ -4997,8 +5003,19 @@ _LOCAL_RECALL_PERMIT = threading.BoundedSemaphore(1)
 _RECALL_SHADOW_PERMIT = threading.BoundedSemaphore(1)
 
 
-def _submit_recall_shadow(user_id: str, through_seq: int, diagnostics) -> None:
-    """Compare in the background; the turn never waits for this."""
+def _submit_recall_shadow(user_id: str, through_seq: int, diagnostics, *,
+                          coordinates: dict | None = None, enclave_rpc_ms=None,
+                          enclave_select_ms=None) -> None:
+    """Compare in the background; the turn never waits for this.
+
+    Timing scopes in the event (T779 step 2c): ``local_ms`` is the whole local
+    read (account, history, candidates, encode, vectors, selection);
+    ``local_select_ms`` / ``enclave_select_ms`` are the shared selector alone on
+    each side; ``enclave_rpc_ms`` is the full enclave call as the slot saw it
+    (in shadow mode it includes the enclave's extra diagnostics work);
+    ``encode_*_ms`` come from the parent encoder for this query.
+    """
+    coords = dict(coordinates or {})
 
     def run():
         deps = _plaintext_recall_deps()
@@ -5006,38 +5023,48 @@ def _submit_recall_shadow(user_id: str, through_seq: int, diagnostics) -> None:
             lambda: plaintext_recall.select(user_id, through_seq, deps),
             plaintext_recall.shadow_timeout_seconds(), _RECALL_SHADOW_PERMIT)
         if status == "busy":
-            _emit_recall_shadow(user_id, {"verdict": "skipped", "reason": "shadow_busy"})
+            _emit_recall_shadow(user_id, {"verdict": "skipped", "reason": "shadow_busy"}, coords)
             return
         if status == "timeout":
             # Not comparable: a late local result is never reported.
-            _emit_recall_shadow(user_id, {"verdict": "unmeasured", "reason": "shadow_timeout"})
+            _emit_recall_shadow(user_id, {"verdict": "unmeasured", "reason": "shadow_timeout"}, coords)
             return
         if status == "error":
             if isinstance(value, plaintext_recall.NotServedHere):
-                _emit_recall_shadow(user_id, {"verdict": "not_served", "reason": value.reason})
+                _emit_recall_shadow(user_id, {"verdict": "not_served", "reason": value.reason}, coords)
             else:
                 _emit_recall_shadow(user_id, {"verdict": "unmeasured",
-                                              "reason": f"local_{type(value).__name__}"[:60]})
+                                              "reason": f"local_{type(value).__name__}"[:60]}, coords)
             return
         local = value
+        local_log = local.payload.get("context_memory_log") or {}
+        local_hybrid = local_log.get("hybrid") or {}
         detail = plaintext_recall.compare(local, diagnostics)
         detail.update({
             "local_ms": local.elapsed_ms,
+            "local_select_ms": local_log.get("dur_ms"),
+            "enclave_select_ms": enclave_select_ms,
+            "enclave_rpc_ms": enclave_rpc_ms,
+            "encode_queue_ms": local_hybrid.get("encode_queue_ms"),
+            "encode_compute_ms": local_hybrid.get("encode_compute_ms"),
             "sealed_cards": local.sealed_cards,
             "local_hybrid": local.input_fingerprint.get("hybrid"),
             "remote_hybrid": ((diagnostics or {}).get("input_fingerprint") or {}).get("hybrid"),
         })
-        _emit_recall_shadow(user_id, detail)
+        _emit_recall_shadow(user_id, detail, coords)
 
     threading.Thread(target=run, name="v2-recall-shadow", daemon=True).start()
 
 
-def _emit_recall_shadow(user_id: str, detail: dict) -> None:
+def _emit_recall_shadow(user_id: str, detail: dict, coordinates: dict | None = None) -> None:
+    coords = dict(coordinates or {})
     try:
         _emit_v2_debug_trace_for_user(
             user_id, "memory.recall.shadow", status="ok",
             summary="Plaintext recall shadow comparison",
-            detail={"driver": "v2", **detail})
+            trace_id=str(coords.get("turn_id") or ""), turn_id=str(coords.get("turn_id") or ""),
+            job_id=str(coords.get("job_id") or ""),
+            detail={"driver": "v2", **detail, **coords})
     except Exception as exc:  # noqa: BLE001
         log.warning("[v2.memory] shadow trace failed: %s", type(exc).__name__)
 
@@ -5913,6 +5940,80 @@ async def _heartbeat_loop(
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
 
 
+def _fleet_memory_snapshot(fleet) -> dict:
+    """One content-free memory sample for this parent and its slot processes.
+
+    The container's cgroup reading is taken once here and must not be summed
+    with anything; per-process RSS and PSS are reported separately (PSS is the
+    one that can be summed across processes)."""
+    slots = []
+    for key in fleet.keys():
+        supervisor = fleet.supervisor(key)
+        pid_fn = getattr(supervisor, "child_pid", None)
+        pid = pid_fn() if callable(pid_fn) else None
+        slots.append({"slot": f"{key.pool}:{key.index}", "pid": pid,
+                      **v2_process_memory.process(pid)})
+    return {
+        "sampled_at": round(time.time(), 1),
+        "release": str(os.environ.get("FEEDLING_GIT_COMMIT", "dev"))[:12],
+        "parent": {"pid": os.getpid(), **v2_process_memory.process(os.getpid())},
+        "slots": slots,
+        "cgroup_kb": v2_process_memory.cgroup_kb(),
+    }
+
+
+# procfs reads (smaps_rollup walks each process's mappings) can be slow; they
+# run on one daemon thread at a time and the heartbeat waits at most this long.
+_MEMORY_READ_TIMEOUT_SEC = 2.0
+_memory_read_pending: concurrent.futures.Future | None = None
+
+
+def _start_memory_read(fleet) -> concurrent.futures.Future:
+    future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def run():
+        try:
+            future.set_result(_fleet_memory_snapshot(fleet))
+        except BaseException as exc:  # noqa: BLE001 — delivered to the waiter
+            future.set_exception(exc)
+
+    threading.Thread(target=run, name="v2-heartbeat-memory", daemon=True).start()
+    return future
+
+
+async def _bounded_memory_snapshot(fleet) -> dict:
+    """At most one read in flight; a read that is still running when the next
+    tick comes is reported busy, and a result that arrives after its own wait
+    is dropped, so a late reading is never written as a fresh one."""
+    global _memory_read_pending
+    pending = _memory_read_pending
+    if pending is not None and not pending.done():
+        return {"unavailable": "reading_busy"}
+    future = _start_memory_read(fleet)
+    _memory_read_pending = future
+    try:
+        return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)),
+                                      _MEMORY_READ_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        return {"unavailable": "reading_timeout"}
+    except Exception as exc:  # noqa: BLE001 — diagnostics only
+        return {"unavailable": type(exc).__name__[:40]}
+
+
+async def _step2c_readings(fleet) -> dict:
+    """Memory, encoder and model readings for the foreground heartbeat. A
+    reading that fails or is slow is marked unavailable; it never costs the
+    heartbeat row itself, and the event loop never waits on procfs."""
+    readings = {"memory": await _bounded_memory_snapshot(fleet)}
+    for name, read in (("query_encoder", query_service.status),
+                       ("embedding_model", memory_embedding_sweep.model_state)):
+        try:
+            readings[name] = read()     # in-memory only: no I/O, no model load
+        except Exception as exc:  # noqa: BLE001 — diagnostics only
+            readings[name] = {"unavailable": type(exc).__name__[:40]}
+    return readings
+
+
 async def _fleet_heartbeat_loop(
     worker_id: str,
     pool: v2_pool_config.PoolName,
@@ -5949,6 +6050,9 @@ async def _fleet_heartbeat_loop(
                     }
                 }
                 if pool == "foreground":
+                    # T779 step 2c: memory and encoder state measured from the
+                    # database (no shell access to the test machine).
+                    runtime_state.update(await _step2c_readings(fleet))
                     broker_state = fleet.broker_snapshot()
                     broker_state.pop("total_granted", None)
                     broker_state.setdefault(
