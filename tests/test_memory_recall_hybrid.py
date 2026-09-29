@@ -27,7 +27,7 @@ import recall_golden_cases as golden  # noqa: E402
 REQUIREMENTS = Path(__file__).parent.parent / "backend" / "requirements.txt"
 from enclave import recall_hybrid  # noqa: E402
 from enclave.routes import chat  # noqa: E402
-from memory import card_shape, recall_metadata  # noqa: E402
+from memory import card_shape, recall_metadata, recall_select  # noqa: E402
 from memory.embedding import fake as fake_embedding  # noqa: E402
 from memory.embedding import projection, serve, sweep  # noqa: E402
 
@@ -148,7 +148,7 @@ def hybrid_on(monkeypatch):
     monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
     # FakeEmbedder shares one alias token between query and target: cosine ~0.13.
     monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.1")
-    monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+    monkeypatch.delenv(recall_select.RECALL_RANKER_ENV, raising=False)
 
 
 def test_hybrid_recalls_the_paraphrased_card_lexical_misses(monkeypatch, hybrid_on):
@@ -202,7 +202,7 @@ def test_encoder_failure_falls_back(monkeypatch, hybrid_on):
 
 def test_failure_on_the_second_pass_discards_the_whole_turn(monkeypatch, hybrid_on):
     """current succeeds with vectors, combined raises: nothing hybrid may survive."""
-    real = chat.mg_retrieval.select_context
+    real = recall_select.mg_retrieval.select_context
     seen = []
 
     def flaky(query, cards, **kw):
@@ -213,7 +213,7 @@ def test_failure_on_the_second_pass_discards_the_whole_turn(monkeypatch, hybrid_
         return real(query, cards, **kw)
 
     lexical = _run(monkeypatch, TWO_TURN_WINDOW)
-    monkeypatch.setattr(chat.mg_retrieval, "select_context", flaky)
+    monkeypatch.setattr(recall_select.mg_retrieval, "select_context", flaky)
     seen.clear()
     got = _run(monkeypatch, TWO_TURN_WINDOW, _state())
     assert ("vector", TWO_TURN_WINDOW[-1]["content"]) in seen  # the first pass did run hybrid
@@ -619,9 +619,10 @@ def test_t741_durable_recall_trace_drops_no_key_with_a_real_hybrid_record():
     The record here is the one the enclave builds, so a field added there that
     V2 does not carry fails the key-set check instead of vanishing."""
     import debug_trace
-    _, _, record = chat._try_hybrid_selection(
+    _, _, record = recall_select.try_hybrid_selection(
         {"fallback_reason": "embedder_loading", "vectors_ms": 4.5, "vectors_requested": 6,
-         "vectors_rejected": 1, "stored": {"a": ("h", [1.0])}}, [], [], {}, "q", "q")
+         "vectors_rejected": 1, "stored": {"a": ("h", [1.0])}}, [], [], {}, "q", "q",
+        encoder=recall_hybrid)
     record = {**record, "lanes": [{"source": "current", "vector_only": 1}]}
     mode = ("relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
             "+host:latest-first-v1:hybrid-fallback:recent7d")

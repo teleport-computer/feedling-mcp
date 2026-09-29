@@ -126,7 +126,7 @@ def test_one_hop_explicit_link_wins_across_sources_and_cap_is_stable():
 
 def test_recent_supplement_is_created_time_bounded_not_updated_time(monkeypatch):
     from datetime import datetime, timezone
-    from memory import recall_metadata
+    from memory import recall_metadata, recall_select
     from enclave.routes import chat
     from model_api_runtime.v2 import memory_context
     now = datetime(2026, 9, 8, tzinfo=timezone.utc)
@@ -138,7 +138,7 @@ def test_recent_supplement_is_created_time_bounded_not_updated_time(monkeypatch)
     original = recall_metadata.recent_cards
     monkeypatch.setattr(recall_metadata, "recent_cards", lambda cards: original(cards, now=now))
     monkeypatch.setattr(chat.readside, "moments_to_cards", lambda *a: cards)
-    monkeypatch.setattr(chat, "_unified_selection", lambda *a: ([], {"selected": []}))
+    monkeypatch.setattr(recall_select, "unified_selection", lambda *a: ([], {"selected": []}))
     args = {"authorized_user_id": "u", "content_sk": None, "want_trace": True}
     assert chat._build_context_memories([], [], args)[0] == []
     picked, trace, log = chat._build_context_memories([], [], {**args, "context_recent": True})

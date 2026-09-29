@@ -499,6 +499,7 @@ jobs:
             tests/test_memory_embedding_sweep.py \
             tests/test_memory_vectors_migration.py \
             tests/test_memory_recall_hybrid.py \
+            tests/test_recall_select_extraction.py \
             tests/test_memory_vectors_route_pg.py \
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
