@@ -23,6 +23,7 @@ from memory import card_shape
 from memory import jieba_tokenizer
 from memory import recall_metadata
 from memory.embedding import projection as embedding_projection
+from memory.embedding import recall_policy
 
 CONTEXT_MEMORY_CAP = 8
 
@@ -164,7 +165,7 @@ def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query,
     All-or-nothing: every query vector is encoded before any selection runs, and
     any failure returns no picks so the caller re-runs the unchanged lexical
     path on the untouched cards. The record is content-free. ``encoder`` supplies
-    ``encode_queries``, ``Fallback`` and ``min_cosine`` and is read at call time.
+    ``encode_queries`` (read at call time); it raises ``recall_policy.Fallback``.
     """
     record = {"status": "fallback", "fallback_reason": hybrid.get("fallback_reason"),
               "encode_ms": None, "encode_queue_ms": None, "encode_compute_ms": None,
@@ -199,7 +200,7 @@ def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query,
     timing: dict = {}
     try:
         vectors = encoder.encode_queries(hybrid["embedder"], texts, hybrid["deadline"], timing)
-    except encoder.Fallback as exc:
+    except recall_policy.Fallback as exc:
         record["fallback_reason"] = exc.reason
         return None, None, record
     finally:
@@ -209,7 +210,7 @@ def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query,
         record.update(timing)
     by_query = dict(zip(texts, vectors))
     model_id = hybrid["model_id"]
-    options = {"card_vectors": card_vectors, "min_cosine": encoder.min_cosine(),
+    options = {"card_vectors": card_vectors, "min_cosine": recall_policy.min_cosine(),
                "vector_model": model_id,
                "card_vector_models": {mid: model_id for mid in card_vectors}}
 

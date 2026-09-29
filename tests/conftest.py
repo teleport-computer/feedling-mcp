@@ -286,6 +286,7 @@ if not _provisioned:
         "test_memory_related_read.py",
         "test_enclave_recall_unified.py",
         "test_recall_select_extraction.py",
+        "test_history_view_extraction.py",
         "test_memgarden_public_api_only.py",
         "test_memory_result_budget.py",
         # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
