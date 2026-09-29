@@ -179,6 +179,11 @@
     {
       "count": 1,
       "path": "backend/model_api_runtime/v2/serve_worker.py",
+      "reason": "plaintext recall reads the same pages the enclave reads"
+    },
+    {
+      "count": 1,
+      "path": "backend/model_api_runtime/v2/serve_worker.py",
       "reason": "profile memory reads use DB/readside helpers"
     },
     {

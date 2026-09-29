@@ -13,7 +13,7 @@ import threading
 
 import db
 from memory import card_shape, service
-from memory.embedding import e5_onnx, projection
+from memory.embedding import e5_onnx, projection, query_service
 
 log = logging.getLogger("feedling.memory.embedding")
 # Bound work per scheduler visit so one garden cannot monopolize a tick.
@@ -30,6 +30,9 @@ def enabled() -> bool:
 
 def get_embedder():
     global _embedder
+    # Only the process that claimed the model may build it (Runtime V2 slot
+    # processes never do; T779 step 2b).
+    query_service.assert_embedder_owner()
     with _embedder_lock:
         if _embedder is None:
             _embedder = e5_onnx.E5SmallOnnxEmbedder()
@@ -79,7 +82,7 @@ def tick(store) -> int:
                    if mid not in existing or existing[mid][0] != digest]
         stale = sum(mid in existing for mid, _, _ in missing)
         batch = missing[:MAX_CARDS_PER_TICK]
-        vectors = embedder.encode_passages([text for _, _, text in batch]) if batch else []
+        vectors = query_service.encode_passages(embedder, [text for _, _, text in batch]) if batch else []
         if len(vectors) != len(batch):
             raise ValueError("embedding_batch_size_mismatch")
         rows = [(mid, digest, vector) for (mid, digest, _), vector in zip(batch, vectors)]

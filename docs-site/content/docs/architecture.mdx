@@ -133,6 +133,13 @@ it does not create or configure the bucket or its lifecycle.
 4. The decrypt service opens required shared ciphertext; plaintext records are
    read under the same tenant boundary. The runner sends the
    plaintext prompt and selected context to the configured model provider.
+   Automatic memory-card selection runs in the decrypt service by default. An
+   operator switch (`FEEDLING_V2_PLAINTEXT_RECALL`, off by default) lets the
+   Runtime V2 child select cards for plaintext accounts itself, from the same
+   history and memory pages, with the same selection code. Query vectors then
+   come from a loopback-only encoder in the Runtime V2 parent, which holds the
+   only embedding model; child processes never load it. Encrypted accounts and
+   turns whose history includes sealed rows keep the decrypt-service path.
 5. The runner wraps the assistant result in the effective write shape before
    it is persisted. The original send remains asynchronous and returns `202`.
 

@@ -33,6 +33,7 @@ sinks are assembled here.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import hashlib
 import hmac
@@ -87,9 +88,12 @@ from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import visual_transport
 from hosted import vision_observer
+from memory.embedding import query_client, query_service, recall_policy
+from memory.embedding import serve as embedding_serve
 from memory.embedding import sweep as memory_embedding_sweep
 from memory import garden_component
 from memory import memory_core
+from memory import plaintext_recall
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -4886,6 +4890,34 @@ def _read_capture_state(user_id: str) -> dict:
 
 
 def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
+    """Pick this turn's context cards.
+
+    ``FEEDLING_V2_PLAINTEXT_RECALL`` (T779 step 2b): ``off`` (default) is the
+    enclave path exactly as before; ``shadow`` keeps the enclave result and also
+    selects locally for comparison; ``on`` serves plaintext accounts locally and
+    keeps the enclave path for everything else.
+    """
+    mode = plaintext_recall.mode()
+    if mode == "on":
+        deps = _plaintext_recall_deps()
+        status, value = plaintext_recall.run_bounded(
+            lambda: plaintext_recall.select(user_id, through_seq, deps),
+            plaintext_recall.local_timeout_seconds(), _LOCAL_RECALL_PERMIT)
+        if status == "ok":
+            return value.payload
+        if status == "error" and not isinstance(value, plaintext_recall.NotServedHere):
+            log.warning("[v2.memory] local recall failed: %s", type(value).__name__)
+        elif status in {"timeout", "busy"}:
+            log.warning("[v2.memory] local recall %s; this turn uses the enclave", status)
+    payload, diagnostics = _read_context_memories_enclave(
+        user_id, through_seq=through_seq, input_fp=(mode == "shadow"))
+    if mode == "shadow":
+        _submit_recall_shadow(user_id, through_seq, diagnostics)
+    return payload
+
+
+def _read_context_memories_enclave(user_id: str, *, through_seq: int,
+                                   input_fp: bool = False) -> tuple[dict, dict | None]:
     """Select on an authenticated, frozen history window inside the enclave.
 
     Do not read the latest unbounded history: ordered replies must never select
@@ -4893,18 +4925,155 @@ def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
     """
     if through_seq < 1:
         raise ValueError("context_memory_frontier_required")
+    params = {"before_seq": through_seq + 1, "limit": 4,
+              "include_image_body": "0", "context_trace": "1", "context_recent": "1"}
+    if input_fp:
+        params["context_input_fp"] = "1"
     payload, error = core_enclave._enclave_get_json_for_gate(
         "/v1/chat/history", None,
-        params={"before_seq": through_seq + 1, "limit": 4,
-                "include_image_body": "0", "context_trace": "1", "context_recent": "1"},
+        params=params,
         runtime_token=_mint_runtime_token(user_id),
     )
     if error or not isinstance(payload, dict):
         raise RuntimeError("context_memory_read_failed")
     if payload.get("user_id") != user_id:
         raise RuntimeError("context_memory_user_mismatch")
-    return {key: payload.get(key) for key in (
-        "context_memories", "context_memory_trace", "context_memory_log")}
+    return ({key: payload.get(key) for key in (
+        "context_memories", "context_memory_trace", "context_memory_log")},
+        payload.get("context_input_diagnostics") if input_fp else None)
+
+
+def _plaintext_recall_store(user_id: str):
+    return core_store.get_store_per_load_mode(
+        user_id, reason="plaintext recall reads the same pages the enclave reads")
+
+
+def _plaintext_history_page(user_id: str, through_seq: int) -> list:
+    """The page the enclave's own backend call returns for this window."""
+    # Imported here, not at module level: chat_core pulls in push setup that
+    # prints on import, and a slot process with the mode off must not load it.
+    from chat import chat_core
+
+    body, status = chat_core.history(
+        _plaintext_recall_store(user_id),
+        query={"limit": "4", "before_seq": str(int(through_seq) + 1), "include_image_body": "0"},
+        user_agent="v2-plaintext-recall", remote_addr="")
+    if status != 200 or not isinstance(body, dict):
+        raise plaintext_recall.NotServedHere("history_unavailable")
+    return list(body.get("messages") or [])
+
+
+def _plaintext_list_moments(user_id: str, limit: int) -> list:
+    body, status = memory_core.list_moments(
+        _plaintext_recall_store(user_id), limit_raw=str(limit), cursor="", since="",
+        include_archived_raw=None)
+    if status != 200 or not isinstance(body, dict):
+        raise plaintext_recall.NotServedHere("memory_list_unavailable")
+    return list(body.get("moments") or [])
+
+
+def _plaintext_stored_vectors(user_id: str, model_id: str, ids: list) -> dict:
+    body, status = embedding_serve.authorized_vectors(
+        _plaintext_recall_store(user_id), {"model_id": model_id, "ids": list(ids)})
+    if status != 200:
+        raise recall_policy.Fallback("vectors_unavailable")
+    return body
+
+
+def _plaintext_recall_deps() -> plaintext_recall.Deps:
+    return plaintext_recall.Deps(
+        effective_mode=accounts_registry.effective_content_encryption,
+        history_page=_plaintext_history_page,
+        list_moments=_plaintext_list_moments,
+        stored_vectors=_plaintext_stored_vectors,
+        encoder=query_client.from_env(),
+    )
+
+
+# One local selection (mode on) and one shadow comparison per slot process at a
+# time. A selection that outlives its wait keeps its permit until it really
+# ends, so slow reads cannot pile up; the next turn meanwhile skips the local path.
+_LOCAL_RECALL_PERMIT = threading.BoundedSemaphore(1)
+_RECALL_SHADOW_PERMIT = threading.BoundedSemaphore(1)
+
+
+def _submit_recall_shadow(user_id: str, through_seq: int, diagnostics) -> None:
+    """Compare in the background; the turn never waits for this."""
+
+    def run():
+        deps = _plaintext_recall_deps()
+        status, value = plaintext_recall.run_bounded(
+            lambda: plaintext_recall.select(user_id, through_seq, deps),
+            plaintext_recall.shadow_timeout_seconds(), _RECALL_SHADOW_PERMIT)
+        if status == "busy":
+            _emit_recall_shadow(user_id, {"verdict": "skipped", "reason": "shadow_busy"})
+            return
+        if status == "timeout":
+            # Not comparable: a late local result is never reported.
+            _emit_recall_shadow(user_id, {"verdict": "unmeasured", "reason": "shadow_timeout"})
+            return
+        if status == "error":
+            if isinstance(value, plaintext_recall.NotServedHere):
+                _emit_recall_shadow(user_id, {"verdict": "not_served", "reason": value.reason})
+            else:
+                _emit_recall_shadow(user_id, {"verdict": "unmeasured",
+                                              "reason": f"local_{type(value).__name__}"[:60]})
+            return
+        local = value
+        detail = plaintext_recall.compare(local, diagnostics)
+        detail.update({
+            "local_ms": local.elapsed_ms,
+            "sealed_cards": local.sealed_cards,
+            "local_hybrid": local.input_fingerprint.get("hybrid"),
+            "remote_hybrid": ((diagnostics or {}).get("input_fingerprint") or {}).get("hybrid"),
+        })
+        _emit_recall_shadow(user_id, detail)
+
+    threading.Thread(target=run, name="v2-recall-shadow", daemon=True).start()
+
+
+def _emit_recall_shadow(user_id: str, detail: dict) -> None:
+    try:
+        _emit_v2_debug_trace_for_user(
+            user_id, "memory.recall.shadow", status="ok",
+            summary="Plaintext recall shadow comparison",
+            detail={"driver": "v2", **detail})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[v2.memory] shadow trace failed: %s", type(exc).__name__)
+
+
+def _start_plaintext_recall_encoder() -> None:
+    """Parent only, before slot processes are spawned (T779 step 2b).
+
+    Nothing happens with the mode off. Otherwise the parent claims the model
+    (slot processes then refuse to build one) and, when hybrid recall is
+    configured for this process, reserves the loopback endpoint and loads the
+    model in the background; until it serves, slots stay lexical.
+
+    Safe to call on every _serve generation: the endpoint, token, loader and
+    service live for the whole parent process (query_service), so a restart
+    re-exports the same token to its new slots instead of replacing it.
+    """
+    if plaintext_recall.mode() == "off":
+        return
+    query_service.claim_embedder_ownership()
+    if not recall_policy.hybrid_enabled() or recall_policy.min_cosine() is None:
+        return
+    query_service.reserve()
+
+    def load():
+        try:
+            embedder = memory_embedding_sweep.get_embedder()
+            if not embedder.available:
+                log.warning("[v2.memory] query encoder unavailable: %s",
+                            embedder.unavailable_reason)
+                return
+            query_service.start(embedder)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[v2.memory] query encoder failed to start: %s", type(exc).__name__)
+
+    if query_service.ensure_loader(load):
+        atexit.register(query_service.stop)
 
 
 def _read_worldbook_context(
@@ -6568,6 +6737,8 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # executor with the reaper/heartbeat/scheduler coroutines below). Unaffected by
     # the turn-child split: it never lived in the turn slots' event loop.
     genesis = _start_genesis_thread(worker_id)
+    # Before any slot process is spawned: they inherit the encoder endpoint.
+    _start_plaintext_recall_encoder()
 
     enclave_broker = v2_enclave_broker.EnclaveBroker(
         limit=config.enclave_instance_concurrency,
