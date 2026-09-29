@@ -1450,6 +1450,12 @@ async def run_tool_loop(
     on_prompt_frontier_exhaustion=None,
     on_prompt_frontier_exhausted_detail=None,
     absolute_deadline: float | None = None,
+    # One bound for every provider HTTP wire of this loop: the httpx timeout,
+    # the true wall-clock wire deadline, and a watchdog progress boundary at
+    # every attempt and wire. The hosted stall clock then sees at most one wire
+    # of silence. None keeps the provider_client defaults (60s httpx timeout, no
+    # wire deadline, no per-attempt progress); wake lanes pass a value.
+    provider_wire_timeout_sec: float | None = None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -1843,6 +1849,19 @@ async def run_tool_loop(
             on_progress(stage)
         except Exception:  # noqa: BLE001
             pass
+
+    # Kept out of provider_kwargs: these configure the retry wrapper, not the
+    # request, and must reach both reliable call sites (incl. tagged-image retry).
+    provider_wire_kwargs: dict = (
+        {
+            "wire_deadline_sec": provider_wire_timeout_sec,
+            "progress_cb": lambda stage, attempt: _progress(
+                f"provider_{stage}_{attempt}"
+            ),
+        }
+        if provider_wire_timeout_sec is not None
+        else {}
+    )
 
     async def _trajectory(event_kind: str, payload: dict) -> None:
         # Unlike cheap progress telemetry this callback is the encrypted flight
@@ -2750,6 +2769,8 @@ async def run_tool_loop(
             # parser return any structurally valid success so an abnormal HTTP
             # 200 is not retried as though it were a transient network failure.
             provider_kwargs = {"tools": tools, "require_reply": False}
+            if provider_wire_timeout_sec is not None:
+                provider_kwargs["timeout"] = provider_wire_timeout_sec
             if terminal_schema_guard and tools is not None:
                 provider_kwargs["tool_choice"] = "none"
             if wake_choice_required:
@@ -2879,6 +2900,7 @@ async def run_tool_loop(
                 base_delay_sec=0.2,
                 max_delay_sec=1.0,
                 absolute_deadline=absolute_deadline,
+                **provider_wire_kwargs,
                 **provider_kwargs,
             )
         except Exception as exc:
@@ -2950,6 +2972,7 @@ async def run_tool_loop(
                         base_delay_sec=0.2,
                         max_delay_sec=1.0,
                         absolute_deadline=absolute_deadline,
+                        **provider_wire_kwargs,
                         **provider_kwargs,
                     )
                     # A successful text-only retry confirms that the rejected

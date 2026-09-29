@@ -51,6 +51,7 @@ from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import profile_store
@@ -5248,7 +5249,7 @@ def test_persistent_provider_circuit_blocks_queued_wakes_but_not_scheduled(monke
         assert row == ('sleep', 'provider_circuit_open')
 
 
-def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
+def test_heartbeat_uses_wake_wire_bound_not_dream_wire_deadline(monkeypatch):
     import inspect
 
     signature = inspect.signature(provider_client.chat_completion_async)
@@ -5272,5 +5273,8 @@ def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
     status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK,
                                          asyncio.Semaphore(4), claimed_by))
     assert status == "completed"
-    # Look-first round (T723) + decision round; every call keeps the budget.
-    assert seen == [(60.0, None), (60.0, None)]
+    # Look-first round (T723) + decision round. Dream's wire deadline must not
+    # leak into heartbeat; timeout and wire deadline are the wake ones (T776).
+    wire = worker.WAKE_PROVIDER_WIRE_TIMEOUT_SEC
+    assert wire != v2_extraction.DREAM_WIRE_DEADLINE_SEC
+    assert seen == [(wire, wire)] * 2

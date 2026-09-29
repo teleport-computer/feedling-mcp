@@ -588,6 +588,19 @@ if not math.isfinite(MCP_TOOL_CALL_TIMEOUT_SEC) or MCP_TOOL_CALL_TIMEOUT_SEC <= 
     raise RuntimeError(
         "FEEDLING_V2_MCP_TOOL_CALL_TIMEOUT_SEC must be positive and finite"
     )
+# Per-wire provider bound for wake lanes (heartbeat, manual_wake, scheduled,
+# screen_watch): httpx timeout, true wall-clock wire deadline, and a stall-clock
+# progress boundary at every attempt and wire (run_tool_loop's
+# provider_wire_timeout_sec). Chat keeps provider_client's 60s httpx default.
+# Prod 2026-09-26..28 (T770): GLM heartbeat first calls slowed to p90 ~100s
+# after T723 (the look round), and GLM round-1 timeouts (60s x 2 attempts) rose
+# from 1.2% to 8.5% of calls; scheduled reminders on GLM failed the same way.
+# Nobody is waiting on a wake reply. 110s stays below z.ai's own server-side cut
+# (measured at 122.7s); one wire plus 30s must stay below the wake slot stall
+# budget (240s), pinned by tests/test_v2_wake_provider_timeout.py.
+WAKE_PROVIDER_WIRE_TIMEOUT_SEC = _positive_float_env(
+    "FEEDLING_V2_WAKE_PROVIDER_WIRE_TIMEOUT_SEC", "110"
+)
 # The per-call deadline alone is not a whole-turn bound: all user-MCP tools are
 # deliberately serialized, so a model could otherwise spend the 45s allowance
 # 24 times while still crossing a progress boundary after every call. Keep one
@@ -11687,6 +11700,7 @@ async def _run_wake(
                 wake_look_first=(lane in _PRESENCE_WAKE_LANES),
                 reply_tool_enabled=True,
                 wake_output_budget_required=True,
+                provider_wire_timeout_sec=WAKE_PROVIDER_WIRE_TIMEOUT_SEC,
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,

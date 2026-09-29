@@ -131,6 +131,13 @@ the prompt-frontier output reserve and does not change the input frontier;
 file-capable calls retain their existing budget precedence. Scheduled reminders
 still require delivery; sharing the budget does not enable a silence choice.
 
+Wake lanes (heartbeat, manual wake, scheduled reminders, and screen watch) give each
+provider request up to 110 seconds in total before it counts as a timeout. Chat keeps
+the 60-second limit on waiting for a response. Retry behavior is unchanged, and each
+attempt counts as progress for the worker's stall watchdog, so a retried request is
+not mistaken for a stuck turn. Nobody is waiting on a wake reply, and reasoning models
+can take longer than a minute before their first response byte.
+
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours
 and its latest failures have continuously required user action for at least one
