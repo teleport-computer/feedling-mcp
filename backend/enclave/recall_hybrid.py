@@ -23,52 +23,23 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
-import math
 import os
 import struct
 import threading
 import time
 
 from enclave import backend_client
+from memory.embedding import recall_policy
 
 HYBRID_ENV = "FEEDLING_MEMORY_RECALL_HYBRID"
-MIN_COSINE_ENV = "FEEDLING_MEMORY_RECALL_MIN_COSINE"
-BUDGET_ENV = "FEEDLING_MEMORY_RECALL_HYBRID_BUDGET_MS"
-DEFAULT_BUDGET_MS = 2000
 VECTORS_PATH = "/v1/memory/vectors"
 MAX_VECTOR_IDS = 2000  # the backend's cap; the candidate pool is far smaller
 _MAX_IN_FLIGHT = 2
-_NORM_TOLERANCE = 1e-3
-
-
-class Fallback(Exception):
-    """This turn uses the lexical path; ``reason`` is a fixed vocabulary word."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
 
 
 def enabled() -> bool:
     raw = str(os.environ.get(HYBRID_ENV, "0") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
-
-
-def min_cosine() -> float | None:
-    """memgarden requires the host to calibrate this; no value means no hybrid."""
-    try:
-        value = float(str(os.environ.get(MIN_COSINE_ENV, "")).strip())
-    except ValueError:
-        return None
-    return value if math.isfinite(value) and -1.0 <= value <= 1.0 else None
-
-
-def budget_seconds() -> float:
-    try:
-        value = int(str(os.environ.get(BUDGET_ENV, DEFAULT_BUDGET_MS)).strip())
-    except ValueError:
-        value = DEFAULT_BUDGET_MS
-    return max(1, min(value, 10_000)) / 1000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -138,7 +109,7 @@ def status_snapshot() -> dict:
         state, reason, embedder = _embedder_state, _embedder_reason, _embedder
     return {
         "enabled": enabled(),
-        "min_cosine": min_cosine(),
+        "min_cosine": recall_policy.min_cosine(),
         "embedder_state": _STATE_LABELS.get(state, "unknown"),
         "failure_reason": reason if state == "unavailable" else None,
         "model_id": (str(embedder.model_id)[:MODEL_ID_PREFIX_CHARS] if embedder is not None else None),
@@ -166,9 +137,9 @@ def encode_queries(embedder, texts: list[str], deadline: float,
     ``encode_compute_ms`` (the model calls) when the job finished in time."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise Fallback("deadline_exceeded")
+        raise recall_policy.Fallback("deadline_exceeded")
     if not _in_flight.acquire(blocking=False):
-        raise Fallback("embedder_busy")
+        raise recall_policy.Fallback("embedder_busy")
     submitted = time.monotonic()  # before submit: the worker may start at once
     try:
         future = _executor.submit(_encode_all, embedder, list(texts))
@@ -180,27 +151,20 @@ def encode_queries(embedder, texts: list[str], deadline: float,
         vectors, started, finished = future.result(timeout=remaining)
     except concurrent.futures.TimeoutError:
         future.cancel()  # only helps if still queued; a running job keeps its permit
-        raise Fallback("deadline_exceeded") from None
+        raise recall_policy.Fallback("deadline_exceeded") from None
     except Exception:
-        raise Fallback("encode_failed") from None
+        raise recall_policy.Fallback("encode_failed") from None
     if timing is not None:
         timing["encode_queue_ms"] = round(max(0.0, started - submitted) * 1000.0, 1)
         timing["encode_compute_ms"] = round((finished - started) * 1000.0, 1)
-    if len(vectors) != len(texts) or any(not _valid_unit(v, embedder.dim) for v in vectors):
-        raise Fallback("encode_failed")
+    if len(vectors) != len(texts) or any(not recall_policy.valid_unit(v, embedder.dim) for v in vectors):
+        raise recall_policy.Fallback("encode_failed")
     return vectors
 
 
 # --------------------------------------------------------------------------- #
 # stored card vectors (read through the backend as the authenticated user)
 # --------------------------------------------------------------------------- #
-
-def _valid_unit(vector, dim: int) -> bool:
-    if len(vector) != dim or any(not math.isfinite(v) for v in vector):
-        return False
-    norm = math.sqrt(sum(v * v for v in vector))
-    return abs(norm - 1.0) <= _NORM_TOLERANCE
-
 
 def plaintext_candidate_ids(moments, authorized_user_id: str) -> list[str]:
     """Ids of this turn's plaintext-tier, non-local_only candidates owned by the
@@ -237,22 +201,22 @@ async def fetch_vectors(forward_headers: dict, state: dict, ids: list[str]) -> N
     try:
         remaining = state["deadline"] - started
         if remaining <= 0:
-            raise Fallback("deadline_exceeded")
+            raise recall_policy.Fallback("deadline_exceeded")
         try:
             payload = await asyncio.wait_for(backend_client.backend_post(
                 VECTORS_PATH, forward_headers,
                 {"model_id": state["model_id"], "ids": ids}), timeout=remaining)
         except asyncio.TimeoutError:
-            raise Fallback("deadline_exceeded") from None
+            raise recall_policy.Fallback("deadline_exceeded") from None
         except Exception:
-            raise Fallback("vectors_unavailable") from None
+            raise recall_policy.Fallback("vectors_unavailable") from None
         stored, rejected = decode_vectors(payload, state["model_id"], state["embedder"].dim)
         wanted = set(ids)
         foreign = [mid for mid in stored if mid not in wanted]
         for mid in foreign:
             del stored[mid]
         state["stored"], state["vectors_rejected"] = stored, rejected + len(foreign)
-    except Fallback as exc:
+    except recall_policy.Fallback as exc:
         state["fallback_reason"] = exc.reason
     except Exception:
         state["fallback_reason"] = "vectors_unavailable"
@@ -263,10 +227,10 @@ async def fetch_vectors(forward_headers: dict, state: dict, ids: list[str]) -> N
 def decode_vectors(payload, model_id: str, dim: int) -> tuple[dict, int]:
     """{moment_id: (projection_hash, vector)} and the count of rejected rows."""
     if not isinstance(payload, dict) or payload.get("model_id") != model_id:
-        raise Fallback("vectors_model_mismatch")
+        raise recall_policy.Fallback("vectors_model_mismatch")
     rows = payload.get("vectors")
     if not isinstance(rows, list):
-        raise Fallback("vectors_malformed")
+        raise recall_policy.Fallback("vectors_malformed")
     out, rejected = {}, 0
     for row in rows:
         try:
@@ -276,7 +240,7 @@ def decode_vectors(payload, model_id: str, dim: int) -> tuple[dict, int]:
             if not mid or mid in out or len(blob) != dim * 4:
                 raise ValueError
             vector = list(struct.unpack(f"<{dim}f", blob))
-            if not _valid_unit(vector, dim):
+            if not recall_policy.valid_unit(vector, dim):
                 raise ValueError
         except Exception:
             rejected += 1
@@ -292,14 +256,14 @@ def decode_vectors(payload, model_id: str, dim: int) -> tuple[dict, int]:
 def begin(unified_ranker: bool) -> dict:
     """Start a turn's hybrid state. Only called when ``enabled()``."""
     started = time.monotonic()
-    state = {"deadline": started + budget_seconds(), "started": started,
+    state = {"deadline": started + recall_policy.budget_seconds(), "started": started,
              "embedder": None, "model_id": None, "stored": None,
              "fallback_reason": None, "vectors_ms": None, "vectors_requested": 0,
              "vectors_rejected": 0}
     if not unified_ranker:
         state["fallback_reason"] = "legacy_ranker"
         return state
-    if min_cosine() is None:
+    if recall_policy.min_cosine() is None:
         state["fallback_reason"] = "min_cosine_unset"
         return state
     embedder, reason = embedder_status()
