@@ -18,6 +18,17 @@ change must not be interpreted as an API guarantee.
   wake failed as `wake_failed:providererror`; for a scheduled reminder, the
   reminder was not delivered. Chat keeps the 60-second limit.
 
+- The Runtime V2 `mcp.surface.resolved` debug trace keeps its verdict again. The
+  stored event is capped at 20 detail keys and the tool-surface counters used to
+  come first, so `resolved`, `skipped_count` and `skipped` were dropped from every
+  stored V2 event while `expected` survived. The verdict fields now come first;
+  the ten cap counters (`count_cap`, `char_cap`, `char_cap_skips`,
+  `count_cap_collapses`, `char_cap_collapses`, `expanded`, `collapsed`,
+  `catalog_chars`, `schema_rejected`, `schema_cap_collapsed`) move into one
+  `caps` object; `skipped` becomes a `{server name: kind}` object (at most 20
+  entries, `skipped_count` is the total); and `server_results`, which repeated
+  `expected_servers` plus `skipped`, is no longer included.
+
 - Runtime V2 proactive messages (heartbeat, scheduled, manual wake, and screen
   watch) no longer receive the fixed reply-language rule tied to the account
   locale or archive language. They get one soft line asking the model to talk

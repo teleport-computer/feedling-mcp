@@ -5007,6 +5007,52 @@ _MCP_CATALOG_DESC_CHARS = 160
 # relationship instead, so raising this without raising the ceiling goes red.
 _MCP_CATALOG_MAX_TOOLS = 20
 
+# `mcp.surface.resolved` detail projection (T775). The durable trace keeps only
+# the first debug_trace._DETAIL_MAX_KEYS (20) keys in insertion order, and the
+# loader summary alone has 22. Spreading it after driver/lane put the 16
+# tool-surface counters first, so the verdict (resolved/skipped_count/skipped)
+# was dropped from every V2 row: prod 3-day read had 814/814 with `expected`
+# and 0 with `resolved`. Verdict keys now go first, the cap counters share one
+# nested key, and every loader key must be named in exactly one of these three
+# tuples -- test_v2_mcp_surface_detail_survives_the_durable_cap turns red on a
+# new loader key instead of letting insertion order pick what gets dropped.
+_MCP_SURFACE_FLAT_KEYS = (
+    "surface_failure_kind", "expected", "resolved", "skipped_count", "skipped",
+    "expected_servers", "kept", "offered", "servers", "per_server",
+    "schema_rejected_names", "schema_cap_collapsed_names",
+)
+_MCP_SURFACE_CAP_KEYS = (
+    "count_cap", "char_cap", "char_cap_skips", "count_cap_collapses",
+    "char_cap_collapses", "expanded", "collapsed", "catalog_chars",
+    "schema_rejected", "schema_cap_collapsed",
+)
+# expected_servers + skipped already carry it, and _safe_detail would flatten
+# its {name, kind} items into 80-char strings anyway.
+_MCP_SURFACE_OMITTED_KEYS = ("server_results",)
+
+
+def _mcp_surface_trace_detail(lane: str, summary: dict,
+                              catalog_detail: dict) -> dict:
+    detail: dict = {"driver": "v2", "lane": str(lane or "chat")}
+    for key in _MCP_SURFACE_FLAT_KEYS:
+        if key not in summary:
+            continue
+        value = summary[key]
+        if key == "skipped":
+            # {name: kind}: a nested dict keeps its scalar values, while
+            # _safe_detail turns each dict inside a list into a repr string
+            # the probe can no longer read. skipped_count stays the total.
+            value = {
+                str(item.get("name")): str(item.get("kind"))
+                for item in (value or []) if isinstance(item, dict)
+            }
+        detail[key] = value
+    caps = {key: summary[key] for key in _MCP_SURFACE_CAP_KEYS if key in summary}
+    if caps:
+        detail["caps"] = caps
+    detail.update(catalog_detail)
+    return detail
+
 
 def _remember_mcp_catalog_fingerprint(user_id: str, fingerprint: str) -> None:
     """Bound the process-local dedupe cache for long-lived workers."""
@@ -5135,8 +5181,7 @@ async def _load_mcp_turn_observed(
                        "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
                        if dropped else "")
                 ),
-                detail={"driver": "v2", "lane": str(lane or "chat"),
-                        **summary, **catalog_detail},
+                detail=_mcp_surface_trace_detail(lane, summary, catalog_detail),
                 **({"job_id": str(job_id)} if failed and job_id else {}),
             )
             # 指纹只在 trace **确实发出去之后**才记。写在前面的话,某轮加载失败
