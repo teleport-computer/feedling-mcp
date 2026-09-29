@@ -361,6 +361,19 @@ def reply_language_system_line(policy: ReplyLanguage) -> str:
     )
 
 
+
+def proactive_language_system_line(policy: ReplyLanguage) -> str:
+    """One soft language nudge for proactive (wake) turns.
+
+    T769 (Seven 2026-09-29): proactive turns do not get the hard reply-language
+    rule; the model picks the language from the conversation itself.  ``policy``
+    only selects which rendering of this single sentence is shown.
+    """
+
+    if policy.language == "en":
+        return "Language: talk to the user in the language they use."
+    return "语言：用用户使用的语言跟他说话。"
+
 def failure_fallback_reply(
     policy: ReplyLanguage,
     *,

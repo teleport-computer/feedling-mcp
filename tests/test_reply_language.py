@@ -18,6 +18,7 @@ from chat.reply_language import (  # noqa: E402
     format_time_anchor,
     garden_language_decision,
     infer_reply_language,
+    proactive_language_system_line,
     reply_language_system_line,
 )
 
@@ -193,9 +194,23 @@ def test_reply_language_system_line_signature_and_production_call_sites_are_clos
                 assert node.keywords == []
 
     assert calls_by_file == {
-        "backend/model_api_runtime/v2/worker.py": 2,
+        # T769: the V2 wake lane moved to proactive_language_system_line.
+        "backend/model_api_runtime/v2/worker.py": 1,
         "tools/chat_resident_consumer.py": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("locale", "expected"),
+    [
+        ("en-US", "Language: talk to the user in the language they use."),
+        ("zh-Hans-CN", "语言：用用户使用的语言跟他说话。"),
+    ],
+)
+def test_proactive_language_system_line_is_one_soft_sentence(locale, expected):
+    line = proactive_language_system_line(infer_reply_language(locale=locale))
+    assert line == expected
+    assert "\n" not in line
 
 
 def test_failure_fallback_reply_selects_paired_shared_copy():
