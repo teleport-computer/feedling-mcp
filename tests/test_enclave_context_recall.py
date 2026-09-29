@@ -18,6 +18,7 @@ from enclave import backend_client, keys, readside  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
 from enclave.routes import chat as chat_routes  # noqa: E402
+from memory import recall_select  # noqa: E402
 from memory import memory_core  # noqa: E402
 
 
@@ -154,13 +155,13 @@ def test_user_entity_survives_long_assistant_topic(monkeypatch, agent_role):
 ])
 def test_recall_query_uses_latest_two_nonempty_user_texts(monkeypatch, latest):
     seen = []
-    original = chat_routes._unified_selection
+    original = recall_select.unified_selection
 
     def observe(cards, query):
         seen.append(query)
         return original(cards, query)
 
-    monkeypatch.setattr(chat_routes, "_unified_selection", observe)
+    monkeypatch.setattr(recall_select, "unified_selection", observe)
     messages = [
         {"role": "user", "content": "更早的话题"},
         {"role": "human", "content": "上一条用户消息"},

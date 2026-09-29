@@ -88,15 +88,17 @@ SCENARIOS = [
 
 def run_scenario(chat, recall_metadata, monkeypatch, name, window, args, ranker):
     """Drive the real _build_context_memories with frozen clocks; return a JSON-able triple."""
+    from memory import recall_select
+
     cards = _garden()
     monkeypatch.setattr(chat.readside, "moments_to_cards", lambda *a, **k: [dict(c) for c in cards])
-    monkeypatch.setattr(chat.time, "monotonic", lambda: FIXED_MONOTONIC)
+    monkeypatch.setattr(recall_select.time, "monotonic", lambda: FIXED_MONOTONIC)
     monkeypatch.setattr(recall_metadata, "recent_cards",
                         functools.partial(_ORIG_RECENT[0], now=FIXED_NOW))
     if ranker is None:
-        monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+        monkeypatch.delenv(recall_select.RECALL_RANKER_ENV, raising=False)
     else:
-        monkeypatch.setenv(chat.RECALL_RANKER_ENV, ranker)
+        monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, ranker)
     picked, trace, log = chat._build_context_memories([], window, {**BASE_ARGS, **args})
     return json.loads(json.dumps({"context_memories": picked, "context_memory_trace": trace,
                                   "context_memory_log": log}, ensure_ascii=False, sort_keys=True))

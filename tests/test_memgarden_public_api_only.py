@@ -50,7 +50,8 @@ ALLOWED_INTERNAL: dict[str, set[str]] = {
     # Automatic-recall kill switch (FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0) falls
     # back to the deprecated legacy selector. TODO(feat/memx-garden-recall): delete
     # with the switch once the unified ranker has run on prod for a release.
-    "backend/enclave/routes/chat.py": {"memgarden.scoring.relevance"},
+    # Moved with the selector from enclave/routes/chat.py (T779 step 1).
+    "backend/memory/recall_select.py": {"memgarden.scoring.relevance"},
 }
 
 
