@@ -12,6 +12,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- The Runtime V2 `mcp.surface.resolved` debug trace keeps its verdict again. The
+  stored event is capped at 20 detail keys and the tool-surface counters used to
+  come first, so `resolved`, `skipped_count` and `skipped` were dropped from every
+  stored V2 event while `expected` survived. The verdict fields now come first;
+  the ten cap counters (`count_cap`, `char_cap`, `char_cap_skips`,
+  `count_cap_collapses`, `char_cap_collapses`, `expanded`, `collapsed`,
+  `catalog_chars`, `schema_rejected`, `schema_cap_collapsed`) move into one
+  `caps` object; `skipped` becomes a `{server name: kind}` object (at most 20
+  entries, `skipped_count` is the total); and `server_results`, which repeated
+  `expected_servers` plus `skipped`, is no longer included.
+
 - The Runtime V2 debug trace now records, for a chat turn that includes images or
   files, whether the text the user typed with them reached the model request:
   `v2.prompt_frontier.budget` gains an `attachment_captions` object with counts

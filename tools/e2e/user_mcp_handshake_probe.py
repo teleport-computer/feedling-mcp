@@ -294,21 +294,36 @@ def classify(events: list[dict], *, runtime: str, expect: str,
             out.append("FAIL resolved 里没有 expected 字段 —— 部署的 backend 早于"
                        "整台失败可观测那批,先发版再测")
             return 3, out
+        if "resolved" not in detail:
+            # Before T775 the durable 20-key cap cut resolved/skipped off every
+            # V2 row while `expected` survived; reading the absent key as 0
+            # would report "no server resolved" from a row that never said so.
+            out.append("FAIL resolved 里没有 resolved 字段 —— 部署的 backend 早于"
+                       "T775(判定字段被 20 键上限截掉),先发版再测")
+            return 3, out
         expected = int(detail.get("expected") or 0)
         resolved = int(detail.get("resolved") or 0)
-        skipped = [s for s in (detail.get("skipped") or []) if isinstance(s, dict)]
+        raw_skipped = detail.get("skipped") or {}
+        # T775 durable shape is {name: kind}; the list form is what the emitter
+        # hands over before _safe_detail, which unit tests still see.
+        skipped = (
+            [{"name": n, "kind": k} for n, k in raw_skipped.items()]
+            if isinstance(raw_skipped, dict)
+            else [s for s in raw_skipped if isinstance(s, dict)]
+        )
+        skipped_count = int(detail.get("skipped_count", len(skipped)) or 0)
         if expected != server_count:
             out.append(f"FAIL 运行时看到 {expected} 台,我们配了 {server_count} 台")
             return 1, out
-        if resolved + len(skipped) != expected:
+        if resolved + skipped_count != expected:
             # An internally inconsistent summary means the numbers cannot be
             # trusted at all — reading a verdict out of them would be worse
             # than admitting we have nothing.
             out.append(f"FAIL 计数对不上:resolved={resolved} + skipped="
-                       f"{len(skipped)} != expected={expected}")
+                       f"{skipped_count} != expected={expected}")
             return 3, out
         names = ",".join(f"{s.get('name')}:{s.get('kind')}" for s in skipped[:10])
-        if expect == "ok" and skipped:
+        if expect == "ok" and skipped_count:
             out.append(f"FAIL 有整台服务器没进工具面:{names}")
             return 1, out
         if expect == "failed" and resolved:
@@ -319,7 +334,7 @@ def classify(events: list[dict], *, runtime: str, expect: str,
             out.append(f"FAIL 期望每台都失败,但有 {resolved} 台进了工具面")
             return 1, out
         out.append(f"PASS resolved={resolved}/{expected}"
-                   + (f",未就绪:{names}" if skipped else ""))
+                   + (f",未就绪:{names}" if skipped_count else ""))
         return 0, out
 
     if "mcp.materialize.applied" not in seen:
