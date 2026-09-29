@@ -10,6 +10,8 @@ authorized user and, for hybrid recall, an ``encoder`` that owns query encoding
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
 import time
 
@@ -26,6 +28,31 @@ from memory.embedding import projection as embedding_projection
 from memory.embedding import recall_policy
 
 CONTEXT_MEMORY_CAP = 8
+
+# Candidate pool read for automatic recall (the memory/list page size), moved from
+# enclave/readside.py (T779 step 2b) so every host that selects reads the same knob.
+MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
+MEMORY_READSIDE_MODEL_API_MIN_LIMIT = 1
+
+
+def memory_readside_model_api_limit() -> int:
+    """自动注入的候选池大小。
+
+    正整数配置原样传给 backend；backend 的 memory/list 契约负责显式拒绝
+    超出其支持范围的值。这里不能再静默钳位，否则运维旋钮只可下调不可上调。
+    """
+    raw = str(os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")).strip()
+    try:
+        value = int(raw) if raw else MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be an integer"
+        ) from exc
+    if value < MEMORY_READSIDE_MODEL_API_MIN_LIMIT:
+        raise ValueError(
+            "MEMORY_READSIDE_MODEL_API_LIMIT must be positive"
+        )
+    return value
 
 #: Kill switch for automatic recall, default ON. ON: memgarden
 #: ``retrieval.select_context`` with io's jieba tokenizer, the ranker
@@ -159,13 +186,16 @@ def latest_first_selection(garden_cards, current_query, combined_query, selector
 
 
 def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query, combined_query,
-                         *, encoder):
+                         *, encoder, evidence: dict | None = None):
     """Hybrid (dense + BM25) pick for one turn, or (None, None, record) to fall back.
 
     All-or-nothing: every query vector is encoded before any selection runs, and
     any failure returns no picks so the caller re-runs the unchanged lexical
     path on the untouched cards. The record is content-free. ``encoder`` supplies
     ``encode_queries`` (read at call time); it raises ``recall_policy.Fallback``.
+    ``evidence`` (optional) receives content-free hashes of what this call really
+    used: the card vectors that passed the projection check, the threshold, the
+    model and the query vectors.
     """
     record = {"status": "fallback", "fallback_reason": hybrid.get("fallback_reason"),
               "encode_ms": None, "encode_queue_ms": None, "encode_compute_ms": None,
@@ -195,6 +225,10 @@ def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query,
             continue
         card_vectors[mid] = hit[1]
     record["with_vector"] = len(card_vectors)
+    if evidence is not None:
+        evidence["card_vectors"] = _digest(sorted([mid, _digest(vec)] for mid, vec in card_vectors.items()))
+        evidence["min_cosine"] = recall_policy.min_cosine()
+        evidence["model_id"] = hybrid.get("model_id")
     texts = [current_query] + ([combined_query] if combined_query != current_query else [])
     started = time.monotonic()
     timing: dict = {}
@@ -209,6 +243,8 @@ def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query,
         record["encode_ms"] = round((time.monotonic() - started) * 1000.0, 1)
         record.update(timing)
     by_query = dict(zip(texts, vectors))
+    if evidence is not None:
+        evidence["query_vectors"] = _digest([_digest(v) for v in vectors])
     model_id = hybrid["model_id"]
     options = {"card_vectors": card_vectors, "min_cosine": recall_policy.min_cosine(),
                "vector_model": model_id,
@@ -234,7 +270,65 @@ def try_hybrid_selection(hybrid, selectable, garden_cards, inner, current_query,
     return picked, trace, record
 
 
-def select_context_memories(cards, decrypted, query_args, *, inner=None, encoder=None):
+def query_texts(decrypted) -> tuple[str, str]:
+    """(current, combined) query for a history window: the latest non-empty user
+    message, then the two most recent ones newest first (assistant turns excluded)."""
+    recent_text = [m["content"] for m in decrypted
+                   if m.get("role") in {"user", "human"}
+                   and isinstance(m.get("content"), str) and m["content"].strip()][-2:]
+    current_query = recent_text[-1] if recent_text else ""
+    combined_query = "\n".join(reversed(recent_text))
+    return current_query, combined_query
+
+
+def _digest(value) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def input_fingerprint(decrypted, cards, query_args, *, evidence: dict, sealed_ids=()) -> dict:
+    """Content-free fingerprint of everything a selection read (T779 step 2b shadow).
+
+    ``evidence`` must be the dict that same ``select_context_memories`` call
+    filled, so the hybrid outcome, card and query vectors, threshold and fresh
+    set are the ones really used, not recomputed afterwards. Also covered: the
+    history window (seq, role, text hash), candidate cards in order (whole card
+    hash) and their plaintext-only subset, and the option flags. Hashes only.
+    """
+    sealed = {str(i) for i in sealed_ids}
+    history = [[m.get("seq"), m.get("role"), _digest(m.get("content"))] for m in decrypted]
+    ordered = [[str(c.get("id") or ""), _digest(c)] for c in cards]
+    return {
+        "history": _digest(history),
+        "cards": _digest(ordered),
+        "cards_plaintext": _digest([row for row in ordered if row[0] not in sealed]),
+        "sealed": len(sealed),
+        "hybrid": evidence.get("hybrid"),
+        "card_vectors": evidence.get("card_vectors"),
+        "query_vectors": evidence.get("query_vectors"),
+        "min_cosine": evidence.get("min_cosine"),
+        "model_id": evidence.get("model_id"),
+        "fresh": evidence.get("fresh"),
+        "flags": _digest({"unified": unified_recall_enabled(),
+                          "recent": bool(query_args.get("context_recent")),
+                          "mode": str(query_args.get("context_mode") or "")}),
+    }
+
+
+def decision_summary(context_memories, context_memory_log) -> dict:
+    """Content-free digest of the deterministic part of one selection."""
+    log = context_memory_log or {}
+    return {
+        "ids": _digest([str(c.get("id") or "") for c in context_memories]),
+        "counts": _digest(log.get("counts")),
+        "by_bucket": _digest(log.get("by_bucket")),
+        "rejected": _digest(log.get("rejected_reasons")),
+        "query": log.get("query_fingerprint"),
+    }
+
+
+def select_context_memories(cards, decrypted, query_args, *, inner=None, encoder=None,
+                            evidence: dict | None = None):
     """Pick context_memories from already-read ``cards`` for the history window ``decrypted``.
 
     Latest non-empty user message first, then the two most recent user messages
@@ -243,11 +337,7 @@ def select_context_memories(cards, decrypted, query_args, *, inner=None, encoder
     ``query_args["hybrid"]`` is set. Returns (context_memories,
     context_memory_trace, context_memory_log).
     """
-    recent_text = [m["content"] for m in decrypted
-                   if m.get("role") in {"user", "human"}
-                   and isinstance(m.get("content"), str) and m["content"].strip()][-2:]
-    current_query = recent_text[-1] if recent_text else ""
-    combined_query = "\n".join(reversed(recent_text))
+    current_query, combined_query = query_texts(decrypted)
 
     want_trace = query_args["want_trace"]
 
@@ -290,7 +380,7 @@ def select_context_memories(cards, decrypted, query_args, *, inner=None, encoder
     if hybrid is not None:
         picked, selection_trace, hybrid_record = try_hybrid_selection(
             hybrid, selectable, garden_cards, inner, current_query, combined_query,
-            encoder=encoder)
+            encoder=encoder, evidence=evidence)
     if picked is None:
         picked, selection_trace = latest_first_selection(
             garden_cards, current_query, combined_query, selector)
@@ -301,6 +391,8 @@ def select_context_memories(cards, decrypted, query_args, *, inner=None, encoder
     context_memories = _back_to_original(picked)
     if query_args.get("context_recent"):
         fresh = recall_metadata.recent_cards(selectable)
+        if evidence is not None:
+            evidence["fresh"] = _digest(sorted(str(c.get("id") or "") for c in fresh))
         fresh_ids = {c["id"] for c in fresh}
         context_memories = fresh + [c for c in context_memories if c.get("id") not in fresh_ids]
         context_memories = context_memories[:CONTEXT_MEMORY_CAP]
@@ -331,4 +423,9 @@ def select_context_memories(cards, decrypted, query_args, *, inner=None, encoder
     )
     if hybrid_record is not None:
         context_memory_log["hybrid"] = hybrid_record
+    if evidence is not None:
+        # The outcome this selection really took (a failure inside hybrid
+        # selection only shows here, not in the pre-selection state).
+        evidence["hybrid"] = (None if hybrid_record is None else
+                              f"{hybrid_record['status']}:{hybrid_record.get('fallback_reason') or ''}")
     return context_memories, context_memory_trace, context_memory_log

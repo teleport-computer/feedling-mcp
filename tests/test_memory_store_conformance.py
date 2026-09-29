@@ -46,10 +46,11 @@ from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from enclave import auth as enclave_auth  # noqa: E402
-from enclave import backend_client, keys, readside, routes, state as enclave_state  # noqa: E402
+from enclave import backend_client, keys, routes, state as enclave_state  # noqa: E402
 from enclave import envelope as enclave_envelope  # noqa: E402
 from enclave.routes import chat as enclave_chat  # noqa: E402
 from hosted import turn as hosted_turn  # noqa: E402
+from memory import recall_select  # noqa: E402
 from memgarden import conformance as kit  # noqa: E402
 from memgarden.conformance import Deviation, Outcome  # noqa: E402
 from memory import memory_core  # noqa: E402
@@ -397,7 +398,7 @@ class IoHost:
     def recall(self, owner, query):
         uid = self._uid(owner)
         listing, status = memory_core.list_moments(
-            self._store(owner), limit_raw=readside.memory_readside_model_api_limit(),
+            self._store(owner), limit_raw=recall_select.memory_readside_model_api_limit(),
             since="", include_archived_raw="")
         assert status == 200, listing
         picked, _trace, _log = enclave_chat._build_context_memories(

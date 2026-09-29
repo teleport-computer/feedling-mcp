@@ -21,25 +21,15 @@ it actually finishes, so abandoned work cannot pile up.
 from __future__ import annotations
 
 import asyncio
-import base64
 import concurrent.futures
-import os
-import struct
 import threading
 import time
 
 from enclave import backend_client
 from memory.embedding import recall_policy
 
-HYBRID_ENV = "FEEDLING_MEMORY_RECALL_HYBRID"
 VECTORS_PATH = "/v1/memory/vectors"
-MAX_VECTOR_IDS = 2000  # the backend's cap; the candidate pool is far smaller
 _MAX_IN_FLIGHT = 2
-
-
-def enabled() -> bool:
-    raw = str(os.environ.get(HYBRID_ENV, "0") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
 
 
 # --------------------------------------------------------------------------- #
@@ -74,7 +64,7 @@ def _load_embedder() -> None:
 def start_warmup() -> bool:
     """Start the one background load (app startup). No-op while the flag is off."""
     global _embedder_state, _embedder_reason
-    if not enabled():
+    if not recall_policy.hybrid_enabled():
         return False
     with _holder_lock:
         if _embedder_state != "idle":
@@ -108,7 +98,7 @@ def status_snapshot() -> dict:
     with _holder_lock:
         state, reason, embedder = _embedder_state, _embedder_reason, _embedder
     return {
-        "enabled": enabled(),
+        "enabled": recall_policy.hybrid_enabled(),
         "min_cosine": recall_policy.min_cosine(),
         "embedder_state": _STATE_LABELS.get(state, "unknown"),
         "failure_reason": reason if state == "unavailable" else None,
@@ -166,31 +156,6 @@ def encode_queries(embedder, texts: list[str], deadline: float,
 # stored card vectors (read through the backend as the authenticated user)
 # --------------------------------------------------------------------------- #
 
-def plaintext_candidate_ids(moments, authorized_user_id: str) -> list[str]:
-    """Ids of this turn's plaintext-tier, non-local_only candidates owned by the
-    authorized user, in list order.
-
-    Mirrors the storage-tier test the sweep and the readside use: an envelope
-    with ``body_ct`` or ``K_enclave`` is enclave-encrypted and never has a
-    vector, so it is never asked for; the owner binding is the one
-    ``read_envelope`` enforces, so a card the reader cannot open is not named.
-    """
-    out = []
-    for moment in moments or []:
-        if not isinstance(moment, dict) or moment.get("visibility") == "local_only":
-            continue
-        if moment.get("owner_user_id") != authorized_user_id:
-            continue
-        if moment.get("body_ct") or moment.get("K_enclave"):
-            continue
-        if moment.get("body") is None and moment.get("body_b64") is None:
-            continue
-        mid = moment.get("id")
-        if isinstance(mid, str) and mid:
-            out.append(mid)
-    return list(dict.fromkeys(out))[:MAX_VECTOR_IDS]
-
-
 async def fetch_vectors(forward_headers: dict, state: dict, ids: list[str]) -> None:
     """Read this turn's candidate vectors into ``state``; never raises.
 
@@ -210,7 +175,7 @@ async def fetch_vectors(forward_headers: dict, state: dict, ids: list[str]) -> N
             raise recall_policy.Fallback("deadline_exceeded") from None
         except Exception:
             raise recall_policy.Fallback("vectors_unavailable") from None
-        stored, rejected = decode_vectors(payload, state["model_id"], state["embedder"].dim)
+        stored, rejected = recall_policy.decode_vectors(payload, state["model_id"], state["embedder"].dim)
         wanted = set(ids)
         foreign = [mid for mid in stored if mid not in wanted]
         for mid in foreign:
@@ -224,37 +189,12 @@ async def fetch_vectors(forward_headers: dict, state: dict, ids: list[str]) -> N
         state["vectors_ms"] = round((time.monotonic() - started) * 1000.0, 1)
 
 
-def decode_vectors(payload, model_id: str, dim: int) -> tuple[dict, int]:
-    """{moment_id: (projection_hash, vector)} and the count of rejected rows."""
-    if not isinstance(payload, dict) or payload.get("model_id") != model_id:
-        raise recall_policy.Fallback("vectors_model_mismatch")
-    rows = payload.get("vectors")
-    if not isinstance(rows, list):
-        raise recall_policy.Fallback("vectors_malformed")
-    out, rejected = {}, 0
-    for row in rows:
-        try:
-            mid = str(row["id"])
-            digest = str(row["projection_hash"])
-            blob = base64.b64decode(row["vector_b64"], validate=True)
-            if not mid or mid in out or len(blob) != dim * 4:
-                raise ValueError
-            vector = list(struct.unpack(f"<{dim}f", blob))
-            if not recall_policy.valid_unit(vector, dim):
-                raise ValueError
-        except Exception:
-            rejected += 1
-            continue
-        out[mid] = (digest, vector)
-    return out, rejected
-
-
 # --------------------------------------------------------------------------- #
 # per-request state carried from the route into the selection thread
 # --------------------------------------------------------------------------- #
 
 def begin(unified_ranker: bool) -> dict:
-    """Start a turn's hybrid state. Only called when ``enabled()``."""
+    """Start a turn's hybrid state. Only called when ``recall_policy.hybrid_enabled()``."""
     started = time.monotonic()
     state = {"deadline": started + recall_policy.budget_seconds(), "started": started,
              "embedder": None, "model_id": None, "stored": None,

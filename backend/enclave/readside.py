@@ -12,30 +12,6 @@ from memory import recall_metadata
 from memory import recall_select
 
 
-MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
-MEMORY_READSIDE_MODEL_API_MIN_LIMIT = 1
-
-
-def memory_readside_model_api_limit() -> int:
-    """自动注入的候选池大小。
-
-    正整数配置原样传给 backend；backend 的 memory/list 契约负责显式拒绝
-    超出其支持范围的值。这里不能再静默钳位，否则运维旋钮只可下调不可上调。
-    """
-    raw = str(os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")).strip()
-    try:
-        value = int(raw) if raw else MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "MEMORY_READSIDE_MODEL_API_LIMIT must be an integer"
-        ) from exc
-    if value < MEMORY_READSIDE_MODEL_API_MIN_LIMIT:
-        raise ValueError(
-            "MEMORY_READSIDE_MODEL_API_LIMIT must be positive"
-        )
-    return value
-
-
 def memory_readside_hard_max() -> int:
     raw = os.environ.get("FEEDLING_MEMORY_READSIDE_HARD_MAX", "1000")
     try:
@@ -72,8 +48,6 @@ def memory_readside_effective_limit(raw_limit=None) -> int:
 
 def memory_readside_text(value, max_chars: int = 2000) -> str:
     return str(value or "").strip()[:max_chars]
-
-
 
 
 def memory_readside_summary(inner: dict) -> str:
@@ -134,8 +108,6 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
         "threads": threads[:8],
     }
     return adapted
-
-
 
 
 def memory_public_item(item: dict) -> dict:

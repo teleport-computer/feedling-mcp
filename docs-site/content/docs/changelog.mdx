@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 can select memory cards for plaintext accounts without the decrypt
+  service, behind `FEEDLING_V2_PLAINTEXT_RECALL` (default `off`, which changes
+  nothing). `shadow` keeps the decrypt-service result and records a content-free
+  `memory.recall.shadow` comparison; `on` serves plaintext accounts locally.
+  Selection code, history window and candidate pool are the ones the decrypt
+  service uses; a plaintext account's remaining sealed cards are left out on
+  this path. Hybrid query vectors come from a loopback encoder in the Runtime V2
+  parent that shares the card-vector sweep's model and runs queries ahead of
+  sweep work.
+
 - Runtime V2 wake lanes (heartbeat, manual wake, scheduled reminders, and screen
   watch) now wait up to 110 seconds for each provider response instead of 60.
   Some reasoning models took longer than a minute before responding, and the

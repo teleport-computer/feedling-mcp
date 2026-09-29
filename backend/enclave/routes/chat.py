@@ -14,8 +14,9 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from core import history_view, plaintext_row
 from memory import recall_select
-from core import history_view
+from memory.embedding import recall_policy
 from enclave import auth, backend_client, envelope, readside, recall_hybrid
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
@@ -108,8 +109,64 @@ def _build_context_memories(moments, decrypted, query_args):
         cards = readside.moments_to_cards(
             moments, query_args["authorized_user_id"], query_args["content_sk"],
             inner_out=inner)
-    return recall_select.select_context_memories(
-        cards, decrypted, query_args, inner=inner, encoder=recall_hybrid)
+    diagnostics = query_args.get("input_fp_out")
+    if diagnostics is None:
+        return recall_select.select_context_memories(
+            cards, decrypted, query_args, inner=inner, encoder=recall_hybrid)
+    # Shadow comparison only (T779 step 2b; the caller asked with
+    # context_input_fp=1). The selection below is the normal one and is always
+    # returned as is. Diagnostics are content-free evidence of what it read and,
+    # when sealed cards were among the candidates, the same selector re-run on
+    # these inputs minus the sealed rows (query vectors reused, never re-encoded).
+    # Any diagnostics failure only marks the comparison unmeasurable.
+    encoder = _MemoEncoder(recall_hybrid)
+    evidence: dict = {}
+    picked, trace, log = recall_select.select_context_memories(
+        cards, decrypted, query_args, inner=inner, encoder=encoder, evidence=evidence)
+    try:
+        sealed_ids = [str(m.get("id") or "") for m in moments
+                      if isinstance(m, dict) and plaintext_row.is_sealed_row(m)]
+        diagnostics["input_fingerprint"] = recall_select.input_fingerprint(
+            decrypted, cards, query_args, evidence=evidence, sealed_ids=sealed_ids)
+        diagnostics["summary"] = recall_select.decision_summary(picked, log)
+        sealed = set(sealed_ids)
+        if sealed & {str(c.get("id") or "") for c in cards}:
+            plain = [c for c in cards if str(c.get("id") or "") not in sealed]
+            n_evidence: dict = {}
+            n_picked, _, n_log = recall_select.select_context_memories(
+                plain, decrypted, query_args, inner=inner, encoder=encoder, evidence=n_evidence)
+            diagnostics["normalized"] = {
+                "input_fingerprint": recall_select.input_fingerprint(
+                    decrypted, plain, query_args, evidence=n_evidence),
+                "summary": recall_select.decision_summary(n_picked, n_log),
+            }
+    except Exception as exc:  # noqa: BLE001 — diagnostics never change the result
+        diagnostics.clear()
+        diagnostics["error"] = f"diagnostics_failed:{type(exc).__name__}"[:80]
+    return picked, trace, log
+
+
+class _MemoEncoder:
+    """Delegates to ``inner`` once per query-text tuple, so a normalized re-run
+    reuses the first run's query vectors (or its failure) instead of encoding again."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._cache: dict = {}
+
+    def encode_queries(self, embedder, texts, deadline, timing=None):
+        key = tuple(texts)
+        if key not in self._cache:
+            try:
+                self._cache[key] = ("ok", self._inner.encode_queries(embedder, texts, deadline, timing))
+            except recall_policy.Fallback as exc:
+                # A failed first encode is replayed, not retried: the normalized
+                # re-run must see the same mode and add no encoder work.
+                self._cache[key] = ("fallback", exc.reason)
+        kind, value = self._cache[key]
+        if kind == "fallback":
+            raise recall_policy.Fallback(value)
+        return value
 
 
 # HEAD 显式声明（同 frames.py）：Flask 自动给 GET 挂 HEAD，FastAPI 不会；
@@ -192,7 +249,7 @@ async def v1_chat_history(request: Request):
         # context_mode/context_strict 只做 wire 兼容解析，不改变挑法。候选池仍可
         # 通过 MEMORY_READSIDE_MODEL_API_LIMIT 调整；enclave 原样转发正整数，
         # backend 对超出 memory/list 支持范围的值显式报错。
-        memory_limit = readside.memory_readside_model_api_limit()
+        memory_limit = recall_select.memory_readside_model_api_limit()
         query_args = {
             "context_mode": context_mode,
             "context_recent": str(request.query_params.get("context_recent") or "").lower()
@@ -201,11 +258,16 @@ async def v1_chat_history(request: Request):
             "authorized_user_id": user_id,
             "content_sk": content_sk,
         }
+        # Shadow comparison only (T779 step 2b): without this parameter the
+        # response is unchanged.
+        if str(request.query_params.get("context_input_fp") or "").lower() in {
+                "1", "true", "yes", "on"}:
+            query_args["input_fp_out"] = {}
         if not probe:
             listing_task = asyncio.create_task(backend_client.backend_get(
                 "/v1/memory/list", ctx.forward_headers,
                 params={"limit": str(memory_limit)}))
-            if recall_hybrid.enabled():
+            if recall_policy.hybrid_enabled():
                 hybrid_state = recall_hybrid.begin(recall_select.unified_recall_enabled())
             quoted_ids = _quoted_memory_ids(hist.get("messages", []))
             if quoted_ids:
@@ -270,7 +332,7 @@ async def v1_chat_history(request: Request):
                 if hybrid_state["model_id"] and not hybrid_state["fallback_reason"]:
                     # Only this turn's plaintext candidates: the backend answers
                     # the intersection with the caller's eligible cards.
-                    ids = recall_hybrid.plaintext_candidate_ids(moments, user_id)
+                    ids = recall_policy.plaintext_candidate_ids(moments, user_id)
                     if ids:
                         await recall_hybrid.fetch_vectors(ctx.forward_headers, hybrid_state, ids)
                     else:
@@ -313,6 +375,9 @@ async def v1_chat_history(request: Request):
             payload[key] = hist[key]
     if context_memory_trace is not None:
         payload["context_memory_trace"] = context_memory_trace
+    diagnostics = (query_args or {}).get("input_fp_out")
+    if diagnostics:
+        payload["context_input_diagnostics"] = diagnostics
     # 图片聊天史 payload 可达数 MB（image_b64）——json.dumps 离事件循环
     return await json_response_offthread(payload)
 
