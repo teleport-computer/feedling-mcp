@@ -489,6 +489,15 @@ services:
       # baked local E5 model (deploy/Dockerfile). test only; prod stays off.
       FEEDLING_MEMORY_EMBEDDING_ENABLED: "1"
       FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+      # Plaintext recall shadow (T779 step 2c, T783): each turn the serve-worker
+      # also picks this turn's cards locally and records a content-free
+      # comparison with the enclave's pick (memory.recall.shadow). The reply
+      # still uses the enclave result. Hybrid settings match the enclave above
+      # so both sides select alike. test only; prod stays off. Roll back by
+      # setting shadow to "off" (or removing these three lines).
+      FEEDLING_V2_PLAINTEXT_RECALL: "shadow"
+      FEEDLING_MEMORY_RECALL_HYBRID: "1"
+      FEEDLING_MEMORY_RECALL_MIN_COSINE: "0.80"
       # tokenizers pulls huggingface_hub as a hard dependency; we only ever read
       # the local tokenizer.json. Make "never phones home" a config fact too.
       HF_HUB_OFFLINE: "1"
