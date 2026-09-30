@@ -519,6 +519,7 @@ _EXPECTED_UPSTREAM_SIGNALS = (
     ("api_key_unavailable", "api_key_unavailable"),
     ("enclave_invalid_readside_response", "enclave_invalid_readside_response"),
     ("memory_load_failed", "memory_load_failed"),
+    ("readside_local_error", "local_search_error"),
 )
 _EXPECTED_UPSTREAM_LABELS = {label for _prefix, label in _EXPECTED_UPSTREAM_SIGNALS}
 # What the doc promises a caller can receive. The two generic codes are not

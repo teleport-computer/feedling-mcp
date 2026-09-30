@@ -138,11 +138,12 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
 
 
 def build_memory_search_item(envelope: dict, inner: dict) -> dict:
-    """Build an index-shaped item with enclave-private search text.
+    """Build an index-shaped item with private search text.
 
-    ``content`` must never appear in the memory-index response, but exact search
-    still needs to match it while plaintext exists inside the enclave. The route
-    strips ``_search_content`` before serialization.
+    ``content`` must never appear in the memory-index response, but search
+    still needs to match it: inside the enclave for sealed-content accounts, in
+    the backend for plaintext accounts (``memory_readside_core``). Both strip
+    ``_search_content`` before serialization.
     """
     adapted = memory_inner_to_v1(inner, envelope)
     item = build_memory_index_item(envelope, inner)

@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Keyword memory search (`memory_search`, and `memory_index` with a query) for a
+  plaintext account is now ranked in the backend over the account's plaintext
+  cards, with the same ranking code, filters, limits and HTTP errors as the
+  enclave path. For the same plaintext-only set of cards the results are the
+  same as before. The account's remaining sealed cards from before plaintext
+  storage are no longer searched and are not counted in `unavailable_count`;
+  because ranking is computed over the whole set, leaving them out can change the
+  ranking or selection of the remaining cards. Accounts not recognized as plaintext still
+  search in the enclave.
+
 - Runtime V2 can select memory cards for plaintext accounts without the decrypt
   service, behind `FEEDLING_V2_PLAINTEXT_RECALL` (default `off`, which changes
   nothing). `shadow` keeps the decrypt-service result and records a content-free

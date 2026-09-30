@@ -1020,6 +1020,7 @@ jobs:
             tests/test_memory_result_budget.py \
             tests/test_memory_search_rank.py \
             tests/test_memory_search_readside.py \
+            tests/test_memory_search_local.py \
             tests/test_memory_related_read.py \
             tests/test_enclave_recall_unified.py \
             tests/test_memgarden_public_api_only.py \

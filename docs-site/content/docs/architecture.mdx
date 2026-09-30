@@ -79,7 +79,7 @@ deployment topology.
 | --- | --- | --- |
 | Client app or integration | Own the user credential and content keypair; call HTTP or WebSocket operations | Plaintext created or displayed by that client, plus encrypted envelopes |
 | TLS ingress | Terminate the public API certificate and route configured traffic | Transport plaintext inside the managed confidential-VM boundary |
-| ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext |
+| ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext, including a plaintext account's memory cards while ranking its keyword search |
 | Attested decrypt service | Own the content private key and authorize envelope decryption or read-side projection | Plaintext while servicing an authorized operation |
 | PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in the deployment-gated write shape, plus legacy ciphertext, and plaintext IDs, timestamps, types, status, and other operational metadata |
 | Object storage | Offload enabled large-object flows | Screen and Chat objects use the effective write shape; plaintext media are raw bytes, while legacy ciphertext remains encrypted |
@@ -133,7 +133,9 @@ it does not create or configure the bucket or its lifecycle.
 4. The decrypt service opens required shared ciphertext; plaintext records are
    read under the same tenant boundary. The runner sends the
    plaintext prompt and selected context to the configured model provider.
-   Automatic memory-card selection runs in the decrypt service by default. An
+   Keyword memory search for a plaintext account is ranked in the ASGI API with
+   the decrypt service's own ranking code; that account's remaining sealed cards
+   are not searched. Automatic memory-card selection runs in the decrypt service by default. An
    operator switch (`FEEDLING_V2_PLAINTEXT_RECALL`, off by default) lets the
    Runtime V2 child select cards for plaintext accounts itself, from the same
    history and memory pages, with the same selection code. Query vectors then

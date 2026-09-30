@@ -11,7 +11,8 @@ import content_encryption
 import nacl.public
 import memory_search_contract as contract
 from asgi_test_client import _AsgiTestClient
-from enclave import auth, backend_client, keys, memory_search, readside, state
+from enclave import auth, backend_client, keys, readside, state
+from memory import search_rank
 from enclave import routes
 
 
@@ -72,14 +73,14 @@ def test_global_stats_include_other_buckets_and_ignore_unreadable(client, monkey
             *[moment(f"other{i}", "coffee", bucket="other") for i in range(20)],
             moment("foreign", "repair repair", owner="someone_else")]
     seen = []
-    original = memory_search.retrieval.rank
+    original = search_rank.retrieval.rank
 
     def observe(query, candidates, **kw):
         result = original(query, candidates, **kw)
         seen.append(result.trace["candidates"])
         return result
 
-    monkeypatch.setattr(memory_search.retrieval, "rank", observe)
+    monkeypatch.setattr(search_rank.retrieval, "rank", observe)
     response = search(client, rows, bucket="topic")
     assert response.status_code == 200
     assert [i["id"] for i in response.get_json()["items"]] == ["b"]
