@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -470,17 +473,22 @@ def _install_quality_identity(c) -> None:
         "tone_style": "简体中文，克制、具体，不写模板式客服话术。",
         "custom_persona_prompt": (
             "主动开口时称呼用户七七，并自然包含短语‘此刻陪你’；"
-            "用一到两句简体中文，提到当前采用上海时区，不提模型、供应商或系统。"
+            "用一到两句简体中文，按当前本地时间自然提到星期几和时段，不提模型、供应商或系统。"
         ),
         "signature": ["此刻陪你"],
         "dimensions": [{"name": "温和", "value": 82, "description": "具体而不打扰"}],
     }, action="proactive quality")
 
 
-def _admin_user(c) -> dict:
+def _require_admin_token() -> str:
     token = os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
     if not token:
         raise _ProbeIssue("BLOCKED_CREDENTIAL", "FEEDLING_ADMIN_TOKEN is unavailable")
+    return token
+
+
+def _admin_user(c) -> dict:
+    token = _require_admin_token()
     try:
         response = httpx.get(
             f"{c.api_url}/v1/admin/data-track/users/{c.user_id}",
@@ -504,6 +512,10 @@ def _admin_user(c) -> dict:
 
 
 def _case_user_turn_priority(c) -> str:
+    # _wait_for_wake_delivery reads the admin surface when no bubble arrives.
+    # Check the token BEFORE enqueuing: blocking mid-wait leaves this manual_wake
+    # in flight and a later case (wake_coalescing) folds into it — T751/T774.
+    _require_admin_token()
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
     collision_wait = _wait_out_chat_collision(c)
@@ -575,13 +587,91 @@ def _case_user_turn_priority(c) -> str:
     )
 
 
+def _server_response_time(response) -> float:
+    """Use the enqueue response's server clock, never the probe host's clock."""
+    try:
+        value = parsedate_to_datetime(response.headers.get("date", ""))
+        if value.tzinfo is None:
+            raise ValueError("missing timezone")
+        return value.timestamp()
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise _ProbeIssue("BLOCKED_EVIDENCE", "quality wake omitted a valid server Date") from exc
+
+
+#: What may follow 「周X早」 for it to read as the greeting itself: end of text,
+#: whitespace or punctuation. A positive list, so no new compound can slip in.
+_WEEKDAY_EARLY_END = r"早(?=$|[\s，,。.！!？?、；;：:…~～—\-])"
+
+
+def _assert_timezone_grounding(text: str, server_started: float, server_finished: float) -> str:
+    """Check a weekday/day-period pair in Shanghai during the measured wake.
+
+    Date has one-second precision; history ts is server-owned. Include both
+    ends of the generation interval so a midnight/period boundary is not a
+    false failure. This is a Chinese lexical check, not a semantic evaluator.
+    Missing clock evidence must not fall back to the machine running the probe.
+    """
+    if (not math.isfinite(server_started) or not math.isfinite(server_finished)
+            or server_started <= 0 or server_finished <= 0
+            or not 0 <= server_finished - server_started <= _MODEL_TIMEOUT + 5):
+        raise _ProbeIssue("BLOCKED_EVIDENCE", "invalid server time interval for quality wake")
+    zone = ZoneInfo("Asia/Shanghai")
+    try:
+        start = datetime.fromtimestamp(server_started - 1, timezone.utc).astimezone(zone)
+        end = datetime.fromtimestamp(server_finished, timezone.utc).astimezone(zone)
+    except (ValueError, OverflowError, OSError) as exc:
+        raise _ProbeIssue("BLOCKED_EVIDENCE", "server time outside supported date range") from exc
+    # Enumerate hours because all vocabulary boundaries fall on whole hours.
+    cursor = start.replace(minute=0, second=0, microsecond=0)
+    while cursor <= end:
+        day = "一二三四五六日"[cursor.weekday()]
+        weekdays = (f"周{day}", f"星期{day}", f"礼拜{day}")
+        if cursor.weekday() == 6:
+            weekdays += ("周天", "星期天", "礼拜天")
+        hour = cursor.hour
+        periods = (
+            ("凌晨", "深夜", "夜里") if hour < 6
+            else ("上午", "早上", "早晨", "清晨") if hour < 12
+            else ("中午", "午间") if hour < 14
+            else ("下午", "午后") if hour < 18
+            else ("晚上", "晚间", "夜晚", "夜里")
+        )
+        # Natural day-period words overlap the canonical prompt labels.
+        # Keep these overlaps hour-bounded, with the same weekday as above.
+        if 5 <= hour < 12:
+            periods += ("清早", "一早", "大早")
+        if hour in (17, 18):
+            periods += ("傍晚",)
+        if hour >= 18:
+            periods += ("今晚", "今夜")
+        if hour >= 22 or hour < 6:
+            periods += ("深夜", "半夜")
+        if hour == 23 or hour < 6:
+            periods += ("午夜",)
+        # A bare 「早」 glued to the weekday and ending the phrase (「周日早，……」)
+        # is a morning greeting. It must be followed by the end, whitespace or
+        # punctuation: 早退/早餐/早起/早就/早点 are words, not a period — T774.
+        weekday_early = 5 <= hour < 12 and any(
+            re.search(re.escape(w) + _WEEKDAY_EARLY_END, text) for w in weekdays)
+        if any(word in text for word in weekdays) and (
+                weekday_early or any(word in text for word in periods)):
+            return f"Asia/Shanghai server_interval={start.isoformat()}..{end.isoformat()}"
+        cursor += timedelta(hours=1)
+    raise _ProbeIssue("PRODUCT_FAIL", f"timezone weekday/day-period mismatch; head={text[:160]!r}")
+
+
 def _case_proactive_message_quality(c) -> str:
+    # _wait_for_wake_delivery reads the admin surface when no bubble arrives.
+    # Check the token BEFORE enqueuing: blocking mid-wait leaves this manual_wake
+    # in flight and a later case (wake_coalescing) folds into it — T751/T774.
+    _require_admin_token()
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
     collision_wait = _wait_out_chat_collision(c)
     started = time.time()
+    response = c.post("/v1/proactive/tick", json={"force": True})
     wake = _body(
-        c.post("/v1/proactive/tick", json={"force": True}),
+        response,
         expected=(200,),
         action="enqueue quality wake",
     )
@@ -589,6 +679,7 @@ def _case_proactive_message_quality(c) -> str:
     job_id = _wake_job_id(job) if isinstance(job, dict) else ""
     if not job_id or job.get("lane") != "manual_wake":
         raise _ProbeIssue("PRODUCT_FAIL", f"quality wake was not enqueued: {wake}")
+    server_started = _server_response_time(response)
     reply = _wait_for_wake_delivery(
         c,
         started,
@@ -599,8 +690,7 @@ def _case_proactive_message_quality(c) -> str:
     required = [value for value in ("七七", "此刻陪你") if value not in text]
     if required:
         raise _ProbeIssue("PRODUCT_FAIL", f"persona/language markers missing: {required}; head={text[:160]!r}")
-    if not any(marker in text for marker in ("上海", "北京时间", "东八区")):
-        raise _ProbeIssue("PRODUCT_FAIL", f"timezone grounding missing; head={text[:160]!r}")
+    grounding = _assert_timezone_grounding(text, server_started, _message_ts(reply))
     forbidden = [
         marker for marker in ("Anthropic", "OpenAI", "OpenRouter", "Gemini", "DeepSeek", "系统提示")
         if marker.lower() in text.lower()
@@ -614,7 +704,7 @@ def _case_proactive_message_quality(c) -> str:
         raise _ProbeIssue("PRODUCT_FAIL", f"one wake produced {len(agents)} agent messages")
     return (
         f"decryptable zh-Hans persona/timezone message; job={job_id}; "
-        f"chars={len(text)}; no spam; collision_wait={collision_wait:.1f}s"
+        f"chars={len(text)}; no spam; collision_wait={collision_wait:.1f}s; {grounding}"
     )
 
 

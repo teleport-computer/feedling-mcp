@@ -102,7 +102,7 @@ backend/
     memory_readside_core.py · memory_index_selector.py ·
     context_memory_selection.py · object_storage.py ·
     provider_attempt_ledger.py · worldbook_match.py ·
-    worldbook_readside_core.py · debug_trace.py
+    worldbook_readside_core.py · debug_trace.py · admin_read_timing.py
                     ← 底层独立模块，保持无业务依赖
 ```
 
@@ -147,7 +147,7 @@ asgi_app.py（装配，最高）
   ↑ core
   ↑ db / content_encryption / provider_client / dstack_tls / hosted_runtime /
      semantic_analysis / memory_readside_core / memory_index_selector /
-     context_memory_selection（最低；均为无业务依赖的共享/底层模块）
+     context_memory_selection / admin_read_timing（最低；均为无业务依赖的共享/底层模块）
   ↑ memgarden（外部低层依赖；记忆判断力内核，不 import IO 模块）
 ```
 

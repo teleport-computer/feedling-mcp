@@ -38,6 +38,12 @@ REJECTION_BOUNDARY_DOMAINS: Mapping[str, str] = MappingProxyType({
 REJECTION_FALLBACK_CODES = frozenset({UNREGISTERED_ERROR_CLASS})
 
 
+def localized_text(text_zh: str, text_en: str, language: str = "") -> str:
+    if str(language or "").strip().lower().startswith("en"):
+        return text_en or text_zh
+    return text_zh
+
+
 @dataclass(frozen=True, slots=True)
 class ErrorSpec:
     code: str
@@ -51,9 +57,7 @@ class ErrorSpec:
     activity_result: bool = False
 
     def text(self, language: str = "") -> str:
-        if str(language or "").strip().lower().startswith("en"):
-            return self.safe_text_en or self.safe_text_zh
-        return self.safe_text_zh
+        return localized_text(self.safe_text_zh, self.safe_text_en, language)
 
     def matcher(self) -> re.Pattern[str] | None:
         return (
@@ -174,6 +178,21 @@ _EXPLICIT_PROVIDER_AUTH = re.compile(
     r"invalid ?(?:x-)?api.?key|unauthorized|authentication",
     re.IGNORECASE,
 )
+# Relays (new-api/one-api family) answer an exhausted balance with 403, e.g.
+# {"error":{"message":"预扣费额度失败, 用户剩余额度: ¥0.44, 需要预扣费额度: ¥0.50",
+#  "code":"insufficient_user_quota"}} (T729). Only this explicit evidence moves a
+# 403 off the fail-closed authentication default. Each marker states a shortfall
+# by itself; a bare balance field (e.g. 用户剩余额度) does not.
+# T750 (prod 30d): relays also answer "用户额度不足, 剩余额度: ¥-0.0003" and
+# "This premium model requires an active paid plan or real deposited balance",
+# both of which were reported to the user as an invalid API key. Only the
+# shortfall phrase counts: a bare "real deposited balance" is a balance noun,
+# like 用户剩余额度 above, and must not turn an unknown 403 into a top-up hint.
+_EXPLICIT_PROVIDER_QUOTA_403 = re.compile(
+    r"insufficient_user_quota|insufficient_quota|预扣费额度失败|余额不足|额度不足"
+    r"|requires an active paid plan",
+    re.IGNORECASE,
+)
 
 
 def _contains_generic_upstream_403_object(value: object) -> bool:
@@ -247,7 +266,31 @@ def provider_response_is_auth_failure(status_code: object, raw_body: object) -> 
     candidate = str(raw_body or "")
     if _EXPLICIT_PROVIDER_AUTH.search(candidate):
         return True
+    if _EXPLICIT_PROVIDER_QUOTA_403.search(candidate):
+        return False
     return not _is_generic_upstream_403_body(candidate)
+
+
+def provider_response_is_quota_exhausted(status_code: object, raw_body: object) -> bool:
+    """402, or a 403 whose original body explicitly reports an exhausted balance.
+
+    Explicit authentication evidence in the same body keeps the auth reading.
+    """
+    if isinstance(status_code, bool):
+        return False
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if status == 402:
+        return True
+    if status != 403:
+        return False
+    candidate = str(raw_body or "")
+    return bool(
+        _EXPLICIT_PROVIDER_QUOTA_403.search(candidate)
+        and not _EXPLICIT_PROVIDER_AUTH.search(candidate)
+    )
 
 
 def _chat_specs() -> tuple[ErrorSpec, ...]:
@@ -256,7 +299,7 @@ def _chat_specs() -> tuple[ErrorSpec, ...]:
         _spec("image_list_empty", "chat", "request", "user_environment", "图片列表不能为空。", en="The images list must not be empty."),
         _spec("image_count_exceeds_limit", "chat", "request", "user_environment", "一次最多发送 9 张图片。", en="You can send at most 9 images in one message."),
         _spec("model_mismatch", "chat", "provider", "system", "当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。", en="The runtime did not load the selected model. Pick the model again or try later.", matcher=r"\bmodel_mismatch\b"),
-        _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota"),
+        _spec("quota_insufficient", "chat", "provider", "user_provider", "模型服务额度不足，充值后再发消息即可恢复。", en="The model service has insufficient quota. Add credit, then send the message again.", matcher=r"余额|额度|insufficient_quota|credit balance|requires more credits|payment required|\b402\b|provider_http_402|quota|\bhit your usage limit\b"),
         _spec("provider_account_expired", "chat", "provider", "user_provider", "你配置的模型服务账号或套餐已过期，请到模型服务商处续费或恢复账号后再发消息。", en="Your configured model provider account or plan has expired. Renew or restore it with the provider, then send the message again.", matcher=r"\baccount[_ -]?(?:has[_ -]?)?expired\b|\bexpired[_ -]?account\b"),
         _spec("auth_invalid", "chat", "provider", "user_provider", "API Key 无效或已过期，请到设置里重新保存。", en="The API key is invalid or expired. Save it again in Settings.", matcher=r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b|" + _AUTH_403 + r"|" + _AUTH_PROVIDER_HTTP_403 + r"|provider_http_401"),
         _spec("model_not_found", "chat", "provider", "user_provider", "模型名不可用，请检查设置里的模型名。", en="The model name is unavailable. Check the model name in Settings.", matcher=r"invalid model name|model_not_found|no such model|unknown model|supported .{0,40}model names|model .{0,80}does not exist|not a valid model|model[ _]not[ _]found"),

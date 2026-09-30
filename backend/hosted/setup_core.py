@@ -36,6 +36,7 @@ from core import util as core_util
 from core import wake_bus
 from core.store import UserStore
 from accounts import onboarding as accounts_onboarding
+from accounts import registry as accounts_registry
 from memory import service as memory_service
 import provider_client
 import provider_attempt_ledger
@@ -50,6 +51,7 @@ from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import wake_circuit
 from notices import catalog as notices_catalog
+from notices import error_contract
 from notices import core as notices_core
 
 
@@ -113,6 +115,7 @@ def _emit_model_api_probe_trace(
     outcome_class: str | None = None,
     usage: dict | None = None,
     error_class: str = "",
+    status_code: object = None,
     dur_ms: float | None = None,
 ) -> None:
     event_type = {
@@ -125,6 +128,12 @@ def _emit_model_api_probe_trace(
         "phase": phase,
         "provider": provider,
         "model": model,
+        # Only a measured HTTP integer may cross this diagnostic boundary.
+        # Never coerce strings/body fragments (or bools) into status evidence.
+        "status_code": (
+            status_code if type(status_code) is int and 100 <= status_code <= 599
+            else None
+        ),
     }
     if usage:
         detail["usage"] = dict(usage)
@@ -188,6 +197,7 @@ def _test_provider_key_observed(
             outcome_class="operational_failure",
             error_class=error_class,
             dur_ms=(time.monotonic() - started) * 1000.0,
+            status_code=exc.status_code,
         )
         raise
 
@@ -1864,6 +1874,11 @@ def _provider_test_failure_class(exc: BaseException) -> str:
         status is None and str(exc).startswith("provider network error:")
     ):
         return notices_catalog.PROVIDER_TEST_UNAVAILABLE_CLASS
+    if status == 403 and error_contract.provider_response_is_quota_exhausted(
+        status,
+        getattr(exc, "raw_response_body", "") or getattr(exc, "response_detail", ""),
+    ):
+        return "quota_insufficient"
     return notices_catalog.PROVIDER_TEST_STATUS_CLASSES.get(
         status, notices_catalog.PROVIDER_TEST_CONFIG_CLASS
     )
@@ -1903,7 +1918,10 @@ def _record_provider_test_failure(store, exc: BaseException, *, route_id=None) -
             store.user_id, route_id, status="failed",
             error=f"{failure_class}: {exc}"[:240],
         )
-    blame, user_text = notices_catalog.provider_test_notice_for(failure_class)
+    blame, user_text = notices_catalog.provider_test_notice_for(
+        failure_class,
+        language=accounts_registry._get_user_archive_language(store.user_id) or "",
+    )
     notices_core.emit(
         store, source="model_api", error_class=failure_class,
         blame=blame, severity="warning", user_text=user_text,

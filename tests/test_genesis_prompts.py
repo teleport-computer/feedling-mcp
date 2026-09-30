@@ -51,6 +51,11 @@ def test_memory_recheck_prompt_is_grounded_and_memory_only():
     assert "Never fabricate" in system
     assert "Output memory cards only" in system
     assert '{"memories"' in system
+    # T755: the recheck follows memgarden#10's history_import rule — a one-time
+    # concrete specific is a gap to fill, not "one-off content with no value".
+    assert "one-off content with no long-term value" not in system
+    assert "DO add a missed concrete specific of this person's own life" in system
+    assert "what the companion itself said or suggested" in system
     payload = json.loads(messages[1]["content"])
     assert payload["original_material"] == "用户说自己养了一只叫蛋子的狗。"
     assert payload["written_memories"] == [{"summary": "用户住在杭州"}]

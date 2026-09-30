@@ -1087,6 +1087,61 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
     assert self_thinking.instruction_for_field().strip() in system_text
 
 
+@pytest.mark.parametrize(
+    ("locale", "user_text", "language"),
+    [("en-US", "hi", "en"), ("zh-Hans-CN", "你好呀", "zh")],
+)
+def test_chat_aside_copy_follows_account_reply_language(
+    monkeypatch, locale, user_text, language,
+):
+    # T734: English accounts get the English aside copy through the real chat
+    # chain; Chinese accounts keep the Chinese copy.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_t734_aside_" + language
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-t734-aside")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>private summary</think>hello")],
+    )
+    loop_kwargs = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy_loop(**kwargs):
+        loop_kwargs.append(kwargs.get("reply_language"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy_loop)
+    deps = _deps(messages=[{
+        "id": "m-t734", "ts": 10.0, "role": "user", "content": user_text,
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    policy_language = reply_language.infer_reply_language(locale=locale).language
+    assert (policy_language == "en") is (language == "en"), policy_language
+    # The compact delivery round inside the loop renders from this value.
+    assert loop_kwargs == [policy_language]
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
+    other = "zh" if language == "en" else "en"
+    assert self_thinking.instruction_for_field(language=language).strip() in system_text
+    assert self_thinking.instruction_for_field(language=other).strip() not in system_text
+
+
 def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_toolloop_fable_plain_reply"
@@ -1668,6 +1723,107 @@ def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
 
     assert status == "completed"
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
+
+
+_DSML_REPLY = (
+    "<｜｜DSML｜｜ calls>\n"
+    '<｜｜DSML｜｜ invoke name="reply">\n'
+    '<｜｜DSML｜｜ parameter name="aside" string="true">他在问那顿慈善饭，我没查到，照实说。</｜｜DSML｜｜ parameter>\n'
+    '<｜｜DSML｜｜ parameter name="text" string="true">这个我没记下来。是哪天？告诉我这次记住。</｜｜DSML｜｜ parameter>\n'
+    "</｜｜DSML｜｜ invoke>\n"
+    "</｜｜DSML｜｜ calls>"
+)
+
+
+def test_foreground_dsml_reply_delivers_body_without_aside(monkeypatch):
+    """T727 (T557 L1): DeepSeek wrote its reply tool call as DSML text. The
+    production chain must deliver the reply body and never the aside."""
+    uid = "u_toolloop_dsml_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-dsml-reply")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round(_DSML_REPLY)])
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "那顿饭是哪天"}])
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == ["这个我没记下来。是哪天？告诉我这次记住。"]
+    assert not any("慈善饭" in body or "DSML" in body for body in bodies)
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"]["reason"] == "tool_markup_leak_sanitized"
+
+
+def test_foreground_dsml_non_reply_call_uses_existing_fallback(monkeypatch):
+    uid = "u_toolloop_dsml_non_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-dsml-non-reply")
+    _patch_real_write(monkeypatch)
+    leaked = (
+        '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="memory_write">'
+        '<｜｜DSML｜｜ parameter name="text" string="true">不该给用户看的</｜｜DSML｜｜ parameter>'
+        "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert "不该给用户看的" not in bubble["body_ct"] and "DSML" not in bubble["body_ct"]
+    assert bubble["turn_failure_error_class"] == "upstream_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("leaked", "body"),
+    [
+        pytest.param('{"aside":"他就问单号，我直接给他。","text":"旅行杯盖子的维修单号是 LK-7319。"}',
+                     "旅行杯盖子的维修单号是 LK-7319。", id="raw-reply-json"),
+        pytest.param('<function_calls><invoke name="reply"><parameter name="aside">他就问单号，我直接给他。</parameter>'
+                     '<parameter name="text">旅行杯盖子的维修单号是 LK-7319。</parameter></invoke></function_calls>',
+                     "旅行杯盖子的维修单号是 LK-7319。", id="xml-reply-with-aside"),
+
+        pytest.param(json.dumps({"aside": "他就问单号，我直接给他。", "text": '<｜｜DSML｜｜ invoke name="reply">'
+                                 '<｜｜DSML｜｜ parameter name="aside">他就问单号，我直接给他。</｜｜DSML｜｜ parameter>'
+                                 '<｜｜DSML｜｜ parameter name="text">旅行杯盖子的维修单号是 LK-7319。</｜｜DSML｜｜ parameter>'
+                                 "</｜｜DSML｜｜ invoke>"}, ensure_ascii=False),
+                     "旅行杯盖子的维修单号是 LK-7319。", id="json-wrapping-dsml-reply"),
+    ],
+)
+def test_foreground_reply_shapes_deliver_body_without_aside(monkeypatch, leaked, body):
+    """T733 (T730 local run, deepseek): the reply call's arguments reached the
+    user as visible text, aside included. The production chain must deliver
+    only the body."""
+    uid = "u_toolloop_t733_" + str(abs(hash(leaked)) % 100000)
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-t733")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "单号是多少"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == [body]
+    assert not any("直接给他" in b or "aside" in b for b in bodies)
 
 
 def test_torn_protocol_evidence_lane_policy():
@@ -4743,3 +4899,208 @@ def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
     protect = seen_child_kwargs[0].get("refresh_protected_extra_tool_names")
     assert callable(protect), "child loop must declare a protected-name source"
     assert set(protect()) == allowed
+
+
+@pytest.mark.parametrize(
+    ("locale", "user_text", "expected_language"),
+    [
+        # T743 (Seven 2026-09-26): the user's latest message decides.
+        ("zh-Hans-CN", "Please try again", "en"),
+        ("en-US", "请再试一次", "zh-Hans"),
+        # No language signal: the account language, as before.
+        ("en-US", "😀 123", "en"),
+        ("zh-Hans-CN", "😀 123", "zh-Hans"),
+    ],
+)
+def test_chat_degenerate_fallback_follows_latest_user_message_language(
+    monkeypatch,
+    locale,
+    user_text,
+    expected_language,
+):
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = (
+        "u_toolloop_fallback_follows_message_"
+        + locale.lower().replace("-", "_")
+        + "_"
+        + expected_language.lower().replace("-", "_")
+    )
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-follows-message")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[
+        {"id": "m-older", "ts": 9.0, "role": "user",
+         "content": "早先那句" if expected_language == "en" else "earlier line"},
+        {"id": "m-latest", "ts": 10.0, "role": "user", "content": user_text},
+    ])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if expected_language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
+
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        # Newest user row decides; placeholders and file bodies are not words.
+        ([{"role": "user", "content": "你好"},
+          {"role": "user", "content": "[image]", "has_image": True, "caption": ""}], ""),
+        ([{"role": "user", "content": "[image]", "has_image": True, "caption": "look"}], "look"),
+        # An enriched file row: content holds the file body, caption the user's words.
+        ([{"role": "user", "content": "[file: a.txt]\nquarterly revenue", "has_file": True,
+           "caption": "这个文件"}], "这个文件"),
+        ([{"role": "user", "content": "[file: a.txt]\nquarterly revenue", "has_file": True}], ""),
+        ([{"role": "user", "content": "[message unavailable]", "unreadable": True}], ""),
+        # A vision observation merged into content is not the user's words either.
+        ([{"role": "user", "content": "[image 1] a red car", "has_image": True,
+           "caption": ""}], ""),
+        ([{"role": "user", "content": "hello"}, {"role": "assistant", "content": "你好"}], "hello"),
+        ([], ""),
+    ],
+    ids=["image-only-newest", "image-caption", "file-caption", "file-no-caption",
+         "unreadable", "vision-observation", "skips-assistant", "empty"],
+)
+def test_latest_user_typed_text_reads_only_the_users_words(rows, expected):
+    assert worker._latest_user_typed_text(rows) == expected
+
+
+@pytest.mark.parametrize(
+    ("locale", "latest", "expected_language"),
+    [
+        ("zh-Hans-CN", {"content": "[image]", "has_image": True, "caption": ""}, "zh-Hans"),
+        ("en-US", {"content": "[image]", "has_image": True, "caption": ""}, "en"),
+        ("en-US", {"content": "[image]", "has_image": True, "caption": "你看这个"}, "zh-Hans"),
+        ("zh-Hans-CN", {"content": "[file: a.txt]", "has_file": True,
+                        "file_name": "a.txt", "caption": ""}, "zh-Hans"),
+    ],
+    ids=["zh-acct-image-only", "en-acct-image-only", "en-acct-zh-caption", "zh-acct-file-only"],
+)
+def test_chat_degenerate_fallback_ignores_attachment_placeholders(
+    monkeypatch, request, locale, latest, expected_language
+):
+    monkeypatch.setattr(
+        worker, "_DEGENERATE_REPLY_FALLBACK", reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    monkeypatch.setattr(
+        worker, "_DEGENERATE_REPLY_FALLBACK_EN", reply_language.DEFAULT_FAILURE_FALLBACK_EN
+    )
+    uid = "u_toolloop_fallback_attachment_" + request.node.callspec.id.replace("-", "_")
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-attachment")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[
+        {"id": "m-older", "ts": 9.0, "role": "user",
+         "content": "早先那句" if expected_language == "en" else "earlier line"},
+        {"id": "m-latest", "ts": 10.0, "role": "user", **latest},
+    ])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if expected_language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
+
+
+_T768_CAPTION = "PRIVATE_CAPTION_看我的猫"
+
+
+@pytest.mark.parametrize("prompt_content,delivered", [
+    (_T768_CAPTION, 1),
+    ("[image]", 0),  # T745 shape: the row knows the caption, the prompt got the marker
+])
+def test_t768_first_round_image_caption_delivery_matches_the_real_request(
+    monkeypatch, prompt_content, delivered,
+):
+    """T768 on the production-shaped seq path (real append+enqueue, ordered chat
+    replies): the budget trace's caption count agrees with the actual request."""
+    uid = f"u_toolloop_t768_caption_{delivered}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_doc = {**_user_doc("image-parent", _T768_CAPTION),
+                 "content_type": "image", "image_mime": "image/png"}
+    _seq, job_id = db.chat_append_and_enqueue(
+        uid, "image-parent", 10.0, input_doc, 5000, "chat",
+        expected_generation=generation)
+    job = jobs_store.claim_next_job("w-t768")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+    _patch_real_write(monkeypatch)
+
+    def _read_after_seq(_user_id, after_seq):
+        return [{
+            "id": row["id"], "seq": int(row["seq"]), "ts": float(row.get("ts") or 0),
+            "role": row.get("role"), "content": prompt_content,
+            "caption": _T768_CAPTION, "has_image": True,
+            "image_mime": row.get("image_mime") or "",
+        } for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"]
+
+    calls = _script_provider(monkeypatch, [_text_round("MODEL REPLY")])
+    events = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _u: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        read_tail_after_seq=lambda _u, after_seq, limit, *, through_seq=None:
+            _read_after_seq(uid, after_seq),
+        read_images=lambda _u, ids: {
+            mid: {"image_b64": "iVBORw0KGgo=", "image_mime": "image/png"} for mid in ids},
+        read_summary_with_seq=lambda _u: ("", 0.0, 0, 0),
+        resolve_provider=lambda _u: (_BYOK, {}),
+        mint_enclave_token=lambda _u: "rt",
+        emit_debug_trace=lambda _u, kind, **kw: events.append((kind, kw)),
+        ordered_chat_replies=True,
+    )
+
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert calls, "provider never called"
+    assert (_T768_CAPTION in repr(calls[0]["messages"])) is bool(delivered)
+    budgets = [e["detail"] for kind, e in events if kind == "v2.prompt_frontier.budget"]
+    assert budgets[0]["attachment_captions"] == {
+        "images": 1, "files": 0, "with_caption": 1, "delivered": delivered, "undetermined": 0,
+        "caption_chars": len(_T768_CAPTION),
+        "delivered_chars": len(_T768_CAPTION) * delivered, "undetermined_chars": 0,
+    }
+    assert _T768_CAPTION not in repr(budgets)

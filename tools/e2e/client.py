@@ -247,17 +247,18 @@ class E2EClient:
         with httpx.Client(timeout=30, verify=False) as boot:
             try:
                 # register is NOT idempotent (each call mints a new account), so we
-                # retry ONLY on ConnectError — a TLS/connect failure means the request
-                # never reached the server (no account created), safe to retry. A
-                # post-send ReadError could have created an account, so it is NOT
-                # retried here. The test env flaps on single-CVM deploy windows.
+                # retry only connection establishment failures: ConnectError or
+                # ConnectTimeout (including TLS handshake timeout). Neither sends
+                # the registration request. Read/write failures may occur after
+                # account creation, so they are NOT retried. Keep this loop around
+                # register only, never whoami or the whole provision/deep run.
                 reg_body = {"public_key": pk_b64, "archive_language": archive_language,
                             "access_mode": route, "label": "e2e-p0"}
                 for _attempt in range(3):
                     try:
                         r = boot.post(f"{api_url}/v1/users/register", json=reg_body)
                         break
-                    except httpx.ConnectError:
+                    except (httpx.ConnectError, httpx.ConnectTimeout):
                         if _attempt == 2:
                             raise
                         time.sleep(3 * (_attempt + 1))

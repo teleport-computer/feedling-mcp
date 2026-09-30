@@ -21,6 +21,7 @@ from model_api_runtime.v2 import jobs_store
 # parse classifications.
 from memory import capture_failure
 from notices import agent_call_failure, catalog, error_contract
+from notices.rollup_outcomes import split_v2_outcomes
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -209,7 +210,6 @@ def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
     """
     stats = LaneRouteStats(lane=lane, route=route)
     per_user: dict[str, list[int]] = {}
-    v2_control = jobs_store.CONTROL_OUTCOME_CODES if route == "model_api" else frozenset()
     skip_lane = lane in db.LANE_ROLLUP_SKIP_DECLARED_LANES
     for row in rows:
         if (str(row.get("lane")) != lane or str(row.get("route")) != route
@@ -233,13 +233,9 @@ def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
         codes = {str(code): _int(n) for code, n in raw_codes.items() if _int(n)}
 
         if route == "model_api":
-            user_codes = {c: n for c, n in codes.items()
-                          if c in catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES}
-            control = sum(n for c, n in codes.items() if c in v2_control)
-            user = sum(user_codes.values())
-            operational = max(0, failed - control - user)
-            remaining = {c: n for c, n in codes.items()
-                         if c not in v2_control and c not in user_codes}
+            operational, control, user, user_codes, remaining = split_v2_outcomes(
+                failed, codes, classify=jobs_store.terminal_outcome_class,
+            )
         else:
             user_codes = {c: n for c, n in codes.items()
                           if c in catalog.USER_UNAVAILABLE_V1_REASONS}

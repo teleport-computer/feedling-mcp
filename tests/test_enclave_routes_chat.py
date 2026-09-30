@@ -12,7 +12,7 @@ from asgi_test_client import _AsgiTestClient  # noqa: E402
 from enclave import auth as enclave_auth  # noqa: E402
 from enclave import backend_client, envelope as envmod, keys  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
-from enclave.readside import MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT  # noqa: E402
+from memory.recall_select import MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
 from enclave.routes import chat as enclave_chat  # noqa: E402
 from core import chat_images  # noqa: E402

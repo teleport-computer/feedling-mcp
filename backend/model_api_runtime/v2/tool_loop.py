@@ -23,6 +23,7 @@ from capabilities import result_budget
 from capabilities import tool_schema
 from agent_protocol_core import protocol_leak, self_thinking
 from chat import language_follow
+from model_api_runtime.v2 import provider_errors
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
@@ -1299,6 +1300,41 @@ def _with_system_suffix(messages: list, suffix: str) -> list:
     return updated
 
 
+def _provider_error_facts(exc: BaseException) -> dict[str, object]:
+    """Derive closed failure metadata without trusting exception text.
+
+    Module level so every V2 lane that calls a provider (tool loop, Profile)
+    projects a failed call through the same closed vocabulary.
+    """
+    status_code = getattr(exc, "status_code", None)
+    try:
+        timed_out = provider_client.is_timeout_error(exc)
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+        timed_out = False
+    try:
+        error_family = provider_client.classify_provider_error(exc)
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+        error_family = "unknown"
+    return {
+        "finish_reason": (
+            "timeout"
+            if timed_out
+            else (
+                "http_error"
+                if isinstance(status_code, int)
+                and not isinstance(status_code, bool)
+                else "provider_error"
+            )
+        ),
+        "status_code": status_code,
+        "error_class": provider_errors.error_class_for_exception(exc),
+        "exception_type": type(exc).__name__,
+        # Retry family is independent of the shared notice cause above.
+        "provider_error_class": error_family,
+        **provider_client.provider_error_diagnostics(exc),
+    }
+
+
 @memory_recall.traced
 async def run_tool_loop(
     *,
@@ -1337,6 +1373,10 @@ async def run_tool_loop(
     # terminal plain-text response remains an unpublished draft and gets at
     # most one correction within the existing provider-call budget.
     regular_wake_choice_required: bool = False,
+    # Presence wakes withhold reply/stay_silent from their first provider call so
+    # the model looks at its context before deciding (prod T723: GLM decided in
+    # one call 96% of the time and chose silence 93% of the time).
+    wake_look_first: bool = False,
     reply_tool_enabled: bool = False,
     # Output capacity is independent of whether this lane requires a terminal
     # reply/stay_silent choice. Scheduled wakes need the same shared budget.
@@ -1346,6 +1386,9 @@ async def run_tool_loop(
     # not explicitly request a second native reasoning channel. Any native
     # reasoning still returned is diagnostic input only, never display text.
     suppress_native_reasoning: bool = False,
+    # ``ReplyLanguage.language`` of the turn; selects the zh/en aside copy the
+    # compact delivery round re-attaches (T734).
+    reply_language: str | None = None,
     # Whether a text-free provider reply is an immediate ERROR. Defaults to
     # True for foreground chat. Wake passes False so this loop can inspect an
     # empty 200 and force the bounded reply/stay_silent choice itself; the
@@ -1407,6 +1450,12 @@ async def run_tool_loop(
     on_prompt_frontier_exhaustion=None,
     on_prompt_frontier_exhausted_detail=None,
     absolute_deadline: float | None = None,
+    # One bound for every provider HTTP wire of this loop: the httpx timeout,
+    # the true wall-clock wire deadline, and a watchdog progress boundary at
+    # every attempt and wire. The hosted stall clock then sees at most one wire
+    # of silence. None keeps the provider_client defaults (60s httpx timeout, no
+    # wire deadline, no per-attempt progress); wake lanes pass a value.
+    provider_wire_timeout_sec: float | None = None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -1499,6 +1548,8 @@ async def run_tool_loop(
         raise ValueError(
             "regular_wake_choice_required requires on_stay_silent"
         )
+    if wake_look_first and not regular_wake_choice_required:
+        raise ValueError("wake_look_first requires regular_wake_choice_required")
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -1542,6 +1593,10 @@ async def run_tool_loop(
     wake_direct_text_seen = False
     wake_direct_text_pending = False
     wake_direct_text_draft = ""
+    # Needs one look round, one decision round and one spare correction round.
+    wake_look_first_pending = bool(wake_look_first and max_calls >= 3)
+    wake_look_first_decide = False
+    wake_look_first_draft = ""
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
     external_content_seen = False
@@ -1670,7 +1725,7 @@ async def run_tool_loop(
         return (
             instruction.rstrip()
             + "\n\n"
-            + self_thinking.instruction_for_field().strip()
+            + self_thinking.instruction_for_field(language=reply_language).strip()
         )
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
@@ -1795,6 +1850,19 @@ async def run_tool_loop(
         except Exception:  # noqa: BLE001
             pass
 
+    # Kept out of provider_kwargs: these configure the retry wrapper, not the
+    # request, and must reach both reliable call sites (incl. tagged-image retry).
+    provider_wire_kwargs: dict = (
+        {
+            "wire_deadline_sec": provider_wire_timeout_sec,
+            "progress_cb": lambda stage, attempt: _progress(
+                f"provider_{stage}_{attempt}"
+            ),
+        }
+        if provider_wire_timeout_sec is not None
+        else {}
+    )
+
     async def _trajectory(event_kind: str, payload: dict) -> None:
         # Unlike cheap progress telemetry this callback is the encrypted flight
         # recorder. Production awaits its durable append at causal boundaries;
@@ -1843,34 +1911,6 @@ async def run_tool_loop(
             )
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
             pass
-
-    def _provider_error_facts(exc: BaseException) -> dict[str, object]:
-        """Derive closed failure metadata without trusting exception text."""
-        status_code = getattr(exc, "status_code", None)
-        try:
-            timed_out = provider_client.is_timeout_error(exc)
-        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
-            timed_out = False
-        try:
-            error_family = provider_client.classify_provider_error(exc)
-        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
-            error_family = "unknown"
-        return {
-            "finish_reason": (
-                "timeout"
-                if timed_out
-                else (
-                    "http_error"
-                    if isinstance(status_code, int)
-                    and not isinstance(status_code, bool)
-                    else "provider_error"
-                )
-            ),
-            "status_code": status_code,
-            "error_class": type(exc).__name__,
-            "provider_error_class": error_family,
-            **provider_client.provider_error_diagnostics(exc),
-        }
 
     async def _record_required_file_missing(round_number: int) -> None:
         nonlocal required_file_missing_recorded
@@ -2036,6 +2076,29 @@ async def run_tool_loop(
             wake_choice_required = True
             force_text_fallback = False
             force_text_fallback_reason = ""
+        look_first_round = bool(
+            wake_look_first_pending
+            and not wake_choice_required
+            and not wake_direct_text_pending
+        )
+        if look_first_round:
+            look_catalog = [
+                spec for spec in turn_catalog
+                if spec.name not in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+            ]
+            if look_catalog:
+                turn_catalog = look_catalog
+            else:
+                # Nothing to look with: an empty tool list is not a valid wire.
+                look_first_round = False
+                wake_look_first_pending = False
+        look_first_decide_round = wake_look_first_decide
+        if look_first_decide_round and wake_look_first_draft:
+            # Same boundary as a direct-text draft: never persisted, never sent.
+            messages = [
+                *messages,
+                {"role": "assistant", "content": wake_look_first_draft},
+            ]
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -2084,6 +2147,17 @@ async def run_tool_loop(
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
                 _WAKE_DIRECT_TEXT_CORRECTION if wake_direct_text_pending else "",
+                (
+                    (
+                        _WAKE_DIRECT_TEXT_CORRECTION
+                        if wake_look_first_draft
+                        else _WAKE_CHOICE_INSTRUCTION
+                    )
+                    if look_first_decide_round
+                    and not wake_choice_required
+                    and not wake_direct_text_pending
+                    else ""
+                ),
                 final_reply_correction_instruction,
                 terminal_text_instruction,
             )
@@ -2464,7 +2538,7 @@ async def run_tool_loop(
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
-        if regular_wake_choice_required:
+        if regular_wake_choice_required and not look_first_round:
             required_schema_names = set(required_schema_names) | {
                 _WAKE_REPLY_TOOL,
                 tool_schema.STAY_SILENT_TOOL,
@@ -2695,6 +2769,8 @@ async def run_tool_loop(
             # parser return any structurally valid success so an abnormal HTTP
             # 200 is not retried as though it were a transient network failure.
             provider_kwargs = {"tools": tools, "require_reply": False}
+            if provider_wire_timeout_sec is not None:
+                provider_kwargs["timeout"] = provider_wire_timeout_sec
             if terminal_schema_guard and tools is not None:
                 provider_kwargs["tool_choice"] = "none"
             if wake_choice_required:
@@ -2824,6 +2900,7 @@ async def run_tool_loop(
                 base_delay_sec=0.2,
                 max_delay_sec=1.0,
                 absolute_deadline=absolute_deadline,
+                **provider_wire_kwargs,
                 **provider_kwargs,
             )
         except Exception as exc:
@@ -2895,6 +2972,7 @@ async def run_tool_loop(
                         base_delay_sec=0.2,
                         max_delay_sec=1.0,
                         absolute_deadline=absolute_deadline,
+                        **provider_wire_kwargs,
                         **provider_kwargs,
                     )
                     # A successful text-only retry confirms that the rejected
@@ -3144,6 +3222,58 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        if look_first_decide_round:
+            wake_look_first_decide = False
+            wake_look_first_draft = ""
+        if look_first_round:
+            wake_look_first_pending = False
+            early_decision_calls = [
+                tc for tc in pr.tool_calls
+                if tc.name in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+            ]
+            early_decision_only = bool(pr.tool_calls) and len(
+                early_decision_calls
+            ) == len(pr.tool_calls)
+            if (not pr.tool_calls and not pr.media) or early_decision_only:
+                # No lookup was wanted. A decision attempted before it was
+                # offered is not a protocol violation: carry any drafted text
+                # (plain text or reply.text) as an unpublished draft into one
+                # ordinary decision round; from there the existing direct-text
+                # and empty-response paths apply unchanged.
+                early_reply_text = next(
+                    (
+                        str((tc.args or {}).get("text") or "")
+                        for tc in early_decision_calls
+                        if tc.name == _WAKE_REPLY_TOOL
+                        and isinstance(tc.args, dict)
+                    ),
+                    "",
+                )
+                draft_source = early_reply_text or (
+                    pr.text if not upstream_response_envelope else ""
+                )
+                wake_look_first_decide = True
+                wake_look_first_draft = (
+                    draft_source[:max_assistant_tool_text_chars]
+                    if draft_source.strip()
+                    else ""
+                )
+                await _trajectory("wake_look_first", {
+                    "round": attempts,
+                    "tool_call_count": len(pr.tool_calls),
+                    "early_decision": early_decision_only,
+                    "provider_text_present": bool(wake_look_first_draft),
+                })
+                await _emit_provider_tool_surface(provider_surface_detail)
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("wake_look_first_decide_boundary")
+                continue
+            # A real lookup: the next round still decides, so it carries the same
+            # choice instruction (no draft). Prod 2026-09-25..28: every GLM
+            # choice_invalid heartbeat looked something up here and then answered
+            # the lookup result in plain text; none took the draft path (T770).
+            wake_look_first_decide = True
         if (
             regular_wake_choice_required and not wake_direct_text_seen
             and not pr.tool_calls and not pr.media and pr.text.strip()

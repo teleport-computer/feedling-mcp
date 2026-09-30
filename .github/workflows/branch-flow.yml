@@ -19,9 +19,33 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
+          fetch-depth: 0
+
+      # Fetch objects only. Even a fork PR must never supply executable files.
+      - name: Fetch hotfix history
+        if: startsWith(github.event.pull_request.head.ref, 'hotfix/')
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Unable to validate hotfix::Invalid PR head SHA" >&2
+            exit 2
+          fi
+          # The token is available only to this fetch; nothing is persisted.
+          # Git expands GH_TOKEN when invoking the credential helper.
+          # shellcheck disable=SC2016
+          if ! git -c credential.helper= \
+            -c 'credential.helper=!f() { printf "%s\n" "username=x-access-token" "password=$GH_TOKEN"; }; f' \
+            fetch --no-tags --filter=blob:none origin \
+            +refs/heads/main:refs/remotes/origin/main "$HEAD_SHA"; then
+            echo "::error title=Unable to validate hotfix::Could not fetch main and PR head objects" >&2
+            exit 2
+          fi
 
       - name: Validate pull request source branch
         env:
           BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: scripts/check-pr-branch-flow.sh "$BASE_BRANCH" "$HEAD_BRANCH"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/check-pr-branch-flow.sh "$BASE_BRANCH" "$HEAD_BRANCH" "$HEAD_SHA"

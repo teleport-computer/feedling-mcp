@@ -33,7 +33,9 @@ sinks are assembled here.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -87,9 +89,12 @@ from hosted import mcp_status
 from hosted import mcp_tools
 from hosted import visual_transport
 from hosted import vision_observer
+from memory.embedding import query_client, query_service, recall_policy
+from memory.embedding import serve as embedding_serve
 from memory.embedding import sweep as memory_embedding_sweep
 from memory import garden_component
 from memory import memory_core
+from memory import plaintext_recall
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -103,6 +108,7 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import pool_config as v2_pool_config
 from model_api_runtime.v2 import pool_supervisor as v2_pool_supervisor
+from model_api_runtime.v2 import process_memory as v2_process_memory
 from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
@@ -467,23 +473,16 @@ _USER_ROLES = frozenset({"user", "human"})
 
 
 def _caption_envelope(m: dict) -> dict | None:
-    """从 `caption_*` 前缀字段重建 caption 信封；无密文时 None。
+    """从 `caption_*` 前缀字段重建 caption 信封；没有 caption 时 None。
 
-    镜像 `enclave/routes/chat.py:79-92`。**必须**用 `caption_id`（不是消息自己的 id）——
-    enclave 的 AEAD additional-data 是 `owner_user_id||v||id`，用错 id 会 AEAD 校验失败。
+    用共用投影 `core_envelope.caption_envelope_from_row`：密文档
+    (`caption_body_ct`)和明文档(`caption_body`)两种都认，`_caption_text` 再经
+    `read_envelope_body` 按形状路由(密文走 enclave，明文本地直读)。
+    T745(2026-09-26):这里原先自己拼、只认 `caption_body_ct`，明文档用户随图片/
+    文件发的话一律变成 `[image]`，模型只看到图(test 实测)。
+    AEAD additional-data 用 `caption_id`(不是消息自己的 id)，投影里已处理。
     """
-    ct = str(m.get("caption_body_ct") or "").strip()
-    if not ct:
-        return None
-    v = m.get("caption_v", m.get("v", 1))
-    return {
-        "id": m.get("caption_id") or m.get("id"),
-        "v": int(v or 1),
-        "body_ct": ct,
-        "nonce": m.get("caption_nonce"),
-        "K_enclave": m.get("caption_K_enclave"),
-        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
-    }
+    return core_envelope.caption_envelope_from_row(m)
 
 
 def _caption_text(m, *, mid, token, caller_user_id: str, fallback: str) -> str:
@@ -514,18 +513,22 @@ def _caption_text(m, *, mid, token, caller_user_id: str, fallback: str) -> str:
 
 def _image_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
-    text = _caption_text(
+    # What the user typed with the picture ("" for none). Kept apart from
+    # content: the marker and later vision observations are not the user's
+    # words, and a caption that happens to read "[image]" still is (T743).
+    caption = _caption_text(
         m,
         mid=mid,
         token=token,
         caller_user_id=caller_user_id,
-        fallback=_IMAGE_MARKER,
+        fallback="",
     )
     row = {
         "id": mid,
         "ts": ts,
         "role": role,
-        "content": text,
+        "content": caption or _IMAGE_MARKER,
+        "caption": caption,
         "has_image": True,
         "image_mime": m.get("image_mime") or "image/jpeg",
     }
@@ -551,13 +554,16 @@ def _file_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
     `enclave/routes/chat.py:104-112`）。
     """
     name = str(m.get("file_name") or "file")
-    text = _caption_text(
+    # What the user typed with the file ("" for none); the marker, Canvas
+    # metadata and the file body later inlined into content are not (T743).
+    caption = _caption_text(
         m,
         mid=mid,
         token=token,
         caller_user_id=caller_user_id,
-        fallback=f"[file: {name}]",
+        fallback="",
     )
+    text = caption or f"[file: {name}]"
     display_title = str(m.get("file_display_title") or "").strip()
     display_subtitle = str(m.get("file_display_subtitle") or "").strip()
     if display_title or display_subtitle:
@@ -571,6 +577,7 @@ def _file_row(m, *, mid, ts, role, token, caller_user_id: str) -> dict:
         "ts": ts,
         "role": role,
         "content": text,
+        "caption": caption,
         "has_file": True,
         "file_name": name,
         "file_display_title": m.get("file_display_title"),
@@ -983,6 +990,7 @@ def _decrypt_chat_rows_inner(
                     "ts": ts,
                     "role": role,
                     "content": _UNAVAILABLE_CHAT_MARKER,
+                    "unreadable": True,
                 }
             else:
                 plaintext = core_envelope.read_envelope_body(
@@ -992,11 +1000,14 @@ def _decrypt_chat_rows_inner(
                     caller_user_id=user_id,
                     runtime_token=token,
                 ).decode("utf-8")
-                if not plaintext.strip():
+                unreadable = not plaintext.strip()
+                if unreadable:
                     if not preserve_unreadable:
                         continue
                     plaintext = _UNAVAILABLE_CHAT_MARKER
                 item = {"id": mid, "ts": ts, "role": role, "content": plaintext}
+                if unreadable:
+                    item["unreadable"] = True
         if m.get("seq") is not None:
             item["seq"] = int(m["seq"])
         if role == "user" and m.get("include_reasoning") is True:
@@ -4880,7 +4891,39 @@ def _read_capture_state(user_id: str) -> dict:
     )
 
 
-def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
+def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict | None = None) -> dict:
+    """Pick this turn's context cards.
+
+    ``FEEDLING_V2_PLAINTEXT_RECALL`` (T779 step 2b): ``off`` (default) is the
+    enclave path exactly as before; ``shadow`` keeps the enclave result and also
+    selects locally for comparison; ``on`` serves plaintext accounts locally and
+    keeps the enclave path for everything else.
+    """
+    mode = plaintext_recall.mode()
+    if mode == "on":
+        deps = _plaintext_recall_deps()
+        status, value = plaintext_recall.run_bounded(
+            lambda: plaintext_recall.select(user_id, through_seq, deps),
+            plaintext_recall.local_timeout_seconds(), _LOCAL_RECALL_PERMIT)
+        if status == "ok":
+            return value.payload
+        if status == "error" and not isinstance(value, plaintext_recall.NotServedHere):
+            log.warning("[v2.memory] local recall failed: %s", type(value).__name__)
+        elif status in {"timeout", "busy"}:
+            log.warning("[v2.memory] local recall %s; this turn uses the enclave", status)
+    rpc_started = time.monotonic()
+    payload, diagnostics = _read_context_memories_enclave(
+        user_id, through_seq=through_seq, input_fp=(mode == "shadow"))
+    if mode == "shadow":
+        _submit_recall_shadow(
+            user_id, through_seq, diagnostics, coordinates=coordinates,
+            enclave_rpc_ms=round((time.monotonic() - rpc_started) * 1000.0, 1),
+            enclave_select_ms=(payload.get("context_memory_log") or {}).get("dur_ms"))
+    return payload
+
+
+def _read_context_memories_enclave(user_id: str, *, through_seq: int,
+                                   input_fp: bool = False) -> tuple[dict, dict | None]:
     """Select on an authenticated, frozen history window inside the enclave.
 
     Do not read the latest unbounded history: ordered replies must never select
@@ -4888,18 +4931,176 @@ def _read_context_memories(user_id: str, *, through_seq: int) -> dict:
     """
     if through_seq < 1:
         raise ValueError("context_memory_frontier_required")
+    params = {"before_seq": through_seq + 1, "limit": 4,
+              "include_image_body": "0", "context_trace": "1", "context_recent": "1"}
+    if input_fp:
+        params["context_input_fp"] = "1"
     payload, error = core_enclave._enclave_get_json_for_gate(
         "/v1/chat/history", None,
-        params={"before_seq": through_seq + 1, "limit": 4,
-                "include_image_body": "0", "context_trace": "1", "context_recent": "1"},
+        params=params,
         runtime_token=_mint_runtime_token(user_id),
     )
     if error or not isinstance(payload, dict):
         raise RuntimeError("context_memory_read_failed")
     if payload.get("user_id") != user_id:
         raise RuntimeError("context_memory_user_mismatch")
-    return {key: payload.get(key) for key in (
-        "context_memories", "context_memory_trace", "context_memory_log")}
+    return ({key: payload.get(key) for key in (
+        "context_memories", "context_memory_trace", "context_memory_log")},
+        payload.get("context_input_diagnostics") if input_fp else None)
+
+
+def _plaintext_recall_store(user_id: str):
+    return core_store.get_store_per_load_mode(
+        user_id, reason="plaintext recall reads the same pages the enclave reads")
+
+
+def _plaintext_history_page(user_id: str, through_seq: int) -> list:
+    """The page the enclave's own backend call returns for this window."""
+    # Imported here, not at module level: chat_core pulls in push setup that
+    # prints on import, and a slot process with the mode off must not load it.
+    from chat import chat_core
+
+    body, status = chat_core.history(
+        _plaintext_recall_store(user_id),
+        query={"limit": "4", "before_seq": str(int(through_seq) + 1), "include_image_body": "0"},
+        user_agent="v2-plaintext-recall", remote_addr="")
+    if status != 200 or not isinstance(body, dict):
+        raise plaintext_recall.NotServedHere("history_unavailable")
+    return list(body.get("messages") or [])
+
+
+def _plaintext_list_moments(user_id: str, limit: int) -> list:
+    body, status = memory_core.list_moments(
+        _plaintext_recall_store(user_id), limit_raw=str(limit), cursor="", since="",
+        include_archived_raw=None)
+    if status != 200 or not isinstance(body, dict):
+        raise plaintext_recall.NotServedHere("memory_list_unavailable")
+    return list(body.get("moments") or [])
+
+
+def _plaintext_stored_vectors(user_id: str, model_id: str, ids: list) -> dict:
+    body, status = embedding_serve.authorized_vectors(
+        _plaintext_recall_store(user_id), {"model_id": model_id, "ids": list(ids)})
+    if status != 200:
+        raise recall_policy.Fallback("vectors_unavailable")
+    return body
+
+
+def _plaintext_recall_deps() -> plaintext_recall.Deps:
+    return plaintext_recall.Deps(
+        effective_mode=accounts_registry.effective_content_encryption,
+        history_page=_plaintext_history_page,
+        list_moments=_plaintext_list_moments,
+        stored_vectors=_plaintext_stored_vectors,
+        encoder=query_client.from_env(),
+    )
+
+
+# One local selection (mode on) and one shadow comparison per slot process at a
+# time. A selection that outlives its wait keeps its permit until it really
+# ends, so slow reads cannot pile up; the next turn meanwhile skips the local path.
+_LOCAL_RECALL_PERMIT = threading.BoundedSemaphore(1)
+_RECALL_SHADOW_PERMIT = threading.BoundedSemaphore(1)
+
+
+def _submit_recall_shadow(user_id: str, through_seq: int, diagnostics, *,
+                          coordinates: dict | None = None, enclave_rpc_ms=None,
+                          enclave_select_ms=None) -> None:
+    """Compare in the background; the turn never waits for this.
+
+    Timing scopes in the event (T779 step 2c): ``local_ms`` is the whole local
+    read (account, history, candidates, encode, vectors, selection);
+    ``local_select_ms`` / ``enclave_select_ms`` are the shared selector alone on
+    each side; ``enclave_rpc_ms`` is the full enclave call as the slot saw it
+    (in shadow mode it includes the enclave's extra diagnostics work);
+    ``encode_*_ms`` come from the parent encoder for this query.
+    """
+    coords = dict(coordinates or {})
+
+    def run():
+        deps = _plaintext_recall_deps()
+        status, value = plaintext_recall.run_bounded(
+            lambda: plaintext_recall.select(user_id, through_seq, deps),
+            plaintext_recall.shadow_timeout_seconds(), _RECALL_SHADOW_PERMIT)
+        if status == "busy":
+            _emit_recall_shadow(user_id, {"verdict": "skipped", "reason": "shadow_busy"}, coords)
+            return
+        if status == "timeout":
+            # Not comparable: a late local result is never reported.
+            _emit_recall_shadow(user_id, {"verdict": "unmeasured", "reason": "shadow_timeout"}, coords)
+            return
+        if status == "error":
+            if isinstance(value, plaintext_recall.NotServedHere):
+                _emit_recall_shadow(user_id, {"verdict": "not_served", "reason": value.reason}, coords)
+            else:
+                _emit_recall_shadow(user_id, {"verdict": "unmeasured",
+                                              "reason": f"local_{type(value).__name__}"[:60]}, coords)
+            return
+        local = value
+        local_log = local.payload.get("context_memory_log") or {}
+        local_hybrid = local_log.get("hybrid") or {}
+        detail = plaintext_recall.compare(local, diagnostics)
+        detail.update({
+            "local_ms": local.elapsed_ms,
+            "local_select_ms": local_log.get("dur_ms"),
+            "enclave_select_ms": enclave_select_ms,
+            "enclave_rpc_ms": enclave_rpc_ms,
+            "encode_queue_ms": local_hybrid.get("encode_queue_ms"),
+            "encode_compute_ms": local_hybrid.get("encode_compute_ms"),
+            "sealed_cards": local.sealed_cards,
+            "local_hybrid": local.input_fingerprint.get("hybrid"),
+            "remote_hybrid": ((diagnostics or {}).get("input_fingerprint") or {}).get("hybrid"),
+        })
+        _emit_recall_shadow(user_id, detail, coords)
+
+    threading.Thread(target=run, name="v2-recall-shadow", daemon=True).start()
+
+
+def _emit_recall_shadow(user_id: str, detail: dict, coordinates: dict | None = None) -> None:
+    coords = dict(coordinates or {})
+    try:
+        _emit_v2_debug_trace_for_user(
+            user_id, "memory.recall.shadow", status="ok",
+            summary="Plaintext recall shadow comparison",
+            trace_id=str(coords.get("turn_id") or ""), turn_id=str(coords.get("turn_id") or ""),
+            job_id=str(coords.get("job_id") or ""),
+            detail={"driver": "v2", **detail, **coords})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[v2.memory] shadow trace failed: %s", type(exc).__name__)
+
+
+def _start_plaintext_recall_encoder() -> None:
+    """Parent only, before slot processes are spawned (T779 step 2b).
+
+    Nothing happens with the mode off. Otherwise the parent claims the model
+    (slot processes then refuse to build one) and, when hybrid recall is
+    configured for this process, reserves the loopback endpoint and loads the
+    model in the background; until it serves, slots stay lexical.
+
+    Safe to call on every _serve generation: the endpoint, token, loader and
+    service live for the whole parent process (query_service), so a restart
+    re-exports the same token to its new slots instead of replacing it.
+    """
+    if plaintext_recall.mode() == "off":
+        return
+    query_service.claim_embedder_ownership()
+    if not recall_policy.hybrid_enabled() or recall_policy.min_cosine() is None:
+        return
+    query_service.reserve()
+
+    def load():
+        try:
+            embedder = memory_embedding_sweep.get_embedder()
+            if not embedder.available:
+                log.warning("[v2.memory] query encoder unavailable: %s",
+                            embedder.unavailable_reason)
+                return
+            query_service.start(embedder)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[v2.memory] query encoder failed to start: %s", type(exc).__name__)
+
+    if query_service.ensure_loader(load):
+        atexit.register(query_service.stop)
 
 
 def _read_worldbook_context(
@@ -5001,6 +5202,52 @@ _MCP_CATALOG_DESC_CHARS = 160
 # here; test_detail_list_caps_cannot_drift_past_the_silent_ceiling pins the
 # relationship instead, so raising this without raising the ceiling goes red.
 _MCP_CATALOG_MAX_TOOLS = 20
+
+# `mcp.surface.resolved` detail projection (T775). The durable trace keeps only
+# the first debug_trace._DETAIL_MAX_KEYS (20) keys in insertion order, and the
+# loader summary alone has 22. Spreading it after driver/lane put the 16
+# tool-surface counters first, so the verdict (resolved/skipped_count/skipped)
+# was dropped from every V2 row: prod 3-day read had 814/814 with `expected`
+# and 0 with `resolved`. Verdict keys now go first, the cap counters share one
+# nested key, and every loader key must be named in exactly one of these three
+# tuples -- test_v2_mcp_surface_detail_survives_the_durable_cap turns red on a
+# new loader key instead of letting insertion order pick what gets dropped.
+_MCP_SURFACE_FLAT_KEYS = (
+    "surface_failure_kind", "expected", "resolved", "skipped_count", "skipped",
+    "expected_servers", "kept", "offered", "servers", "per_server",
+    "schema_rejected_names", "schema_cap_collapsed_names",
+)
+_MCP_SURFACE_CAP_KEYS = (
+    "count_cap", "char_cap", "char_cap_skips", "count_cap_collapses",
+    "char_cap_collapses", "expanded", "collapsed", "catalog_chars",
+    "schema_rejected", "schema_cap_collapsed",
+)
+# expected_servers + skipped already carry it, and _safe_detail would flatten
+# its {name, kind} items into 80-char strings anyway.
+_MCP_SURFACE_OMITTED_KEYS = ("server_results",)
+
+
+def _mcp_surface_trace_detail(lane: str, summary: dict,
+                              catalog_detail: dict) -> dict:
+    detail: dict = {"driver": "v2", "lane": str(lane or "chat")}
+    for key in _MCP_SURFACE_FLAT_KEYS:
+        if key not in summary:
+            continue
+        value = summary[key]
+        if key == "skipped":
+            # {name: kind}: a nested dict keeps its scalar values, while
+            # _safe_detail turns each dict inside a list into a repr string
+            # the probe can no longer read. skipped_count stays the total.
+            value = {
+                str(item.get("name")): str(item.get("kind"))
+                for item in (value or []) if isinstance(item, dict)
+            }
+        detail[key] = value
+    caps = {key: summary[key] for key in _MCP_SURFACE_CAP_KEYS if key in summary}
+    if caps:
+        detail["caps"] = caps
+    detail.update(catalog_detail)
+    return detail
 
 
 def _remember_mcp_catalog_fingerprint(user_id: str, fingerprint: str) -> None:
@@ -5130,8 +5377,7 @@ async def _load_mcp_turn_observed(
                        "每台仍有代表工具。detail.per_server 是「注册数/发现数」"
                        if dropped else "")
                 ),
-                detail={"driver": "v2", "lane": str(lane or "chat"),
-                        **summary, **catalog_detail},
+                detail=_mcp_surface_trace_detail(lane, summary, catalog_detail),
                 **({"job_id": str(job_id)} if failed and job_id else {}),
             )
             # 指纹只在 trace **确实发出去之后**才记。写在前面的话,某轮加载失败
@@ -5694,6 +5940,80 @@ async def _heartbeat_loop(
             log.warning("[v2.serve_worker] clear worker capacity failed: %s", e)
 
 
+def _fleet_memory_snapshot(fleet) -> dict:
+    """One content-free memory sample for this parent and its slot processes.
+
+    The container's cgroup reading is taken once here and must not be summed
+    with anything; per-process RSS and PSS are reported separately (PSS is the
+    one that can be summed across processes)."""
+    slots = []
+    for key in fleet.keys():
+        supervisor = fleet.supervisor(key)
+        pid_fn = getattr(supervisor, "child_pid", None)
+        pid = pid_fn() if callable(pid_fn) else None
+        slots.append({"slot": f"{key.pool}:{key.index}", "pid": pid,
+                      **v2_process_memory.process(pid)})
+    return {
+        "sampled_at": round(time.time(), 1),
+        "release": str(os.environ.get("FEEDLING_GIT_COMMIT", "dev"))[:12],
+        "parent": {"pid": os.getpid(), **v2_process_memory.process(os.getpid())},
+        "slots": slots,
+        "cgroup_kb": v2_process_memory.cgroup_kb(),
+    }
+
+
+# procfs reads (smaps_rollup walks each process's mappings) can be slow; they
+# run on one daemon thread at a time and the heartbeat waits at most this long.
+_MEMORY_READ_TIMEOUT_SEC = 2.0
+_memory_read_pending: concurrent.futures.Future | None = None
+
+
+def _start_memory_read(fleet) -> concurrent.futures.Future:
+    future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def run():
+        try:
+            future.set_result(_fleet_memory_snapshot(fleet))
+        except BaseException as exc:  # noqa: BLE001 — delivered to the waiter
+            future.set_exception(exc)
+
+    threading.Thread(target=run, name="v2-heartbeat-memory", daemon=True).start()
+    return future
+
+
+async def _bounded_memory_snapshot(fleet) -> dict:
+    """At most one read in flight; a read that is still running when the next
+    tick comes is reported busy, and a result that arrives after its own wait
+    is dropped, so a late reading is never written as a fresh one."""
+    global _memory_read_pending
+    pending = _memory_read_pending
+    if pending is not None and not pending.done():
+        return {"unavailable": "reading_busy"}
+    future = _start_memory_read(fleet)
+    _memory_read_pending = future
+    try:
+        return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)),
+                                      _MEMORY_READ_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        return {"unavailable": "reading_timeout"}
+    except Exception as exc:  # noqa: BLE001 — diagnostics only
+        return {"unavailable": type(exc).__name__[:40]}
+
+
+async def _step2c_readings(fleet) -> dict:
+    """Memory, encoder and model readings for the foreground heartbeat. A
+    reading that fails or is slow is marked unavailable; it never costs the
+    heartbeat row itself, and the event loop never waits on procfs."""
+    readings = {"memory": await _bounded_memory_snapshot(fleet)}
+    for name, read in (("query_encoder", query_service.status),
+                       ("embedding_model", memory_embedding_sweep.model_state)):
+        try:
+            readings[name] = read()     # in-memory only: no I/O, no model load
+        except Exception as exc:  # noqa: BLE001 — diagnostics only
+            readings[name] = {"unavailable": type(exc).__name__[:40]}
+    return readings
+
+
 async def _fleet_heartbeat_loop(
     worker_id: str,
     pool: v2_pool_config.PoolName,
@@ -5730,6 +6050,9 @@ async def _fleet_heartbeat_loop(
                     }
                 }
                 if pool == "foreground":
+                    # T779 step 2c: memory and encoder state measured from the
+                    # database (no shell access to the test machine).
+                    runtime_state.update(await _step2c_readings(fleet))
                     broker_state = fleet.broker_snapshot()
                     broker_state.pop("total_granted", None)
                     broker_state.setdefault(
@@ -6018,14 +6341,15 @@ _CHAT_TURN_BUDGET_SEC = (
     + float(v2_worker.MCP_TURN_WALL_BUDGET_SEC)
     + 120.0
 )
-# Keep the same bounded provider-attempt envelope as the Heavy slot budget;
-# separate component parse/truncation re-asks remain outside this allowance.
+# Include Capture's component re-ask and one rejected-budget fallback, using the
+# same nominal envelope as the Heavy slot budget.
 _EXTRACTION_TURN_BUDGET_SEC = v2_extraction.nominal_provider_envelope_sec()
 _MIN_TURN_ABSOLUTE_TIMEOUT_SEC = max(_CHAT_TURN_BUDGET_SEC, _EXTRACTION_TURN_BUDGET_SEC)
 if _TURN_ABSOLUTE_TIMEOUT_SEC < _MIN_TURN_ABSOLUTE_TIMEOUT_SEC:
     raise RuntimeError(
         "FEEDLING_V2_TURN_ABSOLUTE_TIMEOUT_SEC must cover prompt catch-up, "
-        "all provider rounds, the MCP turn wall budget, and 120s "
+        "all provider rounds (including Capture re-ask/budget fallback), "
+        "the MCP turn wall budget, and 120s "
         "setup/write margin "
         f"(minimum {_MIN_TURN_ABSOLUTE_TIMEOUT_SEC:.0f}s)"
     )
@@ -6517,6 +6841,8 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     # executor with the reaper/heartbeat/scheduler coroutines below). Unaffected by
     # the turn-child split: it never lived in the turn slots' event loop.
     genesis = _start_genesis_thread(worker_id)
+    # Before any slot process is spawned: they inherit the encoder endpoint.
+    _start_plaintext_recall_encoder()
 
     enclave_broker = v2_enclave_broker.EnclaveBroker(
         limit=config.enclave_instance_concurrency,

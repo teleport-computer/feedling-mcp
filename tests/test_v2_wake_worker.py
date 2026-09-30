@@ -51,9 +51,9 @@ from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
@@ -98,6 +98,14 @@ def _job_status(job_id):
     return row
 
 
+def _wake_outcome(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+
 def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
 
@@ -139,14 +147,26 @@ def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
     )
 
 
+from wake_look_first_helpers import (  # noqa: E402
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
+
+
 def _script_provider(monkeypatch, responses):
     """Monkeypatch `provider_client.chat_completion_async` — what
     `tool_loop.run_tool_loop` calls once per round (the wake lane's LLM wire
-    boundary)."""
+    boundary). Presence wakes' look-first round is answered with "looked,
+    nothing needed" without consuming a scripted response; it is recorded in
+    ``calls.look_rounds``. Look-first behaviour itself has dedicated tests."""
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            calls.look_rounds.append({"messages": messages, "tools": tools, **_kwargs})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **_kwargs})
         response = next(it)
         offered_names = {spec.name for spec in (tools or [])}
@@ -866,6 +886,8 @@ def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
     )
 
     async def _fake_provider(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         calls.append(messages)
         if len(calls) == 1:
             now = time.time()
@@ -1031,7 +1053,8 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
     assert self_thinking.INSTRUCTION.strip() not in system_msg["content"]
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
+    # Heartbeat is a presence wake: its aside asks why it reaches out now (T723).
+    assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
         system_msg["content"]
     )
     assert [
@@ -2019,6 +2042,9 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
     assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    # T773: no model ran, so this must not read as "spoke" (wake_result NULL).
+    assert _wake_outcome(job_id) == (
+        "completed", worker.HEARTBEAT_SKIPPED, worker.HEARTBEAT_SKIP_NO_USER_HISTORY)
     assert len(shadow) == 1
     assert shadow[0][1]["decision_allowed"] is False
     assert shadow[0][1]["apns_alert_sent"] is False
@@ -2066,7 +2092,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert status == "completed"
     assert provider_calls == []
     assert workspace_calls == []
-    assert _job_status(job_id)[0] == "completed"
+    assert _wake_outcome(job_id) == ("completed", "skipped", "no_user_history")
 
 
 def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
@@ -2080,9 +2106,13 @@ def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
         assert "clearly intrude" in text
     assert "do you feel like reaching out to them right now?" in prompt
     assert "say it; reaching out is what these moments are for" in prompt
-    assert "not having answered your last message is not a reason to hold back" in prompt
-    assert "showing up again a few hours later is normal" in prompt
-    assert "not answering your last message is not a reason by itself" in silent
+    # T723 D (Seven-approved wording): several unanswered messages over a day
+    # or two are still not a reason to go quiet.
+    assert "even several of your messages, even for a day or two" in prompt
+    assert "is not a reason to go quiet" in prompt
+    assert "say something new, or simply check in" in prompt
+    assert "a few hours later" not in prompt
+    assert "even several messages in a row, is not a reason by itself" in silent
     for text in (prompt, silent):
         assert "they asked not to be disturbed, or they are plainly asleep" in text
     assert "calling reply if there is anything you want to say to them" in choice
@@ -2105,6 +2135,8 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
     provider_calls = []
 
     async def _provider(_config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         provider_calls.append(messages)
         return (
             _stay_silent_round()
@@ -2262,7 +2294,7 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
+    assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
     assert "reply tool's `aside` field" in system_text
     assert "never put `<think>` tags in `text`" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
@@ -2353,6 +2385,8 @@ def test_heartbeat_empty_round_forces_stay_silent_and_persists_reason(monkeypatc
     calls = []
 
     async def forced_choice_provider(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **kwargs})
         if len(calls) == 1:
             return {"reply": "", "tool_calls": [], "usage": {}}
@@ -2459,6 +2493,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
         if message.get("role") == "system"
     )
     assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
+    assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is None or schedule["proactive_backoff_until"] is None
 
@@ -3156,6 +3191,8 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
     )
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         late_job_id, late_coalesced = jobs_store.enqueue_job_with_context_log(
             uid,
             "heartbeat",
@@ -3369,6 +3406,8 @@ def test_wake_reply_without_aside_completes_without_choice_invalid(monkeypatch):
     calls = []
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, _messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         calls.append({"tools": tools, **kwargs})
         return {
             "reply": "",
@@ -3912,6 +3951,8 @@ def test_forced_wake_choice_schema_rejection_fails_after_one_400(monkeypatch):
     rejected_calls = []
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, _messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         call = {"tools": tools, **kwargs}
         calls.append(call)
         if len(calls) == 1:
@@ -4011,6 +4052,20 @@ def test_deepseek_forced_wake_choice_disables_thinking_before_t492_fence(
         is_closed = False
 
         async def post(self, _url, *, headers=None, json=None, timeout=None):
+            wire_names = {
+                (tool.get("function") or {}).get("name")
+                for tool in (json or {}).get("tools") or []
+            }
+            if _is_look_first_round(
+                [type("Spec", (), {"name": name})() for name in wire_names if name],
+                (json or {}).get("messages"),
+                (json or {}).get("tool_choice"),
+            ):
+                return FakeResponse({
+                    "id": "chatcmpl-looked",
+                    "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 1},
+                })
             payloads.append(json)
             if len(payloads) == 1:
                 return FakeResponse({
@@ -4182,16 +4237,19 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
+    # The chat path enters through ``_coalesce_inputs``. ``coalesce_pending``
+    # itself is also used by a wake's own mid-turn fold once the look-first
+    # round (T723) makes presence wakes multi-round, so spy on the chat entry.
     coalesce_calls = {"n": 0}
-    orig_coalesce = v2_coalesce.coalesce_pending
+    orig_coalesce_inputs = worker._coalesce_inputs
 
-    def _counting_coalesce(*a, **k):
+    async def _counting_coalesce_inputs(*a, **k):
         coalesce_calls["n"] += 1
-        return orig_coalesce(*a, **k)
+        return await orig_coalesce_inputs(*a, **k)
 
-    monkeypatch.setattr(v2_coalesce, "coalesce_pending", _counting_coalesce)
+    monkeypatch.setattr(worker, "_coalesce_inputs", _counting_coalesce_inputs)
 
-    _script_provider(monkeypatch, [_text_round("a proactive nudge")])
+    calls = _script_provider(monkeypatch, [_text_round("a proactive nudge")])
     written = {}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -4215,6 +4273,7 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     assert coalesce_calls["n"] == 0
     assert written["text"] == "a proactive nudge"
     assert _job_status(job_id)[0] == "completed"
+    assert len(calls.look_rounds) == (0 if lane == "scheduled" else 1)
 
 
 def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
@@ -4430,7 +4489,7 @@ def test_only_scheduled_wake_demands_a_reply(
 @pytest.mark.parametrize(
     "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
 )
-def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
+def test_all_wake_lanes_receive_soft_language_nudge_not_hard_rule(monkeypatch, lane):
     uid = f"u_wake_language_{lane}"
     conftest.seed_user(uid)
     _reset(uid)
@@ -4471,14 +4530,79 @@ def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    expected = (
-        "回复语言规则：\n"
-        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
-        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
-        "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
-    )
-    assert expected in system_text
+    # T769 (Seven 2026-09-29): proactive turns get one soft nudge and the model
+    # picks the language itself; the hard reply-language rule must not come back.
+    expected = "语言：用用户使用的语言跟他说话。"
     assert system_text.count(expected) == 1
+    assert "回复语言规则" not in system_text
+    assert "Reply language rule" not in system_text
+    assert "主动/后台回复也使用本规则所用的语言" not in system_text
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
+)
+@pytest.mark.parametrize(
+    ("locale", "archive_language", "language"),
+    [("en-US", "en", "en"), ("zh-CN", "zh-Hans", "zh")],
+)
+def test_wake_aside_copy_follows_account_reply_language(
+    monkeypatch, lane, locale, archive_language, language,
+):
+    # T734: every wake lane renders the aside copy in the account's language.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = f"u_wake_t734_aside_{lane}_{language}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    loop_kwargs = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy_loop(**kwargs):
+        loop_kwargs.append(kwargs.get("reply_language"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy_loop)
+
+    async def _empty_cap(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(worker, "_cap_data", _empty_cap)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": archive_language,
+    }
+
+    asyncio.run(
+        worker._run_wake(
+            job_id, uid, lane, deps, _BYOK, asyncio.Semaphore(4), claimed_by,
+        )
+    )
+
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    # The compact delivery round inside the loop renders from this value.
+    assert [value == "en" for value in loop_kwargs] == [language == "en"]
+    presence = lane in worker._PRESENCE_WAKE_LANES
+    other = "zh" if language == "en" else "en"
+    field = self_thinking.instruction_for_field(presence=presence, language=language)
+    other_field = self_thinking.instruction_for_field(presence=presence, language=other)
+    assert field.strip() in system_text
+    assert other_field.strip() not in system_text
+    if lane == "screen_watch":
+        assert self_thinking.screen_watch_instruction(language).strip() in system_text
+        assert self_thinking.screen_watch_instruction(other).strip() not in system_text
 
 
 def test_heartbeat_prefetch_injects_v1_facts_without_a_tool_round(monkeypatch):
@@ -5125,7 +5249,7 @@ def test_persistent_provider_circuit_blocks_queued_wakes_but_not_scheduled(monke
         assert row == ('sleep', 'provider_circuit_open')
 
 
-def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
+def test_heartbeat_uses_wake_wire_bound_not_dream_wire_deadline(monkeypatch):
     import inspect
 
     signature = inspect.signature(provider_client.chat_completion_async)
@@ -5149,4 +5273,8 @@ def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
     status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK,
                                          asyncio.Semaphore(4), claimed_by))
     assert status == "completed"
-    assert seen == [(60.0, None)]
+    # Look-first round (T723) + decision round. Dream's wire deadline must not
+    # leak into heartbeat; timeout and wire deadline are the wake ones (T776).
+    wire = worker.WAKE_PROVIDER_WIRE_TIMEOUT_SEC
+    assert wire != v2_extraction.DREAM_WIRE_DEADLINE_SEC
+    assert seen == [(wire, wire)] * 2

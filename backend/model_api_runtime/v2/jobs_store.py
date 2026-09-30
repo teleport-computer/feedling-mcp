@@ -36,8 +36,8 @@ import db
 from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_language,
     failure_fallback_reply,
-    infer_reply_language,
 )
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
@@ -5422,6 +5422,43 @@ def _scheduled_failure_reply_text(
     )
 
 
+def _terminal_failure_parent_text(user_id: str, parent_id: str) -> str:
+    """The words the user typed in the failed turn, or ``""`` (T743).
+
+    Attachment rows (image/file) keep their payload in ``body_b64`` or
+    ``body_key``; the payload is never the user's words, only the owner's
+    caption is. A text row counts only when its body is stored as plaintext
+    text. Sealed rows, attachments without a caption, other owners and failed
+    reads yield ``""`` so the caller keeps the account language.
+    """
+    from core import envelope as core_envelope
+
+    try:
+        parent = db.chat_get_strict(user_id, parent_id)
+    except Exception:  # noqa: BLE001 — language lookup must not block failure delivery
+        return ""
+    if not isinstance(parent, dict) or parent.get("owner_user_id") != user_id:
+        return ""
+    if str(parent.get("content_type") or "") in {"image", "file"}:
+        # Same projection and shape/owner gate every plaintext caption reader
+        # uses: a sealed caption, a caption owned by someone else or a stale
+        # plaintext body left beside ciphertext all read as "no signal".
+        # A malformed caption row (e.g. a non-numeric caption_v) is "no
+        # signal" too: the language lookup must never delay the delivery.
+        try:
+            caption = core_envelope.caption_envelope_from_row(parent)
+            if caption is None:
+                return ""
+            return core_envelope.read_plaintext_envelope_body(
+                caption, owner_user_id=user_id
+            ).decode("utf-8")
+        except (TypeError, ValueError):
+            return ""
+    if core_envelope.classify_envelope_shape(parent) != "plaintext_text":
+        return ""
+    return str(parent.get("body") or "")
+
+
 def _deliver_terminal_failure_reply(row: dict) -> bool:
     """Write one encrypted failure result exactly once.
 
@@ -5498,7 +5535,15 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         language = accounts_registry._get_user_archive_language(user_id) or ""
     except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
         language = ""
-    reply_language = infer_reply_language(
+    # Seven 2026-09-26 (T743): the retry-later fallback follows the language
+    # of the user's message in this turn; no readable signal keeps the account
+    # language. Scheduled failures have no user message.
+    reply_language = failure_fallback_language(
+        user_text=(
+            _terminal_failure_parent_text(user_id, parent_id)
+            if lane == "chat"
+            else ""
+        ),
         archive_language=language,
     )
     user_text = notices_catalog.user_text_for(

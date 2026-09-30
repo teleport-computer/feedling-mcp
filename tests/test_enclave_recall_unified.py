@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import memory_search_contract as contract  # noqa: E402
 from enclave.routes import chat  # noqa: E402
+from memory import recall_select  # noqa: E402
 from memgarden import observability  # noqa: E402
 from model_api_runtime.v2 import memory_context  # noqa: E402
 
@@ -45,9 +46,9 @@ def _run(monkeypatch, cards, rows=WINDOW, **args):
 
 
 def test_default_unified_ranker_records_version_and_latest_two_user_query(monkeypatch):
-    monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+    monkeypatch.delenv(recall_select.RECALL_RANKER_ENV, raising=False)
     legacy = []
-    monkeypatch.setattr(chat.memory_relevance, "select_relevant_context_memories_with_trace",
+    monkeypatch.setattr(recall_select.memory_relevance, "select_relevant_context_memories_with_trace",
                         lambda *a, **k: legacy.append(1))
     filler = [{"id": f"f{i}", "summary": f"第{i}次整理工作周报和会议纪要", "status": "active"}
               for i in range(30)]
@@ -59,9 +60,10 @@ def test_default_unified_ranker_records_version_and_latest_two_user_query(monkey
     # The model gets the original io cards, not the kernel translation.
     assert next(c for c in picked if c["id"] == "cat")["title"] == "猫咪照顾"
     assert "search_text" not in json.dumps(picked, ensure_ascii=False)
-    assert trace["version"] == contract.RECALL_VERSION
+    assert trace["version"] == contract.RECALL_VERSION + "+host:latest-first-v1"
+    assert trace["kernel_version"] == contract.RECALL_VERSION
     assert contract.RECALL_VERSION.startswith(contract.VERSION + "+cfg:")
-    assert log["mode"] == f"relevant:unified:{contract.RECALL_VERSION}"
+    assert log["mode"] == f"relevant:unified:{contract.RECALL_VERSION}+host:latest-first-v1"
     assert log["injected_ids"] == [c["id"] for c in picked]
     by_id = {item["id"]: item for item in trace["selected"]}
     assert by_id["cat"]["bucket"] in {"query", "recent"} and by_id["cat"]["reason"] == "bm25_match"
@@ -95,24 +97,25 @@ def test_stopword_only_window_injects_nothing(monkeypatch):
 
 def test_kill_switch_off_restores_previous_selector_with_latest_two_user_query(monkeypatch):
     calls = []
-    original = chat.memory_relevance.select_relevant_context_memories_with_trace
+    original = recall_select.memory_relevance.select_relevant_context_memories_with_trace
 
     def spy(cards, query):
         calls.append(query)
         return original(cards, query)
 
-    monkeypatch.setattr(chat.memory_relevance, "select_relevant_context_memories_with_trace", spy)
+    monkeypatch.setattr(recall_select.memory_relevance, "select_relevant_context_memories_with_trace", spy)
     for value in ("0", "false", "off", "NO"):
-        monkeypatch.setenv(chat.RECALL_RANKER_ENV, value)
+        monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, value)
         picked, trace, log = _run(monkeypatch, _cards())
-        assert log["mode"] == "relevant:unified"
-        assert trace["mode"] == "relevant" and "version" not in trace
+        assert log["mode"] == "relevant:unified:legacy-relevance+host:latest-first-v1"
+        assert trace["mode"] == "latest_first"
+        assert all(p["trace"]["mode"] == "relevant" for p in trace["passes"])
     # T684 changes query construction for both selectors, not the kill switch.
-    assert calls == [USER_QUERY] * 4
+    assert calls == [WINDOW[2]["content"], USER_QUERY] * 4
     for value in ("1", "true", "", "anything"):
-        monkeypatch.setenv(chat.RECALL_RANKER_ENV, value)
+        monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, value)
         assert _run(monkeypatch, _cards())[2]["mode"].startswith("relevant:unified:memgarden-bm25-v2")
-    assert len(calls) == 4
+    assert len(calls) == 8
 
 
 def test_record_stays_content_free(monkeypatch):

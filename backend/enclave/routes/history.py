@@ -64,7 +64,7 @@ def _ciphertext_size(row: dict) -> int:
 def _caption_envelope(row: dict) -> dict | None:
     """从 ``caption_*`` 前缀字段重建 caption 信封；无密文时 None。
 
-    镜像 chat.py:_decrypt_caption / serve_worker._caption_envelope：AEAD AAD 是
+    镜像 core/history_view.py:caption_text / serve_worker._caption_envelope：AEAD AAD 是
     ``owner_user_id||v||id``，**必须**用 ``caption_id``（不是消息自己的 id），
     用错 id 会 AEAD 校验失败。
     """

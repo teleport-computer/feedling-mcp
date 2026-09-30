@@ -447,12 +447,17 @@ jobs:
             tests/test_reply_language.py \
             tests/test_chat_language_follow_module.py \
             tests/test_pr_branch_flow.py \
+            tests/test_branch_flow_guard.py \
             tests/test_pi_mcp_bridge.py \
             tests/test_v2_cache_retry_metrics.py \
             tests/test_v2_screen_chat.py \
             tests/test_v2_serve_worker_screen_frames.py \
             tests/test_v2_user_triage.py \
             tests/test_v2_wake_tool_loop.py \
+            tests/test_v2_wake_look_first.py \
+            tests/test_v2_wake_provider_timeout.py \
+            tests/test_wake_open_rate_report.py \
+            tests/test_quota_exhausted_403.py \
             -v
 
       - name: Run resident consumer regression suite
@@ -493,6 +498,12 @@ jobs:
             tests/test_memory_embedding_real.py \
             tests/test_memory_embedding_sweep.py \
             tests/test_memory_vectors_migration.py \
+            tests/test_memory_recall_hybrid.py \
+            tests/test_recall_select_extraction.py \
+            tests/test_history_view_extraction.py \
+            tests/test_plaintext_recall.py \
+            tests/test_recall_observability.py \
+            tests/test_memory_vectors_route_pg.py \
             tests/test_garden_selection_pluggable.py \
             tests/test_garden_card_shape.py \
             tests/test_context_memories.py \
@@ -994,6 +1005,7 @@ jobs:
             tests/test_model_api_chat_send_routing.py \
             tests/test_model_api_profiles_db.py \
             tests/test_model_api_profiles_endpoints.py \
+            tests/test_model_api_probe_trace.py \
             tests/test_provider_prompt_cache.py \
             tests/test_safe_url_fetch.py \
             tests/test_prompt_cache_canary.py \
@@ -1114,6 +1126,7 @@ jobs:
             tests/test_v2_serve_worker.py \
             tests/test_v2_serve_worker_screen_watch.py \
             tests/test_v2_worker_unit_telemetry.py \
+            tests/test_v2_attachment_caption_trace.py \
             tests/test_t550_empty_diagnostics_and_retry.py \
             tests/test_resident_failure_diagnostics.py \
             tests/test_resident_cli_output_cap.py \
@@ -1255,6 +1268,7 @@ jobs:
             tests/test_v2_context.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_profile_lane.py \
+            tests/test_v2_profile.py \
             tests/test_v2_profile_prompt.py \
             tests/test_v2_profile_refresh.py \
             tests/test_v2_profile_retry.py \

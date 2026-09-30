@@ -24,3 +24,18 @@ def card_projection_text(card: Mapping) -> str:
 
 def projection_hash(card: Mapping) -> str:
     return hashlib.sha256(card_projection_text(card).encode("utf-8")).hexdigest()[:16]
+
+
+def body_projection(body: Mapping) -> tuple[str, str]:
+    """(projection_hash, text) of one raw decrypted card body.
+
+    The single shape both the serve-worker sweep (which writes vectors) and the
+    enclave recall (which checks them) use, so a stored hash is comparable
+    across the two. IO's Garden adapter carries retrieval cues only inside the
+    lexical search_text, so the structured field is copied explicitly.
+    """
+    from memory import card_shape  # local: keep importing this module dependency-free
+
+    garden = card_shape.to_garden_card(body)
+    garden["retrieval_cues"] = body.get("retrieval_cues")
+    return projection_hash(garden), card_projection_text(garden)

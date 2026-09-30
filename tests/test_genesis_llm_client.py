@@ -208,3 +208,87 @@ def test_genesis_canary_preserves_provider_config_failure(monkeypatch):
 
     assert exc.value is provider_error
     assert provider_client.classify_provider_error(exc.value) == "provider_config"
+
+
+# ---------------------------------------------------------------------------
+# T750-D: relay routes get a longer first call; every call records its time
+# ---------------------------------------------------------------------------
+
+def _relay_runtime():
+    return provider_client.ProviderConfig(
+        provider="openai_compatible",
+        model="claude-opus-4-6",
+        api_key="sk-user-secret",
+        base_url="https://relay.example/v1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("runtime", "env", "expected_first"),
+    [
+        (_relay_runtime, {}, 120.0),
+        (_runtime, {}, 60.0),
+        (_relay_runtime, {"FEEDLING_GENESIS_RELAY_CANARY_TIMEOUT_SEC": "150"}, 150.0),
+        (_runtime, {"FEEDLING_GENESIS_CANARY_TIMEOUT_SEC": "45"}, 45.0),
+        # The non-relay knob does not move relays, and vice versa.
+        (_relay_runtime, {"FEEDLING_GENESIS_CANARY_TIMEOUT_SEC": "45"}, 120.0),
+        (_runtime, {"FEEDLING_GENESIS_RELAY_CANARY_TIMEOUT_SEC": "150"}, 60.0),
+    ],
+    ids=["relay-default", "official-default", "relay-env", "official-env",
+         "relay-ignores-official-env", "official-ignores-relay-env"],
+)
+def test_first_call_budget_depends_on_the_route(monkeypatch, runtime, env, expected_first):
+    from genesis import llm_client
+
+    for name in ("FEEDLING_GENESIS_CANARY_TIMEOUT_SEC", "FEEDLING_GENESIS_RELAY_CANARY_TIMEOUT_SEC"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(llm_client.db, "genesis_upsert_output", lambda *a, **k: None)
+    monkeypatch.setattr(llm_client.db, "genesis_touch_job", lambda *a, **k: None)
+    calls = []
+
+    def fake_completion(_runtime, _messages, **kwargs):
+        calls.append(kwargs)
+        return {"reply": "{}", "usage": {}}
+
+    client = GenesisLLMClient(completion_fn=fake_completion, canary=True)
+    for key in ("first", "second"):
+        client.complete(
+            user_id="usr", job_id="job", task_id=key, runtime=runtime(),
+            messages=[{"role": "user", "content": key}], timeout=90, idempotency_key=key,
+        )
+
+    # Only the first call is the canary; later calls keep the caller's timeout.
+    assert [call["timeout"] for call in calls] == [expected_first, 90]
+
+
+def test_each_recorded_call_carries_its_elapsed_time(monkeypatch):
+    from genesis import llm_client
+
+    docs = []
+    monkeypatch.setattr(
+        llm_client.db, "genesis_upsert_output",
+        lambda _uid, _jid, _type, *, doc, **_k: docs.append(doc),
+    )
+    monkeypatch.setattr(llm_client.db, "genesis_touch_job", lambda *a, **k: None)
+    clock = iter([100.0, 102.5, 200.0, 200.25])
+    monkeypatch.setattr(llm_client.time, "monotonic", lambda: next(clock))
+
+    client = GenesisLLMClient(
+        completion_fn=lambda *_a, **_k: {"reply": "REPLY_SENTINEL_T750", "usage": {}},
+        canary=True,
+    )
+    for key in ("first", "second"):
+        client.complete(
+            user_id="usr", job_id="job", task_id=key, runtime=_relay_runtime(),
+            messages=[{"role": "user", "content": "PROMPT_SENTINEL_T750"}],
+            idempotency_key=key,
+        )
+
+    assert [d["elapsed_ms"] for d in docs] == [2500, 250]
+    assert [d["canary"] for d in docs] == [True, False]
+    # Still content-free: no prompt or reply text in the record.
+    assert all(d["plaintext_stored"] is False for d in docs)
+    recorded = json.dumps(docs, ensure_ascii=False)
+    assert "PROMPT_SENTINEL_T750" not in recorded and "REPLY_SENTINEL_T750" not in recorded

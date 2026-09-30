@@ -16,7 +16,10 @@ Run it directly:
 
     python3 tests/live_web_gate_check.py
 
-Costs a few cents of the DEEPSEEK_KEY in io/.env.local.
+The DeepSeek key comes from the DEEPSEEK_KEY environment variable, else from
+E2E_KEY_DEEPSEEK in the shared e2e key pool (tools/e2e/config.py::KEYS_FILE).
+Postgres comes from FEEDLING_TEST_PG (same default as tests/conftest.py).
+Costs a few cents of that key.
 """
 
 from __future__ import annotations
@@ -24,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import sys
 import uuid
 from pathlib import Path
@@ -32,16 +34,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "backend"))
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT))
 
-ADMIN = "postgresql://postgres:test@127.0.0.1:55432/postgres"
+ADMIN = os.environ.get("FEEDLING_TEST_PG", "postgresql://postgres:test@127.0.0.1:55432/postgres")
 
 
-def _load_key(name: str) -> str:
-    for line in open("/Users/hx/Projects/io/.env.local", encoding="utf-8"):
-        m = re.match(rf"\s*{name}\s*=\s*(.+)\s*$", line)
-        if m:
-            return m.group(1).strip().strip('"').strip("'")
-    raise SystemExit(f"{name} not found in io/.env.local")
+def _load_key(name: str = "DEEPSEEK_KEY", pool_name: str = "E2E_KEY_DEEPSEEK") -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    from tools.e2e.config import KEYS_FILE, load_keys
+
+    value = load_keys().get(pool_name, "").strip()
+    if value:
+        return value
+    raise SystemExit(f"{name} is not set and {pool_name} is missing from {KEYS_FILE}")
 
 
 def _provision() -> tuple[str, str]:
@@ -237,7 +244,7 @@ def main() -> None:
         cfg = provider_client.ProviderConfig(
             provider="deepseek",
             model="deepseek-chat",
-            api_key=_load_key("DEEPSEEK_KEY"),
+            api_key=_load_key(),
             base_url="",
         )
         only = os.environ.get("LIVE_CASE")

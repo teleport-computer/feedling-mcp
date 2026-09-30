@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import httpx
 import pytest
 
@@ -218,19 +220,30 @@ def test_collision_wait_has_recent_and_clear_window_extremes(monkeypatch):
     assert sleeps == []
 
 
-def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monkeypatch):
+@pytest.mark.parametrize("text,expected", [
+    ("七七，周一中午，此刻陪你，记忆小测验告一段落了吗？", "PASS"),
+    ("七七，此刻陪你，也会记得上海时区。", "PRODUCT_FAIL"),
+    ("七七，周一晚上，此刻陪你。", "PRODUCT_FAIL"),
+    ("七七，周日中午，此刻陪你。", "PRODUCT_FAIL"),
+])
+def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monkeypatch, text, expected):
+    # T774: these cases now require the admin token before enqueuing.
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "token")
     client = _PriorityClient()
-    reply = {"role": "agent", "id": "quality-reply", "ts": 12.0}
+    reply = {"role": "agent", "id": "quality-reply", "ts": _ts("2026-09-21T12:59:00+08:00")}
+    response = httpx.Response(200, headers={"date": "Mon, 21 Sep 2026 04:58:00 GMT"},
+                              json={"job": {"id": "wake-quality", "lane": "manual_wake"}})
+
+    def post(path, **kwargs):
+        client.posts.append((path, kwargs.get("json")))
+        return response
+
+    monkeypatch.setattr(client, "post", post)
     monkeypatch.setattr(proactive_probe, "_install_quality_identity", lambda _c: None)
     monkeypatch.setattr(proactive_probe, "_save_settings", lambda _c, _patch: {})
     monkeypatch.setattr(proactive_probe, "_wait_out_chat_collision", lambda _c: 0.0)
     monkeypatch.setattr(proactive_probe.time, "time", lambda: 10.0)
     capture_sleeps(monkeypatch, proactive_probe)
-    monkeypatch.setattr(
-        proactive_probe,
-        "_body",
-        lambda *_a, **_kw: {"job": {"id": "wake-quality", "lane": "manual_wake"}},
-    )
     monkeypatch.setattr(
         proactive_probe,
         "_wait_for_wake_delivery",
@@ -244,14 +257,102 @@ def test_quality_probe_does_not_create_a_setup_chat_inside_collision_window(monk
     monkeypatch.setattr(
         proactive_probe,
         "_decrypt",
-        lambda *_a, **_kw: "七七，此刻陪你，也会记得上海时区。",
+        lambda *_a, **_kw: text,
     )
     monkeypatch.setattr(proactive_probe, "_history", lambda *_a, **_kw: [reply])
 
-    detail = proactive_probe._case_proactive_message_quality(client)
-
-    assert "collision_wait=0.0s" in detail
+    result = proactive_probe._case("quality", lambda: proactive_probe._case_proactive_message_quality(client))
+    assert result["result"] == expected
+    if expected == "PASS":
+        assert "collision_wait=0.0s" in result["detail"]
+        assert "2026-09-21T12:57:59+08:00" in result["detail"]
     assert [path for path, _body in client.posts] == ["/v1/proactive/tick"]
+
+
+def _ts(value):
+    return datetime.fromisoformat(value).timestamp()
+
+
+@pytest.mark.parametrize("stamp,text", [
+    ("2026-09-21T12:59:00+08:00", "周一中午，陪你坐会儿。"),
+    ("2026-09-22T02:00:00+08:00", "星期二凌晨，睡不着吗？"),
+    ("2026-09-23T06:00:01+08:00", "礼拜三早晨，吃早饭了吗？"),
+    ("2026-09-24T11:59:00+08:00", "周四上午，先喝口水。"),
+    ("2026-09-25T14:00:01+08:00", "星期五午后，可以歇一会。"),
+    ("2026-09-26T18:00:01+08:00", "礼拜六晚间，忙完了吗？"),
+    ("2026-09-27T20:00:00+08:00", "星期天晚上，陪你。"),
+    ("2026-09-27T20:00:00+08:00", "周日夜晚，陪你。"),
+])
+def test_quality_grounding_uses_shanghai_weekday_and_period(stamp, text):
+    ts = _ts(stamp)
+    assert "Asia/Shanghai" in proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
+
+
+@pytest.mark.parametrize("hour,word", [
+    (7, "一早"), (7, "清早"), (7, "一大早"), (7, "大清早"),
+    (5, "一早"), (11, "清早"),
+    (17, "傍晚"), (18, "傍晚"),
+    (18, "今晚"), (20, "今晚"), (20, "今夜"),
+    (22, "深夜"), (23, "深夜"), (22, "半夜"), (23, "午夜"),
+    (0, "半夜"), (0, "午夜"), (5, "半夜"), (5, "午夜"),
+])
+def test_quality_grounding_accepts_natural_period_synonyms(hour, word):
+    ts = _ts(f"2026-09-24T{hour:02d}:05:00+08:00")
+    proactive_probe._assert_timezone_grounding(f"周四{word}，此刻陪你。", ts, ts + 30)
+
+
+@pytest.mark.parametrize("hour,word", [
+    (4, "一早"), (12, "清早"), (12, "一大早"),
+    (16, "傍晚"), (19, "傍晚"),
+    (17, "今晚"), (12, "今夜"),
+    (21, "深夜"), (21, "半夜"), (22, "午夜"),
+    (6, "半夜"), (6, "午夜"),
+])
+def test_quality_grounding_synonyms_do_not_match_other_hours(hour, word):
+    ts = _ts(f"2026-09-24T{hour:02d}:05:00+08:00")
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(f"周四{word}", ts, ts + 30)
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+@pytest.mark.parametrize("text", ["上海时区", "北京时间，周一晚上", "周日中午", "周一", "中午"])
+def test_quality_grounding_rejects_place_name_or_wrong_time(text):
+    ts = _ts("2026-09-21T12:59:00+08:00")
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+@pytest.mark.parametrize("start,end,text", [
+    ("2026-09-21T23:59:30+08:00", "2026-09-22T00:00:30+08:00", "周一晚上"),
+    ("2026-09-21T23:59:30+08:00", "2026-09-22T00:00:30+08:00", "周二凌晨"),
+    ("2026-09-21T13:59:30+08:00", "2026-09-21T14:00:30+08:00", "周一中午"),
+    ("2026-09-21T13:59:30+08:00", "2026-09-21T14:00:30+08:00", "周一下午"),
+])
+def test_quality_grounding_accepts_generation_boundary(start, end, text):
+    proactive_probe._assert_timezone_grounding(text, _ts(start), _ts(end))
+
+
+def test_quality_grounding_does_not_mix_weekday_and_period_across_midnight():
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(
+            "周二晚上", _ts("2026-09-21T23:59:30+08:00"), _ts("2026-09-22T00:00:30+08:00"))
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+@pytest.mark.parametrize("start,end", [(0, 10), (10, 0), (10, float("nan")),
+                                       (float("inf"), 10), (20, 10), (10, 99999), (1e20, 1e20)])
+def test_quality_grounding_missing_clock_is_not_a_product_failure(start, end):
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding("周一中午", start, end)
+    assert exc.value.result == "BLOCKED_EVIDENCE"
+
+
+@pytest.mark.parametrize("date", ["", "not-a-date", "Mon, 21 Sep 2026 04:58:00"])
+def test_quality_grounding_requires_server_date(date):
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._server_response_time(httpx.Response(200, headers={"date": date}))
+    assert exc.value.result == "BLOCKED_EVIDENCE"
 
 
 def test_wait_for_scheduled_fire_returns_exact_agent_job_then_times_out(monkeypatch):
@@ -290,6 +391,8 @@ def test_wait_for_scheduled_fire_returns_exact_agent_job_then_times_out(monkeypa
 
 
 def test_user_turn_priority_runs_no_competition_control_without_echo_requirement(monkeypatch):
+    # T774: these cases now require the admin token before enqueuing.
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "token")
     rows = [
         {"role": "user", "id": "old-user", "reply_message_id": "old-reply", "ts": 11},
         {"role": "agent", "id": "old-reply", "ts": 12},
@@ -345,6 +448,8 @@ def test_user_turn_priority_runs_no_competition_control_without_echo_requirement
 
 
 def test_user_turn_priority_rejects_uncorrelated_wake_before_reply(monkeypatch):
+    # T774: these cases now require the admin token before enqueuing.
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "token")
     rows = [
         {"role": "agent", "id": "wake-output", "ts": 12},
         {"role": "user", "id": "current-user", "reply_message_id": "current-reply", "ts": 13},
@@ -806,3 +911,71 @@ def test_isolation_passes_on_exact_batch_denial(monkeypatch):
 def test_isolation_fails_on_old_or_broken_denial(monkeypatch, status, body):
     result, detail = _run_isolation(monkeypatch, supersede_status=status, supersede_body=body)
     assert result == memory_probe.PRODUCT_FAIL, detail
+
+
+# --------------------------------------------------------------------------- #
+# T774: bare 「早」 glued to the weekday; admin token checked before enqueue
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("stamp,text", [
+    # T751's real deepseek reply (Sunday 06:13–06:17 Asia/Shanghai), a false FAIL before.
+    ("2026-09-27T06:15:00+08:00", "七七，周日早，此刻陪你。这会儿才六点多，你要是还赖在床上"),
+    ("2026-09-24T07:05:00+08:00", "周四早，先喝口水。"),
+    ("2026-09-24T11:05:00+08:00", "礼拜四早，忙起来了吗？"),
+    ("2026-09-24T07:05:00+08:00", "周四早"),              # end of text
+    ("2026-09-24T07:05:00+08:00", "周四早 陪你"),          # whitespace
+    ("2026-09-24T07:05:00+08:00", "周四早! 陪你"),         # ASCII punctuation
+])
+def test_quality_grounding_accepts_weekday_glued_early(stamp, text):
+    ts = _ts(stamp)
+    assert "Asia/Shanghai" in proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
+
+
+@pytest.mark.parametrize("stamp,text", [
+    ("2026-09-24T07:05:00+08:00", "周四早就说过了，陪你。"),   # 早就 is not a period
+    ("2026-09-24T07:05:00+08:00", "周四早点睡。"),              # 早点 is not a period
+    ("2026-09-24T07:05:00+08:00", "周四早些时候，陪你。"),
+    # codex T774 r1: compounds are words, not a period, even with the right weekday.
+    ("2026-09-24T07:05:00+08:00", "七七，周四早退了，下午再聊，此刻陪你。"),
+    ("2026-09-24T07:05:00+08:00", "周四早餐吃了吗？"),
+    ("2026-09-24T07:05:00+08:00", "周四早起了吗？"),
+    ("2026-09-24T13:05:00+08:00", "周四早，陪你。"),            # right words, wrong hour
+    ("2026-09-24T04:05:00+08:00", "周四早，陪你。"),
+    ("2026-09-24T07:05:00+08:00", "早，此刻陪你。"),            # the weekday is still required
+    ("2026-09-24T07:05:00+08:00", "周三早，陪你。"),            # wrong weekday
+])
+def test_quality_grounding_still_fails_without_a_real_weekday_morning(stamp, text):
+    ts = _ts(stamp)
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        proactive_probe._assert_timezone_grounding(text, ts, ts + 30)
+    assert exc.value.result == "PRODUCT_FAIL"
+
+
+class _NoEnqueueClient:
+    """Records every request; any call at all means work started before the gate."""
+
+    api_url = "http://probe.invalid"
+    user_id = "u_probe"
+
+    def __init__(self):
+        self.calls = []
+
+    def post(self, path, **kwargs):
+        self.calls.append(("POST", path))
+        raise AssertionError(f"request before the admin-token gate: POST {path}")
+
+    def get(self, path, **kwargs):
+        self.calls.append(("GET", path))
+        raise AssertionError(f"request before the admin-token gate: GET {path}")
+
+
+@pytest.mark.parametrize("case", ["_case_proactive_message_quality", "_case_user_turn_priority"])
+def test_missing_admin_token_blocks_before_any_manual_wake_is_enqueued(monkeypatch, case):
+    """T751: blocking mid-wait left a manual_wake in flight that a later case
+    (wake_coalescing) folded into. Without the token nothing may be enqueued."""
+    monkeypatch.delenv("FEEDLING_ADMIN_TOKEN", raising=False)
+    client = _NoEnqueueClient()
+    with pytest.raises(proactive_probe._ProbeIssue) as exc:
+        getattr(proactive_probe, case)(client)
+    assert exc.value.result == "BLOCKED_CREDENTIAL"
+    assert client.calls == []

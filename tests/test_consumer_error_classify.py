@@ -1015,3 +1015,89 @@ def test_actionable_reply_suppresses_duplicate_banner():
 
     assert notice.error_class in crc._system_notice_last_sent
     crc._system_notice_last_sent.pop(notice.error_class, None)
+
+
+# T716: copied verbatim from T711/codex-cli-quota-check.log, including U+2019.
+_CODEX_USAGE_LIMIT = (
+    Path(__file__).parent / "fixtures" / "codex_usage_limit.txt"
+).read_text().strip()
+
+
+@pytest.mark.parametrize("straight_apostrophe", [False, True])
+@pytest.mark.parametrize("transport", ["stderr", "error_event", "turn_failed"])
+def test_codex_usage_limit_real_cli_failure(monkeypatch, tmp_path, straight_apostrophe, transport):
+    """Real child process -> CLI reader -> raised error -> trace and public fields.
+
+    The executable is a fault-injection fixture, not an actual Codex service.
+    Its output is the observed error; parsing/classification are not mocked.
+    """
+    import json
+
+    message = _CODEX_USAGE_LIMIT
+    assert "You\u2019ve" in message
+    if straight_apostrophe:
+        message = message.replace("\u2019", "'")
+    stdout, stderr = "", message
+    if transport != "stderr":
+        event = ({"type": "error", "message": message} if transport == "error_event"
+                 else {"type": "turn.failed", "error": {"message": message}})
+        stdout = json.dumps(event, ensure_ascii=False) + "\n"
+        stderr = "unrelated CLI warning"
+    executable = tmp_path / "codex"
+    executable.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        f"sys.stdout.write({stdout!r})\nsys.stderr.write({stderr!r})\nsys.exit(1)\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: str(tmp_path))
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda *a, **kw: ([str(executable), "exec", "--json"], None))
+    events = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda sub, typ, **kw: events.append((typ, kw)))
+
+    with pytest.raises(RuntimeError, match="cli agent exited 1") as raised:
+        crc.call_agent_cli("synthetic test prompt")
+    assert message in str(raised.value)
+    notice = crc.classify_agent_error(raised.value)
+    assert notice.error_class == "quota_insufficient"
+    assert notice.blame == "user_provider"
+    assert notice.user_text == crc._error_contract.require_spec("quota_insufficient").safe_text_zh
+    fields = crc.turn_failure_post_kwargs(notice)
+    assert fields["turn_failure_error_class"] == "quota_insufficient"
+    assert fields["turn_failure_blame"] == "user_provider"
+    assert fields["turn_failure_user_text"] == notice.user_text
+    assert "Sep 29th" not in fields["turn_failure_user_text"]
+    failures = [kw for typ, kw in events if typ == "agent.model.call.error"]
+    assert len(failures) == 1
+    assert failures[0]["detail"]["error_class"] == "quota_insufficient"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("cli agent exited 1: exceeded retry limit, last status: 429 Too Many Requests", "rate_limited"),
+    ("HTTP 429: usage limit per minute exceeded; retry later", "rate_limited"),
+    ("usage limit configuration could not be read", "unknown"),
+])
+def test_usage_limit_match_does_not_swallow_rate_or_unknown_errors(text, expected):
+    from notices import catalog
+
+    notice = crc.classify_agent_error(RuntimeError(text))
+    assert notice.error_class == expected
+    # Non-Codex backend/provider text uses the same matchers.
+    assert catalog.classify_upstream(text) == ("" if expected == "unknown" else expected)
+
+
+def test_codex_usage_limit_shared_contract_and_memory_evidence_boundary():
+    from notices import agent_call_failure, catalog, error_contract
+
+    assert error_contract.classify_text(_CODEX_USAGE_LIMIT).code == "quota_insufficient"
+    assert catalog.classify_upstream(_CODEX_USAGE_LIMIT) == "quota_insufficient"
+    # Memory lanes intentionally require additional strong evidence. Do not
+    # silently expand their independent evidence policy with this chat fix.
+    assert agent_call_failure.classify_failure_text(_CODEX_USAGE_LIMIT) == "unknown"
+
+
+def test_quota_contract_change_is_relevant_to_vps_self_update():
+    assert "backend/notices/error_contract.py" in crc._runtime_repo_files()
+    assert crc._relevant_changed({"backend/notices/error_contract.py"})

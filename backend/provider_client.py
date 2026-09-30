@@ -46,7 +46,8 @@ PROVIDER_ERROR_TYPES = frozenset({
     "request_too_large", "unknown",
 })
 _PROVIDER_ERROR_SIGNATURE_PATTERNS = (
-    ("thinking_forced_tool_choice", r"thinking.*(?:may not|cannot|not supported|incompatible).*tool_choice|tool_choice.*(?:incompatible|not supported).*thinking"),
+    ("thinking_forced_tool_choice", r"thinking.*(?:may not|cannot|not supported|does not support|incompatible).*tool_choice|tool_choice.*(?:incompatible|not supported).*thinking"),
+    ("forced_tool_json_mime", r"forced\s+function\s+calling.*(?:mime|json).*(?:unsupported|not supported)"),
     ("trailing_whitespace", r"(?:final|assistant).*trailing\s+whitespace"),
     ("tool_use_id_mismatch", r"unexpected\s+tool_use_id|tool_use_id.*(?:not found|missing)|tool_result.*(?:without|must have|matching).*tool_use|tool_use.*(?:without|must have|matching).*tool_result"),
     ("invalid_tool_schema", r"(?:tools?(?:\[\d+\]|\.\d+)?[.: ]+)?input_schema.*(?:invalid|must|should)|(?:invalid|unsupported).*tool.*schema|tool.*name.*(?:must|match|invalid)"),
@@ -56,6 +57,20 @@ _PROVIDER_ERROR_SIGNATURE_PATTERNS = (
 PROVIDER_ERROR_SIGNATURES = frozenset(
     name for name, _ in _PROVIDER_ERROR_SIGNATURE_PATTERNS
 ) | {"unclassified"}
+
+
+def _forces_named_or_required_tool(tool_choice: Any) -> bool:
+    """True for the OpenAI-chat tool choices that force a call.
+
+    ``required`` forces any tool; ``{"type": "function", "function": {"name":
+    ...}}`` forces one named tool. ``auto``/``none``/absent do not force.
+    """
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        return isinstance(function, dict) and bool(str(function.get("name") or "").strip())
+    return False
 
 
 def provider_error_diagnostics(exc: BaseException) -> dict[str, str]:
@@ -3295,15 +3310,16 @@ def _build_openai_compat_payload(
         if tool_choice is not None:
             payload["tool_choice"] = copy.deepcopy(tool_choice)
         # DeepSeek supports tools in thinking mode, but its Chat Completions
-        # endpoint rejects the narrower combination of native thinking and the
-        # literal ``required`` tool choice.  Keep thinking for ordinary/auto
-        # rounds and disable it only for the request whose wire contract must
-        # force a tool call.  Key this on the declared provider, never the URL:
-        # an openai_compatible route remains owned by that adapter even when it
+        # endpoint rejects native thinking combined with a *forcing* tool
+        # choice: the literal ``required`` and a named function alike (T735:
+        # "Thinking mode does not support this tool_choice" for the Profile
+        # emit_profile call).  Keep thinking for ordinary/auto rounds and
+        # disable it only for the request whose wire contract must force a
+        # tool call.  Key this on the declared provider, never the URL: an
+        # openai_compatible route remains owned by that adapter even when it
         # happens to point at a DeepSeek host.
-        if (
-            normalize_provider(provider) == "deepseek"
-            and payload.get("tool_choice") == "required"
+        if normalize_provider(provider) == "deepseek" and _forces_named_or_required_tool(
+            payload.get("tool_choice")
         ):
             payload["thinking"] = {"type": "disabled"}
     if cache_key := _cache_key(prompt_cache_key):
@@ -5501,6 +5517,15 @@ def model_catalog_error_slug(exc: BaseException) -> str:
     return "model_catalog_invalid_response"
 
 
+# HTTP timeout for setup's live probe (T754, Seven 09-28: raised from 30 s so
+# slow relay channels such as reverse-proxied "anti"/AG pools can answer).
+# httpx applies it per phase (connect/read/write/pool), not as a deadline for
+# the whole probe, and bounded compatibility retries may add attempts, so the
+# probe can take longer than this in total. The iOS requests that trigger the
+# probe must wait longer than this, or the app gives up first.
+SETUP_PROBE_TIMEOUT_S = 90.0
+
+
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
     # Validates that the key is usable for this model. We deliberately do NOT
     # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-
@@ -5526,7 +5551,7 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
         # since only some upstream channels behind a model id reject it), which read
         # to the user as "sometimes I can add this model, sometimes I can't".
         temperature=None,
-        timeout=30.0,
+        timeout=SETUP_PROBE_TIMEOUT_S,
         require_reply=False,
     )
 
@@ -6249,6 +6274,7 @@ async def reliable_chat_completion_async(
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
     refusal_out: Any = None,
+    retry_refusal: bool = True,
     absolute_deadline: float | None = None,
     retry_output_truncation: bool = True,
     wire_deadline_sec: float | None = None,
@@ -6259,6 +6285,12 @@ async def reliable_chat_completion_async(
     ``refusal_out`` observes explicit policy metadata on each outer attempt,
     including a refused attempt followed by recovery. It never supplies retry
     decisions; observer failures are swallowed and no raw policy text is passed.
+
+    ``retry_refusal=False`` lets Capture/Dream stop on the explicit structured
+    refusal metadata recognized by ``provider_refusal.project``. Both empty
+    refusals and refused responses carrying partial text raise on that attempt
+    with ``feedling_error_class == "content_filtered"``. Other callers retain
+    the default policy; this choice is independent of the observer callback.
 
     Same semantics as `reliable_chat_completion`: exponential backoff (base·3^n)
     + jitter, capped; honours 429 Retry-After when present. NEVER retries
@@ -6376,6 +6408,17 @@ async def reliable_chat_completion_async(
                 result = await _with_wire_progress(
                     chat_completion_async(*args, **attempt_kwargs), attempt
                 )
+            refusal = provider_refusal.project(
+                result.get("provider_refusal") if isinstance(result, dict) else None
+            )
+            if not retry_refusal and refusal is not None:
+                # A partial refused answer is not a usable extraction result.
+                # Enter the same exception path as an empty parser refusal,
+                # retaining wire evidence and observing this attempt once.
+                exc = ProviderError("provider_refusal")
+                exc.provider_refusal = refusal
+                _attach_provider_attempt_trace(exc, _attempts_from_result(result))
+                raise exc
             await provider_refusal.observe(refusal_out, result, attempt)
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
@@ -6427,9 +6470,13 @@ async def reliable_chat_completion_async(
             truncation_terminal = (
                 not retry_output_truncation and is_output_truncation_error(exc)
             )
+            refusal_terminal = not retry_refusal and provider_refusal.project(
+                getattr(exc, "provider_refusal", None)
+            ) is not None
             terminal = (
                 cls == "provider_config"
                 or truncation_terminal
+                or refusal_terminal
                 or attempt >= attempts
                 or deadline_exhausted
             )
@@ -6471,7 +6518,9 @@ async def reliable_chat_completion_async(
                 )
             if terminal:
                 exc.feedling_error_class = (
-                    "provider_config"
+                    "content_filtered"
+                    if refusal_terminal
+                    else "provider_config"
                     if cls == "provider_config"
                     else "output_truncated"
                     if truncation_terminal

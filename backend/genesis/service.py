@@ -125,6 +125,7 @@ FAILED_JOB_STATUS = "failed"
 GENESIS_ERROR_CODES = (
     "distill_model_too_slow",
     "distill_empty_output",
+    "distill_material_too_short",
     "bad_api_key",
     "provider_timeout",
     "provider_quota",
@@ -139,6 +140,9 @@ GENESIS_ERROR_CODES = (
 GENESIS_ERROR_HINTS: dict[str, str] = {
     "distill_model_too_slow": "当前模型无法及时处理文件,请换更快的模型后重试",
     "distill_empty_output": "当前模型没有从非空记忆材料中生成任何卡片,请换模型后重试",
+    # T750-B, Seven 2026-09-28 approved verbatim (the template supplies the
+    # final full stop): very short material where the model found nothing.
+    "distill_material_too_short": "这份材料太短,没找到可以记下的内容。补充一些细节后再导入试试",
     "bad_api_key": "模型 API key 无效或无权限,检查 key",
     # usr_9037eaa8 (2026-07-24): a relay "thinking" model timed out 15+ times
     # in a row; the old "稍后重试" hint sent the user retrying into the same
@@ -167,6 +171,10 @@ GENESIS_ERROR_HINTS_EN: dict[str, str] = {
     ),
     "distill_empty_output": (
         "the model generated no cards from non-empty memory material; switch models and retry"
+    ),
+    "distill_material_too_short": (
+        "This material is too short — nothing worth remembering was found. "
+        "Add some detail and import it again"
     ),
     "bad_api_key": "the model API key is invalid or unauthorized — check the key",
     "provider_timeout": (
@@ -291,6 +299,8 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
 
     if "distill_model_too_slow" in lower:
         return "distill_model_too_slow"
+    if "distill_material_too_short" in lower:
+        return "distill_material_too_short"
     if "distill_empty_output" in lower:
         return "distill_empty_output"
 
@@ -302,6 +312,10 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
                 or getattr(exc, "response_detail", "")
                 or str(exc or "")
             )
+            if error_contract.provider_response_is_quota_exhausted(
+                status_code, raw_body
+            ):
+                return "provider_quota"
             if error_contract.provider_response_is_auth_failure(
                 status_code, raw_body
             ):
@@ -327,6 +341,8 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         code = int(status_match.group(1))
         if code in _BAD_API_KEY_STATUS:
             detail = text[status_match.end() :].lstrip(" :")
+            if error_contract.provider_response_is_quota_exhausted(code, detail):
+                return "provider_quota"
             if error_contract.provider_response_is_auth_failure(code, detail):
                 return "bad_api_key"
             return "internal"
@@ -341,6 +357,19 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         or "provider returned non-object response" in lower
     ):
         return "model_bad_json"
+
+    # T750: the identity profile's own validation codes
+    # (worker `genesis_profile_invalid:<reject_code>`, profile.py) and
+    # provider_client's empty-reply error used to fall through to "internal",
+    # telling the user our system broke when the model's output was unusable.
+    # prod 30d: 4 profile_invalid + 1 empty reply, all shown as internal.
+    profile_invalid = re.search(r"genesis_profile_invalid:([a-z_]+)", lower)
+    if profile_invalid:
+        if profile_invalid.group(1) in {"reply_empty", "map_reply_empty"}:
+            return "model_empty_output"
+        return "model_bad_json"
+    if "provider response had no usable reply text" in lower:
+        return "model_empty_output"
 
     # I6: worker._classify_fact_map_failures appends the real cause it picked
     # (by priority across every fact-map exception in the batch) as a third

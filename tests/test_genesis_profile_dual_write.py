@@ -279,3 +279,121 @@ def test_profile_patch_builder_preserves_disabled_state_by_default():
     )
 
     assert document["disabled"] is True
+
+
+def test_genesis_profile_ignores_a_draft_inside_inline_thinking():
+    """T750: a relay thinking model inlines <think> with a draft object first."""
+    llm = _ProfileLLM([
+        "<think>草稿 " + _profile_reply("草稿记忆", "草稿方式") + "</think>"
+        + _profile_reply("用户养了一只狗", "短句接住情绪"),
+    ])
+    output = {
+        "persona": {"content": "## 你是谁\n你叫 Mira。"},
+        "voice_workset": {"behavior_notes": ["短句"], "exemplars": []},
+    }
+
+    result = worker.build_profile_output_from_sources(
+        user_id="u1",
+        job_id="j1",
+        runtime=object(),
+        rendered_cards="- id=m1 | summary=养狗 | content=狗叫蛋子",
+        memory_material=True,
+        output=output,
+        llm=llm,
+    )
+
+    assert len(llm.calls) == 1
+    assert result["profile"]["memory"] == "用户养了一只狗"
+    assert result["profile"]["style"] == "短句接住情绪"
+
+
+def test_genesis_profile_drops_extra_keys_from_the_stored_output():
+    """T750 (督导 20:34): ignored extra keys must not reach the job output."""
+    sentinel = "T750_EXTRA_KEY_SENTINEL_MUST_NOT_PERSIST"
+    llm = _ProfileLLM([json.dumps({
+        "memory": "用户养了一只狗",
+        "style": "短句接住情绪",
+        "instructions": sentinel,
+    }, ensure_ascii=False)])
+    output = {
+        "persona": {"content": "## 你是谁\n你叫 Mira。"},
+        "voice_workset": {"behavior_notes": ["短句"], "exemplars": []},
+    }
+
+    result = worker.build_profile_output_from_sources(
+        user_id="u1",
+        job_id="j1",
+        runtime=object(),
+        rendered_cards="- id=m1 | summary=养狗 | content=狗叫蛋子",
+        memory_material=True,
+        output=output,
+        llm=llm,
+    )
+
+    assert set(result["profile"]) == {
+        "memory", "style", "memory_touched", "style_touched", "provider_calls",
+    }
+    assert sentinel not in json.dumps(result, ensure_ascii=False, default=str)
+
+
+def test_known_limit_draft_in_think_then_braced_prose_fails_safe_not_draft():
+    """T750 known limitation: after <think> is dropped, the shared extractor reads
+    the first balanced {...}; braced prose before the answer makes that block
+    invalid. The reply is then rejected — the draft inside <think> is never used."""
+    from model_api_runtime.v2 import profile
+
+    raw = (
+        "<think>草稿 " + _profile_reply("草稿记忆", "草稿方式") + "</think>"
+        "好的 {这是说明} 结果:" + _profile_reply("最终记忆", "最终方式")
+    )
+    fields, reject = profile._validate_profile(worker._profile_json_reply(raw))
+    assert fields is None
+    assert reject == "reply_not_json"
+
+
+class _MapReduceProfileLLM:
+    """Map requests get a valid bullet summary containing braces; the final
+    request gets the profile JSON."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        from model_api_runtime.v2 import profile
+
+        if kwargs["messages"][0]["content"] == profile._PROFILE_MAP_SYSTEM_PROMPT:
+            text = "- 用户偏好 {简短} 回复"
+        else:
+            text = _profile_reply("用户养了一只狗", "短句接住情绪")
+        return types.SimpleNamespace(
+            text=text, usage={}, cached=False, output_ref=kwargs["task_id"],
+        )
+
+
+def test_genesis_long_material_map_summary_with_braces_still_reaches_final():
+    """T750 review: only the final JSON request goes through the JSON extractor;
+    a map bullet like "- 偏好 {简短} 回复" must not be cut to "{简短}"."""
+    from model_api_runtime.v2 import profile
+
+    llm = _MapReduceProfileLLM()
+    output = {
+        "persona": {"content": "## 你是谁\n你叫 Mira。"},
+        "voice_workset": {"behavior_notes": ["短句"], "exemplars": []},
+    }
+
+    result = worker.build_profile_output_from_sources(
+        user_id="u1",
+        job_id="j1",
+        runtime=object(),
+        rendered_cards="甲" * (profile.PROFILE_SINGLE_CALL_MAX_CHARS + 1),
+        memory_material=True,
+        output=output,
+        llm=llm,
+    )
+
+    map_calls = [c for c in llm.calls
+                 if c["messages"][0]["content"] == profile._PROFILE_MAP_SYSTEM_PROMPT]
+    assert map_calls, "the long material did not take the map path"
+    assert result["profile"]["memory"] == "用户养了一只狗"
+    assert result["profile"]["style"] == "短句接住情绪"

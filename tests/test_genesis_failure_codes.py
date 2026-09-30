@@ -11,7 +11,10 @@ import sys
 import types
 from pathlib import Path
 
+import re
+
 import httpx
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -372,3 +375,66 @@ def test_failure_copy_never_promises_materials_are_kept_forever():
         assert "materials are kept." not in line
         assert "过期后需要重新选择文件" in line
         assert "pick the file again" in line.lower()
+
+
+# T750: the identity profile's validation codes and the provider's empty-reply
+# error used to fall through to "internal" ("内部错误,请稍后重试"). Every
+# reject code profile.py can produce (every `return None, "<code>"` in
+# _validate_profile / map validation), wrapped the way genesis/worker.py raises
+# it; the two empty-reply codes are covered separately below.
+_PROFILE_BAD_OUTPUT = [
+    "reply_not_json", "reply_not_text", "missing_field:memory", "missing_field:style",
+    "field_empty:memory", "field_empty:style", "placeholder_detected:memory",
+    "memory_chars_over_budget:9999", "style_chars_over_budget:9999",
+    "map_reply_not_text", "map_reply_chars_over_budget:9999",
+    "map_line_count_over_budget:99", "map_line_not_bullet:3",
+    "map_bullet_empty:3", "map_bullet_chars_over_budget:3",
+    "map_rendered_chars_over_budget:9999", "unknown",
+]
+
+
+def test_profile_reject_code_list_covers_every_code_profile_py_returns():
+    """Derived from the source so a new reject code cannot silently go untested."""
+    source = (Path(__file__).parent.parent / "backend" / "model_api_runtime" / "v2"
+              / "profile.py").read_text(encoding="utf-8")
+    produced = set(re.findall(r'return None, f?"([a-z_]+)', source))
+    covered = {c.split(":")[0] for c in _PROFILE_BAD_OUTPUT} | {"reply_empty", "map_reply_empty"}
+    assert produced, "found no reject codes in profile.py"
+    assert produced <= covered, sorted(produced - covered)
+
+
+@pytest.mark.parametrize("code", _PROFILE_BAD_OUTPUT)
+@pytest.mark.parametrize("prefix", [
+    "plaintext_import_failed:GenesisWorkerError:",
+    "genesis_v2_background_failed:GenesisWorkerError:",
+    "",
+])
+def test_classify_profile_invalid_is_model_bad_json(prefix, code):
+    error = f"{prefix}genesis_profile_invalid:{code}"
+    assert service.classify_genesis_error(error) == "model_bad_json"
+
+
+@pytest.mark.parametrize("code", ["reply_empty", "map_reply_empty"])
+def test_classify_empty_profile_reply_is_model_empty_output(code):
+    error = f"plaintext_import_failed:GenesisWorkerError:genesis_profile_invalid:{code}"
+    assert service.classify_genesis_error(error) == "model_empty_output"
+
+
+def test_classify_provider_empty_reply_is_model_empty_output():
+    error = (
+        "update_identity_failed:provider_identity_failed:ProviderError:"
+        "provider response had no usable reply text"
+    )
+    assert service.classify_genesis_error(error) == "model_empty_output"
+
+
+@pytest.mark.parametrize("error, expected", [
+    # Out of scope for T750 and unchanged: a relay with no channel stays internal.
+    ("update_identity_failed:provider_identity_failed:ProviderError:provider_http_503: "
+     "No available channel for model x under group auto", "internal"),
+    ("plaintext_import_failed:GenesisWorkerError:distill_empty_output:keep_all_nonempty:"
+     "zero_memory_cards", "distill_empty_output"),
+    ("plaintext_import_failed:RuntimeError:something unexpected", "internal"),
+])
+def test_t750_neighbours_keep_their_classification(error, expected):
+    assert service.classify_genesis_error(error) == expected

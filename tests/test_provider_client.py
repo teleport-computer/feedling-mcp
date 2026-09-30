@@ -428,11 +428,46 @@ def test_deepseek_required_tool_choice_disables_thinking_for_that_request(
 
 
 @pytest.mark.parametrize(
+    ("configured_model", "wire_model"),
+    [
+        ("deepseek-flash", "deepseek-flash"),
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek-reasoner", "deepseek-v4-flash"),
+    ],
+)
+def test_deepseek_named_tool_choice_disables_thinking_for_that_request(
+    configured_model,
+    wire_model,
+):
+    """T735: a named forcing choice conflicts with thinking exactly like
+    ``required`` ("Thinking mode does not support this tool_choice")."""
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    named = {"type": "function", "function": {"name": "ping"}}
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice=named,
+    )
+
+    assert payload["model"] == wire_model
+    assert payload["tool_choice"] == named
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
     "tool_choice",
     [
         None,
         "auto",
-        {"type": "function", "function": {"name": "ping"}},
+        {"type": "function", "function": {"name": ""}},
     ],
 )
 def test_deepseek_non_required_tool_choice_preserves_default_thinking(
@@ -1091,6 +1126,14 @@ def test_bedrock_forced_tools_explicitly_disable_manual_thinking(
 
 @pytest.mark.parametrize("message, signature", [
     ("Thinking may not be enabled when tool_choice forces tool use.", "thinking_forced_tool_choice"),
+    # T735: DeepSeek's wording for the same conflict.
+    ("Thinking mode does not support this tool_choice", "thinking_forced_tool_choice"),
+    # T735: Gemini rejects a forced call combined with a JSON response mime type.
+    ("Forced function calling (ANY mode) with a response mime type: 'application/json' is unsupported",
+     "forced_tool_json_mime"),
+    # Negatives: the same words without the specific conflict stay unclassified.
+    ("This model does not support this tool_choice value", "unclassified"),
+    ("Function calling with a response mime type is fine", "unclassified"),
     ("final assistant content cannot end with trailing whitespace", "trailing_whitespace"),
     ("unexpected tool_use_id in tool_result blocks", "tool_use_id_mismatch"),
     ("tools.0.input_schema: JSON schema is invalid", "invalid_tool_schema"),
@@ -3466,3 +3509,44 @@ def test_bracketed_non_address_never_escapes_as_a_valueerror():
             pass
         except ValueError as exc:  # pragma: no cover - the regression itself
             raise AssertionError(f"ValueError escaped for {base_url!r}: {exc}") from exc
+
+
+
+# (provider, model, base_url, 2xx body) — one case per chat_completion dispatch
+# branch: anthropic, bedrock, gemini, openai Responses (gpt-5*/o-series),
+# openai chat, and the openai-compatible fallthrough (openai_compatible/deepseek).
+_PROBE_CASES = [
+    ("anthropic", "some-model", "", {"content": [{"type": "text", "text": "ok"}]}),
+    ("bedrock", "some-model", "https://bedrock.example",
+     {"output": {"message": {"content": [{"text": "ok"}]}}}),
+    ("gemini", "some-model", "", {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+    ("openai", "gpt-5.2", "",
+     {"output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}),
+    ("openai", "gpt-4o-mini", "", {"choices": [{"message": {"content": "ok"}}]}),
+    ("openai_compatible", "some-model", "https://relay.example/v1",
+     {"choices": [{"message": {"content": "ok"}}]}),
+    ("deepseek", "some-model", "", {"choices": [{"message": {"content": "ok"}}]}),
+]
+
+
+@pytest.mark.parametrize(("provider", "model", "base_url", "body"), _PROBE_CASES)
+def test_setup_probe_http_timeout_is_90_seconds(monkeypatch, provider, model, base_url, body):
+    # T754 (Seven 09-28): setup's probe passes 90 s as the HTTP timeout (httpx
+    # applies it per phase, not as a whole-call deadline; bounded compatibility
+    # retries may add attempts). Pin the value on every request each dispatch
+    # branch sends.
+    seen: list = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, *, headers=None, json=None, timeout=None):
+            seen.append(timeout)
+            return FakeResponse(200, body)
+
+    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+    pc.test_provider_key(pc.ProviderConfig(provider, model, "sk-x", base_url=base_url))
+    assert seen and all(t == 90.0 for t in seen), seen
+    assert pc.SETUP_PROBE_TIMEOUT_S == 90.0

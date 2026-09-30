@@ -127,3 +127,20 @@ def test_coalesce_rejects_ambiguous_dual_cursor():
 
     with pytest.raises(ValueError, match="exactly one"):
         v2_coalesce.coalesce_pending([], since_ts=1.0, since_seq=1)
+
+
+def test_attachment_caption_and_unreadable_flag_survive_coalesce():
+    """T743: the failure language reads these, and rows folded in mid-turn pass
+    through here; dropping them would turn "[image]" back into a language signal."""
+    messages = [
+        {**_msg("m1", "user", 1.0, "[image]"), "seq": 1, "has_image": True, "caption": ""},
+        {**_msg("m2", "user", 2.0, "[file: a.pdf]"), "seq": 2, "has_file": True, "caption": "看看"},
+        {**_msg("m3", "user", 3.0, "[message unavailable]"), "seq": 3, "unreadable": True},
+        {**_msg("m4", "user", 4.0, "hello"), "seq": 4},
+    ]
+    coalesced, _ = v2_coalesce.coalesce_pending(messages, since_seq=0)
+    by_id = {row["id"]: row for row in coalesced}
+    assert by_id["m1"]["caption"] == ""
+    assert by_id["m2"]["caption"] == "看看"
+    assert by_id["m3"]["unreadable"] is True
+    assert "caption" not in by_id["m4"] and "unreadable" not in by_id["m4"]

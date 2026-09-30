@@ -1,6 +1,7 @@
 """V1/self-hosted Canvas cards join the metadata index without body copies."""
 import base64
 import importlib.util
+import json
 import os
 import sys
 import uuid
@@ -15,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
+import debug_trace
 from asgi_test_client import make_client
 from chat import chat_core
 from conftest import seed_user
@@ -23,6 +25,26 @@ from model_api_runtime.v2 import jobs_store
 
 ROOT = Path(__file__).parent.parent
 INDEX = "ix_chat_messages_agent_canvas_cards"
+
+
+@pytest.fixture
+def trace_events(monkeypatch):
+    events = []
+    monkeypatch.setattr(debug_trace, "_enabled_fast", lambda store: True)
+    # Observe the real trace serializer at its persistence queue boundary.
+    monkeypatch.setattr(debug_trace, "_enqueue", lambda uid, event: events.append((uid, event)))
+    return events
+
+
+def _read_event(events, uid, event_type):
+    matches = [event for owner, event in events if owner == uid and event["type"] == event_type]
+    assert len(matches) == 1
+    event = matches[0]
+    assert event["dur_ms"] == event["detail"]["dur_ms"] >= 0
+    assert "content_excerpt" not in event
+    assert "lane" not in event["detail"]
+    assert "history_fallback" not in json.dumps(event)
+    return event
 
 
 @pytest.fixture
@@ -62,7 +84,7 @@ def _index(uid):
     return result['canvases']
 
 
-def test_v1_store_delivery_visible_through_authenticated_endpoint():
+def test_v1_store_delivery_visible_through_authenticated_endpoint(trace_events):
     client = make_client()
     registration = client.post('/v1/users/register', json={
         'public_key': base64.b64encode(os.urandom(32)).decode(), 'archive_language': 'en'})
@@ -82,6 +104,15 @@ def test_v1_store_delivery_visible_through_authenticated_endpoint():
     assert cards[0]['mime_type'] == 'text/html'
     assert jobs_store.list_canvas_workspace_entries(user['user_id']) == []
     assert 'body_ct' not in str(cards)
+    event = _read_event(trace_events, user['user_id'], 'chat.canvas.index')
+    assert event['detail'] == {
+        'source': 'canvas_index', 'status': 'ok', 'error_class': None,
+        'http_status': 200, 'response_bytes': len(response.get_data()),
+        'workspace_count': 0, 'chat_card_count': 1, 'cards': 1,
+        'limit_reached': False, 'dur_ms': event['dur_ms'],
+    }
+    assert 'Resident.io.html' not in json.dumps(event)
+    assert msg['id'] not in json.dumps(event)
 
 
 def test_latest_ts_earliest_creation_and_deleted_card(uid):
@@ -104,7 +135,7 @@ def test_latest_ts_earliest_creation_and_deleted_card(uid):
     assert first != latest
 
 
-def test_workspace_precedence_and_existing_latest_seq_metadata(uid):
+def test_workspace_precedence_and_existing_latest_seq_metadata(uid, trace_events):
     _card(uid, 'same.io.html', 300)
     newest_seq = _card(uid, 'same.io.html', 100, title='Latest delivery')
     workspace = _workspace(uid, 'same.io.html', 200)
@@ -115,6 +146,8 @@ def test_workspace_precedence_and_existing_latest_seq_metadata(uid):
     assert datetime.fromisoformat(rows[0]['updated_at']).timestamp() == 200
     assert rows[0]['display_title'] == 'Latest delivery'
     assert db.chat_latest_agent_canvas_cards(uid) == []
+    detail = _read_event(trace_events, uid, 'chat.canvas.index')['detail']
+    assert (detail['workspace_count'], detail['chat_card_count'], detail['cards']) == (1, 0, 1)
 
 
 def test_filters_role_type_suffix_and_isolates_users(uid):
@@ -130,7 +163,7 @@ def test_filters_role_type_suffix_and_isolates_users(uid):
     assert [r['filename'] for r in _index(uid)] == ['Case.IO.HTML', 'case.io.html']
 
 
-def test_limit_after_union_and_workspace_precedence_beyond_500(uid):
+def test_limit_after_union_and_workspace_precedence_beyond_500(uid, trace_events):
     # A newest card whose workspace is older than the workspace top 500 must
     # not bypass workspace precedence. Likewise duplicates cannot starve V1.
     for n in range(501):
@@ -146,6 +179,89 @@ def test_limit_after_union_and_workspace_precedence_beyond_500(uid):
     assert len(rows) == 500
     assert 'w000.io.html' not in {r['filename'] for r in rows}
     assert len(db.chat_latest_agent_canvas_cards(uid, limit=3)) == 3
+    detail = _read_event(trace_events, uid, 'chat.canvas.index')['detail']
+    assert detail['cards'] == 500 and detail['limit_reached'] is True
+    expected_workspace = sum(name.startswith('w') for _, name in expected[:500])
+    assert detail['workspace_count'] == expected_workspace
+    assert detail['chat_card_count'] == 500 - expected_workspace
+
+
+def test_empty_index_is_measured_zero_not_missing(uid, trace_events):
+    assert _index(uid) == []
+    detail = _read_event(trace_events, uid, 'chat.canvas.index')['detail']
+    assert (detail['workspace_count'], detail['chat_card_count'], detail['cards']) == (0, 0, 0)
+    assert detail['limit_reached'] is False
+
+
+@pytest.mark.parametrize('filename,expected_status', [
+    ('Private.io.html', 200), ('missing.io.html', 404), ('../Private.io.html', 400),
+])
+def test_workspace_body_read_trace_preserves_response_and_omits_content(
+    uid, trace_events, filename, expected_status,
+):
+    _workspace(uid, 'Private.io.html', 100)
+    body, status = chat_core.workspace_canvas_body(core_store.get_store(uid), filename)
+    assert status == expected_status
+    event = _read_event(trace_events, uid, 'chat.canvas.body')
+    assert event['status'] == ('ok' if status == 200 else 'error')
+    assert event['detail'] == {
+        'source': 'workspace', 'status': {200: 'ok', 404: 'not_found', 400: 'invalid_request'}[status],
+        'error_class': None, 'http_status': status,
+        'response_bytes': len(json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()),
+        'dur_ms': event['dur_ms'],
+    }
+    for secret in ('Private.io.html', 'must-not-be-copied', 'content_envelope'):
+        assert secret not in json.dumps(event)
+
+
+@pytest.mark.parametrize('filename,content_type,is_canvas', [
+    ('private.IO.HTML', 'file', True), ('private.txt', 'file', False),
+    ('private.io.html', 'text', False),
+])
+def test_message_body_inline_trace_does_not_claim_all_files_are_canvases(
+    uid, trace_events, filename, content_type, is_canvas,
+):
+    store = core_store.get_store(uid)
+    message = store.append_chat('openclaw', 'chat', {'body_ct': 'opaque-private-body'},
+                                content_type=content_type, extra={'file_name': filename},
+                                strict=True)
+    body, status = chat_core.message_body(store, message['id'])
+    assert status == 200
+    event = _read_event(trace_events, uid, 'chat.message_body.read')
+    assert event['detail'] == {
+        'source': 'chat_message', 'lookup_source': 'durable', 'is_canvas': is_canvas,
+        'status': 'ok', 'error_class': None, 'http_status': 200,
+        'response_bytes': len(json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode()),
+        'dur_ms': event['dur_ms'],
+    }
+    for secret in (filename, message['id'], 'opaque-private-body'):
+        assert secret not in json.dumps(event)
+
+
+def test_missing_message_has_unknown_canvas_kind(uid, trace_events):
+    body, status = chat_core.message_body(core_store.get_store(uid), 'private-missing-id')
+    assert (body, status) == ({'error': 'message_not_found'}, 404)
+    event = _read_event(trace_events, uid, 'chat.message_body.read')
+    assert event['status'] == 'error'
+    assert event['detail']['status'] == 'not_found'
+    assert event['detail']['is_canvas'] is None
+    assert 'private-missing-id' not in json.dumps(event)
+
+
+def test_canvas_read_database_failure_records_no_invented_count(uid, trace_events, monkeypatch):
+    class BrokenPool:
+        def connection(self):
+            raise TimeoutError('private-database-address')
+    monkeypatch.setattr(jobs_store, '_pool', lambda: BrokenPool())
+    with pytest.raises(TimeoutError):
+        chat_core.canvas_index(core_store.get_store(uid))
+    event = _read_event(trace_events, uid, 'chat.canvas.index')
+    assert event['status'] == 'error'
+    assert event['detail']['status'] == 'timeout'
+    assert event['detail']['http_status'] is None
+    assert event['detail']['response_bytes'] is None
+    assert 'cards' not in event['detail']
+    assert 'private-database-address' not in json.dumps(event)
 
 
 def _migration(chain):

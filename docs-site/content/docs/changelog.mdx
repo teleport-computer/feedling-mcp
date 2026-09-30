@@ -12,6 +12,209 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 can select memory cards for plaintext accounts without the decrypt
+  service, behind `FEEDLING_V2_PLAINTEXT_RECALL` (default `off`, which changes
+  nothing). `shadow` keeps the decrypt-service result and records a content-free
+  `memory.recall.shadow` comparison; `on` serves plaintext accounts locally.
+  Selection code, history window and candidate pool are the ones the decrypt
+  service uses; a plaintext account's remaining sealed cards are left out on
+  this path. Hybrid query vectors come from a loopback encoder in the Runtime V2
+  parent that shares the card-vector sweep's model and runs queries ahead of
+  sweep work.
+
+- Runtime V2 wake lanes (heartbeat, manual wake, scheduled reminders, and screen
+  watch) now wait up to 110 seconds for each provider response instead of 60.
+  Some reasoning models took longer than a minute before responding, and the
+  wake failed as `wake_failed:providererror`; for a scheduled reminder, the
+  reminder was not delivered. Chat keeps the 60-second limit.
+
+- The Runtime V2 `mcp.surface.resolved` debug trace keeps its verdict again. The
+  stored event is capped at 20 detail keys and the tool-surface counters used to
+  come first, so `resolved`, `skipped_count` and `skipped` were dropped from every
+  stored V2 event while `expected` survived. The verdict fields now come first;
+  the ten cap counters (`count_cap`, `char_cap`, `char_cap_skips`,
+  `count_cap_collapses`, `char_cap_collapses`, `expanded`, `collapsed`,
+  `catalog_chars`, `schema_rejected`, `schema_cap_collapsed`) move into one
+  `caps` object; `skipped` becomes a `{server name: kind}` object (at most 20
+  entries, `skipped_count` is the total); and `server_results`, which repeated
+  `expected_servers` plus `skipped`, is no longer included.
+
+- Runtime V2 proactive messages (heartbeat, scheduled, manual wake, and screen
+  watch) no longer receive the fixed reply-language rule tied to the account
+  locale or archive language. They get one soft line asking the model to talk
+  to the user in the language the user uses, and the model chooses the language
+  from the conversation. Chat replies, memory-garden language, and failure
+  fallback copy are unchanged.
+
+- The Runtime V2 debug trace now records, for a chat turn that includes images or
+  files, whether the text the user typed with them reached the model request:
+  `v2.prompt_frontier.budget` gains an `attachment_captions` object with counts
+  and character lengths only, never the caption text: `images`, `files`,
+  `with_caption` (attachments that had typed text), `delivered` (their text is
+  in the attachment's own message in the request), `undetermined` (the text is
+  in the request but that message could equally belong to an earlier one), and
+  the matching `caption_chars`, `delivered_chars`, `undetermined_chars`.
+  Missing = `with_caption` − `delivered` − `undetermined`.
+
+- A Runtime V2 heartbeat or manual wake that looks something up in its first
+  call is now reminded in the next call to end the wake with `reply` or
+  `stay_silent`. Some models answered the lookup result as plain text instead,
+  and the wake then failed as `wake_failed:choice_invalid` without reaching the
+  user.
+
+- A plaintext Genesis import that finishes now reports its final `stage` and
+  per-material `materials` in the same update that marks it `done`.
+  Previously a status read in the brief moment after completion could see
+  `done` with an empty `materials` list (add-memory imports and the full
+  one-pass onboarding path).
+
+- Updated memgarden from 0.22.0 to 0.23.0 (#10, 3e5da470; release preparation #11, fc872478). History import and daily memory capture now keep concrete one-time details of a person's life (what they bought, saw or attended; names, numbers, dates, places) instead of dropping them as one-off events, and are told not to record the companion's own suggestions as the person's facts or to supply a missing year. Dream merges are asked to keep those values. The resident memory recheck pass follows the same rule.
+
+- A long-term-memory import of a sentence or two, where the model finds nothing
+  to remember, now fails as `distill_material_too_short` and asks the user to
+  add some detail, instead of telling them to switch models. It still counts
+  as a failed import and writes no cards.
+
+- The provider test that runs when adding or switching a Model API route now
+  uses a 90-second HTTP timeout (was 30), giving slow relay channels more time
+  before `provider network error: ReadTimeout`. It is not a deadline for the
+  whole test and does not guarantee the route can be added. Clients must wait
+  longer than this; iOS app versions that still use the 60-second system
+  default give up first.
+
+- Genesis import's first model call (the "model too slow" check) now allows
+  120 seconds on `openai_compatible` relay routes instead of 60; other routes
+  keep 60 seconds. Each import model call's content-free record now includes
+  its elapsed time.
+
+- Identity profile generation accepts more well-formed replies: reasoning a
+  relay inlines in `<think>` is stripped first (the same stripper memory-card
+  parsing uses), every `{` in the reply is tried in turn, and extra keys next to
+  `memory` and `style` are ignored and discarded rather than failing the whole
+  reply. Truncated or non-object replies and missing or empty fields still fail.
+
+- Genesis import failures now name the actual cause more often. An identity
+  profile the model returned in an unusable shape is reported as
+  `model_bad_json` and an empty reply as `model_empty_output` (both were an
+  internal error), and relay `403` responses reporting `额度不足` or a required
+  paid plan / deposited balance are reported as quota exhaustion instead of an
+  invalid API key — on every lane that uses the shared classification.
+
+- The resident CLI output limit (`FEEDLING_CLI_MAX_OUTPUT_BYTES`) now counts the
+  content it keeps rather than raw transfer: pi resends the whole reply so far on
+  every token, so a `message_update` line is dropped once a parseable one with no
+  less text supersedes it. Long
+  pi replies (roughly above 16–20 KB of text) no longer fail with
+  `cli_output_too_large`.
+
+- A resident CLI turn killed at the output limit (`cli_output_too_large`) now also
+  drops its resumable agent session, so the next message starts a fresh session
+  instead of replaying the same oversized turn every time.
+
+- Runtime V2 now reads the text a user sends with an image or file when that
+  text is stored in plaintext (content encryption off). Previously the model
+  saw only the attachment marker (`[image]` / `[file: name]`) and not the
+  user's words; encrypted captions were unaffected.
+
+- Runtime V2 retry-later failure replies now follow the language of the words
+  the user typed in the latest message (or an attachment's caption) instead of
+  the account language, using the same language check as resident paths: a
+  Chinese-language account that writes in English receives the English
+  fallback, and vice versa. Messages without a language signal keep the account
+  language. Actionable error-catalog texts are unchanged.
+
+- Hosted Runtime V2 now gives English reply-language accounts the English
+  version of the `aside` guidance (foreground chat, every proactive wake lane,
+  and the screen-watch note). Chinese accounts keep the existing Chinese text
+  unchanged. Previously every account got the Chinese guidance, which could
+  pull English conversations into Chinese replies.
+
+- The enclave `/healthz` adds `rss_kb` (the process's current resident memory)
+  and `recall_hybrid` (`enabled`, `min_cosine`, `embedder_state`,
+  `failure_reason`, and a model-id prefix). It carries no user data and no
+  paths, and is used as deploy-state and capacity evidence for hybrid recall.
+
+- A relay's `403` that explicitly reports an exhausted balance (for example
+  `code: insufficient_user_quota`, 「预扣费额度失败」) is now reported as insufficient
+  quota instead of an invalid API key, on every Model API lane and in credential
+  probes. Other `403` responses keep their existing classification.
+
+- Added disabled-by-default hybrid automatic recall (`FEEDLING_MEMORY_RECALL_HYBRID`).
+  When enabled, the enclave encodes the query with the local E5 model, reads the
+  caller's current-projection card vectors through a new internal backend route,
+  and fuses a cosine lane with the lexical ranker (memgarden 0.22.0). A per-turn
+  budget (default 2 s) bounds the vector read and encoding; any failure keeps the
+  whole turn on the unchanged lexical path and records a content-free fallback
+  reason. Runtime V2 recall traces gain a `selection_mode` field and a nested
+  `hybrid` object only while enabled. The recall trace's event tallies
+  (`tool_result_events`, `provider_requests`) now sit inside `counts`, so the
+  turn's `lane`, `attempt`, `turn_id` and `job_id` are no longer dropped from
+  the stored event.
+  While disabled, recall output is byte-identical to before. Public API unchanged.
+
+- Hosted Runtime V2 no longer shows a reply call's `aside` when a model writes
+  the call as visible text. For XML-style tool markup, when removing the whole
+  block would leave nothing, only the reply's `text` (or its bare body) is kept
+  instead of every parameter. A message that is only a reply-arguments JSON
+  object (`{"aside": ..., "text": ...}`) now shows just its `text`. Markup with
+  other visible prose outside it is still removed as before.
+
+- Heartbeat and manual wake guidance, and the `stay_silent` description, now say
+  that several unanswered messages over a day or two are still not a reason to go
+  quiet, and ask the agent to say something new rather than repeat itself. Wake
+  scheduling and intervals are unchanged; screen-watch wording is unchanged.
+
+- Hosted Runtime V2 now also removes DeepSeek DSML tool-call markup that a model
+  writes into its visible reply. A DSML `reply` call keeps only its `text`
+  payload; the `aside` and any other parameters are never shown. A DSML block
+  without a completed reply body is removed and the existing fallback applies.
+  Fenced code examples are left unchanged.
+
+- Runtime V2 heartbeat and manual wakes now look before deciding: their first
+  provider call omits `reply`/`stay_silent`, then the usual choice is offered.
+  Drafted text from that first call is never delivered directly. Their optional
+  `aside` guidance now asks what makes the agent want to reach out now instead of
+  how it will answer a message. Scheduled and screen-watch wakes are unchanged.
+
+- The probe-local `provider_config` credential-test notice now has English copy
+  and follows the user's stored `archive_language`, like registered probe
+  classes. It remains outside the runtime error registry.
+
+- Runtime V2 Capture now doubles only a truncated reply's re-ask budget
+  (1,500 → 3,000 tokens by default, capped at the provider ceiling), with
+  180-second wire and phase limits. First calls remain at 1,500 tokens and
+  90 seconds. Capture and Dream can fall back once to the original budget
+  after a larger-budget 402, as already supported for too-large 400/422
+  responses. Capture's truncation re-ask and budget fallback each allow one
+  reliable attempt, fitting the existing 1,260-second Heavy pool limit; the
+  global 3,000-second default is unchanged.
+  Already-truncated jobs may spend more tokens or make a budget-fallback call;
+  normal jobs keep their existing call budget.
+
+- Runtime V2 model-call error traces now report shared failure causes in
+  `error_class` instead of Python exception class names. The original name is
+  retained separately as `exception_type`; retry categories remain unchanged.
+
+- Setup and manual Model API probe traces now retain a bounded upstream HTTP
+  `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
+  without storing provider error text or response bodies.
+
+- Resident CLI errors reporting Codex usage exhaustion now use the existing
+  `quota_insufficient` classification and quota notice instead of the generic
+  `unknown` fallback. Temporary rate-limit errors keep their existing class.
+
+- Automatic memory recall now gives the latest user message first priority,
+  then fills remaining seats from the latest two user messages. A long previous
+  topic can no longer displace already selected current-message hits; short
+  follow-ups retain previous-message context. The eight-card cap, relevance
+  gates, and recent-card supplement remain in place. Recall diagnostics label
+  the new host merge rule and preserve the underlying ranking evidence.
+
+- Model API credential probe notices now select existing registry translations
+  using the user's stored `archive_language`. English users receive English text
+  for registered failure classes; the probe-local `provider_config` notice
+  retains its Chinese text and remains outside the runtime error registry.
+
 - Runtime V2 replies whose optional `aside` was never written now display no
   thinking at all instead of the `（思考没写完）` marker, recorded on the
   `none` branch. A reply whose inline thinking block was malformed but still
@@ -28,9 +231,13 @@ change must not be interpreted as an API guarantee.
   the wake lane does not.
 
 - Runtime V2 Capture and Dream traces now distinguish explicit Anthropic
-  refusals with content-free `memory.extraction.refusal` observations, including
-  refusals seen before a successful retry. Existing failure outcomes and retry
-  budgets are unchanged; unknown refusal categories remain `unclassified`.
+  refusals with content-free `memory.extraction.refusal` observations; unknown
+  categories remain `unclassified`. Explicit refusals stop the extraction on
+  that attempt with `content_filtered`, including responses with partial text,
+  and do not count as provider-health failures. Capture uses its existing
+  generic backoff notice and skips the window after six failed jobs; skipped
+  batches produce no memories. Ordinary empty replies, transient service
+  retries, chat, and Resident V1 retain their existing behavior.
 
 - Resident V1 asks for the persona aside as a leading `<aside>…</aside>` block
   again, on every driver and route (pi and codex no longer use `<think>`).

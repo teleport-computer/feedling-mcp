@@ -87,7 +87,7 @@ def test_t336_worker_file_output_default_is_bound_to_shared_wire_cap():
 
 
 _REAL_TOOL_COUNT = 69
-_REAL_TOOL_CATALOG_BYTES = 36_827
+_REAL_TOOL_CATALOG_BYTES = 36_842
 
 
 def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -144,6 +144,8 @@ def _real_sized_mixed_tool_catalog() -> tuple[list[ToolSpec], list[ToolSpec]]:
     MCP padding, tool count, and parameter schemas remain unchanged.
     T619 replaces that description with the approved agent-led choice wording,
     adding another 34 UTF-8 bytes (36,827 total) with the same MCP padding.
+    T723 D extends it to several unanswered messages (Seven-approved wording),
+    adding 15 UTF-8 bytes (36,842 total) with the same 12-byte MCP padding.
     """
     platform = list(tool_schema.build_tool_specs())
     mcp_count = _REAL_TOOL_COUNT - len(platform)

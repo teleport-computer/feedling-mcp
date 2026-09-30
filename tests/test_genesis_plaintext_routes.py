@@ -1999,6 +1999,11 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
     assert calls["completed"]["memory_action_count"] == 0
     assert calls["completed"]["identity_status"] == "updated"
     assert calls["completed"]["output"]["profile_status"] == "written"
+    # T758: the completing write already carries the final stage and materials,
+    # so no status read can see "done" with the materials missing.
+    assert calls["completed"]["output"]["stage"] == "plaintext_update_identity_done"
+    assert calls["completed"]["output"]["identity_ready"] is True
+    assert [m["kind"] for m in calls["completed"]["output"]["materials"]] == ["ai_persona"]
     assert calls["profile_written"] is True
     done = next(event for event in trace_events if event["event_type"] == "genesis.plaintext.done")
     assert done["detail"] == {"mode": "update_identity", "identity_status": "updated"}

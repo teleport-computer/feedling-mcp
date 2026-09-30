@@ -28,6 +28,11 @@ from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import worker
+from wake_look_first_helpers import (
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -268,9 +273,13 @@ def _script_provider(monkeypatch, responses):
     assert what the model actually saw each round (e.g. that a prior round's
     tool observation was folded in)."""
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            # Presence-wake look-first round (T723): "looked, nothing needed".
+            calls.look_rounds.append({"messages": messages, "tools": tools, **kwargs})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **kwargs})
         return next(it)
 
@@ -1940,8 +1949,8 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
         raise provider_client.ProviderError("fixture authentication failure", status_code=401)
     monkeypatch.setattr(provider_client, "chat_completion_async", failing_provider)
     reads, events = [], []
-    def select(user_id, *, through_seq):
-        reads.append((user_id, through_seq))
+    def select(user_id, *, through_seq, coordinates=None):
+        reads.append((user_id, through_seq, coordinates))
         if selection_fails:
             raise RuntimeError("selection unavailable")
         return {"context_memories": [{"id": "chat-memory", "summary": "露营灯编号 NP-4286"}],
@@ -1958,7 +1967,7 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
     status = asyncio.run(worker.process_job(job, deps, provider_config=_BYOK,
                                            api_key=None, runtime_token="rt"))
     assert status == "failed" and len(provider_calls) == 1
-    assert reads == [(uid, 1)]
+    assert [r[:2] for r in reads] == [(uid, 1)]
     blocks = [m["content"] for m in provider_calls[0]["messages"]
               if isinstance(m, dict) and str(m.get("content", "")).startswith("# 相关记忆")]
     assert len(blocks) == (0 if selection_fails else 1)
@@ -1966,6 +1975,10 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
     assert len(completed) == 1
     assert completed[0]["counts"]["injected"] == (0 if selection_fails else 1)
     assert completed[0]["counts"]["selected"] == (None if selection_fails else 1)
+    # T779 step 2c: the read is labelled with the same turn as memory.recall.completed.
+    coords = reads[0][2]
+    assert set(coords) == {"lane", "turn_id", "job_id", "attempt"}
+    assert {k: completed[0][k] for k in coords} == coords
 
 
 def test_process_job_records_failed_whole_turn_metric_on_provider_error(monkeypatch):
@@ -2027,9 +2040,10 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
-    selection_reads = []
-    def read_memories(user_id, *, through_seq):
+    selection_reads, wake_coordinates = [], []
+    def read_memories(user_id, *, through_seq, coordinates=None):
         selection_reads.append((user_id, through_seq))
+        wake_coordinates.append(coordinates)
         return {"context_memories": [{"id": "wake-memory", "summary": "露营灯保修码 NP-4286"}],
                 "context_memory_log": {"mode": "default"}}
 
@@ -2051,6 +2065,9 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
 
     assert status == "completed"
     assert selection_reads == [(uid, 1)]
+    assert wake_coordinates == [worker._turn_coordinates(
+        "heartbeat", job["id"], job.get("trace_id"), job.get("attempt_count"))]
+    assert wake_coordinates[0]["lane"] == "wake" and wake_coordinates[0]["job_id"] == str(job_id)
     assert any(m.get("role") == "assistant" and "NP-4286" in str(m.get("content"))
                for m in provider_calls[0]["messages"] if isinstance(m, dict))
     with db.get_pool().connection() as c:
@@ -2060,9 +2077,13 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     assert row is not None
     assert row[0] == uid
     assert row[1] == "heartbeat"
-    assert row[2] == 17          # real usage, surfaced via the scripted round's usage
-    assert row[3] == 4
-    assert row[4] == 1           # exactly one model call
+    # Real usage, surfaced via the scripted rounds' usage: the look-first
+    # round (T723) plus the one decision round.
+    assert len(provider_calls.look_rounds) == 1
+    look_usage = _looked_nothing_needed()["usage"]
+    assert row[2] == 17 + look_usage["prompt_tokens"]
+    assert row[3] == 4 + look_usage["completion_tokens"]
+    assert row[4] == 2           # look-first call + exactly one decision call
     assert row[5] is False
     assert row[6] == "ok"
 
@@ -2075,7 +2096,7 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    _script_provider(monkeypatch, [
+    weak_calls = _script_provider(monkeypatch, [
         _text_round("", prompt_tokens=9, completion_tokens=0),
         _stay_silent_round(prompt_tokens=2, completion_tokens=1),
     ])
@@ -2103,8 +2124,10 @@ def test_run_wake_weak_wake_still_records_whole_turn_metric_with_call_counted(mo
             "SELECT prompt_tokens, model_calls, failed, status "
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
-    assert row[0] == 11
-    assert row[1] == 2
+    # Look-first round (T723) + empty round + forced explicit sleep.
+    assert len(weak_calls.look_rounds) == 1
+    assert row[0] == 11 + _looked_nothing_needed()["usage"]["prompt_tokens"]
+    assert row[1] == 3
     assert row[2] is False
     assert row[3] == "ok"
 
@@ -3033,3 +3056,71 @@ def test_official_route_chat_turn_also_pins_the_exact_model_id(monkeypatch):
     system = calls[0]["messages"][0]["content"]
     assert _BYOK.model in system        # claude-sonnet-4-test，钉死精确型号
     assert "官方直连" in system          # 走官方文案，不是第三方那套
+
+
+_T768_CAPTION = "PRIVATE_CAPTION_看我的猫"
+
+
+def _t768_deps(rows_after, events, *, ordered=False):
+    """Seq-native deps; ``rows_after()`` decides what is visible. ``ordered`` is
+    production's chat setting (serve_worker passes ordered_chat_replies=True)."""
+    def read_after(_uid, after_seq, *args, **kwargs):
+        return [r for r in rows_after() if int(r["seq"]) > int(after_seq)]
+
+    def read_tail(_uid, after_seq, limit, *, through_seq=None):
+        return [r for r in rows_after() if int(r["seq"]) > int(after_seq)
+                and (through_seq is None or int(r["seq"]) <= int(through_seq))]
+
+    return worker.TurnDeps(
+        read_messages=lambda _uid: rows_after(),
+        read_messages_after_seq=read_after,
+        read_tail_after_seq=read_tail,
+        read_summary_with_seq=lambda _uid: ("", 0.0, 0, 0),
+        read_images=lambda _uid, ids: {
+            mid: {"image_mime": "image/png", "image_b64": "iVBORw0KGgo="} for mid in ids},
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        emit_debug_trace=lambda _uid, kind, **kwargs: events.append((kind, kwargs)),
+        apply_pending_effects=_apply_effects,
+        ordered_chat_replies=ordered,
+    )
+
+
+def _t768_budgets(events):
+    return [e["detail"] for kind, e in events if kind == "v2.prompt_frontier.budget"]
+
+
+def test_t768_attachment_folded_in_mid_turn_is_counted_once(monkeypatch):
+    """First round text only; an image with a caption arrives between rounds and is
+    folded into the second request; the third round must not count it twice."""
+    uid = "u_t768_fold"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("t768")
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r1"})
+    text_row = {"id": "t1", "seq": 1, "ts": 1.0, "role": "user", "content": "hi"}
+    image_row = {"id": "img2", "seq": 2, "ts": 2.0, "role": "user", "content": _T768_CAPTION,
+                 "caption": _T768_CAPTION, "has_image": True, "image_mime": "image/png"}
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("c1", "memory_index")),
+        _tool_round(_tc("c2", "memory_index")),
+        _text_round("MODEL REPLY"),
+    ])
+    visible = lambda: [text_row, image_row] if len(calls) >= 1 else [text_row]  # noqa: E731
+    events = []
+
+    asyncio.run(worker.process_job(
+        job, _t768_deps(visible, events),
+        provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert len(calls) >= 3
+    assert _T768_CAPTION not in repr(calls[0]["messages"])
+    assert _T768_CAPTION in repr(calls[1]["messages"])
+    budgets = _t768_budgets(events)
+    assert "attachment_captions" not in budgets[0]
+    expected = {"images": 1, "files": 0, "with_caption": 1, "delivered": 1, "undetermined": 0,
+                "caption_chars": len(_T768_CAPTION), "delivered_chars": len(_T768_CAPTION), "undetermined_chars": 0}
+    assert budgets[1]["attachment_captions"] == expected
+    assert budgets[2]["attachment_captions"] == expected

@@ -977,6 +977,12 @@ reply is linked through `reply_to_message_id` and carries
 `turn_failure_user_text`. Provider-configuration failures use actionable text
 from the shared error catalog; transient provider and system failures use the
 standard retry-later fallback while preserving the classified metadata.
+The retry-later fallback is written in the language of the words the user typed
+in that turn, or the caption of an image or file (Chinese when they contain Han
+characters, English when they contain a Latin word); attachment contents never
+count. A message without either signal, an attachment without a caption, or a
+legacy encrypted message falls back to the account language; catalog texts
+keep using the account language.
 If the main model explicitly rejects image input, the failure is classified as
 `vision_model_required`, allowing clients to direct the user to add or select a
 vision-capable model instead of presenting the generic retry-later fallback.

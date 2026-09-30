@@ -103,13 +103,23 @@ recognized manual-thinking models.
 
 Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
 choice. Speaking is the default; silence is the agent's own call when it has
-nothing it wants to say or when speaking would clearly intrude. An unanswered
-previous message is not by itself a reason to stay silent. These are model
+nothing it wants to say or when speaking would clearly intrude. Unanswered
+messages, even several over a day or two, are not by themselves a reason to stay
+silent; the agent is asked to say something new rather than repeat itself. These are model
 instructions, not new scheduler gates. Missing or invalid choices still
 fail without a visible bubble; free-form text cannot bypass the validated reply
 path. Explicitly scheduled reminders retain their must-deliver behavior.
 A regular wake's otherwise valid `reply` whose entire text is a bare protocol
 token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
+Heartbeat and manual wakes first make one provider call without `reply` or
+`stay_silent`, so the agent looks at its context before deciding. If it needs no
+lookup, any drafted text stays unpublished and carries into one ordinary decision
+round with both choices offered. If it does look something up, the next round is
+that decision round and carries the same instruction to end the wake with `reply`
+or `stay_silent`; it can still look further. This uses the existing provider-call budget and
+applies only when that budget allows at least three calls. For these two lanes, the
+optional `aside` asks what makes the agent want to reach out now rather than how it
+will answer a message.
 The screen-watch lane follows the same default while keeping its own guidance
 to avoid interrupting the user's flow.
 
@@ -120,6 +130,13 @@ that shared budget with `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS`. It is separate fro
 the prompt-frontier output reserve and does not change the input frontier;
 file-capable calls retain their existing budget precedence. Scheduled reminders
 still require delivery; sharing the budget does not enable a silence choice.
+
+Wake lanes (heartbeat, manual wake, scheduled reminders, and screen watch) give each
+provider request up to 110 seconds in total before it counts as a timeout. Chat keeps
+the 60-second limit on waiting for a response. Retry behavior is unchanged, and each
+attempt counts as progress for the worker's stall watchdog, so a retried request is
+not mistaken for a stuck turn. Nobody is waiting on a wake reply, and reasoning models
+can take longer than a minute before their first response byte.
 
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours
@@ -264,14 +281,27 @@ lease instead of being killed speculatively. Ownership is checked again in the
 atomic update, and live workers renew only jobs they still own. Done and failed
 jobs release the account slot.
 
-The worker uses the first real model request as a canary with a default
-60-second timeout. A timed-out canary ends the job with
-`distill_model_too_slow`; changing to a faster model is required before retry.
-Malformed JSON response bodies are reported as `model_bad_json`. Other provider
+The worker uses the first real model request as a canary: a single attempt
+with a 60-second timeout, or 120 seconds on `openai_compatible` relay routes,
+where healthy first calls to thinking-capable models regularly take longer. A
+timed-out canary ends the job with `distill_model_too_slow`; changing to a
+faster model is required before retry. Each model call's content-free record
+includes its elapsed time.
+Malformed JSON response bodies are reported as `model_bad_json`. An identity
+profile the model returned but that fails validation (not JSON, a missing or
+empty field, a placeholder, or over its length budget) is also reported as
+`model_bad_json`, and an empty profile or provider reply as `model_empty_output`,
+instead of an internal error. Before a profile reply is validated, reasoning inlined in
+`<think>` is stripped, each `{` is tried in turn, and keys other than `memory`
+and `style` are discarded. Other provider
 configuration failures retain their specific error class and remediation
 guidance.
 For a non-empty long-term-memory (`keep_all`) import, producing zero memory
 cards fails the job as `distill_empty_output` instead of publishing `done`.
+When the material is at most 500 characters and the model cleanly proposed
+nothing (no candidate dropped, no batch failed), the job still fails, as
+`distill_material_too_short`, with copy asking for more detail instead of a
+different model.
 Discarded map attempts add at most six diagnostics to the user-owned job
 output. Each diagnostic includes a discard reason and at most 500 characters
 of the model reply, plus its original length and truncation flag. Empty map

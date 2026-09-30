@@ -40,6 +40,7 @@ import re
 import struct
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
@@ -50,11 +51,13 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+import admin_read_timing
 import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 import storage_read_trace
 from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
+from notices.rollup_outcomes import split_v2_outcomes
 
 log = logging.getLogger("feedling.db")
 
@@ -178,7 +181,7 @@ def configure_pool_max_size(max_size: int | str) -> int:
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is not None:
-        return _pool
+        return admin_read_timing.wrap_pool(_pool)
     with _pool_lock:
         if _pool is None:
             _pool = ConnectionPool(
@@ -191,7 +194,7 @@ def get_pool() -> ConnectionPool:
                 open=True,
                 **_database_pool_lifetime_kwargs(),
             )
-    return _pool
+    return admin_read_timing.wrap_pool(_pool)
 
 
 def get_health_pool() -> ConnectionPool:
@@ -1248,19 +1251,34 @@ def clear_reconcile_cursor(table: str) -> None:
         log.warning("[db] clear_reconcile_cursor(%s) failed: %s", table, e)
 
 
-def user_exists(user_id: str) -> bool:
+def user_exists(
+    user_id: str,
+    *,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> bool:
     """Authoritative membership check against the users table. The push path uses
     it to close the sub-second window where another worker committed a delete but
     THIS worker's in-memory registry hasn't processed the ``users`` wake-bus
     reload yet — the stale snapshot would otherwise pass the guard and send a push
     to a just-deleted account. One indexed PK lookup; negligible next to the store
-    load / chat work a push already does."""
+    load / chat work a push already does. Admin callers may supply their remaining
+    read budget; failures propagate rather than reporting a missing account."""
     if not user_id:
         return False
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
-        ).fetchone()
+    connection_kwargs = (
+        {"timeout": float(connection_timeout)}
+        if connection_timeout is not None else {}
+    )
+    with get_pool().connection(**connection_kwargs) as conn:
+        timeout_scope = (
+            _local_statement_timeout(conn, int(statement_timeout_ms))
+            if statement_timeout_ms is not None else nullcontext()
+        )
+        with timeout_scope:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
+            ).fetchone()
     return row is not None
 
 
@@ -5406,8 +5424,11 @@ _LANE_ROLLUP_V2_SPOKE_JOIN = """
 # dream 的「真成功」= completed - silent_declared，读侧据此算成功率。
 # 不能把真跑的完成塞进 spoke_completed：0093 的 CHECK 要求 spoke_completed <= spoke，
 # 而 spoke 锚的是用户可见产出，为 dream 伪造 spoke 等于污染说话率。
-# 只认 lane='dream'：wake_result='skipped' 目前只有 dream 会写；别的 lane 将来若
-# 写了同一个词，语义要另行拍板，不能被这里静默吸收成「声明沉默」。
+# 只认 lane='dream'。2026-09-28 起（T773）heartbeat 也写 wake_result='skipped'
+# （没有真实用户历史 no_user_history / 让位给新聊天 yielded_to_chat，都是一次模型
+# 都没问）。这里**刻意没改**：heartbeat 的 skipped 仍落 silent_undeclared，和改前
+# （wake_result 为 NULL 时）完全一样，冻结数不变。要不要把它算成声明沉默，语义
+# 另行拍板，不能被这里静默吸收。
 _LANE_ROLLUP_V2_DECLARED_SILENCE = (
     "(j.wake_result IS NOT DISTINCT FROM 'sleep' "
     "OR (j.lane = 'dream' AND j.wake_result IS NOT DISTINCT FROM 'skipped'))"
@@ -7252,7 +7273,8 @@ def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
 
 
 def admin_background_lane_users(
-    user_ids: list[str], *, days: int = 7, tz: str = "Asia/Shanghai"
+    user_ids: list[str], *, classify_v2_code: Callable[[str], str],
+    days: int = 7, tz: str = "Asia/Shanghai"
 ) -> dict:
     """Bounded per-user heartbeat/capture outcomes from immutable day cells.
 
@@ -7260,6 +7282,8 @@ def admin_background_lane_users(
     ``user_logs`` for every page load and reached the production server's 240s
     boundary.  This reader scans only completed Beijing-day cells.  Counts and
     coverage stay separate so an unmeasured zero cannot look healthy.
+    The admin caller injects V2's producer classifier to keep the database
+    independent of the runtime package and share the daily summary's split.
     """
     ids = list(dict.fromkeys(str(uid) for uid in user_ids if str(uid)))
     day_count = max(1, min(int(days or 7), 90))
@@ -7376,10 +7400,12 @@ def admin_background_lane_users(
         complete = (
             bool(wm.get("backfill_from"))
             and bool(wm.get("through_day"))
-            and bool(wm.get("outcomes_from"))
             and str(wm["backfill_from"]) <= start_day.isoformat()
-            and str(wm["outcomes_from"]) <= start_day.isoformat()
             and str(wm["through_day"]) >= end_day.isoformat()
+            and (route == "model_api" or (
+                bool(wm.get("outcomes_from"))
+                and str(wm["outcomes_from"]) <= start_day.isoformat()
+            ))
         )
         coverage[route] = {
             "level": "green" if complete else "partial",
@@ -7394,6 +7420,16 @@ def admin_background_lane_users(
         uid, route, lane = str(row[0]), str(row[1]), str(row[2])
         completed = int(row[3] or 0)
         operational = int(row[7] or 0)
+        control, user_unavailable = int(row[8] or 0), int(row[9] or 0)
+        codes = {str(code): int(count or 0)
+                 for code, count in dict(row[10] or {}).items()}
+        if route == "model_api":
+            outcomes = split_v2_outcomes(
+                int(row[4] or 0) + int(row[5] or 0), codes,
+                classify=classify_v2_code,
+            )
+            operational = outcomes.operational
+            control, user_unavailable = outcomes.control, outcomes.user_unavailable
         denominator = completed + operational
         lane_row = {
             "completed": completed,
@@ -7401,14 +7437,11 @@ def admin_background_lane_users(
             "expired": int(row[5] or 0),
             "superseded": int(row[6] or 0),
             "operational_failures": operational,
-            "control_outcomes": int(row[8] or 0),
-            "user_unavailable": int(row[9] or 0),
+            "control_outcomes": control,
+            "user_unavailable": user_unavailable,
             "terminal_attempts": denominator,
             "failure_rate": operational / denominator if denominator else None,
-            "failure_codes": {
-                str(code): int(count or 0)
-                for code, count in dict(row[10] or {}).items()
-            },
+            "failure_codes": codes,
         }
         user = users.setdefault(uid, {"routes": {}, "lanes": {}})
         user["routes"].setdefault(route, {})[lane] = dict(lane_row)

@@ -18,7 +18,7 @@ import os
 import re
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Callable, Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chat.reply_language import infer_reply_language, local_time_labels
@@ -366,7 +366,9 @@ def self_thinking_tag(provider_config: Any = None) -> str:
     )
 
 
-def chat_system_prompt(provider_config: Any = None) -> str:
+def chat_system_prompt(
+    provider_config: Any = None, *, language: str | None = None,
+) -> str:
     """Return the topic-grouped foreground policy for the selected V2 model.
 
     The shared self-thinking instruction remains atomic (one rendering, chosen
@@ -376,7 +378,7 @@ def chat_system_prompt(provider_config: Any = None) -> str:
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return _join_policy_blocks(
             _CHAT_REPLY_POLICY,
-            self_thinking.instruction_for_field(),
+            self_thinking.instruction_for_field(language=language),
             _CHAT_POLICY_AFTER_THINKING,
         )
     return CHAT_SYSTEM_PROMPT
@@ -670,7 +672,10 @@ def build_turn_messages(
     proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
+    on_tail_message: Callable[[dict, dict], None] | None = None,
 ) -> list[dict]:
+    """``on_tail_message(row, message)`` sees each conversation row next to the
+    message object rendered for it (T768 caption delivery observation)."""
     if application_data_role not in {"user", "assistant"}:
         raise ValueError("application_data_role must be user or assistant")
     has_runtime_context = bool(
@@ -748,6 +753,8 @@ def build_turn_messages(
             messages.append({"role": application_data_role, "content": content})
             continue
         messages.append({"role": _norm_role(m.get("role")), "content": content})
+        if on_tail_message is not None:
+            on_tail_message(m, messages[-1])
 
     if coverage_hole_notice.strip():
         messages.append({

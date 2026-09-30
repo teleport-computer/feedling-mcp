@@ -32,21 +32,27 @@ from core import store as core_store  # noqa: E402
 from hosted import config_store  # noqa: E402
 
 _ENV = {"v": 1, "body_ct": "ct", "nonce": "n"}
+PROVIDER_CONFIG_TEXT_ZH = "模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。"
+PROVIDER_CONFIG_TEXT_EN = (
+    "Model service settings failed the test. Check the endpoint URL, model name, "
+    "and settings, then try again."
+)
 
 
 @pytest.fixture
-def registered_user(client):
+def registered_user(client, request):
     """A fresh registered user. public_key MUST be random — a fixed literal
     would collide across tests sharing the session DB and trip
     account_exists_for_key (409)."""
-    res = client.post(
-        "/v1/users/register",
-        json={"public_key": base64.b64encode(os.urandom(32)).decode("ascii"),
-              "archive_language": "en"},
-    )
+    language = getattr(request, "param", "en")
+    payload = {"public_key": base64.b64encode(os.urandom(32)).decode("ascii")}
+    if language is not None:
+        payload["archive_language"] = language
+    res = client.post("/v1/users/register", json=payload)
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()
-    return {"user_id": body["user_id"], "api_key": body["api_key"]}
+    return {"user_id": body["user_id"], "api_key": body["api_key"],
+            "archive_language": language}
 
 
 @pytest.fixture
@@ -1090,6 +1096,8 @@ def _probe_failure(status, detail):
 
 @pytest.mark.parametrize('entry', ['setup', 'test', 'route_create', 'route_test', 'activate', 'credential'])
 @pytest.mark.parametrize('provider_status,detail,expected_class', _PROBE_FAILURE_CASES)
+@pytest.mark.parametrize('registered_user', ['en', 'zh', None], indirect=True,
+                         ids=['english', 'chinese', 'unset-language'])
 def test_probe_failure_class_across_api_notice_and_persisted_route(
     client, registered_user, fake_provider, fake_envelope, fake_enclave,
     monkeypatch, entry, provider_status, detail, expected_class,
@@ -1140,13 +1148,18 @@ def test_probe_failure_class_across_api_notice_and_persisted_route(
     notice = notices[0]
     assert notice['error_class'] == expected_class
     if expected_class == 'provider_config':
+        # Probe-local notice: localized by archive_language, still unregistered.
         assert expected_class not in catalog.ERROR_CLASSES
         assert notice['blame'] == 'user_provider'
-        assert notice['user_text'] == '模型服务配置未通过测试，请检查接口地址、模型名和配置后重试。'
+        assert notice['user_text'] == (
+            PROVIDER_CONFIG_TEXT_EN if registered_user['archive_language'] == 'en'
+            else PROVIDER_CONFIG_TEXT_ZH
+        )
     else:
         assert expected_class in catalog.ERROR_CLASSES
         assert notice['blame'] == catalog.blame_for(expected_class)
-        assert notice['user_text'] == catalog.user_text_for(expected_class)
+        assert notice['user_text'] == catalog.user_text_for(
+            expected_class, language=registered_user['archive_language'])
     assert notice['dedupe_key'] == f'model_api:test_failed:{expected_class}'
     assert notice['occurrences'] == 2
     assert notice['resolved'] is False
@@ -1201,6 +1214,21 @@ def test_probe_config_class_does_not_expand_runtime_registry():
     assert 'provider_config' not in catalog.registry_export().values
     assert catalog.blame_for('provider_config') == 'system'
     assert catalog.provider_test_notice_for('provider_config')[0] == 'user_provider'
+
+
+@pytest.mark.parametrize('language,expected', [
+    ('en', PROVIDER_CONFIG_TEXT_EN),
+    ('en-US', PROVIDER_CONFIG_TEXT_EN),
+    ('zh-Hans', PROVIDER_CONFIG_TEXT_ZH),
+    ('', PROVIDER_CONFIG_TEXT_ZH),
+])
+def test_probe_config_notice_follows_archive_language(language, expected):
+    from notices import catalog
+
+    assert catalog.provider_test_notice_for('provider_config', language=language) == (
+        'user_provider', expected,
+    )
+    assert 'provider_config' not in catalog.ERROR_CLASSES
 
 
 @pytest.mark.parametrize('action', ['key', 'route', 'setup', 'label', 'failed_key'])

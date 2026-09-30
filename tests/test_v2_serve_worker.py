@@ -908,17 +908,8 @@ def test_context_truncation_reaches_final_debug_event_without_upstream_content(
     )
     assert rare_secret not in raw_admin_response
 
-def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
-    monkeypatch,
-):
-    """Drive the real loader failure taxonomy, not a hand-written summary.
-
-    One server resolves normally. The other enters mcp_client's actual SSRF
-    refusal path, which is the same stable ProbeError shape as an unreachable
-    configured endpoint. The turn stays usable, but its surface must be red and
-    name exactly which expected server disappeared without leaking connection
-    details.
-    """
+def _drive_mixed_mcp_turn(monkeypatch):
+    """Run the real loader with one reachable and one SSRF-refused server."""
     from hosted import mcp_client
 
     store = types.SimpleNamespace(user_id="usr_mcp_observed")
@@ -981,6 +972,21 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
 
     turn = asyncio.run(serve_worker._load_mcp_turn_observed(
         store, api_key="k", runtime_token="rt", job_id="job-mcp-failure"))
+    return turn, traces, recorded
+
+
+def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
+    monkeypatch,
+):
+    """Drive the real loader failure taxonomy, not a hand-written summary.
+
+    One server resolves normally. The other enters mcp_client's actual SSRF
+    refusal path, which is the same stable ProbeError shape as an unreachable
+    configured endpoint. The turn stays usable, but its surface must be red and
+    name exactly which expected server disappeared without leaking connection
+    details.
+    """
+    turn, traces, recorded = _drive_mixed_mcp_turn(monkeypatch)
 
     assert [spec.name for spec in turn.tool_specs] == ["mcp__up__search"]
     assert len(traces) == 1
@@ -990,9 +996,8 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     assert trace["job_id"] == "job-mcp-failure"
     assert trace["detail"]["expected"] == 2
     assert trace["detail"]["resolved"] == 1
-    assert trace["detail"]["skipped"] == [
-        {"name": "down", "kind": "unreachable_from_backend"},
-    ]
+    assert trace["detail"]["skipped_count"] == 1
+    assert trace["detail"]["skipped"] == {"down": "unreachable_from_backend"}
     assert recorded == [[
         {"name": "up", "kind": "available"},
         {"name": "down", "kind": "unreachable_from_backend"},
@@ -1000,6 +1005,56 @@ def test_v2_mcp_mixed_reachable_and_unreachable_servers_are_traced_and_recorded(
     dumped = json.dumps({"trace": trace, "recorded": recorded})
     assert "127.0.0.1" not in dumped
     assert "must-not-leak" not in dumped
+
+
+def test_v2_mcp_surface_detail_survives_the_durable_cap(monkeypatch):
+    """T775: what the durable row keeps, not what the emitter hands over.
+
+    The loader summary alone has 22 keys and _safe_detail keeps the first 20,
+    so spreading it verbatim dropped resolved/skipped from every V2 row (prod:
+    814/814 rows had `expected`, 0 had `resolved`). The test above asserted on
+    the pre-_safe_detail dict and could not see it. This one takes the real
+    loader turn at its widest (catalog attached), pushes the emitted detail
+    through the real _safe_detail, and reads the verdict back with the real
+    probe classifier.
+    """
+    from tools.e2e.user_mcp_handshake_probe import classify
+
+    monkeypatch.setattr(serve_worker, "_LAST_MCP_CATALOG_FINGERPRINT", {})
+    monkeypatch.setattr(
+        serve_worker.mcp_core, "fingerprint_for_store", lambda _store: "fp-t775")
+    turn, traces, _recorded = _drive_mixed_mcp_turn(monkeypatch)
+    [trace] = traces
+    emitted = trace["detail"]
+    assert "catalog" in emitted, "widest shape must include the catalog"
+
+    # Every loader key is placed on purpose; a new one must be named, not
+    # left for insertion order to decide what the cap drops.
+    placed = (set(serve_worker._MCP_SURFACE_FLAT_KEYS)
+              | set(serve_worker._MCP_SURFACE_CAP_KEYS)
+              | set(serve_worker._MCP_SURFACE_OMITTED_KEYS))
+    assert len(placed) == (len(serve_worker._MCP_SURFACE_FLAT_KEYS)
+                           + len(serve_worker._MCP_SURFACE_CAP_KEYS)
+                           + len(serve_worker._MCP_SURFACE_OMITTED_KEYS))
+    assert set(turn.summary) - {"surface_failure_kind"} <= placed
+    assert set(turn.summary) - set(serve_worker._MCP_SURFACE_OMITTED_KEYS) <= (
+        set(emitted) | set(emitted.get("caps") or {}))
+
+    durable = debug_trace._safe_detail(emitted)
+    assert list(durable) == list(emitted), "the durable cap dropped a key"
+    assert set(durable["caps"]) == set(emitted["caps"])
+    assert durable["expected"] == 2
+    assert durable["resolved"] == 1
+    assert durable["skipped_count"] == 1
+    assert durable["skipped"] == {"down": "unreachable_from_backend"}
+
+    events = [{"type": "agent.model.call.done", "detail": {"driver": "v2"}},
+              {"type": "mcp.surface.resolved", "detail": durable}]
+    code, lines = classify(events, runtime="v2", expect="ok", server_count=2)
+    assert code == 1, lines
+    assert any("down:unreachable_from_backend" in x for x in lines), lines
+    code, lines = classify(events, runtime="v2", expect="any", server_count=2)
+    assert code == 0, lines
 
 
 def test_v2_mcp_config_list_failure_is_traced_without_clearing_recent_status(
@@ -1349,7 +1404,7 @@ def test_seq_reader_preserves_local_only_row_as_safe_placeholder(monkeypatch):
 
     assert out == [{
         "id": "local", "seq": 11, "ts": 100.0, "role": "user",
-        "content": "[message unavailable]",
+        "content": "[message unavailable]", "unreadable": True,
     }]
 
 
@@ -1427,7 +1482,7 @@ def test_chat_reader_does_not_fall_back_to_stale_body_when_enclave_key_is_missin
 
     assert out == [{
         "id": "broken-mixed", "seq": 14, "ts": 103.0, "role": "user",
-        "content": "[message unavailable]",
+        "content": "[message unavailable]", "unreadable": True,
     }]
 
 
@@ -1489,7 +1544,7 @@ def test_read_messages_carries_id_and_ts_and_seq_for_coalesce(client, backend_en
     # enter this read path, because compaction shares it.
     assert messages == [{
         "id": "m_synthetic_1", "ts": 12345.0, "seq": seq, "role": "user", "content": "[image]",
-        "has_image": True, "image_mime": "image/jpeg",
+        "caption": "", "has_image": True, "image_mime": "image/jpeg",
     }]
 
 
