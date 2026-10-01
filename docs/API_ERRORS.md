@@ -222,7 +222,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 
 | slug | 状态码 | blame | 说明 | 需本地化 |
 |---|---|---|---|---|
-| `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*` 及任何未知消息）；分诊看 `detail.upstream` | |
+| `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*`、明文账户 backend 搜索组卡失败 `readside_local_error` → `detail.upstream=local_search_error`，及任何未知消息）；分诊看 `detail.upstream` | |
 | `memory_search_resource_limit` | 413 | system | query 全语料超过 4096 卡、32 MiB 内部 JSON 请求或 16 MiB 可搜索 UTF-8 文本；整次失败，不返回局部排名 | |
 | `memory_load_failed` | 503 | system | `memory/service.py` 载入 moments 失败 | |
 | `enclave_unavailable` | 503 | system | 未配置 `FEEDLING_ENCLAVE_URL` | |

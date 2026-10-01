@@ -101,6 +101,8 @@ _UPSTREAM_SIGNALS: tuple[tuple[str, str], ...] = (
     ("api_key_unavailable", "api_key_unavailable"),
     ("enclave_invalid_readside_response", "enclave_invalid_readside_response"),
     ("memory_load_failed", "memory_load_failed"),
+    # T779 step 4: a plaintext account's keyword search failed in backend.
+    ("readside_local_error", "local_search_error"),
 )
 
 

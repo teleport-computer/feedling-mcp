@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import memory_search_contract as contract  # noqa: E402
-from enclave import memory_search  # noqa: E402
+from memory import search_rank  # noqa: E402
 from memgarden import retrieval  # noqa: E402
 from memgarden import timestamps  # noqa: E402
 from memory import jieba_tokenizer as jt  # noqa: E402
@@ -28,7 +28,7 @@ def ids(items):
 
 
 def rank(items, query, **kw):
-    return ids(memory_search.rank(items, query, **kw))
+    return ids(search_rank.rank(items, query, **kw))
 
 
 # --------------------------------------------------------------------------- #
@@ -61,7 +61,7 @@ def test_pinned_precise_tokenizer_keeps_identifiers():
 
 
 def test_wire_version_names_the_real_tokenizer_and_memgarden_ranker():
-    # The backend never imports jieba, so the contract pins the name as a literal.
+    # The contract pins the name as a literal; this keeps it equal to jieba's.
     assert contract.TOKENIZER_NAME == jt.NAME == jt.TOKENIZER.name
     real = retrieval.rank("x", [{"id": "a", "summary": "x"}], tokenizer=jt.TOKENIZER,
                           **contract.RANK_OPTIONS)
@@ -80,14 +80,14 @@ def test_previous_memgarden_protocol_is_the_v1_coverage_gate():
     # finds its answer; the v1 label keeps the old gate for an old backend.
     items = [{"id": "a", "summary": "喜欢喝美式咖啡，不加糖"}]
     query = "我平时早上一般喝什么咖啡"
-    assert ids(memory_search.rank(items, query)) == ["a"]
-    assert ids(memory_search.rank(items, query, protocol=contract.PREVIOUS_MEMGARDEN)) == []
+    assert ids(search_rank.rank(items, query)) == ["a"]
+    assert ids(search_rank.rank(items, query, protocol=contract.PREVIOUS_MEMGARDEN)) == []
     # From 20 candidates on, the two protocols are the same ranking.
     for seed in range(40):
         garden, q = _garden(seed)
         if len(garden) >= 20:
-            assert ids(memory_search.rank(garden, q)) == ids(
-                memory_search.rank(garden, q, protocol=contract.PREVIOUS_MEMGARDEN)), seed
+            assert ids(search_rank.rank(garden, q)) == ids(
+                search_rank.rank(garden, q, protocol=contract.PREVIOUS_MEMGARDEN)), seed
 
 
 # --------------------------------------------------------------------------- #
@@ -158,9 +158,9 @@ def test_previous_protocol_reproduces_old_enclave_bm25_exactly():
         items, query = _garden(seed)
         old = _old_rank(items, query)
         new = retrieval.rank(query, items, tokenizer=jt.TOKENIZER,
-                             text_of=memory_search.search_text, **contract.PREVIOUS_RANK_OPTIONS)
+                             text_of=search_rank.search_text, **contract.PREVIOUS_RANK_OPTIONS)
         assert [(item["id"], score) for item, score in old] == [(h.id, h.score) for h in new.hits], seed
-        assert ids(memory_search.rank(items, query, protocol=contract.PREVIOUS)) == \
+        assert ids(search_rank.rank(items, query, protocol=contract.PREVIOUS)) == \
             [item["id"] for item, _ in old]
 
 
@@ -189,7 +189,7 @@ def test_rank_matches_noncontiguous_terms_not_literal_substring():
     rows = [{"id": "late", "summary": "coffee grinder needs repair", "score": .01},
             {"id": "early", "summary": "coffee shop", "score": 99},
             {"id": "absent", "summary": "other"}]
-    ranked = memory_search.rank(rows, "repair coffee")
+    ranked = search_rank.rank(rows, "repair coffee")
     assert ids(ranked) == ["late", "early"]
     assert ranked[0]["score"] == .01
     assert rows[0]["score"] == .01
@@ -244,7 +244,7 @@ def test_deleted_or_updated_corpus_has_no_stale_stats_or_text_cache():
 
 def test_projection_deduplicates_same_field_and_searches_private_content_and_source():
     item = {"id": "a", "summary": "same", "_search_content": "same"}
-    assert memory_search.search_text(item) == "same"
+    assert search_rank.search_text(item) == "same"
     item["_search_content"] = "unpublished repair code"
     assert rank([item], "repair") == ["a"]
     assert rank([{"id": "s", "summary": "x", "source": "voicecall"}], "voicecall") == ["s"]
@@ -265,10 +265,10 @@ def test_duplicate_ids_are_returned_once():
 def test_resource_limits_are_explicit_and_use_the_io_exception(monkeypatch):
     monkeypatch.setattr(contract, "MAX_TEXT_BYTES", 3)
     with pytest.raises(contract.SearchLimitExceeded):
-        memory_search.rank([{"id": "a", "summary": "needle"}], "needle")
+        search_rank.rank([{"id": "a", "summary": "needle"}], "needle")
     with pytest.raises(contract.SearchLimitExceeded):
-        memory_search.rank([{"id": "a", "summary": "needle"}], "!!!")
+        search_rank.rank([{"id": "a", "summary": "needle"}], "!!!")
     monkeypatch.setattr(contract, "MAX_TEXT_BYTES", 1 << 20)
     monkeypatch.setattr(contract, "MAX_CARDS", 1)
     with pytest.raises(contract.SearchLimitExceeded):
-        memory_search.rank([{"id": "a", "summary": "x"}, {"id": "b", "summary": "x"}], "x")
+        search_rank.rank([{"id": "a", "summary": "x"}, {"id": "b", "summary": "x"}], "x")

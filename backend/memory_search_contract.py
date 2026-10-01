@@ -1,6 +1,7 @@
 """Wire/resource contract shared by search callers and the enclave.
 
-No tokenizer or user-content processing belongs in the backend caller.
+Plaintext accounts are ranked in the backend (``memory.search_rank``) and
+sealed-content accounts in the enclave, with the same code and these limits.
 
 Ranking is ``memgarden.retrieval`` with io's jieba tokenizer
 (``backend/memory/jieba_tokenizer.py``), the same ruler automatic recall uses.
@@ -13,7 +14,7 @@ import json
 from memgarden import retrieval
 
 #: Must equal ``memory.jieba_tokenizer.NAME`` (pinned jieba); a test keeps them equal.
-#: Kept as a literal so the backend caller never imports jieba.
+#: Kept as a literal so reading the contract does not import jieba.
 TOKENIZER_NAME = "jieba-0.42.1"
 
 #: Keyword options passed to ``retrieval.rank`` / ``select_context`` on top of
