@@ -210,6 +210,11 @@ _WAKE_CHOICE_INSTRUCTION = (
     "is anything you want to say to them. Call stay_silent only if you honestly "
     "have nothing to say, or speaking would clearly intrude."
 )
+_WAKE_PERSONA_REPLY_REMINDER = (
+    "If you choose to reply, check the complete visible text against the user's "
+    "existing requirements in the identity context (including custom_persona_prompt), "
+    "while preserving the safety and tool-use rules already given."
+)
 _WAKE_DIRECT_TEXT_CORRECTION = (
     "Your previous assistant text is an unpublished draft, not a message already "
     "sent. Decide once: call reply with the complete text you want them to see "
@@ -2151,7 +2156,7 @@ async def run_tool_loop(
                     (
                         _WAKE_DIRECT_TEXT_CORRECTION
                         if wake_look_first_draft
-                        else _WAKE_CHOICE_INSTRUCTION
+                        else _WAKE_CHOICE_INSTRUCTION + " " + _WAKE_PERSONA_REPLY_REMINDER
                     )
                     if look_first_decide_round
                     and not wake_choice_required

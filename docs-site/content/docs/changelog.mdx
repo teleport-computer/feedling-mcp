@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 heartbeat and manual wakes now include a one-round reminder to
+  check a reply against existing identity requirements after their initial look,
+  when that decision has no draft and is not a forced choice or correction.
+  This prompt change aims to improve adherence; it does not guarantee it or add
+  a model call. Other reply paths keep their existing guidance.
+
 - Keyword memory search (`memory_search`, and `memory_index` with a query) for a
   plaintext account is now ranked in the backend over the account's plaintext
   cards, with the same ranking code, filters, limits and HTTP errors as the

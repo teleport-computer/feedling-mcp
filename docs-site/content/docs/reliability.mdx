@@ -116,7 +116,12 @@ Heartbeat and manual wakes first make one provider call without `reply` or
 lookup, any drafted text stays unpublished and carries into one ordinary decision
 round with both choices offered. If it does look something up, the next round is
 that decision round and carries the same instruction to end the wake with `reply`
-or `stay_silent`; it can still look further. This uses the existing provider-call budget and
+or `stay_silent`; it can still look further. When this decision round has no draft
+and is not a forced choice or direct-text correction, it also reminds the model
+to check a visible reply against the user's existing identity requirements,
+including `custom_persona_prompt`, within the existing safety and tool-use rules.
+This is a prompt reminder, not a guarantee of model adherence or a new retry;
+it disappears after that round. This uses the existing provider-call budget and
 applies only when that budget allows at least three calls. For these two lanes, the
 optional `aside` asks what makes the agent want to reach out now rather than how it
 will answer a message.
