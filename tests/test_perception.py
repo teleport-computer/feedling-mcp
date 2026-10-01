@@ -576,10 +576,12 @@ def test_report_no_setup_accepted_and_stored(env):
     assert service.snapshot(UID)["motion_state"] == {"state": "walking"}
 
 
-def test_location_signal_keeps_labels_drops_precise(env):
+@pytest.mark.parametrize("now", [1790882066.1, 1790882066.1095014])
+def test_location_signal_keeps_labels_drops_precise(env, monkeypatch, now):
     """location_signal carries PRECISE fields; backend keeps only coarse labels
     (place_label via geofence, wifi_label, country) and drops coords/BSSID/address."""
     fake, _ = env
+    monkeypatch.setattr(service, "_now", lambda: now)
     fake.merge_config(UID, {"geofences": [
         {"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150}]})
     service.ingest_snapshot(UID, [_item("location_signal", {
@@ -590,13 +592,18 @@ def test_location_signal_keeps_labels_drops_precise(env):
         "country_region_change": {"locale_region": "US"},
         "placemark": {"locality": "Cupertino", "iso_country_code": "US", "postal_code": "95014"},
     })])
-    st = fake.get_state(UID)
-    assert st["place_label"]["v"] == "home"           # geofence from the raw fix
-    assert st["wifi_label"]["v"] == "home_wifi"
-    assert st["country"]["v"] == "US"
-    blob = str(st)                                    # no precise field anywhere
-    for precise in ("latitude", "37.0", "bssid", "a4:b1", "postal", "95014", "Cupertino"):
-        assert precise not in blob
+    # Compare the entire stored shape: no raw fields, nested values or messages
+    # may leak. A timestamp containing the postal-code digits is still valid.
+    assert fake.get_state(UID) == {
+        field: {"v": value, "ts": now, "msg": ""}
+        for field, value in {
+            "place_label": "home",  # geofence from the raw fix
+            "wifi_label": "home_wifi",
+            "country": "US",
+            "locality": None,
+            "wifi_anchor_id": None,
+        }.items()
+    }
 
 
 def test_snapshot_ttl_nulls_stale(env):
