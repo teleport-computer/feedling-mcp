@@ -265,6 +265,7 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_resident_plaintext_history.py",
+        "test_resident_plaintext_health.py",
         "test_memory_embedding.py",
         "test_memory_embedding_real.py",
         "test_tcp_connect_monitor.py",

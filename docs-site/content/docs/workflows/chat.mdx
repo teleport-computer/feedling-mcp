@@ -801,7 +801,8 @@ have the same trust level.
 
 #### Decrypt-health heartbeat and onboarding
 
-An official resident reports decrypt-source health on poll requests only:
+An official resident reports read-source health through the existing
+`X-Feedling-Decrypt-*` headers on poll requests only:
 
 | Status | Meaning |
 | --- | --- |
@@ -809,6 +810,20 @@ An official resident reports decrypt-source health on poll requests only:
 | `degraded` | Consecutive claimed messages could not be recovered as non-empty plaintext. The standard consumer changes to this status after two consecutive read failures by default; `FEEDLING_DECRYPT_DEGRADE_AFTER` changes that threshold (minimum 1). Only a later real, ordinary user-message decrypt clears this state. A server-generated maintenance turn is not recovery evidence. |
 | `unconfigured` | `FEEDLING_ENCLAVE_URL` is absent. |
 | `unreachable` | The configured enclave decrypt source could not be reached. |
+| `backend_ready` | For effective-off accounts, an authenticated backend history read returned a valid page (possibly empty), or an actual message read succeeded. This does not prove old ciphertext decryptable. |
+| `backend_unreachable` | The backend history probe/read failed: transport, HTTP, JSON or page shape. |
+| `backend_degraded` | Consecutive claimed messages could not be read from backend history. Only a real successful message read clears this state; probes cannot. |
+
+The server accepts the three `backend_*` statuses only when its own account
+registry resolves effective content encryption to `off`; a client header cannot
+bypass an encrypted account's requirement. Legacy decrypt statuses remain
+accepted with their existing meanings for older consumers. Upgraded effective-off
+consumers use backend probes at startup and on idle refresh, regardless of an
+enclave URL; they neither reuse nor publish shared enclave health. On a whoami
+mode change they discard the previous route's status and probe throttle.
+Encrypted and unknown consumers retain the enclave probe, shared positive
+cache, and selfcheck 401/404 history fallback. Startup probe failures are logged
+while polling continues.
 
 `X-Feedling-Decrypt-Checked-At` is the Unix epoch time of the confirmation. The
 backend accepts a report as fresh for 300 seconds. The standard resident
@@ -836,14 +851,16 @@ older server as false. The backoff uses
 can change the retry count with `FEEDLING_CHAT_RESPONSE_MAX_RETRIES`.
 
 For a resident-route account that has not completed one ordinary user/agent
-exchange, every non-`ok` result blocks onboarding validation, live-loop
+exchange, a report that is neither fresh `ok` nor accepted `backend_ready`
+blocks onboarding validation, live-loop
 verification, and visible Chat with `409 bootstrap_incomplete` and
 `stage: "needs_decrypt_source"`. `GET /v1/onboarding/validate` exposes the
 ordered `decrypt_source` step, and `GET /v1/bootstrap/status` exposes
 `decrypt_source_ready`, `decrypt_health`, and `decrypt_health_policy`.
 
 After an account has a durable successful first Chat exchange, explicit
-`degraded`, `unconfigured`, or `unreachable` still blocks onboarding completion
+`degraded`, `unconfigured`, `unreachable`, `backend_degraded`, or
+`backend_unreachable` still blocks onboarding completion
 and a new sticky verification, but does not add a new hard block to ordinary
 Chat. An `unknown` report receives a seven-day warning-only onboarding grace;
 it cannot mint a sticky verification during the grace, and after the grace it

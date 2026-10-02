@@ -29,6 +29,17 @@ If the probe fails, the consumer logs an error, reports decrypt health as
 are skipped; later cycles can recover when the source becomes reachable.
 Startup authentication and encryption-module checks still must succeed.
 
+For an effective-off account, startup instead makes one authenticated backend
+history read (`limit=1`, omitted image bodies, 10-second timeout), even without
+an enclave URL. A valid page, including an empty page, reports `backend_ready`;
+HTTP, transport, JSON or page-shape failure reports `backend_unreachable`.
+Failure logs an error and continues polling; it is not a hard startup block.
+Idle checks use the same account-local backend route. These results never read
+or write the runner's shared enclave health file. A whoami mode change clears
+the previous route's health and probe throttle before another poll report.
+Consecutive unreadable claimed messages report `backend_degraded`; only an
+actual successful message read clears that degradation, not a reachability probe.
+
 ## Resident plaintext history
 
 Upgraded consumers read history and omitted plaintext bodies from the
@@ -42,9 +53,9 @@ per-turn memory-selection anchor. Encrypted and unknown accounts keep their
 existing decrypt-service paths.
 
 This history policy is independent of the memory-selection switch below.
-Startup probes and health reporting still use the existing decrypt-source
-checks; this history change alone does not make all Resident operations
-independent of the enclave. Plaintext history and attachments are visible to
+Startup and health probes follow the account mode described above; other
+Resident operations, including the separate memory-selection fallback, may
+still depend on the enclave. Plaintext history and attachments are visible to
 the authenticated backend and resident host; neither an ordinary VPS nor this
 routing change adds a hardware confidentiality boundary.
 
@@ -548,9 +559,10 @@ traffic until all enabled capabilities pass:
   Runtime V2 worker heartbeat, or a V1 resident supervisor heartbeat during the
   dual-runtime window) and a test turn produces an encrypted assistant
   response; or the resident consumer polls with fresh
-  `X-Feedling-Decrypt-Status: ok` and
+  `X-Feedling-Decrypt-Status: ok` (enclave path) or `backend_ready`
+  (effective-off backend path), with fresh
   `X-Feedling-Decrypt-Checked-At` headers, passes `POST /v1/chat/verify_loop`,
-  and replies to an ordinary encrypted test turn.
+  and replies to an ordinary test turn in the account's effective content mode.
 - Provider cache telemetry reports the expected route and usage fields. Where
   prompt caching matters operationally, run a two-turn cache-hit canary against
   the exact provider/model; do not infer a live hit from unit tests. The

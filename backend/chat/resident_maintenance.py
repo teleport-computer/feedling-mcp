@@ -404,8 +404,13 @@ def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
             "unconfigured": "启动环境缺少 FEEDLING_ENCLAVE_URL,resident 无法解密真实加密消息,用户消息会被跳过不回复。",
             "unreachable": "配置的 FEEDLING_ENCLAVE_URL 探测失败,可能是网络/TLS/防火墙问题。",
             "degraded": "最近有已认领的加密消息连续多次读不出明文。",
+            "backend_unreachable": "resident 无法读取已认证的 backend history,或返回的历史页格式无效。",
+            "backend_degraded": "resident 连续多次无法从 backend history 读取已认领的消息。",
         }.get(status, "resident 的解密源明确报告失败,真实加密消息目前无法可靠回复。")
-        steps = _decrypt_steps()
+        steps = (
+            "检查 FEEDLING_API_URL、当前账户凭证、网络/TLS、history 响应格式和消息正文。"
+            if status.startswith("backend_") else _decrypt_steps()
+        )
     else:
         issue = {
             "missing_consumer_commit": "你所在的 resident consumer 没有向服务端上报版本号(commit),通常说明这份代码太旧,缺少近期的自动更新与蒸馏逻辑。",
@@ -434,6 +439,8 @@ def _notice_text(reason: Mapping[str, Any]) -> str:
             "或健康心跳已过期；这不代表解密源已经故障。"
         )
     if str(reason.get("reason") or "") == "decrypt_source_unavailable":
+        if str(reason.get("decrypt_status") or "").startswith("backend_"):
+            return "你的 resident 无法可靠读取 backend history。请检查 API 地址、账户凭证、网络和历史响应。"
         return (
             "你的 resident 解密源不可用，真实消息目前无法回复。"
             "请检查 FEEDLING_ENCLAVE_URL、网络/TLS 和 enclave 密钥配置。"
@@ -578,7 +585,7 @@ def _maybe_handle_poll(
         state_fallback_skipped = False
         state_should_emit_notice_only = False
         maintenance = _maintenance_state(state.get("resident_maintenance"))
-        health = chat_consumer._decrypt_health_from_state(state, now_epoch=now)
+        health = chat_consumer._decrypt_health_from_state(state, now_epoch=now, store=store)
         decrypt_policy = chat_consumer._decrypt_health_enforcement_state(
             store,
             {"decrypt_health": health},

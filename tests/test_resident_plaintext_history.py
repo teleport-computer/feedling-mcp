@@ -366,4 +366,7 @@ def test_run_without_enclave_reads_backend_and_distinguishes_empty_from_failure(
     crc.run()
     assert saved == expected_checkpoints
     assert [m["content"] for m in processed] == ([] if expected_content is None else [expected_content])
-    assert len(requests) == 1 and requests[0].url.path == "/v1/chat/history"
+    # Startup now proves backend readiness before the ordinary poll-history read.
+    assert [r.url.path for r in requests] == ["/v1/chat/history", "/v1/chat/history"]
+    assert dict(requests[0].url.params) == {"limit": "1", "include_image_body": "false"}
+    assert requests[1].url.params["since"] == "1.0"

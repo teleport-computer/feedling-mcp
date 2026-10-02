@@ -3569,6 +3569,27 @@ _SHARED_HEALTH_REUSABLE = frozenset({"ok"})
 # the reuse grace to POLL_TIMEOUT and with dedicated tests.
 
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
+# Route ownership is local to this consumer, never stored in the shared enclave
+# file. A whoami mode change invalidates the previous route's proof and throttle.
+_decrypt_health_route: dict = {"plaintext": None}
+
+
+def _sync_decrypt_health_route() -> None:
+    plaintext = _plaintext_account()
+    previous = _decrypt_health_route["plaintext"]
+    if previous is not None and previous != plaintext:
+        _decrypt_health.update(status="unknown", checked_at=0.0)
+        _decrypt_health_last_refresh["at"] = 0.0
+        _decrypt_read_failures["count"] = 0
+    _decrypt_health_route["plaintext"] = plaintext
+
+
+def _read_health_status(status: str) -> str:
+    """Keep backend read readiness distinct from an enclave decrypt verdict."""
+    if _plaintext_account():
+        return {"ok": "backend_ready", "unreachable": "backend_unreachable",
+                "degraded": "backend_degraded"}.get(status, status)
+    return status
 
 # One unreadable claim can be a transient blip (claim/history race, a single
 # boundary message). Degrading on the first one parked healthy established
@@ -3588,7 +3609,8 @@ _decrypt_read_failures = {"count": 0}
 
 
 def _set_decrypt_health(status: str) -> None:
-    _decrypt_health["status"] = status
+    _sync_decrypt_health_route()
+    _decrypt_health["status"] = _read_health_status(status)
     _decrypt_health["checked_at"] = time.time()
 
 
@@ -3598,14 +3620,16 @@ def _note_decrypt_read_failure() -> None:
     Below the streak threshold the current status is left untouched (the
     heartbeat/probe path keeps reporting it) so a lone blip never flips a
     healthy resident to degraded."""
+    _sync_decrypt_health_route()
     _decrypt_read_failures["count"] += 1
     if _decrypt_read_failures["count"] >= DECRYPT_DEGRADE_AFTER:
         _set_decrypt_health("degraded")
 
 
 def _note_decrypt_read_success() -> None:
-    """A real message decrypted to non-empty plaintext — the only signal that
+    """A real message read as non-empty plaintext — the only signal that
     clears degraded (reachability probes never do) and resets the streak."""
+    _sync_decrypt_health_route()
     _decrypt_read_failures["count"] = 0
     _set_decrypt_health("ok")
 
@@ -3615,6 +3639,7 @@ def _decrypt_health_headers() -> dict:
     first reading. The backend treats a missing header as ``unknown`` on purpose
     (no inheritance of a previous green), so emitting nothing while status is
     unknown is correct rather than shipping a hollow value."""
+    _sync_decrypt_health_route()
     status = str(_decrypt_health.get("status") or "unknown")
     if status == "unknown":
         return {}
@@ -3625,17 +3650,14 @@ def _decrypt_health_headers() -> dict:
 
 
 def _measure_infra_health() -> str:
-    """Pure reachability probe of the SHARED decrypt infrastructure. Returns an
-    infra-layer status — ``ok`` | ``unreachable`` | ``unconfigured`` — and does
-    NOT touch _decrypt_health. This is exactly the value published to the
-    runner-shared health file: it must never carry a per-user ``degraded`` (that
-    signal is local-only; the degrade-masking lives in _apply_infra_health).
+    """Measure the whoami-selected read route without mutating local health.
 
-    Stage 2 (FEEDLING_DECRYPT_SELFCHECK): prefer the not-bound-to-any-user
-    /v1/decrypt/selfcheck endpoint (real content_sk round trip + loopback).
-    An enclave predating that endpoint answers 404, and we transparently fall
-    back to the history reachability probe — so enabling the flag before the
-    enclave rolls out is a soft degrade, not a false outage."""
+    Effective-off returns account-local backend_ready/backend_unreachable.
+    Other modes return enclave ok/unreachable/unconfigured; only enclave ok
+    is eligible for sharing. Selfcheck 401/404 retains the history fallback.
+    """
+    if _plaintext_account():
+        return _measure_backend_history_health()
     if not FEEDLING_ENCLAVE_URL:
         return "unconfigured"
     if DECRYPT_SELFCHECK:
@@ -3644,6 +3666,41 @@ def _measure_infra_health() -> str:
             return status
         # endpoint absent (old enclave) → fall through to the history probe
     return _measure_via_history_probe()
+
+
+def _validated_backend_history_rows(data: object) -> list[dict]:
+    """Validate an actual history response before it can prove read readiness."""
+    if not isinstance(data, dict):
+        raise ValueError("invalid history page")
+    rows = data["messages"] if "messages" in data else data["history"]
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("invalid history page")
+    for row in rows:
+        if not (row.get("id") or row.get("message_id")):
+            raise ValueError("missing history message id")
+        ts = float(row["ts"] if "ts" in row else row["timestamp"])
+        if not -float("inf") < ts < float("inf"):
+            raise ValueError("invalid history timestamp")
+    return rows
+
+
+def _measure_backend_history_health() -> str:
+    """Authenticated, account-local read probe; no body hydration or enclave.
+
+    An empty valid page proves the backend read route, never decryption of old
+    sealed rows. This result must neither consume nor publish shared health.
+    """
+    try:
+        resp = _HTTP.get(
+            f"{FEEDLING_API_URL}/v1/chat/history",
+            params={"limit": 1, "include_image_body": "false"},
+            headers=_HEADERS, timeout=10,
+        )
+        resp.raise_for_status()
+        _validated_backend_history_rows(resp.json())
+    except Exception:
+        return "backend_unreachable"
+    return "backend_ready"
 
 
 def _measure_via_history_probe() -> str:
@@ -3688,6 +3745,8 @@ def _measure_via_selfcheck() -> str | None:
         data = resp.json()
     except Exception:
         return "unreachable"
+    if not isinstance(data, dict):
+        return "unreachable"
     decrypt = data.get("decrypt")
     loopback = data.get("loopback")
     if decrypt == "ok" and loopback == "ok":
@@ -3715,17 +3774,19 @@ def _measure_via_selfcheck() -> str | None:
 
 
 def _apply_infra_health(status: str, *, checked_at: float | None = None) -> None:
-    """Fold an infra-layer status into the reported decrypt health, preserving
-    the per-user degrade: a standing ``degraded`` is never upgraded to ``ok`` by
+    """Fold a route probe into read health, preserving same-route degradation:
+    backend_degraded follows the same rule as degraded; a standing ``degraded`` is never upgraded to ``ok`` by
     a mere reachability signal (only a real non-empty decrypt clears it), just
     heartbeated so it stays fresh. ``checked_at`` lets a consumer reusing a
     runner-shared reading report that reading's REAL probe time, so a lagging
     consumer ages into the backend's own staleness window instead of vouching a
     stale ``ok`` under its own clock; None means "our own probe, stamp now"."""
+    _sync_decrypt_health_route()
+    status = _read_health_status(status)
     at = time.time() if checked_at is None else checked_at
     cur_status = _decrypt_health.get("status")
     cur_at = float(_decrypt_health.get("checked_at") or 0.0)
-    if cur_status == "degraded":
+    if cur_status in {"degraded", "backend_degraded"}:
         # A reachability signal (ANY of ok / unreachable / unconfigured) is
         # orthogonal to a per-user envelope degrade and must NEVER overwrite it —
         # only a real decrypt success (_note_decrypt_read_success) or a failure
@@ -3797,8 +3858,8 @@ _decrypt_health_last_refresh = {"at": 0.0}
 
 
 def _maybe_refresh_decrypt_health() -> None:
-    """Throttled idle refresh so an idle-but-healthy resident keeps a fresh
-    checked_at without probing the enclave on every poll cycle.
+    """Throttled idle refresh of the account's backend or enclave read route.
+    Effective-off skips the shared enclave file entirely.
 
     Shared mode (FEEDLING_DECRYPT_HEALTH_SHARED): reading the runner-shared file
     is a local op, so every idle cycle reuses a fresh peer reading — carrying its
@@ -3809,8 +3870,9 @@ def _maybe_refresh_decrypt_health() -> None:
     most a handful of peers probe together before the fresh write reuses
     everyone. The per-user envelope layer (_note_decrypt_read_*) still wins — a
     standing ``degraded`` is never overridden by a shared ``ok``."""
+    _sync_decrypt_health_route()
     now = time.time()
-    if not DECRYPT_HEALTH_SHARED:
+    if _plaintext_account() or not DECRYPT_HEALTH_SHARED:
         if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
             return
         _decrypt_health_last_refresh["at"] = now
@@ -3841,14 +3903,24 @@ def _maybe_refresh_decrypt_health() -> None:
 
 
 def _verify_decrypt_sources() -> bool:
-    """Probe all configured decrypt sources at startup.
+    """Probe the whoami-selected read source at startup.
 
-    Returns True if at least one configured source is reachable.
-    Each unreachable source is logged at ERROR level so the operator
-    can distinguish "configured but broken" from "not configured at all".
-    Uses the runtime enclave timeout and bounded transient-failure retries.
-    Also seeds the reported decrypt-health status.
+    Effective-off uses authenticated backend history, even without an enclave
+    URL. Other modes retain the bounded enclave startup probe below.
+
+    Returns whether the selected source probe succeeded and seeds read health.
+    Encrypted mode uses the runtime enclave timeout and bounded transient retries;
+    effective-off uses one bounded backend probe. Failure does not stop startup.
     """
+    _sync_decrypt_health_route()
+    if _plaintext_account():
+        status = _measure_backend_history_health()
+        _apply_infra_health(status)
+        _decrypt_health_last_refresh["at"] = time.time()
+        if status != "backend_ready":
+            log.error("backend history startup probe failed; continuing to poll")
+        return status == "backend_ready"
+
     any_ok = False
 
     if FEEDLING_ENCLAVE_URL:
@@ -3949,19 +4021,7 @@ def _fetch_plaintext_or_mixed_history(
         resp.raise_for_status()
         data = resp.json()
         if plaintext_only:
-            rows = data["messages"] if "messages" in data else data["history"]
-            if not isinstance(rows, list) or any(
-                not isinstance(row, dict) for row in rows
-            ):
-                raise ValueError("invalid history page")
-            # Validate before filtering: a broken timestamp must not look like
-            # a healthy empty page and advance the poll checkpoint.
-            for row in rows:
-                if not (row.get("id") or row.get("message_id")):
-                    raise ValueError("missing history message id")
-                ts = float(row["ts"] if "ts" in row else row["timestamp"])
-                if not -float("inf") < ts < float("inf"):
-                    raise ValueError("invalid history timestamp")
+            rows = _validated_backend_history_rows(data)
         else:
             rows = data.get("messages") or data.get("history") or []
     except Exception as exc:
@@ -14988,6 +15048,7 @@ def _load_whoami() -> bool:
         archive_language=archive_language,
         content_encryption_effective=content_encryption_effective,
     )
+    _sync_decrypt_health_route()
     ok = bool(user_id and user_pk)
     if _whoami_cache_has_full_keys():
         global _whoami_cache_loaded_at
@@ -15075,6 +15136,7 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
         return True
     if not _whoami_cache_has_encryption_keys() and _whoami_cache_has_encryption_keys(previous):
         _whoami_cache.update(previous)
+        _sync_decrypt_health_route()
     if _whoami_cache_has_encryption_keys():
         # Bounded fallback: a cache this old may predate a key rotation, and
         # sealing to a retired key stores ciphertext the device can never open
@@ -21458,18 +21520,21 @@ def _process_messages(messages: list) -> float:
             # Genuinely empty text — a message was CLAIMED but can't be read.
             # Report the health so the backend surfaces the real blocker instead
             # of a verify_ping-only false green. Preserve the actionable
-            # distinction: no source at all → unconfigured (the usr_6c1971 case);
-            # a configured source that still yielded no plaintext → a read
-            # failure, degrading only on a streak (single blips stay green).
-            # Never send a fallback for content we cannot read.
-            if FEEDLING_ENCLAVE_URL:
+            # distinction: effective-off always has the backend read route;
+            # encrypted/unknown accounts without an enclave are unconfigured.
+            # A selected source that yields no plaintext counts toward the
+            # read-failure streak. Never send a fallback for unreadable content.
+            plaintext = _plaintext_account()
+            if plaintext or FEEDLING_ENCLAVE_URL:
                 _note_decrypt_read_failure()
             else:
                 _apply_infra_health("unconfigured")   # reachability → guarded set
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
-                "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
+                "— skipping (%s)",
                 ts, content_type,
+                "check backend history and message bodies" if plaintext
+                else "set FEEDLING_ENCLAVE_URL to enable decryption",
             )
             latest = max(latest, ts)
             continue
@@ -24084,14 +24149,15 @@ def run() -> None:
             target=_redistill_ipc_serve_forever, args=(RESIDENT_IPC_SOCK,), daemon=True,
         ).start()
 
-    if FEEDLING_ENCLAVE_URL:
+    if _plaintext_account() or FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():
             # Keep the consumer alive so later poll cycles can recover without
             # a supervisor restart; failed history reads already skip the cycle.
             log.error(
-                "decrypt source unreachable at startup after up to %d attempts; "
+                "%s source unreachable at startup after up to %d attempts; "
                 "continuing — poll cycles will be skipped until it recovers",
-                ENCLAVE_FETCH_MAX_ATTEMPTS,
+                "backend history" if _plaintext_account() else "decrypt",
+                1 if _plaintext_account() else ENCLAVE_FETCH_MAX_ATTEMPTS,
             )
     else:
         # No decrypt source at all. Establish the reported health immediately so
@@ -24104,7 +24170,7 @@ def run() -> None:
         log.warning(
             "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
             "User messages in v1 encrypted mode have content=\"\" and will be "
-            "silently skipped — the consumer will never send replies. "
+            "skipped until the decrypt source recovers. "
             "Set FEEDLING_ENCLAVE_URL (direct enclave) to fix this."
         )
 
