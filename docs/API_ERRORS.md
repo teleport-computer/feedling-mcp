@@ -213,6 +213,18 @@ canonical_owner: self
 | `memory_action_failed` | — | — | `_execute_memory_actions` 的兜底默认值（正常路径下单个 action 总会带自己的 `error`，状态码随子 action） | |
 | `db_write_failed` | 500 | system | | |
 
+### resident 每轮挑卡（`POST /v1/memory/turn-selection`，T788）
+
+明文 resident 账号的每轮挑卡由 backend 完成（纯关键词）。开关 `FEEDLING_RESIDENT_PLAINTEXT_RECALL`（默认 off）。consumer 约定：只有 404（旧 backend）和 409 才自己走 enclave 旧路；其余错误一律记 unknown，不再重试 enclave（回退的唯一负责方是 backend）。
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `not_served` | 409 | — | 开关 off（detail `mode_off`）或账号不是明文（detail `account_encrypted`）；**保证 backend 没有调用 enclave** | |
+| `recall_unavailable` | 503 | system | 本轮拿不到挑卡：预算耗尽、容量不足或选择失败；backend 最多回退一次，预算不足时不启动回退；consumer 不再重试 enclave | |
+| `message_not_in_window` | 422 | — | 请求的 message_id 不在按 seq 读出的那一页里 | |
+| `request_too_large` | 413 | — | 请求体超过 1024 字节（先核 Content-Length，流式读取中一旦超限立即停止） | |
+| `request_invalid` | 400 | — | 已有 slug；本路由 detail 为 `invalid_body` / `invalid_message_id` / `invalid_seq` | |
+
 ### readside（`/v1/memory/index`、`/v1/memory/fetch`）
 
 `memory_readside_core` 抛的 `RuntimeError` / `ValueError` 曾以 `str(e)` 原样回传，

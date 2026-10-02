@@ -502,6 +502,7 @@ jobs:
             tests/test_recall_select_extraction.py \
             tests/test_history_view_extraction.py \
             tests/test_plaintext_recall.py \
+            tests/test_resident_recall.py \
             tests/test_recall_observability.py \
             tests/test_memory_vectors_route_pg.py \
             tests/test_garden_selection_pluggable.py \
