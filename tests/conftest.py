@@ -289,6 +289,7 @@ if not _provisioned:
         "test_history_view_extraction.py",
         "test_plaintext_recall.py",
         "test_resident_recall.py",
+        "test_resident_recall_deploy.py",
         "test_recall_observability.py",
         "test_memgarden_public_api_only.py",
         "test_memory_result_budget.py",

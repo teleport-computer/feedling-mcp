@@ -38,6 +38,24 @@ change it). Encrypted and unknown accounts retain their existing decrypt-service
 path. This switch is independent of Runtime V2 recall and does not install an
 embedding model or enable vector preparation.
 
+The repository's test deployment accepts the GitHub repository variable
+`TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL`. Unset or empty means `off`; otherwise
+it must be exactly `off`, `shadow`, or `on` (lowercase, without surrounding
+whitespace). The test deployment rejects other values before calling the
+deployment command. The value is passed only to the test backend through the
+normal compose deployment. Changing the variable alone does not update running
+workers: redeploy, then verify the existing workers' mode and the Hosted or
+self-hosted consumer version separately. Production and pre deployment wiring
+are unchanged.
+
+Start with `shadow` to observe comparisons, then enable `on` after the relevant
+checks pass. Shadow still returns the decrypt-service result; a missing
+background comparison is unmeasured, and a comparable result is not necessarily
+an equal result. Verify the actual backend response and memory injected by the
+consumer for the same turn before claiming that it used local selection.
+Rollback uses `off` followed by the same normal redeployment and runtime
+verification; it does not require changing account encryption or stored data.
+
 With `on`, the backend reads that account's plaintext history and memory cards
 to select lexical matches. Remaining sealed cards are excluded from local
 selection; sealed history requires the existing decrypt-service fallback.
