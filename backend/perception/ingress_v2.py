@@ -39,6 +39,7 @@ def wake_event_from_differ_event_v2(
     *,
     ts: float,
     origin_refs: Iterable[str] = (),
+    wake_id: str | None = None,
 ) -> WakeEventV2:
     return WakeEventV2(
         user_id=user_id,
@@ -49,6 +50,7 @@ def wake_event_from_differ_event_v2(
         presence_hints=dict(event.presence_hints or {}),
         origin_refs=tuple(str(ref) for ref in origin_refs if str(ref)),
         payload=dict(event.payload or {}),
+        **({"wake_id": wake_id} if wake_id else {}),
     )
 
 

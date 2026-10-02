@@ -23,10 +23,10 @@ one connection, so the adapter deliberately takes a connection rather than a
 pool -- but keeping one open between rounds means an idle transaction sitting
 on the database for the whole sleep.
 
-Die on one bad event. A single event that makes the runtime raise must not
-end the loop; the outbox would stop draining for everybody. It is logged and
-the round moves on, and the delivery state machine's retry cap eventually
-sends a permanently failing event to dead-letter.
+Die on one uncertain event. A single event that makes the runtime raise must
+not end the loop; the outbox would stop draining for everybody. Once dispatch
+has started, uncertainty is frozen as ``unknown`` and a later round resolves it
+only from durable Runtime evidence; it is never blindly retried.
 """
 from __future__ import annotations
 
@@ -35,6 +35,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from perceptkit.contracts import delivery as _delivery
+from perceptkit.contracts.event import EventCondition, PerceptionEvent, safe_context
+from perceptkit.contracts.receipt import WakeReceipt
 from perceptkit.processing.dispatch import DispatchOutcome, drain
 
 log = logging.getLogger(__name__)
@@ -72,6 +75,74 @@ def run_once(
         now=now or datetime.now(timezone.utc),
         limit=batch, lease_seconds=lease_seconds,
     )
+
+
+def _event(entry) -> PerceptionEvent:
+    raw_condition = entry.fact_snapshot.get("condition") or {}
+    return PerceptionEvent(
+        event_id=entry.event_id,
+        definition_id=entry.definition_id,
+        definition_version=entry.definition_version,
+        subject_id=entry.subject_id,
+        type=entry.event_type,
+        signal=str(entry.fact_snapshot.get("signal") or ""),
+        occurred_at=entry.occurred_at,
+        received_at=entry.detected_at,
+        condition=EventCondition(
+            type=str(raw_condition.get("type") or "unknown"),
+            operator=raw_condition.get("operator"),
+            value=raw_condition.get("value"),
+        ),
+        field_name=entry.fact_snapshot.get("field"),
+        previous=entry.fact_snapshot.get("previous"),
+        current=entry.fact_snapshot.get("current"),
+        context=safe_context(entry.fact_snapshot.get("context")),
+    )
+
+
+def reconcile_unknown(
+    *,
+    storage_factory: Callable[[], Any],
+    lookup: Callable[[Any], Any],
+    now: datetime | None = None,
+    limit: int = DEFAULT_BATCH,
+) -> DispatchOutcome:
+    """Resolve only attempts backed by one durable Runtime enqueue row."""
+    storage = storage_factory()
+    outcome = DispatchOutcome()
+    received_at = now or datetime.now(timezone.utc)
+    for entry in storage.list_unknown_events(limit=limit):
+        try:
+            result = lookup(_event(entry))
+        except Exception:  # absence/lookup failure is never proof of failure
+            log.exception("perceptkit unknown lookup failed; leaving event unknown")
+            continue
+        if (result is None or not bool(getattr(result, "accepted", False))
+                or not getattr(result, "runtime_ref", None)):
+            continue
+        receipt = WakeReceipt(
+            event_id=entry.event_id,
+            attempt_id=f"{entry.event_id}:{entry.attempt_count}",
+            status="accepted",
+            received_at=received_at,
+            runtime_ref=str(result.runtime_ref),
+        )
+        state = storage.record_wake_receipt(
+            receipt=receipt, next_state=_delivery.DELIVERED,
+            claim_token=entry.claim_token,
+        )
+        if state == _delivery.DELIVERED:
+            outcome.delivered.append(entry.event_id)
+    return outcome
+
+
+def _merge(left: DispatchOutcome, right: DispatchOutcome) -> DispatchOutcome:
+    for name in (
+        "delivered", "retrying", "dead", "suppressed", "rejected",
+        "invalidated", "unknown",
+    ):
+        getattr(left, name).extend(getattr(right, name))
+    return left
 
 
 def run_forever(
@@ -117,7 +188,7 @@ def run_forever(
 
 
 __all__ = ["DEFAULT_BATCH", "DEFAULT_LEASE_SECONDS", "DEFAULT_IDLE_SLEEP",
-           "run_once", "run_forever"]
+           "run_once", "run_forever", "reconcile_unknown"]
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +219,19 @@ def run_round(*, now: datetime | None = None,
     # 空闲事务；而 transaction() 又要求所有写在同一条连接上，所以是"每轮一条"。
     with db.get_pool().connection() as conn:
         conn.autocommit = True
-        return run_once(
+        dispatched = run_once(
             storage_factory=lambda: PostgresStorage(conn),
             wake=FeedlingWakePort(),
             worker_id=_worker_id(),
             now=now, batch=batch,
         )
+        from .. import service
+        reconciled = reconcile_unknown(
+            storage_factory=lambda: PostgresStorage(conn),
+            lookup=service._lookup_wake_event_v2,
+            now=now, limit=batch,
+        )
+        return _merge(dispatched, reconciled)
 
 
 def _worker_id() -> str:

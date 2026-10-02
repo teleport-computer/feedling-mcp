@@ -173,12 +173,17 @@ def test_a_failing_round_does_not_end_the_loop(db):
 
 
 def test_a_runtime_that_raises_is_the_kits_problem_not_the_loops(db):
-    """runtime 抛异常算投递失败、进重试 —— 不是 worker 该处理的异常。"""
+    """Runtime 结果不确定时冻结为 unknown，不能靠重试猜是否已入队。"""
     store = factory()
     store.enqueue_event(entry("e1"))
     out = worker.run_once(storage_factory=factory, wake=Runtime("raise"),
                           worker_id="w1", now=T0)
-    assert out.retrying == ["e1"] and not out.delivered
+    assert out.unknown == ["e1"] and not out.delivered and not out.retrying
+    assert store.list_pending_events(subject_id="u1") == []
+    healthy = Runtime()
+    later = worker.run_once(storage_factory=factory, wake=healthy,
+                            worker_id="w2", now=T0 + timedelta(days=1))
+    assert not later.delivered and healthy.seen == []
 
 
 def test_the_loop_sleeps_instead_of_spinning_on_an_empty_outbox(db):

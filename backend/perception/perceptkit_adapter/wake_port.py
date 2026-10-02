@@ -20,6 +20,7 @@ runtime 决定怎么运行、要不要跟用户说话。
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,15 @@ _SOURCE_BY_TYPE = {
 _DEFAULT_SOURCE = "perception_event"
 
 
+@dataclass(frozen=True)
+class RuntimeEnqueueResult:
+    """Authoritative result of the host's durable Runtime enqueue boundary."""
+
+    accepted: bool
+    runtime_ref: str | None = None
+    reason: str | None = None
+
+
 class FeedlingWakePort:
     """io 的 WakePort 实现。
 
@@ -49,7 +59,7 @@ class FeedlingWakePort:
         #: 本进程内已投过的 event_id。**这不是幂等的全部** —— 真正的幂等靠
         #: 外发箱里的 wake receipt（跨进程、跨重启）。这里只挡住同一个进程
         #: 里的重复投递，省掉一次没必要的排队。
-        self._seen: set[str] = seen if seen is not None else set()
+        self._seen: dict[str, str | None] = seen if seen is not None else {}
 
     def wake(self, event: Any, attempt: Any):
         from perceptkit.contracts.receipt import WakeReceipt
@@ -58,28 +68,30 @@ class FeedlingWakePort:
         attempt_id = getattr(attempt, "attempt_id", None) or "1"
         if event.event_id in self._seen:
             return WakeReceipt(event_id=event.event_id, attempt_id=attempt_id,
-                               status="duplicate", received_at=now)
+                               status="duplicate", received_at=now,
+                               runtime_ref=self._seen[event.event_id])
         try:
-            accepted = self._deliver(event, now)
+            result = self._deliver(event, now)
         except Exception as exc:                   # noqa: BLE001
             # 真正的意外。让调用方安排重试 —— 但**不要**把它说成拒绝，
             # 那会让一次连接抖动看起来像用户设置的静音。
             log.warning("perceptkit wake delivery failed (%s): %s",
                         event.event_id, exc)
             raise
-        self._seen.add(event.event_id)
+        self._seen[event.event_id] = result.runtime_ref
         return WakeReceipt(
             event_id=event.event_id, attempt_id=attempt_id,
             # 契约里表达「runtime 收到了但决定不说话」的词是
             # `conversation_suppressed`，不是 `suppressed` —— 后者不在允许值
             # 里，写进去会被当成投递失败，然后**一直重试到闸放行为止**，
             # 正好绕过那道闸。
-            status="accepted" if accepted else "conversation_suppressed",
+            status="accepted" if result.accepted else "conversation_suppressed",
             received_at=now,
-            reason=None if accepted else "host_gate",
+            runtime_ref=result.runtime_ref,
+            reason=result.reason if not result.accepted else None,
         )
 
-    def _deliver(self, event: Any, now: datetime) -> bool:
+    def _deliver(self, event: Any, now: datetime) -> RuntimeEnqueueResult:
         """排进 io 的唤醒队列。返回 False = io 这边的闸把它挡下了。"""
         submit = self._submit
         if submit is None:
@@ -94,7 +106,7 @@ class FeedlingWakePort:
         from ..ingress_v2 import wake_event_from_differ_event_v2
 
         source = _SOURCE_BY_TYPE.get(event.type, _DEFAULT_SOURCE)
-        return bool(submit(wake_event_from_differ_event_v2(
+        raw = submit(wake_event_from_differ_event_v2(
             event.subject_id,
             DifferEventV2(
                 source=source,
@@ -115,7 +127,15 @@ class FeedlingWakePort:
             # 本身里，不进队列。
             ts=now.timestamp(),
             origin_refs=(f"perceptkit:{event.definition_id}",),
-        )))
+            wake_id=event.event_id,
+        ))
+        if isinstance(raw, RuntimeEnqueueResult):
+            return raw
+        # Test/custom adapters that expose only a boolean remain representable,
+        # but production IO returns the durable reference above this boundary.
+        return RuntimeEnqueueResult(
+            accepted=bool(raw), reason=None if raw else "host_gate",
+        )
 
 
-__all__ = ["FeedlingWakePort"]
+__all__ = ["FeedlingWakePort", "RuntimeEnqueueResult"]

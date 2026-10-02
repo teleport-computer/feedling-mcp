@@ -178,3 +178,148 @@ def test_a_report_that_only_carries_split_off_fields_makes_no_main_observation()
     obs = envelope("health_vitals", json.dumps({"step_count": 4211}))
     assert "health_resting_hr" not in obs
     assert obs["steps"]["value"] == {"step_count": 4211}   # 拆出来的照发
+
+
+# --------------------------------------------------------------------------
+# 逐指标来源身份：iOS 已经发送，Kit adapter 必须真正提升到 Fact 顶层
+# --------------------------------------------------------------------------
+
+def test_health_body_metrics_keep_their_own_sample_identity_and_time():
+    """一份 health_body 里四个值可能来自四台设备、四个日期。
+
+    把它们都留在 value 里，或共用整份 report 的 received_at，会让 Kit 看不见
+    真实 Fact identity；删除 weight-1 时也就精确命不中那条体重。
+    """
+    observations = envelope("health_body", json.dumps({
+        "weight_kg": 70.0,
+        "weight_kg_measured_at": "2026-09-28T07:00:00+08:00",
+        "weight_kg_sample_id": "weight-1",
+        "bmi": 22.0,
+        "bmi_measured_at": "2026-09-27T08:00:00+08:00",
+        "bmi_sample_id": "bmi-1",
+        "body_fat_pct": 18.0,
+        "body_fat_pct_measured_at": "2026-09-26T09:00:00+08:00",
+        "body_fat_pct_sample_id": "fat-1",
+        "height_cm": 175.0,
+        "height_cm_measured_at": "2026-01-01T10:00:00+08:00",
+        "height_cm_sample_id": "height-1",
+    }))
+
+    expected = {
+        "health_weight": ("weight-1", "2026-09-28T07:00:00+08:00"),
+        "health_bmi": ("bmi-1", "2026-09-27T08:00:00+08:00"),
+        "health_body_fat": ("fat-1", "2026-09-26T09:00:00+08:00"),
+        "health_height": ("height-1", "2026-01-01T10:00:00+08:00"),
+    }
+    for signal, (sample_id, measured_at) in expected.items():
+        assert observations[signal]["source_event_id"] == sample_id
+        assert observations[signal]["occurred_at"] == measured_at
+        assert all(not key.endswith(("_sample_id", "_measured_at"))
+                   for key in observations[signal]["value"])
+
+
+def test_sleep_segments_use_each_real_healthkit_identity_and_end_time():
+    payload = {"context_snapshot": [
+        {"key": "time", "data": {"timezone": "Asia/Shanghai"}},
+        {"key": "health_sleep", "data": json.dumps({
+            "asleep_minutes": 60,
+            "sleep_start": "2026-09-27T23:00:00+08:00",
+            "sleep_end": "2026-09-28T00:00:00+08:00",
+            "sleep_sample_id": "sleep-parent",
+            "stages": [
+                {"stage": "core", "duration_minutes": 30,
+                 "start_at": "2026-09-27T23:00:00+08:00",
+                 "end_at": "2026-09-27T23:30:00+08:00",
+                 "source_event_id": "sleep-core-1"},
+                {"stage": "deep", "duration_minutes": 30,
+                 "start_at": "2026-09-27T23:30:00+08:00",
+                 "end_at": "2026-09-28T00:00:00+08:00",
+                 "source_event_id": "sleep-deep-1"},
+            ],
+        })},
+    ], "client_ts": 1}
+    observations = [o for o in to_envelope(payload, occurred_at=AT)["observations"]
+                    if o["signal"] == "health_sleep"]
+
+    assert [(o["source_event_id"], o["occurred_at"]) for o in observations] == [
+        ("sleep-core-1", "2026-09-27T23:30:00+08:00"),
+        ("sleep-deep-1", "2026-09-28T00:00:00+08:00"),
+    ]
+    assert all("source_event_id" not in o["value"] for o in observations)
+
+
+def test_workout_uses_healthkit_identity_and_episode_end():
+    observation = envelope("health_workout", json.dumps({
+        "workout_type": "running",
+        "duration_min": 32,
+        "count_today": 1,
+        "workout_start": "2026-09-28T06:00:00+08:00",
+        "workout_end": "2026-09-28T06:32:00+08:00",
+        "workout_sample_id": "workout-1",
+    }))["health_workout"]
+
+    assert observation["source_event_id"] == "workout-1"
+    assert observation["occurred_at"] == "2026-09-28T06:32:00+08:00"
+    assert observation["value"] == {"workout_type": "running", "duration_minutes": 32}
+
+
+def test_vitals_and_metabolic_split_metrics_keep_their_own_identity():
+    vitals = envelope("health_vitals", json.dumps({
+        "resting_heart_rate": 58,
+        "resting_heart_rate_measured_at": "2026-09-28T07:00:00+08:00",
+        "resting_heart_rate_sample_id": "resting-1",
+        "current_heart_rate": 72,
+        "current_heart_rate_measured_at": "2026-09-28T09:00:00+08:00",
+        "current_heart_rate_sample_id": "current-1",
+    }))
+    metabolic = envelope("health_metabolic", json.dumps({
+        "blood_glucose_mmol_l": 5.2,
+        "blood_glucose_mmol_l_measured_at": "2026-09-27T08:00:00+08:00",
+        "blood_glucose_mmol_l_sample_id": "glucose-1",
+        "blood_pressure_systolic": 118,
+        "blood_pressure_diastolic": 76,
+        "blood_pressure_measured_at": "2026-09-26T08:00:00+08:00",
+        "blood_pressure_sample_id": "pressure-1",
+    }))
+
+    assert vitals["health_resting_hr"]["source_event_id"] == "resting-1"
+    assert vitals["health_current_hr"]["source_event_id"] == "current-1"
+    assert vitals["health_current_hr"]["occurred_at"] == "2026-09-28T09:00:00+08:00"
+    assert metabolic["health_glucose"]["source_event_id"] == "glucose-1"
+    assert metabolic["health_blood_pressure"]["source_event_id"] == "pressure-1"
+    assert metabolic["health_blood_pressure"]["occurred_at"] == "2026-09-26T08:00:00+08:00"
+
+
+def test_ios_weight_identity_reaches_kit_and_health_deletion_hits_the_same_fact():
+    """不是只看字典字段：真实进 Kit 后按 iOS sample id 精确撤回。"""
+    from datetime import datetime, timezone
+
+    from perceptkit import IngestContext, PerceptionKit
+    from perceptkit.conformance import InMemoryStorage
+    from perceptkit.contracts.retraction import Retraction
+    from perceptkit.manifest.minimal import MINIMAL_SIGNALS
+
+    payload = {"context_snapshot": [
+        {"key": "time", "data": {"timezone": "Asia/Shanghai"}},
+        {"key": "health_body", "data": json.dumps({
+            "weight_kg": 70.0,
+            "weight_kg_measured_at": "2026-09-28T07:00:00+08:00",
+            "weight_kg_sample_id": "weight-to-delete",
+        })},
+    ], "client_ts": 1}
+    wire = to_envelope(payload, occurred_at=AT)
+    at = datetime(2026, 9, 28, 1, tzinfo=timezone.utc)
+    storage = InMemoryStorage()
+    kit = PerceptionKit(storage=storage, signals=MINIMAL_SIGNALS)
+
+    outcome = kit.ingest(wire, context=IngestContext("u", at))
+    assert not outcome.rejected
+    current = storage.get_current(subject_id="u", signals=["health_weight"])
+    assert current["health_weight"][0].source_event_id == "weight-to-delete"
+
+    kit.apply_retractions([
+        Retraction("u", "health_weight", "weight-to-delete", "ios", at)
+    ], now=at)
+    current = storage.get_current(subject_id="u", signals=["health_weight"])
+    assert current["health_weight"][0].availability == "no_data"
+    assert current["health_weight"][0].typed_value is None
