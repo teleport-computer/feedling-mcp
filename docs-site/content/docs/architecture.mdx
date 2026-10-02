@@ -418,6 +418,15 @@ An [independent resident consumer](/docs/workflows/chat#independent-resident-loo
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
 
+Upgraded Resident consumers (hosted and independent) read conversation history
+and omitted plaintext bodies from the authenticated backend when whoami reports
+`content_encryption_effective=off`. These history reads do not retry through the
+enclave: backend failure remains a read failure, while old sealed rows retain
+their cursor metadata but are unreadable and excluded from conversation context,
+Capture input, and per-turn memory selection anchors. Encrypted and unknown
+accounts retain the existing mixed-page and enclave history paths. This change
+does not remove startup health probes or the separate memory-selection fallback.
+
 Resident consumers (hosted and independent) ask for each turn's memory cards.
 By default the decrypt service selects them. An operator switch
 (`FEEDLING_RESIDENT_PLAINTEXT_RECALL`, off by default) lets the backend select

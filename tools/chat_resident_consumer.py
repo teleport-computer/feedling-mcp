@@ -3000,6 +3000,8 @@ def _auto_memory_fetch_for_turn(msg: dict) -> dict | None:
     unknown; an empty pick list on a healthy response ⇒ selected 0.
     Returns ``{"picks", "selected", "pool"}``.
     """
+    if isinstance(msg, dict) and msg.get("body_unavailable_reason") == "unreadable_history":
+        return None
     seq = msg.get("seq") if isinstance(msg, dict) else None
     if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
         return None
@@ -3896,12 +3898,12 @@ def get_decrypted_history(
     since: float, limit: int = 20, include_image_body: bool = True,
     after_seq: int | None = None,
 ) -> list[dict] | None:
-    """Try all configured decrypt sources in priority order.
+    """Read backend history for effective-off accounts; otherwise try decrypt sources.
 
     Returns:
       list  — source was reachable; contains messages newer than `since`
               (may be empty if no new messages).
-      None  — no source configured, or all configured sources failed.
+      None  — the required backend read failed, or no decrypt source succeeded.
     """
     # after_seq 只在给了的时候才往下传：其余调用点的请求参数逐字节不变。
     seq_kwargs = {} if after_seq is None else {"after_seq": int(after_seq)}
@@ -3927,13 +3929,11 @@ def _fetch_plaintext_or_mixed_history(
     include_image_body: bool,
     after_seq: int | None = None,
 ) -> tuple[bool, list[dict] | None]:
-    """Use backend rows when a page contains plaintext; decrypt sealed rows one-by-one.
+    """Effective-off reads stay on the backend, including failures and sealed rows.
 
-    ``handled=False`` means the page is entirely sealed and the existing bulk
-    enclave path remains the efficient path. Once plaintext is present, the
-    bulk endpoint is forbidden because it would forward that plaintext page to
-    enclave along with the sealed rows.
+    Other modes retain mixed-page per-row decryption and sealed-page bulk reads.
     """
+    plaintext_only = _plaintext_account()
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
@@ -3948,10 +3948,25 @@ def _fetch_plaintext_or_mixed_history(
         )
         resp.raise_for_status()
         data = resp.json()
-        rows = data.get("messages") or data.get("history") or []
+        if plaintext_only:
+            rows = data["messages"] if "messages" in data else data["history"]
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) for row in rows
+            ):
+                raise ValueError("invalid history page")
+            # Validate before filtering: a broken timestamp must not look like
+            # a healthy empty page and advance the poll checkpoint.
+            for row in rows:
+                if not (row.get("id") or row.get("message_id")):
+                    raise ValueError("missing history message id")
+                ts = float(row["ts"] if "ts" in row else row["timestamp"])
+                if not -float("inf") < ts < float("inf"):
+                    raise ValueError("invalid history timestamp")
+        else:
+            rows = data.get("messages") or data.get("history") or []
     except Exception as exc:
         log.warning("backend history shape probe failed: %s", exc)
-        return False, None
+        return plaintext_only, None
     if not isinstance(rows, list):
         return False, None
 
@@ -3972,7 +3987,9 @@ def _fetch_plaintext_or_mixed_history(
             return "plaintext_binary_omitted"
         return "invalid"
 
-    if not any(isinstance(row, dict) and _shape(row).startswith("plaintext") for row in rows):
+    if not plaintext_only and not any(
+        isinstance(row, dict) and _shape(row).startswith("plaintext") for row in rows
+    ):
         return False, None
 
     out: list[dict] = []
@@ -3980,7 +3997,9 @@ def _fetch_plaintext_or_mixed_history(
         if not isinstance(row, dict):
             continue
         shape = _shape(row)
-        if shape == "sealed":
+        if plaintext_only and _is_sealed_history_body(row):
+            resolved = _unreadable_history_row(row)
+        elif shape == "sealed":
             message_id = str(row.get("id") or row.get("message_id") or "")
             decrypted = _fetch_message_body_from_enclave(message_id)
             if decrypted is None:
@@ -3992,28 +4011,13 @@ def _fetch_plaintext_or_mixed_history(
         elif shape == "plaintext_binary":
             hydrated = _hydrate_plaintext_binary_body(row)
             resolved = hydrated
-        elif shape == "plaintext_binary_omitted":
-            message_id = str(row.get("id") or row.get("message_id") or "")
-            try:
-                body_resp = _HTTP.get(
-                    f"{FEEDLING_API_URL}/v1/chat/messages/"
-                    f"{urllib.parse.quote(message_id, safe='')}/body",
-                    headers=_HEADERS,
-                    timeout=20,
-                )
-                body_resp.raise_for_status()
-                full = (body_resp.json() or {}).get("message")
-            except Exception:
-                full = None
-            if isinstance(full, dict):
-                merged = {**row, **full}
-                if merged.get("body_b64") is not None:
-                    merged = _hydrate_plaintext_binary_body(merged)
-                elif isinstance(merged.get("body"), str):
-                    merged["content"] = merged["body"]
-                resolved = merged
-            else:
-                resolved = {**row, "body_unavailable": True}
+        elif shape == "plaintext_binary_omitted" or (plaintext_only and row.get("body_omitted")):
+            resolved = _hydrate_backend_history_body(row, plaintext_only=plaintext_only)
+        elif plaintext_only:
+            # Failed R2 hydration can return neither body nor an omission flag.
+            # It is still unreadable history, not an attachment placeholder or
+            # a usable recall anchor. Do not infer plaintext from its metadata.
+            resolved = _unreadable_history_row(row)
         else:
             resolved = {**row, "body_unavailable": True}
         if resolved.get("seq") is None and row.get("seq") is not None:
@@ -4022,6 +4026,70 @@ def _fetch_plaintext_or_mixed_history(
             resolved["seq"] = row.get("seq")
         out.append(_finalize_plaintext_or_mixed_history_row(resolved))
     return True, _filter_since(out, since)
+
+
+def _is_sealed_history_body(row: dict) -> bool:
+    # An omitted body's body_ct_len alone is ambiguous: an inline plaintext
+    # binary upload may omit body_size_bytes. Resolve it on the backend.
+    return bool(row.get("body_ct"))
+
+
+def _unreadable_history_row(row: dict) -> dict:
+    # Keep cursor/identity metadata, but no content or route capable of reading
+    # a sealed or unresolved body. The marker survives a later mode refresh.
+    result = {key: value for key, value in row.items() if key not in {
+        "body", "body_b64", "text", "plaintext", "image_b64", "file_b64",
+        "images", "vision_route_id",
+    } and not key.startswith("caption_")}
+    return {**result, "content": "", "body_unavailable": True,
+            "body_unavailable_reason": "unreadable_history"}
+
+
+def _hydrate_backend_history_body(row: dict, *, plaintext_only: bool) -> dict:
+    """Fetch one authenticated plaintext body and retain the history page cursor."""
+    mid = str(row.get("id") or row.get("message_id") or "")
+    try:
+        if not mid:
+            raise ValueError("missing history message id")
+        response = _HTTP.get(
+            f"{FEEDLING_API_URL}/v1/chat/messages/{urllib.parse.quote(mid, safe='')}/body",
+            headers=_HEADERS, timeout=20,
+        )
+        response.raise_for_status()
+        full = response.json()["message"]
+        if not isinstance(full, dict):
+            raise ValueError("invalid history body")
+        for key in ("id", "message_id", "owner_user_id"):
+            expected = mid if key != "owner_user_id" else row.get(key)
+            if full.get(key) is not None and expected is not None and full[key] != expected:
+                raise ValueError("history body identity mismatch")
+        if _is_sealed_history_body(full):
+            if plaintext_only:
+                return _unreadable_history_row(row)
+            raise ValueError("expected plaintext history body")
+        if not isinstance(full.get("body"), str) and not isinstance(full.get("body_b64"), str):
+            raise ValueError("missing plaintext history body")
+        merged = {**row, **full}
+        for key in ("id", "message_id", "seq", "ts", "timestamp", "role", "owner_user_id"):
+            if key in row:
+                merged[key] = row[key]
+        if merged.get("body_b64") is not None:
+            merged = _hydrate_plaintext_binary_body(merged)
+        else:
+            merged["content"] = merged["body"]
+        for key in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
+            merged.pop(key, None)
+        return _finalize_plaintext_or_mixed_history_row(merged)
+    except Exception as exc:
+        log.warning("backend history body unavailable [id=%s]: %s", mid, type(exc).__name__)
+        if plaintext_only and row.get("body_size_bytes") is None:
+            # An unresolved omitted row could be old ciphertext. Preserve its
+            # cursor but do not turn a caption/attachment placeholder into context.
+            return _unreadable_history_row(row)
+        result = {**row, "body_unavailable": True}
+        if plaintext_only:
+            result["body_unavailable_reason"] = "backend_body_unavailable"
+        return result
 
 
 def _finalize_plaintext_or_mixed_history_row(row: dict) -> dict:
@@ -4145,12 +4213,23 @@ def _hydrate_omitted_bodies(messages: list[dict]) -> list[dict]:
     """
     out: list[dict] = []
     for m in messages:
+        if isinstance(m, dict) and m.get("body_unavailable_reason") in {
+            "unreadable_history", "backend_body_unavailable",
+        }:
+            out.append(m)
+            continue
+        if isinstance(m, dict) and _plaintext_account() and _is_sealed_history_body(m):
+            out.append(_unreadable_history_row(m))
+            continue
         if not isinstance(m, dict) or not m.get("body_omitted"):
             out.append(m)
             continue
         mid = str(m.get("id") or m.get("message_id") or "").strip()
         if not mid:
             out.append(m)
+            continue
+        if _plaintext_account():
+            out.append(_hydrate_backend_history_body(m, plaintext_only=True))
             continue
         full = _fetch_message_body_from_enclave(mid)
         if full is None:
@@ -4166,6 +4245,8 @@ def _hydrate_omitted_bodies(messages: list[dict]) -> list[dict]:
             out.append({**m, "body_unavailable": True})
             continue
         merged = {**m, **full}
+        if merged.get("seq") is None and m.get("seq") is not None:
+            merged["seq"] = m["seq"]
         if merged.get("body_b64") is not None:
             merged = _hydrate_plaintext_binary_body(merged)
         for k in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
@@ -16861,6 +16942,8 @@ def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[di
     for msg in _conversation_rows(history or []):
         if not isinstance(msg, dict):
             continue
+        if msg.get("body_unavailable_reason") == "unreadable_history":
+            continue
         role = str(msg.get("role") or "").strip().lower()
         if role == "system":
             # system 通知（如上游报错提醒）不是 agent 自己说过的话，混进前台/proactive
@@ -18100,6 +18183,8 @@ def _capture_live_history(history: list[dict] | None) -> list[dict]:
     out: list[dict] = []
     for msg in history or []:
         if not isinstance(msg, dict):
+            continue
+        if msg.get("body_unavailable_reason") == "unreadable_history":
             continue
         source = str(msg.get("source") or "").strip()
         if source == "verify_ping":
@@ -24261,8 +24346,9 @@ def run() -> None:
                 continue
 
             # poll is used only as a trigger — its content fields are "" for
-            # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
-            if FEEDLING_ENCLAVE_URL:
+            # v1 encrypted envelopes. Effective-off accounts read the backend
+            # even when no enclave URL is configured.
+            if _plaintext_account() or FEEDLING_ENCLAVE_URL:
                 decrypt_since = _poll_decrypt_since(last_ts, poll_messages)
                 # Text only. The window spans every message since the cursor, and an
                 # unanswered photo holds the cursor still — so inlining bodies here

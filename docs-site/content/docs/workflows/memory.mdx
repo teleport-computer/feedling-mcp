@@ -16,6 +16,15 @@ backend (`POST /v1/memory/turn-selection`, operator switch
 ranker on the same history page; encrypted accounts keep the decrypt-service
 path.
 
+The upgraded Resident history reader separately uses only the backend for
+accounts explicitly reporting `content_encryption_effective=off`. Old sealed
+history remains unreadable and is excluded from conversation context and
+Capture input; such a row cannot initiate per-turn selection. History or body
+read failures do not trigger enclave retries. A failed history page remains
+distinct from an empty page so the poll checkpoint can retry. This does not
+change the selection route's compatibility fallbacks described below, or the
+history path for encrypted and unknown accounts.
+
 For this resident route, `off` returns `409 not_served` without contacting the
 decrypt service; `shadow` returns the decrypt service's result and schedules a
 bounded local comparison; `on` serves the local lexical result, with at most
