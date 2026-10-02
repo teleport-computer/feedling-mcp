@@ -12,14 +12,23 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident startup and idle health checks now read authenticated backend history
+  for effective-off accounts, including with no enclave URL. The existing health
+  header adds `backend_ready`, `backend_unreachable`, and `backend_degraded`;
+  the backend accepts them only for server-authoritative effective-off accounts.
+  A valid empty history page proves backend read readiness, not decryption.
+  Backend health never consumes or publishes shared enclave health, and a mode
+  change invalidates the previous route's local evidence. Startup failures keep
+  polling for recovery; encrypted/unknown routes retain their existing probes.
+
 - Upgraded Resident consumers read effective-off accounts' history and omitted
   plaintext bodies directly from the authenticated backend, even without an
   enclave URL. Backend read failures no longer fall back to enclave history.
   Old sealed rows remain unreadable with cursor metadata preserved and cannot
   supply conversation context, Capture input, or a memory-selection anchor.
   Hydrated attachments no longer trigger a second body fetch. Encrypted and
-  unknown accounts retain their existing history paths; startup health checks
-  and the separate memory-selection fallback are unchanged.
+  unknown accounts retain their existing history paths. The separate
+  memory-selection fallback is unchanged.
 
 - The test deployment now wires `TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL` to the
   backend. It defaults to `off`, accepts only `off`, `shadow`, or `on`, and

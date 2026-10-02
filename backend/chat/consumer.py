@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Callable, TypeVar
 
 import db
+from accounts import registry
 from capabilities import vision_probe as vision_probe_capability
 from core.store import UserStore
 from notices import rejection_stats
@@ -283,7 +284,7 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             )[:_POLL_CONSUMER_HISTORY_LIMIT]
             state["poll_consumers"] = dict(newest)
             if state.get("official"):
-                health = _decrypt_health_from_state(state, now_epoch=now_epoch)
+                health = _decrypt_health_from_state(state, now_epoch=now_epoch, store=store)
                 if health["status"] == "unknown":
                     state.setdefault("decrypt_health_unknown_since_epoch", now_epoch)
                 else:
@@ -316,6 +317,7 @@ def _decrypt_health_from_state(
     state: dict,
     *,
     now_epoch: float | None = None,
+    store: UserStore | None = None,
 ) -> dict:
     """Normalize a resident's authenticated decrypt-health self-report.
 
@@ -326,7 +328,13 @@ def _decrypt_health_from_state(
     now = time.time() if now_epoch is None else float(now_epoch)
     raw_status = str(state.get("decrypt_status") or "").strip().lower()
     checked_at = _safe_epoch(state.get("decrypt_checked_at_epoch"))
+    # Backend readiness is account-local. A client header cannot opt an
+    # encrypted/unknown account out of its decrypt requirement. Legacy decrypt
+    # reports retain their semantics for older consumers during rollout.
+    backend_status = raw_status in {"backend_ready", "backend_unreachable", "backend_degraded"}
     valid_status = raw_status in _DECRYPT_HEALTH_STATUSES
+    if backend_status and store is not None:
+        valid_status = registry.effective_content_encryption(store.user_id) == "off"
     future = checked_at > now + _DECRYPT_HEALTH_FUTURE_SKEW_SEC
     age_sec = max(0.0, now - checked_at) if checked_at else None
     fresh = bool(
@@ -352,9 +360,20 @@ def _decrypt_health_from_state(
             "degraded": "decrypt_source_degraded",
             "unconfigured": "decrypt_source_unconfigured",
             "unreachable": "decrypt_source_unreachable",
+            "backend_ready": "",
+            "backend_unreachable": "backend_history_unreachable",
+            "backend_degraded": "backend_history_degraded",
         }[status]
 
     required = {
+        "backend_history_unreachable": (
+            "The resident consumer cannot read authenticated backend history. "
+            "Check FEEDLING_API_URL, credentials, network and history responses."
+        ),
+        "backend_history_degraded": (
+            "The resident consumer repeatedly failed to read claimed messages "
+            "from backend history. Check the history response and message bodies."
+        ),
         "decrypt_health_unknown": (
             "Update the resident consumer so every poll reports current decrypt "
             "health, then retry onboarding verification."
@@ -381,7 +400,7 @@ def _decrypt_health_from_state(
         ),
     }.get(reason, "")
     return {
-        "passing": status == "ok",
+        "passing": status in {"ok", "backend_ready"},
         "status": status,
         "reported_status": raw_status if valid_status else "",
         "checked_at_epoch": checked_at,
@@ -566,7 +585,7 @@ def _consumer_validation_state(
         ),
         "age_sec": age_sec,
         "recent_window_sec": _CONSUMER_RECENT_SEC,
-        "decrypt_health": _decrypt_health_from_state(state, now_epoch=now),
+        "decrypt_health": _decrypt_health_from_state(state, now_epoch=now, store=store),
         "required": (
             "Run the standard independent feedling-chat-resident / IO resident "
             "consumer with the current FEEDLING_API_KEY. It must poll "

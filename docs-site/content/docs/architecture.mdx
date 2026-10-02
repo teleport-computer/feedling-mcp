@@ -424,8 +424,13 @@ and omitted plaintext bodies from the authenticated backend when whoami reports
 enclave: backend failure remains a read failure, while old sealed rows retain
 their cursor metadata but are unreadable and excluded from conversation context,
 Capture input, and per-turn memory selection anchors. Encrypted and unknown
-accounts retain the existing mixed-page and enclave history paths. This change
-does not remove startup health probes or the separate memory-selection fallback.
+accounts retain the existing mixed-page and enclave history paths. Startup and
+idle health probes follow the same effective account mode: `backend_ready`
+means a valid authenticated backend history read, including an empty page;
+`backend_unreachable` and `backend_degraded` report read failures. These
+account-local results never consume or publish the runner-shared enclave health
+cache. Mode changes invalidate local health and probe throttling. This does not
+remove the separate memory-selection fallback or prove old ciphertext readable.
 
 Resident consumers (hosted and independent) ask for each turn's memory cards.
 By default the decrypt service selects them. An operator switch
@@ -1143,7 +1148,7 @@ enabled capability:
 | Account and storage API | Authenticated request plus a successful write/read round trip through PostgreSQL |
 | Memory index and fetch | Storage round trip plus a successful authorized decrypt projection |
 | Hosted Chat | Database, decrypt service, a fresh runtime heartbeat for the user's fenced runtime (Runtime V2 worker heartbeat and capacity, or V1 resident supervisor heartbeat during the dual-runtime window), queue processing, provider call, and encrypted assistant result |
-| Independent resident Chat | Fresh official poll plus a fresh `ok` decrypt-health report, an exact-parent verify-ping reply, and an encrypted ordinary reply |
+| Independent resident Chat | Fresh official poll plus a fresh `ok` decrypt-health report or server-validated effective-off `backend_ready`, an exact-parent verify-ping reply, and an ordinary reply in the account's effective content mode |
 | Screen ingestion | Authenticated WebSocket ingest plus frame persistence and, when needed, decrypt retrieval |
 | Push delivery | Valid device token and a confirmed provider delivery attempt |
 
@@ -1156,7 +1161,9 @@ capability-level checks above.
 The resident decrypt-health headers are an operational self-report used to
 prevent live-loop-only false greens. They do not move the decrypt trust boundary
 and are not attestation: phase one may report `ok` after a successful
-reachability probe. A future encrypted challenge can provide stronger proof
+reachability probe. `backend_ready` proves only the backend read route; the
+server checks effective-off eligibility before accepting it, while legacy
+decrypt reports retain their rollout semantics. A future encrypted challenge can provide stronger proof
 that the resident opened ciphertext for the account.
 
 ## Security boundary summary
