@@ -291,6 +291,9 @@ services:
       # election, core/wake_bus.py). Budget: test RDS max_connections=79, ~20
       # conns/worker → -w2≈40, safe.
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
+      # Backend-only Resident lexical recall; changing the TEST_ variable
+      # requires a normal redeploy. Missing/empty keeps the legacy path.
+      FEEDLING_RESIDENT_PLAINTEXT_RECALL: "${FEEDLING_RESIDENT_PLAINTEXT_RECALL:-off}"
       # TEST cutover is attested in the compose hash: consume durable change
       # events instead of reloading the full chat window on every sync.
       FEEDLING_CHAT_SYNC_MODE: "incremental"

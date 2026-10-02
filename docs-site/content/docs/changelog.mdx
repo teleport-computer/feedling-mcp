@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- The test deployment now wires `TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL` to the
+  backend. It defaults to `off`, accepts only `off`, `shadow`, or `on`, and
+  rejects invalid values before deployment. Changing the variable requires a
+  normal redeployment; this configuration support does not itself enable local
+  selection or change production or pre deployments.
+
 - Runtime V2 heartbeat and manual wakes now include a one-round reminder to
   check a reply against existing identity requirements after their initial look,
   when that decision has no draft and is not a forced choice or correction.

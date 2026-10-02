@@ -983,6 +983,7 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_deploy_yaml_strict.py \
+            tests/test_resident_recall_deploy.py \
             tests/test_store_sections.py \
             tests/test_store_load_contract.py \
             tests/test_agent_mailbox_post.py \
@@ -3018,6 +3019,7 @@ jobs:
           # on-chain re-auth. Gate: the deployed image must contain the leader-
           # election patch (core/leader.py) or N>1 double-binds :9998.
           FEEDLING_BACKEND_WORKERS:     ${{ vars.TEST_FEEDLING_BACKEND_WORKERS }}
+          FEEDLING_RESIDENT_PLAINTEXT_RECALL: ${{ vars.TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL || 'off' }}
           # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
           # container env. Empty = feature off; token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -3032,6 +3034,11 @@ jobs:
             echo "::error::TEST_DATABASE_URL secret is not set — backend has no datastore"
             exit 1
           fi
+          FEEDLING_RESIDENT_PLAINTEXT_RECALL="${FEEDLING_RESIDENT_PLAINTEXT_RECALL:-off}"
+          case "$FEEDLING_RESIDENT_PLAINTEXT_RECALL" in
+            off|shadow|on) ;;
+            *) echo "::error::TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL must be exactly off, shadow or on"; exit 1 ;;
+          esac
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
@@ -3066,6 +3073,7 @@ jobs:
             -e "FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC=$FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC" \
             -e "FEEDLING_V2_TAIL_BUDGET_MSGS=$FEEDLING_V2_TAIL_BUDGET_MSGS" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
+            -e "FEEDLING_RESIDENT_PLAINTEXT_RECALL=$FEEDLING_RESIDENT_PLAINTEXT_RECALL" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
           # serve-worker now rides the main CVM: fleet identity (runner_identity.py)
