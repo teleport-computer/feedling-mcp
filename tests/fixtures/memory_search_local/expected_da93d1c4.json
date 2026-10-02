@@ -1,0 +1,387 @@
+{
+ "_base": "da93d1c4079bdb132d6f0125b0fa1fc77f5a951e",
+ "b64_row": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "bin",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee grinder",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "t",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "body_and_b64_both": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "plain",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "both",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "from-text coffee",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "bucket_filter_global_idf": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "b",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "repair",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "chinese": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "c1",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "周六去爬山 带了三明治",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "c3",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "三明治 做法",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "duplicate_ids": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "dup",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee repair second",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "x",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "k_enclave_shadow_row": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "ok",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 1
+  }
+ },
+ "late_match_in_1600": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "last",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee grinder repair",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "limit_cut": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "k9",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "k8",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "k7",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato garden tomato",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "no_hit": {
+  "result": {
+   "items": [],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "stopword_only": {
+  "result": {
+   "items": [],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "thread_filter": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "t1",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "猫咪 不吃饭",
+     "threads": [
+      "cat"
+     ],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "ties_same_score_same_time": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "tiea",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "same exact words",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "tieb",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "same exact words",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "tiem",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "same exact words",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    },
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "tieq",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "same exact words",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 0
+  }
+ },
+ "unreadable_rows": {
+  "result": {
+   "items": [
+    {
+     "bucket": "topic",
+     "created_at": "2026-06-20T10:00:00",
+     "id": "ok",
+     "importance": 0.5,
+     "last_referenced_at": "",
+     "occurred_at": "2026-06-20T10:00:00",
+     "pulse": 0.3,
+     "score": 0.0,
+     "status": "active",
+     "summary": "coffee repair",
+     "threads": [],
+     "updated_at": "2026-06-20T10:00:00"
+    }
+   ],
+   "ranking": "memgarden-bm25-v2+tok:jieba-0.42.1",
+   "unavailable_count": 5
+  }
+ }
+}

@@ -11,9 +11,11 @@ import httpx
 import memory_search_contract as search_contract
 
 from core import envelope as core_envelope
+from core import plaintext_row
 from enclave import readside as enclave_readside
 from memory import service as memory_service
 from memory import card_shape
+from memory import search_rank
 from memgarden import related as mg_related
 from memgarden import timestamps as memory_timestamps
 
@@ -426,13 +428,30 @@ def memory_index_core(
     }
 
 
+def _plaintext_account(owner_user_id: str) -> bool:
+    from accounts import registry  # lazy: registry imports readside callers at assembly
+
+    return registry.effective_content_encryption(owner_user_id) == "off"
+
+
 def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict:
-    # Do not build plaintext search projections or rank partitions in backend.
-    # Strip shadow plaintext from sealed rows using the existing shape guard.
+    # T779 step 4: a plaintext account ranks its whole plaintext corpus here,
+    # once and globally, with the enclave's own ranking code. Never rank
+    # partitions and merge them: that changes IDF, ranks and the cut.
+    # Sealed-content accounts still send one corpus to the enclave; strip
+    # shadow plaintext from sealed rows using the existing shape guard.
     plain, sealed, invalid = _partition_memory_candidates(candidates, owner_user_id)
     by_id = {str(row.get("id") or ""): row for row in plain + sealed}
     corpus = [by_id[str(row.get("id") or "")] for row in candidates
               if str(row.get("id") or "") in by_id]
+    if _plaintext_account(owner_user_id):
+        # Same corpus the enclave would have ranked, minus sealed rows: a
+        # plaintext account's sealed cards are no longer searched (approved
+        # T779 change) and are not counted as unreadable either.
+        sealed_rows = {id(row) for row in sealed}
+        return _memory_search_local(
+            [row for row in corpus if id(row) not in sealed_rows],
+            invalid, owner_user_id, payload)
     request = {**payload, "search_protocol": search_contract.VERSION}
     search_contract.check_request({**request, "moments": corpus})
     fallbacks = iter(search_contract.FALLBACKS)
@@ -473,6 +492,85 @@ def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict
     return {"items": items[:int(payload["limit"])], "ranking": ranking,
             "unavailable_count": len(invalid) + len(response["unavailable_ids"])}
 
+
+
+
+class _SearchRowUnreadable(Exception):
+    pass
+
+
+def _read_search_items(rows: list, owner_user_id: str) -> tuple[list[dict], list[str]]:
+    """``enclave.readside.decrypt_readside_items`` for a sealed-free corpus.
+
+    Row by row the same verdicts: local_only or bodiless rows, rows the enclave
+    would treat as sealed (``is_sealed_row``; here they carry no ``body_ct``, so
+    the enclave's decrypt fails), foreign/ownerless rows and non-object JSON
+    are unavailable; ``body`` wins over ``body_b64``. The item builder runs
+    outside the per-row guard, exactly as in the enclave.
+    """
+    items: list[dict] = []
+    unavailable_ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        memory_id = str(row.get("id") or "")
+        if row.get("visibility") == "local_only" or (
+            not row.get("K_enclave")
+            and row.get("body") is None
+            and row.get("body_b64") is None
+        ):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        try:
+            if plaintext_row.is_sealed_row(row):
+                raise _SearchRowUnreadable("sealed-shaped row without ciphertext")
+            raw = plaintext_row.read_plaintext_row(row, owner_user_id, _SearchRowUnreadable)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("memory plaintext is not an object")
+        except (_SearchRowUnreadable, json.JSONDecodeError, ValueError):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        items.append(enclave_readside.build_memory_search_item(row, inner))
+    return items, unavailable_ids
+
+
+def _memory_search_local(corpus, invalid, owner_user_id, payload) -> dict:
+    """``enclave.memory_search.search`` for a plaintext account, in backend.
+
+    Same steps in the same order on the same corpus: request check, item build,
+    one global rank, bucket/thread filter, cut, then the post-processing
+    ``_memory_search`` applies to an enclave answer. Any failure after the
+    request check (the stage that ran in the enclave and answered 5xx) is a
+    ``RuntimeError`` here, so callers map it the same way; the resource limit
+    stays ``SearchLimitExceeded`` (413).
+    """
+    request = {**payload, "search_protocol": search_contract.VERSION}
+    search_contract.check_request({**request, "moments": corpus})
+    # Everything below ran inside the enclave service before: any failure there
+    # was a 5xx the backend saw as RuntimeError (503), except the resource limit
+    # (413). Keep exactly that boundary.
+    try:
+        built, unavailable_ids = _read_search_items(corpus, owner_user_id)
+        ranked = search_rank.rank(built, str(payload.get("query") or "")[:500],
+                                  protocol=search_contract.VERSION)
+        ordered = enclave_readside.memory_index_filter_items(ranked, {**payload, "query": ""})
+        limit = enclave_readside.memory_readside_effective_limit(payload.get("limit"))
+        items = []
+        for item in ordered[:limit]:
+            clean = _public_memory_item(enclave_readside.memory_public_item(item))
+            clean.pop("content", None)
+            clean.pop("_search_content", None)
+            clean.pop("_bm25_score", None)
+            items.append(clean)
+    except search_contract.SearchLimitExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 — was an enclave 5xx
+        raise RuntimeError("readside_local_error") from exc
+    return {"items": items[:int(payload["limit"])], "ranking": search_contract.VERSION,
+            "unavailable_count": len(invalid) + len(unavailable_ids)}
 
 def _bool_payload(value: Any) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}

@@ -1,44 +1,14 @@
-"""Request-local full-corpus search; decrypted text/postings stay in enclave.
+"""Request-local full-corpus search for sealed-content accounts.
 
-Ranking is ``memgarden.retrieval.rank`` with io's jieba tokenizer: the same
-ruler as automatic recall (``enclave/routes/chat.py``). No hit returns no
-items; nothing pads the result with recent cards.
+Decrypted text/postings stay in the enclave. Ranking is ``memory.search_rank``
+(memgarden ``retrieval.rank`` + jieba), the same code the backend runs for
+plaintext accounts (T779 step 4). No hit returns no items; nothing pads the
+result with recent cards.
 """
-
-from memgarden import retrieval
 
 import memory_search_contract as search_contract
 from enclave import readside
-from memory import jieba_tokenizer
-
-
-def search_text(item: dict) -> str:
-    # Preserve existing searchable fields, without counting an identical
-    # summary/content projection twice. Private content never leaves readside.
-    fields = [item.get(key) for key in (
-        "summary", "content", "_search_content", "bucket", "source",
-    )]
-    fields.extend(item.get("threads") or [])
-    return "\n".join(dict.fromkeys(str(value) for value in fields if value))
-
-
-def rank(items: list[dict], query: str, *, protocol: str = search_contract.VERSION) -> list[dict]:
-    """Ordered matching items. An older ``protocol`` reproduces that ranking."""
-    options = (search_contract.SERVED.get(protocol, search_contract.RANK_OPTIONS)
-               if isinstance(protocol, str) else search_contract.RANK_OPTIONS)
-    try:
-        result = retrieval.rank(
-            query, items, tokenizer=jieba_tokenizer.TOKENIZER, text_of=search_text,
-            max_cards=search_contract.MAX_CARDS, max_text_bytes=search_contract.MAX_TEXT_BYTES,
-            **options)
-    except retrieval.SearchLimitExceeded as exc:
-        raise search_contract.SearchLimitExceeded() from exc
-    # Hits carry ids only. ``Hit.matched`` holds query terms (user text) and is
-    # deliberately dropped here: it never reaches a response, log or trace.
-    by_id: dict[str, dict] = {}
-    for item in items:
-        by_id.setdefault(str(item.get("id") or ""), item)
-    return [by_id[hit_id] for hit_id in dict.fromkeys(result.ids) if hit_id in by_id]
+from memory import search_rank
 
 
 def search(moments: list[dict], user_id: str, content_sk, payload: dict) -> dict:
@@ -56,7 +26,7 @@ def search(moments: list[dict], user_id: str, content_sk, payload: dict) -> dict
         unavailable.extend(failed)
     # Statistics include every authorized readable card, independent of the
     # output bucket/thread filter and decrypt chunk boundary.
-    ranked = rank(items, str(payload.get("query") or "")[:500], protocol=protocol)
+    ranked = search_rank.rank(items, str(payload.get("query") or "")[:500], protocol=protocol)
     ordered = readside.memory_index_filter_items(ranked, {**payload, "query": ""})
     limit = readside.memory_readside_effective_limit(payload.get("limit"))
     public = []

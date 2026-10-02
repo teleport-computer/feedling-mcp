@@ -909,7 +909,8 @@ def test_v1_block_renders_the_unified_enclave_selection(monkeypatch):
     """V1 resident path on the real enclave output (memgarden select_context + jieba)."""
     sys.path.insert(0, str(ROOT / "backend"))
     from enclave.routes import chat
-    monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+    from memory import recall_select
+    monkeypatch.delenv(recall_select.RECALL_RANKER_ENV, raising=False)
     cards = [{"id": "lamp", "summary": "露营灯保修码 NP-4286", "status": "active"},
              *[{"id": f"f{i}", "summary": f"第{i}次整理工作周报", "status": "active"} for i in range(20)]]
     monkeypatch.setattr(chat.readside, "moments_to_cards", lambda *a: cards)

@@ -26,6 +26,8 @@ from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import serialization
 
+from core import plaintext_row
+
 log = logging.getLogger("feedling.enclave.envelope")
 
 
@@ -162,34 +164,9 @@ def read_envelope(env: dict, authorized_user_id: str,
     """
     if not isinstance(env, dict):
         raise DecryptFailure("envelope must be an object")
-    if (
-        env.get("body_ct")
-        or env.get("K_enclave")
-        or (env.get("body") is None and env.get("body_b64") is None)
-    ):
+    if plaintext_row.is_sealed_row(env):
         # The sealed implementation performs its own owner binding.  Delegate
         # unchanged so this router remains a zero-semantic-diff wrapper for all
         # encrypted rows (and so sealed-path test doubles keep working).
         return decrypt_envelope(env, authorized_user_id, content_sk)
-    owner = env.get("owner_user_id")
-    if not owner:
-        raise DecryptFailure("envelope missing owner_user_id")
-    if owner != authorized_user_id:
-        raise DecryptFailure(
-            f"owner mismatch: envelope claims owner={owner} "
-            f"but caller is {authorized_user_id}"
-        )
-    if env.get("body") is not None:
-        body = env["body"]
-        if not isinstance(body, str):
-            raise DecryptFailure("plaintext body must be a string")
-        return body.encode("utf-8")
-    if env.get("body_b64") is not None:
-        body_b64 = env["body_b64"]
-        if not isinstance(body_b64, str):
-            raise DecryptFailure("plaintext body_b64 must be a string")
-        try:
-            return base64.b64decode(body_b64, validate=True)
-        except Exception as e:
-            raise DecryptFailure(f"body_b64 decode: {e}") from e
-    raise DecryptFailure("envelope has no supported body shape")
+    return plaintext_row.read_plaintext_row(env, authorized_user_id, DecryptFailure)

@@ -26,8 +26,9 @@ import recall_golden_cases as golden  # noqa: E402
 
 REQUIREMENTS = Path(__file__).parent.parent / "backend" / "requirements.txt"
 from enclave import recall_hybrid  # noqa: E402
+from memory.embedding import recall_policy  # noqa: E402
 from enclave.routes import chat  # noqa: E402
-from memory import card_shape, recall_metadata  # noqa: E402
+from memory import card_shape, recall_metadata, recall_select  # noqa: E402
 from memory.embedding import fake as fake_embedding  # noqa: E402
 from memory.embedding import projection, serve, sweep  # noqa: E402
 
@@ -60,9 +61,9 @@ def test_golden_provenance_is_the_pre_change_baseline():
 @pytest.mark.parametrize("scenario", golden.SCENARIOS, ids=[s[0] for s in golden.SCENARIOS])
 def test_flag_off_matches_pre_change_golden(monkeypatch, scenario, flag):
     if flag is None:
-        monkeypatch.delenv(recall_hybrid.HYBRID_ENV, raising=False)
+        monkeypatch.delenv(recall_policy.HYBRID_ENV, raising=False)
     else:
-        monkeypatch.setenv(recall_hybrid.HYBRID_ENV, flag)
+        monkeypatch.setenv(recall_policy.HYBRID_ENV, flag)
     name, window, args, ranker = scenario
     got = golden.run_scenario(chat, recall_metadata, monkeypatch, name, window, args, ranker)
     assert got == GOLDEN["cases"][name]
@@ -79,7 +80,7 @@ def test_flag_off_selection_never_asks_for_raw_bodies(monkeypatch):
 
 
 def test_start_warmup_is_a_noop_while_off(monkeypatch):
-    monkeypatch.delenv(recall_hybrid.HYBRID_ENV, raising=False)
+    monkeypatch.delenv(recall_policy.HYBRID_ENV, raising=False)
     assert recall_hybrid.start_warmup() is False
 
 
@@ -145,10 +146,10 @@ def _run(monkeypatch, window, hybrid=None):
 
 @pytest.fixture()
 def hybrid_on(monkeypatch):
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
     # FakeEmbedder shares one alias token between query and target: cosine ~0.13.
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.1")
-    monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "0.1")
+    monkeypatch.delenv(recall_select.RECALL_RANKER_ENV, raising=False)
 
 
 def test_hybrid_recalls_the_paraphrased_card_lexical_misses(monkeypatch, hybrid_on):
@@ -192,7 +193,7 @@ def test_expired_deadline_falls_back_before_encoding(monkeypatch, hybrid_on):
 
 def test_encoder_failure_falls_back(monkeypatch, hybrid_on):
     def boom(*a, **k):
-        raise recall_hybrid.Fallback("encode_failed")
+        raise recall_policy.Fallback("encode_failed")
     monkeypatch.setattr(recall_hybrid, "encode_queries", boom)
     lexical = _run(monkeypatch, TWO_TURN_WINDOW)
     got = _run(monkeypatch, TWO_TURN_WINDOW, _state())
@@ -202,7 +203,7 @@ def test_encoder_failure_falls_back(monkeypatch, hybrid_on):
 
 def test_failure_on_the_second_pass_discards_the_whole_turn(monkeypatch, hybrid_on):
     """current succeeds with vectors, combined raises: nothing hybrid may survive."""
-    real = chat.mg_retrieval.select_context
+    real = recall_select.mg_retrieval.select_context
     seen = []
 
     def flaky(query, cards, **kw):
@@ -213,7 +214,7 @@ def test_failure_on_the_second_pass_discards_the_whole_turn(monkeypatch, hybrid_
         return real(query, cards, **kw)
 
     lexical = _run(monkeypatch, TWO_TURN_WINDOW)
-    monkeypatch.setattr(chat.mg_retrieval, "select_context", flaky)
+    monkeypatch.setattr(recall_select.mg_retrieval, "select_context", flaky)
     seen.clear()
     got = _run(monkeypatch, TWO_TURN_WINDOW, _state())
     assert ("vector", TWO_TURN_WINDOW[-1]["content"]) in seen  # the first pass did run hybrid
@@ -224,7 +225,7 @@ def test_failure_on_the_second_pass_discards_the_whole_turn(monkeypatch, hybrid_
 def test_invalid_min_cosine_at_selection_time_falls_back(monkeypatch, hybrid_on):
     lexical = _run(monkeypatch, TWO_TURN_WINDOW)
     state = _state()
-    monkeypatch.setattr(recall_hybrid, "min_cosine", lambda: 2.0)  # memgarden rejects it
+    monkeypatch.setattr(recall_policy, "min_cosine", lambda: 2.0)  # memgarden rejects it
     got = _run(monkeypatch, TWO_TURN_WINDOW, state)
     _assert_same_selection(got, lexical)
     assert got[2]["hybrid"]["fallback_reason"] == "vector_contract_error"
@@ -259,13 +260,13 @@ def test_empty_query_skips_hybrid_and_stays_lexical(monkeypatch, hybrid_on):
 # --------------------------------------------------------------------------- #
 
 def test_begin_reports_why_hybrid_cannot_run(monkeypatch):
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
-    monkeypatch.delenv(recall_hybrid.MIN_COSINE_ENV, raising=False)
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
+    monkeypatch.delenv(recall_policy.MIN_COSINE_ENV, raising=False)
     assert recall_hybrid.begin(True)["fallback_reason"] == "min_cosine_unset"
     assert recall_hybrid.begin(False)["fallback_reason"] == "legacy_ranker"
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "nan")
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "nan")
     assert recall_hybrid.begin(True)["fallback_reason"] == "min_cosine_unset"
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.8")
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "0.8")
     monkeypatch.setattr(recall_hybrid, "_embedder_state", "loading")
     state = recall_hybrid.begin(True)
     assert state["fallback_reason"] == "embedder_loading" and state["model_id"] is None
@@ -297,12 +298,12 @@ def test_encoding_is_bounded_by_deadline_and_in_flight_cap():
         try:
             recall_hybrid.encode_queries(slow, [text], time.monotonic() + 10)
             results.append("ok")
-        except recall_hybrid.Fallback as exc:
+        except recall_policy.Fallback as exc:
             results.append(exc.reason)
 
     try:
         # a job that outlives its deadline keeps its permit while it runs
-        with pytest.raises(recall_hybrid.Fallback) as first:
+        with pytest.raises(recall_policy.Fallback) as first:
             recall_hybrid.encode_queries(slow, ["a"], time.monotonic() + 0.05)
         assert first.value.reason == "deadline_exceeded"
         waiter = threading.Thread(target=caller, args=("b",))  # takes the second permit, queued
@@ -311,7 +312,7 @@ def test_encoding_is_bounded_by_deadline_and_in_flight_cap():
         while recall_hybrid._in_flight._value > 0 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert recall_hybrid._in_flight._value == 0
-        with pytest.raises(recall_hybrid.Fallback) as busy:
+        with pytest.raises(recall_policy.Fallback) as busy:
             recall_hybrid.encode_queries(slow, ["c"], time.monotonic() + 1.0)
         assert busy.value.reason == "embedder_busy"
     finally:
@@ -333,13 +334,13 @@ def _row(mid, vector, digest="h" * 16):
 
 def test_decode_vectors_rejects_foreign_model_and_bad_rows():
     unit = [1.0] + [0.0] * 63
-    with pytest.raises(recall_hybrid.Fallback) as exc:
-        recall_hybrid.decode_vectors({"model_id": "other", "vectors": []}, "m", 64)
+    with pytest.raises(recall_policy.Fallback) as exc:
+        recall_policy.decode_vectors({"model_id": "other", "vectors": []}, "m", 64)
     assert exc.value.reason == "vectors_model_mismatch"
     rows = [_row("ok", unit), _row("ok", unit), _row("short", unit[:10]),
             _row("nan", [math.nan] + [0.0] * 63), _row("not_unit", [2.0] + [0.0] * 63),
             {"id": "bad_b64", "projection_hash": "x", "vector_b64": "@@@"}]
-    out, rejected = recall_hybrid.decode_vectors({"model_id": "m", "vectors": rows}, "m", 64)
+    out, rejected = recall_policy.decode_vectors({"model_id": "m", "vectors": rows}, "m", 64)
     assert list(out) == ["ok"] and rejected == 5
 
 
@@ -506,7 +507,7 @@ def _paths(calls):
 
 
 def test_route_flag_off_never_reads_vectors(monkeypatch, route_client):
-    monkeypatch.delenv(recall_hybrid.HYBRID_ENV, raising=False)
+    monkeypatch.delenv(recall_policy.HYBRID_ENV, raising=False)
     client, calls = route_client
     r = client.get("/v1/chat/history?limit=1&context_trace=1", headers={"X-API-Key": "k"})
     assert r.status_code == 200
@@ -515,8 +516,8 @@ def test_route_flag_off_never_reads_vectors(monkeypatch, route_client):
 
 
 def test_route_flag_on_reads_vectors_as_the_same_user_and_skips_probes(monkeypatch, route_client):
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.1")
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "0.1")
     embedder = _embedder()
     monkeypatch.setattr(recall_hybrid, "_embedder_state", "ready")
     monkeypatch.setattr(recall_hybrid, "_embedder", embedder)
@@ -539,8 +540,8 @@ def test_route_flag_on_reads_vectors_as_the_same_user_and_skips_probes(monkeypat
 
 
 def test_route_flag_on_but_embedder_loading_does_not_read_vectors(monkeypatch, route_client):
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.1")
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "0.1")
     monkeypatch.setattr(recall_hybrid, "_embedder_state", "loading")
     monkeypatch.setattr(recall_hybrid, "start_warmup", lambda: False)
     client, calls = route_client
@@ -619,9 +620,10 @@ def test_t741_durable_recall_trace_drops_no_key_with_a_real_hybrid_record():
     The record here is the one the enclave builds, so a field added there that
     V2 does not carry fails the key-set check instead of vanishing."""
     import debug_trace
-    _, _, record = chat._try_hybrid_selection(
+    _, _, record = recall_select.try_hybrid_selection(
         {"fallback_reason": "embedder_loading", "vectors_ms": 4.5, "vectors_requested": 6,
-         "vectors_rejected": 1, "stored": {"a": ("h", [1.0])}}, [], [], {}, "q", "q")
+         "vectors_rejected": 1, "stored": {"a": ("h", [1.0])}}, [], [], {}, "q", "q",
+        encoder=recall_hybrid)
     record = {**record, "lanes": [{"source": "current", "vector_only": 1}]}
     mode = ("relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:95bb8c3b"
             "+host:latest-first-v1:hybrid-fallback:recent7d")
@@ -712,7 +714,7 @@ def test_plaintext_candidate_ids_skip_encrypted_local_only_and_foreign():
                {"id": "lo", "visibility": "local_only", "body": "{}", **me}, {"id": "nobody", **me},
                {"id": "theirs", "body": "{}", "owner_user_id": "usr_b"}, {"id": "ownerless", "body": "{}"},
                {"id": "p", "body": "{}", **me}, "junk", {"body": "{}", **me}]
-    assert recall_hybrid.plaintext_candidate_ids(moments, "usr_a") == ["p", "b64"]
+    assert recall_policy.plaintext_candidate_ids(moments, "usr_a") == ["p", "b64"]
 
 
 def test_encode_timing_splits_queue_and_compute():
@@ -766,7 +768,7 @@ def test_real_readside_inner_out_only_holds_cards_that_passed_the_gates():
     assert [c["id"] for c in cards] == ["plain", "enc"]  # local_only, foreign, tampered dropped
     assert set(inner) == {"plain", "enc"}
     assert inner["plain"]["summary"] == plain["summary"]
-    assert recall_hybrid.plaintext_candidate_ids(moments, "usr_a") == ["plain"]
+    assert recall_policy.plaintext_candidate_ids(moments, "usr_a") == ["plain"]
 
 
 def test_route_real_crypto_requests_plaintext_ids_and_rejects_encrypted_vector(monkeypatch):
@@ -811,8 +813,8 @@ def test_route_real_crypto_requests_plaintext_ids_and_rejects_encrypted_vector(m
     monkeypatch.setattr(backend_client, "backend_get", fake_get)
     monkeypatch.setattr(backend_client, "backend_post", fake_post)
     monkeypatch.setattr(keys, "get_content_sk", fake_sk)
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.1")
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "0.1")
     monkeypatch.setattr(recall_hybrid, "_embedder_state", "ready")
     monkeypatch.setattr(recall_hybrid, "_embedder", embedder)
     monkeypatch.setattr(recall_hybrid, "start_warmup", lambda: False)
@@ -834,8 +836,8 @@ def test_route_real_crypto_requests_plaintext_ids_and_rejects_encrypted_vector(m
 
 def test_healthz_reports_flag_off_and_model_not_loaded(monkeypatch):
     from enclave.routes import health
-    monkeypatch.delenv(recall_hybrid.HYBRID_ENV, raising=False)
-    monkeypatch.delenv(recall_hybrid.MIN_COSINE_ENV, raising=False)
+    monkeypatch.delenv(recall_policy.HYBRID_ENV, raising=False)
+    monkeypatch.delenv(recall_policy.MIN_COSINE_ENV, raising=False)
     monkeypatch.setattr(recall_hybrid, "_embedder_state", "idle")
     monkeypatch.setattr(recall_hybrid, "_embedder", None)
     body = health._health_body()
@@ -851,8 +853,8 @@ def test_healthz_reports_flag_off_and_model_not_loaded(monkeypatch):
 ])
 def test_healthz_embedder_state_labels(monkeypatch, state, reason, label, expect_reason):
     from enclave.routes import health
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
-    monkeypatch.setenv(recall_hybrid.MIN_COSINE_ENV, "0.80")
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, "0.80")
     monkeypatch.setattr(recall_hybrid, "_embedder_state", state)
     monkeypatch.setattr(recall_hybrid, "_embedder_reason", reason)
     monkeypatch.setattr(recall_hybrid, "_embedder", None)
@@ -863,7 +865,7 @@ def test_healthz_embedder_state_labels(monkeypatch, state, reason, label, expect
 
 def test_healthz_loaded_model_id_is_a_bounded_prefix_without_paths(monkeypatch):
     from enclave.routes import health
-    monkeypatch.setenv(recall_hybrid.HYBRID_ENV, "1")
+    monkeypatch.setenv(recall_policy.HYBRID_ENV, "1")
     embedder = _embedder()
     monkeypatch.setattr(recall_hybrid, "_embedder_state", "ready")
     monkeypatch.setattr(recall_hybrid, "_embedder", embedder)

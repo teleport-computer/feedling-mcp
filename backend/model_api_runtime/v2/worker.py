@@ -85,6 +85,7 @@ from chat.reply_language import (
     garden_language_decision,
     infer_garden_language,
     infer_reply_language,
+    proactive_language_system_line,
     reply_language_system_line,
     user_written_text,
 )
@@ -587,6 +588,19 @@ if not math.isfinite(MCP_TOOL_CALL_TIMEOUT_SEC) or MCP_TOOL_CALL_TIMEOUT_SEC <= 
     raise RuntimeError(
         "FEEDLING_V2_MCP_TOOL_CALL_TIMEOUT_SEC must be positive and finite"
     )
+# Per-wire provider bound for wake lanes (heartbeat, manual_wake, scheduled,
+# screen_watch): httpx timeout, true wall-clock wire deadline, and a stall-clock
+# progress boundary at every attempt and wire (run_tool_loop's
+# provider_wire_timeout_sec). Chat keeps provider_client's 60s httpx default.
+# Prod 2026-09-26..28 (T770): GLM heartbeat first calls slowed to p90 ~100s
+# after T723 (the look round), and GLM round-1 timeouts (60s x 2 attempts) rose
+# from 1.2% to 8.5% of calls; scheduled reminders on GLM failed the same way.
+# Nobody is waiting on a wake reply. 110s stays below z.ai's own server-side cut
+# (measured at 122.7s); one wire plus 30s must stay below the wake slot stall
+# budget (240s), pinned by tests/test_v2_wake_provider_timeout.py.
+WAKE_PROVIDER_WIRE_TIMEOUT_SEC = _positive_float_env(
+    "FEEDLING_V2_WAKE_PROVIDER_WIRE_TIMEOUT_SEC", "110"
+)
 # The per-call deadline alone is not a whole-turn bound: all user-MCP tools are
 # deliberately serialized, so a model could otherwise spend the 45s allowance
 # 24 times while still crossing a progress boundary after every call. Keep one
@@ -672,6 +686,13 @@ if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
         "and FEEDLING_V2_WAKE_TAIL_MAX_TURNS for prompt replay depth"
     )
 _CAPTURE_BATCH_LIMIT = 60
+#: Heartbeats that end before any provider call are recorded as
+#: ``wake_result='skipped'`` with one of these reasons (T773). Without it they
+#: completed with ``wake_result`` NULL, which open-rate reports read as "spoke"
+#: although no model ran and nothing was sent.
+HEARTBEAT_SKIPPED = "skipped"
+HEARTBEAT_SKIP_NO_USER_HISTORY = "no_user_history"
+HEARTBEAT_SKIP_YIELDED_TO_CHAT = "yielded_to_chat"
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
 # MUST stay a superset-compatible mirror of
 # capture_scheduler.CAPTURE_LIVE_SOURCES (locked by
@@ -3394,14 +3415,29 @@ def _schema_surface_trace_callback(
     return _emit
 
 
-async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem):
-    """Best-effort selection with an explicit unavailable state, never fake 0."""
+def _turn_coordinates(lane, job_id, trace_id, attempt) -> dict:
+    """The coordinates _memory_recall_callback puts on memory.recall.completed,
+    so other per-turn diagnostics can be joined to the same turn."""
+    job_id = str(job_id)
+    return {"lane": "chat" if lane == "chat" else "wake",
+            "turn_id": str(trace_id or "") or f"{lane}:{job_id}", "job_id": job_id,
+            "attempt": int(attempt or 0)}
+
+
+async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None):
+    """Best-effort selection with an explicit unavailable state, never fake 0.
+
+    ``coordinates`` (optional) only labels diagnostics about this read; the
+    selection itself does not depend on it."""
     if deps.read_context_memories is None or int(through_seq or 0) < 1:
         return {}
+    kwargs = {"through_seq": int(through_seq)}
+    if coordinates is not None:
+        kwargs["coordinates"] = coordinates
     try:
         async with enclave_sem:
             payload = await asyncio.to_thread(
-                deps.read_context_memories, user_id, through_seq=int(through_seq)
+                deps.read_context_memories, user_id, **kwargs
             )
         if not isinstance(payload, dict):
             raise ValueError("context_memory_response_not_object")
@@ -4031,6 +4067,7 @@ def _emit_prompt_frontier_trace(
     observation: Any,
     *,
     lane: str,
+    attachment_captions: dict[str, int] | None = None,
 ) -> None:
     """Best-effort final debug-trace boundary for one prompt budget decision."""
 
@@ -4041,6 +4078,8 @@ def _emit_prompt_frontier_trace(
             observation,
             lane=lane,
         )
+        if attachment_captions and event_type == "v2.prompt_frontier.budget":
+            detail["attachment_captions"] = dict(attachment_captions)
         deps.emit_debug_trace(
             user_id,
             event_type,
@@ -5168,6 +5207,7 @@ def _ledger_tapped_sink(
     lane: str = "chat",
     trace_id: str = "",
     job_id: str = "",
+    caption_probe: "_AttachmentCaptionProbe | None" = None,
 ):
     """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
 
@@ -5186,13 +5226,25 @@ def _ledger_tapped_sink(
         if recorder is not None:
             await recorder.record(event_kind, payload)
             await _mirror_provider_attempt(recorder, event_kind, payload)
+        if event_kind == "late_input_fold" and caption_probe is not None:
+            try:
+                caption_probe.expect(payload.get("messages") or ())
+            except Exception:  # noqa: BLE001 — observability cannot fail a turn
+                pass
         if event_kind == "provider_request" and deps is not None:
+            attachment_captions = None
+            if caption_probe is not None:
+                try:
+                    attachment_captions = caption_probe.observe(payload)
+                except Exception:  # noqa: BLE001 — observability cannot fail a turn
+                    attachment_captions = None
             await asyncio.to_thread(
                 _emit_prompt_frontier_trace,
                 deps,
                 user_id,
                 payload.get("prompt_frontier"),
                 lane=lane,
+                attachment_captions=attachment_captions,
             )
             await asyncio.to_thread(
                 _emit_context_truncation_trace,
@@ -5233,6 +5285,146 @@ def _ledger_tapped_sink(
                         )
 
     return _record
+
+
+_ATTACHMENT_CAPTION_TEXT_KEYS = ("content", "text")
+_ATTACHMENT_CAPTION_WALK_DEPTH = 6
+
+
+def _carrier_text(value: Any, out: list[str], depth: int = 0) -> None:
+    # Only text-bearing keys are walked, so image bytes are never scanned.
+    if depth > _ATTACHMENT_CAPTION_WALK_DEPTH:
+        return
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key in _ATTACHMENT_CAPTION_TEXT_KEYS:
+            if key in value:
+                _carrier_text(value[key], out, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _carrier_text(item, out, depth + 1)
+
+
+class _AttachmentCaptionProbe:
+    """Did the words typed with this turn's images/files reach the provider? (T768)
+
+    The prompt builder reports every conversation row it renders together with
+    the message it created. Messages reach the request as shallow copies (e.g.
+    ``tool_loop._with_system_suffix``), so the message dict itself cannot be the
+    token; the rendered content object is, disambiguated by ownership: a content
+    object rendered by one row belongs to that row. When several rows rendered
+    the same object (a shared or interned string), the sent message is assigned
+    by its position between unambiguous neighbours; if another row could still
+    own it, this turn's candidates are reported as ``undetermined`` rather than
+    delivered or missing (missing = with_caption - delivered - undetermined).
+    Equal text in a different object never counts. Captions and ids
+    stay in memory; only integer counts reach telemetry.
+    """
+
+    def __init__(self) -> None:
+        self._rows: dict[str, tuple[str, str]] = {}
+        # id(content) -> [(order, row_id, content)]; content kept so ids stay live.
+        self._owners: dict[int, list[tuple[float, str, Any]]] = {}
+        self._noted = 0
+
+    def expect(self, rows: Iterable[Any]) -> None:
+        for row in rows or ():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role") or "user") not in {"user", "human"}:
+                continue
+            kind = "image" if row.get("has_image") else "file" if row.get("has_file") else ""
+            row_id = str(row.get("id") or "")
+            if kind and row_id and row_id not in self._rows:
+                self._rows[row_id] = (kind, str(row.get("caption") or "").strip())
+
+    def note_message(self, row: Any, message: Any) -> None:
+        if not isinstance(row, dict) or not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if content is None:
+            return
+        self._noted += 1
+        row_id = str(row.get("id") or "") or f"anon:{id(row)}"
+        try:
+            order = float(row.get("seq"))
+        except (TypeError, ValueError):
+            order = 1e18 + self._noted
+        owners = self._owners.setdefault(id(content), [])
+        if not any(owner == row_id and known is content for _o, owner, known in owners):
+            owners.append((order, row_id, content))
+
+    def _candidates(self, content: Any) -> list[tuple[float, str]]:
+        found: dict[str, float] = {}
+        for order, row_id, known in self._owners.get(id(content), ()):
+            if known is content:
+                found[row_id] = min(order, found.get(row_id, order))
+        return sorted((order, row_id) for row_id, order in found.items())
+
+    def observe(self, provider_request: dict) -> dict[str, int] | None:
+        if not self._rows:
+            return None
+        sent = [
+            message.get("content")
+            for message in provider_request.get("messages") or ()
+            if isinstance(message, dict) and message.get("content") is not None
+        ]
+        candidates = [self._candidates(content) for content in sent]
+        anchors = [cands[0][0] if len(cands) == 1 else None for cands in candidates]
+        owned: dict[str, list[Any]] = {}
+        unresolved: dict[str, list[Any]] = {}
+        for index, cands in enumerate(candidates):
+            if not cands:
+                continue
+            if len(cands) > 1:
+                before = max((a for a in anchors[:index] if a is not None), default=float("-inf"))
+                after = min((a for a in anchors[index + 1:] if a is not None), default=float("inf"))
+                cands = [c for c in cands if before < c[0] < after] or cands
+            if len(cands) > 1:
+                if any(row_id not in self._rows for _o, row_id in cands):
+                    # Another row could own it: this turn's rows among the
+                    # candidates are undetermined, never delivered or missing.
+                    for _o, row_id in cands:
+                        if row_id in self._rows:
+                            unresolved.setdefault(row_id, []).append(sent[index])
+                    continue
+                free = [c for c in cands if c[1] not in owned]
+                cands = free[:1] or cands[:1]
+            owned.setdefault(cands[0][1], []).append(sent[index])
+        def carries(contents: Iterable[Any], caption: str) -> bool:
+            for content in contents:
+                fragments: list[str] = []
+                _carrier_text(content, fragments)
+                if any(caption in fragment for fragment in fragments):
+                    return True
+            return False
+
+        with_caption = delivered = caption_chars = delivered_chars = 0
+        undetermined = undetermined_chars = 0
+        for row_id, (_kind, caption) in self._rows.items():
+            if not caption:
+                continue
+            with_caption += 1
+            caption_chars += len(caption)
+            if carries(owned.get(row_id, ()), caption):
+                delivered += 1
+                delivered_chars += len(caption)
+            elif carries(unresolved.get(row_id, ()), caption):
+                undetermined += 1
+                undetermined_chars += len(caption)
+        kinds = [kind for kind, _ in self._rows.values()]
+        # missing = with_caption - delivered - undetermined
+        return {
+            "images": kinds.count("image"),
+            "files": kinds.count("file"),
+            "with_caption": with_caption,
+            "delivered": delivered,
+            "undetermined": undetermined,
+            "caption_chars": caption_chars,
+            "delivered_chars": delivered_chars,
+            "undetermined_chars": undetermined_chars,
+        }
 
 
 def _worldbook_context_observation(provider_request: dict) -> dict | None:
@@ -6263,6 +6455,7 @@ def _make_build_messages_fn(
     proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
+    caption_probe: "_AttachmentCaptionProbe | None" = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -6323,6 +6516,14 @@ def _make_build_messages_fn(
             ),
         )
 
+    def _note_caption_message(row: dict, message: dict) -> None:
+        if caption_probe is None:
+            return
+        try:
+            caption_probe.note_message(row, message)
+        except Exception:  # noqa: BLE001 — observability cannot fail a turn
+            pass
+
     def _base(
         selected_turns: list[list[dict]],
         *,
@@ -6357,6 +6558,7 @@ def _make_build_messages_fn(
             proactive_turn_boundary=proactive_turn_boundary,
             manual_wake=manual_wake,
             screen_frame_message=screen_frame_message,
+            on_tail_message=_note_caption_message,
         )
 
     base_messages = _base(optional_turns)
@@ -6370,6 +6572,7 @@ def _make_build_messages_fn(
             content = item.get("content")
             if context._has_payload(content):
                 rendered.append({"role": "user", "content": content})
+                _note_caption_message(item, rendered[-1])
         return list(base_messages) + rendered
 
     if target_turns is not None:
@@ -9492,6 +9695,8 @@ async def _run_wake(
                     context_stream="v2_perception_wake_context",
                     consumed_context_seq=consumed_context_seq,
                     clear_wake_backoff=True,
+                    wake_result=HEARTBEAT_SKIPPED,
+                    wake_result_reason=HEARTBEAT_SKIP_NO_USER_HISTORY,
                 )
             else:
                 successor_id = None
@@ -9500,6 +9705,8 @@ async def _run_wake(
                     job_id,
                     claimed_by=claimed_by,
                     clear_wake_backoff=True,
+                    wake_result=HEARTBEAT_SKIPPED,
+                    wake_result_reason=HEARTBEAT_SKIP_NO_USER_HISTORY,
                 )
             if not completed:
                 raise LostJobLease(
@@ -9727,6 +9934,13 @@ async def _run_wake(
             )
             if base_prompt_user_frontier > wake_reply_cursor_seq:
                 successor_id = None
+                # Only heartbeats are re-labelled: other wake lanes keep their
+                # existing record until their own semantics are decided.
+                yield_result = (
+                    {"wake_result": HEARTBEAT_SKIPPED,
+                     "wake_result_reason": HEARTBEAT_SKIP_YIELDED_TO_CHAT}
+                    if lane == "heartbeat" else {}
+                )
                 if (
                     lane == "heartbeat"
                     and deps.read_perception_wake_context is not None
@@ -9738,12 +9952,14 @@ async def _run_wake(
                         observed_generation=observed_generation,
                         context_stream="v2_perception_wake_context",
                         consumed_context_seq=0,
+                        **yield_result,
                     )
                 else:
                     completed = await asyncio.to_thread(
                         jobs_store.mark_completed,
                         job_id,
                         claimed_by=claimed_by,
+                        **yield_result,
                     )
                 if not completed:
                     raise LostJobLease(
@@ -11313,6 +11529,7 @@ async def _run_wake(
 
         turn_memory_payload = await _load_turn_memory_context(
             deps, user_id, wake_snapshot_seq, enclave_sem,
+            coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
         )
         turn_memory_observation: dict = {}
 
@@ -11336,7 +11553,7 @@ async def _run_wake(
             )
             _wake_sys = context._join_policy_blocks(
                 _wake_sys,
-                reply_language_system_line(wake_reply_language),
+                proactive_language_system_line(wake_reply_language),
             )
             return _make_build_messages_fn(
                 system_prompt=_wake_sys,
@@ -11499,6 +11716,7 @@ async def _run_wake(
                 wake_look_first=(lane in _PRESENCE_WAKE_LANES),
                 reply_tool_enabled=True,
                 wake_output_budget_required=True,
+                provider_wire_timeout_sec=WAKE_PROVIDER_WIRE_TIMEOUT_SEC,
                 memory_delete_allowed=False,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -16685,8 +16903,16 @@ async def process_job(
 
         turn_memory_payload = await _load_turn_memory_context(
             deps, user_id, cursor_seq, enclave_sem,
+            coordinates=_turn_coordinates(
+                lane, job["id"], job.get("trace_id"), job.get("attempt_count")),
         )
         turn_memory_observation: dict = {}
+
+        caption_probe = _AttachmentCaptionProbe()
+        try:
+            caption_probe.expect(coalesced)
+        except Exception:  # noqa: BLE001 — observability cannot fail a turn
+            pass
 
         def _chat_builder():
             chat_system_prompt = context._join_policy_blocks(
@@ -16719,6 +16945,7 @@ async def process_job(
                 tail_lane=lane,
                 tail_anchor_seq=optional_anchor_seq,
                 screen_frame_message=screen_frame_message,
+                caption_probe=caption_probe,
             )
 
         build_messages = _chat_builder()
@@ -16892,6 +17119,7 @@ async def process_job(
                 lane=lane,
                 trace_id=str(job.get("trace_id") or ""),
                 job_id=str(job_id),
+                caption_probe=caption_probe,
             ),
             extra_tool_specs=offered_mcp_tool_specs,
             refresh_extra_tool_specs=_current_offered_mcp_tool_specs,

@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import memory_search_contract as contract  # noqa: E402
 from enclave.routes import chat  # noqa: E402
+from memory import recall_select  # noqa: E402
 from memgarden import observability  # noqa: E402
 from model_api_runtime.v2 import memory_context  # noqa: E402
 
@@ -45,9 +46,9 @@ def _run(monkeypatch, cards, rows=WINDOW, **args):
 
 
 def test_default_unified_ranker_records_version_and_latest_two_user_query(monkeypatch):
-    monkeypatch.delenv(chat.RECALL_RANKER_ENV, raising=False)
+    monkeypatch.delenv(recall_select.RECALL_RANKER_ENV, raising=False)
     legacy = []
-    monkeypatch.setattr(chat.memory_relevance, "select_relevant_context_memories_with_trace",
+    monkeypatch.setattr(recall_select.memory_relevance, "select_relevant_context_memories_with_trace",
                         lambda *a, **k: legacy.append(1))
     filler = [{"id": f"f{i}", "summary": f"第{i}次整理工作周报和会议纪要", "status": "active"}
               for i in range(30)]
@@ -96,15 +97,15 @@ def test_stopword_only_window_injects_nothing(monkeypatch):
 
 def test_kill_switch_off_restores_previous_selector_with_latest_two_user_query(monkeypatch):
     calls = []
-    original = chat.memory_relevance.select_relevant_context_memories_with_trace
+    original = recall_select.memory_relevance.select_relevant_context_memories_with_trace
 
     def spy(cards, query):
         calls.append(query)
         return original(cards, query)
 
-    monkeypatch.setattr(chat.memory_relevance, "select_relevant_context_memories_with_trace", spy)
+    monkeypatch.setattr(recall_select.memory_relevance, "select_relevant_context_memories_with_trace", spy)
     for value in ("0", "false", "off", "NO"):
-        monkeypatch.setenv(chat.RECALL_RANKER_ENV, value)
+        monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, value)
         picked, trace, log = _run(monkeypatch, _cards())
         assert log["mode"] == "relevant:unified:legacy-relevance+host:latest-first-v1"
         assert trace["mode"] == "latest_first"
@@ -112,7 +113,7 @@ def test_kill_switch_off_restores_previous_selector_with_latest_two_user_query(m
     # T684 changes query construction for both selectors, not the kill switch.
     assert calls == [WINDOW[2]["content"], USER_QUERY] * 4
     for value in ("1", "true", "", "anything"):
-        monkeypatch.setenv(chat.RECALL_RANKER_ENV, value)
+        monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, value)
         assert _run(monkeypatch, _cards())[2]["mode"].startswith("relevant:unified:memgarden-bm25-v2")
     assert len(calls) == 8
 

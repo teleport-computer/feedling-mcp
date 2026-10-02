@@ -219,7 +219,7 @@ def run_add_memory(store, api_key: str | None, job_id: str, *, runtime, source_g
         raise worker.GenesisWorkerError("distill_empty_output:keep_all_nonempty:zero_memory_cards")
     _emit_partial(store, job_id, result.dropped)
     completed = db.genesis_complete_job(
-        store.user_id, job_id, output={"stage": "plaintext_add_memory_done"},
+        store.user_id, job_id, output=progress.done_output("plaintext_add_memory_done"),
         memory_action_count=result.cards_written, identity_status="skipped",
         persona_ref="", persona_sha256="")
     if completed:
@@ -559,7 +559,8 @@ def _run_full(store, api_key, job_id, *, runtime, source_groups, relationship_an
     _emit_partial(store, job_id, result.dropped)
     applied = _apply_non_memory(store, api_key, job_id, merged, memory_action_count=result.cards_written)
     completed = db.genesis_complete_job(
-        store.user_id, job_id, output=applied, memory_action_count=result.cards_written,
+        store.user_id, job_id, output=progress.done_output("plaintext_reducer_done", **applied),
+        memory_action_count=result.cards_written,
         identity_status=str(applied.get("identity_status") or ""),
         persona_ref=str(applied.get("persona_ref") or ""),
         persona_sha256=str(applied.get("persona_sha256") or ""))

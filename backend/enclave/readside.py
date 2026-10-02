@@ -9,30 +9,7 @@ from memgarden.prompts.recall_fields import retrieval_cues
 
 from enclave import envelope
 from memory import recall_metadata
-
-
-MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT = 500
-MEMORY_READSIDE_MODEL_API_MIN_LIMIT = 1
-
-
-def memory_readside_model_api_limit() -> int:
-    """自动注入的候选池大小。
-
-    正整数配置原样传给 backend；backend 的 memory/list 契约负责显式拒绝
-    超出其支持范围的值。这里不能再静默钳位，否则运维旋钮只可下调不可上调。
-    """
-    raw = str(os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "")).strip()
-    try:
-        value = int(raw) if raw else MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "MEMORY_READSIDE_MODEL_API_LIMIT must be an integer"
-        ) from exc
-    if value < MEMORY_READSIDE_MODEL_API_MIN_LIMIT:
-        raise ValueError(
-            "MEMORY_READSIDE_MODEL_API_LIMIT must be positive"
-        )
-    return value
+from memory import recall_select
 
 
 def memory_readside_hard_max() -> int:
@@ -73,14 +50,6 @@ def memory_readside_text(value, max_chars: int = 2000) -> str:
     return str(value or "").strip()[:max_chars]
 
 
-def memory_readside_list(value) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip()[:160] for item in value if str(item or "").strip()]
-    if isinstance(value, str) and value.strip():
-        return [value.strip()[:160]]
-    return []
-
-
 def memory_readside_summary(inner: dict) -> str:
     for key in ("summary", "description", "title"):
         text = memory_readside_text(inner.get(key), 500)
@@ -108,7 +77,7 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
             "summary": memory_readside_text(inner.get("summary"), 500),
             "content": str(inner.get("content") or "").strip(),
             "bucket": memory_readside_text(inner.get("bucket"), 80) or "未分类",
-            "threads": memory_readside_list(inner.get("threads"))[:8],
+            "threads": recall_select.readside_list(inner.get("threads"))[:8],
             # 通话溯源:agent 拿到它就能调 voice_transcript_read
             # 回看原文。这个 dict 是显式重建的,漏加 = 字段被
             # 静默剥掉,写进去也等于没写。
@@ -126,11 +95,11 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
         f"上下文: {quote or '对话中明确提到。'}",
         f"使用提示: {follow_up or '自然使用这条记忆，不要机械复述。'}",
     ])
-    threads = memory_readside_list(inner.get("threads"))
+    threads = recall_select.readside_list(inner.get("threads"))
     if not threads:
-        threads = memory_readside_list(inner.get("linked_dimension"))
+        threads = recall_select.readside_list(inner.get("linked_dimension"))
     if not threads:
-        threads = memory_readside_list(inner.get("anchor_memory_ids"))
+        threads = recall_select.readside_list(inner.get("anchor_memory_ids"))
     adapted = {
         "summary": summary,
         "content": content,
@@ -139,10 +108,6 @@ def memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
         "threads": threads[:8],
     }
     return adapted
-
-
-def memory_readside_status(envelope: dict, inner: dict) -> str:
-    return str(envelope.get("status") or inner.get("status") or "active").strip().lower() or "active"
 
 
 def memory_public_item(item: dict) -> dict:
@@ -163,7 +128,7 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
         "threads": list(adapted.get("threads") or [])[:8],
         "importance": float(envelope.get("importance") or 0.5),
         "pulse": float(envelope.get("pulse") or 0.3),
-        "status": memory_readside_status(envelope, inner),
+        "status": recall_select.readside_status(envelope, inner),
         "occurred_at": memory_readside_text(envelope.get("occurred_at"), 80),
         "created_at": memory_readside_text(envelope.get("created_at"), 80),
         "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
@@ -173,11 +138,12 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
 
 
 def build_memory_search_item(envelope: dict, inner: dict) -> dict:
-    """Build an index-shaped item with enclave-private search text.
+    """Build an index-shaped item with private search text.
 
-    ``content`` must never appear in the memory-index response, but exact search
-    still needs to match it while plaintext exists inside the enclave. The route
-    strips ``_search_content`` before serialization.
+    ``content`` must never appear in the memory-index response, but search
+    still needs to match it: inside the enclave for sealed-content accounts, in
+    the backend for plaintext accounts (``memory_readside_core``). Both strip
+    ``_search_content`` before serialization.
     """
     adapted = memory_inner_to_v1(inner, envelope)
     item = build_memory_index_item(envelope, inner)
@@ -197,7 +163,7 @@ def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
         "threads": list(adapted.get("threads") or [])[:8],
         "importance": float(envelope.get("importance") or 0.5),
         "pulse": float(envelope.get("pulse") or 0.3),
-        "status": memory_readside_status(envelope, inner),
+        "status": recall_select.readside_status(envelope, inner),
         "source": memory_readside_text(envelope.get("source"), 160),
         "occurred_at": memory_readside_text(envelope.get("occurred_at"), 80),
         "created_at": memory_readside_text(envelope.get("created_at"), 80),
@@ -289,31 +255,5 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk,
             continue
         if inner_out is not None and m.get("id"):
             inner_out[str(m.get("id"))] = inner
-        out.append({
-            **recall_metadata.fields(inner, m),
-            "id": m.get("id"),
-            "bucket": inner.get("bucket"),
-            "threads": memory_readside_list(inner.get("threads"))[:8],
-            "roles": inner.get("roles") if isinstance(inner.get("roles"), list) else [],
-            "status": memory_readside_status(m, inner),
-            "archived_at": m.get("archived_at"),
-            "is_archived": m.get("is_archived"),
-            "archived": m.get("archived"),
-            "archive_reason": m.get("archive_reason"),
-            "superseded_by": m.get("superseded_by"),
-            "title": inner.get("title"),
-            "description": inner.get("description"),
-            # v1 memories keep their real text in summary/content with
-            # title/description empty; surface them so consumers (e.g. the
-            # Garden「talk in chat」quote expansion) can render actual text.
-            "summary": inner.get("summary"),
-            "content": inner.get("content"),
-            "type": inner.get("type"),
-            "source": m.get("source"),
-            "occurred_at": m.get("occurred_at"),
-            "created_at": m.get("created_at"),
-            "her_quote": inner.get("her_quote"),
-            "context": inner.get("context"),
-            "linked_dimension": inner.get("linked_dimension"),
-        })
+        out.append(recall_select.card_from_inner(inner, m))
     return out

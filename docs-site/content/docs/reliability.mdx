@@ -114,7 +114,14 @@ token (for example, `stay_silent`) is treated as `stay_silent` and never deliver
 Heartbeat and manual wakes first make one provider call without `reply` or
 `stay_silent`, so the agent looks at its context before deciding. If it needs no
 lookup, any drafted text stays unpublished and carries into one ordinary decision
-round with both choices offered. This uses the existing provider-call budget and
+round with both choices offered. If it does look something up, the next round is
+that decision round and carries the same instruction to end the wake with `reply`
+or `stay_silent`; it can still look further. When this decision round has no draft
+and is not a forced choice or direct-text correction, it also reminds the model
+to check a visible reply against the user's existing identity requirements,
+including `custom_persona_prompt`, within the existing safety and tool-use rules.
+This is a prompt reminder, not a guarantee of model adherence or a new retry;
+it disappears after that round. This uses the existing provider-call budget and
 applies only when that budget allows at least three calls. For these two lanes, the
 optional `aside` asks what makes the agent want to reach out now rather than how it
 will answer a message.
@@ -128,6 +135,13 @@ that shared budget with `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS`. It is separate fro
 the prompt-frontier output reserve and does not change the input frontier;
 file-capable calls retain their existing budget precedence. Scheduled reminders
 still require delivery; sharing the budget does not enable a silence choice.
+
+Wake lanes (heartbeat, manual wake, scheduled reminders, and screen watch) give each
+provider request up to 110 seconds in total before it counts as a timeout. Chat keeps
+the 60-second limit on waiting for a response. Retry behavior is unchanged, and each
+attempt counts as progress for the worker's stall watchdog, so a retried request is
+not mistaken for a stuck turn. Nobody is waiting on a wake reply, and reasoning models
+can take longer than a minute before their first response byte.
 
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours

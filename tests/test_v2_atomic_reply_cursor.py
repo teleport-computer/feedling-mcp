@@ -1244,6 +1244,12 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         user_id=uid,
         claimed_by=str(wake_job["claimed_by"]),
     ) == "completed"
+    # T773: the heartbeat yielded before any model call; it must not read as "spoke".
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (wake_id,),
+        ).fetchone() == ("skipped", "yielded_to_chat")
 
     chat_job = jobs_store.claim_next_job("chat-after-wake-yield")
     assert chat_job is not None and chat_job["lane"] == "chat"

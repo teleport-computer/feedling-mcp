@@ -18,6 +18,7 @@ from enclave import backend_client, keys, readside  # noqa: E402
 from enclave import state as enclave_state  # noqa: E402
 from enclave.routes import build_app  # noqa: E402
 from enclave.routes import chat as chat_routes  # noqa: E402
+from memory import recall_select  # noqa: E402
 from memory import memory_core  # noqa: E402
 
 
@@ -154,13 +155,13 @@ def test_user_entity_survives_long_assistant_topic(monkeypatch, agent_role):
 ])
 def test_recall_query_uses_latest_two_nonempty_user_texts(monkeypatch, latest):
     seen = []
-    original = chat_routes._unified_selection
+    original = recall_select.unified_selection
 
     def observe(cards, query):
         seen.append(query)
         return original(cards, query)
 
-    monkeypatch.setattr(chat_routes, "_unified_selection", observe)
+    monkeypatch.setattr(recall_select, "unified_selection", observe)
     messages = [
         {"role": "user", "content": "更早的话题"},
         {"role": "human", "content": "上一条用户消息"},
@@ -327,11 +328,11 @@ def test_context_recall_uses_configurable_memory_limit(enclave_history_client, m
     monkeypatch.delenv("MEMORY_READSIDE_MODEL_API_LIMIT", raising=False)
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
                               headers={"X-API-Key": "key_routeb"})
-    assert captured_limits[-1] == readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+    assert captured_limits[-1] == recall_select.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
 
     configured = max(
-        readside.MEMORY_READSIDE_MODEL_API_MIN_LIMIT,
-        readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT // 2,
+        recall_select.MEMORY_READSIDE_MODEL_API_MIN_LIMIT,
+        recall_select.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT // 2,
     )
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", str(configured))
     enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
@@ -349,7 +350,7 @@ def test_context_recall_uses_configurable_memory_limit(enclave_history_client, m
 
 def test_model_api_limit_default_uses_full_backend_supported_page():
     assert (
-        readside.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
+        recall_select.MEMORY_READSIDE_MODEL_API_DEFAULT_LIMIT
         == memory_core.MEMORY_LIST_MAX_LIMIT
     )
 
@@ -359,15 +360,15 @@ def test_model_api_limit_rejects_invalid_config(monkeypatch, raw):
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", raw)
 
     with pytest.raises(ValueError, match="must be an integer"):
-        readside.memory_readside_model_api_limit()
+        recall_select.memory_readside_model_api_limit()
 
 
 def test_model_api_limit_rejects_non_positive_config(monkeypatch):
-    unsupported = readside.MEMORY_READSIDE_MODEL_API_MIN_LIMIT - 1
+    unsupported = recall_select.MEMORY_READSIDE_MODEL_API_MIN_LIMIT - 1
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", str(unsupported))
 
     with pytest.raises(ValueError, match="must be positive"):
-        readside.memory_readside_model_api_limit()
+        recall_select.memory_readside_model_api_limit()
 
 
 @pytest.mark.parametrize("raw", ["not-an-integer", "0"])

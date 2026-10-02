@@ -6,6 +6,15 @@ canonical_owner: self
 ---
 
 Memory separates ciphertext storage from enclave-authorized read projections.
+Automatic card selection runs in the decrypt service by default; with the
+operator switch `FEEDLING_V2_PLAINTEXT_RECALL` enabled, Runtime V2 selects cards
+for plaintext accounts next to the data using the same selection code. A
+plaintext account's remaining sealed cards are not selected on that path.
+Keyword search (`memory_search`, and `memory_index` with a query) for a
+plaintext account ranks the account's plaintext cards in the backend with the
+same ranking code the decrypt service uses; its remaining sealed cards are not
+searched. Accounts the server does not recognize as plaintext still search in
+the decrypt service.
 
 V1 hosted and self-hosted resident consumers include relevant memory summaries
 in proactive wake prompts as well as Chat prompts. Heartbeat, scheduled,
@@ -545,8 +554,10 @@ response's effective `limit` and `truncated` values.
 
 A nonblank `query` searches the existing readable summary/content/thread/bucket
 projection plus retrieval cues using **BM25** (`k1=1.2`, `b=0.75`, nonnegative
-IDF). In the enclave, plaintext-tier and sealed cards share one corpus and one
-set of statistics. Exact `bucket` / `thread` filters select from that ranking;
+IDF). A plaintext account's plaintext cards are ranked in the backend as one
+corpus with one set of statistics; sealed cards left from before plaintext
+storage are not part of that corpus. Otherwise, in the enclave, plaintext-tier and
+sealed cards share one corpus and one set of statistics. Exact `bucket` / `thread` filters select from that ranking;
 `limit` is applied only afterwards. Scores tie by `occurred_at` descending, then
 ID ascending. The existing per-item `score` remains importance/recency, **not**
 BM25. Full content, tokens, postings and BM25 scores are not added to the response.
@@ -554,7 +565,7 @@ Final evidence selection still belongs to your client or agent.
 
 Query responses additionally carry `ranking: "memgarden-bm25-v2+tok:jieba-0.42.1"`
 and `unavailable_count` (candidate cards that could not be read, excluded from
-statistics). The relevance gate's coverage check counts term rarity over at least
+statistics; a plaintext account's sealed cards are not searched and not counted). The relevance gate's coverage check counts term rarity over at least
 20 cards, so a Garden with only a few cards still finds its answer. During a
 rolling upgrade a response may instead report
 `ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"` (the same ranker with the coverage

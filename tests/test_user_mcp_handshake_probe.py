@@ -226,6 +226,32 @@ def test_v2_pre_deploy_event_shape_says_deploy_first():
     assert any("先发版" in x for x in lines)
 
 
+def test_v2_capped_row_without_resolved_is_not_read_as_zero():
+    """T775 前的真实 prod 行:expected 在,resolved/skipped 被 20 键上限截掉。
+
+    读成 resolved=0 会报「计数对不上」或「每台都失败」,都是编出来的判定。
+    """
+    detail = {"driver": "v2", "lane": "chat", "kept": 3, "offered": 3,
+              "servers": 1, "per_server": "up:3/3",
+              "expected": 1, "expected_servers": ["up"]}
+    events = [{"type": "agent.model.call.done", "detail": {"driver": "v2"}},
+              {"type": "mcp.surface.resolved", "detail": detail}]
+    for expect in ("ok", "failed", "any"):
+        code, lines = classify(events, runtime="v2", expect=expect,
+                               server_count=1)
+        assert code == 3, (expect, lines)
+        assert any("T775" in x for x in lines), lines
+
+
+def test_v2_durable_skipped_map_counts_via_skipped_count():
+    """skipped 的 {name: kind} 截到 20 台时,算账仍按 skipped_count。"""
+    code, lines = classify(
+        _v2(expected=22, resolved=0, skipped_count=22,
+            skipped={f"s{i}": "tls" for i in range(20)}),
+        runtime="v2", expect="failed", server_count=22)
+    assert code == 0, lines
+
+
 # --- 完整观测 / 授权 ---------------------------------------------------------
 
 def test_a_missing_driver_receipt_is_no_observation():

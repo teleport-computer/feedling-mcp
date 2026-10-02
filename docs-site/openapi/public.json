@@ -4576,7 +4576,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 in the enclave, then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking."
+        "description": "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 (plaintext accounts: plaintext cards, in the backend; otherwise in the enclave), then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking."
       }
     },
     "/v1/memory/list": {
@@ -11404,7 +11404,7 @@
           "unavailable_count": {
             "type": "integer",
             "minimum": 0,
-            "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches."
+            "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches. A plaintext account's sealed cards are not searched and not counted."
           }
         },
         "additionalProperties": false

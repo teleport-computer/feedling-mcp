@@ -285,3 +285,110 @@ def test_too_short_rule(chars, dropped, skipped, replies, empty, expected):
     importer = types.SimpleNamespace(model_replies=replies, explicit_empty_replies=empty)
     assert plaintext_garden._too_short_and_nothing_proposed(
         [source, other], result, importer) is expected
+
+
+# ---------------------------------------------------------------------------
+# T758: a completion writes its final stage + materials in the same statement
+# that marks the job done (T757: a status read between genesis_complete_job and
+# the following publish saw done with materials=[]).
+# ---------------------------------------------------------------------------
+
+def test_add_memory_completion_already_carries_stage_and_materials(monkeypatch):
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+    user_id, store = _setup_plaintext_job(monkeypatch, job_id=job_id)
+    counter = {"value": 0}
+
+    def fake_envelope(actual_store, inner, *, item_id=None):
+        counter["value"] += 1
+        memory_id = item_id or f"mom_genesis_{counter['value']}"
+        return ({
+            "id": memory_id, "body_ct": json.dumps(inner, ensure_ascii=False),
+            "nonce": f"nonce_{memory_id}", "K_user": f"ku_{memory_id}",
+            "K_enclave": f"ke_{memory_id}", "enclave_pk_fpr": "test_fpr",
+            "visibility": "shared", "owner_user_id": actual_store.user_id,
+        }, "")
+
+    monkeypatch.setattr(memory_actions, "_build_memory_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(memory_actions.boot_gates, "_log_bootstrap_event", lambda *_a, **_k: None)
+    seen = []
+    real_complete = db.genesis_complete_job
+
+    def complete_and_read_back(uid, jid, **kwargs):
+        completed = real_complete(uid, jid, **kwargs)
+        # What any status read sees right after the completing statement.
+        seen.append(db.genesis_get_job(uid, jid))
+        return completed
+
+    monkeypatch.setattr(db, "genesis_complete_job", complete_and_read_back)
+
+    _run_add_memory(store, job_id)
+
+    assert len(seen) == 1
+    row = seen[0]
+    assert row["status"] == "done"
+    assert row["output"]["stage"] == "plaintext_add_memory_done"
+    materials = row["output"]["materials"]
+    assert [m["kind"] for m in materials] == ["memory_summary"]
+    assert materials[0]["status"] == "done" and materials[0]["cards"] == 1
+    assert service.public_materials_for_job(row) == materials
+
+
+def test_run_full_completion_carries_stage_materials_and_applied_fields(monkeypatch):
+    """_run_full used to complete with only _apply_non_memory's result doc."""
+    from genesis import plaintext_garden as pg
+
+    materials = [{"kind": "chat_history", "status": "done", "windows_done": 1,
+                  "windows_total": 1, "cards": 9}]
+
+    class _Progress:
+        def publish(self, **_k):
+            pass
+
+        def mark_identity_ready(self):
+            pass
+
+        def materials(self, **_k):
+            return list(materials)
+
+        done_output = plaintext._PlaintextCheckpointProgress.done_output
+
+    class _Runner:
+        state: dict = {}
+
+        def run(self, *_a, **_k):
+            return types.SimpleNamespace(cards_written=9, dropped=0, batches_skipped=0)
+
+    applied = {"memory_action_count": 9, "identity_status": "written",
+               "persona_ref": "p", "persona_sha256": "ps"}
+    captured = {}
+    monkeypatch.setattr(pg, "_finish_output", lambda *_a, **_k: {})
+    monkeypatch.setattr(pg, "_apply_non_memory", lambda *_a, **_k: dict(applied))
+    monkeypatch.setattr(pg, "_emit_partial", lambda *_a, **_k: None)
+    monkeypatch.setattr(pg.notices_core, "resolve", lambda *_a, **_k: None)
+    monkeypatch.setattr(pg.service, "write_genesis_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(pg.pt, "_write_back_plaintext_user_name", lambda *_a, **_k: None)
+    monkeypatch.setattr(pg, "_sources", lambda *_a, **_k: [])
+    monkeypatch.setattr(pg.db, "genesis_complete_job",
+                        lambda _u, _j, **kwargs: captured.update(kwargs) or {"status": "done"})
+
+    pg._run_full(
+        types.SimpleNamespace(user_id="u1"), "api_key", "job_full", runtime=object(),
+        source_groups=[], relationship_anchor=None, msgs=[], user_name="TA", llm=object(),
+        progress=_Progress(), runner=_Runner(), language="zh")
+
+    output = captured["output"]
+    assert output["stage"] == "plaintext_reducer_done"
+    assert output["materials"] == materials
+    assert output["identity_ready"] is True
+    for key, value in applied.items():
+        assert output[key] == value
+
+
+def test_done_output_has_the_publish_shape():
+    fake = types.SimpleNamespace(materials=lambda **_k: [{"kind": "memory_summary"}])
+    out = plaintext._PlaintextCheckpointProgress.done_output(fake, "some_done", extra_key=1)
+    assert out == {"extra_key": 1, "stage": "some_done",
+                   "materials": [{"kind": "memory_summary"}], "identity_ready": True}
+    # A stale key passed through cannot override the fresh materials.
+    out = plaintext._PlaintextCheckpointProgress.done_output(fake, "done_stage", materials=["stale"])
+    assert out["materials"] == [{"kind": "memory_summary"}]

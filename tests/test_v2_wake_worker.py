@@ -51,6 +51,7 @@ from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import profile_store
@@ -95,6 +96,14 @@ def _job_status(job_id):
     with db.get_pool().connection() as conn:
         row = conn.execute("SELECT status, last_error FROM agent_jobs WHERE id=%s", (job_id,)).fetchone()
     return row
+
+
+def _wake_outcome(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
 
 
 def _status_events(uid):
@@ -2033,6 +2042,9 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
     assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    # T773: no model ran, so this must not read as "spoke" (wake_result NULL).
+    assert _wake_outcome(job_id) == (
+        "completed", worker.HEARTBEAT_SKIPPED, worker.HEARTBEAT_SKIP_NO_USER_HISTORY)
     assert len(shadow) == 1
     assert shadow[0][1]["decision_allowed"] is False
     assert shadow[0][1]["apns_alert_sent"] is False
@@ -2080,7 +2092,7 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert status == "completed"
     assert provider_calls == []
     assert workspace_calls == []
-    assert _job_status(job_id)[0] == "completed"
+    assert _wake_outcome(job_id) == ("completed", "skipped", "no_user_history")
 
 
 def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
@@ -4477,7 +4489,7 @@ def test_only_scheduled_wake_demands_a_reply(
 @pytest.mark.parametrize(
     "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
 )
-def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
+def test_all_wake_lanes_receive_soft_language_nudge_not_hard_rule(monkeypatch, lane):
     uid = f"u_wake_language_{lane}"
     conftest.seed_user(uid)
     _reset(uid)
@@ -4518,14 +4530,13 @@ def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    expected = (
-        "回复语言规则：\n"
-        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
-        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
-        "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
-    )
-    assert expected in system_text
+    # T769 (Seven 2026-09-29): proactive turns get one soft nudge and the model
+    # picks the language itself; the hard reply-language rule must not come back.
+    expected = "语言：用用户使用的语言跟他说话。"
     assert system_text.count(expected) == 1
+    assert "回复语言规则" not in system_text
+    assert "Reply language rule" not in system_text
+    assert "主动/后台回复也使用本规则所用的语言" not in system_text
 
 
 @pytest.mark.parametrize(
@@ -5238,7 +5249,7 @@ def test_persistent_provider_circuit_blocks_queued_wakes_but_not_scheduled(monke
         assert row == ('sleep', 'provider_circuit_open')
 
 
-def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
+def test_heartbeat_uses_wake_wire_bound_not_dream_wire_deadline(monkeypatch):
     import inspect
 
     signature = inspect.signature(provider_client.chat_completion_async)
@@ -5262,5 +5273,8 @@ def test_heartbeat_keeps_phase_60_without_dream_wire_deadline(monkeypatch):
     status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK,
                                          asyncio.Semaphore(4), claimed_by))
     assert status == "completed"
-    # Look-first round (T723) + decision round; every call keeps the budget.
-    assert seen == [(60.0, None), (60.0, None)]
+    # Look-first round (T723) + decision round. Dream's wire deadline must not
+    # leak into heartbeat; timeout and wire deadline are the wake ones (T776).
+    wire = worker.WAKE_PROVIDER_WIRE_TIMEOUT_SEC
+    assert wire != v2_extraction.DREAM_WIRE_DEADLINE_SEC
+    assert seen == [(wire, wire)] * 2

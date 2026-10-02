@@ -1,0 +1,82 @@
+{
+ "cards": [
+  {
+   "archive_reason": null,
+   "archived": null,
+   "archived_at": null,
+   "bucket": "home",
+   "content": "every afternoon",
+   "context": "c",
+   "created_at": "2026-09-02T00:00:00Z",
+   "description": "d",
+   "her_quote": "q",
+   "id": "full",
+   "is_archived": null,
+   "linked_dimension": "pets",
+   "occurred_at": "2026-09-01T00:00:00Z",
+   "roles": [
+    "pet"
+   ],
+   "source": "chat",
+   "status": "active",
+   "summary": "The cat naps on the green sofa",
+   "superseded_by": null,
+   "threads": [
+    "猫",
+    "sofa"
+   ],
+   "title": "Cat",
+   "type": "moment"
+  },
+  {
+   "archive_reason": null,
+   "archived": null,
+   "archived_at": "2026-09-03",
+   "bucket": null,
+   "content": null,
+   "context": null,
+   "created_at": "2026-09-02T00:00:00Z",
+   "description": null,
+   "her_quote": null,
+   "id": "bare",
+   "is_archived": null,
+   "linked_dimension": null,
+   "occurred_at": "2026-09-01T00:00:00Z",
+   "roles": [],
+   "source": "chat",
+   "status": "retired",
+   "summary": "Only a summary",
+   "superseded_by": null,
+   "threads": [],
+   "title": null,
+   "type": null
+  },
+  {
+   "archive_reason": null,
+   "archived": null,
+   "archived_at": null,
+   "bucket": null,
+   "content": null,
+   "context": null,
+   "created_at": "2026-09-02T00:00:00Z",
+   "description": null,
+   "her_quote": null,
+   "id": "threads_str",
+   "is_archived": null,
+   "linked_dimension": null,
+   "occurred_at": "2026-09-01T00:00:00Z",
+   "roles": [],
+   "source": "chat",
+   "status": "active",
+   "summary": "s",
+   "superseded_by": "full",
+   "threads": [
+    "single thread"
+   ],
+   "title": null,
+   "type": null
+  }
+ ],
+ "generated_from": "f47c91962417fb19cf0981438b523f89a758997a",
+ "generator": "enclave/readside.py::moments_to_cards before T779 step 1"
+}
