@@ -121,6 +121,7 @@ export function ArchitectureDiagram() {
             <InlineFlow label="HTTP" />
             <Node eyebrow="Application plane" title="ASGI API">
               Authenticates callers, enforces user ownership, orchestrates workflows, and persists state.
+              Serves plaintext residents&apos; history and attachment bodies directly.
               Optionally selects plaintext residents&apos; memory cards with the lexical ranker.
             </Node>
             <InlineFlow label="Authorized calls" />

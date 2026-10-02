@@ -264,6 +264,7 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_resident_plaintext_history.py",
         "test_memory_embedding.py",
         "test_memory_embedding_real.py",
         "test_tcp_connect_monitor.py",

@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Upgraded Resident consumers read effective-off accounts' history and omitted
+  plaintext bodies directly from the authenticated backend, even without an
+  enclave URL. Backend read failures no longer fall back to enclave history.
+  Old sealed rows remain unreadable with cursor metadata preserved and cannot
+  supply conversation context, Capture input, or a memory-selection anchor.
+  Hydrated attachments no longer trigger a second body fetch. Encrypted and
+  unknown accounts retain their existing history paths; startup health checks
+  and the separate memory-selection fallback are unchanged.
+
 - The test deployment now wires `TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL` to the
   backend. It defaults to `off`, accepts only `off`, `shadow`, or `on`, and
   rejects invalid values before deployment. Changing the variable requires a

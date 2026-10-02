@@ -29,6 +29,25 @@ If the probe fails, the consumer logs an error, reports decrypt health as
 are skipped; later cycles can recover when the source becomes reachable.
 Startup authentication and encryption-module checks still must succeed.
 
+## Resident plaintext history
+
+Upgraded consumers read history and omitted plaintext bodies from the
+authenticated backend when whoami reports `content_encryption_effective=off`,
+including when `FEEDLING_ENCLAVE_URL` is unset. Backend history failures keep the
+poll checkpoint for retry; a successful empty page can advance it. An unavailable
+individual body stays unreadable without blocking other rows. Old sealed rows
+are not decrypted: their identifiers and sequence metadata remain for cursor
+progress, but they cannot supply conversation context, Capture text, or a
+per-turn memory-selection anchor. Encrypted and unknown accounts keep their
+existing decrypt-service paths.
+
+This history policy is independent of the memory-selection switch below.
+Startup probes and health reporting still use the existing decrypt-source
+checks; this history change alone does not make all Resident operations
+independent of the enclave. Plaintext history and attachments are visible to
+the authenticated backend and resident host; neither an ordinary VPS nor this
+routing change adds a hardware confidentiality boundary.
+
 ## Resident plaintext memory selection
 
 An upgraded consumer uses `POST /v1/memory/turn-selection` only when whoami
@@ -58,7 +77,9 @@ verification; it does not require changing account encryption or stored data.
 
 With `on`, the backend reads that account's plaintext history and memory cards
 to select lexical matches. Remaining sealed cards are excluded from local
-selection; sealed history requires the existing decrypt-service fallback.
+selection; a selection page containing sealed history still uses the existing
+decrypt-service fallback. That selection-route behavior is separate from the
+consumer history reader's unreadable-row policy above.
 Protect plaintext access at the backend as well as at the resident process.
 A generic host provides no additional hardware trust boundary through this
 switch. See [the selection and fallback contract](/docs/workflows/memory).
