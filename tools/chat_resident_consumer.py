@@ -2929,8 +2929,68 @@ def _stash_auto_memories(cards, trace) -> list[dict] | None:
     return picked
 
 
+_BACKEND_DEFERS_TO_ENCLAVE = object()
+TURN_SELECTION_DEADLINE_MS = 3000
+
+
+def _plaintext_account() -> bool:
+    """Only an account the whoami cache names ``off`` uses the backend route;
+    ``on``, missing and unrecognized values keep the enclave path (fail safe)."""
+    value = str(_whoami_cache.get("content_encryption_effective") or "on").strip().lower()
+    return value == "off"
+
+
+def _turn_selection_from_backend(mid: str, seq: int):
+    """Ask the backend for this turn's picks (plaintext accounts, T788).
+
+    Returns the response dict, ``None`` (unknown — never retry the enclave:
+    the backend may already have fallen back, and it is the only side that
+    does), or ``_BACKEND_DEFERS_TO_ENCLAVE`` when the backend guarantees it did
+    not call the enclave (encrypted account, mode off, or an older backend
+    without the route)."""
+    if not _plaintext_account():
+        return _BACKEND_DEFERS_TO_ENCLAVE
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/memory/turn-selection",
+            json={"message_id": mid, "seq": seq},
+            headers={**_HEADERS, "X-Recall-Deadline-Ms": str(TURN_SELECTION_DEADLINE_MS)},
+            timeout=TURN_SELECTION_DEADLINE_MS / 1000.0 + 2.0,
+        )
+    except Exception as exc:  # noqa: BLE001 — outcome on the server is unknown
+        log.debug("per-turn memory selection (backend) failed: %s", exc)
+        return None
+    if resp.status_code in (404, 409):
+        return _BACKEND_DEFERS_TO_ENCLAVE
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _turn_selection_from_enclave(seq: int):
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        return None
+    try:
+        resp = _ENCLAVE_CLIENT.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+            params={"before_seq": seq + 1, "limit": AUTO_MEMORY_TURN_PAGE,
+                    "context_trace": "1", "include_image_body": "false"},
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:  # noqa: BLE001 — recall is best-effort; unknown, never 0
+        log.debug("per-turn memory selection fetch failed: %s", exc)
+        return None
+
+
 def _auto_memory_fetch_for_turn(msg: dict) -> dict | None:
-    """Ask the enclave for the picks bound to exactly this user message (T512).
+    """Get the picks bound to exactly this user message (T512): from the backend
+    for plaintext accounts (T788, lexical, same page), otherwise from the enclave.
 
     One small history page ending at this message (``before_seq = seq + 1``,
     ``limit = AUTO_MEMORY_TURN_PAGE``) so the enclave's selection query is this
@@ -2943,23 +3003,12 @@ def _auto_memory_fetch_for_turn(msg: dict) -> dict | None:
     seq = msg.get("seq") if isinstance(msg, dict) else None
     if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
         return None
-    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
-        return None
     mid = str(msg.get("id") or msg.get("message_id") or "").strip()
     if not mid:
         return None
-    try:
-        resp = _ENCLAVE_CLIENT.get(
-            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params={"before_seq": seq + 1, "limit": AUTO_MEMORY_TURN_PAGE,
-                    "context_trace": "1", "include_image_body": "false"},
-            headers=_HEADERS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001 — recall is best-effort; unknown, never 0
-        log.debug("per-turn memory selection fetch failed: %s", exc)
-        return None
+    data = _turn_selection_from_backend(mid, seq)
+    if data is _BACKEND_DEFERS_TO_ENCLAVE:
+        data = _turn_selection_from_enclave(seq)
     if not isinstance(data, dict):
         return None
     page = data.get("messages") or data.get("history") or []

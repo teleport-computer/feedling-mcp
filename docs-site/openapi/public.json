@@ -4743,6 +4743,176 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/memory/turn-selection": {
+      "post": {
+        "summary": "Resident Turn Selection",
+        "description": "Per-turn memory selection for a plaintext resident account: the cards picked for this message, selected by the backend with the lexical ranker on the same history page the enclave read used (before_seq = seq + 1, limit 4). Returns 409 not_served when the account is not plaintext or the feature is off (the enclave was not called; the resident keeps its enclave path), 503 recall_unavailable on exhausted budget, capacity, or selection failure (at most one backend enclave fallback when budget remains; the consumer must not retry), and 422 message_not_in_window when the message is not in that page.",
+        "operationId": "resident_turn_selection_v1_memory_turn_selection_post",
+        "responses": {
+          "200": {
+            "description": "Selection and content-free page identity, with the complete selection trace.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "source",
+                    "messages",
+                    "context_memories",
+                    "context_memory_trace",
+                    "context_memory_log"
+                  ],
+                  "properties": {
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "local",
+                        "enclave_fallback",
+                        "enclave_shadow"
+                      ]
+                    },
+                    "messages": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "role",
+                          "seq"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "role": {
+                            "type": "string"
+                          },
+                          "seq": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "context_memories": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "context_memory_trace": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "context_memory_log": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "request_invalid: invalid message_id, seq, or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "not_served: feature off or account not plaintext; enclave was not contacted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "request_too_large: body exceeds 1024 bytes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "message_not_in_window: message does not belong to the fixed user-bound page.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "recall_unavailable: deadline, capacity, or selection failure; do not retry the enclave.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ],
+        "parameters": [
+          {
+            "name": "X-Recall-Deadline-Ms",
+            "in": "header",
+            "required": false,
+            "description": "The resident's remaining budget for this selection in milliseconds; the server caps it at 4000 ms (default 3000) and reserves 150 ms for the response. Starts after authentication and includes body reads and worker queueing; an exhausted budget is not extended.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 3000
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryTurnSelectionRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/memory/verify": {
       "get": {
         "summary": "Memory Verify",
@@ -11408,6 +11578,30 @@
           }
         },
         "additionalProperties": false
+      },
+      "MemoryTurnSelectionRequest": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "seq"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775806
+          }
+        },
+        "additionalProperties": false,
+        "example": {
+          "message_id": "msg_abc123",
+          "seq": 1042
+        }
       },
       "MemoryFetchRequest": {
         "type": "object",

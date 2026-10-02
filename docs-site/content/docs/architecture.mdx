@@ -418,6 +418,19 @@ An [independent resident consumer](/docs/workflows/chat#independent-resident-loo
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
 
+Resident consumers (hosted and independent) ask for each turn's memory cards.
+By default the decrypt service selects them. An operator switch
+(`FEEDLING_RESIDENT_PLAINTEXT_RECALL`, off by default) lets the backend select
+cards for plaintext accounts itself through `POST /v1/memory/turn-selection`,
+on the same history page and with the same selection code, using the lexical
+ranker only: the backend loads no embedding model for this and reads no card
+vectors. For those accounts the backend reads the account's plaintext cards and
+the history page to make the selection. A consumer calls this route only for an
+account it knows to be plaintext; encrypted or unknown accounts keep the
+decrypt-service path and do not depend on the route. When the backend's own
+selection is unavailable it falls back to the decrypt service once; it is the
+only side that falls back.
+
 ### Genesis plaintext imports
 
 The plaintext compatibility endpoint accepts onboarding material inside the

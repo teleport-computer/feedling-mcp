@@ -29,6 +29,38 @@ If the probe fails, the consumer logs an error, reports decrypt health as
 are skipped; later cycles can recover when the source becomes reachable.
 Startup authentication and encryption-module checks still must succeed.
 
+## Resident plaintext memory selection
+
+An upgraded consumer uses `POST /v1/memory/turn-selection` only when whoami
+explicitly reports plaintext content encryption. The backend operator can set
+`FEEDLING_RESIDENT_PLAINTEXT_RECALL=off|shadow|on` (default `off`; redeploy to
+change it). Encrypted and unknown accounts retain their existing decrypt-service
+path. This switch is independent of Runtime V2 recall and does not install an
+embedding model or enable vector preparation.
+
+With `on`, the backend reads that account's plaintext history and memory cards
+to select lexical matches. Remaining sealed cards are excluded from local
+selection; sealed history requires the existing decrypt-service fallback.
+Protect plaintext access at the backend as well as at the resident process.
+A generic host provides no additional hardware trust boundary through this
+switch. See [the selection and fallback contract](/docs/workflows/memory).
+
+The lexical tokenizer loads its dictionary separately in each backend worker
+on first use; the default-off route does not load it. Measure per-worker memory
+growth and other-request latency before enabling it across a deployment.
+Per worker, account checks and local selections each allow two outstanding jobs,
+enclave calls four, and shadow and response diagnostics one each. A timed-out
+job keeps its permit until it finishes; overload returns an unavailable result
+or skips optional diagnostics rather than queueing unlimited work.
+
+Hosted consumers upgrade through the runner release; independent consumers must
+upgrade on their own machines. Old consumers continue to work through the
+decrypt service. Assess migration over seven days, tracking hosted and
+independent residents separately: every active plaintext resident must have
+new-route records and plaintext resident selection requests at the decrypt
+service must reach zero before claiming the migration complete. Missing
+diagnostics are not evidence of zero traffic.
+
 ## Agent body generation
 
 Upgrade both backend and consumer for `POST /v1/agent-body/generate`. Hosted

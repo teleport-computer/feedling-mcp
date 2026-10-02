@@ -18,6 +18,23 @@ change must not be interpreted as an API guarantee.
   This prompt change aims to improve adherence; it does not guarantee it or add
   a model call. Other reply paths keep their existing guidance.
 
+- Resident consumers can get per-turn memory cards for plaintext accounts from
+  the backend instead of the decrypt service: new `POST /v1/memory/turn-selection`
+  behind `FEEDLING_RESIDENT_PLAINTEXT_RECALL` (default `off`: the route answers
+  `409 not_served` and residents keep their decrypt-service path). `shadow`
+  returns the decrypt-service result and records a content-free
+  `memory.resident_recall.shadow` comparison; `on` returns the backend's
+  selection, falling back to the decrypt service once if it is unavailable.
+  Selection is lexical only, on the same history page (limit 4, the resident's
+  window) with the same selection code; no embedding model is loaded in the
+  backend. The consumer uses the route only for accounts its whoami cache marks
+  plaintext; a `404` or `409` sends it to the decrypt service, any other failure
+  is recorded as unknown without a second decrypt-service request.
+  The route bounds streamed request bodies and selection waiting after
+  authentication, including queueing. Shadow comparisons and diagnostics use
+  bounded background jobs; sealed-card comparisons use the enclave's frozen
+  normalized inputs.
+
 - Keyword memory search (`memory_search`, and `memory_index` with a query) for a
   plaintext account is now ranked in the backend over the account's plaintext
   cards, with the same ranking code, filters, limits and HTTP errors as the
