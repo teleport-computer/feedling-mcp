@@ -51,6 +51,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+import admin_first_events
 import admin_read_timing
 import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
@@ -4619,7 +4620,7 @@ def admin_home_feed(*, tz: str = "Asia/Shanghai", limit: int = 12) -> dict:
     now = time.time()
     window_e = now - 48 * 3600.0
     events: list[dict] = []
-    with get_pool().connection() as conn:
+    with _admin_data_track_connection() as conn:
         ca = _ph_created_at_sql(conn)
         regs = conn.execute(
             f"""
@@ -4630,26 +4631,9 @@ def admin_home_feed(*, tz: str = "Asia/Shanghai", limit: int = 12) -> dict:
             """,
             (window_e,),
         ).fetchall()
-        replies = conn.execute(
-            """
-            WITH cand AS (
-                SELECT DISTINCT user_id FROM chat_messages
-                WHERE ts >= %s
-                  AND doc->>'role' IN ('agent','openclaw')
-                  AND COALESCE(doc->>'source','')
-                      NOT IN ('foreground_fallback','proactive_fallback')
-            )
-            SELECT cm.user_id, MIN(cm.ts) AS t
-            FROM chat_messages cm
-            WHERE cm.user_id IN (SELECT user_id FROM cand)
-              AND cm.doc->>'role' IN ('agent','openclaw')
-              AND COALESCE(cm.doc->>'source','')
-                  NOT IN ('foreground_fallback','proactive_fallback')
-            GROUP BY cm.user_id
-            HAVING MIN(cm.ts) >= %s
-            """,
-            (window_e, window_e),
-        ).fetchall()
+        replies = admin_first_events.recent_first_reply_rows(
+            conn, window_epoch=window_e,
+        )
         fails = conn.execute(
             """
             SELECT user_id, COUNT(*)::int,
@@ -8552,65 +8536,16 @@ def admin_onboarding_funnel(
     windowed ops-overview caller. ``None`` keeps the fleet-wide funnel exactly
     as before (the `view=events&event=onboarding` page depends on that)."""
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             registered_at_sql = _admin_utc_text_timestamp_sql(
                 "created_at",
                 supports_input_validation=conn.info.server_version >= 160000,
             )
-            if registered_cutoff_ts is None:
-                u_filter = ""
-                cohort_and = ""
-                cohort_where = ""
-                params = None
-            else:
-                # t0 is not visible inside its own CTE's WHERE, so the parse
-                # expression repeats; the cutoff itself stays a bound param.
-                u_filter = (
-                    "\n                      WHERE EXTRACT(EPOCH FROM "
-                    f"({registered_at_sql})) >= %s"
-                )
-                cohort_and = " AND user_id IN (SELECT user_id FROM u)"
-                cohort_where = " WHERE user_id IN (SELECT user_id FROM u)"
-                params = (float(registered_cutoff_ts),)
-            rows = conn.execute(f"""
-                {_EVENTS_ROUTES_CTE},
-                u AS (SELECT user_id,
-                        EXTRACT(EPOCH FROM ({registered_at_sql})) AS t0
-                      FROM users{u_filter}),
-                gen_started AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
-                          FROM genesis_import_jobs
-                          WHERE COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'{cohort_and}
-                          GROUP BY user_id),
-                firstact AS (SELECT user_id, MIN(ts) AS t FROM (
-                             SELECT user_id, ts FROM chat_messages{cohort_where}
-                             UNION ALL SELECT user_id, ts FROM user_logs WHERE stream='proactive_jobs'{cohort_and}
-                           ) a GROUP BY user_id),
-                gen AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
-                        FROM genesis_import_jobs
-                        WHERE status IN ('done','completed')
-                          AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'{cohort_and}
-                        GROUP BY user_id),
-                mem AS (SELECT user_id,
-                        MIN(EXTRACT(EPOCH FROM (COALESCE(NULLIF(doc->>'created_at',''), occurred_at))::timestamptz)) AS t
-                        FROM memory_moments
-                        WHERE COALESCE(NULLIF(doc->>'created_at',''), occurred_at) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'{cohort_and}
-                        GROUP BY user_id),
-                reply AS (SELECT user_id, MIN(ts) AS t FROM chat_messages
-                          WHERE doc->>'role' IN ('agent','openclaw')
-                            AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback'){cohort_and}
-                          GROUP BY user_id)
-                SELECT u.user_id, COALESCE(r.route,'resident') AS route, u.t0,
-                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen_started.t ELSE firstact.t END AS t1,
-                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen.t ELSE mem.t END AS t2,
-                       reply.t AS t3
-                FROM u
-                LEFT JOIN routes r ON r.user_id = u.user_id
-                LEFT JOIN gen_started ON gen_started.user_id = u.user_id
-                LEFT JOIN firstact ON firstact.user_id = u.user_id
-                LEFT JOIN gen ON gen.user_id = u.user_id
-                LEFT JOIN mem ON mem.user_id = u.user_id
-                LEFT JOIN reply ON reply.user_id = u.user_id
-            """, params).fetchall()
+            rows = admin_first_events.onboarding_rows(
+                conn, registered_at_sql=registered_at_sql,
+                routes_cte=_EVENTS_ROUTES_CTE,
+                registered_cutoff_ts=registered_cutoff_ts,
+           )
         def f(v):
             return float(v) if v is not None else None
         return [{"user_id": r[0], "route": r[1], "t0": f(r[2]), "t1": f(r[3]),
