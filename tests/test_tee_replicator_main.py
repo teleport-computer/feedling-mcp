@@ -13,10 +13,16 @@ runs, which is enough to prove the import succeeded.
 """
 import subprocess
 import sys
+import json
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _BACKEND_DIR = _REPO_ROOT / "backend"
+sys.path.insert(0, str(_BACKEND_DIR))
+
+from tee_replicator import __main__ as cli  # noqa: E402
 
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -40,3 +46,58 @@ def test_module_form_from_backend_dir_does_not_importerror():
     assert "ImportError" not in proc.stderr, proc.stderr
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "usage:" in proc.stderr.lower()
+
+
+def test_run_probes_policy_source_before_replication(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli.policy,
+        "probe_policy_source",
+        lambda: calls.append("probe") or {
+            "users": 10,
+            "explicit_on": 2,
+            "explicit_off": 3,
+            "default_off": 5,
+        },
+    )
+    monkeypatch.setattr(
+        cli.worker,
+        "run_table",
+        lambda table, **_kwargs: calls.append(("run", table)) or {"table": table},
+    )
+
+    assert cli.main(["run", "--table", "chat_messages"]) == 0
+
+    output = capsys.readouterr()
+    assert calls == ["probe", ("run", "chat_messages")]
+    assert json.loads(output.err) == {
+        "event": "policy_source_ready",
+        "users": 10,
+        "explicit_on": 2,
+        "explicit_off": 3,
+        "default_off": 5,
+    }
+    assert json.loads(output.out) == {"table": "chat_messages"}
+
+
+def test_run_refuses_unreadable_policy_source_without_leaking_details(
+    monkeypatch, capsys
+):
+    secret = "postgresql://secret:password@example.invalid/prod"
+    monkeypatch.setattr(
+        cli.policy,
+        "probe_policy_source",
+        lambda: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    monkeypatch.setattr(
+        cli.worker,
+        "run_table",
+        lambda *_args, **_kwargs: pytest.fail("replication must not start"),
+    )
+
+    assert cli.main(["run", "--table", "chat_messages"]) == 1
+
+    output = capsys.readouterr()
+    assert secret not in output.err
+    assert "runtimeerror" in output.err.lower()
+    assert output.out == ""

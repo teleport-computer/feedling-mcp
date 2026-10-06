@@ -1,43 +1,17 @@
-"""Genesis v2 Step 2 — job phase state machine + per-task checkpoint (the contract).
+"""Shared encrypted checkpoint helpers for garden voice and identity updates.
 
-⚠️ LIVE-USE STATUS (2026-08-03): plaintext Genesis now uses
-`new_checkpoint` / `upsert_task` / `is_task_done` / `resume` for encrypted
-per-window map recovery. The foreground-written/provider-blocked phase helpers
-remain the Step-4 contract and are not all driven by the live orchestration yet.
-
-PURE, side-effect-free helpers (no DB / LLM) so they unit-test in isolation. The
-worker/routes own persistence. The live plaintext path seals this dict in a shared
-envelope before storing `genesis_checkpoint:{job_id}`; candidate text must never be
-placed in plaintext job/output metadata. Step 3 (foreground reducer) and Step 4
-(background continuation) drive it through these helpers; they must NOT reach past
-this contract.
-
-Bakes in the 4 v2 safety contracts (CC + Codex, 2026-06-30) so Step 3/4 can't
-"forget" them:
-
-  1. **fg/bg + live-capture 双写** → append + dedup, never replace-all. Background
-     continuation only ever `memory.add` / `memory.supersede`; every genesis card
-     carries a stable `source_ref` / `candidate_id`; resolve/dedup before writing,
-     **including cards the live capture lane just wrote.**
-  2. **前台 core vs 后台 full 去重** → foreground-written refs/ids are recorded;
-     background full extraction skips/supersedes them instead of re-adding.
-  3. **greeting 挂 FOREGROUND_READY,不等 DONE** → `greeting_allowed(phase)`.
-  4. **provider_config_blocked 可 resume** → `resume()` keeps done tasks, redoes the
-     rest; never re-uploads the whole import.
+The garden import session owns memory-card progress. These helpers retain the
+per-window voice/direct-reduce task state and resume semantics used by plaintext
+imports. Persistence and encryption stay in service.py. The phase vocabulary is
+also used to recognize stored checkpoints and bound legacy-reset trace metadata.
 """
 from __future__ import annotations
 
-import hashlib
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 
-# --- stable candidate_id / source_ref (Codex rule #2: the dedup anchor) -------
-# THE critical dedup rule: foreground and background must derive the SAME id for
-# the SAME fact, or contract #1/#2 dedup drifts and a card gets written twice.
-# So the id is a pure hash of stable inputs and lives HERE (one place), never
-# generated ad-hoc in foreground/background. Deliberately EXCLUDES bucket / thread
-# / importance / pulse — those drift between passes; the fact text does not.
+# Normalization remains shared by the encrypted worker fact reduction path.
 _FACT_NORM_MAX = 280
 
 
@@ -45,25 +19,6 @@ def normalize_fact_text(text: str, *, max_len: int = _FACT_NORM_MAX) -> str:
     """Stable normalization for hashing: trim + lower + collapse whitespace +
     truncate. Same fact phrased with different spacing/case → same string."""
     return " ".join(str(text or "").split()).strip().lower()[:max_len]
-
-
-def make_candidate_id(
-    *, user_id: str, job_id: str, source_family: str, source_pass: str,
-    chunk_index: Any, fact_text: str,
-) -> str:
-    """Deterministic candidate id. Same (user, job, family, pass, chunk, fact) →
-    same id, whether foreground writes it first or background re-scans it."""
-    raw = "\x1f".join([
-        str(user_id), str(job_id), str(source_family), str(source_pass),
-        str(chunk_index), normalize_fact_text(fact_text),
-    ])
-    return "cand_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-
-def make_source_ref(*, job_id: str, source_pass: str, chunk_index: Any, candidate_id: str) -> str:
-    """Human/ops-readable locator carrying the candidate hash; pairs with candidate_id."""
-    cand_hash = str(candidate_id or "").split("_")[-1][:16]
-    return f"genesis:{job_id}:{source_pass}:{chunk_index}:{cand_hash}"
 
 
 # --- job phase state machine -------------------------------------------------
@@ -81,20 +36,8 @@ PHASES = frozenset({
     PHASE_DONE, PHASE_FAILED_TERMINAL,
 })
 
-# Once foreground is ready the user can enter + be greeted; later phases keep that.
-_GREETING_OK = frozenset({
-    PHASE_FOREGROUND_READY, PHASE_BACKGROUND_PROCESSING,
-    PHASE_PROVIDER_CONFIG_BLOCKED, PHASE_DONE,
-})
-
-
-def greeting_allowed(phase: str | None) -> bool:
-    """Contract #3 — greeting fires once foreground baseline exists, not at DONE."""
-    return str(phase or "") in _GREETING_OK
-
-
 # --- per-task checkpoint -----------------------------------------------------
-# One entry per genesis task × chunk: voice_map / fact_map / fact_write / persona_build.
+# One entry per voice or direct-reduce source window.
 TASK_PENDING = "pending"
 TASK_DONE = "done"
 TASK_TRANSIENT_FAILED = "transient_failed"
@@ -139,23 +82,17 @@ def upsert_task(
     error_type: str = "",
     error_message: str = "",
     provider_status_code: int | None = None,
-    source_ref: str = "",
-    candidate_id: str = "",
-    written_memory_ids: Iterable[str] = (),
-    foreground_written: bool = False,
     bump_attempts: bool = False,
     now: float | None = None,
 ) -> dict:
     """Return a copy of `cp` with one task entry upserted. `bump_attempts=True`
-    increments the per-task retry counter (for the transient cap). Idempotent on
-    re-write of the SAME (task_id, chunk_id) — does NOT create duplicate cards;
-    the caller dedups card *content* via the *_refs helpers before writing."""
+    increments the per-task retry counter. Re-writing the same (task_id, chunk_id)
+    updates one task entry; memory-card deduplication belongs to the garden session."""
     base = dict(cp) if isinstance(cp, Mapping) else new_checkpoint(now=now)
     tasks = _tasks(base)
     k = task_key(task_id, chunk_id)
     prev = tasks.get(k) if isinstance(tasks.get(k), Mapping) else {}
     attempts = int(prev.get("attempts") or 0) + (1 if bump_attempts else 0)
-    ids = sorted({str(i) for i in (list(prev.get("written_memory_ids") or []) + list(written_memory_ids)) if str(i).strip()})
     tasks[k] = {
         "task_id": str(task_id),
         "chunk_id": str(chunk_id),
@@ -170,107 +107,10 @@ def upsert_task(
         "error_type": str(error_type or ""),
         "error_message": str(error_message or "")[:240],
         "provider_status_code": (int(provider_status_code) if isinstance(provider_status_code, int) else None),
-        "source_ref": str(source_ref or prev.get("source_ref") or ""),
-        "candidate_id": str(candidate_id or prev.get("candidate_id") or ""),
-        "written_memory_ids": ids,
-        "foreground_written": bool(foreground_written or prev.get("foreground_written") or False),
     }
     base["tasks"] = tasks
     base["v"] = 1
     base["updated_at"] = float(now if now is not None else time.time())
-    return base
-
-
-def pending_tasks(cp: Mapping[str, Any] | None) -> list[dict]:
-    """Tasks NOT done → what a resume re-runs (contract #4). Done tasks are skipped
-    so a single failure never re-runs the whole import."""
-    return [dict(t) for t in _tasks(cp).values()
-            if isinstance(t, Mapping) and str(t.get("status") or "") != TASK_DONE]
-
-
-# Phases in which the worker may actually run pending tasks. Critically NOT
-# provider_config_blocked: pending_tasks() lists blocked tasks too (so resume can
-# pick them up), but the worker loop must NOT auto-run them — it has to wait for
-# resume() to flip the phase back. (Codex review point 2.)
-_RUNNABLE_PHASES = frozenset({PHASE_FOREGROUND_PROCESSING, PHASE_BACKGROUND_PROCESSING})
-
-
-def runnable_tasks(cp: Mapping[str, Any] | None) -> list[dict]:
-    """pending_tasks(), but only when the phase permits running. Returns [] while
-    provider_config_blocked / done / failed_terminal, so the worker can't process
-    pending work on a blocked job — it must call resume() first."""
-    phase = str((cp or {}).get("phase") or "") if isinstance(cp, Mapping) else ""
-    if phase not in _RUNNABLE_PHASES:
-        return []
-    return pending_tasks(cp)
-
-
-# --- dedup refs (contracts #1 / #2) ------------------------------------------
-
-def written_refs(cp: Mapping[str, Any] | None) -> set[str]:
-    """All source_ref/candidate_id already written (any task) — strong-dedup key set."""
-    out: set[str] = set()
-    for t in _tasks(cp).values():
-        # Only a task that actually finished writing counts as "already written" —
-        # a pending/failed task (incl. one flipped back to pending by resume()) must
-        # NOT block re-processing its candidate.
-        if not isinstance(t, Mapping) or str(t.get("status") or "") != TASK_DONE:
-            continue
-        for key in ("source_ref", "candidate_id"):
-            v = str(t.get(key) or "").strip()
-            if v:
-                out.add(v)
-    return out
-
-
-def foreground_written_refs(cp: Mapping[str, Any] | None) -> set[str]:
-    """Refs the FOREGROUND already wrote — background full extraction must skip these
-    (contract #2: don't re-add the 3-5 core cards)."""
-    out: set[str] = set()
-    for t in _tasks(cp).values():
-        if (not isinstance(t, Mapping) or not t.get("foreground_written")
-                or str(t.get("status") or "") != TASK_DONE):
-            continue
-        for key in ("source_ref", "candidate_id"):
-            v = str(t.get(key) or "").strip()
-            if v:
-                out.add(v)
-    return out
-
-
-def all_written_memory_ids(cp: Mapping[str, Any] | None) -> set[str]:
-    out: set[str] = set()
-    for t in _tasks(cp).values():
-        if isinstance(t, Mapping):
-            out.update(str(i) for i in (t.get("written_memory_ids") or []) if str(i).strip())
-    return out
-
-
-def should_skip_candidate(cp: Mapping[str, Any] | None, *, source_ref: str = "", candidate_id: str = "") -> bool:
-    """Strong dedup: True if this candidate was already written (by foreground OR an
-    earlier background task). Lexical/semantic weak-dedup is layered on by the caller."""
-    refs = written_refs(cp)
-    return (str(source_ref or "").strip() in refs and bool(str(source_ref or "").strip())) or \
-           (str(candidate_id or "").strip() in refs and bool(str(candidate_id or "").strip()))
-
-
-# --- phase transitions -------------------------------------------------------
-
-def set_phase(cp: Mapping[str, Any] | None, phase: str, *, now: float | None = None) -> dict:
-    if phase not in PHASES:
-        raise ValueError(f"unknown genesis phase: {phase!r}")
-    base = dict(cp) if isinstance(cp, Mapping) else new_checkpoint(now=now)
-    base["phase"] = phase
-    base["updated_at"] = float(now if now is not None else time.time())
-    return base
-
-
-def mark_provider_config_blocked(cp: Mapping[str, Any] | None, *, reason: str = "", now: float | None = None) -> dict:
-    """Contract #4 — user must fix provider; job is resumable, not failed_terminal."""
-    base = set_phase(cp, PHASE_PROVIDER_CONFIG_BLOCKED, now=now)
-    base["resumable"] = True
-    if reason:
-        base["blocked_reason"] = str(reason)[:240]
     return base
 
 

@@ -481,7 +481,9 @@ class UserStore:
         # blob was lost). Reconstruct the lightweight index from the stored
         # frame envelope rows, prune to MAX_FRAMES, and re-persist the index.
         try:
-            recovered = db.frame_list_meta(self.user_id)  # already sorted by ts
+            recovered = db.frame_list_meta(
+                self.user_id, source="screen"
+            )  # already sorted by ts
             if len(recovered) > MAX_FRAMES:
                 drop = recovered[:-MAX_FRAMES]
                 recovered = recovered[-MAX_FRAMES:]
@@ -2019,6 +2021,14 @@ class UserStore:
                 update,
                 seed_doc=cur,
             )
+        if update.get("capture_enabled") is False:
+            # 关闭落卡提交之后是「记忆整理受阻、正在重试」提示的最后清理边界（Codex 第 13 轮 I2）：
+            # 关闭之前已经发出去的、以及和关闭并发的崩溃记账发的提示，都在这里清掉 ——
+            # 回收器发提示时握着 consent 锁，关闭提交只能排在它后面，所以这次清理一定在它之后。
+            # V1 / V2 的设置写入都经过这里。清理失败不影响关闭本身（notices 内部自吞异常）。
+            from notices import core as notices_core
+
+            notices_core.resolve(self, "memory_backoff:capture")
         if "wake_interval_sec" in update:
             persisted[HEARTBEAT_NEXT_TICK_AT_KEY] = shrink_proactive_heartbeat_tick(
                 self.user_id,
@@ -2276,6 +2286,7 @@ class UserStore:
             "cards_superseded",
             "questions",
             "noop_reason",
+            "dream_skip_reason",
         }
         patch = {k: v for k, v in (fields or {}).items() if k in allowed}
         if not patch:
@@ -2406,17 +2417,22 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
     )
 
 
+def _get_or_create_store(user_id: str) -> UserStore:
+    with _stores_lock:
+        store = _stores.get(user_id)
+        if store is None:
+            store = UserStore(user_id)
+            _stores[user_id] = store
+    return store
+
+
 def get_store(
     user_id: str,
     *,
     require: Iterable[StoreSection] = (),
 ) -> UserStore:
     now = time.monotonic()
-    with _stores_lock:
-        store = _stores.get(user_id)
-        if store is None:
-            store = UserStore(user_id)
-            _stores[user_id] = store
+    store = _get_or_create_store(user_id)
     expired = store.mark_expired_sections_stale(now)
     mode = store_load_mode()
     if mode is StoreLoadMode.LEGACY:
@@ -2434,10 +2450,39 @@ def get_store(
     return store
 
 
-def get_store_shell_only(user_id: str, *, reason: str) -> UserStore:
-    """Return an unloaded store shell with a mandatory review reason."""
+def get_store_per_load_mode(
+    user_id: str,
+    *,
+    reason: str,
+    bypass_legacy_hydration: bool = False,
+) -> UserStore:
+    """Return a store for a reviewed call site; hydration follows the load mode.
+
+    The former name claimed the caller got an unloaded shell. That is not what
+    this returns, which is why it was renamed:
+
+    * default (``bypass_legacy_hydration=False``) delegates to :func:`get_store`.
+      Under ``StoreLoadMode.LEGACY`` that call tries to ``ensure_sections`` for
+      **every** section; under ``SELECTIVE``/``LAZY`` it is called with no
+      ``require``, so *this call* triggers no new loading.
+    * ``bypass_legacy_hydration=True`` goes straight to the process-local store
+      registry and triggers no loading in **any** mode. It is for a caller that
+      has proved every operation it performs is backed by a direct bounded read;
+      it changes only that call site and leaves the other reviewed sites alone.
+
+    ⚠️ Neither path promises anything about the *returned object's* state: both
+    may hand back a **cached** instance that some earlier caller already loaded
+    sections into. "Triggers no loading here" is the guarantee; "is unhydrated"
+    is not.
+
+    ``reason`` is mandatory and recorded in the reviewed-call-site inventory
+    (``tests/fixtures/store_per_load_mode_sites.json``), so adding a call site is
+    a visible diff rather than a silent one.
+    """
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("shell-only store reason required")
+    if bypass_legacy_hydration:
+        return _get_or_create_store(user_id)
     return get_store(user_id)
 
 

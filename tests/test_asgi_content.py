@@ -357,7 +357,7 @@ def test_rewrap_full_parity_and_credential_forwarding(env, monkeypatch):
 
     seen_keys: list = []
 
-    def fake_decrypt(envelope, key, *, purpose, runtime_token=""):
+    def fake_decrypt(envelope, key, *, purpose, caller_user_id, runtime_token=""):
         seen_keys.append(key)
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
 
@@ -386,7 +386,7 @@ def test_rewrap_dry_run_parity(env, monkeypatch):
     _seed_encrypted_content(au)
     new_pk = _b64(b"\x33" * 32)
 
-    def fake_decrypt(envelope, key, *, purpose, runtime_token=""):
+    def fake_decrypt(envelope, key, *, purpose, caller_user_id, runtime_token=""):
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)

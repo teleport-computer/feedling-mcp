@@ -380,7 +380,7 @@ def test_get_decrypts_the_card_instead_of_handing_the_model_ciphertext(monkeypat
                         lambda store: ({"identity": _envelope()}, 200))
     seen = {}
 
-    def fake_decrypt(env, api_key, *, purpose, runtime_token=""):
+    def fake_decrypt(env, api_key, *, purpose, caller_user_id, runtime_token=""):
         seen["api_key"], seen["runtime_token"] = api_key, runtime_token
         seen["envelope"] = env
         return json.dumps(_INNER).encode("utf-8")

@@ -51,9 +51,9 @@ from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
+from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import screen_chat as v2_screen_chat
 from model_api_runtime.v2 import jobs_store
-from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import profile_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
@@ -98,6 +98,14 @@ def _job_status(job_id):
     return row
 
 
+def _wake_outcome(job_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT status, wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (job_id,),
+        ).fetchone()
+
+
 def _status_events(uid):
     return jobs_store.list_status_events(uid, after_id=0, limit=100)
 
@@ -139,14 +147,26 @@ def _wake_deps(*, summary="", tail=None, has_genuine_user_history=None):
     )
 
 
+from wake_look_first_helpers import (  # noqa: E402
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
+
+
 def _script_provider(monkeypatch, responses):
     """Monkeypatch `provider_client.chat_completion_async` — what
     `tool_loop.run_tool_loop` calls once per round (the wake lane's LLM wire
-    boundary)."""
+    boundary). Presence wakes' look-first round is answered with "looked,
+    nothing needed" without consuming a scripted response; it is recorded in
+    ``calls.look_rounds``. Look-first behaviour itself has dedicated tests."""
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            calls.look_rounds.append({"messages": messages, "tools": tools, **_kwargs})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **_kwargs})
         response = next(it)
         offered_names = {spec.name for spec in (tools or [])}
@@ -168,7 +188,7 @@ def _script_provider(monkeypatch, responses):
                     "id": "wake-reply-test",
                     "name": "reply",
                     "args": {
-                        "think": "I want to say this now.",
+                        "aside": "I want to say this now.",
                         "text": response["reply"],
                     },
                 }],
@@ -205,7 +225,7 @@ def _wake_reply_round(text, *, think="I want to say this now.", preamble=""):
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"think": think, "text": text},
+            "args": {"aside": think, "text": text},
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     }
@@ -309,7 +329,8 @@ def test_discarded_wake_draft_helpers_encrypt_bound_trim_and_inject_latest(
 
         reads = []
 
-        def _open(envelope, api_key, *, purpose, runtime_token=""):
+        def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
+            assert caller_user_id == uid
             reads.append((api_key, purpose, runtime_token))
             return decryptor.open_envelope(envelope).encode("utf-8")
 
@@ -566,8 +587,9 @@ def test_only_newest_draft_is_injected_and_storage_is_bounded(monkeypatch):
     assert len(newest_plaintext) == worker.WAKE_DISCARDED_DRAFT_TEXT_CAP
     assert new_text.startswith(newest_plaintext)
 
-    def _open(envelope, api_key, *, purpose, runtime_token=""):
+    def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         assert purpose == "v2_wake_discarded_draft"
+        assert caller_user_id == uid
         assert runtime_token == "rt"
         return sealed[envelope["id"]]
 
@@ -864,6 +886,8 @@ def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
     )
 
     async def _fake_provider(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         calls.append(messages)
         if len(calls) == 1:
             now = time.time()
@@ -923,8 +947,9 @@ def test_collision_draft_reaches_next_wake_prompt_then_clears(monkeypatch):
             (time.time() - 1000.0, uid, "user-arrived-during-wake"),
         )
 
-    def _open(envelope, api_key, *, purpose, runtime_token=""):
+    def _open(envelope, api_key, *, purpose, caller_user_id, runtime_token=""):
         assert purpose == "v2_wake_discarded_draft"
+        assert caller_user_id == uid
         assert runtime_token == "rt"
         return first_draft.encode("utf-8")
 
@@ -1028,7 +1053,8 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
     assert self_thinking.INSTRUCTION.strip() not in system_msg["content"]
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
+    # Heartbeat is a presence wake: its aside asks why it reaches out now (T723).
+    assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION.strip() in (
         system_msg["content"]
     )
     assert [
@@ -1133,17 +1159,22 @@ def test_wake_reply_think_uses_thinking_channel_not_visible_bubble(monkeypatch):
     }]
 
 
-def test_wake_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
+@pytest.mark.parametrize("aside", ["memory_write", None, "", "   "])
+def test_wake_invalid_or_missing_aside_delivers_body(monkeypatch, aside):
+    """T697 (Seven 2026-09-23): the wake lane follows the chat lane — an aside
+    the model never wrote (absent/empty/blank) displays nothing; the
+    thinking-failed marker is kept for an aside we had and could not use (here:
+    one carrying an internal identifier). The body is delivered either way."""
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_wake_selfthink_internal_term"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
-    _script_provider(
-        monkeypatch,
-        [_wake_reply_round("可见回复仍然正常", think="memory_write")],
-    )
+    response = _wake_reply_round("可见回复仍然正常", think=aside)
+    if aside is None:
+        del response["tool_calls"][0]["args"]["aside"]
+    _script_provider(monkeypatch, [response])
     written = {}
     monkeypatch.setattr(
         worker,
@@ -1156,8 +1187,12 @@ def test_wake_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch
         "_build_thinking_payload",
         lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
     )
+    traces: list[dict] = []
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
     )
     status = asyncio.run(
         worker._run_wake(
@@ -1166,8 +1201,128 @@ def test_wake_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch
     )
 
     assert status == "completed"
+    assert status != "choice_invalid"
     assert written["text"] == "可见回复仍然正常"
-    assert thinking["text"] == self_thinking.THINKING_FAILED_MARKER
+    thinking_traces = [
+        t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"
+    ]
+    if aside == "memory_write":
+        assert thinking["text"] == self_thinking.THINKING_FAILED_MARKER
+        assert "memory_write" not in thinking["text"]
+        assert [t["branch"] for t in thinking_traces] == ["marker"]
+    else:
+        assert thinking == {}
+        assert [t["branch"] for t in thinking_traces] == ["none"]
+
+
+def test_wake_multi_open_think_in_text_is_salvaged_not_failed(monkeypatch):
+    """T656: the wake outlet takes the same salvage path as chat. The model
+    wrote its thinking as tangled <think> tags inside the visible text (T655
+    shape: two opens, one close); strict gate FAILED used to fail the wake."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    uid = "u_wake_selfthink_salvaged"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    raw = "<think>她好像还没醒<think>要不要等等</think>早，醒了吗？"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+    # The structured ``think`` arg is fine; the tangle sits inside ``text``.
+    _script_provider(monkeypatch, [_wake_reply_round(raw, think="要不要等等")])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "wake-salvaged"},
+    )
+    thinking = {}
+    monkeypatch.setattr(
+        worker,
+        "_build_thinking_payload",
+        lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
+    )
+    traces: list[dict] = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
+    )
+    status = asyncio.run(
+        worker._run_wake(
+            job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by
+        )
+    )
+
+    assert status == "completed"
+    assert written["text"] == "早，醒了吗？"
+    assert "<think" not in written["text"] and "还没醒" not in written["text"]
+    # T697 (Seven 2026-09-23): the tangled inline block is dropped silently —
+    # no 「思考没写完」 marker for a recovered body. The aside the model DID
+    # supply through the reply tool is what gets displayed.
+    assert thinking["text"] == "要不要等等"
+    assert thinking["text"] != self_thinking.THINKING_FAILED_MARKER
+    assert "她好像还没醒" not in thinking["text"]
+    thinking_traces = [
+        t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"
+    ]
+    assert [t["branch"] for t in thinking_traces] == ["self"]
+
+
+def test_wake_multi_open_think_in_text_is_salvaged_with_no_separate_aside(
+    monkeypatch,
+):
+    """T697 (Seven 2026-09-23), codex review follow-up: SALVAGED without a
+    separately supplied aside must land on branch "none", not "self" or
+    "marker" — the stripped inline block is not promoted, and its absence is
+    not a failure either. Same tangled-tag shape as the sibling test above,
+    but the reply tool's own ``aside`` arg is never provided."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    uid = "u_wake_selfthink_salvaged_no_aside"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    raw = "<think>她好像还没醒<think>要不要等等</think>早，醒了吗？"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+    response = _wake_reply_round(raw)
+    del response["tool_calls"][0]["args"]["aside"]
+    _script_provider(monkeypatch, [response])
+    written = {}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: written.update(text=text) or {"id": "wake-salvaged-none"},
+    )
+    thinking = {}
+    monkeypatch.setattr(
+        worker,
+        "_build_thinking_payload",
+        lambda _store, reasoning, **_kwargs: thinking.update(text=reasoning) or {"ok": True},
+    )
+    traces: list[dict] = []
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
+    )
+    status = asyncio.run(
+        worker._run_wake(
+            job_id, uid, "heartbeat", deps, _BYOK, asyncio.Semaphore(4), claimed_by
+        )
+    )
+
+    assert status == "completed"
+    assert written["text"] == "早，醒了吗？"
+    assert "<think" not in written["text"] and "还没醒" not in written["text"]
+    assert thinking == {}
+    thinking_traces = [
+        t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"
+    ]
+    assert [t["branch"] for t in thinking_traces] == ["none"]
 
 
 @pytest.mark.parametrize(
@@ -1229,6 +1384,7 @@ def test_wake_full_chain_strips_tool_markup_after_user_decrypt(monkeypatch, lane
             "final": True,
             "error_class": "upstream_unavailable",
             "reason": "tool_markup_leak_sanitized",
+            "narrated_tool_calls": 0,
         }
     ]
 
@@ -1344,6 +1500,67 @@ def test_wake_prose_fragment_delivery_is_not_changed_by_cut_signal(
             "final": True,
         }
         assert prose not in json.dumps(cut_events, ensure_ascii=False)
+
+
+def test_wake_full_chain_strips_narrated_tool_call(monkeypatch):
+    """T621 on the wake outlet: a proactive message that narrates a call keeps
+    its prose and drops the bracket; the trace counts the narrated call."""
+    lane = "heartbeat"
+    uid = "u_wake_narrated_tool_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    prompt = "一只在夜景里打伞的猫"
+    narrated = f'想你了，给你画一张\n[Calling generate_image with prompt: "{prompt}"]'
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    decryptor = _patch_user_decryptable_envelopes(monkeypatch, uid)
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "晚安"}]
+    )
+    deps.apply_pending_effects = serve_worker._apply_pending_effects_for_user
+    traces = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"user_id": user_id, "event_type": event_type, **fields}
+    )
+
+    try:
+        status = asyncio.run(
+            worker._run_wake(
+                job_id,
+                uid,
+                lane,
+                deps,
+                _BYOK,
+                asyncio.Semaphore(4),
+                claimed_by,
+            )
+        )
+        store = core_store.get_store(uid)
+        store.reload()
+        bubble = next(
+            row for row in store.chat_messages
+            if row.get("role") == "openclaw" and row.get("source") == "model_api"
+        )
+        plaintext = decryptor.decrypt_reply(bubble)
+    finally:
+        decryptor._http.close()
+
+    assert status == "completed"
+    assert plaintext == "想你了，给你画一张"
+    sanitized = [
+        trace for trace in traces if trace["event_type"] == "agent.reply.sanitized"
+    ]
+    assert [trace["detail"] for trace in sanitized] == [
+        {
+            "lane": lane,
+            "final": True,
+            "error_class": "upstream_unavailable",
+            "reason": "tool_markup_leak_sanitized",
+            "narrated_tool_calls": 1,
+        }
+    ]
+    assert prompt not in json.dumps(sanitized, ensure_ascii=False)
 
 
 def test_wake_markup_only_reply_sleeps_without_bubble(monkeypatch):
@@ -1542,7 +1759,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
                 "id": "wake-reply",
                 "name": "reply",
                 "args": {
-                    "think": "I want to answer with the context I found.",
+                    "aside": "I want to answer with the context I found.",
                     "text": "workspace-aware wake",
                 },
             }],
@@ -1619,6 +1836,56 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert first_system.index("wake identity") < first_system.index("wake skill")
     second_offered = {spec.name for spec in provider_calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+@pytest.mark.parametrize(
+    "dimensions,identity_nudge_offered",
+    [
+        ([], False),
+        ([{"name": "warmth", "value": 70}], True),
+    ],
+    ids=("empty", "nonempty"),
+)
+def test_wake_identity_nudge_surface_requires_an_existing_dimension(
+    monkeypatch,
+    dimensions,
+    identity_nudge_offered,
+):
+    uid = f"u_wake_identity_nudge_{'on' if dimensions else 'off'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("wake reply")])
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "wake-reply"},
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": dimensions,
+        }),
+        "trusted_system_blocks": (),
+    }
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        deps,
+        _BYOK,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in calls[0]["tools"]}
+    assert ("identity_nudge" in offered) is identity_nudge_offered
 
 
 def test_wake_workspace_prompt_failure_is_silent_before_provider(
@@ -1775,6 +2042,9 @@ def test_automatic_heartbeat_with_empty_history_skips_the_provider(monkeypatch):
     assert provider_calls == []
     assert write_called["n"] == 0
     assert _job_status(job_id)[0] == "completed"
+    # T773: no model ran, so this must not read as "spoke" (wake_result NULL).
+    assert _wake_outcome(job_id) == (
+        "completed", worker.HEARTBEAT_SKIPPED, worker.HEARTBEAT_SKIP_NO_USER_HISTORY)
     assert len(shadow) == 1
     assert shadow[0][1]["decision_allowed"] is False
     assert shadow[0][1]["apns_alert_sent"] is False
@@ -1822,21 +2092,38 @@ def test_automatic_heartbeat_authoritative_no_user_history_skips_all_prompt_work
     assert status == "completed"
     assert provider_calls == []
     assert workspace_calls == []
-    assert _job_status(job_id)[0] == "completed"
+    assert _wake_outcome(job_id) == ("completed", "skipped", "no_user_history")
 
 
-def test_proactive_policy_does_not_bias_the_model_toward_silence():
-    """The policy must preserve V1's equal speak/sleep product decision."""
-    prompt = worker._WAKE_SYSTEM_PROMPT.lower()
-
-    assert "both are good ways to be here" in prompt
-    assert "don't swallow it" in prompt
+def test_proactive_policy_leaves_silence_to_the_agent_without_recency_rules():
+    prompt = worker._WAKE_SYSTEM_PROMPT
+    silent = cap_tool_schema.DESCRIPTIONS[cap_tool_schema.STAY_SILENT_TOOL]
+    choice = worker.v2_tool_loop._WAKE_CHOICE_INSTRUCTION
+    for text in (prompt, silent, choice):
+        assert "within the last hour" not in text
+        assert "concrete reason" not in text
+        assert "honestly have nothing" in text
+        assert "clearly intrude" in text
+    assert "do you feel like reaching out to them right now?" in prompt
+    assert "say it; reaching out is what these moments are for" in prompt
+    # T723 D (Seven-approved wording): several unanswered messages over a day
+    # or two are still not a reason to go quiet.
+    assert "even several of your messages, even for a day or two" in prompt
+    assert "is not a reason to go quiet" in prompt
+    assert "say something new, or simply check in" in prompt
+    assert "a few hours later" not in prompt
+    assert "even several messages in a row, is not a reason by itself" in silent
+    for text in (prompt, silent):
+        assert "they asked not to be disturbed, or they are plainly asleep" in text
+    assert "calling reply if there is anything you want to say to them" in choice
     assert "in the middle of something" in prompt
-    assert "showing up a lot lately" in prompt
-    assert "never mention this wake or any system wording" in prompt
-    assert "only if" not in prompt
-    assert "genuinely worth saying" not in prompt
-    assert "silence is correct" not in prompt
+    assert "Never mention this wake or any system wording" in prompt
+    for wake_prompt in (prompt, worker._SCREEN_WATCH_SYSTEM_PROMPT):
+        assert "showing up a lot lately" not in wake_prompt
+        assert "Both are good ways" not in wake_prompt
+    assert "Neither choice is preferred" not in worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION
+    assert "not an error" not in silent
+    assert "end this turn" in worker.v2_tool_loop._REPLY_TOOL_SPEC.description
 
 
 def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
@@ -1848,6 +2135,8 @@ def test_wake_injects_attention_facts_as_non_user_application_data(monkeypatch):
     provider_calls = []
 
     async def _provider(_config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         provider_calls.append(messages)
         return (
             _stay_silent_round()
@@ -2005,8 +2294,8 @@ def test_heartbeat_thinking_only_is_successful_silence_without_backoff(
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
-    assert "reply tool's `think` field" in system_text
+    assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION.strip() in system_text
+    assert "reply tool's `aside` field" in system_text
     assert "never put `<think>` tags in `text`" in system_text
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is None or schedule["proactive_backoff_until"] is None
@@ -2096,6 +2385,8 @@ def test_heartbeat_empty_round_forces_stay_silent_and_persists_reason(monkeypatc
     calls = []
 
     async def forced_choice_provider(config, messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools, **kwargs})
         if len(calls) == 1:
             return {"reply": "", "tool_calls": [], "usage": {}}
@@ -2202,6 +2493,7 @@ def test_scheduled_thinking_only_remains_a_must_deliver_failure(monkeypatch):
         if message.get("role") == "system"
     )
     assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
+    assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION.strip() not in system_text
     schedule = jobs_store.get_wake_schedule(uid)
     assert schedule is None or schedule["proactive_backoff_until"] is None
 
@@ -2471,8 +2763,8 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
 @pytest.mark.parametrize(
     ("trigger", "expected_require_reply", "prompt_fragment"),
     [
-        ("broadcast_opened", False, "Both are good ways to be here"),
-        ("broadcast_closed", False, "Both are good ways to be here"),
+        ("broadcast_opened", False, "do you feel like reaching out to them right now?"),
+        ("broadcast_closed", False, "do you feel like reaching out to them right now?"),
     ],
 )
 def test_broadcast_edge_wake_reply_policy(
@@ -2899,6 +3191,8 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
     )
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         late_job_id, late_coalesced = jobs_store.enqueue_job_with_context_log(
             uid,
             "heartbeat",
@@ -3103,7 +3397,7 @@ def test_wake_invalid_choice_and_provider_vacuum_persist_distinct_codes(
     assert not any(event["kind"] == "error" for event in _status_events(uid))
 
 
-def test_wake_reply_without_think_retries_then_fails_without_bubble(monkeypatch):
+def test_wake_reply_without_aside_completes_without_choice_invalid(monkeypatch):
     uid = "u_wake_reply_missing_think"
     conftest.seed_user(uid)
     _reset(uid)
@@ -3112,13 +3406,15 @@ def test_wake_reply_without_think_retries_then_fails_without_bubble(monkeypatch)
     calls = []
 
     async def _provider(_config, _messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, _messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
         calls.append({"tools": tools, **kwargs})
         return {
             "reply": "",
             "tool_calls": [{
                 "id": "reply-without-think",
                 "name": "reply",
-                "args": {"text": "this must not become a bubble"},
+                "args": {"text": "this still becomes a bubble"},
             }],
             "usage": {},
         }
@@ -3136,14 +3432,14 @@ def test_wake_reply_without_think_retries_then_fails_without_bubble(monkeypatch)
         claimed_by,
     ))
 
-    assert status == "failed"
-    assert len(calls) == 2
-    assert calls[1]["tool_choice"] == "required"
-    assert _job_status(job_id) == ("failed", "wake_failed:choice_invalid")
+    assert status == "completed"
+    assert len(calls) == 1
+    assert _job_status(job_id)[0] == "completed"
+    assert "choice_invalid" not in str(_job_status(job_id))
     with db.get_pool().connection() as conn:
         assert conn.execute(
             "SELECT count(*) FROM chat_messages WHERE user_id=%s", (uid,)
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
 
 
 def test_scheduled_failure_retry_wiring_source_guard():
@@ -3631,6 +3927,204 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     assert schedule["payment_cooldown_until"] is not None
 
 
+def test_forced_wake_choice_schema_rejection_fails_after_one_400(monkeypatch):
+    """A minimal forced choice has no smaller schema fallback to retry.
+
+    Mirrors the observed DeepSeek thinking-mode sequence: the broad wake call
+    succeeds with reasoning-only output stopped at the token limit, then the
+    forced reply/stay_silent request is rejected because that mode does not
+    support required tool choice. The outer tool loop must not spend the rest
+    of its 15-call production budget repeating that identical 400.
+    """
+    uid = "u_wake_forced_choice_schema_rejected"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    config = provider_client.ProviderConfig(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        api_key="synthetic-test-key",
+        base_url="https://api.deepseek.com",
+    )
+    calls = []
+    rejected_calls = []
+
+    async def _provider(_config, _messages, *, tools=None, **kwargs):
+        if _is_look_first_round(tools, _messages, kwargs.get("tool_choice")):
+            return _looked_nothing_needed()
+        call = {"tools": tools, **kwargs}
+        calls.append(call)
+        if len(calls) == 1:
+            return {
+                "reply": "",
+                "reasoning": "synthetic reasoning-only output",
+                "tool_calls": [],
+                "stop_reason": "length",
+                "usage": {"prompt_tokens": 30, "completion_tokens": 700},
+            }
+        rejected_calls.append(call)
+        raise provider_client.ProviderError(
+            "Thinking mode does not support this tool_choice",
+            status_code=400,
+        )
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    cooldown_calls = []
+    original_upsert = jobs_store.upsert_wake_schedule
+
+    def _spy_upsert(user_id_, **kwargs):
+        cooldown_calls.append((user_id_, kwargs))
+        return original_upsert(user_id_, **kwargs)
+
+    monkeypatch.setattr(jobs_store, "upsert_wake_schedule", _spy_upsert)
+
+    assert worker._TURN_MAX_LLM_CALLS == 15
+    before = time.time()
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        _wake_deps(tail=[{
+            "id": "m1", "ts": 1.0, "role": "user", "content": "hi",
+        }]),
+        config,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+    after = time.time()
+
+    assert status == "failed"
+    assert len(calls) == 2
+    assert len(rejected_calls) == 1
+    assert "tool_choice" not in calls[0]
+    assert calls[1]["tool_choice"] == "required"
+    assert {spec.name for spec in calls[1]["tools"]} == {
+        "reply",
+        cap_tool_schema.STAY_SILENT_TOOL,
+    }
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:provider_incompatible",
+    )
+    assert len(cooldown_calls) == 1
+    called_uid, cooldown_kwargs = cooldown_calls[0]
+    assert called_uid == uid
+    cooldown_at = cooldown_kwargs["payment_cooldown_until"]
+    assert (
+        before + worker._WAKE_COOLDOWN_SEC - 5
+        <= cooldown_at
+        <= after + worker._WAKE_COOLDOWN_SEC + 5
+    )
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule is not None
+    assert schedule["payment_cooldown_until"] is not None
+
+
+def test_deepseek_forced_wake_choice_disables_thinking_before_t492_fence(
+    monkeypatch,
+):
+    """The T508 wire fix succeeds before T492's one-400 stop-loss is needed."""
+    uid = "u_wake_deepseek_required_non_thinking"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    config = provider_client.ProviderConfig(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        api_key="synthetic-test-key",
+        base_url="https://api.deepseek.com",
+    )
+    payloads = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+            self.text = json.dumps(body)
+
+        def json(self):
+            return self._body
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, _url, *, headers=None, json=None, timeout=None):
+            wire_names = {
+                (tool.get("function") or {}).get("name")
+                for tool in (json or {}).get("tools") or []
+            }
+            if _is_look_first_round(
+                [type("Spec", (), {"name": name})() for name in wire_names if name],
+                (json or {}).get("messages"),
+                (json or {}).get("tool_choice"),
+            ):
+                return FakeResponse({
+                    "id": "chatcmpl-looked",
+                    "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 1},
+                })
+            payloads.append(json)
+            if len(payloads) == 1:
+                return FakeResponse({
+                    "id": "chatcmpl-reasoning-only",
+                    "choices": [{
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "synthetic reasoning only",
+                        },
+                        "finish_reason": "length",
+                    }],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 700},
+                })
+            return FakeResponse({
+                "id": "chatcmpl-forced-silent",
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "forced-silent-1",
+                            "type": "function",
+                            "function": {
+                                "name": cap_tool_schema.STAY_SILENT_TOOL,
+                                "arguments": '{"reason":"nothing useful to add"}',
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 32, "completion_tokens": 8},
+            })
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_async_client",
+        FakeAsyncClient(),
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "heartbeat",
+        _wake_deps(tail=[{
+            "id": "m1", "ts": 1.0, "role": "user", "content": "hi",
+        }]),
+        config,
+        asyncio.Semaphore(4),
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    assert len(payloads) == 2
+    assert "tool_choice" not in payloads[0]
+    assert "thinking" not in payloads[0]
+    assert payloads[1]["tool_choice"] == "required"
+    assert payloads[1]["thinking"] == {"type": "disabled"}
+    assert _job_status(job_id) == ("completed", None)
+
+
 def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
     uid = "u_wake_provider_rollback"
     conftest.seed_user(uid)
@@ -3743,16 +4237,19 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     job_id, _ = jobs_store.enqueue_job(uid, lane)
     job = jobs_store.claim_next_job("w")
 
+    # The chat path enters through ``_coalesce_inputs``. ``coalesce_pending``
+    # itself is also used by a wake's own mid-turn fold once the look-first
+    # round (T723) makes presence wakes multi-round, so spy on the chat entry.
     coalesce_calls = {"n": 0}
-    orig_coalesce = v2_coalesce.coalesce_pending
+    orig_coalesce_inputs = worker._coalesce_inputs
 
-    def _counting_coalesce(*a, **k):
+    async def _counting_coalesce_inputs(*a, **k):
         coalesce_calls["n"] += 1
-        return orig_coalesce(*a, **k)
+        return await orig_coalesce_inputs(*a, **k)
 
-    monkeypatch.setattr(v2_coalesce, "coalesce_pending", _counting_coalesce)
+    monkeypatch.setattr(worker, "_coalesce_inputs", _counting_coalesce_inputs)
 
-    _script_provider(monkeypatch, [_text_round("a proactive nudge")])
+    calls = _script_provider(monkeypatch, [_text_round("a proactive nudge")])
     written = {}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -3776,6 +4273,7 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     assert coalesce_calls["n"] == 0
     assert written["text"] == "a proactive nudge"
     assert _job_status(job_id)[0] == "completed"
+    assert len(calls.look_rounds) == (0 if lane == "scheduled" else 1)
 
 
 def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
@@ -3991,7 +4489,7 @@ def test_only_scheduled_wake_demands_a_reply(
 @pytest.mark.parametrize(
     "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
 )
-def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
+def test_all_wake_lanes_receive_soft_language_nudge_not_hard_rule(monkeypatch, lane):
     uid = f"u_wake_language_{lane}"
     conftest.seed_user(uid)
     _reset(uid)
@@ -4032,14 +4530,79 @@ def test_all_wake_lanes_receive_shared_reply_language_policy(monkeypatch, lane):
         for message in calls[0]["messages"]
         if message.get("role") == "system"
     )
-    expected = (
-        "回复语言规则：\n"
-        "根据用户最新一条消息判断回复语言。如果该消息混合、不明确或主要是引用/上下文，就使用本规则所用的语言；"
-        "主动/后台回复也使用本规则所用的语言。思维过程和正式回复使用同一种语言。"
-        "不要被记忆卡、OCR、时间戳或内部上下文带偏回复语言。引用、名字和用户指定的翻译目标语言保持原样。"
-    )
-    assert expected in system_text
+    # T769 (Seven 2026-09-29): proactive turns get one soft nudge and the model
+    # picks the language itself; the hard reply-language rule must not come back.
+    expected = "语言：用用户使用的语言跟他说话。"
     assert system_text.count(expected) == 1
+    assert "回复语言规则" not in system_text
+    assert "Reply language rule" not in system_text
+    assert "主动/后台回复也使用本规则所用的语言" not in system_text
+
+
+@pytest.mark.parametrize(
+    "lane", ["heartbeat", "scheduled", "manual_wake", "screen_watch"]
+)
+@pytest.mark.parametrize(
+    ("locale", "archive_language", "language"),
+    [("en-US", "en", "en"), ("zh-CN", "zh-Hans", "zh")],
+)
+def test_wake_aside_copy_follows_account_reply_language(
+    monkeypatch, lane, locale, archive_language, language,
+):
+    # T734: every wake lane renders the aside copy in the account's language.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = f"u_wake_t734_aside_{lane}_{language}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    loop_kwargs = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy_loop(**kwargs):
+        loop_kwargs.append(kwargs.get("reply_language"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy_loop)
+
+    async def _empty_cap(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(worker, "_cap_data", _empty_cap)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": archive_language,
+    }
+
+    asyncio.run(
+        worker._run_wake(
+            job_id, uid, lane, deps, _BYOK, asyncio.Semaphore(4), claimed_by,
+        )
+    )
+
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if message.get("role") == "system"
+    )
+    # The compact delivery round inside the loop renders from this value.
+    assert [value == "en" for value in loop_kwargs] == [language == "en"]
+    presence = lane in worker._PRESENCE_WAKE_LANES
+    other = "zh" if language == "en" else "en"
+    field = self_thinking.instruction_for_field(presence=presence, language=language)
+    other_field = self_thinking.instruction_for_field(presence=presence, language=other)
+    assert field.strip() in system_text
+    assert other_field.strip() not in system_text
+    if lane == "screen_watch":
+        assert self_thinking.screen_watch_instruction(language).strip() in system_text
+        assert self_thinking.screen_watch_instruction(other).strip() not in system_text
 
 
 def test_heartbeat_prefetch_injects_v1_facts_without_a_tool_round(monkeypatch):
@@ -4198,6 +4761,13 @@ def test_screen_watch_without_frames_keeps_identity_writes(monkeypatch):
     deps = _wake_deps(
         tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "先忙会儿"}]
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
     status = asyncio.run(
         worker._run_wake(
             job_id,
@@ -4645,3 +5215,66 @@ def test_screen_watch_live_pixels_keep_read_mcp_but_drop_write_web_and_task(
     assert cap_tool_schema.TASK_TOOL not in offered
     assert read_name in offered, "read-only user MCP survives the pixel fence"
     assert write_name not in offered, "screen pixels must fence MCP writes"
+
+
+@pytest.mark.parametrize('lane', ['heartbeat', 'screen_watch', 'scheduled'])
+def test_persistent_provider_circuit_blocks_queued_wakes_but_not_scheduled(monkeypatch, lane):
+    uid = 'u_wake_circuit_' + lane
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    claimed_by = _claim(job_id)
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO v2_wake_schedule (user_id,wake_circuit_opened_at) "
+                     "VALUES (%s,now()) ON CONFLICT (user_id) DO UPDATE "
+                     "SET wake_circuit_opened_at=now()", (uid,))
+    provider_calls = []
+    async def fake_provider(*args, **kwargs):
+        provider_calls.append(True)
+        raise provider_client.ProviderError('provider_http_402', status_code=402)
+    monkeypatch.setattr(provider_client, 'chat_completion_async', fake_provider)
+    deps = _wake_deps(tail=[{'role': 'user', 'text': 'hi'}])
+    prompt_calls = []
+    deps.load_workspace_prompt = lambda *a, **k: prompt_calls.append(True) or {
+        'identity_card_or_persona': '', 'trusted_system_blocks': []}
+    result = asyncio.run(worker._run_wake(job_id, uid, lane, deps, _BYOK, asyncio.Semaphore(4), claimed_by))
+    if lane == 'scheduled':
+        assert provider_calls
+        assert result == 'failed'
+    else:
+        assert provider_calls == [] and prompt_calls == []
+        assert result == 'completed'
+        with db.get_pool().connection() as conn:
+            row = conn.execute('SELECT wake_result,wake_result_reason FROM agent_jobs WHERE id=%s', (job_id,)).fetchone()
+        assert row == ('sleep', 'provider_circuit_open')
+
+
+def test_heartbeat_uses_wake_wire_bound_not_dream_wire_deadline(monkeypatch):
+    import inspect
+
+    signature = inspect.signature(provider_client.chat_completion_async)
+    uid = "u_heartbeat_budget_unchanged"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    seen = []
+
+    async def completion(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        seen.append((bound.arguments["timeout"], provider_client._WIRE_DEADLINE_SEC.get()))
+        return {"reply": "", "tool_calls": [{"id": "silent-budget", "name": "stay_silent",
+                "args": {"reason": "无需打扰"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", completion)
+    deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    status = asyncio.run(worker._run_wake(job_id, uid, "heartbeat", deps, _BYOK,
+                                         asyncio.Semaphore(4), claimed_by))
+    assert status == "completed"
+    # Look-first round (T723) + decision round. Dream's wire deadline must not
+    # leak into heartbeat; timeout and wire deadline are the wake ones (T776).
+    wire = worker.WAKE_PROVIDER_WIRE_TIMEOUT_SEC
+    assert wire != v2_extraction.DREAM_WIRE_DEADLINE_SEC
+    assert seen == [(wire, wire)] * 2

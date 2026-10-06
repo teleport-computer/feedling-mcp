@@ -33,8 +33,15 @@ def _install_dream_blob(monkeypatch, initial=None, capture_initial=None):
         blobs.setdefault(kind, {}).clear()
         blobs[kind].update(doc)
 
+    def fake_patch_blob_strict(user_id, kind, patch, **_kwargs):
+        # Same contract as db.patch_blob_strict: top-level merge (upsert).
+        assert user_id == _Store.user_id
+        blobs.setdefault(kind, {}).update(patch)
+        return dict(blobs[kind])
+
     monkeypatch.setattr(dream_scheduler.db, "get_blob", fake_get_blob)
     monkeypatch.setattr(dream_scheduler.db, "set_blob", fake_set_blob)
+    monkeypatch.setattr(dream_scheduler.db, "patch_blob_strict", fake_patch_blob_strict)
     return blobs[dream_scheduler.DREAM_STATE_KIND]
 
 
@@ -68,6 +75,42 @@ def test_dream_completed_records_organized_and_merged_counts(monkeypatch):
         "capture_completed_at": 0,
         "capture_cards_added": 0,
     }
+
+
+def test_stale_state_save_preserves_concurrently_completed_dream_ledger(monkeypatch):
+    blob = _install_dream_blob(monkeypatch)
+    store = _Store()
+    stale = dream_scheduler.load_dream_state(store)
+
+    dream_scheduler.record_dream_job_status(store, {
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "dream_key": "dream:completed",
+        "dream_stats": {
+            "card_count": 8, "seed_card_count": 5,
+            "turn_count": 22, "signature": "completed-signature",
+        },
+        "dream_until": {"last_until": "2030-06-02T00:00:00Z"},
+        "organized_count": 4,
+        "merged_count": 2,
+    }, status="completed", now=1234.0)
+
+    # An ordinary writer resumes with a snapshot taken before that completion.
+    stale["pending_dream_key"] = "dream:next"
+    dream_scheduler.save_dream_state(store, stale, now=1235.0)
+
+    expected_ledger = {
+        "last_dream_completed_at": 1234.0,
+        "last_dream_organized_count": 4,
+        "last_dream_merged_count": 2,
+        "last_dreamed_card_count": 8,
+        "last_dreamed_seed_card_count": 5,
+        "last_dreamed_turn_count": 22,
+        "last_dream_signature": "completed-signature",
+        "last_dreamed_until": "2030-06-02T00:00:00Z",
+    }
+    assert {key: blob[key] for key in expected_ledger} == expected_ledger
+    assert blob["pending_dream_key"] == "dream:next"
 
 
 def test_dream_completed_without_consolidation_records_zero_counts(monkeypatch):

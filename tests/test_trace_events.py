@@ -107,9 +107,10 @@ def test_migration_has_beijing_bounds_no_fk_and_stable_indexes():
     assert any("(ts DESC, id DESC)" in definition for definition in indexes)
     assert any("(trace_id, ts DESC, id DESC)" in definition for definition in indexes)
     assert f"{today.isoformat()} 00:00:00+08" in bound
-    assert outcome_column == (
-        "NO", f"'{db.TRACE_OUTCOME_DEFAULT}'::text"
-    )
+    # The physical default is historical schema metadata. The sole production
+    # writer always supplies its normalized value explicitly; changing that
+    # default would not rewrite old rows and is outside this vocabulary change.
+    assert outcome_column == ("NO", "'operational_failure'::text")
     migration = (
         Path(__file__).parents[1]
         / "backend/alembic_tee/versions/0033_trace_events.py"
@@ -175,7 +176,7 @@ def test_trace_outcome_default_provenance_distinguishes_three_inputs(tee_primary
     }
     explicit = {
         **_event(ts=now + 2, trace_id="outcome-explicit"),
-        "outcome_class": db.TRACE_OUTCOME_DEFAULT,
+        "outcome_class": "operational_failure",
     }
     try:
         assert db.insert_trace_events_strict(uid, [missing, invalid, explicit]) == 3
@@ -183,10 +184,9 @@ def test_trace_outcome_default_provenance_distinguishes_three_inputs(tee_primary
             row["trace_id"]: row
             for row in db.query_trace_events(user_id=uid)
         }
-        assert {
-            rows[trace_id]["outcome_class"]
-            for trace_id in rows
-        } == {db.TRACE_OUTCOME_DEFAULT}
+        assert rows["outcome-missing"]["outcome_class"] == "unspecified"
+        assert rows["outcome-invalid"]["outcome_class"] == "unspecified"
+        assert rows["outcome-explicit"]["outcome_class"] == "operational_failure"
         assert rows["outcome-missing"]["detail"][
             db.TRACE_OUTCOME_PROVENANCE_FIELD
         ] == "missing"
@@ -201,8 +201,17 @@ def test_trace_outcome_default_provenance_distinguishes_three_inputs(tee_primary
 
 
 def test_trace_outcome_vocabulary_matches_runtime_dashboard():
-    assert debug_trace.TRACE_OUTCOME_CLASSES == data_track.RUNTIME_OUTCOME_CLASSES
-    assert debug_trace.TRACE_OUTCOME_DEFAULT == data_track.RUNTIME_OUTCOME_DEFAULT
+    assert (
+        db.TRACE_OUTCOME_CLASSES
+        == debug_trace.TRACE_OUTCOME_CLASSES
+        == data_track.RUNTIME_OUTCOME_CLASSES
+        == frozenset(data_track.RUNTIME_OUTCOME_CLASS_LABELS)
+        == frozenset(data_track._OUTCOME_CLASS_LABELS)
+    )
+    assert debug_trace.TRACE_OUTCOME_DEFAULT == "unspecified"
+    assert data_track.RUNTIME_OUTCOME_DEFAULT == "unspecified"
+    assert data_track.RUNTIME_OUTCOME_CLASS_LABELS["unspecified"] == "未说明"
+    assert data_track._OUTCOME_CLASS_LABELS["unspecified"] == "未说明"
     assert debug_trace.TRACE_OUTCOME_DEFAULT in debug_trace.TRACE_OUTCOME_CLASSES
 
 

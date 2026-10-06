@@ -57,12 +57,12 @@ and attachment plaintext binary uses strict `body_b64`; large objects may use a
    ciphertext using the guarded procedure below, run strict verification, then
    perform Phase 4 and switch both units to TEE.
 7. Open `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` only after compatible clients and
-   regression evidence exist, one environment at a time. Production uses the
-   fail-closed `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` repository variable;
-   CI accepts `1` only when `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the
-   same value to the API, in-CVM worker, and every independent runner. This
-   per-user write gate is independent from the all-plaintext shadow described
-   below.
+   regression evidence exist, one environment at a time. Production now
+   defaults this gate to `1`, while the `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED`
+   repository variable can explicitly close it; CI accepts `1` only when
+   `PROD_FEEDLING_DATABASE_SCHEMA=tee` and forwards the same value to the API,
+   in-CVM worker, and every independent runner. This per-user write gate is
+   independent from the all-plaintext shadow described below.
 
 ## Post-promotion plaintext shadow
 
@@ -273,6 +273,131 @@ WHERE jsonb_path_exists(payload, '$.**.body_ct');
 Ciphertext in an `off` account can be old history, an old-client upload, or the
 sealed resident lane. Inspect time, producer, and family before rewriting it.
 Mixed reads are supported steady state.
+
+## Single-user historical plaintext migration
+
+Use this only for an existing account whose effective preference is off
+(explicit `off` or unset/default-off) and after the operator has confirmed that
+its historical shared content should be rewritten. The command is intentionally single-user,
+dry-run by default, count-only, and unavailable without two independent apply
+gates. It leaves `local_only` or missing-`K_enclave` records unchanged because
+the enclave cannot decrypt them.
+
+Run inside the managed CVM from the exact deployed release:
+
+```bash
+cd backend
+python migrate_user_content_to_plaintext.py \
+  --user usr_exact_target \
+  --json
+```
+
+Review the aggregate `migratable_shared`, `already_plaintext`,
+`skipped_local_only`, and `invalid_shape` counts. Do not proceed if the target
+user or expected totals do not match the incident record. Canary at one row per
+second, then resume at no more than two rows per second:
+
+```bash
+export FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1
+python migrate_user_content_to_plaintext.py \
+  --user usr_exact_target \
+  --apply --allow-plaintext-rewrite \
+  --limit 20 --rate 1 --json
+
+python migrate_user_content_to_plaintext.py \
+  --user usr_exact_target \
+  --apply --allow-plaintext-rewrite \
+  --rate 2 --json
+```
+
+Every inline write compares the exact source document and rechecks effective
+off in the write transaction. Chat R2 bodies use the durable upload-guard
+lifecycle. Frame plaintext is uploaded under a separate
+`frames-plaintext/<user>/...` key and the legacy ciphertext object is retired
+only after the row CAS commits. A deletion failure leaves a content-free
+`cleanup_pending` marker which a later apply resumes without decrypting again.
+Rerun the dry-run until neither `migratable_shared` nor `cleanup_pending` rows
+remain; any failure count is a stop condition, not a reason to raise the rate.
+Operator output must remain aggregate-only.
+
+## Fleet historical plaintext repair
+
+Use the fleet coordinator only after the code release containing the
+database-backed replication policy resolver is deployed and its exact commit is
+visible in `/healthz`. It selects existing explicit-off and unset/default-off
+ users in deterministic `user_id` order, excludes explicit-on users, and runs
+ one user at a time. By default it stops on the first migration or health-gate
+ failure. For unattended batches, add `--continue-on-failure`: failed rows are
+ counted and left unchanged while later users continue; review and retry the
+ reported failures separately.
+
+Inventory is read-only and does not require the enclave to be healthy:
+
+```bash
+cd backend
+python migrate_effective_off_content_to_plaintext.py \
+  --user-limit 10 --json
+```
+
+Apply first in TEST at one decrypt operation per second. All three write gates
+are mandatory; the health gate checks `FEEDLING_ENCLAVE_URL/healthz` before
+admitting each user and requires two consecutive timely responses:
+
+```bash
+export FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1
+python migrate_effective_off_content_to_plaintext.py \
+  --apply --allow-plaintext-rewrite \
+  --confirm-all-effective-off ALL-EFFECTIVE-OFF \
+  --user-limit 10 --row-limit 20 --rate 1 --workers 1 --json
+```
+
+`--workers` is bounded to 1--4 and defaults to 1.  It controls per-user
+parallel migration work while `--rate` remains the process-wide maximum start
+rate.  Increase workers only after observing enclave latency and backend CPU;
+CAS writes remain conflict-safe when users are active.
+
+`--continue-on-failure` is opt-in. It advances the cursor past users with
+failed rows, so retain the reported failure count and rerun those users when
+their decrypt or storage issue is resolved.
+
+With this flag, item failures, user-state/setup failures, and temporary health
+gate failures do not terminate the queue: item/user failures are logged and the
+queue advances; a health-gate failure pauses and retries until the enclave is
+healthy again.
+
+Apply runs also append one content-free JSONL record per failed item to
+`FEEDLING_PLAINTEXT_MIGRATION_FAILURE_LOG`, defaulting to
+`/data/plaintext-migration-failures.jsonl` on the persistent backend volume.
+Copy or ship this file before replacing the volume; it contains IDs and error
+classes, never message bodies or keys.
+
+Apply runs also take `/data/plaintext-migration.lock` by default and atomically
+write `/data/plaintext-migration-checkpoint.json` after each completed user.
+Use `--retry-failures <path>` to retry only the `user_id`/`item_id` pairs from a
+failure JSONL file.
+
+Record `last_completed_user_id` only after a zero-failure user with no
+`not_attempted_limit` rows. When `--row-limit` leaves rows deferred, the
+coordinator stops before the next user, does not count the partial user as
+completed, and leaves the cursor on the previous fully completed user. Resume
+strictly after that value with the same row limit; this selects the partial
+user again until it is complete:
+
+```bash
+python migrate_effective_off_content_to_plaintext.py \
+  --apply --allow-plaintext-rewrite \
+  --confirm-all-effective-off ALL-EFFECTIVE-OFF \
+  --start-after usr_last_completed --row-limit 20 --rate 1 --json
+```
+
+If `last_completed_user_id` is empty, omit `--start-after` on the next run.
+Once a run no longer reports `not_attempted_limit`, that user is complete and
+the returned cursor may advance normally.
+
+Before and after every batch, record content-shape counts split into explicit-on
+and effective-off users. Abort rather than raising QPS if the enclave health
+gate, decrypts, CAS, or storage cleanup reports a failure. A PROD apply is a
+separate operator action and is never performed by deployment automation.
 
 ## Two-account regression
 

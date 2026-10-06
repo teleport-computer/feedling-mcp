@@ -35,6 +35,29 @@ _TEST_PROVIDER_CONFIG = provider_client.ProviderConfig(
     api_key="test-key",
 )
 
+_PROVIDER_TOOL_HISTORY_REJECTION_DETAILS = (
+    "provider_http_400: The GenerateContentRequest proto is invalid:\n"
+    "  * contents[2].parts[0].function_response.name: "
+    "[REQUIRED_FIELD_MISSING]",
+    "provider_http_400: Function call is missing a thought_signature in "
+    "functionCall parts. This is required for tools to work correctly, and "
+    "missing thought_signature may lead to degraded model performance. "
+    "Additional data, function call `default_api:memory_write` , position 2. "
+    "Please refer to https://***.dev/***/***/*** for more details.",
+    "provider_http_400: Provider API error: Provider API error: Please ensure "
+    "that function call turn comes immediately after a user turn or after a "
+    "function response turn. (request id: "
+    "20260903134117388340505BvsDKsJo)",
+)
+
+_PROVIDER_TOOL_SCHEMA_REJECTION_DETAILS = (
+    "provider_http_400: Invalid value at "
+    "'tools[0].function_declarations[18].parameters.properties[mode].enum[0]' "
+    "(TYPE_STRING), true",
+    'provider_http_400: Invalid JSON payload received. Unknown name "$ref" '
+    "at 'tools[0].function_declarations[0].parameters'",
+)
+
 
 class _ScriptedProvider:
     """Records every chat_completion_async call and returns the next scripted dict."""
@@ -216,7 +239,7 @@ def test_tool_loop_threads_visual_fallback_deadline_to_main_provider(monkeypatch
     assert provider.calls[0]["absolute_deadline"] == deadline
 
 
-def test_terminal_self_thinking_round_requests_assistant_prefill(monkeypatch):
+def test_terminal_aside_round_never_requests_think_prefill(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "<think>reason</think>hello", "tool_calls": [], "usage": {}},
     ])
@@ -237,9 +260,7 @@ def test_terminal_self_thinking_round_requests_assistant_prefill(monkeypatch):
 
     assert outcome.stop_reason == "final_text"
     assert provider.calls[0]["tools"] is None
-    assert provider.calls[0].get("assistant_prefill") == (
-        provider_client.SELF_THINKING_ASSISTANT_PREFILL
-    )
+    assert "assistant_prefill" not in provider.calls[0]
 
 
 def test_nonterminal_tool_round_does_not_request_assistant_prefill(monkeypatch):
@@ -455,7 +476,7 @@ def test_tagged_screen_images_retry_once_without_frames(monkeypatch):
     assert tagged in provider.calls[0]["messages"]
     assert tagged not in provider.calls[1]["messages"]
     assert rejected == ["ProviderError"]
-    assert usage == [None, {}]
+    assert usage == [None, {"provider_retry_count": 0}]
     assert outcome.final_text == "text fallback"
     initial_error = next(
         payload for kind, payload in trajectory if kind == "provider_error"
@@ -1030,7 +1051,7 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         {
             "reply": "",
             "reasoning": "private trajectory content",
-            "stop_reason": "private trajectory content " * 100,
+            "stop_reason": "NOVEL_STOP_MARKER",
             "tool_calls": [],
             "usage": {"completion_tokens": 4096},
         },
@@ -1080,6 +1101,13 @@ def test_empty_response_trajectory_records_only_content_free_shape(monkeypatch):
         },
         "action": "semantic_correction",
     }]
+    # T568 non-Gemini mirror: a non-Gemini provider's unknown stop marker still
+    # collapses to "other" and must NOT surface raw_stop_reason — the raw
+    # projection is scoped to real Gemini responses (owned gemini_diagnostics).
+    assert empty_events[0]["response_shape"]["stop_reason"] == "other"
+    assert "raw_stop_reason" not in empty_events[0]["response_shape"]
+    assert "NOVEL_STOP_MARKER" not in str(empty_events)
+    # Reasoning/message content is still never carried.
     assert "private trajectory content" not in str(empty_events)
     assert "messages" not in str(empty_events)
     assert debug_shapes == [empty_events[0]["response_shape"]]
@@ -3261,7 +3289,7 @@ def test_all_tool_results_share_per_call_and_aggregate_prompt_budgets(monkeypatc
     assert all(result.content.endswith("...[truncated]") for result in exchange.results[1:])
 
 
-def test_truncated_memory_index_result_keeps_partition_guidance_and_metadata():
+def test_truncated_memory_index_result_keeps_actionable_guidance_and_metadata():
     original = ToolResult(
         call_id="memory-many",
         content="x" * 5000,
@@ -3280,7 +3308,8 @@ def test_truncated_memory_index_result_keeps_partition_guidance_and_metadata():
 
     assert len(normalized.content) == 500
     assert "returned 50 of 103 total cards" in normalized.content
-    assert "bucket or thread filters" in normalized.content
+    assert "memory_search with a narrower query" in normalized.content
+    assert "Use memory_index" not in normalized.content
     assert normalized.metadata == original.metadata
 
 
@@ -3324,7 +3353,7 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert provider.calls[1]["tools"] is None
     assert "allow_image_output" not in provider.calls[1]
     assert len(provider.calls) == 2
-    assert usage == [None, {}]
+    assert usage == [None, {"provider_retry_count": 0}]
     assert reply.calls == [("fallback answer", True)]
     assert outcome.rounds == 2
     assert [item["reason"] for item in surfaces] == [
@@ -3345,6 +3374,142 @@ def test_tool_schema_rejection_gets_exactly_one_tools_disabled_fallback(monkeypa
     assert initial_error["status_code"] == status_code
     assert initial_error["provider_error_class"] == "provider_config"
     assert initial_error["dur_ms"] >= 0
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_provider_tool_history_rejections_are_not_tool_schema_rejections(detail):
+    exc = provider_client.ProviderError(detail, status_code=400)
+
+    assert tool_loop._is_provider_tool_history_rejection(exc) is True
+    assert tool_loop._is_probably_tool_schema_rejection(exc) is False
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_SCHEMA_REJECTION_DETAILS)
+def test_observed_tool_schema_rejections_remain_schema_rejections(detail):
+    exc = provider_client.ProviderError(detail, status_code=400)
+
+    assert tool_loop._is_provider_tool_history_rejection(exc) is False
+    assert tool_loop._is_probably_tool_schema_rejection(exc) is True
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_provider_tool_history_rejection_ends_turn_without_retry(
+    monkeypatch,
+    detail,
+):
+    class _AlwaysReject:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append({"tools": tools, **kwargs})
+            raise provider_client.ProviderError(detail, status_code=400)
+
+    provider = _AlwaysReject()
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    usage = []
+    surfaces = []
+    trajectory = []
+
+    async def record_surface(surface_detail):
+        surfaces.append(surface_detail)
+
+    async def record_trajectory(event_kind, payload):
+        trajectory.append((event_kind, payload))
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_RecordingBuildMessages(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=usage.append,
+            max_calls=5,
+            on_provider_tool_surface=record_surface,
+            on_trajectory_event=record_trajectory,
+        ))
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] is not None
+    assert usage == [None]
+    assert len(surfaces) == 1
+    assert surfaces[0]["force_text_fallback_reason"] == (
+        "provider_tool_history_rejected"
+    )
+    provider_errors = [
+        payload for event_kind, payload in trajectory
+        if event_kind == "provider_error"
+    ]
+    assert len(provider_errors) == 1
+    assert provider_errors[0]["fallback_reason"] == (
+        "provider_tool_history_rejected"
+    )
+    assert all(
+        payload.get("reason") != "tool_schema_rejected"
+        and payload.get("fallback_reason") != "tool_schema_rejected"
+        for _event_kind, payload in trajectory
+    )
+    assert not any(
+        event_kind == "protocol_fallback"
+        for event_kind, _payload in trajectory
+    )
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_tagged_image_tool_history_rejection_does_not_retry_without_image(
+    monkeypatch,
+    detail,
+):
+    tagged_image_key = "__tagged_image__"
+
+    class _TaggedBuild(_RecordingBuildMessages):
+        def __call__(self, transcript):
+            self.calls.append(list(transcript))
+            return [
+                {
+                    "role": "user",
+                    "content": "pic",
+                    tagged_image_key: True,
+                },
+                {"role": "user", "content": "turn"},
+            ]
+
+    class _AlwaysReject:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, config, messages, *, tools=None, **kwargs):
+            self.calls.append({"messages": messages, "tools": tools, **kwargs})
+            raise provider_client.ProviderError(detail, status_code=400)
+
+    provider = _AlwaysReject()
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    trajectory = []
+
+    async def record_trajectory(event_kind, payload):
+        trajectory.append((event_kind, payload))
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=_TaggedBuild(),
+            dispatch_tools=_RecordingDispatch(),
+            on_reply=_RecordingReply(),
+            fold_new_messages=_RecordingFold([[]]),
+            add_usage=_noop_add_usage,
+            max_calls=5,
+            tagged_image_message_key=tagged_image_key,
+            on_trajectory_event=record_trajectory,
+        ))
+
+    assert len(provider.calls) == 1, (
+        f"expected 1 provider call, got {len(provider.calls)}"
+    )
+    assert not any(
+        payload.get("tagged_images_rejected") is True
+        for _event_kind, payload in trajectory
+    )
 
 
 def test_terminal_surface_preserves_same_round_rejection_subtype(monkeypatch):
@@ -3851,7 +4016,11 @@ def test_regular_wake_free_text_retries_once_then_fails_without_bubble(
         ))
 
     assert replies.calls == []
-    assert len(provider.calls) == len(responses)
+    assert len(provider.calls) == 2
+    assert all(
+        call["max_tokens"] == provider_client.CHAT_OUTPUT_MAX_TOKENS
+        for call in provider.calls
+    )
     assert "tool_choice" not in provider.calls[0]
     assert {"reply", "stay_silent", "memory_index"} <= {
         spec.name for spec in provider.calls[0]["tools"]
@@ -3867,7 +4036,44 @@ def test_regular_wake_free_text_retries_once_then_fails_without_bubble(
         payload["choice"]
         for kind, payload in events
         if kind == "wake_choice_response"
-    ] == ["invalid", "invalid", "invalid"]
+    ] == ["invalid", "invalid"]
+
+
+@pytest.mark.parametrize("file_limit", [None, 16384])
+@pytest.mark.parametrize("file_capable", [False, True])
+def test_regular_wake_output_budget_and_file_priority(monkeypatch, file_limit, file_capable):
+    provider = _ScriptedProvider([{
+        "reply": "", "tool_calls": [{
+            "id": "silence-1", "name": "stay_silent",
+            "args": {"reason": "They asked not to be disturbed."},
+        }], "usage": {},
+    }])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    async def on_stay_silent(_reason):
+        return None
+
+    file_kwargs = {}
+    if file_capable:
+        file_kwargs["on_file_reply"] = lambda _path, _revision: None
+    if file_limit is not None:
+        file_kwargs["file_output_max_tokens"] = file_limit
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        on_stay_silent=on_stay_silent,
+        regular_wake_choice_required=True,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+        require_reply=False,
+        **file_kwargs,
+    ))
+    assert outcome.stop_reason == "stay_silent"
+    assert len(provider.calls) == 1
+    expected_limit = file_limit or provider_client.CHAT_OUTPUT_MAX_TOKENS
+    assert provider.calls[0]["max_tokens"] == expected_limit
 
 
 def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
@@ -3877,7 +4083,7 @@ def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
             "id": "wake-reply-1",
             "name": "reply",
             "args": {
-                "think": "I want to say this now.",
+                "aside": "I want to say this now.",
                 "text": "structured proactive reply",
             },
         }],
@@ -3911,8 +4117,8 @@ def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
     reply_spec = next(
         spec for spec in provider.calls[0]["tools"] if spec.name == "reply"
     )
-    assert reply_spec.parameters["required"] == ["think", "text"]
-    think_description = reply_spec.parameters["properties"]["think"]["description"]
+    assert reply_spec.parameters["required"] == ["text"]
+    think_description = reply_spec.parameters["properties"]["aside"]["description"]
     assert "entirely in their language" in think_description
     assert "in your usual voice with them" in think_description
     for forbidden_internal in (
@@ -3934,9 +4140,9 @@ def test_regular_wake_reply_tool_delivers_its_text(monkeypatch):
 
 @pytest.mark.parametrize("args", [
     {"text": "message without think"},
-    {"think": "   ", "text": "message with empty think"},
+    {"aside": "   ", "text": "message with empty think"},
 ])
-def test_regular_wake_reply_requires_nonempty_think_then_fails_closed(
+def test_regular_wake_reply_missing_aside_delivers_text(
     monkeypatch,
     args,
 ):
@@ -3953,23 +4159,23 @@ def test_regular_wake_reply_requires_nonempty_think_then_fails_closed(
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     replies = _RecordingReply()
 
-    with pytest.raises(tool_loop.WakeChoiceInvalid, match="choice_invalid"):
-        asyncio.run(tool_loop.run_tool_loop(
-            provider_config=_TEST_PROVIDER_CONFIG,
-            build_messages=_RecordingBuildMessages(),
-            dispatch_tools=_RecordingDispatch(),
-            on_reply=replies,
-            on_stay_silent=lambda _reason: None,
-            regular_wake_choice_required=True,
-            fold_new_messages=_RecordingFold([]),
-            add_usage=_noop_add_usage,
-            max_calls=3,
-            require_reply=False,
-        ))
+    asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=replies,
+        on_stay_silent=lambda _reason: None,
+        regular_wake_choice_required=True,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+        require_reply=False,
+    ))
 
-    assert len(provider.calls) == 2
-    assert provider.calls[1]["tool_choice"] == "required"
-    assert replies.calls == []
+    assert len(provider.calls) == 1
+    assert replies.calls == [(args["text"], True)]
+    assert isinstance(replies.calls[0][0], tool_loop.ValidatedWakeReply)
+    assert replies.calls[0][0].thinking == ""
 
 
 def test_regular_wake_reserves_last_call_and_never_uses_text_fallback(
@@ -4184,7 +4390,7 @@ def test_regular_wake_schema_rejection_retries_with_only_terminal_choice_tools(
                     "id": "wake-reply-after-schema-rejection",
                     "name": "reply",
                     "args": {
-                        "think": "I still want to say this now.",
+                        "aside": "I still want to say this now.",
                         "text": "structured reply after schema rejection",
                     },
                 }],
@@ -4248,7 +4454,7 @@ def test_tool_then_empty_wake_forces_terminal_reply_without_preamble_duplicate(
                 "id": "reply-forced",
                 "name": "reply",
                 "args": {
-                    "think": "我想把刚查到的上下文接起来。",
+                    "aside": "我想把刚查到的上下文接起来。",
                     "text": "这是唯一的终局回复",
                 },
             }],

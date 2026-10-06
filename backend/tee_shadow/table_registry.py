@@ -76,6 +76,13 @@ class Entry:
 
 
 REGISTRY: dict[str, Entry] = {
+    "memory_vectors": Entry(
+        SKIP,
+        "Primary-local rebuildable plaintext embedding index. The serve-worker "
+        "rebuilds from current authorized cards; no RDS-to-TEE vector replication. "
+        "Both primary modes require the local table; account deletion purges it.",
+        required_in_tee=True,
+    ),
     # ---------------------------------------------------------------- #
     # MIRROR —— 明文运维表，热路径双写（db.py 的 mirror.execute 写点）。
     # 这 13 张是 alembic_tee 0001 baseline 的"13 张明文运维表"，加 0002 的
@@ -303,6 +310,15 @@ REGISTRY: dict[str, Entry] = {
     "perceptkit_sync_state": Entry(
         SKIP,
         "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
+        required_in_tee=True,
+    ),
+    "perceptkit_retraction": Entry(
+        SKIP,
+        "来源撤回账：用户在来源侧（健康 app / 日历）删掉的那条记录，这边跟着不作数。"
+        "影子期不复制——它和其余 perceptkit_* 一样只有 backend 的影子在写，TEE 那边没有读者。"
+        "**切换时这一条要重新定，而且比其余几张更要紧**：漏了它，TEE 侧重算出来的"
+        "当前值和聚合会把用户已经删掉的数值算回去，而 RDS 侧是对的——两边不一致，"
+        "且错的那边看起来完全正常。",
         required_in_tee=True,
     ),
     "perceptkit_shadow_divergence": Entry(

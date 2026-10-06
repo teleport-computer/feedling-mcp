@@ -55,3 +55,26 @@ def test_client_disconnect_mid_upload_returns_empty_not_500():
     # iOS 后台上报中途断开：不得向路由层抛 ClientDisconnect（→500 噪音）
     assert asyncio.run(read_json_payload(
         _req("application/json", disconnect=True))) == {}
+
+
+def test_bounded_reader_preserves_content_type_disconnect_and_exact_limit():
+    import pytest
+    import memory_search_contract
+    assert asyncio.run(read_json_payload(_req("application/json"), max_bytes=8)) == {"a": 1}
+    assert asyncio.run(read_json_payload(_req("text/plain"), max_bytes=1)) == {}
+    assert asyncio.run(read_json_payload(_req("application/json", disconnect=True), max_bytes=1)) == {}
+    with pytest.raises(memory_search_contract.SearchLimitExceeded):
+        asyncio.run(read_json_payload(_req("application/json"), max_bytes=7))
+
+
+def test_bounded_reader_counts_chunked_upload_not_content_length():
+    import pytest
+    import memory_search_contract
+    chunks = iter([b'{"a":', b'123}'])
+    async def receive():
+        body = next(chunks)
+        return {"type": "http.request", "body": body, "more_body": body == b'{"a":'}
+    scope = {"type": "http", "headers": [(b"content-type", b"application/json"),
+                                         (b"content-length", b"1")]}
+    with pytest.raises(memory_search_contract.SearchLimitExceeded):
+        asyncio.run(read_json_payload(Request(scope, receive), max_bytes=8))

@@ -12,6 +12,7 @@ from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from perception.perceptkit_adapter import schema as perceptkit_schema  # noqa: E402
 
 
 @pytest.fixture()
@@ -172,6 +173,68 @@ def _seed_all_per_user_tables(user_id: str) -> None:
     db.model_api_route_upsert(user_id, cid, "claude-sonnet-4-5", None)
 
 
+def _perceptkit_event_id(user_id: str) -> str:
+    return f"account-reset-{user_id}"
+
+
+def _perceptkit_seed_value(
+    *, table: str, column: str, data_type: str, user_id: str
+):
+    """Build one minimal row from the registered table's actual columns."""
+    if column == "subject_id":
+        return user_id
+    if column == "event_id":
+        # The receipt is deliberately linked to the subject-owned outbox row.
+        return _perceptkit_event_id(user_id)
+    if data_type in {"integer", "bigint", "smallint"}:
+        return 1
+    if data_type == "date":
+        return "2026-09-06"
+    if data_type.startswith("timestamp"):
+        return "2026-09-06T00:00:00Z"
+    if data_type in {"json", "jsonb"}:
+        return db.Jsonb({})
+    return f"reset-test:{table}:{column}"
+
+
+def _seed_all_perceptkit_tables(user_id: str) -> None:
+    """Seed every registered PerceptKit table without copying its table list."""
+    tables = tuple(perceptkit_schema.TABLES)
+    assert len(tables) >= 12, "PerceptKit deletion coverage lost registered tables"
+
+    # wake_receipt has no subject_id. Seed it after its subject-owned outbox row
+    # and use the same event_id, which is also how deletion finds its owner.
+    wake_table = "perceptkit_wake_receipt"
+    ordered_tables = tuple(table for table in tables if table != wake_table)
+    if wake_table in tables:
+        ordered_tables += (wake_table,)
+
+    with db.get_pool().connection() as conn:
+        for table in ordered_tables:
+            columns = conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s "
+                "AND is_nullable = 'NO' ORDER BY ordinal_position",
+                (table,),
+            ).fetchall()
+            assert columns, f"registered PerceptKit table is missing: {table}"
+            names = [column for column, _data_type in columns]
+            values = [
+                _perceptkit_seed_value(
+                    table=table,
+                    column=column,
+                    data_type=data_type,
+                    user_id=user_id,
+                )
+                for column, data_type in columns
+            ]
+            placeholders = ", ".join(["%s"] * len(names))
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(names)}) VALUES ({placeholders})",
+                values,
+            )
+
+
 _PER_USER_TABLES = (
     "perception_items",
     "perception_daily",
@@ -204,12 +267,32 @@ def _remaining_rows(user_id: str) -> dict[str, int]:
     return counts
 
 
+def _remaining_perceptkit_rows(user_id: str) -> dict[str, int]:
+    tables = tuple(perceptkit_schema.TABLES)
+    assert len(tables) >= 12, "PerceptKit deletion coverage lost registered tables"
+    counts = {}
+    with db.get_pool().connection() as conn:
+        for table in tables:
+            if table == "perceptkit_wake_receipt":
+                predicate = "event_id = %s"
+                value = _perceptkit_event_id(user_id)
+            else:
+                predicate = "subject_id = %s"
+                value = user_id
+            counts[table] = conn.execute(
+                f"SELECT count(*) FROM {table} WHERE {predicate}", (value,)
+            ).fetchone()[0]
+    return counts
+
+
 def test_reset_purges_every_per_user_table(client):
     uid, api_key = _register(client)
     _seed_all_per_user_tables(uid)
+    _seed_all_perceptkit_tables(uid)
 
     # sanity: 行确实插进去了
     assert all(v > 0 for v in _remaining_rows(uid).values())
+    assert all(v > 0 for v in _remaining_perceptkit_rows(uid).values())
 
     res = client.post(
         "/v1/account/reset",
@@ -219,6 +302,9 @@ def test_reset_purges_every_per_user_table(client):
     assert res.status_code == 200, res.get_data(as_text=True)
 
     leftover = {t: n for t, n in _remaining_rows(uid).items() if n > 0}
+    leftover.update(
+        {t: n for t, n in _remaining_perceptkit_rows(uid).items() if n > 0}
+    )
     assert leftover == {}, f"删账号后这些表仍有残留行: {leftover}"
 
 

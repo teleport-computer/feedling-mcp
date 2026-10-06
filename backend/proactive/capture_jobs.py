@@ -20,11 +20,6 @@ CAPTURE_JOB_ID_PREFIX = "cap"
 CAPTURE_JOB_KIND_DREAM = "memory_dream"
 DREAM_JOB_SOURCE = "memory_dream"
 DREAM_JOB_ID_PREFIX = "dream"
-# Legacy-card migration lane (old card → v1). Same substrate as dream: a quiet-window
-# maintenance job, never a reach-out wake. The handler picks the batch at run time.
-CAPTURE_JOB_KIND_MIGRATE = "memory_migrate"
-MIGRATE_JOB_SOURCE = "memory_migrate"
-MIGRATE_JOB_ID_PREFIX = "migr"
 CAPTURE_ACTIVE_STATUSES = frozenset({"pending", "claimed", "realizing"})
 # Same-key terminal states that should NOT block a fresh enqueue: the window was
 # not successfully captured, so re-enqueuing the same window is correct (failed =
@@ -37,8 +32,8 @@ def failure_backoff_sec(streak: int) -> float:
 
     没有退避时，永远失败的窗口（典型：坏掉的 BYOK key，agent 调用必败）每个
     调度 tick 都会重建 job——min_interval 只看「上次成功完成」，对纯失败流
-    不生效。指数退避 base × 2^(streak-1)，封顶 max；三条 lane
-    （capture/dream/migrate）共用。"""
+    不生效。指数退避 base × 2^(streak-1)，封顶 max；两条 lane
+    （capture/dream）共用。"""
     n = int(streak or 0)
     if n <= 0:
         return 0.0
@@ -64,8 +59,9 @@ def in_failure_backoff(streak: int, last_failed_at: float, now_ts: float) -> boo
 _BACKOFF_NOTICE_STREAK = 3   # 前两次退避噪音价值低，第 3 次才打扰用户
 
 
-def notify_backoff(store, *, lane: str, status: str, streak: int) -> None:
-    """三条 maintenance lane（capture/migrate/dream）共用的退避通知钩子。
+def notify_backoff(store, *, lane: str, status: str, streak: int,
+                   account_code: str = "", skipped: bool = False) -> None:
+    """两条 maintenance lane（capture/dream）共用的退避通知钩子。
 
     streak>=3 的失败 emit warning（occurrences 天然吸收后续 +1，不刷屏）；
     completed 恢复 resolve（同 lane 精确 dedupe_key，不跨 lane 清）。两支
@@ -73,14 +69,41 @@ def notify_backoff(store, *, lane: str, status: str, streak: int) -> None:
     影响原 streak/状态流程（notices.emit/resolve 内部已自吞异常）。"""
     from notices import core as notices
     from notices import catalog
-    if status == "completed":
+    if status == "completed" or skipped:
+        # 跳过一批后游标已经推进、后面继续整理 —— 旧的「受阻/会补记」提示已经不成立，
+        # 留着会一直显示「修好后会补记」，而那批其实已经丢了（Codex 第 6 轮）。
         notices.resolve(store, f"memory_backoff:{lane}")
     elif status == "failed" and int(streak or 0) >= _BACKOFF_NOTICE_STREAK:
-        notices.emit(store, source="memory", error_class="memory_backoff",
-                     blame=catalog.blame_for("memory_backoff"), severity="warning",
-                     user_text=f"记忆整理（{lane}）连续失败 {streak} 次，正在退避重试。",
-                     detail=f"lane={lane} streak={streak}",
-                     dedupe_key=f"memory_backoff:{lane}")
+        # 失败原因是用户自己的账号/服务（余额不足、密钥失效、登录过期…）时，提示里直接说原因：
+        # 只写「连续失败 N 次」用户不知道要去充值，记忆就一直停着（2026-09-13 prod：
+        # 触发过逃生阀的 42 人里 33 人是账号问题）。文案取统一错误对照表，和聊天报错一致。
+        if account_code == "provider_setup":
+            # 模型服务还没配好（未配置/未测试/配置无效）：对照表里没有这一条，单独写。
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame="user_provider", severity="warning",
+                         user_text=("记忆整理暂停了：模型服务还没有配置好或没通过测试，"
+                                    "请到设置里完成模型配置。配好后会自动继续整理。"),
+                         detail=f"lane={lane} streak={streak} cause={account_code}",
+                         dedupe_key=f"memory_backoff:{lane}")
+            return
+        spec = None
+        if account_code:
+            from notices import error_contract
+            spec = error_contract.spec_for(account_code, public_only=False)
+        if spec is not None:
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame=spec.blame, severity="warning",
+                         user_text=(f"记忆整理暂停了：{spec.safe_text_zh}"
+                                    "修好后会自动继续整理；"
+                                    "积压太多或超过 7 天仍未恢复时，较早的聊天可能无法补记。"),
+                         detail=f"lane={lane} streak={streak} cause={account_code}",
+                         dedupe_key=f"memory_backoff:{lane}")
+        else:
+            notices.emit(store, source="memory", error_class="memory_backoff",
+                         blame=catalog.blame_for("memory_backoff"), severity="warning",
+                         user_text=f"记忆整理（{lane}）连续失败 {streak} 次，正在退避重试。",
+                         detail=f"lane={lane} streak={streak}",
+                         dedupe_key=f"memory_backoff:{lane}")
 
 
 def is_memory_capture_job(job: Mapping[str, Any] | None) -> bool:
@@ -101,17 +124,8 @@ def is_memory_dream_job(job: Mapping[str, Any] | None) -> bool:
     )
 
 
-def is_memory_migrate_job(job: Mapping[str, Any] | None) -> bool:
-    if not isinstance(job, Mapping):
-        return False
-    return (
-        str(job.get("job_kind") or "").strip() == CAPTURE_JOB_KIND_MIGRATE
-        or str(job.get("source") or "").strip() == MIGRATE_JOB_SOURCE
-    )
-
-
 def is_memory_maintenance_job(job: Mapping[str, Any] | None) -> bool:
-    return is_memory_capture_job(job) or is_memory_dream_job(job) or is_memory_migrate_job(job)
+    return is_memory_capture_job(job) or is_memory_dream_job(job)
 
 
 def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -124,12 +138,32 @@ def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
         message_count = int(raw.get("message_count") or 0)
     except (TypeError, ValueError):
         message_count = 0
-    return {
+    window = {
         "after_message_id": str(raw.get("after_message_id") or "")[:160],
         "until_message_id": str(raw.get("until_message_id") or "")[:160],
         "until_ts": until_ts,
         "message_count": max(0, message_count),
     }
+    # 🔴 起点 seq 必须跟着任务走，**包括 0**。首次落卡的用户没有 after_message_id，
+    # 丢了 after_seq 的话逃生阀只能按「终点」认窗口 —— 新消息一来终点就变，
+    # 失败次数永远重数、永远到不了阈值（Codex 第 10 轮）。
+    if raw.get("after_seq") is not None and raw.get("after_seq") != "":
+        try:
+            window["after_seq"] = max(0, int(float(raw.get("after_seq"))))
+        except (TypeError, ValueError):
+            pass
+    # Resident V1 按批次落卡：终点 seq 是这批的精确边界。consumer 靠它按 seq 取批，
+    # 完成时游标只推到这里（capture_scheduler._v1_oldest_batch_window）。
+    # 老窗口没有这个键，consumer 据此走老的取窗逻辑。
+    if raw.get("through_seq") is not None and raw.get("through_seq") != "":
+        try:
+            through_seq = int(float(raw.get("through_seq")))
+        except (TypeError, ValueError):
+            through_seq = 0
+        if through_seq > 0:
+            window["through_seq"] = through_seq
+            window["backlog_remaining"] = bool(raw.get("backlog_remaining"))
+    return window
 
 
 def _active_capture_job(job: Mapping[str, Any]) -> bool:
@@ -177,53 +211,6 @@ def _find_active_capture(store: UserStore) -> dict | None:
 def _find_active_dream(store: UserStore) -> dict | None:
     for job in store.list_proactive_jobs(since_epoch=0, limit=0):
         if _active_dream_job(job):
-            return dict(job)
-    return None
-
-
-def _active_migrate_job(job: Mapping[str, Any]) -> bool:
-    return is_memory_migrate_job(job) and str(job.get("status") or "pending").strip().lower() in CAPTURE_ACTIVE_STATUSES
-
-
-def _find_migrate_by_key(store: UserStore, migrate_key: str) -> dict | None:
-    matches = [
-        dict(job)
-        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
-        if is_memory_migrate_job(job) and str(job.get("migrate_key") or "") == migrate_key
-    ]
-    if not matches:
-        return None
-    return max(matches, key=lambda j: float(j.get("ts") or 0))
-
-
-def _migrate_same_key_blocks_retry(job: Mapping[str, Any]) -> bool:
-    """Whether a same-window migrate job should suppress another enqueue.
-
-    Migration can legitimately need another job in the same quiet window: a prior
-    no-op may have raced card seeding, and a finished batch can still leave legacy
-    cards. Only active jobs and terminal jobs that settled the window should block.
-    """
-    status = str(job.get("status") or "pending").strip().lower()
-    if status in CAPTURE_ACTIVE_STATUSES:
-        return True
-    if status in CAPTURE_RETRYABLE_TERMINAL:
-        return False
-    if status != "completed":
-        return True
-    reason = str(job.get("status_reason") or "").strip().lower()
-    result = job.get("migrate_result") if isinstance(job.get("migrate_result"), Mapping) else {}
-    if reason == "migrate_no_legacy" or str(result.get("reason") or "").strip().lower() == "no_legacy":
-        return False
-    try:
-        remaining = int(result.get("remaining"))
-    except (TypeError, ValueError):
-        remaining = 0
-    return remaining <= 0
-
-
-def _find_active_migrate(store: UserStore) -> dict | None:
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if _active_migrate_job(job):
             return dict(job)
     return None
 
@@ -359,69 +346,6 @@ def enqueue_memory_dream_job(
         dream_key=key,
         dream_until=dream_until,
         dream_stats=dream_stats,
-        not_before=not_before,
-        now=now,
-    )
-    return store.append_proactive_job(job), True, "enqueued"
-
-
-def make_memory_migrate_job(
-    *,
-    trigger: str,
-    migrate_key: str,
-    migrate_stats: Mapping[str, Any] | None = None,
-    not_before: float | None = None,
-    now: float | None = None,
-) -> dict[str, Any]:
-    now_ts = time.time() if now is None else float(now)
-    not_before_ts = now_ts if not_before is None else float(not_before)
-    return {
-        "job_id": util._new_public_id(MIGRATE_JOB_ID_PREFIX),
-        "job_kind": CAPTURE_JOB_KIND_MIGRATE,
-        "source": MIGRATE_JOB_SOURCE,
-        "status": "pending",
-        "trigger": str(trigger or "quiet_window_migrate")[:120],
-        "migrate_key": str(migrate_key or "")[:240],
-        "migrate_stats": dict(migrate_stats or {}),
-        "not_before": not_before_ts,
-        "ts": now_ts,
-        "created_at": datetime.fromtimestamp(now_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-
-
-def enqueue_memory_migrate_job(
-    store: UserStore,
-    *,
-    trigger: str,
-    migrate_key: str,
-    migrate_stats: Mapping[str, Any] | None = None,
-    not_before: float | None = None,
-    now: float | None = None,
-) -> tuple[dict | None, bool, str]:
-    """Enqueue one legacy→v1 migration batch job if none equivalent/active exists.
-
-    Single-flight per user (one active migrate at a time) so batches run serially
-    and never race each other; the handler picks the next batch of legacy cards at
-    run time. Idempotent by migrate_key (e.g. the quiet-window day/window id)."""
-    from memory import migration as _migration  # local import avoids load-order cycle
-    if not _migration.migration_enabled():
-        return None, False, "migration_disabled"
-    key = str(migrate_key or "").strip()
-    if not key:
-        return None, False, "migrate_key_required"
-    existing_same_key = _find_migrate_by_key(store, key)
-    if existing_same_key is not None and _migrate_same_key_blocks_retry(existing_same_key):
-        return existing_same_key, False, "duplicate_migrate_key"
-    # Plan §2: migration must not run alongside capture/dream (shared memory_lock +
-    # overlapping read→derive→write windows). Block at enqueue on ANY active
-    # maintenance job, not just another migrate — simplest, single source of truth.
-    active = _find_active_capture(store) or _find_active_dream(store) or _find_active_migrate(store)
-    if active is not None:
-        return active, False, "maintenance_already_pending"
-    job = make_memory_migrate_job(
-        trigger=trigger,
-        migrate_key=key,
-        migrate_stats=migrate_stats,
         not_before=not_before,
         now=now,
     )

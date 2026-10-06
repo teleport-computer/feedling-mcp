@@ -325,8 +325,12 @@ def test_model_cannot_forge_occurred_at(monkeypatch):
     assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
 
 
-def test_update_also_carries_a_frozen_time(monkeypatch):
-    """supersede 走的是同一个 raw（action["memory"]），同样要带上。"""
+def test_update_does_not_author_an_occurred_at(monkeypatch):
+    """update 走 supersede:不带 occurred_at,由服务端继承旧卡的发生时间。
+
+    以前这里也塞了入队时刻,于是 V2 每改一次卡,2024 年的事就被挪到今天
+    (DB 级验证见 test_memory_store_conformance 的 correction 用例)。
+    """
     monkeypatch.setattr(
         worker.memory_timestamps,
         "now_iso",
@@ -336,4 +340,4 @@ def test_update_also_carries_a_frozen_time(monkeypatch):
     out = worker._memory_tool_actions([
         {"op": "update", "target_id": "mem_1", "summary": "新的记忆标题", "content": "这是更新后的记忆正文，包含足够的实际内容。"}])
 
-    assert out[0]["memory"]["occurred_at"] == "2026-08-10T23:00:00Z"
+    assert "occurred_at" not in out[0]["memory"]

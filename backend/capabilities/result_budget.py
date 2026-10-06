@@ -72,6 +72,11 @@ WEB_FETCH_RESULT_MAX_CHARS_ENV = "FEEDLING_V2_WEB_FETCH_RESULT_MAX_CHARS"
 DEFAULT_WEB_FETCH_RESULT_MAX_CHARS = 8000
 DEFAULT_WEB_FETCH_EXTRA_BATCH_CHARS = 6000
 
+# Full atomic reservations are additive to the generic batch's 8000 chars;
+# even repeated memory calls cannot consume the non-memory siblings' share.
+MEMORY_TOOL_NAMES = ("memory_index", "memory_search", "memory_fetch")
+MEMORY_RESULT_CAPS = {"memory_index": 6000, "memory_search": 6000, "memory_fetch": 12000}
+
 # history_search.CURSOR_MAX_CHARS.  Duplicated as a plain number on purpose:
 # model_api_runtime already imports this module (executor / tool_loop), so
 # importing back into model_api_runtime here would close the loop.  A unit test
@@ -129,6 +134,10 @@ MIN_RESULT_CAPS: Mapping[str, int] = {
     }),
 }
 
+MIN_RESULT_CAPS = {
+    **MIN_RESULT_CAPS,
+    **{name: 512 for name in MEMORY_TOOL_NAMES},
+}
 ATOMIC_TOOL_NAMES = tuple(MIN_RESULT_CAPS)
 
 
@@ -152,6 +161,9 @@ def _int_env(name: str, default: int) -> int:
 def for_tool(tool_name) -> ResultBudget | None:
     """Policy for one tool name, or None = the caller's generic default."""
     name = str(tool_name or "")
+    if name in MEMORY_RESULT_CAPS:
+        cap = MEMORY_RESULT_CAPS[name]
+        return ResultBudget(result_cap=cap, atomic_json=True, extra_batch_budget=cap)
     if name == "history_search":
         return ResultBudget(
             result_cap=_int_env(
@@ -200,6 +212,7 @@ _ENV_BY_TOOL = {
     "history_search": HISTORY_SEARCH_RESULT_MAX_CHARS_ENV,
     "history_fetch": HISTORY_FETCH_RESULT_MAX_CHARS_ENV,
     "web_fetch": WEB_FETCH_RESULT_MAX_CHARS_ENV,
+    **{name: f"{name} result policy" for name in MEMORY_TOOL_NAMES},
 }
 _BATCH_CAP_ENV = "FEEDLING_V2_TOOL_BATCH_RESULT_CHAR_CAP"
 

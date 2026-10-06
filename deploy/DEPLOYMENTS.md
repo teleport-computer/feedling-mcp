@@ -237,7 +237,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.yaml`; recorded live service set: `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
-| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, `cpu-recorder`, and `log-shipper`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
@@ -248,7 +248,7 @@ certificate-chain 与 hostname 验证；不得改成 unverified context、`verif
 | WS ingest | `wss://9798850e096d770293c67305c6cfdceed68c1d28-9998.dstack-pha-prod9.phala.network/ingest` |
 | TLS model | `api.feedling.app` terminates at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
 | Database promotion wiring | The staged production workflow defaults `PROD_FEEDLING_DATABASE_SCHEMA` to `rds` and forwards the same selector to the backend, in-CVM `serve-worker`, and every independent runner. Selecting `tee` is fail-closed before any CVM mutation: CI proves the owner/app DSNs target the same database, requires the deployed `DATABASE_URL` role to be `app`, checks the exact `alembic_tee` head, and runs the Phase-4 startup contract. On a normal TEE-primary release, the app process itself runs `alembic_tee` before readiness through its app DSN; CI does not execute that migration. The owner migration DSN/CA remain only for protected manual initialization or diagnosis. `PROD_TEE_DATABASE_URL` and `PROD_FEEDLING_TEE_DUAL_WRITE` must both be empty in primary mode. This row describes release wiring, not evidence that the live production database has already been promoted. |
-| Plaintext write gate | `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED` defaults to `0`, accepts only `0` or `1`, and is forwarded identically to the backend, in-CVM `serve-worker`, and every independent runner. CI refuses `1` unless `PROD_FEEDLING_DATABASE_SCHEMA=tee`, preventing an unrelated RDS deployment from opening plaintext writes. With the gate open, known users whose preference is unset or `off` write plaintext; explicit `on` and unknown users remain encrypted, and historical ciphertext is not rewritten. |
+| Plaintext write gate | Production TEE-primary defaults `FEEDLING_PLAINTEXT_WRITES_ACCEPTED` to `1` identically on the backend, in-CVM `serve-worker`, and every independent runner; an explicit `PROD_FEEDLING_PLAINTEXT_WRITES_ACCEPTED=0` can still close it. CI refuses the production release when the gate is `1` unless `PROD_FEEDLING_DATABASE_SCHEMA=tee`, preventing an unrelated RDS deployment from opening plaintext writes. With the gate open, known users whose preference is unset or `off` write plaintext; explicit `on` and unknown users remain encrypted, and historical ciphertext is not rewritten. |
 | Plaintext shadow Gate 2 | Source wiring supports `PROD_PLAINTEXT_SHADOW_DATABASE_URL` plus the literal `PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED` gate. This is separate from Gate 1 and is not evidence that the live target is enabled. When the gate is `1`, the protected `prod-plaintext-shadow-gate2` environment runs redacted `preflight` and strict `verify --require-green` against the already-running Gate-1 backend before deployment. The main backend alone receives the target DSN and owns the singleton drain; `serve-worker` and every independent runner force the gate to `0` and receive no target credential. The TEE database stays primary and the target is an all-plaintext projection, never a failover source. |
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | **Enclave content pk** | `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620` — **THE prod9 content-key baseline.** Verified against live `/attestation` 2026-07-03. Envelope `enclave_pk_fpr` = `sha256(pk)[:16]` = `50f9a01800d4a230de85507d25b86eb1`, a constant stamped on envelopes April→July → the enclave content key has **never changed**. ⚠️ Do NOT confuse with the retired prod5 value `f50c90f7…` (app `051a174f`) that still appears in the Phase A/B tables below — that is a different, dead CVM and is NOT this baseline. |
@@ -277,7 +277,7 @@ python tools/verify_enclave_domain.py \
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
 | Current/live Compose | Deployment unit `deploy/docker-compose.phala.test.yaml`; recorded live service set matches prod: `ingress`, `backend`, `enclave`, with test domains + `_test` volumes |
-| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, and `cpu-recorder`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
+| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`, `cpu-socket-proxy`, `cpu-recorder`, and `log-shipper`; this source row is not evidence that the custom domain or CPU recorder has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | **TEE primary is live since 2026-08-18**, promoted by test release [`82c4c019`](https://github.com/teleport-computer/feedling-mcp/commit/82c4c019da24e6bfbe47d05411c0f812bf519ae7). `TEST_DATABASE_URL` is the TEE `app`-role DSN shared by the main CVM and runner, `TEST_FEEDLING_DATABASE_SCHEMA=tee`, and the old dual-write secret is absent. CI verified the owner/app database fingerprint, `alembic_tee` head, and application startup contract before changing either CVM; subsequent normal TEE-primary processes run the independent Alembic chain before they become ready. The former RDS is a frozen pre-cutover snapshot only; after the first TEE-primary write it is not a lossless rollback target without reverse reconciliation. |
@@ -319,6 +319,74 @@ python tools/verify_enclave_domain.py \
   --expected-compose-hash "$TEST_COMPOSE_HASH" \
   --expected-content-pk "$TEST_ENCLAVE_CONTENT_PK_BASELINE" \
   --reference-measurements "$TEST_REFERENCE_MEASUREMENTS"
+```
+
+
+#### Enclave diagnostic log history (staged source topology)
+
+Production and test add `log-shipper` alongside CPU history. The existing
+socket proxy admits only GET container listing, stats and logs, from
+`cpu-recorder,log-shipper` ([proxy hostname list syntax](https://github.com/wollomatic/socket-proxy)).
+Only the proxy mounts docker.sock. The shipper is non-root, read-only apart
+from its named volume, drops all capabilities, and is capped at 0.10 CPU/128 MB.
+The image creates the volume mountpoint owned by UID 1000. Business services do
+not depend on either collector. A separate `log-egress` bridge is attached only
+to the shipper for R2; the Docker proxy remains on the internal network. Code
+calls only the proxy and configured R2 endpoint; Compose bridge networking does
+**not** impose a destination-domain firewall.
+
+Container Names are resolved through `/containers/json` every follow cycle:
+`feedling-enclave-enclave-1` / `feedling-enclave-enclave-domain-1` in production,
+`feedling-test-enclave-1` / `feedling-test-enclave-domain-1` in test. Output aliases
+are `enclave` and `enclave-domain`. The allowlist checks every T637 JSON field,
+including closed route templates and truncated user prefixes; gunicorn worker
+boot/exit/timeout messages become fixed event names and PIDs. Legacy free text,
+full user IDs, exceptions and unknown shapes are discarded and counted, with
+an additional PEM/envelope/ciphertext/plaintext_b64/long-hex deny filter. This
+is a filtered diagnostic stream, not a backup of raw container stdout/stderr.
+
+Files are `/var/lib/feedling-logs/<container>/YYYY-MM-DD/HH.log.part` while open,
+then `.log.gz` on UTC hour rollover, replacement or graceful shutdown. Late
+records append to an atomic replacement without losing prior gzip contents.
+Each append is fsynced before its durable per-container-ID cursor advances;
+reconnect uses an exact `seconds.nanoseconds` Docker timestamp and skips
+already acknowledged boundary records
+([Docker log timestamp semantics](https://docs.docker.com/reference/cli/docker/container/logs/)).
+The cursor also counts records at that exact timestamp so distinct same-time
+events remain intact. A new container ID starts from its retained beginning.
+Routine reconnects do not duplicate acknowledged records. Crashes between
+append and cursor persistence (or gzip replacement and part removal) can replay
+records; records already deleted/rotated by Docker
+before collection cannot be recovered. Interrupted unacknowledged tail records
+are replayed. Whole-hour files expire after all their records are at least
+`LOG_SHIPPER_RETENTION_DAYS=30` days old; unuploaded files also expire then.
+
+`feedling_log_history` (prod) / `feedling_log_history_test` (test) survive container
+replacement. Sealed files upload via `object_storage.client()` into the separate
+`R2_LOGS_BUCKET`, key `<env>/<cvm>/<container>/YYYY-MM-DD/HH.log.gz`. A content-digest
+receipt makes late updates pending again. Upload failures use bounded exponential
+retries, retain local files, and retry next UTC hour; uploads run separately so
+an R2 outage cannot stop collection or rotation. Empty bucket means local-only
+and one hourly status line with `R2 未配置`. Configured bucket without credentials
+reports `credentials_missing`; `configured` reports configuration, not a claim
+that a PUT succeeded. Counters expose dropped lines, storage/Docker/upload
+errors and uploaded files without log contents or exception messages.
+
+Before real external delivery, ops must create dedicated buckets, set an R2
+**90-day lifecycle expiration rule**, grant the existing R2 token access to the
+log bucket (or provision an appropriately scoped credential), and configure
+GitHub secrets `R2_LOGS_BUCKET` / `TEST_R2_LOGS_BUCKET`. Existing
+`R2_ENDPOINT/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY` wiring is reused. Empty secret
+is deliberately nonblocking and does not enable uploads. Code never deletes
+remote objects; an unconfigured lifecycle does not implement the 90-day limit.
+Compose changes alter measured compose_hash and require the normal reviewed
+release/attestation update; this source change is not deployment evidence.
+
+```bash
+# Local hour inventory (same aliases in test and prod)
+phala ssh feedling-enclave-v2 -- docker exec log-shipper ls /var/lib/feedling-logs/enclave/2026-09-17/
+# Read a sealed R2 hour with operator-provided credentials
+aws s3 cp --endpoint-url "$R2_ENDPOINT" "s3://$R2_LOGS_BUCKET/prod/feedling-enclave-v2/enclave/2026-09-17/12.log.gz" - | gzip -dc
 ```
 
 ### Runtime V2 worker CVM (test, `feedling-io-agents-test`)
@@ -447,6 +515,59 @@ The former supervisor, per-user CLI processes, homes, leases, and rollback
 procedure have been removed from this runbook. Git history preserves the
 incident record; it must not be copied into current manifests. Recover hosted
 incidents only through [`HOSTED_RUNTIME_V2_ROLLOUT.md`](HOSTED_RUNTIME_V2_ROLLOUT.md).
+
+## Scheduled read-only monitors
+
+### Memory pipeline daily Lark report (`memory-pipeline-daily.yml`)
+
+Once a day (01:30 UTC = 09:30 Beijing) GitHub Actions runs
+`tools/memory_pipeline_daily_report.py` against **prod** and posts one Chinese
+message to the deploy-notice Lark group: capture and dream, split by V1
+`resident` / V2 `model_api`, with active users, real completions, operational
+failures and failure rate, users with at least one operational failure
+(受影响), users with operational failures and zero real completions (零成功),
+and operational failures grouped as 账号/配置类 / 模型服务 / 我们这边 / 未知
+(grouping reuses `notices.error_contract` blame and `memory.capture_failure`).
+The failure rate uses the admin lane views' definition — operational failures
+÷ (real completions + operational failures) — and is per attempt: since
+2026-09-16 a Dream retries up to 4 times a night, so one broken user moves
+the rate by four; the message says so in a fixed caveat line and the two user
+counts are the numbers to compare across days (T646, Seven 2026-09-18).
+Control outcomes (V1 `skipped`; V2 `capture_disabled`, `dream_disabled`,
+`turns_halted`, …), failures proven to be the user's own account
+(`notices.catalog` user-unavailable sets) and Dream skips (garden too small,
+rollup `silent_declared`) are shown on a separate 不算失败 line and never trigger
+attention. V1 reads the frozen `operational_failures` / `control_outcomes` /
+`user_unavailable` columns; V2 classifies `failure_codes` like
+`jobs_store.terminal_outcome_class`. The first line is `[需要关注]` when any
+threshold in the tool fires (stuck users ≥ 10, our-side failures ≥ 5 users,
+failure rate ≥ 50% or +15 pp day over day on ≥ 20 attempts, active users halved,
+≥ 20 live stuck jobs, or unfrozen/missing/unclassified data).
+
+- **Runs outside the CVM on purpose**: the CVM never holds the webhook secret,
+  and a dead backend still yields a "没生成出来" message instead of silence. Any
+  unexpected error (response shape change, bug in the tool) also posts that
+  message, naming only the exception type, and fails the run.
+- **Reads only** `GET /v1/admin/lane-rollup` (content-free). Pages are merged
+  by the full cell key. The message carries counts and sanitized failure codes
+  only — no user ids.
+- **Live stuck jobs**: V2 jobs past their own deadline; V1 jobs older than 6 h
+  but created within the last 24 h (`stuck.rows[].recent_count`). Older V1
+  non-terminal rows are orphans of consumers that went away and are not counted.
+- **Day** is the previous **Beijing** day, because lane-rollup cells are frozen
+  per Beijing day.
+- **Secrets / vars** (all pre-existing): `FEEDLING_ADMIN_TOKEN`,
+  `LARK_BOT_WEBHOOK`, `LARK_BOT_SECRET` (signed exactly like the ci.yml deploy
+  notices), optional `vars.PROD_MAIN_API_URL`.
+- **Verify locally without sending**: `python tools/memory_pipeline_daily_report.py --fixture tests/fixtures/memory_pipeline_daily_report/sources_2026-09-14.json --day 2026-09-14 --dry-run`;
+  or `workflow_dispatch` with `dry_run=true`.
+- **Known gaps**: capture escape-valve skips (`memory.capture.window_skipped`)
+  have no aggregate admin read yet, so they are not in the message. A V1 cell
+  records reasons without their status, so when a cell has both control
+  outcomes and failures whose codes cannot be matched exactly, its failures are
+  shown as 未知 `unattributed` instead of being guessed into a group. Dream days
+  frozen before Dream skips were written to `silent_declared` show those skips
+  as completions. The schedule only fires from the default branch.
 
 ## Enclave configuration
 
@@ -778,6 +899,12 @@ prod/pre 的 authority 与 selector 必须从各自 exact deployed release 和 l
 | Migration | 正常发布由应用启动前的 app-role Alembic 执行；`TEE migrate` workflow 的 `pre` lane（owner DSN + verify-full CA）仅用于初始化、诊断和人工恢复。 |
 | App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |
 
+TEE revision `0045_account_recover_challenges` adds the recovery-challenge table
+and its two indexes that existed only in the RDS chain. Normal application
+startup applies it before readiness; it also advances any existing prepared
+marker to the new head. No manual DDL or historical challenge copying is needed.
+This describes the release migration, not evidence that it is already deployed.
+
 Phase 4 is a stop-the-world release unit. After stopping backend, main
 `serve-worker`, and the independent runner, run the final replicate/reconcile
 and strict verify, then execute the offline bridge tool from the same release:
@@ -811,7 +938,8 @@ read-only and refuses to boot if the prepare was skipped or only partially
 completed. The marker remains audit metadata and is not a startup dependency.
 
 The complete encrypted/plaintext two-account release order, inventory queries,
-and test/prod promotion checklist are in
+test/prod promotion checklist, and the dry-run-first effective-off historical
+repair command are in
 `docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`.
 
 ### TEE-primary to plaintext-shadow release gates

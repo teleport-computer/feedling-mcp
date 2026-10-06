@@ -7,8 +7,7 @@ responses.
 
 E2E boundary (unchanged): memory ``body_ct`` fields are v1 E2E envelopes. The
 server NEVER decrypts them here. Read/write store operations stay plaintext-free;
-the readside (index/fetch/buckets/threads) and the migration decrypt
-(legacy_batch) forward the caller's credential (api key OR runtime token) to the
+the readside (index/fetch/buckets/threads) forwards the caller's credential (api key OR runtime token) to the
 enclave, which owns decryption. These functions take already-parsed params + the
 store + the credential (or a pre-bound ``post_enclave`` callable) as arguments —
 they never read ``flask.request`` — so no new server-side plaintext is ever
@@ -27,17 +26,16 @@ import json
 import uuid
 from datetime import datetime
 
-import db
 import debug_trace
 from accounts import registry
 from core import envelope as core_envelope
 from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
-from memory import migration as memory_migration
 from memory import service as memory_service
 from memgarden import timestamps as memory_timestamps
 import memory_readside_core
+import memory_search_contract as search_contract
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +101,8 @@ _UPSTREAM_SIGNALS: tuple[tuple[str, str], ...] = (
     ("api_key_unavailable", "api_key_unavailable"),
     ("enclave_invalid_readside_response", "enclave_invalid_readside_response"),
     ("memory_load_failed", "memory_load_failed"),
+    # T779 step 4: a plaintext account's keyword search failed in backend.
+    ("readside_local_error", "local_search_error"),
 )
 
 
@@ -192,11 +192,22 @@ def index(store, api_key, payload: dict, *, post_enclave) -> tuple[dict, int]:
         debug_trace.trace_event(
             store, subsystem="memory", type=event_type, actor="agent",
             status="failed", summary=f"{operation_label} failed", detail=detail)
+        if isinstance(e, search_contract.SearchLimitExceeded):
+            return {"error": "memory_search_resource_limit"}, 413
         return _readside_error_body(e), 503
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     detail = {"counts": {"items": len(_items), "limit": requested_limit}}
     if is_search:
+        if response.get("ranking") in search_contract.ACCEPTED:
+            detail["ranking"] = response["ranking"]
+            detail["counts"]["unavailable"] = response.get("unavailable_count", 0)
         detail["query_fingerprint"] = query_fingerprint
+        # debug_trace bounds lists at 20; make that sampling explicit rather
+        # than suggesting that unlogged matches did not exist. Never log text.
+        returned_ids = [item["id"] for item in _items
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        detail["ids"] = returned_ids[:20]
+        detail["ids_omitted"] = max(0, len(returned_ids) - 20)
     debug_trace.trace_event(
         store, subsystem="memory", type=event_type, actor="agent",
         summary=f"{operation_label} returned {len(_items)} items",
@@ -311,54 +322,6 @@ def actions(
         },
     )
     return body, status
-
-
-# --------------------------------------------------------------------------- #
-# migration state + legacy batch
-# --------------------------------------------------------------------------- #
-
-def migration_state_get(store) -> tuple[dict, int]:
-    state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    return {"state": state or memory_migration.initial_state()}, 200
-
-
-def migration_state_post(store, payload: dict) -> tuple[dict, int]:
-    try:
-        migrated = int(payload.get("migrated") or 0)
-        legacy_remaining = int(payload.get("legacy_remaining") or 0)
-    except (TypeError, ValueError):
-        return {"error": "migrated/legacy_remaining must be ints"}, 400
-    failed_raw = payload.get("failed_ids")
-    failed_ids = [str(i) for i in failed_raw if str(i or "").strip()] if isinstance(failed_raw, list) else []
-    current = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    # A11: count this round's failures per card BEFORE advancing the state machine, so a
-    # card that just hit the cap is already 'skipped' and won't keep 'pending' alive.
-    if failed_ids:
-        current = memory_migration.bump_attempts(current, failed_ids)
-    new_state = memory_migration.next_state(current, migrated=migrated, legacy_remaining=legacy_remaining)
-    db.set_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB, new_state)
-    return {"state": new_state}, 200
-
-
-def legacy_batch(store, api_key, runtime_token: str, payload: dict) -> tuple[dict, int]:
-    try:
-        batch_size = max(1, min(int(payload.get("batch_size") or memory_migration.DEFAULT_MIGRATE_BATCH), 50))
-    except (TypeError, ValueError):
-        batch_size = memory_migration.DEFAULT_MIGRATE_BATCH
-    moments = memory_service._active_memory_moments(memory_service._load_moments(store))
-    decrypted: list[tuple[dict, dict]] = []
-    for m in moments:
-        if not isinstance(m, dict) or m.get("visibility") == "local_only":
-            continue
-        inner, _err = memory_actions_mod._memory_plain_from_envelope(m, api_key, runtime_token=runtime_token)
-        if isinstance(inner, dict):
-            decrypted.append((m, inner))
-    # A11: drop cards that hit the per-card attempt cap so they're never re-selected
-    # and legacy_remaining can reach 0 (status → done). They stay legacy + readable.
-    state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
-    skip = memory_migration.capped_ids(state)
-    batch = memory_migration.select_legacy_batch(decrypted, batch_size=batch_size, exclude_ids=skip)
-    return {"batch": batch, "legacy_remaining": memory_migration.count_legacy(decrypted, exclude_ids=skip)}, 200
 
 
 # --------------------------------------------------------------------------- #
@@ -649,10 +612,14 @@ def add(store, payload: dict) -> tuple[dict, int]:
         moment["anchor_memory_ids"] = list(anchor_ids)
     # Re-read + append + save under one memory_lock hold so a concurrent
     # same-user write can't lost-update (the load above was for validation only).
-    with memory_service.mutation_lock(store):
-        moments = memory_service._load_moments(store)
-        moments.append(moment)
-        memory_service._save_moments(store, moments)
+    # A supplied id that is already stored is never overwritten: the exact same
+    # sealed card again is a retry and returns the stored card unchanged (200);
+    # any other card under that id is refused without echoing either card.
+    outcome, existing = memory_service.insert_new_moment(store, moment)
+    if outcome == "replay":
+        return {"status": "exists", "moment": existing, "v": 1, "replayed": True}, 200
+    if outcome == "conflict":
+        return {"error": "memory_id_conflict"}, 409
     boot_gates._log_bootstrap_event(store, "memory_moment_added_v1", success=True)
     print(f"[memory:{store.user_id}] added v1 type={mem_type} id={moment['id']} "
           f"visibility={envelope['visibility']} anchors={len(anchor_ids)}")

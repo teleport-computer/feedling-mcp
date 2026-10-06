@@ -118,7 +118,10 @@ def test_load_runtime_provider_config_forwards_runtime_token(backend_env, monkey
     cfg = hosted_config_store._load_runtime_provider_config(
         store, None, runtime_token="rt-secret-123")
     assert isinstance(cfg, provider_client.ProviderConfig)
-    assert seen_kwargs == {"runtime_token": "rt-secret-123"}
+    assert seen_kwargs == {
+        "caller_user_id": uid,
+        "runtime_token": "rt-secret-123",
+    }
 
 
 def test_load_runtime_provider_config_omits_runtime_token_when_absent(backend_env, monkeypatch):
@@ -143,7 +146,7 @@ def test_load_runtime_provider_config_omits_runtime_token_when_absent(backend_en
 
     cfg = hosted_config_store._load_runtime_provider_config(store, "api-key")
     assert isinstance(cfg, provider_client.ProviderConfig)
-    assert seen_kwargs == {}
+    assert seen_kwargs == {"caller_user_id": uid}
 
 
 def test_load_runtime_provider_config_missing_envelope(backend_env):

@@ -16,7 +16,6 @@ import json
 import logging
 import os
 
-import anyio.to_thread
 import httpx
 from fastapi import APIRouter
 from starlette.requests import Request
@@ -26,6 +25,7 @@ import provider_client
 from core import visual
 from core.frame_ids import is_supported_frame_id
 from enclave import auth, backend_client, config, envelope, state
+from enclave.routes import _reqlog
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 
@@ -128,8 +128,8 @@ async def v1_frame_decrypt(frame_id: str, request: Request):
 
     try:
         # Frames are 100KB+ — decrypt off the event loop (spec §4).
-        plaintext = await anyio.to_thread.run_sync(
-            envelope.decrypt_envelope, env, user_id, content_sk)
+        plaintext = await _reqlog.decrypt_job(
+            request, envelope.decrypt_envelope, env, user_id, content_sk)
     except envelope.DecryptFailure as e:
         return JSONResponse({"error": f"decrypt_failed: {e.reason}"}, status_code=502)
 
@@ -207,8 +207,8 @@ async def v1_frame_caption(frame_id: str, request: Request):
         return err_response
 
     try:
-        plaintext = await anyio.to_thread.run_sync(
-            envelope.decrypt_envelope, env, user_id, content_sk)
+        plaintext = await _reqlog.decrypt_job(
+            request, envelope.decrypt_envelope, env, user_id, content_sk)
         inner = visual.parse_visual_plaintext(plaintext)
     except envelope.DecryptFailure as e:
         return JSONResponse({"error": f"decrypt_failed: {e.reason}"}, status_code=502)
@@ -296,8 +296,8 @@ async def v1_frame_image(frame_id: str, request: Request):
         return err_response
 
     try:
-        plaintext = await anyio.to_thread.run_sync(
-            envelope.decrypt_envelope, env, user_id, content_sk)
+        plaintext = await _reqlog.decrypt_job(
+            request, envelope.decrypt_envelope, env, user_id, content_sk)
     except envelope.DecryptFailure as e:
         return JSONResponse({"error": f"decrypt_failed: {e.reason}"}, status_code=502)
 

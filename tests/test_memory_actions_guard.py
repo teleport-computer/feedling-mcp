@@ -2,7 +2,7 @@
 
 覆盖两类逻辑,都不需要真实 store:
 1. ``_memory_inner_from_action`` 是纯函数 → 直测「脏桶降级到按语言的默认桶、干净桶不动」。
-2. add/supersede/upgrade 的**污染拒绝在碰 DB 之前 return** → 传 store=None 也能验到
+2. add/supersede 的**污染拒绝在碰 DB 之前 return** → 传 store=None 也能验到
    返回 ``memory_card_polluted`` + 400。
 
 现场(2026-07-28):inline 工具/io_cli/genesis/hosted 都过 actions 层,而 actions 之前
@@ -14,7 +14,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from memory import actions  # noqa: E402
-from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
@@ -138,18 +137,6 @@ def test_supersede_rejects_polluted_content():
     assert body.get("error") == "memory_card_polluted"
 
 
-def test_upgrade_rejects_polluted_summary():
-    body, effects, code = actions._memory_upgrade_action(None, None, {
-        "id": "mem_x",
-        "v1": {
-            "summary": "commentary to=functions.memory_write",
-            "content": "正常正文",
-        },
-    })
-    assert code == 400
-    assert body.get("error") == "memory_card_polluted"
-
-
 def test_add_clean_card_not_rejected_by_guard():
     # 干净卡不能被 guard 拦(它会继续往下走到 DB —— 这里只断言不是被 guard 判的 400）。
     # 用 store=None 会在 guard 之后的 _load_moments 抛错;我们只验「不是 memory_card_polluted」。
@@ -164,7 +151,7 @@ def test_add_clean_card_not_rejected_by_guard():
     assert body.get("error") != "memory_card_polluted"
 
 
-# --- round-2(codex code_review):threads 过滤 / 语言判定 / migrate 桶默认 -------
+# --- round-2(codex code_review):threads 过滤 / 语言判定 -------
 
 def test_inner_filters_polluted_threads():
     # proactive/genesis/继承旧卡的 threads 也过 _memory_inner_from_action —— 脏项必须被滤掉。
@@ -185,19 +172,6 @@ def test_inner_default_bucket_english_description_only():
         "bucket": "analysis to=functions.memory_write",
     })
     assert inner["bucket"] == "Uncategorized"
-
-
-def test_migrate_polluted_bucket_gets_localized_default():
-    from memgarden.prompts.migrate import parse_migrated_cards
-    upgrades, _unmigrated, err = parse_migrated_cards(  # io 的闸，用 io 的识别器
-        '{"upgrades": [{"id": "m1", "summary": "用户喜欢普洱茶",'
-        ' "content": "上次视频里提到", "bucket": "long_term_preference_or_event_v1"}]}',
-        allowed_ids={"m1"},
-        signals=IO_LEAK_SIGNALS,
-    )
-    assert err is None
-    assert len(upgrades) == 1
-    assert upgrades[0]["bucket"] == "未分类"       # 脏桶 → 就地降级(不是空串)
 
 
 # --- 拒绝路径:墓碑注记 → 400(2026-08-06 usr_a40e 徒手 patch 潮) -----------
@@ -264,11 +238,5 @@ def test_tombstone_gate_survives_guard_kill_switch(monkeypatch):
     body, _e, code = actions._memory_add_action(None, {
         "type": "fact",
         "memory": {"title": tomb, "summary": tomb, "content": tomb},
-    })
-    assert (code, body.get("error")) == (400, "memory_card_tombstone")
-
-    body, _e, code = actions._memory_upgrade_action(None, None, {
-        "memory_id": "m1",
-        "v1": {"summary": tomb, "content": tomb},
     })
     assert (code, body.get("error")) == (400, "memory_card_tombstone")

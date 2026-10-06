@@ -402,7 +402,7 @@ def test_tool_effect_builder_fails_closed_when_envelope_cannot_be_built(monkeypa
 def test_tool_effect_decrypt_uses_enclave_and_trusts_outer_effect_id(monkeypatch):
     calls = []
 
-    def fake_decrypt(envelope, api_key, *, purpose, runtime_token):
+    def fake_decrypt(envelope, api_key, *, purpose, caller_user_id, runtime_token):
         calls.append((envelope, api_key, purpose, runtime_token))
         return json.dumps({
             "actions": [{"op": "add", "text": "likes tea"}],
@@ -498,7 +498,7 @@ def test_production_applier_decrypts_tool_effects_with_one_lazy_token(monkeypatc
         lambda user_id: minted.append(user_id) or "minted-token",
     )
 
-    def fake_decrypt(value, api_key, *, purpose, runtime_token):
+    def fake_decrypt(value, api_key, *, purpose, caller_user_id, runtime_token):
         decrypt_calls.append((value, api_key, purpose, runtime_token))
         if value["body_ct"] == "memory":
             return (
@@ -578,7 +578,7 @@ def test_production_applier_replays_identity_ops_through_validation(monkeypatch)
         serve_worker, "_mint_runtime_token", lambda user_id: "minted-token"
     )
 
-    def fake_decrypt(value, api_key, *, purpose, runtime_token):
+    def fake_decrypt(value, api_key, *, purpose, caller_user_id, runtime_token):
         if value["body_ct"] == "nudge":
             return b'{"op":"identity_nudge","dimension":"trust","delta":2}'
         if value["body_ct"] == "dimensions":

@@ -43,6 +43,10 @@ EXCLUDED_OPERATIONS = {
     ("post", "/v1/copytext"),
     # User-authenticated implementation diagnostics, not a product API.
     ("get", "/v1/proactive/debug"),
+    # Internal read for enclave hybrid recall (T523): the enclave forwards the
+    # user's own credentials; derived vectors are an implementation detail,
+    # documented in the architecture page, not a product API.
+    ("post", "/v1/memory/vectors"),
 }
 
 PUBLIC_OPERATIONS = {
@@ -67,6 +71,7 @@ RELAY_TOKEN_OPERATIONS = {
 # These operations intentionally reject runtime tokens. Perception report is
 # API-key-only until sensitive-signal credentials are forwarded to the enclave.
 API_KEY_ONLY_OPERATIONS = {
+    ("post", "/v1/agent-body/generate"),
     ("get", "/v1/web/settings"),
     ("post", "/v1/web/settings"),
     ("post", "/v1/access/link-token"),
@@ -111,7 +116,7 @@ TAG_DESCRIPTIONS = {
     "Chat": "Encrypted chat messages and hosted-agent conversations.",
     "Model API": "Model provider credentials, routes, and runtime configuration.",
     "MCP": "User-configured MCP servers and connection management.",
-    "Memory": "Memory records, buckets, threads, and migration state.",
+    "Memory": "Memory records, buckets, and threads.",
     "Identity": "Agent identity and relationship state.",
     "Worldbook": "Worldbook entries and contextual matching.",
     "Perception": "Device perception reports, snapshots, and photos.",

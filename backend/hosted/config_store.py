@@ -452,6 +452,7 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             api_key,
+            caller_user_id=str(store.user_id),
             **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as e:

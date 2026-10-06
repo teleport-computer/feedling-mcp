@@ -11,6 +11,8 @@ from fastapi import FastAPI
 from enclave import backend_client, config
 from enclave.routes.gzip import ContentTypeGZipMiddleware
 from enclave.routes.head import HeadBodyStripMiddleware
+from enclave.routes import _reqlog
+from memory import jieba_tokenizer
 
 # 每个路由任务落地时把模块名加进来（Task 9-13）。
 _ROUTE_MODULES = ("health", "envelope", "memory", "worldbook", "chat", "identity",
@@ -24,14 +26,26 @@ async def lifespan(app):
     # 无关，用 FEEDLING_ENCLAVE_THREADS（默认 32，env 名沿用免动 compose）。
     limiter = anyio.to_thread.current_default_thread_limiter()
     limiter.total_tokens = config.ENCLAVE_THREADS
+    await anyio.to_thread.run_sync(jieba_tokenizer.prewarm)
+    # Hybrid recall (T523): background model load, never on a request. No-op
+    # unless FEEDLING_MEMORY_RECALL_HYBRID is on.
+    from enclave import recall_hybrid
+    recall_hybrid.start_warmup()
     yield
     import provider_client
     await backend_client.aclose()
     await provider_client.aclose_async_http_client()
 
 
+class _EnclaveFastAPI(FastAPI):
+    def build_middleware_stack(self):
+        # Outside ServerErrorMiddleware too, so its generated 500 is observed.
+        return _reqlog.RequestLogMiddleware(
+            super().build_middleware_stack())
+
+
 def build_app() -> FastAPI:
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = _EnclaveFastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     # decrypt-with-image ~470KB JSON 是主要受益者；500B 阈值对齐 flask-compress 默认。
     # 用内容类型限定版而非 Starlette 自带 GZipMiddleware：后者不看
     # content-type/status，会把 /image（image/jpeg）和其 206 Range 分片也压缩，
@@ -39,7 +53,7 @@ def build_app() -> FastAPI:
     # 下载（spec §6）。ContentTypeGZipMiddleware 复刻旧 flask-compress 语义：只压
     # 200 + text/JSON allowlist。
     app.add_middleware(ContentTypeGZipMiddleware, minimum_size=500)
-    # 最外层：HEAD 请求剥掉响应体（保留全部头，含 gzip 后的 Content-Length）。app 层
+    # 响应变换最外层（其外还有 reqlog）：HEAD 请求剥掉响应体（保留全部头，含 gzip 后的 Content-Length）。app 层
     # 显式剥离，不再把"HEAD 不带 body"押在 uvicorn 协议层行为上（见 head.py）。
     app.add_middleware(HeadBodyStripMiddleware)
     for name in _ROUTE_MODULES:

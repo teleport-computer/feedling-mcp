@@ -24,7 +24,7 @@ import db
 from core import wake_bus
 from model_api_runtime.v2 import jobs_store
 
-from conftest import seed_user
+from conftest import capture_mirror_groups, seed_user
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -421,10 +421,7 @@ def test_atomic_send_retains_every_source_row_without_tee_eviction(monkeypatch):
         expected_version=0,
     )
 
-    from tee_shadow import mirror
-
-    mirrored: list[list[tuple[str, tuple]]] = []
-    monkeypatch.setattr(mirror, "execute_many", lambda statements: mirrored.append(statements))
+    mirrored = capture_mirror_groups(monkeypatch)
 
     new_id = "new-message"
     db.chat_append_and_enqueue(

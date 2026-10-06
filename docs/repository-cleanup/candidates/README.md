@@ -46,7 +46,7 @@ loader。其余候选
   这不再要求保留零消费者的 Python 客户端或 `redis-py` 生产依赖。
 - TEE reflow/prune/frames、enclave `serving.py`/`asgi_worker.py`：仍承担恢复、复制或
   TLS/attestation 信任边界。
-- `scripts/audit_resident_model_routes.py`、`tools/seed_legacy_memory.py`、
+- `scripts/audit_resident_model_routes.py`、
   `tools/strict_yaml.py`、`scripts/provider_probe/probe.py`：分别仍承担 remediation、
   兼容 fixture、严格 YAML 校验和 provider 原始 wire 探测。
 - `supports_responses` 数据库/API 字段：仍是持久化和公开 wire。Hosted Resident roster

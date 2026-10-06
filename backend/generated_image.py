@@ -9,6 +9,50 @@ from pathlib import PurePath
 
 
 MAX_GENERATED_IMAGE_SOURCE_BYTES = 25_000_000
+# Every ``ValueError`` this module raises on purpose carries one of these
+# codes. Pillow can also raise ``ValueError`` with free text from inside
+# ``normalize_generated_image`` (e.g. its decompression-bomb guard); callers
+# that log or trace a reject reason must pass it through ``reject_code()`` so
+# only a member of this set — never provider or image text — leaves the seam.
+GENERATED_IMAGE_REJECT_CODES = frozenset({
+    "generated_image_base64_invalid",
+    "generated_image_data_url_invalid",
+    "generated_image_dimensions_invalid",
+    "generated_image_empty",
+    "generated_image_format_unsupported",
+    "generated_image_invalid",
+    "generated_image_mime_mismatch",
+    "generated_image_normalized_too_large",
+    "generated_image_too_large",
+})
+_CANONICAL_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
+
+
+@dataclass(frozen=True)
+class GeneratedImageReject:
+    """Classified normalization failure. ``code`` is the only field a trace
+    may carry; it is always a member of ``GENERATED_IMAGE_REJECT_CODES``."""
+    code: str
+
+
+def classify_generated_image_reject(exc: BaseException) -> GeneratedImageReject:
+    """Closed-set classification of one normalization failure (the sanitizer
+    seam ``tests/test_trace_detail_provenance.py`` recognises by name)."""
+    text = str(exc or "").strip()
+    return GeneratedImageReject(
+        code=text if text in GENERATED_IMAGE_REJECT_CODES else "generated_image_invalid"
+    )
+
+
+def reject_code(exc: BaseException) -> str:
+    """Closed-set reject code for one normalization failure."""
+    return classify_generated_image_reject(exc).code
+
+
+def canonical_declared_mime(value: object) -> str:
+    """Provider-declared MIME reduced to a closed set for logs and traces."""
+    text = str(value or "").strip().lower().split(";", 1)[0]
+    return text if text in _CANONICAL_MIMES else ("other" if text else "")
 MAX_GENERATED_IMAGE_STORED_BYTES = 2_000_000
 MAX_GENERATED_IMAGE_EDGE_PX = 1568
 MAX_GENERATED_IMAGE_PIXELS = 40_000_000

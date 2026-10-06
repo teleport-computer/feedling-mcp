@@ -31,3 +31,14 @@ trafilatura==2.1.0
 # Generated PDF downloads. Imported lazily only when send_file targets .pdf;
 # Word .docx rendering uses the standard-library OOXML writer.
 reportlab==5.0.0
+
+# Memory embeddings (T523 step 1b). The serve-worker encodes plaintext memory
+# cards with a local multilingual-e5-small ONNX model
+# (backend/memory/embedding/e5_onnx.py). Imported lazily, constructed only when
+# FEEDLING_MEMORY_EMBEDDING_ENABLED=1 and FEEDLING_EMBED_MODEL_DIR points at the
+# baked weights; missing packages surface as available=False, never a crash.
+# The backend / enclave containers share this image but never import these.
+# Pinned exactly: the runtime that ships is the runtime the vectors were
+# produced with — a silent bump would change model_id and rebuild every vector.
+onnxruntime==1.22.1
+tokenizers==0.21.4

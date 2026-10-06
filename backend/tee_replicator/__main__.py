@@ -17,7 +17,7 @@ _backend_dir = Path(__file__).resolve().parent.parent
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
 
-from tee_replicator import worker  # noqa: E402 — path fixup above must run first
+from tee_replicator import policy, worker  # noqa: E402 — path fixup above must run first
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +36,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "run":
+        try:
+            source = policy.probe_policy_source()
+        except Exception as exc:  # noqa: BLE001 - redact DSN/query details
+            print(
+                "policy source probe failed: " + type(exc).__name__.lower(),
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            json.dumps({"event": "policy_source_ready", **source}, sort_keys=True),
+            file=sys.stderr,
+        )
         report = worker.run_table(args.table, qps=args.qps, dry_run=args.dry_run,
                                   limit=args.limit)
         print(json.dumps(report, ensure_ascii=False))

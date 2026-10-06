@@ -102,7 +102,7 @@ backend/
     memory_readside_core.py · memory_index_selector.py ·
     context_memory_selection.py · object_storage.py ·
     provider_attempt_ledger.py · worldbook_match.py ·
-    worldbook_readside_core.py · debug_trace.py
+    worldbook_readside_core.py · debug_trace.py · admin_read_timing.py
                     ← 底层独立模块，保持无业务依赖
 ```
 
@@ -147,15 +147,13 @@ asgi_app.py（装配，最高）
   ↑ core
   ↑ db / content_encryption / provider_client / dstack_tls / hosted_runtime /
      semantic_analysis / memory_readside_core / memory_index_selector /
-     context_memory_selection（最低；均为无业务依赖的共享/底层模块）
+     context_memory_selection / admin_read_timing（最低；均为无业务依赖的共享/底层模块）
   ↑ memgarden（外部低层依赖；记忆判断力内核，不 import IO 模块）
-  ↑ agent_protocol_core（外部最低层依赖；模型协议判据，只依赖标准库；
-     memgarden → agent_protocol_core，二者都不依赖 backend/core）
 ```
 
 > `memgarden` 是安装进来的外部判断力内核（什么值得记 / 怎么归桶 / 打分排序 /
-> 要不要整理 / 解析并算 mutation），不是 `backend/` 下的本地包。它只依赖标准库和
-> 同一外部发行物里的 `agent_protocol_core`，被 `memory` / `genesis` /
+> 要不要整理 / 解析并算 mutation），不是 `backend/` 下的本地包。它只依赖标准库，
+> 不依赖 `agent_protocol_core`；被 `memory` / `genesis` /
 > `model_api_runtime` 等 IO 上层单向 import。
 > 加解密、身份装配、锁、审计、调模型一律不在其中 —— 那些由调用方提供。
 >
@@ -222,16 +220,17 @@ result = chat_completion(runtime, messages)
 - ❌ 不准再造任何全局符号 re-export 门面；新代码直接 import 真正的模块。
 - ❌ 不准新建 `backend/app.py`。
 
-**关于 `memgarden` 搬迁期的兼容壳**（2026-08-14 已收尾，仅存两个）：
+**关于 `memgarden` 搬迁期的兼容壳**（2026-09-16 全部收尾）：
 
 内核提取时，被搬走的模块曾在原路径保留一层 re-export，让调用方不必一次性全改。
-**这些纯转发壳已全部删除**，调用方现在直接 `import memgarden.*`。
+纯转发壳 2026-08-14 已删；最后两个 `import *` 壳 —— `memory/capture_prompt_v1.py`
+与 `memory/dream_prompt_v1.py` —— 随两条 runtime 的落卡 / 整理换成组件会话退出运行时。
+两个文件现已删除；io 的落卡档位 `IO_CONVERSATION_CAPTURE_POLICY`（50 张）
+定义在 `memory/garden_component.py`，仍经公开的 `CaptureRequest.policy` 传入组件。
 
-仍保留的两个 —— `memory/capture_prompt_v1.py` 与 `memory/dream_prompt_v1.py` ——
-**不是 re-export 门面，是适配层**：内核不 import `identity`（那是宿主的身份体系），
-所以称呼规则的装配放在这两个文件里，它们有实际逻辑，不只是转发。
-
-新代码一律直接 import `memgarden.*`。需要称呼装配时走上面这两个适配层。
+记忆 runtime 的入口文件只 import memgarden 的**公开 API**（顶层 `__all__`，或
+`memgarden.STABLE_MODULES` 中模块的 `__all__`）；`prompts.capture` / `prompts.dream`
+这类内部零件不许直接 import，要用就经 `memory/garden_component.py` 调组件方法。
 
 ---
 

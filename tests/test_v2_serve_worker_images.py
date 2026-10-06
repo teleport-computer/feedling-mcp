@@ -55,7 +55,7 @@ def test_file_row_renders_a_marker_and_never_decrypts_the_body():
     try:
         row = serve_worker._file_row(
             {"id": "m1", "file_name": "report.pdf", "file_mime": "application/pdf"},
-            mid="m1", ts=1.0, role="user", token="t")
+            mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
     finally:
         core_enclave._decrypt_envelope_via_enclave = orig
 
@@ -74,7 +74,7 @@ def test_file_row_prefers_the_user_caption_when_present(monkeypatch):
     row = serve_worker._file_row(
         {"id": "m1", "file_name": "report.pdf", "caption_body_ct": "CT",
          "caption_id": "cap1", "owner_user_id": "u1"},
-        mid="m1", ts=1.0, role="user", token="t")
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
     assert row["content"] == "这个报告哪里有问题"
 
 
@@ -88,7 +88,7 @@ def test_file_row_fails_explicitly_when_caption_decrypt_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="enclave down"):
         serve_worker._file_row(
             {"id": "m1", "file_name": "a.bin", "caption_body_ct": "CT", "caption_id": "c"},
-            mid="m1", ts=1.0, role="user", token="t")
+            mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
 
 
 def test_a_pdf_body_would_have_crashed_the_old_generic_branch():
@@ -108,6 +108,7 @@ def test_image_row_preserves_pinned_vision_route(monkeypatch):
         ts=1.0,
         role="user",
         token="token",
+        caller_user_id="u1",
     )
 
     assert row["vision_route_id"] == "route-123"
@@ -590,3 +591,149 @@ def test_direct_vision_internal_error_is_not_misclassified_as_provider_failure(
         "vision.batch.budget.evaluated",
     ]
     assert "vision_model_failed" not in json.dumps(events)
+
+
+# ---------------------------------------------------------------------------
+# T743: attachment rows expose only what the user typed as `caption`
+# ---------------------------------------------------------------------------
+
+def _stub_caption(monkeypatch, stored_caption):
+    """Stand in for the caption decrypt: the stored caption, or the fallback."""
+    monkeypatch.setattr(
+        serve_worker,
+        "_caption_text",
+        lambda *_a, fallback, **_k: stored_caption or fallback,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored_caption", "content", "caption"),
+    [
+        (None, "[image]", ""),
+        ("look", "look", "look"),
+        # A user who literally typed the marker still typed it.
+        ("[image]", "[image]", "[image]"),
+    ],
+    ids=["no-caption", "caption", "caption-equals-marker"],
+)
+def test_image_row_caption_is_only_the_users_words(monkeypatch, stored_caption, content, caption):
+    _stub_caption(monkeypatch, stored_caption)
+    row = serve_worker._image_row(
+        {}, mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert row["content"] == content
+    assert row["caption"] == caption
+
+
+@pytest.mark.parametrize(
+    ("stored_caption", "display", "caption"),
+    [
+        (None, {}, ""),
+        (None, {"file_display_title": "Q3"}, ""),
+        ("这个报告哪里有问题", {"file_display_title": "Q3"}, "这个报告哪里有问题"),
+        ("[file: report.pdf]", {}, "[file: report.pdf]"),
+    ],
+    ids=["no-caption", "no-caption-canvas", "caption-canvas", "caption-equals-marker"],
+)
+def test_file_row_caption_excludes_marker_and_canvas_metadata(
+    monkeypatch, stored_caption, display, caption
+):
+    _stub_caption(monkeypatch, stored_caption)
+    row = serve_worker._file_row(
+        {"file_name": "report.pdf", **display},
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert row["caption"] == caption
+    assert row["content"].startswith(caption or "[file: report.pdf]")
+    if display:
+        assert "Canvas display metadata" in row["content"]
+
+
+@pytest.mark.parametrize(
+    ("stored", "plaintext", "unreadable"),
+    [
+        ({"body_ct": "ct", "K_enclave": "key"}, b"hello", False),
+        ({"body_ct": "ct", "K_enclave": "key"}, b"  ", True),
+        ({"body_ct": "ct"}, b"never read", True),  # missing K_enclave
+    ],
+    ids=["readable", "empty", "no-key"],
+)
+def test_placeholder_rows_are_marked_unreadable(monkeypatch, stored, plaintext, unreadable):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: plaintext,
+    )
+    rows = serve_worker._decrypt_chat_rows(
+        "u1",
+        [{"id": "m1", "ts": 1.0, "seq": 4, "role": "user", **stored}],
+        user_only=True,
+        preserve_unreadable=True,
+    )
+    assert rows[0].get("unreadable", False) is unreadable
+    if unreadable:
+        assert rows[0]["content"] == serve_worker._UNAVAILABLE_CHAT_MARKER
+
+
+# ---------------------------------------------------------------------------
+# T745: plaintext captions (content encryption off) reach the prompt
+# ---------------------------------------------------------------------------
+
+def _no_enclave(monkeypatch):
+    from core import enclave as core_enclave
+
+    def _boom(*_a, **_k):
+        raise AssertionError("a plaintext caption must be read locally")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", _boom)
+
+
+def test_caption_envelope_projects_a_plaintext_caption():
+    env = serve_worker._caption_envelope({
+        "id": "m1", "owner_user_id": "u1", "v": 1,
+        "caption_id": "cap1", "caption_body": "这是我家猫",
+        "caption_owner_user_id": "u1",
+    })
+    assert env is not None
+    assert env["body"] == "这是我家猫"
+    assert env["id"] == "cap1"
+    assert not env.get("body_ct")
+
+
+@pytest.mark.parametrize("builder", ["image", "file"])
+def test_plaintext_caption_reaches_the_row_without_the_enclave(monkeypatch, builder):
+    _no_enclave(monkeypatch)
+    row = {"id": "m1", "owner_user_id": "u1", "caption_id": "cap1",
+           "caption_body": "  look at my bakery logo  ", "caption_owner_user_id": "u1",
+           "file_name": "logo.pdf"}
+    build = serve_worker._image_row if builder == "image" else serve_worker._file_row
+    out = build(row, mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert out["caption"] == "look at my bakery logo"
+    assert out["content"].startswith("look at my bakery logo")
+
+
+def test_plaintext_image_row_through_the_reader_carries_the_caption(monkeypatch):
+    _no_enclave(monkeypatch)
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    rows = serve_worker._decrypt_chat_rows(
+        "u1",
+        [{
+            "id": "m1", "ts": 1.0, "seq": 3, "role": "user", "content_type": "image",
+            "owner_user_id": "u1", "body_key": "r2/k", "image_mime": "image/png",
+            "caption_id": "cap1", "caption_body": "What is my bakery called?",
+            "caption_owner_user_id": "u1",
+        }],
+        user_only=True,
+        preserve_unreadable=True,
+    )
+    assert rows[0]["content"] == "What is my bakery called?"
+    assert rows[0]["caption"] == "What is my bakery called?"
+    assert rows[0]["has_image"] is True
+
+
+def test_image_row_without_any_caption_still_renders_the_marker(monkeypatch):
+    _no_enclave(monkeypatch)
+    out = serve_worker._image_row(
+        {"id": "m1", "owner_user_id": "u1"},
+        mid="m1", ts=1.0, role="user", token="t", caller_user_id="u1")
+    assert out["content"] == "[image]"
+    assert out["caption"] == ""

@@ -177,6 +177,31 @@ def test_provider_key_resolution_declares_a_coalesced_trace_scope(monkeypatch):
     assert scopes == ["model_api_provider_key"]
 
 
+def test_provider_key_resolution_passes_job_to_coalesced_trace_scope(monkeypatch):
+    _install_provider_config(monkeypatch)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "runtime-secret")
+    scopes = []
+
+    @contextmanager
+    def record_scope(purpose, **kwargs):
+        scopes.append((purpose, kwargs))
+        yield
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "coalesced_success_trace",
+        record_scope,
+    )
+
+    resolved, metadata = serve_worker._resolve_provider(
+        "user-one", trace_job_id="job-42"
+    )
+
+    assert resolved is not None
+    assert metadata == {}
+    assert scopes == [("model_api_provider_key", {"job_id": "job-42"})]
+
+
 def test_prompt_cache_key_is_distinct_for_different_users(monkeypatch):
     _install_provider_config(monkeypatch)
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "runtime-secret-alpha")

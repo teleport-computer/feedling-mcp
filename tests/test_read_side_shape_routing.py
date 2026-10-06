@@ -37,7 +37,8 @@ def spy(monkeypatch):
 def test_sealed_row_goes_through_enclave_with_purpose(spy):
     env = {"body_ct": "Y3Q=", "nonce": "bm9uY2U=", "K_user": "a3U="}
 
-    out = core_envelope.read_envelope_body(env, "ak", purpose="memory_read")
+    out = core_envelope.read_envelope_body(
+        env, "ak", purpose="memory_read", caller_user_id="usr_test")
 
     assert out == b"decrypted"
     assert len(spy) == 1 and spy[0]["purpose"] == "memory_read"
@@ -47,7 +48,7 @@ def test_plaintext_row_never_touches_enclave(spy):
     """v6 的核心兑现点：明文档的读路径不依赖 enclave，故 enclave 故障不连坐。"""
     out = core_envelope.read_envelope_body(
         {"body": "hello", "id": "i", "owner_user_id": "u"}, "ak",
-        purpose="memory_read")
+        purpose="memory_read", caller_user_id="usr_test")
 
     assert out == b"hello"
     assert spy == [], "明文行不应打 enclave"
@@ -58,6 +59,7 @@ def test_binary_plaintext_row_strictly_decodes_without_enclave(spy):
         {"body_b64": base64.b64encode(b"\x00binary").decode("ascii")},
         "ak",
         purpose="chat_file_read",
+        caller_user_id="usr_test",
     )
 
     assert out == b"\x00binary"
@@ -70,6 +72,7 @@ def test_binary_plaintext_rejects_invalid_base64(spy):
             {"body_b64": "not base64!"},
             "ak",
             purpose="chat_file_read",
+            caller_user_id="usr_test",
         )
     assert spy == []
 
@@ -77,7 +80,11 @@ def test_binary_plaintext_rejects_invalid_base64(spy):
 def test_body_ct_wins_when_both_present(spy):
     """迁移中间态密文是真源；反过来会读到过期的明文残留。"""
     out = core_envelope.read_envelope_body(
-        {"body_ct": "Y3Q=", "body": "stale"}, "ak", purpose="p")
+        {"body_ct": "Y3Q=", "body": "stale"},
+        "ak",
+        purpose="p",
+        caller_user_id="usr_test",
+    )
 
     assert out == b"decrypted" and len(spy) == 1
 
@@ -85,35 +92,39 @@ def test_body_ct_wins_when_both_present(spy):
 def test_runtime_token_is_only_forwarded_when_present(spy):
     """api-key 调用方的下游入参必须逐字不变——无脑传空串会打破既有契约
     （Task 1.1 就是这样造出过一个回归）。"""
-    core_envelope.read_envelope_body({"body_ct": "x"}, "ak", purpose="p")
+    core_envelope.read_envelope_body(
+        {"body_ct": "x"}, "ak", purpose="p", caller_user_id="usr_test")
     assert "runtime_token" not in spy[0]
 
     core_envelope.read_envelope_body({"body_ct": "x"}, None, purpose="p",
-                                     runtime_token="rt")
+                                     caller_user_id="usr_test", runtime_token="rt")
     assert spy[1]["runtime_token"] == "rt"
 
 
 def test_unrecognized_shape_raises(spy):
     with pytest.raises(ValueError, match="envelope_shape_unrecognized"):
-        core_envelope.read_envelope_body({"id": "i"}, "ak", purpose="p")
+        core_envelope.read_envelope_body(
+            {"id": "i"}, "ak", purpose="p", caller_user_id="usr_test")
     assert spy == []
 
 
 def test_non_dict_raises(spy):
     with pytest.raises(ValueError, match="envelope_shape_unrecognized"):
-        core_envelope.read_envelope_body(None, "ak", purpose="p")
+        core_envelope.read_envelope_body(
+            None, "ak", purpose="p", caller_user_id="usr_test")
 
 
 def test_empty_plaintext_body_reads_as_empty_bytes(spy):
     """空正文是合法内容。真值判会把它当成「形状不认识」而抛错。"""
     assert core_envelope.read_envelope_body(
-        {"body": ""}, "ak", purpose="p") == b""
+        {"body": ""}, "ak", purpose="p", caller_user_id="usr_test") == b""
     assert spy == []
 
 
 def test_provider_key_wrapper_pins_its_purpose(spy):
     """Task 1.1 的 wrapper 保留，purpose 钉死——它的调用点不该因泛化而改动。"""
-    core_envelope.decrypt_provider_key_envelope({"body_ct": "x"}, "ak")
+    core_envelope.decrypt_provider_key_envelope(
+        {"body_ct": "x"}, "ak", caller_user_id="usr_test")
     assert spy[0]["purpose"] == "model_api_provider_key"
 
 

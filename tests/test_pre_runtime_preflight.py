@@ -19,7 +19,7 @@ TEST_COMPOSE = ROOT / "deploy" / "docker-compose.phala.test.yaml"
 TEST_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.runner.yaml"
 PROD_COMPOSE = ROOT / "deploy" / "docker-compose.phala.yaml"
 PROD_RUNNER_COMPOSE = ROOT / "deploy" / "docker-compose.phala.prod.runner.yaml"
-EXPECTED_TEE_HEAD = "0040_perceptkit_objects"
+EXPECTED_TEE_HEAD = "0051_outbox_source_fact"
 
 # The two inventory files that name the shared test CVMs.  Every job that
 # reaches one of those machines has to learn its target from here.
@@ -436,6 +436,9 @@ def _condition_requires(condition: str, atom: str) -> bool:
     every assignment of the other atoms instead.
     """
     normalised = " ".join(condition.split())
+    # Keep no-argument status checks such as ``cancelled()`` atomic.  Splitting
+    # their parentheses would compile a boolean placeholder as a function call.
+    normalised = re.sub(r"\b([A-Za-z_][\w.]*)\(\)", r"\1__call", normalised)
     # Protect ``!=`` so the operator split below does not tear it apart.
     sentinel = "\x00NE\x00"
     normalised = normalised.replace("!=", sentinel)
@@ -455,7 +458,7 @@ def _condition_requires(condition: str, atom: str) -> bool:
         elif token in "()":
             expression.append(token)
         else:
-            text = token.replace(sentinel, "!=")
+            text = token.replace(sentinel, "!=").replace("__call", "()")
             expression.append(f" {names.setdefault(text, f'a{len(names)}')} ")
 
     if atom not in names:
@@ -506,6 +509,42 @@ def test_tee_migrate_has_one_head_after_runtime_v2_alignment():
     assert runtime_head == EXPECTED_TEE_HEAD
     assert (
         script.get_revision(EXPECTED_TEE_HEAD).down_revision
+        == "0050_user_logs_autovacuum"
+    )
+    assert (
+        script.get_revision("0050_user_logs_autovacuum").down_revision
+        == "0049_agent_canvas_cards"
+    )
+    assert (
+        script.get_revision("0049_agent_canvas_cards").down_revision
+        == "0048_v2_wake_circuit"
+    )
+    assert (
+        script.get_revision("0046_memory_vectors").down_revision
+        == "0045_account_recover_challenges"
+    )
+    assert (
+        script.get_revision("0045_account_recover_challenges").down_revision
+        == "0044_divergence_observed_at"
+    )
+    assert (
+        script.get_revision("0044_divergence_observed_at").down_revision
+        == "0043_divergence_skew"
+    )
+    assert (
+        script.get_revision("0043_divergence_skew").down_revision
+        == "0042_perceptkit_retraction"
+    )
+    assert (
+        script.get_revision("0042_perceptkit_retraction").down_revision
+        == "0041_perceptkit_mirror_source"
+    )
+    assert (
+        script.get_revision("0041_perceptkit_mirror_source").down_revision
+        == "0040_perceptkit_objects"
+    )
+    assert (
+        script.get_revision("0040_perceptkit_objects").down_revision
         == "0039_distill_artifact_ledger"
     )
     assert (
@@ -1022,6 +1061,9 @@ def test_every_test_cvm_touching_job_is_locked_to_the_test_branch():
     # is not the same as a dependence on it.
     assert _condition_requires(TEST_REF_ATOM, TEST_REF_ATOM)
     assert _condition_requires(f"{TEST_REF_ATOM} && github.event_name == 'push'", TEST_REF_ATOM)
+    assert _condition_requires(f"!cancelled() && {TEST_REF_ATOM} && github.event_name == 'push'", TEST_REF_ATOM)
+    assert not _condition_requires(f"{TEST_REF_ATOM} || !cancelled()", TEST_REF_ATOM)
+    assert not _condition_requires(f"cancelled() || {TEST_REF_ATOM}", TEST_REF_ATOM)
     assert not _condition_requires(
         f"{TEST_REF_ATOM} || github.event_name == 'workflow_dispatch'", TEST_REF_ATOM
     )
@@ -1209,6 +1251,8 @@ def test_test_release_jobs_only_run_for_pushes_to_test():
             if name in change_detectors
             else f"{push_to_test} && {cvm_changed}"
         )
+        if name == "deploy-test-runner-cvm":
+            expected += " && !cancelled()"
         assert actual == expected, name
 
 

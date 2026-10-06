@@ -17,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from accounts import registry  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
@@ -581,7 +582,9 @@ def test_empty_ids_reads_watermark_without_scanning_lane_rows(client, monkeypatc
             yield _RecordingConn(conn, executed)
 
     monkeypatch.setattr(db, "_admin_data_track_connection", recording_connection)
-    report = db.admin_background_lane_users([], days=1)
+    report = db.admin_background_lane_users(
+        [], days=1, classify_v2_code=jobs_store.terminal_outcome_class,
+    )
 
     lane_sql = [sql for sql in executed if "lane_daily_rollup" in sql]
     watermark_sql = [sql for sql in executed if "lane_rollup_watermark" in sql]
@@ -681,6 +684,7 @@ def test_background_lane_coverage_uses_weakest_observed_and_current_route():
 def test_data_track_admin_connection_sets_session_timeout_and_resets(
         monkeypatch):
     executed = []
+    leases = []
 
     class FakeConnection:
         def execute(self, sql):
@@ -698,17 +702,38 @@ def test_data_track_admin_connection_sets_session_timeout_and_resets(
 
     class FakePool:
         def connection(self, *, timeout):
-            assert timeout == 5
+            leases.append(timeout)
             return FakeLease()
 
     monkeypatch.setattr(db, "get_pool", lambda: FakePool())
     with pytest.raises(RuntimeError, match="probe"):
         with db._admin_data_track_connection():
             raise RuntimeError("probe")
+    with pytest.raises(RuntimeError, match="detail probe"):
+        with db._admin_data_track_connection(
+            timeout_ms=db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS,
+        ):
+            raise RuntimeError("detail probe")
 
+    # T653: jit is switched off for the lease (fleet aggregates spent 0.76 s
+    # compiling) and reset alongside statement_timeout before the connection
+    # returns to the pool.
     assert executed == [
-        "SET statement_timeout = '5000ms'",
+        f"SET statement_timeout = '{db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'",
+        "SET jit = off",
+        "RESET jit",
         "RESET statement_timeout",
+        (
+            "SET statement_timeout = "
+            f"'{db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS}ms'"
+        ),
+        "SET jit = off",
+        "RESET jit",
+        "RESET statement_timeout",
+    ]
+    assert leases == [
+        db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000,
+        db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS / 1000,
     ]
 
 
@@ -727,7 +752,7 @@ def test_t428_dau_and_daily_usage_use_bounded_admin_connection(monkeypatch):
             return EmptyResult()
 
     @contextlib.contextmanager
-    def bounded_connection():
+    def bounded_connection(**_kwargs):
         calls.append("bounded")
         yield FakeConnection()
 
@@ -742,6 +767,61 @@ def test_t428_dau_and_daily_usage_use_bounded_admin_connection(monkeypatch):
         user_id="usr_t428", days=1
     ) == []
     assert calls == ["bounded", "bounded"]
+
+
+def test_t478_user_usage_queries_narrow_stream_before_json_filter(monkeypatch):
+    """Keep the detail queries on the existing per-user stream index.
+
+    Filtering ``app_session_end`` first selects the fleet-wide partial index;
+    for a heavy user that read tens of thousands of other users' rows.  The
+    materialized CTE is the deliberate optimization boundary.
+    """
+    executed = []
+
+    class EmptyResult:
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    class FakeConnection:
+        def execute(self, sql, *_args, **_kwargs):
+            executed.append(str(sql))
+            return EmptyResult()
+
+    @contextlib.contextmanager
+    def bounded_connection(**_kwargs):
+        yield FakeConnection()
+
+    monkeypatch.setattr(db, "_admin_data_track_connection", bounded_connection)
+
+    db.admin_data_track_snapshot(["usr_a", "usr_b"])
+    fleet_usage_query = next(
+        " ".join(sql.split())
+        for sql in executed
+        if "app_session_end" in sql and "foreground_sec" in sql
+    )
+    assert "user_tracking AS MATERIALIZED" not in fleet_usage_query
+    assert "FROM user_logs" in fleet_usage_query
+
+    executed.clear()
+    db.admin_data_track_snapshot(
+        ["usr_t478"],
+        narrow_app_usage_to_user_stream=True,
+    )
+    db.admin_data_track_user_daily_usage(user_id="usr_t478", days=14)
+
+    usage_queries = [
+        " ".join(sql.split())
+        for sql in executed
+        if "app_session_end" in sql and "foreground_sec" in sql
+    ]
+    assert len(usage_queries) == 2
+    for sql in usage_queries:
+        assert "user_tracking AS MATERIALIZED" in sql
+        assert "stream = 'tracking_events'" in sql
+        assert "FROM user_tracking" in sql
 
 
 def test_admin_data_track_reports_screen_frame_storage_and_freshness(client):
@@ -1040,6 +1120,96 @@ def test_user_detail_daily_usage_json_page_and_events_limit(client):
     assert (first_day + timedelta(days=1)).isoformat() in body
 
 
+def test_caption_envelope_failure_tracking_event_is_visible_in_user_detail(client):
+    user_id, _ = _register(client)
+    turn_id = "turn-caption-failed"
+    job_id = "481"
+    event = {
+        "event_id": f"caption-envelope-failed:{turn_id}",
+        "type": "caption_envelope_failed",
+        "created_at": "2030-06-02T12:00:00Z",
+        "source": "backend",
+        "route": "/v1/model_api/chat/send",
+        "payload": {
+            "turn_id": turn_id,
+            "job_id": job_id,
+            "attachment_kind": "image",
+            "outcome_class": "operational_failure",
+            "error_code": "enclave_info_unavailable",
+            "caption_persisted": False,
+        },
+    }
+    assert db.log_append(
+        user_id,
+        "tracking_events",
+        event,
+        ts=_epoch(event["created_at"]),
+        item_key=event["event_id"],
+    )
+
+    res = client.get(
+        f"/v1/admin/data-track/users/{user_id}?events_limit=50",
+        headers=_admin_headers(),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    visible = next(
+        item for item in res.get_json()["user"]["tracking"]["latest"]
+        if item.get("type") == "caption_envelope_failed"
+    )
+    assert visible["event_id"] == event["event_id"]
+    assert visible["source"] == "backend"
+    assert visible["route"] == "/v1/model_api/chat/send"
+    assert visible["payload"] == event["payload"]
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}?events_limit=50",
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    page_html = page.get_data(as_text=True)
+    assert "caption_envelope_failed" in page_html
+    assert turn_id in page_html
+    assert job_id in page_html
+
+
+def test_t478_user_detail_never_materializes_store_caches(client, monkeypatch):
+    user_id, _ = _register(client)
+    snapshot_calls = []
+    real_snapshot = db.admin_data_track_snapshot
+
+    def forbidden_store_load(*_args, **_kwargs):
+        raise AssertionError("detail page materialized a legacy Store cache")
+
+    def observed_snapshot(user_ids, **kwargs):
+        snapshot_calls.append(kwargs)
+        return real_snapshot(user_ids, **kwargs)
+
+    monkeypatch.setattr(core_store, "get_store", forbidden_store_load)
+    monkeypatch.setattr(
+        db,
+        "chat_load_hot_snapshot_strict",
+        forbidden_store_load,
+    )
+    monkeypatch.setattr(db, "admin_data_track_snapshot", observed_snapshot)
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}",
+        headers=_admin_headers(),
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    row = response.get_json()["user"]
+    assert row["user_id"] == user_id
+    assert row["snapshot_read_status"]["level"] == "ok"
+    assert row["onboarding"]["steps"]
+    assert snapshot_calls == [{
+        "include_worldbook": True,
+        "narrow_app_usage_to_user_stream": True,
+        "statement_timeout_ms": db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS,
+    }]
+
+
 def test_t428_daily_usage_query_failure_is_distinct_from_true_zero(
     client, monkeypatch
 ):
@@ -1048,17 +1218,23 @@ def test_t428_daily_usage_query_failure_is_distinct_from_true_zero(
     state = {"failed": False}
 
     @contextlib.contextmanager
-    def broken_connection():
+    def broken_connection(**_kwargs):
         raise RuntimeError("injected daily usage query failure")
         yield  # pragma: no cover - makes this a contextmanager generator
 
-    def daily_usage(*, user_id, days, tz):
+    def daily_usage(*, user_id, days, tz, statement_timeout_ms):
+        assert statement_timeout_ms == db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS
         if state["failed"]:
             with monkeypatch.context() as failure_patch:
                 failure_patch.setattr(
                     db, "_admin_data_track_connection", broken_connection
                 )
-                return real_daily_usage(user_id=user_id, days=days, tz=tz)
+                return real_daily_usage(
+                    user_id=user_id,
+                    days=days,
+                    tz=tz,
+                    statement_timeout_ms=statement_timeout_ms,
+                )
         return [{
             "day": "2030-01-01",
             "foreground_sec": 0,
@@ -2676,9 +2852,9 @@ def test_fleet_wide_read_does_not_scan_memory_docs_for_breakdowns(client, monkey
     assert page_ids == seeded[2:4]
 
     breakdown_ids = [
-        params[1]
+        params[0]
         for sql, params in calls
-        if "COALESCE(NULLIF(doc->>%s" in sql and "memory_moments" in sql
+        if "jsonb_to_record(" in sql and "memory_moments" in sql
     ]
     assert breakdown_ids, (
         "no by_type/by_source SQL ran at all — this guard would pass "
@@ -2960,6 +3136,8 @@ def test_fleet_wide_read_does_not_scan_the_paged_log_streams(client, monkeypatch
     assert "bootstrap_events" not in fleet_log_sql[0], (
         "bootstrap_events is back in the fleet-wide user_logs aggregate"
     )
+    assert "tracking_events" not in fleet_log_sql[0]
+    assert "device_events" not in fleet_log_sql[0]
     assert "'memory_changes'" in fleet_log_sql[0], (
         "memory_changes must stay fleet-wide: it is the second element of the "
         "memory sort tuple, so it takes part in a full-set ordering"
@@ -2976,8 +3154,10 @@ def test_fleet_wide_read_does_not_scan_the_paged_log_streams(client, monkeypatch
         f"{[len(params[0]) for _, params in paged_calls]} ids per call for a "
         f"page of {len(page_ids)} out of {len(seeded)} seeded users"
     )
-    assert all(list(params[1]) == ["bootstrap_events"] for _, params in paged_calls), (
-        "the page-scoped log read must ask for exactly bootstrap_events; got "
+    # T680 pages two more counts; tracking MAX stays fleet-wide separately.
+    assert all(list(params[1]) == ["bootstrap_events", "tracking_events", "device_events"]
+               for _, params in paged_calls), (
+        "the page-scoped log read must ask for exactly these three streams; got "
         f"{[list(params[1]) for _, params in paged_calls]}"
     )
 
@@ -3443,24 +3623,46 @@ def _restore_the_fleet_wide_read(monkeypatch) -> None:
         )
 
 
-def _take_clock_fields(payload: dict) -> tuple[str, list]:
-    """Remove the two fields that read the wall clock, and only those two.
+def _take_clock_fields(payload: dict) -> tuple[str, list, list]:
+    """Remove the three fields that read the wall clock, and only those three.
 
-    Everything else in the payload has to match exactly; these two cannot,
+    Everything else in the payload has to match exactly; these three cannot,
     because the two sides are two requests served seconds apart.
-    summary.generated_at is the timestamp of the request itself, and
-    screen_frames.latest_age_sec is now() minus latest_at — which is compared
-    exactly along with everything else, and pinned against the seed by
+    summary.generated_at is the timestamp of the request itself;
+    screen_frames.latest_age_sec is now() minus latest_at, and
+    onboarding.stuck_for_sec is now() minus the user's latest activity
+    (T736: it was compared exactly and went red whenever the two requests
+    straddled a second boundary). latest_at itself is compared exactly along
+    with everything else, and pinned against the seed by
     test_page_rows_carry_all_three_slices_for_the_right_user.
 
     Anything else that stops matching is a real divergence, so this list stays
     closed: a new time-dependent field must be justified here, not skipped.
     """
-    ages = []
+    ages, stuck = [], []
     for row in payload.get("users") or []:
         ages.append((row.get("screen_frames") or {}).pop("latest_age_sec", None))
+        stuck.append((row.get("onboarding") or {}).pop("stuck_for_sec", None))
     generated_at = (payload.get("summary") or {}).pop("generated_at", "")
-    return generated_at, ages
+    return generated_at, ages, stuck
+
+
+class _SteppedClock:
+    """The real ``time`` module, except ``time()`` can be moved forward.
+
+    Lets the parity test put its second request deterministically across a
+    second boundary instead of only when the machine happens to be slow.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.offset = 0.0
+
+    def time(self):
+        return self._real.time() + self.offset
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 @pytest.mark.parametrize("query", [
@@ -3484,9 +3686,17 @@ def test_paged_payload_is_field_identical_to_the_fleet_wide_read(
     """
     seeded = _seed_every_paged_slice(client, 5)
 
+    # The two requests are always 1.5s apart on the wall clock the payload
+    # reads, so every clock-derived field crosses a second boundary on every
+    # run (T736: this used to depend on how slow the machine was).
+    from admin import data_track as data_track_module
+    clock = _SteppedClock(data_track_module.time)
+    monkeypatch.setattr(data_track_module, "time", clock)
+
     url = f"/v1/admin/data-track/users?{query}"
     live = client.get(url, headers=_admin_headers()).get_json()
     _restore_the_fleet_wide_read(monkeypatch)
+    clock.offset = 1.5
     reference = client.get(url, headers=_admin_headers()).get_json()
 
     assert live["users"], (
@@ -3497,8 +3707,8 @@ def test_paged_payload_is_field_identical_to_the_fleet_wide_read(
         "the page contains a user this fixture did not seed"
     )
 
-    live_stamp, live_ages = _take_clock_fields(live)
-    reference_stamp, reference_ages = _take_clock_fields(reference)
+    live_stamp, live_ages, live_stuck = _take_clock_fields(live)
+    reference_stamp, reference_ages, reference_stuck = _take_clock_fields(reference)
     assert live_stamp and reference_stamp and reference_stamp >= live_stamp, (
         f"summary.generated_at is not the time of the request: {live_stamp} "
         f"then {reference_stamp}"
@@ -3511,6 +3721,23 @@ def test_paged_payload_is_field_identical_to_the_fleet_wide_read(
         if before is not None:
             assert after - before <= 5 and after >= before, (
                 f"latest_age_sec moved by more than the gap between the two "
+                f"requests: {before} -> {after}"
+            )
+    assert len(live_stuck) == len(reference_stuck)
+    # The stepped clock must actually move this field on some row, or the
+    # tolerance below is never exercised (the seed's activity is milliseconds
+    # old, so the typical move is 0 -> 1, the exact CI flake of T736).
+    assert any(
+        before is not None and after is not None and after > before
+        for before, after in zip(live_stuck, reference_stuck)
+    ), f"no row's stuck_for_sec moved across the step: {live_stuck} -> {reference_stuck}"
+    for before, after in zip(live_stuck, reference_stuck):
+        assert (before is None) == (after is None), (
+            "one side has an onboarding stuck clock the other does not"
+        )
+        if before is not None:
+            assert after - before <= 5 and after >= before, (
+                f"stuck_for_sec moved by more than the gap between the two "
                 f"requests: {before} -> {after}"
             )
 
@@ -3728,3 +3955,111 @@ def test_admin_user_detail_redacts_skipped_control_reasons(client):
     # Collapsing two raw keys into one bucket must not lose either job.
     assert sum(proactive["job_control_reasons"].values()) == 3
     assert proactive["heartbeat_control"] == 3
+
+
+def test_admin_data_track_surfaces_wake_circuit_count_and_unavailable(client, monkeypatch):
+    from conftest import set_v2_runtime_owner
+    user_id, _ = _register(client)
+    set_v2_runtime_owner(user_id)
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO v2_wake_schedule (user_id,wake_circuit_opened_at) "
+                     "VALUES (%s,now()) ON CONFLICT (user_id) DO UPDATE "
+                     "SET wake_circuit_opened_at=now()", (user_id,))
+    body = client.get('/v1/admin/data-track/users', headers=_admin_headers()).get_json()
+    assert body['summary']['wake_provider_circuit_open_users'] == 1
+    assert body['users'][0]['wake_provider_circuit_open'] is True
+    html = client.get('/admin/data-track?view=users', headers=_admin_headers()).get_data(as_text=True)
+    assert '主动唤醒熔断账号行' in html
+    original = db.admin_data_track_snapshot
+    def unavailable(*args, **kwargs):
+        result = original(*args, **kwargs)
+        for row in result.values():
+            row.pop('wake_provider_circuit_open', None)
+            row['snapshot_read_status'] = {'level': 'unavailable', 'message': 'test read failure'}
+        return result
+    monkeypatch.setattr(db, 'admin_data_track_snapshot', unavailable)
+    body = client.get('/v1/admin/data-track/users', headers=_admin_headers()).get_json()
+    assert body['summary']['wake_provider_circuit_open_users'] is None
+    assert body['users'][0]['wake_provider_circuit_open'] is None
+
+
+@pytest.mark.parametrize("lane", ["capture", "heartbeat"])
+@pytest.mark.parametrize("code,operational,user,control", [
+    ("extraction_failed:auth_invalid", 1, 2, 0),
+    ("extraction_failed:quota_insufficient", 1, 2, 0),
+    ("extraction_failed:model_not_found", 1, 2, 0),
+    ("extraction_failed:upstream_unavailable", 3, 0, 0),
+    ("extraction_failed:provider_config", 3, 0, 0),
+    ("wake_failed:providererror", 3, 0, 0),
+    ("future_failure_code", 3, 0, 0),
+    (None, 3, 0, 0),
+    ("turns_halted", 1, 0, 2),
+])
+def test_v2_background_users_share_daily_summary_classification(
+        client, lane, code, operational, user, control):
+    """Real DB -> users API -> HTML; V1-only frozen columns remain zero."""
+    from admin import lane_rollup_summary
+    uid, _ = _register(client)
+    yesterday = (datetime.now(ZoneInfo("Asia/Shanghai")).date()
+                 - timedelta(days=1)).isoformat()
+    codes = {code: 2} if code else {}
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO lane_daily_rollup "
+            "(user_id,day,route,lane,completed,failed,expired,superseded,failure_codes) "
+            "VALUES (%s,%s,'model_api',%s,2,2,1,4,%s::jsonb)",
+            (uid, yesterday, lane, json.dumps(codes)),
+        )
+        conn.execute(
+            "INSERT INTO lane_rollup_watermark "
+            "(route,backfill_from,through_day,outcomes_from) "
+            "VALUES ('model_api',%s,%s,NULL),('resident',%s,%s,%s) "
+            "ON CONFLICT (route) DO UPDATE SET "
+            "backfill_from=EXCLUDED.backfill_from,through_day=EXCLUDED.through_day,"
+            "outcomes_from=EXCLUDED.outcomes_from",
+            (yesterday,) * 5,
+        )
+    response = client.get("/v1/admin/data-track/users?lane_days=1",
+                          headers=_admin_headers())
+    assert response.status_code == 200, response.get_data(as_text=True)
+    payload = response.get_json()
+    block = next(r for r in payload["users"] if r["user_id"] == uid)["background_lanes"]
+    row = block["routes"]["model_api"][lane]
+    assert row == {
+        "completed": 2, "failed": 2, "expired": 1, "superseded": 4,
+        "operational_failures": operational, "user_unavailable": user,
+        "control_outcomes": control, "terminal_attempts": 2 + operational,
+        "failure_rate": pytest.approx(operational / (2 + operational)),
+        "failure_codes": codes,
+    }
+    assert block["lanes"][lane] == row
+    assert block["coverage"]["level"] == "green"
+    coverage = payload["background_lane_window"]["coverage_by_route"]["model_api"]
+    assert coverage["level"] == "green"
+    assert coverage["outcomes_from"] is None, "V2 has no V1 outcome watermark"
+    frozen = db.admin_lane_rollup(user_id=uid, lane=lane,
+                                 since_day=yesterday, until_day=yesterday)["rows"]
+    assert frozen[0]["operational_failures"] == 0, "no historical row rewrite"
+    daily = lane_rollup_summary.aggregate_day(
+        frozen, lane=lane, route="model_api", day=yesterday,
+    )
+    assert (daily.completed, daily.failed_raw, daily.operational, daily.control,
+            daily.user_unavailable, daily.attempts, daily.failure_rate) == (
+        row["completed"], row["failed"] + row["expired"], row["operational_failures"],
+        row["control_outcomes"], row["user_unavailable"], row["terminal_attempts"],
+        row["failure_rate"],
+    )
+    page = client.get("/admin/data-track?view=users&lane_days=1",
+                      headers=_admin_headers())
+    assert page.status_code == 200
+    label = "心跳" if lane == "heartbeat" else "capture"
+    expected = (f"{label} {operational / (2 + operational):.0%}"
+                f"（成2/故{operational}/分母{2 + operational}）")
+    assert expected in page.get_data(as_text=True)
+    assert expected + " · 覆盖" not in page.get_data(as_text=True)
+    with db.get_pool().connection() as conn:
+        conn.execute("UPDATE lane_rollup_watermark SET through_day=%s WHERE route='model_api'",
+                     ((datetime.fromisoformat(yesterday).date() - timedelta(days=1)).isoformat(),))
+    incomplete = client.get("/v1/admin/data-track/users?lane_days=1",
+                            headers=_admin_headers()).get_json()
+    assert incomplete["background_lane_window"]["coverage_by_route"]["model_api"]["level"] == "partial"

@@ -38,6 +38,11 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import worker
+from wake_look_first_helpers import (
+    ScriptedCalls as _ScriptedCalls,
+    is_look_first_round as _is_look_first_round,
+    looked_nothing_needed as _looked_nothing_needed,
+)
 from core import store as core_store
 
 pytestmark = pytest.mark.skipif(
@@ -124,9 +129,13 @@ def _wake_deps(*, tail=None, load_mcp_turn=None, emit_debug_trace=None):
 
 def _script_provider(monkeypatch, responses):
     it = iter(responses)
-    calls = []
+    calls = _ScriptedCalls()
 
     async def _fake(config, messages, *, tools=None, **_kwargs):
+        if _is_look_first_round(tools, messages, _kwargs.get("tool_choice")):
+            # Presence-wake look-first round (T723): "looked, nothing needed".
+            calls.look_rounds.append({"messages": messages, "tools": tools})
+            return _looked_nothing_needed()
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -140,7 +149,7 @@ def _wake_reply_round(text, *, think="I want to say this now."):
         "tool_calls": [{
             "id": "wake-reply-test",
             "name": "reply",
-            "args": {"think": think, "text": text},
+            "args": {"aside": think, "text": text},
         }],
         "usage": {},
     }
@@ -365,13 +374,25 @@ def _force_pressure(monkeypatch):
         "oversized optional manual " * 6_000,
     )
     monkeypatch.setattr(tool_loop, "_CATALOG", None)
-    return provider_client.ProviderConfig(
+    pressure_config = provider_client.ProviderConfig(
         provider="anthropic",
         model="claude-sonnet-4-test",
         api_key="sk-user-byok",
         base_url="",
         context_window_tokens=40_000,
     )
+    # Pressure is an explicit test constraint. Accepted route metadata can be
+    # raised to an audited family bound, so it cannot force this smaller window.
+    monkeypatch.setitem(
+        worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+        "anthropic:claude-sonnet-4-test", 40_000,
+    )
+    limit = worker.v2_prompt_frontier.resolve_model_limit_from_config(
+        pressure_config, deployment_overrides=worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    assert limit.context_window_tokens == 40_000
+    assert limit.source == "deployment_override"
+    return pressure_config
 
 
 def test_wake_pressure_folded_platform_schema_is_searchable(monkeypatch):

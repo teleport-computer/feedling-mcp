@@ -131,8 +131,21 @@ def _vitals_back(doc: Mapping[str, Any], steps_doc: Mapping[str, Any] | None
     return out
 
 
+#: 🔴 **同一天同一信号可能有好几行 —— 每个 aggregation_version 一行。**
+#:
+#: 聚合语义变了就会升版本（kit 的 AGGREGATION_VERSION），而新旧两版是
+#: **并排存着**的，旧口径留着供对照和回滚，这是设计如此。不挑版本就会两版
+#: 混读：同一条曲线上半段一个口径、下半段另一个，两边都是合法 JSON，不报错。
+#:
+#: 2026-09-07 睡眠改聚合算法时踩到：v1 的 minutes 恒为空、duration_minutes
+#: 是各阶段的 **max**；v2 才是真正的分桶和求和。混读的话「昨晚睡了多久」
+#: 会在 430 和 250 之间跳。
+#:
+#: 版本一起选出来，**由 Python 挑最高的那一版**（见 daily_rollups）——
+#: 不靠 SQL 的返回顺序。靠顺序的话测试也证不了什么：写一版正确的和一版
+#: 错误的进去，碰巧正确的那版最后返回，测试就绿了。
 _READ = """
-SELECT local_date, signal, typed_aggregate
+SELECT local_date, signal, typed_aggregate, aggregation_version
 FROM perceptkit_daily_aggregate
 WHERE subject_id = %s AND signal = ANY(%s) AND aggregation_kind = 'daily'
 ORDER BY local_date DESC
@@ -152,10 +165,15 @@ def daily_rollups(user_id: str, old_signal: str, days: int) -> list[dict] | None
         return None
     from .backfill import _FIELD_RENAMES, _FIELD_SCALES, _SPLITS
 
+    from .ios_report import SPLIT_OFF
+    # 一条老信号的历史现在散在好几个 kit 信号里（0.4.0 的拆分），
+    # 要全读回来才能拼回老路那一份形状 —— 少读一个，那个指标的趋势
+    # 就静默变成空的，而调用方看到的是"这项没有历史"。
     wanted = [kit_signal]
     split = _SPLITS.get(old_signal)
     if split:
         wanted.append(split[0])
+    wanted += sorted({t for t, _f in SPLIT_OFF.get(old_signal, {}).values()})
 
     import db
     limit = max(1, min(int(days), 400)) * len(wanted)
@@ -167,7 +185,15 @@ def daily_rollups(user_id: str, old_signal: str, days: int) -> list[dict] | None
         return None
 
     by_date: dict[Any, dict[str, Any]] = {}
-    for day, signal, doc in rows:
+    # (日期, 信号) -> 已经采用的那一版。见 _READ 上面那段：同一格可能有
+    # 好几个版本的行，只能留最高的那一版，混读会让同一条曲线两种口径。
+    chosen: dict[tuple[Any, str], int] = {}
+    for day, signal, doc, version in rows:
+        version = int(version or 0)
+        key = (day, signal)
+        if key in chosen and chosen[key] >= version:
+            continue
+        chosen[key] = version
         by_date.setdefault(day, {})[signal] = doc if isinstance(doc, dict) else {}
 
     out: list[dict] = []
@@ -177,8 +203,15 @@ def daily_rollups(user_id: str, old_signal: str, days: int) -> list[dict] | None
         #   `'2026-08-31'` 一边给 `date(2026, 8, 31)`，比较、当字典键、
         #   序列化全会静默走岔。
         docs = by_date[day]
-        main = docs.get(kit_signal)
-        if main is None:
+        # 主信号那份可能整天都没有（比如那天只测了体脂没称体重）——
+        # 但拆出去的兄弟信号有。以前 `main is None: continue` 会把
+        # 那一天整个丢掉。合并之后只要有任何一个信号有数据就算这天有。
+        main = dict(docs.get(kit_signal) or {})
+        for extra_signal in wanted[1:]:
+            extra = docs.get(extra_signal)
+            if isinstance(extra, dict):
+                main.update(extra)
+        if not main:
             continue
         if old_signal == "health_sleep":
             translated = _sleep_back(main)

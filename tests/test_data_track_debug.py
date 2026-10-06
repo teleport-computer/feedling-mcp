@@ -1120,3 +1120,43 @@ def test_debug_page_can_render_timeline_mode(monkeypatch):
     assert "agent.model.call.start" in html
     assert "agent.model.call.done" in html
     assert "900ms" in html
+
+
+@pytest.mark.parametrize("error_class", ["provider_error_unclassified", "quota_insufficient"])
+def test_pi_error_head_public_projection_and_size_exception(error_class):
+    import debug_trace
+
+    raw = {"error_class": error_class, "pi_error_head": "渠道原始错误" * 60,
+           "raw_reply_head": "r" * 320, "ordinary_detail": "x" * 320}
+    safe = debug_trace._safe_detail(debug_trace._safe_detail(raw))
+    assert safe["pi_error_head"] == raw["pi_error_head"][:300]
+    assert len(safe["raw_reply_head"]) == 200  # T617 still requires parse-failed
+    assert len(safe["ordinary_detail"]) == 200
+    event = _event(1, "user_t638", "agent.model.call.error", trace_id="t638", detail=safe)
+    assert data_track._debug_event_public_json(event)["detail"]["pi_error_head"] == safe["pi_error_head"]
+    raw["error_class"] = "reply_parse_failed"
+    assert len(debug_trace._safe_detail(raw)["raw_reply_head"]) == 300
+
+
+@pytest.mark.parametrize("event_type,value", [
+    ("agent.model.call.done", "provider text"),
+    ("agent.turn.failure", "provider text"),
+    ("agent.model.call.error", "x" * 301),
+    ("agent.model.call.error", ["provider text"]),
+    ("agent.model.call.error", {"message": "provider text"}),
+])
+def test_pi_error_head_public_projection_rejects_other_events_and_bad_shape(event_type, value):
+    event = _event(1, "user_t638", event_type, trace_id="t638", detail={"pi_error_head": value})
+    projected = data_track._debug_event_public_json(event)["detail"].get("pi_error_head")
+    assert projected != value
+
+
+@pytest.mark.parametrize("malformed_class", [[], {}, 123, None])
+def test_wide_detail_table_keeps_generic_bound_for_non_string_class(malformed_class):
+    import debug_trace
+
+    value = debug_trace._safe_detail({"error_class": malformed_class,
+                                      "raw_reply_head": "r" * 310,
+                                      "pi_error_head": "p" * 310})
+    assert value["raw_reply_head"] == "r" * 200
+    assert value["pi_error_head"] == "p" * 300

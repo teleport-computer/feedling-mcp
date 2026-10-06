@@ -34,10 +34,13 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import struct
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
@@ -48,8 +51,14 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+import admin_first_events
+import admin_read_timing
+import enclave_health_contract
 import object_storage  # lowest-layer peer: R2 offload for frame body_ct
+import storage_read_trace
+from notices import agent_call_failure as notices_agent_call_failure
 from notices import catalog as notices_catalog
+from notices.rollup_outcomes import split_v2_outcomes
 
 log = logging.getLogger("feedling.db")
 
@@ -173,7 +182,7 @@ def configure_pool_max_size(max_size: int | str) -> int:
 def get_pool() -> ConnectionPool:
     global _pool
     if _pool is not None:
-        return _pool
+        return admin_read_timing.wrap_pool(_pool)
     with _pool_lock:
         if _pool is None:
             _pool = ConnectionPool(
@@ -186,7 +195,7 @@ def get_pool() -> ConnectionPool:
                 open=True,
                 **_database_pool_lifetime_kwargs(),
             )
-    return _pool
+    return admin_read_timing.wrap_pool(_pool)
 
 
 def get_health_pool() -> ConnectionPool:
@@ -956,6 +965,8 @@ def save_all_users(users: list[dict]) -> None:
                             cur, removed_id, advance_generation=True,
                         )
                         _delete_runtime_allowlist_on_cursor(cur, removed_id)
+                        cur.execute("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,))
+                        mirror_group.append(("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,)))
                         # Preserve the global lifecycle -> users/chat lock order.
                         # A bulk users FOR UPDATE before lifecycle would deadlock
                         # against append/clear, which take the lifecycle fence
@@ -1022,6 +1033,7 @@ def delete_user(user_id: str) -> bool:
                 )
                 _delete_runtime_allowlist_on_cursor(cur, user_id)
                 cur.execute(sql, (user_id,))
+                cur.execute("DELETE FROM memory_vectors WHERE user_id=%s", (user_id,))
             # Rollup anonymize-merge AFTER the users DELETE, inside the same
             # transaction (this is the AUTHORITATIVE site — delete_user_data
             # is only a swallowed best-effort belt and must not be the load
@@ -1034,7 +1046,8 @@ def delete_user(user_id: str) -> bool:
             chat_cells = chat_rollup_anonymize_user(conn, user_id)
             anonymized = lane_rollup_anonymize_user(conn, user_id)
     from tee_shadow import mirror
-    group: list[tuple[str, tuple]] = [(sql, (user_id,))]
+    group: list[tuple[str, tuple]] = [
+        (sql, (user_id,)), ("DELETE FROM memory_vectors WHERE user_id=%s", (user_id,))]
     if chat_cells:
         group.append((_CHAT_ROLLUP_DELETE_SQL, (user_id,)))
     if anonymized:
@@ -1239,19 +1252,34 @@ def clear_reconcile_cursor(table: str) -> None:
         log.warning("[db] clear_reconcile_cursor(%s) failed: %s", table, e)
 
 
-def user_exists(user_id: str) -> bool:
+def user_exists(
+    user_id: str,
+    *,
+    connection_timeout: float | None = None,
+    statement_timeout_ms: int | None = None,
+) -> bool:
     """Authoritative membership check against the users table. The push path uses
     it to close the sub-second window where another worker committed a delete but
     THIS worker's in-memory registry hasn't processed the ``users`` wake-bus
     reload yet — the stale snapshot would otherwise pass the guard and send a push
     to a just-deleted account. One indexed PK lookup; negligible next to the store
-    load / chat work a push already does."""
+    load / chat work a push already does. Admin callers may supply their remaining
+    read budget; failures propagate rather than reporting a missing account."""
     if not user_id:
         return False
-    with get_pool().connection() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
-        ).fetchone()
+    connection_kwargs = (
+        {"timeout": float(connection_timeout)}
+        if connection_timeout is not None else {}
+    )
+    with get_pool().connection(**connection_kwargs) as conn:
+        timeout_scope = (
+            _local_statement_timeout(conn, int(statement_timeout_ms))
+            if statement_timeout_ms is not None else nullcontext()
+        )
+        with timeout_scope:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
+            ).fetchone()
     return row is not None
 
 
@@ -1454,6 +1482,7 @@ def _chat_rollup_into(conn, ids: list[str], out: dict, ensure) -> None:
 
 
 _ADMIN_DATA_TRACK_READ_TIMEOUT_MS = 5000
+_ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS = 60000
 
 
 class AdminDataTrackDauReadError(RuntimeError):
@@ -1465,24 +1494,32 @@ class AdminDataTrackDailyUsageReadError(RuntimeError):
 
 
 @contextmanager
-def _admin_data_track_connection():
+def _admin_data_track_connection(*, timeout_ms: int | None = None):
     """Lease one bounded admin connection without poisoning the shared pool."""
+    effective_timeout_ms = int(
+        _ADMIN_DATA_TRACK_READ_TIMEOUT_MS
+        if timeout_ms is None
+        else timeout_ms
+    )
     with get_pool().connection(
-        timeout=_ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+        timeout=effective_timeout_ms / 1000
     ) as conn:
         # Pool connections are autocommit, so SET LOCAL/set_config(..., true)
         # would expire at the end of that one statement. Use a session setting
         # for this lease and always reset it before returning the connection.
         conn.execute(
-            f"SET statement_timeout = '{_ADMIN_DATA_TRACK_READ_TIMEOUT_MS}ms'"
+            f"SET statement_timeout = '{effective_timeout_ms}ms'"
         )
         try:
+            # Fleet aggregates spend more time compiling JIT than executing.
+            conn.execute("SET jit = off")
             yield conn
         finally:
-            try:
-                conn.execute("RESET statement_timeout")
-            except Exception:  # noqa: BLE001 — pool discards broken sessions
-                pass
+            for setting in ("jit", "statement_timeout"):
+                try:
+                    conn.execute(f"RESET {setting}")
+                except Exception:  # noqa: BLE001 — pool discards broken sessions
+                    pass
 
 
 # user_logs streams read per page rather than fleet-wide.
@@ -1502,7 +1539,10 @@ def _admin_data_track_connection():
 # log_trim/log_prune_older_than anywhere — so paging it would keep an unbounded
 # GROUP BY alive for no consumer, and, sharing this query with bootstrap_events,
 # could time the bootstrap read out and mark a readable row degraded.
-_PAGED_LOG_STREAMS = ("bootstrap_events",)
+# tracking/device counts only render on a row. Tracking MAX(ts) stays in the
+# fleet snapshot: it contributes to last_activity_at and active_1d/3d before
+# pagination. Device timestamps have no fleet consumer.
+_PAGED_LOG_STREAMS = ("bootstrap_events", "tracking_events", "device_events")
 
 
 def _paged_log_streams_into(conn, ids: list[str], out: dict, ensure) -> None:
@@ -1618,48 +1658,58 @@ def admin_screen_frames(
 
 
 def _memory_breakdowns_into(conn, ids: list[str], out: dict, ensure) -> None:
-    """Per-user memory breakdowns — page-scoped, never fleet-wide.
+    """Extract page memory fields together, then aggregate just the metadata.
 
-    ``memory_moments.doc`` is an encrypted card large enough to live out of
-    line, so every additional ``doc->`` expression costs another detoast pass
-    over the whole matched set: on a 25.9k-row fixture the four-expression
-    aggregate read 310,819 buffers where a bare ``COUNT(*)`` read 320. None of
-    the fields below reaches fleet summary, sort or filters — data_track.py
-    renders them on the user's own row, and the detail page computes its own
-    via _memory_stats — so they are read for the current page only.
+    jsonb_to_record extracts all four fields together after the type guard.
+    The materialized relation contains only metadata, not the encrypted body. The
+    CASE preserves ->>'s NULL result for scalar/array/null documents; text
+    conversion and empty-string handling match the former three queries.
+    These breakdowns do not feed fleet ordering, filters or summaries.
     """
     rows = conn.execute(
         """
-        SELECT user_id,
-               MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
-               MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
-               MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
-        FROM memory_moments
-        WHERE user_id = ANY(%s)
-        GROUP BY user_id
+        WITH metadata AS MATERIALIZED (
+            SELECT user_id,
+                   NULLIF(m.created_at, '') AS created_at,
+                   NULLIF(m.occurred_at, '') AS occurred_at,
+                   COALESCE(NULLIF(m.type, ''), 'unknown') AS type,
+                   COALESCE(NULLIF(m.source, ''), 'unknown') AS source
+            FROM memory_moments
+            CROSS JOIN LATERAL jsonb_to_record(
+                CASE WHEN jsonb_typeof(doc) = 'object' THEN doc
+                     ELSE '{}'::jsonb END
+            ) AS m(created_at text, occurred_at text, type text, source text)
+            WHERE user_id = ANY(%s)
+        ), dates AS (
+            SELECT user_id, MIN(created_at) AS first_created_at,
+                   MIN(occurred_at) AS earliest_occurred_at,
+                   MAX(occurred_at) AS latest_occurred_at
+            FROM metadata GROUP BY user_id
+        ), types AS (
+            SELECT user_id, jsonb_object_agg(type, n) AS by_type
+            FROM (SELECT user_id, type, COUNT(*)::int AS n
+                  FROM metadata GROUP BY user_id, type) counts
+            GROUP BY user_id
+        ), sources AS (
+            SELECT user_id, jsonb_object_agg(source, n) AS by_source
+            FROM (SELECT user_id, source, COUNT(*)::int AS n
+                  FROM metadata GROUP BY user_id, source) counts
+            GROUP BY user_id
+        )
+        SELECT user_id, first_created_at, earliest_occurred_at,
+               latest_occurred_at, by_type, by_source
+        FROM dates JOIN types USING (user_id) JOIN sources USING (user_id)
         """,
         (ids,),
     ).fetchall()
-    for uid, first_created_at, earliest_occurred_at, latest_occurred_at in rows:
-        memory = ensure(out, uid).setdefault("memory", {})
-        memory["first_created_at"] = first_created_at or ""
-        memory["earliest_occurred_at"] = earliest_occurred_at or ""
-        memory["latest_occurred_at"] = latest_occurred_at or ""
-
-    for field, target in (("type", "by_type"), ("source", "by_source")):
-        rows = conn.execute(
-            """
-            SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
-                   COUNT(*)::int
-            FROM memory_moments
-            WHERE user_id = ANY(%s)
-            GROUP BY user_id, value
-            """,
-            (field, ids),
-        ).fetchall()
-        for uid, value, count in rows:
-            memory = ensure(out, uid).setdefault("memory", {})
-            memory.setdefault(target, {})[value] = count
+    for uid, first, earliest, latest, by_type, by_source in rows:
+        ensure(out, uid).setdefault("memory", {}).update({
+            "first_created_at": first or "",
+            "earliest_occurred_at": earliest or "",
+            "latest_occurred_at": latest or "",
+            "by_type": by_type,
+            "by_source": by_source,
+        })
 
 
 def admin_memory_breakdowns(
@@ -1701,6 +1751,9 @@ def admin_data_track_snapshot(
     include_memory_breakdowns: bool = True,
     include_screen_frames: bool = True,
     include_paged_log_streams: bool = True,
+    include_worldbook: bool = False,
+    narrow_app_usage_to_user_stream: bool = False,
+    statement_timeout_ms: int | None = None,
 ) -> dict[str, dict]:
     """Return metadata-only aggregate stats for a set of users.
 
@@ -1708,6 +1761,11 @@ def admin_data_track_snapshot(
     full encrypted chat envelopes or memory bodies into Python just to count
     them. The returned shape is consumed by the data-track surface in
     admin/data_track.py (routes wired in admin/routes_asgi.py).
+
+    ``narrow_app_usage_to_user_stream`` is for one-user detail reads. It makes
+    PostgreSQL use the existing ``(user_id, stream, seq)`` index before testing
+    the JSON event type. Fleet snapshots leave it off so their partial
+    app-session index remains available.
     """
     ids = [str(uid) for uid in user_ids if uid]
     if not ids:
@@ -1727,8 +1785,24 @@ def admin_data_track_snapshot(
         for uid in ids
     }
     try:
-        with _admin_data_track_connection() as conn:
+        with _admin_data_track_connection(
+            timeout_ms=statement_timeout_ms,
+        ) as conn:
             _chat_rollup_into(conn, ids, out, ensure)
+
+            # Same bounded admin connection/timeout; absent schedules are closed,
+            # a failed read stays absent so the UI can report unavailable.
+            circuit_rows = conn.execute(
+                "SELECT requested.user_id, "
+                "(schedule.wake_circuit_opened_at IS NOT NULL "
+                "AND control.hosted_runtime_state='v2') AS circuit_open "
+                "FROM unnest(%s::text[]) AS requested(user_id) "
+                "LEFT JOIN v2_wake_schedule AS schedule USING (user_id) "
+                "LEFT JOIN v2_runtime_state AS control USING (user_id)",
+                (ids,),
+            ).fetchall()
+            for uid, circuit_open in circuit_rows:
+                ensure(out, uid)["wake_provider_circuit_open"] = bool(circuit_open)
 
             if include_screen_frames:
                 _screen_frames_into(conn, ids, out, ensure)
@@ -1783,6 +1857,22 @@ def admin_data_track_snapshot(
             if include_memory_breakdowns:
                 _memory_breakdowns_into(conn, ids, out, ensure)
 
+            if include_worldbook:
+                rows = conn.execute(
+                    """
+                    SELECT user_id, COUNT(*)::int, MAX(updated_at)
+                    FROM world_book_entries
+                    WHERE user_id = ANY(%s)
+                    GROUP BY user_id
+                    """,
+                    (ids,),
+                ).fetchall()
+                for uid, entries, last_updated_at in rows:
+                    ensure(out, uid)["worldbook"] = {
+                        "entries": int(entries or 0),
+                        "last_updated_at": str(last_updated_at or ""),
+                    }
+
             rows = conn.execute(
                 """
                 SELECT user_id, stream, COUNT(*)::int, MAX(ts)
@@ -1790,7 +1880,7 @@ def admin_data_track_snapshot(
                 WHERE user_id = ANY(%s)
                   AND stream IN (
                     'memory_changes', 'gate_decisions',
-                    'proactive_jobs', 'device_events', 'tracking_events'
+                    'proactive_jobs'
                   )
                 GROUP BY user_id, stream
                 """,
@@ -1802,35 +1892,57 @@ def admin_data_track_snapshot(
                     "last_ts": max_ts,
                 }
 
-            # memory_changes stays here on a harder criterion than "feeds the
-            # summary": it is the second element of the memory sort tuple in
-            # _data_track_sort_rows, so it is part of a full-set ordering. The
-            # four remaining streams are per-user trimmed, and all of them are
-            # read fleet-wide (proactive_jobs/gate_decisions through the
-            # proactive sort tuple, tracking_events through _latest_epoch).
-            if include_paged_log_streams:
-                _paged_log_streams_into(conn, ids, out, ensure)
-
+            # Counts for these three streams participate in full-set sorting.
+            # Tracking count does not, but its last timestamp feeds fleet
+            # activity. MAX uses the existing (user_id, stream, ts) index and
+            # ignores NULL timestamps, exactly like the former GROUP BY.
             rows = conn.execute(
                 """
-                SELECT user_id,
-                       COALESCE(SUM(
-                         CASE
-                           WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
-                           THEN (doc->'payload'->>'duration_sec')::bigint
-                           ELSE 0
-                         END
-                       ), 0)::bigint AS foreground_sec,
-                       COUNT(*)::int AS sessions,
-                       MAX(ts) AS last_at
-                FROM user_logs
-                WHERE user_id = ANY(%s)
-                  AND stream = 'tracking_events'
-                  AND doc->>'type' = 'app_session_end'
-                GROUP BY user_id
+                SELECT requested.user_id,
+                       (SELECT MAX(l.ts) FROM user_logs l
+                        WHERE l.user_id = requested.user_id
+                          AND l.stream = 'tracking_events')
+                FROM unnest(%s::text[]) AS requested(user_id)
                 """,
                 (ids,),
             ).fetchall()
+            for uid, max_ts in rows:
+                ensure(out, uid).setdefault("logs", {})["tracking_events"] = {
+                    "last_ts": max_ts,
+                }
+
+            if include_paged_log_streams:
+                _paged_log_streams_into(conn, ids, out, ensure)
+
+            if narrow_app_usage_to_user_stream:
+                app_usage_sql = """
+                    WITH user_tracking AS MATERIALIZED (
+                        SELECT user_id, ts, duration_sec, doc
+                        FROM user_logs
+                        WHERE user_id = ANY(%s)
+                          AND stream = 'tracking_events'
+                    )
+                    SELECT user_id,
+                           COALESCE(SUM(duration_sec), 0)::bigint AS foreground_sec,
+                           COUNT(*)::int AS sessions,
+                           MAX(ts) AS last_at
+                    FROM user_tracking
+                    WHERE doc->>'type' = 'app_session_end'
+                    GROUP BY user_id
+                """
+            else:
+                app_usage_sql = """
+                    SELECT user_id,
+                           COALESCE(SUM(duration_sec), 0)::bigint AS foreground_sec,
+                           COUNT(*)::int AS sessions,
+                           MAX(ts) AS last_at
+                    FROM user_logs
+                    WHERE user_id = ANY(%s)
+                      AND stream = 'tracking_events'
+                      AND doc->>'type' = 'app_session_end'
+                    GROUP BY user_id
+                """
+            rows = conn.execute(app_usage_sql, (ids,)).fetchall()
             for uid, foreground_sec, sessions, last_at in rows:
                 ensure(out, uid)["app_usage"] = {
                     "foreground_sec": int(foreground_sec or 0),
@@ -2859,6 +2971,7 @@ def admin_data_track_user_daily_usage(
     user_id: str,
     days: int = 14,
     tz: str = "Asia/Shanghai",
+    statement_timeout_ms: int | None = None,
 ) -> list[dict]:
     """Return one user's app usage for the latest ``days`` local dates.
 
@@ -2873,7 +2986,9 @@ def admin_data_track_user_daily_usage(
         day_limit = 14
 
     try:
-        with _admin_data_track_connection() as conn:
+        with _admin_data_track_connection(
+            timeout_ms=statement_timeout_ms,
+        ) as conn:
             rows = conn.execute(
                 """
                 WITH local_clock AS (
@@ -2898,6 +3013,12 @@ def admin_data_track_user_daily_usage(
                     )::date AS day
                     FROM bounds b
                 ),
+                user_tracking AS MATERIALIZED (
+                    SELECT ts, doc
+                    FROM user_logs
+                    WHERE user_id = %s
+                      AND stream = 'tracking_events'
+                ),
                 usage AS (
                     SELECT
                         timezone(%s, to_timestamp(l.ts))::date AS day,
@@ -2916,11 +3037,9 @@ def admin_data_track_user_daily_usage(
                               ELSE 0
                             END
                         ), 0)::bigint AS max_session_sec
-                    FROM user_logs l
+                    FROM user_tracking l
                     CROSS JOIN bounds b
-                    WHERE l.user_id = %s
-                      AND l.stream = 'tracking_events'
-                      AND l.doc->>'type' = 'app_session_end'
+                    WHERE l.doc->>'type' = 'app_session_end'
                       AND l.ts IS NOT NULL
                       AND l.ts >= b.start_epoch
                       AND l.ts < b.end_epoch
@@ -2935,7 +3054,7 @@ def admin_data_track_user_daily_usage(
                 LEFT JOIN usage u USING (day)
                 ORDER BY c.day
                 """,
-                (tz, day_limit, tz, tz, day_limit, tz, str(user_id or "")),
+                (tz, day_limit, tz, tz, day_limit, str(user_id or ""), tz),
             ).fetchall()
         return [
             {
@@ -3483,7 +3602,7 @@ def admin_data_track_growth_accounting(
     try:
         with get_pool().connection() as conn:
             act_rows = conn.execute(
-                f"""
+                """
                 SELECT DISTINCT user_id,
                        (timezone(%s, to_timestamp(ts)))::date AS d
                 FROM (
@@ -4501,7 +4620,7 @@ def admin_home_feed(*, tz: str = "Asia/Shanghai", limit: int = 12) -> dict:
     now = time.time()
     window_e = now - 48 * 3600.0
     events: list[dict] = []
-    with get_pool().connection() as conn:
+    with _admin_data_track_connection() as conn:
         ca = _ph_created_at_sql(conn)
         regs = conn.execute(
             f"""
@@ -4512,26 +4631,9 @@ def admin_home_feed(*, tz: str = "Asia/Shanghai", limit: int = 12) -> dict:
             """,
             (window_e,),
         ).fetchall()
-        replies = conn.execute(
-            """
-            WITH cand AS (
-                SELECT DISTINCT user_id FROM chat_messages
-                WHERE ts >= %s
-                  AND doc->>'role' IN ('agent','openclaw')
-                  AND COALESCE(doc->>'source','')
-                      NOT IN ('foreground_fallback','proactive_fallback')
-            )
-            SELECT cm.user_id, MIN(cm.ts) AS t
-            FROM chat_messages cm
-            WHERE cm.user_id IN (SELECT user_id FROM cand)
-              AND cm.doc->>'role' IN ('agent','openclaw')
-              AND COALESCE(cm.doc->>'source','')
-                  NOT IN ('foreground_fallback','proactive_fallback')
-            GROUP BY cm.user_id
-            HAVING MIN(cm.ts) >= %s
-            """,
-            (window_e, window_e),
-        ).fetchall()
+        replies = admin_first_events.recent_first_reply_rows(
+            conn, window_epoch=window_e,
+        )
         fails = conn.execute(
             """
             SELECT user_id, COUNT(*)::int,
@@ -5042,10 +5144,20 @@ def content_free_failure_code(
 
     Freezers call this after grouping by raw reason, so ``count`` preserves the
     number of affected attempts without logging hundreds of identical lines.
+
+    Resident memory-lane agent-call failures written before the status
+    endpoint started classifying them (``<lane>_agent_call_failed:<raw text>``)
+    keep their prefix plus a registry class instead of ``runtime_failed``; the
+    raw tail is still discarded and logged exactly like any other free text.
     """
     reason = str(raw_reason or "")
     if _LANE_ROLLUP_CODE_RE.match(reason):
         return reason
+    replacement = "runtime_failed"
+    if notices_agent_call_failure.is_agent_call_failed_reason(reason):
+        classified = notices_agent_call_failure.normalize_reason(reason)
+        if _LANE_ROLLUP_CODE_RE.match(classified):
+            replacement = classified
     bounded = reason[:_DISCARDED_FAILURE_REASON_LOG_MAX_CHARS]
     try:
         affected = max(1, int(count))
@@ -5054,7 +5166,7 @@ def content_free_failure_code(
     log.warning(
         "[failure-code] discarded non-allowlisted reason "
         "source=%s user_id=%r lane=%r day=%s count=%d "
-        "reason=%r truncated=%s",
+        "reason=%r truncated=%s replacement=%s",
         str(source or "unknown")[:80],
         str(user_id or "")[:200],
         str(lane or "")[:120],
@@ -5062,8 +5174,9 @@ def content_free_failure_code(
         affected,
         bounded,
         len(reason) > len(bounded),
+        replacement,
     )
-    return "runtime_failed"
+    return replacement
 
 _LANE_ROLLUP_TERMINAL = ("completed", "failed", "expired", "superseded")
 
@@ -5220,6 +5333,10 @@ _LANE_ROLLUP_LIVE_MAX_DAYS = 3
 _LANE_ROLLUP_NONTERMINAL = ("pending", "claimed", "running")
 _LANE_ROLLUP_V1_NONTERMINAL = ("pending", "active", "claimed", "realizing")
 _LANE_ROLLUP_STUCK_AFTER_HOURS = 6.0
+# resident stuck 没有下界：consumer 早已离开留下的 claimed/pending 孤儿会永远算 stuck。
+# 每行额外给出「创建于最近这么多小时内」的计数（``recent_count``），读的人要看
+# 「最近卡住的」而不是「历史孤儿」时用它；``count`` 口径不变。
+_LANE_ROLLUP_V1_STUCK_RECENT_HOURS = 24.0
 
 # --- 说话率与沉默分解（Seven 2026-08-18 拍板：主动侧要两个数） ---------------- #
 #
@@ -5275,13 +5392,59 @@ _LANE_ROLLUP_V2_SPOKE_JOIN = """
 # PG head 上实证过减法的洞:一次尝试可以先投出中间气泡、随后因租约超时终结成
 # expired(或 superseded),只扣 failed 的减法盖不住,恒等式当场不闭合。直接数
 # completed 那一侧结构上不会长出这类洞——除 completed 外的终态根本不在这个和里。
-_LANE_ROLLUP_V2_VOICE_SELECT = """
+#
+# 「显式声明的沉默」谓词只写**一份**，declared 用它、undeclared 用它的 NOT——
+# 两边各写一份时，改了一边忘了另一边，恒等式就会悄悄不闭合。谓词刻意写成
+# 永不为 NULL 的形态（IS NOT DISTINCT FROM），NOT 之后才是严格的补集。
+#
+# dream 的「花园太小、这次不整理」（2026-09-15 hx 拍板，不加列）：V2 worker 把它
+# 记成 status='completed' + wake_result='skipped'——一次模型都没问。它仍算
+# completed（终态口径不变），但落进 silent_declared 而不是 silent_undeclared：
+# 这是内核**明确声明**「没活可干」，与 sleep 同性质，而不是「不知道为什么没产出」
+# 的盲区。于是 dream 格子的三分解读作：
+#     spoke_completed   = 0（dream 结构上不说话，spoke 锚产出，这个 0 是真的）
+#     silent_declared   = skip（没真跑）
+#     silent_undeclared = 真跑过的完成
+# dream 的「真成功」= completed - silent_declared，读侧据此算成功率。
+# 不能把真跑的完成塞进 spoke_completed：0093 的 CHECK 要求 spoke_completed <= spoke，
+# 而 spoke 锚的是用户可见产出，为 dream 伪造 spoke 等于污染说话率。
+# 只认 lane='dream'。2026-09-28 起（T773）heartbeat 也写 wake_result='skipped'
+# （没有真实用户历史 no_user_history / 让位给新聊天 yielded_to_chat，都是一次模型
+# 都没问）。这里**刻意没改**：heartbeat 的 skipped 仍落 silent_undeclared，和改前
+# （wake_result 为 NULL 时）完全一样，冻结数不变。要不要把它算成声明沉默，语义
+# 另行拍板，不能被这里静默吸收。
+_LANE_ROLLUP_V2_DECLARED_SILENCE = (
+    "(j.wake_result IS NOT DISTINCT FROM 'sleep' "
+    "OR (j.lane = 'dream' AND j.wake_result IS NOT DISTINCT FROM 'skipped'))"
+)
+# 读侧用：哪些 lane 的 silent_declared 是「没真跑的完成」（要从成功里剔掉）。
+# 心跳等唤醒 lane 的 sleep 是一次真跑过、模型选择闭嘴的完成，**仍算成功**，
+# 所以这里只放 dream。Python 与 SQL 两份表达都从这个集合出，别手抄 lane 名。
+LANE_ROLLUP_SKIP_DECLARED_LANES = frozenset({"dream"})
+_LANE_ROLLUP_ATTEMPTED_COMPLETED_SQL = (
+    "(completed - CASE WHEN lane IN ("
+    + ",".join(f"'{name}'" for name in sorted(LANE_ROLLUP_SKIP_DECLARED_LANES))
+    + ") THEN silent_declared ELSE 0 END)"
+)
+
+
+def lane_rollup_skipped(lane: object, silent_declared: object) -> int:
+    """How many of a frozen cell's completions never actually ran (dream skip)."""
+    if str(lane or "") not in LANE_ROLLUP_SKIP_DECLARED_LANES:
+        return 0
+    try:
+        return max(0, int(silent_declared or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+_LANE_ROLLUP_V2_VOICE_SELECT = f"""
                COUNT(*) FILTER (WHERE spoke.hit)::int,
                COUNT(*) FILTER (WHERE spoke.hit AND j.status = 'completed')::int,
                COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
-                                  AND j.wake_result = 'sleep')::int,
+                                  AND {_LANE_ROLLUP_V2_DECLARED_SILENCE})::int,
                COUNT(*) FILTER (WHERE NOT spoke.hit AND j.status = 'completed'
-                                  AND j.wake_result IS DISTINCT FROM 'sleep')::int"""
+                                  AND NOT {_LANE_ROLLUP_V2_DECLARED_SILENCE})::int"""
 
 # resident 的送达锚：聊天行自带 proactive_job_id，能落到具体那一次尝试。
 #
@@ -5478,6 +5641,7 @@ _LANE_ROLLUP_V1_FAIL_PRED = (
     "OR ({mem} AND COALESCE(l.doc->>'status','') IN ('failed','error','skipped')))"
 )
 
+# memory_migrate 是历史 job_kind，机制已删；以下统计仍按原 lane 分桶。
 # lane 推断与 admin_events_overview 同一 CASE；memory 三种 job_kind 在这里拆成
 # 独立 lane（capture/dream/migrate）——events 页的合并 category 等于三者之和，
 # 互核仍然成立，粒度更高。
@@ -6495,7 +6659,8 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                    operational_failures, control_outcomes, user_unavailable,
                    spoke, spoke_completed, silent_declared, silent_undeclared
             FROM lane_daily_rollup{clause}
-            ORDER BY day DESC, user_id, lane, enqueue_source
+            ORDER BY day DESC, user_id, route, lane, enqueue_source,
+                     access_path, mode_source
             LIMIT %s OFFSET %s
             """,
             params + [int(limit), int(offset)],
@@ -6714,11 +6879,13 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
         if not route or route == "resident":
             cutoff = (datetime.now(zone)
                       - timedelta(hours=_LANE_ROLLUP_STUCK_AFTER_HOURS))
+            recent_cutoff = (datetime.now(zone)
+                             - timedelta(hours=_LANE_ROLLUP_V1_STUCK_RECENT_HOURS))
             v1_where = ["l.stream IN ('proactive_jobs','memory_capture_jobs')",
                         "COALESCE(r.route,'resident') = 'resident'",
                         "COALESCE(l.doc->>'status','') = ANY(%s)",
                         f"{_LANE_ROLLUP_V1_CREATED_TS} < %s"]
-            v1_params: list = [list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
+            v1_params: list = [recent_cutoff, list(_LANE_ROLLUP_V1_NONTERMINAL), cutoff]
             if user_id:
                 v1_where.append("l.user_id = %s")
                 v1_params.append(user_id)
@@ -6730,7 +6897,9 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                     FROM user_blobs WHERE kind = 'onboarding_route'
                 )
                 SELECT l.user_id, {_LANE_ROLLUP_V1_LANE} AS lane, COUNT(*)::int,
-                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5]  -- noqa
+                       MIN(l.ts), (array_agg(l.seq ORDER BY l.ts))[1:5],  -- noqa
+                       COUNT(*) FILTER (
+                         WHERE {_LANE_ROLLUP_V1_CREATED_TS} >= %s)::int
                 FROM user_logs l
                 LEFT JOIN routes r ON r.user_id = l.user_id,
                 LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),
@@ -6749,6 +6918,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
                      "oldest_at": (datetime.fromtimestamp(float(r[3]), timezone.utc)
                                    .isoformat() if r[3] else None),
                      "job_seqs": [int(x) for x in (r[4] or [])],
+                     "recent_count": int(r[5] or 0),
                      "basis": "older_than_threshold"})
     return {
         "rows": out_rows,
@@ -6757,6 +6927,7 @@ def admin_lane_rollup(*, user_id: str = "", lane: str = "", route: str = "",
             "rows": stuck_rows,
             "total": sum(r["count"] for r in stuck_rows),
             "stuck_after_hours": _LANE_ROLLUP_STUCK_AFTER_HOURS,
+            "resident_recent_hours": _LANE_ROLLUP_V1_STUCK_RECENT_HOURS,
             "note": ("非终态尝试不进失败率的分子或分母（Seven 2026-08-18 定 A）；"
                      "它们只出现在这里，必须与失败率并排读"),
         },
@@ -6886,6 +7057,91 @@ def admin_data_track_proactive_kinds(*, since_epoch: float = 0.0, days: int = 30
         return {}
 
 
+def memory_dream_active_job_count(
+    *,
+    legacy_since_epoch: float,
+    legacy_active_statuses: list[str],
+    v2_active_statuses: list[str],
+    v2_pending_horizon_sec: float | None = None,
+) -> int:
+    """Fleet-wide count of Dream jobs that are queued or running, both runtimes.
+
+    Dream admission uses this as its concurrency ceiling (``dream_scheduler``).
+    Both runtimes read cards through the same enclave, so one ceiling covers:
+
+    - resident V1 (hosted runner and self-hosted consumers): ``memory_dream``
+      rows in the per-user ``proactive_jobs`` log whose status is still active.
+      Only rows created since ``legacy_since_epoch`` count — a consumer that went
+      away leaves its job ``pending``/``claimed`` forever (hosted claims are never
+      reclaimed), and such an orphan must not hold a slot night after night.
+      Served by ``ix_user_logs_proactive_jobs_ts`` (partial index on ts).
+    - Runtime V2: ``agent_jobs`` rows in the ``dream`` lane whose status is in
+      ``v2_active_statuses`` (claimed/running; stale leases are retired by the
+      V2 reaper), plus — when ``v2_pending_horizon_sec`` is given — ``pending``
+      dream rows created within that many seconds of database time. Pending
+      rows must count: the pool claims every pending row the moment it has
+      capacity, so admitting while they are invisible lets the claimed total
+      exceed the ceiling. A V2 Dream has no queue deadline, so without the
+      horizon a stalled queue's pending rows would hold slots forever.
+
+    Status vocabularies are passed in by the caller so they cannot drift from
+    the job modules that own them. Raises on DB failure; the caller decides.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM user_logs
+                WHERE stream = 'proactive_jobs'
+                  AND ts >= %s
+                  AND (doc->>'job_kind' = 'memory_dream' OR doc->>'source' = 'memory_dream')
+                  AND lower(COALESCE(NULLIF(btrim(doc->>'status'), ''), 'pending')) = ANY(%s))
+              +
+              (SELECT count(*) FROM agent_jobs
+                WHERE lane = 'dream'
+                  AND (status = ANY(%s)
+                       OR (%s::double precision IS NOT NULL
+                           AND status = 'pending'
+                           AND created_at >= now() - make_interval(secs => %s::double precision))))
+            """,
+            (
+                float(legacy_since_epoch),
+                list(legacy_active_statuses),
+                list(v2_active_statuses),
+                None if v2_pending_horizon_sec is None else float(v2_pending_horizon_sec),
+                0.0 if v2_pending_horizon_sec is None else float(v2_pending_horizon_sec),
+            ),
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+@contextmanager
+def memory_dream_admission_lock():
+    """Serialize fleet Dream admission (count + enqueue) across every process.
+
+    Yields ``True`` while this caller holds the admission lock, ``False`` when
+    another admission holds it right now. The lock is a transaction-scoped
+    advisory lock on a dedicated connection, held until the ``with`` body
+    returns — the caller counts and enqueues inside the body (on their own
+    connections; the enqueue commits before this transaction ends, so the next
+    holder's count sees it). Commit or rollback releases it, including when the
+    body raises or the process dies.
+
+    ``pg_try_advisory_xact_lock`` (never the blocking form) on purpose: a
+    waiter would sit on a pool connection while the holder needs a second one
+    to enqueue, so a burst of waiters could exhaust the pool under the holder.
+    A caller that does not get the lock just re-evaluates on its next tick.
+    Raises on DB failure; the caller decides.
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("feedling.memory_dream_admission",),
+            ).fetchone()
+            yield bool(row and row[0])
+
+
 def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int = 7,
                                         tz: str = "Asia/Shanghai") -> dict[str, list[dict]]:
     """超速哨兵：每天心跳 job 数超过其 wake_interval 物理上限的用户。
@@ -7001,7 +7257,8 @@ def _admin_event_read_failure(exc: Exception) -> tuple[str, str]:
 
 
 def admin_background_lane_users(
-    user_ids: list[str], *, days: int = 7, tz: str = "Asia/Shanghai"
+    user_ids: list[str], *, classify_v2_code: Callable[[str], str],
+    days: int = 7, tz: str = "Asia/Shanghai"
 ) -> dict:
     """Bounded per-user heartbeat/capture outcomes from immutable day cells.
 
@@ -7009,6 +7266,8 @@ def admin_background_lane_users(
     ``user_logs`` for every page load and reached the production server's 240s
     boundary.  This reader scans only completed Beijing-day cells.  Counts and
     coverage stay separate so an unmeasured zero cannot look healthy.
+    The admin caller injects V2's producer classifier to keep the database
+    independent of the runtime package and share the daily summary's split.
     """
     ids = list(dict.fromkeys(str(uid) for uid in user_ids if str(uid)))
     day_count = max(1, min(int(days or 7), 90))
@@ -7125,10 +7384,12 @@ def admin_background_lane_users(
         complete = (
             bool(wm.get("backfill_from"))
             and bool(wm.get("through_day"))
-            and bool(wm.get("outcomes_from"))
             and str(wm["backfill_from"]) <= start_day.isoformat()
-            and str(wm["outcomes_from"]) <= start_day.isoformat()
             and str(wm["through_day"]) >= end_day.isoformat()
+            and (route == "model_api" or (
+                bool(wm.get("outcomes_from"))
+                and str(wm["outcomes_from"]) <= start_day.isoformat()
+            ))
         )
         coverage[route] = {
             "level": "green" if complete else "partial",
@@ -7143,6 +7404,16 @@ def admin_background_lane_users(
         uid, route, lane = str(row[0]), str(row[1]), str(row[2])
         completed = int(row[3] or 0)
         operational = int(row[7] or 0)
+        control, user_unavailable = int(row[8] or 0), int(row[9] or 0)
+        codes = {str(code): int(count or 0)
+                 for code, count in dict(row[10] or {}).items()}
+        if route == "model_api":
+            outcomes = split_v2_outcomes(
+                int(row[4] or 0) + int(row[5] or 0), codes,
+                classify=classify_v2_code,
+            )
+            operational = outcomes.operational
+            control, user_unavailable = outcomes.control, outcomes.user_unavailable
         denominator = completed + operational
         lane_row = {
             "completed": completed,
@@ -7150,14 +7421,11 @@ def admin_background_lane_users(
             "expired": int(row[5] or 0),
             "superseded": int(row[6] or 0),
             "operational_failures": operational,
-            "control_outcomes": int(row[8] or 0),
-            "user_unavailable": int(row[9] or 0),
+            "control_outcomes": control,
+            "user_unavailable": user_unavailable,
             "terminal_attempts": denominator,
             "failure_rate": operational / denominator if denominator else None,
-            "failure_codes": {
-                str(code): int(count or 0)
-                for code, count in dict(row[10] or {}).items()
-            },
+            "failure_codes": codes,
         }
         user = users.setdefault(uid, {"routes": {}, "lanes": {}})
         user["routes"].setdefault(route, {})[lane] = dict(lane_row)
@@ -7200,7 +7468,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
         return {
             "completed": 0, "failed": 0, "expired": 0, "superseded": 0,
             "operational_failures": 0, "control_outcomes": 0,
-            "user_unavailable": 0, "failure_codes": {},
+            "user_unavailable": 0, "skipped": 0, "failure_codes": {},
         }
 
     output: dict[str, dict] = {}
@@ -7278,6 +7546,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                 "operational_failures": int(row[11] or 0),
                 "control_outcomes": int(row[12] or 0),
                 "user_unavailable": int(row[13] or 0),
+                "skipped": lane_rollup_skipped(lane, row[14]),
             }
             for bucket in (
                 lanes.setdefault(lane, empty_counts()),
@@ -7288,7 +7557,7 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -7298,7 +7567,9 @@ def _lane_rollup_path_window(*, path_rows, watermarks: dict,
             per_user = per_user_lane.setdefault(
                 (lane, user_id), {"completed": 0, "failed": 0}
             )
-            per_user["completed"] += counts["completed"]
+            # 集中度的「零成功」按真跑过的完成算：只有 skip + 失败的 dream 用户
+            # 就是零成功，不能被 skip 充当成功。
+            per_user["completed"] += counts["completed"] - counts["skipped"]
             per_user["failed"] += counts["failed"]
 
         if coverage_level == "green":
@@ -7398,7 +7669,8 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                   SELECT user_id, day, route, lane, enqueue_source,
                          completed, failed, expired, superseded, failure_codes,
                          operational_failures, control_outcomes,
-                         user_unavailable
+                         user_unavailable, silent_declared,
+                         {attempted_completed} AS attempted_completed
                   FROM lane_daily_rollup
                   WHERE day >= %s AND day <= %s
                     AND route IN ('resident', 'model_api')
@@ -7413,7 +7685,9 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          coalesce(sum(control_outcomes), 0)::bigint
                            AS control_outcomes,
                          coalesce(sum(user_unavailable), 0)::bigint
-                           AS user_unavailable
+                           AS user_unavailable,
+                         coalesce(sum(silent_declared), 0)::bigint
+                           AS silent_declared
                   FROM filtered
                   GROUP BY day, route, lane, enqueue_source
                 ), code_counts AS (
@@ -7441,11 +7715,12 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                 ), per_user_lane AS (
                   SELECT route, lane, user_id,
                          bool_or(day = %s) AS active_24h,
-                         coalesce(sum(completed)
+                         coalesce(sum(attempted_completed)
                            FILTER (WHERE day = %s), 0)::bigint AS completed_24h,
                          coalesce(sum(failed)
                            FILTER (WHERE day = %s), 0)::bigint AS failed_24h,
-                         coalesce(sum(completed), 0)::bigint AS completed_7d,
+                         coalesce(sum(attempted_completed), 0)::bigint
+                           AS completed_7d,
                          coalesce(sum(failed), 0)::bigint AS failed_7d
                   FROM filtered
                   GROUP BY route, lane, user_id
@@ -7488,13 +7763,17 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                          'users_zero_success', lc.users_zero_success_7d,
                          'top_user_failure_share',
                            lc.top_user_failure_share_7d
-                       ) AS concentration_7d
+                       ) AS concentration_7d,
+                       c.silent_declared
                 FROM cells c
                 LEFT JOIN codes x USING (day, route, lane, enqueue_source)
                 JOIN route_users u USING (route)
                 JOIN lane_concentration lc USING (route, lane)
                 ORDER BY c.day, c.route, c.lane, c.enqueue_source
-                """,
+                """.replace(
+                    "{attempted_completed}",
+                    _LANE_ROLLUP_ATTEMPTED_COMPLETED_SQL,
+                ),
                 (
                     earliest.isoformat(), end_day.isoformat(),
                     end_day.isoformat(), end_day.isoformat(),
@@ -7510,7 +7789,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                 SELECT day, access_path, mode_source, user_id, lane,
                        enqueue_source, completed, failed, expired, superseded,
                        failure_codes, operational_failures, control_outcomes,
-                       user_unavailable
+                       user_unavailable, silent_declared
                 FROM lane_daily_rollup
                 WHERE day >= %s AND day <= %s
                   AND access_path <> 'unavailable'
@@ -7603,6 +7882,7 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
             "operational_failures": int(row[8] or 0),
             "control_outcomes": int(row[9] or 0),
             "user_unavailable": int(row[10] or 0),
+            "skipped": lane_rollup_skipped(row[2], row[16]),
             "failure_codes": {
                 str(code): int(count or 0)
                 for code, count in dict(row[11] or {}).items()
@@ -7660,13 +7940,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     {"completed": 0, "failed": 0,
                      "expired": 0, "superseded": 0,
                      "operational_failures": 0, "control_outcomes": 0,
-                     "user_unavailable": 0,
+                     "user_unavailable": 0, "skipped": 0,
                      "failure_codes": {}},
                 )
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -7678,13 +7958,13 @@ def admin_event_path_rollup_windows(*, through_day: str = "",
                     {"completed": 0, "failed": 0,
                      "expired": 0, "superseded": 0,
                      "operational_failures": 0, "control_outcomes": 0,
-                     "user_unavailable": 0,
+                     "user_unavailable": 0, "skipped": 0,
                      "failure_codes": {}},
                 )
                 for field in (
                     "completed", "failed", "expired", "superseded",
                     "operational_failures", "control_outcomes",
-                    "user_unavailable",
+                    "user_unavailable", "skipped",
                 ):
                     source_bucket[field] += counts[field]
                 for code, count in counts["failure_codes"].items():
@@ -8256,65 +8536,16 @@ def admin_onboarding_funnel(
     windowed ops-overview caller. ``None`` keeps the fleet-wide funnel exactly
     as before (the `view=events&event=onboarding` page depends on that)."""
     try:
-        with get_pool().connection() as conn:
+        with _admin_data_track_connection() as conn:
             registered_at_sql = _admin_utc_text_timestamp_sql(
                 "created_at",
                 supports_input_validation=conn.info.server_version >= 160000,
             )
-            if registered_cutoff_ts is None:
-                u_filter = ""
-                cohort_and = ""
-                cohort_where = ""
-                params = None
-            else:
-                # t0 is not visible inside its own CTE's WHERE, so the parse
-                # expression repeats; the cutoff itself stays a bound param.
-                u_filter = (
-                    "\n                      WHERE EXTRACT(EPOCH FROM "
-                    f"({registered_at_sql})) >= %s"
-                )
-                cohort_and = " AND user_id IN (SELECT user_id FROM u)"
-                cohort_where = " WHERE user_id IN (SELECT user_id FROM u)"
-                params = (float(registered_cutoff_ts),)
-            rows = conn.execute(f"""
-                {_EVENTS_ROUTES_CTE},
-                u AS (SELECT user_id,
-                        EXTRACT(EPOCH FROM ({registered_at_sql})) AS t0
-                      FROM users{u_filter}),
-                gen_started AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
-                          FROM genesis_import_jobs
-                          WHERE COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'{cohort_and}
-                          GROUP BY user_id),
-                firstact AS (SELECT user_id, MIN(ts) AS t FROM (
-                             SELECT user_id, ts FROM chat_messages{cohort_where}
-                             UNION ALL SELECT user_id, ts FROM user_logs WHERE stream='proactive_jobs'{cohort_and}
-                           ) a GROUP BY user_id),
-                gen AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
-                        FROM genesis_import_jobs
-                        WHERE status IN ('done','completed')
-                          AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'{cohort_and}
-                        GROUP BY user_id),
-                mem AS (SELECT user_id,
-                        MIN(EXTRACT(EPOCH FROM (COALESCE(NULLIF(doc->>'created_at',''), occurred_at))::timestamptz)) AS t
-                        FROM memory_moments
-                        WHERE COALESCE(NULLIF(doc->>'created_at',''), occurred_at) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'{cohort_and}
-                        GROUP BY user_id),
-                reply AS (SELECT user_id, MIN(ts) AS t FROM chat_messages
-                          WHERE doc->>'role' IN ('agent','openclaw')
-                            AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback'){cohort_and}
-                          GROUP BY user_id)
-                SELECT u.user_id, COALESCE(r.route,'resident') AS route, u.t0,
-                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen_started.t ELSE firstact.t END AS t1,
-                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen.t ELSE mem.t END AS t2,
-                       reply.t AS t3
-                FROM u
-                LEFT JOIN routes r ON r.user_id = u.user_id
-                LEFT JOIN gen_started ON gen_started.user_id = u.user_id
-                LEFT JOIN firstact ON firstact.user_id = u.user_id
-                LEFT JOIN gen ON gen.user_id = u.user_id
-                LEFT JOIN mem ON mem.user_id = u.user_id
-                LEFT JOIN reply ON reply.user_id = u.user_id
-            """, params).fetchall()
+            rows = admin_first_events.onboarding_rows(
+                conn, registered_at_sql=registered_at_sql,
+                routes_cte=_EVENTS_ROUTES_CTE,
+                registered_cutoff_ts=registered_cutoff_ts,
+           )
         def f(v):
             return float(v) if v is not None else None
         return [{"user_id": r[0], "route": r[1], "t0": f(r[2]), "t1": f(r[3]),
@@ -8802,10 +9033,10 @@ _TRACE_EVENT_COLUMNS = (
     "dur_ms",
 )
 TRACE_OUTCOME_CLASSES = frozenset({
-    "operational_failure", "timeout", "control", "safety_suppression",
-    "user_unavailable",
+    "unspecified", "operational_failure", "timeout", "control",
+    "safety_suppression", "user_unavailable",
 })
-TRACE_OUTCOME_DEFAULT = "operational_failure"
+TRACE_OUTCOME_DEFAULT = "unspecified"
 TRACE_OUTCOME_PROVENANCE_FIELD = "outcome_class_provenance"
 TRACE_OUTCOME_PROVENANCE_VALUES = frozenset({
     "explicit", "missing", "normalized_invalid",
@@ -8902,6 +9133,102 @@ def insert_trace_events_strict(
             if eligible:
                 cur.executemany(statement, eligible)
     return len(eligible)
+
+
+def enclave_decrypt_health_windows(window_minutes: int, *, now: datetime | None = None) -> tuple:
+    """UTC wall-clock aligned (start, end] windows, last complete bucket first.
+
+    An event exactly at a bucket's end belongs to that completed bucket.
+    """
+    if type(window_minutes) is not int or not 1 <= window_minutes <= 1440:
+        raise ValueError("invalid_window_minutes")
+    calculated_at = now if now is not None else datetime.now(timezone.utc)
+    if calculated_at.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    seconds = window_minutes * 60
+    end_epoch = (calculated_at.timestamp() // seconds) * seconds
+    end = datetime.fromtimestamp(end_epoch, timezone.utc)
+    start = end - timedelta(minutes=window_minutes)
+    return start - timedelta(minutes=window_minutes), start, end
+
+
+def admin_enclave_decrypt_health(window_minutes: int = 15, *, now: datetime | None = None) -> dict:
+    """Two complete adjacent (start, end] windows of recorded terminal events.
+
+    Calls counts all done/timeout/error rows, not starts, batches or suppressed
+    successes. The alert rate excludes HTTP errors from both numerator and
+    denominator: (timeout + transport_error) / (done + unavailable).
+    A zero denominator is unmeasured (None), never a measured zero rate.
+    User IDs and raw detail never leave PostgreSQL. Unknown purpose labels are
+    collapsed before grouping, including slug-shaped identifiers/secrets.
+    """
+    previous_start, current_start, calculated_at = enclave_decrypt_health_windows(
+        window_minutes, now=now,
+    )
+    with get_pool().connection(timeout=5) as conn:
+        with conn.transaction():
+            conn.execute("SELECT set_config('statement_timeout', %s, true)", ("5000ms",))
+            rows = conn.execute(
+                """
+                WITH events AS MATERIALIZED (
+                    SELECT CASE WHEN ts > %s THEN 'current' ELSE 'previous' END AS period,
+                           user_id,
+                           CASE WHEN type = 'enclave.call.done' THEN 'done'
+                                WHEN type = 'enclave.call.timeout' THEN 'timeout'
+                                WHEN detail->>'status_code' = '401' THEN 'http_401'
+                                WHEN detail->>'status_code' = '403' THEN 'http_403'
+                                WHEN detail->>'failure_class' = 'enclave_transport_error'
+                                    THEN 'transport_error'
+                                ELSE 'http_other' END AS kind,
+                           CASE WHEN detail->>'purpose' = ANY(%s)
+                                THEN detail->>'purpose' ELSE 'other' END AS purpose
+                    FROM trace_events
+                    WHERE ts > %s AND ts <= %s AND subsystem = 'enclave'
+                      AND type IN ('enclave.call.done', 'enclave.call.timeout', 'enclave.call.error')
+                ), totals AS (
+                    SELECT period,
+                           count(*) FILTER (WHERE kind = 'done') AS done,
+                           count(*) FILTER (WHERE kind = 'timeout') AS timeout,
+                           count(*) FILTER (WHERE kind = 'transport_error') AS transport_error,
+                           count(*) FILTER (WHERE kind = 'http_401') AS http_401,
+                           count(*) FILTER (WHERE kind = 'http_403') AS http_403,
+                           count(*) FILTER (WHERE kind = 'http_other') AS http_other,
+                           count(DISTINCT user_id) FILTER (WHERE kind <> 'done') AS users_affected
+                    FROM events GROUP BY period
+                ), purposes AS (
+                    SELECT period, purpose, count(*) AS count
+                    FROM events WHERE kind <> 'done' GROUP BY period, purpose
+                )
+                SELECT totals.*,
+                       (SELECT jsonb_agg(jsonb_build_object('purpose', p.purpose, 'count', p.count)
+                                         ORDER BY p.count DESC, p.purpose)
+                        FROM (SELECT purpose, count FROM purposes
+                              WHERE period = totals.period
+                              ORDER BY count DESC, purpose LIMIT 5) p) AS top_purposes
+                FROM totals
+                """,
+                (current_start, sorted(enclave_health_contract.PURPOSE_LABELS),
+                 previous_start, calculated_at),
+            ).fetchall()
+    windows = {}
+    for period, start, end in (("current", current_start, calculated_at),
+                               ("previous", previous_start, current_start)):
+        windows[period] = {key: 0 for key in enclave_health_contract.COUNT_KEYS}
+        windows[period].update(start_at=start.isoformat(), end_at=end.isoformat(),
+                               unavailable_rate=None, top_purposes=[])
+    for period, done, timeout, transport, http401, http403, other, users, purposes in rows:
+        unavailable = timeout + transport
+        denominator = done + unavailable
+        windows[period].update(
+            done=done, timeout=timeout, transport_error=transport,
+            http_401=http401, http_403=http403, http_other=other,
+            calls=denominator + http401 + http403 + other,
+            unavailable=unavailable,
+            unavailable_rate=unavailable / denominator if denominator else None,
+            users_affected=users, top_purposes=purposes or [],
+        )
+    return {"window_minutes": window_minutes, "calculated_at": calculated_at.isoformat(),
+            **windows}
 
 
 def query_trace_events(
@@ -10007,6 +10334,62 @@ def patch_blob_strict(
     return persisted_doc
 
 
+def patch_blob_if_match_strict(
+    user_id: str,
+    kind: str,
+    patch: dict,
+    *,
+    precondition,
+    statement_timeout_ms: int | None = None,
+) -> tuple[bool, dict | None]:
+    """Compare-and-merge one existing blob: the operator-repair write path.
+
+    Locks the row, evaluates ``precondition(current_doc, conn)`` on the locked
+    document — ``conn`` is this transaction's connection, so the precondition
+    can also check related rows in the same transaction — and only then merges
+    ``patch``'s top-level keys, so a writer that commits after this read cannot
+    be overwritten by a merge computed from a stale view. A missing row is never
+    created (``(False, None)``); a failed precondition returns
+    ``(False, current_doc)``; a merge returns ``(True, persisted_doc)`` after
+    mirroring the committed document to the TEE shadow exactly as
+    :func:`patch_blob_strict` does.
+
+    The lock only fences writers that also lock or merge atomically. A
+    read/modify/full-write writer (``set_blob``) that read before this commit
+    can still overwrite the merge afterwards, so the patched keys must not be
+    full-written by such a writer. Revisioned kinds are refused: their mirror
+    ordering needs the revision bump this merge does not perform. DB failures
+    propagate.
+    """
+    if kind in _REVISIONED_BLOB_KINDS:
+        raise ValueError("compare-and-merge does not support revisioned blob kinds")
+    clean_patch = dict(patch or {})
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            if statement_timeout_ms is not None:
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f"{int(statement_timeout_ms)}ms",),
+                )
+            current = conn.execute(
+                "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                (user_id, kind),
+            ).fetchone()
+            if current is None:
+                return False, None
+            current_doc = dict(current[0]) if isinstance(current[0], dict) else {}
+            if not precondition(dict(current_doc), conn):
+                return False, current_doc
+            row = conn.execute(
+                "UPDATE user_blobs SET doc = doc || %s "
+                "WHERE user_id=%s AND kind=%s RETURNING doc",
+                (Jsonb(clean_patch), user_id, kind),
+            ).fetchone()
+    persisted_doc = row[0]
+    _mirror_persisted_blob(user_id, kind, persisted_doc)
+    return True, persisted_doc
+
+
 def advance_blob_int_strict(user_id: str, kind: str, key: str, new_value: int):
     """Atomically advance one non-negative integer field without regression.
 
@@ -10460,8 +10843,8 @@ def claim_and_enqueue_introduction(
         "RETURNING doc"
     )
     job_sql = (
-        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-        "VALUES (%s, 'proactive_jobs', %s, %s, %s) RETURNING seq"
+        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+        "VALUES (%s, 'proactive_jobs', %s, %s, %s, NULL) RETURNING seq"
     )
     claimed_doc = None
     seq = None
@@ -10499,8 +10882,8 @@ def claim_and_enqueue_introduction(
     from tee_shadow import mirror
     _mirror_proactive_settings_current(str(user_id))
     mirror.execute(
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s, NULL) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING",
         (user_id, seq, ts, item_key, Jsonb(job)),
     )
@@ -11999,6 +12382,93 @@ def chat_get_many_strict(user_id: str, message_ids: list[str]) -> list[dict]:
     return [_chat_project_row(row) for row in rows]
 
 
+# This predicate matches both migration chains' partial index. Keep it literal:
+# parameterizing its constants prevents generic plans proving index eligibility.
+_AGENT_CANVAS_CARD_PREDICATE = (
+    "(doc->>'role') IN ('agent','openclaw') "
+    "AND (doc->>'content_type') = 'file' "
+    "AND lower(doc->>'file_name') LIKE '%.io.html'"
+)
+
+_CHAT_LATEST_AGENT_CANVAS_CARDS_SQL = (
+    "SELECT filename,msg_id,to_timestamp(created_ts),to_timestamp(updated_ts),"
+    "display_title,display_subtitle FROM ("
+    "SELECT DISTINCT ON (doc->>'file_name') "
+    "doc->>'file_name' AS filename,msg_id,ts AS updated_ts,"
+    "min(ts) OVER (PARTITION BY doc->>'file_name') AS created_ts,"
+    "NULLIF(doc->>'file_display_title','') AS display_title,"
+    "NULLIF(doc->>'file_display_subtitle','') AS display_subtitle "
+    "FROM chat_messages WHERE user_id=%s AND "
+    + _AGENT_CANVAS_CARD_PREDICATE.replace("%", "%%")
+    + " AND NOT EXISTS (SELECT 1 FROM v2_workspace_entries AS workspace "
+    "WHERE workspace.user_id=chat_messages.user_id AND workspace.kind='workspace' "
+    "AND workspace.path='/workspace/' || (chat_messages.doc->>'file_name')) "
+    "ORDER BY doc->>'file_name',ts DESC,seq DESC) AS cards "
+    "ORDER BY updated_ts DESC,filename ASC LIMIT %s"
+)
+
+
+def chat_latest_agent_canvas_cards(user_id: str, limit: int = 500) -> list[dict]:
+    """Read latest cards for Canvas names without a published workspace entry.
+
+    Only card metadata leaves SQL; bodies/envelopes stay in storage. Excluding
+    *all* workspace names before LIMIT preserves workspace precedence even if
+    that workspace row falls outside the endpoint's newest 500 entries.
+    """
+    maximum = max(1, min(int(limit), 500))
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _CHAT_LATEST_AGENT_CANVAS_CARDS_SQL, (user_id, maximum),
+        ).fetchall()
+    return [
+        {"filename": str(filename), "message_id": str(message_id),
+         "created_at": created_at, "updated_at": updated_at,
+         "display_title": display_title, "display_subtitle": display_subtitle}
+        for filename, message_id, created_at, updated_at, display_title,
+        display_subtitle in rows
+    ]
+
+
+def chat_latest_agent_canvas_metadata_by_name(
+    user_id: str,
+    file_names: list[str],
+) -> dict[str, dict]:
+    """Return the newest agent-authored Canvas-card metadata for each name.
+
+    Canvas workspace rows are durable independently of their original Chat
+    attachment, so missing names are expected and simply do not appear in the
+    result. Only plaintext card metadata is projected; message bodies and
+    envelopes never leave this query.
+    """
+    names = list(
+        dict.fromkeys(
+            str(file_name) for file_name in file_names if str(file_name)
+        )
+    )[:500]
+    if not names:
+        return {}
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (doc->>'file_name') "
+            "doc->>'file_name',msg_id,"
+            "NULLIF(doc->>'file_display_title',''),"
+            "NULLIF(doc->>'file_display_subtitle','') "
+            "FROM chat_messages WHERE user_id=%s "
+            "AND " + _AGENT_CANVAS_CARD_PREDICATE.replace("%", "%%") + " "
+            "AND doc->>'file_name'=ANY(%s) "
+            "ORDER BY doc->>'file_name',seq DESC",
+            (user_id, names),
+        ).fetchall()
+    return {
+        str(file_name): {
+            "message_id": str(message_id),
+            "display_title": display_title,
+            "display_subtitle": display_subtitle,
+        }
+        for file_name, message_id, display_title, display_subtitle in rows
+    }
+
+
 def chat_verify_reply_strict(
     user_id: str,
     ping_id: str,
@@ -12718,6 +13188,52 @@ def chat_capture_messages_after_seq(
     ]
 
 
+def chat_capture_messages_oldest_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    sources: list[str] | tuple[str, ...],
+    limit: int,
+) -> list[dict]:
+    """Return the OLDEST bounded Capture-eligible metadata after an exact seq.
+
+    Counterpart of :func:`chat_capture_messages_after_seq` (which returns the
+    newest rows for trigger heuristics). Resident V1 capture uses this to cut
+    one exact contiguous batch starting right after the capture cursor, so a
+    backlog larger than one batch is drained oldest-first instead of the
+    cursor jumping to the newest message. Same eligibility predicate, same
+    metadata-only shape; ``ORDER BY seq ASC LIMIT`` reads one small index
+    range, never the whole uncaptured transcript.
+    """
+    cursor_seq = int(after_seq)
+    bounded = max(1, min(int(limit), 1000))
+    allowed = [str(source) for source in sources if str(source)]
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    if not allowed:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,msg_id,ts,doc->>'role' AS role,"
+            " COALESCE(doc->>'source','') AS source FROM chat_messages "
+            " WHERE user_id=%s AND seq>%s "
+            " AND doc->>'role' IN ('user','openclaw') "
+            " AND COALESCE(doc->>'source','')=ANY(%s::text[]) "
+            " ORDER BY seq ASC LIMIT %s",
+            (str(user_id), cursor_seq, allowed, bounded),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[1]),
+            "ts": float(row[2]),
+            "seq": int(row[0]),
+            "role": str(row[3] or ""),
+            "source": str(row[4] or ""),
+        }
+        for row in rows
+    ]
+
+
 def chat_user_turn_count_strict(user_id: str) -> int:
     """Return the durable count of chat rows whose role is exactly ``user``.
 
@@ -12956,6 +13472,15 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
+    with storage_read_trace.observe(user_id, hydrate=True) as observation:
+        out = _hydrate_chat_file_pointer(user_id, doc)
+        if _is_chat_file_pointer(out) and observation["status"] == "ok":
+            observation.update(status="other", error_class="body_unavailable")
+        return out
+
+
+def _hydrate_chat_file_pointer(user_id: str, doc: dict) -> dict:
+    """Decode/validate an enabled R2 pointer within its hydrate observation."""
     body_format = _chat_body_object_format(doc)
     if body_format == "sealed_v1":
         body = object_storage.get_chat_body(
@@ -13294,7 +13819,7 @@ def memory_user_mutation_fence(user_id: str):
     """
     normalized = str(user_id)
     if _memory_mutation_context(normalized) is not None:
-        yield
+        yield _memory_mutation_context(normalized)[0]
         return
 
     callbacks: list = []
@@ -13307,7 +13832,7 @@ def memory_user_mutation_fence(user_id: str):
             current[normalized] = (conn, callbacks)
             token = _memory_mutation_contexts.set(current)
             try:
-                yield
+                yield conn
             finally:
                 _memory_mutation_contexts.reset(token)
 
@@ -13993,7 +14518,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     return False
                 cur.execute(
                     "SELECT 1 FROM users WHERE user_id=%s "
-                    "AND doc->>'content_encryption'='off'",
+                    "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                    "<> 'on'",
                     (user_id,),
                 )
                 if cur.fetchone() is None:
@@ -14045,7 +14571,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     guard_exists = cur.fetchone() is not None
                     cur.execute(
                         "SELECT 1 FROM users WHERE user_id=%s "
-                        "AND doc->>'content_encryption'='off'",
+                        "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                        "<> 'on'",
                         (user_id,),
                     )
                     tier_allows = cur.fetchone() is not None
@@ -14082,7 +14609,8 @@ def migrate_chat_r2_pointer_to_plaintext(
                     guard_exists = cur.fetchone() is not None
                     cur.execute(
                         "SELECT 1 FROM users WHERE user_id=%s "
-                        "AND doc->>'content_encryption'='off'",
+                        "AND lower(trim(coalesce(doc->>'content_encryption',''))) "
+                        "<> 'on'",
                         (user_id,),
                     )
                     tier_allows = cur.fetchone() is not None
@@ -15625,6 +16153,15 @@ def chat_append_and_enqueue(
                     "requeue",
                 )
         for preempted in _preempted_jobs:
+            if preempted.capture_failure_state is not None:
+                # 抢占时终结了一个租约已过期的落卡任务并记了失败：提交后镜像状态 + 同步提示。
+                # 纯旁路，放到后台线程做，不拖慢这次发送的返回（Codex 第 13 轮 M2）。
+                jobs_store.after_capture_crash_recorded_in_background(
+                    user_id,
+                    preempted.job_id,
+                    source="chat_preempt",
+                    failed_state=preempted.capture_failure_state,
+                )
             if preempted.claimed_by is None:
                 continue
             core_wake_bus.notify_job_cancel(
@@ -16917,7 +17454,7 @@ def memory_load(user_id: str) -> list[dict]:
 
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
     """Single-row upsert. Returns True iff the write committed — callers that
-    advance state on success (e.g. memory.upgrade / migration) MUST check it."""
+    advance state on success MUST check it."""
     try:
         context = _memory_mutation_context(user_id)
         if context is None:
@@ -16980,6 +17517,69 @@ def memory_delete(user_id: str, moment_id: str) -> bool:
         ]),
     )
     return deleted
+
+
+def memory_vectors_load(user_id: str, model_id: str) -> dict:
+    """Read one model version; omit corrupt rows so the scanner rebuilds them.
+
+    Database errors still propagate. Only invalid derived values count as absent.
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT moment_id, projection_hash, dim, vector FROM memory_vectors "
+            "WHERE user_id=%s AND model_id=%s", (user_id, model_id),
+        ).fetchall()
+    result = {}
+    invalid = 0
+    for mid, digest, dim, blob in rows:
+        values = list(struct.unpack("<" + "f" * dim, blob))
+        if not any(values) or any(not math.isfinite(v) for v in values):
+            invalid += 1
+            continue
+        result[mid] = (digest, values)
+    if invalid:
+        log.warning("memory_embedding invalid_vectors=%d", invalid)
+    return result
+
+
+def memory_vectors_upsert(user_id: str, model_id: str, rows) -> None:
+    """Rows are (moment_id, projection_hash, float vector); one atomic batch.
+
+    Caller owns fresh-card projection checks. The shared account fence also
+    prevents an in-flight scanner from recreating rows after account deletion.
+    """
+    prepared = []
+    for mid, digest, vector in rows:
+        values = [float(v) for v in vector]
+        if (not mid or not model_id or not re.fullmatch(r"[0-9a-f]{16}", digest)
+                or not values or any(not math.isfinite(v) for v in values)
+                or not any(values)):
+            raise ValueError("memory_vector_invalid")
+        blob = struct.pack("<" + "f" * len(values), *values)
+        if not any(struct.unpack("<" + "f" * len(values), blob)):
+            raise ValueError("memory_vector_invalid")
+        prepared.append((user_id, mid, model_id, digest, len(values), blob,
+                         datetime.now(timezone.utc).isoformat()))
+    if not prepared:
+        return
+    with memory_user_mutation_fence(user_id) as conn:
+        if conn.execute("SELECT 1 FROM users WHERE user_id=%s FOR KEY SHARE", (user_id,)).fetchone() is None:
+            raise ValueError("memory_vector_user_missing")
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO memory_vectors(user_id,moment_id,model_id,projection_hash,dim,vector,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id,moment_id,model_id) "
+                "DO UPDATE SET projection_hash=EXCLUDED.projection_hash, dim=EXCLUDED.dim, "
+                "vector=EXCLUDED.vector, created_at=EXCLUDED.created_at", prepared)
+
+
+def memory_vectors_prune(user_id: str, model_id: str, keep_moment_ids: list[str]) -> int:
+    """Prune only this user/model; an empty keep set removes all its vectors."""
+    with memory_user_mutation_fence(user_id) as conn:
+        return conn.execute(
+            "DELETE FROM memory_vectors WHERE user_id=%s AND model_id=%s "
+            "AND NOT (moment_id = ANY(%s))", (user_id, model_id, keep_moment_ids),
+        ).rowcount
 
 
 def memory_replace_all(user_id: str, moments: list[dict]) -> None:
@@ -17934,6 +18534,25 @@ def model_api_autoselect_active(user_id: str) -> str | None:
 # Frame envelopes (heavy body_ct lives here; frames_meta index stays a blob)
 # ---------------------------------------------------------------------------
 
+FRAME_SOURCE_SCREEN = "screen"
+FRAME_SOURCE_PHOTO = "photo"
+# Rows written before source attribution are intentionally not assigned to
+# either normal source. They remain readable by id, but fail closed from all
+# source-filtered list/rebuild paths.
+FRAME_SOURCE_LEGACY_UNATTRIBUTED = "legacy_unattributed"
+_FRAME_SOURCES = frozenset({FRAME_SOURCE_SCREEN, FRAME_SOURCE_PHOTO})
+FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD = (
+    "_plaintext_migration_legacy_frame_cleanup_pending"
+)
+
+
+def _require_frame_source(source: str) -> str:
+    if not isinstance(source, str) or source not in _FRAME_SOURCES:
+        raise ValueError(
+            f"source must be one of {sorted(_FRAME_SOURCES)!r}; got {source!r}"
+        )
+    return source
+
 
 class FrameReadUnavailable(RuntimeError):
     """The frame may exist, but its durable store could not be read."""
@@ -17962,7 +18581,9 @@ def _frame_write_row(user_id: str, frame_id: str, ts: float,
         return False
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
+def frame_upsert(
+    user_id: str, frame_id: str, ts: float, doc: dict, *, source: str
+) -> bool:
     """Persist a v1 frame envelope.
 
     With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
@@ -17981,14 +18602,20 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
     inline row. ``doc`` is offloaded out of the row only after the body is in
     R2, so the at-rest table stays small without a missing-object window.
     Returns whether a readable row was durably stored."""
+    source = _require_frame_source(source)
     body_field = (
         "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
         else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
         else None
     )
+    env_meta = {
+        k: v for k, v in doc.items()
+        if k not in {"body_ct", "body_b64"}
+    }
+    env_meta["source"] = source
     if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
-        if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
+        if not _frame_write_row(user_id, frame_id, ts, doc, env_meta, None):
             return False  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
@@ -18000,7 +18627,6 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
-        env_meta = {k: v for k, v in doc.items() if k != body_field}
         if body_field == "body_b64":
             env_meta["body_object_format"] = "plaintext_v1"
             raw = base64.b64decode(str(doc[body_field]), validate=True)
@@ -18008,7 +18634,196 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> bool:
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
         return True
-    return _frame_write_row(user_id, frame_id, ts, doc, None, None)
+    return _frame_write_row(user_id, frame_id, ts, doc, env_meta, None)
+
+
+def migrate_frame_to_plaintext(
+    user_id: str,
+    frame_id: str,
+    *,
+    ts: float,
+    old_doc: dict | None,
+    old_env_meta: dict | None,
+    old_body_key: str | None,
+    plaintext: bytes,
+    semantic_meta: dict,
+) -> bool:
+    """CAS one legacy frame to plaintext without overwriting its ciphertext.
+
+    With R2 enabled, plaintext is uploaded under the distinct
+    ``frames-plaintext`` prefix before the row is promoted.  The legacy object
+    remains authoritative until that CAS commits.  Without R2, the row becomes
+    a verified inline ``body_b64`` document.  A CAS loser never retires the old
+    object and best-effort removes its unreferenced candidate upload.
+    """
+    if not isinstance(plaintext, bytes):
+        raise TypeError("plaintext must be bytes")
+    if not isinstance(semantic_meta, dict):
+        raise TypeError("semantic_meta must be a dict")
+
+    expected_doc = Jsonb(old_doc) if old_doc is not None else None
+    expected_meta = Jsonb(old_env_meta) if old_env_meta is not None else None
+
+    def _lock_matches(cur) -> bool:
+        cur.execute(
+            "SELECT doc->>'content_encryption' FROM users "
+            "WHERE user_id=%s FOR UPDATE",
+            (user_id,),
+        )
+        preference = cur.fetchone()
+        if (
+            preference is None
+            or str(preference[0] or "").strip().lower() == "on"
+        ):
+            return False
+        cur.execute(
+            "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND frame_id=%s "
+            "AND ts=%s AND doc IS NOT DISTINCT FROM %s "
+            "AND env_meta IS NOT DISTINCT FROM %s "
+            "AND body_key IS NOT DISTINCT FROM %s FOR UPDATE",
+            (
+                user_id, frame_id, float(ts), expected_doc, expected_meta,
+                old_body_key,
+            ),
+        )
+        return cur.fetchone() is not None
+
+    # Do not perform network writes until the exact source shape and tier have
+    # both been checked under locks.
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if not _lock_matches(cur):
+                    return False
+
+    digest = hashlib.sha256(plaintext).hexdigest()
+    common = dict(semantic_meta)
+    common.update({
+        "body_object_format": "plaintext_v1",
+        "body_sha256": digest,
+        "body_size_bytes": len(plaintext),
+    })
+    if old_body_key:
+        if old_body_key != object_storage.frame_key(user_id, frame_id):
+            raise ValueError("frame plaintext migration requires canonical legacy key")
+        common[FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD] = True
+    candidate_key = None
+    if object_storage.enabled():
+        candidate_key = object_storage.put_frame_plaintext_body(
+            user_id, frame_id, plaintext,
+        )
+        new_doc = None
+        new_meta = common
+    else:
+        new_doc = {
+            **common,
+            "body_b64": base64.b64encode(plaintext).decode("ascii"),
+        }
+        new_meta = None
+
+    won = False
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if _lock_matches(cur):
+                    cur.execute(
+                        "UPDATE frame_envelopes SET doc=%s,env_meta=%s,body_key=%s "
+                        "WHERE user_id=%s AND frame_id=%s AND ts=%s "
+                        "AND doc IS NOT DISTINCT FROM %s "
+                        "AND env_meta IS NOT DISTINCT FROM %s "
+                        "AND body_key IS NOT DISTINCT FROM %s RETURNING 1",
+                        (
+                            Jsonb(new_doc) if new_doc is not None else None,
+                            Jsonb(new_meta) if new_meta is not None else None,
+                            candidate_key,
+                            user_id,
+                            frame_id,
+                            float(ts),
+                            expected_doc,
+                            expected_meta,
+                            old_body_key,
+                        ),
+                    )
+                    won = cur.fetchone() is not None
+
+    if candidate_key and not won:
+        with get_pool().connection() as conn:
+            referenced = conn.execute(
+                "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND body_key=%s LIMIT 1",
+                (user_id, candidate_key),
+            ).fetchone() is not None
+        if not referenced:
+            object_storage.delete_frame_body_key(candidate_key, user_id)
+    if not won:
+        return False
+
+    from tee_shadow import mirror
+
+    mirror.mark_pending(
+        user_id, "frame_envelopes", frame_id, "requeue_plaintext_migration"
+    )
+    if old_body_key and old_body_key != candidate_key:
+        retry_frame_plaintext_cleanup(user_id, frame_id)
+    return True
+
+
+def frame_plaintext_cleanup_pending(user_id: str, frame_id: str) -> bool:
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM frame_envelopes WHERE user_id=%s AND frame_id=%s "
+            "AND env_meta->%s = 'true'::jsonb",
+            (user_id, frame_id, FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD),
+        ).fetchone()
+    return row is not None
+
+
+def retry_frame_plaintext_cleanup(user_id: str, frame_id: str) -> bool:
+    """Retire the deterministic legacy ciphertext and clear its durable marker."""
+    legacy_key = object_storage.frame_key(user_id, frame_id)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT doc->>'content_encryption' FROM users "
+                    "WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                preference = cur.fetchone()
+                if (
+                    preference is None
+                    or str(preference[0] or "").strip().lower() == "on"
+                ):
+                    return False
+                cur.execute(
+                    "SELECT body_key FROM frame_envelopes "
+                    "WHERE user_id=%s AND frame_id=%s "
+                    "AND env_meta->%s = 'true'::jsonb "
+                    "FOR UPDATE",
+                    (user_id, frame_id, FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return True
+                current_key = str(row[0] or "")
+                expected_prefix = f"frames-plaintext/{user_id}/{frame_id}/"
+                if not current_key.startswith(expected_prefix):
+                    return False
+                # Keep the row lock across this one bounded network delete. A
+                # concurrent frame rewrite cannot repoint to the legacy key
+                # between our safety check and deletion.
+                if not object_storage.delete_frame_body_key(legacy_key, user_id):
+                    return False
+                cur.execute(
+                    "UPDATE frame_envelopes SET env_meta=env_meta-%s "
+                    "WHERE user_id=%s AND frame_id=%s AND body_key=%s",
+                    (
+                        FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD,
+                        user_id,
+                        frame_id,
+                        current_key,
+                    ),
+                )
+    return True
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -18089,7 +18904,12 @@ def frame_get(
         body = None
         for attempt in range(2):
             try:
-                body = object_storage.get_frame_body_strict(user_id, frame_id)
+                if body_key == object_storage.frame_key(user_id, frame_id):
+                    body = object_storage.get_frame_body_strict(user_id, frame_id)
+                else:
+                    body = object_storage.get_frame_body_by_key_strict(
+                        body_key, user_id,
+                    )
                 break
             except Exception as e:  # noqa: BLE001
                 if attempt == 0:
@@ -18110,6 +18930,10 @@ def frame_get(
                       user_id, frame_id, body_key)
             return None
         out = dict(env_meta or {})
+        # Source attribution belongs to storage metadata, not the uploaded
+        # cryptographic envelope returned to callers.
+        out.pop("source", None)
+        out.pop(FRAME_PLAINTEXT_CLEANUP_PENDING_FIELD, None)
         if out.pop("body_object_format", None) == "plaintext_v1":
             try:
                 raw = base64.b64decode(body, validate=True)
@@ -18133,12 +18957,16 @@ def frame_get(
 
 
 def frame_delete(user_id: str, frame_id: str) -> None:
+    stored_body_key = None
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = %s",
+            deleted = conn.execute(
+                "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = %s "
+                "RETURNING body_key",
                 (user_id, frame_id),
-            )
+            ).fetchone()
+            if deleted is not None:
+                stored_body_key = deleted[0]
     except Exception as e:
         # Row delete failed → the pointer row survives, so leave the R2 body in
         # place; deleting it now would corrupt later reads of the still-present row.
@@ -18156,23 +18984,42 @@ def frame_delete(user_id: str, frame_id: str) -> None:
     ])
     if object_storage.enabled():
         object_storage.delete_frame_body(user_id, frame_id)
+        if (
+            stored_body_key
+            and stored_body_key != object_storage.frame_key(user_id, frame_id)
+        ):
+            object_storage.delete_frame_body_key(stored_body_key, user_id)
         # Also reap the TEE storage-layer re-encrypted body (frames-tee/) so a
         # single-frame delete doesn't orphan it (best-effort, same style).
         object_storage.delete_frame_tee_body(user_id, frame_id)
 
 
-def frame_list_meta(user_id: str) -> list[dict]:
+def frame_list_meta(
+    user_id: str, *, source: str, unavailable_raises: bool = False
+) -> list[dict]:
     """Reconstruct a lightweight frames_meta index from the stored envelopes.
-    Used as the rebuild fallback when the frames_meta blob is missing."""
+    Used as the rebuild fallback when the frames_meta blob is missing.
+
+    Source is mandatory and validated before accessing storage. Legacy rows
+    without ``env_meta.source`` have the explicit fail-safe classification
+    ``FRAME_SOURCE_LEGACY_UNATTRIBUTED`` and are excluded from normal lists.
+    When ``unavailable_raises`` is true, storage outages remain distinguishable
+    from a valid empty source list.
+    """
+    source = _require_frame_source(source)
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
                 "SELECT frame_id, ts, COALESCE(env_meta, doc) FROM frame_envelopes "
-                "WHERE user_id = %s ORDER BY ts",
-                (user_id,),
+                "WHERE user_id = %s "
+                "AND COALESCE(NULLIF(env_meta->>'source', ''), %s) = %s "
+                "ORDER BY ts",
+                (user_id, FRAME_SOURCE_LEGACY_UNATTRIBUTED, source),
             ).fetchall()
     except Exception as e:
         log.error("[db] frame_list_meta(%s) failed: %s", user_id, e)
+        if unavailable_raises:
+            raise FrameReadUnavailable("frame list unavailable") from e
         return []
     meta: list[dict] = []
     for frame_id, ts, doc in rows:
@@ -18196,17 +19043,22 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
     Returns the evicted frame_ids."""
     if not max_frames or max_frames <= 0:
         return []
+    evicted_body_keys: dict[str, str] = {}
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
                 rows = conn.execute(
-                    "SELECT frame_id FROM frame_envelopes WHERE user_id = %s AND frame_id NOT IN ("
+                    "SELECT frame_id,body_key FROM frame_envelopes "
+                    "WHERE user_id = %s AND frame_id NOT IN ("
                     "  SELECT frame_id FROM frame_envelopes WHERE user_id = %s "
                     "  ORDER BY ts DESC LIMIT %s"
                     ")",
                     (user_id, user_id, max_frames),
                 ).fetchall()
                 evicted = [r[0] for r in rows]
+                evicted_body_keys = {
+                    str(r[0]): str(r[1]) for r in rows if r[1]
+                }
                 if evicted:
                     conn.execute(
                         "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = ANY(%s)",
@@ -18229,6 +19081,12 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
         if evicted and object_storage.enabled():
             for fid in evicted:
                 object_storage.delete_frame_body(user_id, fid)
+                stored_key = evicted_body_keys.get(str(fid))
+                if (
+                    stored_key
+                    and stored_key != object_storage.frame_key(user_id, fid)
+                ):
+                    object_storage.delete_frame_body_key(stored_key, user_id)
                 # Reap the TEE storage-layer re-encrypted body too (frames-tee/).
                 object_storage.delete_frame_tee_body(user_id, fid)
         return evicted
@@ -18242,16 +19100,33 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _user_log_duration_sec(stream: str, doc: dict) -> int | None:
+    """Match the app-session SQL bigint projection without limiting log size."""
+    if stream != "tracking_events" or doc.get("type") != "app_session_end":
+        return None
+    payload = doc.get("payload")
+    value = payload.get("duration_sec") if isinstance(payload, dict) else None
+    text = str(value)
+    return int(text) if re.fullmatch(r"[0-9]{1,10}", text) else None
+
+
 def log_append(user_id: str, stream: str, doc: dict,
                ts: float | None = None, item_key: str | None = None) -> bool:
-    sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-           "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
-    try:
-        with get_pool().connection() as conn:
-            row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
-    except Exception as e:
-        log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
-        return False
+    sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+           "VALUES (%s, %s, %s, %s, %s, %s) RETURNING seq")
+    duration_sec = _user_log_duration_sec(stream, doc)
+    context = _memory_mutation_context(user_id)
+    if context is not None:
+        # A memory action and its change log must roll back together. Let a
+        # database failure abort the owning transaction, not look successful.
+        row = context[0].execute(sql, (user_id, stream, ts, item_key, Jsonb(doc), duration_sec)).fetchone()
+    else:
+        try:
+            with get_pool().connection() as conn:
+                row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc), duration_sec)).fetchone()
+        except Exception as e:
+            log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
+            return False
     if row is None:
         return False
     # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
@@ -18262,11 +19137,12 @@ def log_append(user_id: str, stream: str, doc: dict,
     # (same PK (user_id, stream, seq)) idempotent rather than erroring.
     from tee_shadow import mirror
     mirror_sql = (
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
-    mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+    _defer_memory_post_commit(user_id, lambda: mirror.execute(
+        mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc), duration_sec)))
     return True
 
 
@@ -18302,9 +19178,10 @@ def log_append_numbered(
                     )
                     numbered_doc[number_field] = int(cur.fetchone()[0]) + 1
                     cur.execute(
-                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-                        "VALUES (%s, %s, %s, %s, %s) RETURNING seq",
-                        (user_id, stream, ts, item_key, Jsonb(numbered_doc)),
+                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc, duration_sec) "
+                        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING seq",
+                        (user_id, stream, ts, item_key, Jsonb(numbered_doc),
+                         _user_log_duration_sec(stream, numbered_doc)),
                     )
                     seq = cur.fetchone()[0]
     except Exception as e:
@@ -18314,10 +19191,11 @@ def log_append_numbered(
 
     from tee_shadow import mirror
     mirror.execute(
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc, duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (user_id, stream, seq) DO NOTHING",
-        (user_id, stream, seq, ts, item_key, Jsonb(numbered_doc)),
+        (user_id, stream, seq, ts, item_key, Jsonb(numbered_doc),
+         _user_log_duration_sec(stream, numbered_doc)),
     )
     return numbered_doc
 
@@ -18506,6 +19384,7 @@ def delete_user_data(user_id: str) -> None:
         "chat_message_archive",
         "chat_messages",
         "memory_moments",
+        "memory_vectors",
         "world_book_entries",
         "frame_envelopes",
         "user_logs",
@@ -18521,8 +19400,14 @@ def delete_user_data(user_id: str) -> None:
         "model_api_credentials",
     )
     try:
+        from perception.perceptkit_adapter.storage import PostgresStorage
+
         with get_pool().connection() as conn:
             with conn.transaction():
+                # PerceptKit tables intentionally have no users FK. Keep their
+                # subject-scoped purge in this same belt transaction so both
+                # user and admin reset entrypoints cover them atomically.
+                PostgresStorage(conn).purge_subject(subject_id=user_id)
                 for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
                 # lane_daily_rollup is deliberately NOT in the delete list:

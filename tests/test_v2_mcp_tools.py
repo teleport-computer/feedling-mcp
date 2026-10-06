@@ -41,7 +41,7 @@ def test_builds_namespaced_specs_with_schemas(monkeypatch):
         return [{"name": "search", "description": "find things",
                  "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}}}]
     _patch(monkeypatch, servers=_servers("weather"),
-           decrypt=lambda env, api_key, runtime_token: {"url": "https://w.example.com", "headers": {}},
+           decrypt=lambda env, api_key, runtime_token, _caller_user_id: {"url": "https://w.example.com", "headers": {}},
            list_tools=fake_list)
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
     assert not turn.is_empty
@@ -70,7 +70,7 @@ def test_missing_resident_defaults_to_folded_schema(monkeypatch):
     _patch(
         monkeypatch,
         servers=servers,
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://w.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -113,7 +113,7 @@ def test_tool_search_resolves_exact_name_before_remote_dispatch(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("weather", resident=False),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://w.example.com", "headers": {}},
         list_tools=fake_list,
         call_tool=fake_call,
@@ -160,7 +160,7 @@ def test_tool_search_query_only_matches_folded_tools(monkeypatch):
     _patch(
         monkeypatch,
         servers=servers,
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": f"https://{env['id']}.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -231,7 +231,7 @@ def test_tool_search_can_resolve_beyond_initial_manual_char_budget(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("tools", resident=False),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://tools.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -324,7 +324,7 @@ def test_catalog_permutations_produce_identical_provider_tool_bytes(monkeypatch)
     ]
     state = {"variant": 0}
 
-    def decrypt(envelope, api_key, runtime_token):
+    def decrypt(envelope, api_key, runtime_token, _caller_user_id):
         server = envelope["id"].removeprefix("env_")
         return {"url": f"https://{server}.example.com", "headers": {}}
 
@@ -425,7 +425,7 @@ def test_duplicate_resolution_precedes_sort_and_dispatches_first_route(
     }
     seen = []
 
-    def decrypt(envelope, api_key, runtime_token):
+    def decrypt(envelope, api_key, runtime_token, _caller_user_id):
         source = envelope["id"]
         return {"url": f"https://{source}.example.com", "headers": {}}
 
@@ -490,7 +490,7 @@ def test_read_only_hint_is_preserved_as_metadata_but_grants_no_privilege(
     _patch(
         monkeypatch,
         servers=_servers("files"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://files.example.com",
             "headers": {},
         },
@@ -544,7 +544,7 @@ def test_catalog_count_cap_folds_manuals_without_dropping_tool_names(monkeypatch
     _patch(
         monkeypatch,
         servers=_servers("bounded"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://bounded.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -585,7 +585,7 @@ def test_valid_schema_over_manual_cap_stays_registered_and_searchable(monkeypatc
     _patch(
         monkeypatch,
         servers=_servers("bounded"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://bounded.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -641,7 +641,7 @@ def test_tool_and_parameter_descriptions_both_pass_through(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("safe"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://safe.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -679,7 +679,7 @@ def test_enum_reaches_the_model_so_it_does_not_have_to_guess(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("safe"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://safe.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -711,7 +711,7 @@ def test_a_tool_dropped_for_an_unusable_schema_is_counted_in_the_summary(
     _patch(
         monkeypatch,
         servers=_servers("safe"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://safe.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -736,7 +736,7 @@ def test_tool_without_a_description_falls_back_to_the_same_text_as_the_pi_bridge
     _patch(
         monkeypatch,
         servers=_servers("safe"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://safe.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -772,7 +772,7 @@ def test_exact_approved_read_only_fingerprint_enables_parallel_classification(
     _patch(
         monkeypatch,
         servers=_servers("approved"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://approved.example.com",
             "headers": {},
             "read_only_tool_fingerprints": {"search": fingerprint},
@@ -807,7 +807,7 @@ def test_stale_or_unhinted_read_only_approval_fails_closed(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("closed"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://closed.example.com",
             "headers": {},
             "read_only_tool_fingerprints": {
@@ -845,7 +845,7 @@ def test_long_unsafe_tool_name_is_provider_safe_but_dispatches_raw_name(
     _patch(
         monkeypatch,
         servers=_servers("repo"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://repo.example.com", "headers": {}},
         list_tools=fake_list,
         call_tool=fake_call,
@@ -873,7 +873,7 @@ def test_dispatch_proxies_to_call_tool(monkeypatch):
         return {"is_error": False, "text": "sunny 25C"}
 
     _patch(monkeypatch, servers=_servers("weather"),
-           decrypt=lambda env, api_key, runtime_token: {"url": "https://w.example.com",
+           decrypt=lambda env, api_key, runtime_token, _caller_user_id: {"url": "https://w.example.com",
                                                          "headers": {"Authorization": "Bearer x"}},
            list_tools=fake_list, call_tool=fake_call)
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
@@ -903,7 +903,7 @@ def test_persisted_transport_threads_into_list_and_call(monkeypatch):
         return {"is_error": False, "text": "ok"}
 
     _patch(monkeypatch, servers=_servers("maps"),
-           decrypt=lambda env, api_key, runtime_token: {
+           decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
                "url": "https://mcp.map.qq.com/sse", "headers": {},
                "transport": "sse"},
            list_tools=fake_list, call_tool=fake_call)
@@ -929,7 +929,7 @@ def test_missing_transport_threads_none(monkeypatch):
         return {"is_error": False, "text": "ok"}
 
     _patch(monkeypatch, servers=_servers("s"),
-           decrypt=lambda env, api_key, runtime_token: {"url": "https://s.example.com",
+           decrypt=lambda env, api_key, runtime_token, _caller_user_id: {"url": "https://s.example.com",
                                                         "headers": {}},
            list_tools=fake_list, call_tool=fake_call)
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
@@ -948,7 +948,7 @@ def test_tool_error_prefixed_but_not_fatal(monkeypatch):
         return {"is_error": True, "text": "rate limited"}
 
     _patch(monkeypatch, servers=_servers("s"),
-           decrypt=lambda env, api_key, runtime_token: {"url": "https://s.example.com", "headers": {}},
+           decrypt=lambda env, api_key, runtime_token, _caller_user_id: {"url": "https://s.example.com", "headers": {}},
            list_tools=fake_list, call_tool=fake_call)
     turn = asyncio.run(mcp_tools.load_turn_mcp(STORE, api_key="k", runtime_token="rt"))
     result = asyncio.run(turn.dispatch(ToolCall(id="c1", name="mcp__s__t", args={})))
@@ -969,7 +969,7 @@ def test_dispatch_transport_exception_returns_stable_code_without_raw_details(
     _patch(
         monkeypatch,
         servers=_servers("s"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://s.example.com", "headers": {}},
         list_tools=fake_list,
         call_tool=fake_call,
@@ -1022,7 +1022,7 @@ def test_down_server_is_skipped_not_fatal(monkeypatch):
         calls["n"] += 1
         return await (boom_list if url.endswith("down") else ok_list)(url, headers)
 
-    def decrypt(env, api_key, runtime_token):
+    def decrypt(env, api_key, runtime_token, _caller_user_id):
         return {"url": "https://up" if env["id"] == "env_up" else "https://x/down", "headers": {}}
 
     _patch(monkeypatch, servers=_servers("up", "down"), decrypt=decrypt, list_tools=mixed_list)
@@ -1053,7 +1053,7 @@ def test_config_decrypts_use_shared_enclave_semaphore(monkeypatch):
     state = {"active": 0, "max_active": 0}
     lock = threading.Lock()
 
-    def decrypt(env, api_key, runtime_token):
+    def decrypt(env, api_key, runtime_token, _caller_user_id):
         with lock:
             state["active"] += 1
             state["max_active"] = max(state["max_active"], state["active"])
@@ -1119,7 +1119,7 @@ def test_auto_ca_fetch_on_tls_failure_pins_anchor_and_reuses_for_call(monkeypatc
     _patch(
         monkeypatch,
         servers=_servers("maps"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://maps.example.com/sse", "headers": {}, "transport": "sse"},
         list_tools=fake_list,
         call_tool=fake_call,
@@ -1150,7 +1150,7 @@ def test_configured_ca_pem_is_never_overridden_by_auto_ca(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("x"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://x.example.com", "headers": {}, "ca_pem": "USER_CA"},
         list_tools=fake_list,
     )
@@ -1176,7 +1176,7 @@ def test_configured_ca_pem_tls_failure_does_not_auto_fetch(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("x"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://x.example.com", "headers": {}, "ca_pem": "USER_CA"},
         list_tools=fake_list,
     )
@@ -1202,7 +1202,7 @@ def test_non_tls_failure_does_not_trigger_auto_ca(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("x"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://x.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -1224,7 +1224,7 @@ def test_auto_ca_fetch_returns_none_skips_server(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("x"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://x.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -1246,7 +1246,7 @@ def test_auto_ca_fetch_exception_skips_only_that_server(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers("x"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": "https://x.example.com", "headers": {}},
         list_tools=fake_list,
     )
@@ -1291,7 +1291,7 @@ def test_small_server_is_not_starved_by_a_large_one(monkeypatch):
     _patch(
         monkeypatch,
         servers=_servers(*sizes),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": f"https://{env['id'].removeprefix('env_')}.example.com",
             "headers": {}},
         list_tools=fake_list,
@@ -1360,7 +1360,7 @@ def test_char_cap_folds_the_overflowing_manual_and_keeps_allocating(monkeypatch)
     _patch(
         monkeypatch,
         servers=_servers("big", "small"),
-        decrypt=lambda env, api_key, runtime_token: {
+        decrypt=lambda env, api_key, runtime_token, _caller_user_id: {
             "url": f"https://{env['id'].removeprefix('env_')}.example.com",
             "headers": {}},
         list_tools=fake_list,

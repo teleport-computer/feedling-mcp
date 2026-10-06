@@ -51,7 +51,7 @@ services:
   # process-specific lease ownership remains independent.
   # No per-runner config: every prod runner CVM deploys this identical compose.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:b8f103f   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:f4906b5   # CI pins the sha
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
@@ -75,8 +75,8 @@ services:
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       FEEDLING_PLAINTEXT_SHADOW_ENABLED: "0"
-      # Must match the main release unit; CI admits 1 only with TEE primary.
-      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-0}"
+      # Must match the main release unit; prod TEE-primary accepts plaintext writes.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "${FEEDLING_PLAINTEXT_WRITES_ACCEPTED:-1}"
       # Resident photo tools resolve the same R2-backed frame pointers as V2.
       R2_ENDPOINT: "${R2_ENDPOINT:-}"
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
@@ -86,7 +86,6 @@ services:
       AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # Genesis import worker: ON here because once the main prod CVM's inline
       # agent-runner is removed, the runner CVMs are the ONLY place genesis import
       # jobs get drained. Safe on multiple runner CVMs — claim is FOR UPDATE SKIP

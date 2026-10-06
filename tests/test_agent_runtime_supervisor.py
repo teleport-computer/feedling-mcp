@@ -6,6 +6,7 @@ acceptance ("two users concurrent, leases/home not shared") rests on.
 """
 
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -495,7 +496,7 @@ def test_dead_child_is_reaped_and_respawned():
     assert sup.children["u_1"]["pid"] != pid
 
 
-def test_crash_backoff_sequence_opens_hourly_circuit(monkeypatch):
+def test_crash_backoff_sequence_opens_fixed_five_minute_circuit(monkeypatch):
     procs = FakeProcTable()
     clock = {"now": T0}
     sup = _sup(procs, clock=lambda: clock["now"])
@@ -509,7 +510,7 @@ def test_crash_backoff_sequence_opens_hourly_circuit(monkeypatch):
     roster = _roster("u_1")
     sup.tick(roster)
 
-    expected_delays = [15.0, 60.0, 300.0, 900.0, 3600.0]
+    expected_delays = [15.0, 60.0, 300.0, 900.0, supervisor_mod._RESTART_CIRCUIT_RETRY_SEC]
     for attempt, delay in enumerate(expected_delays, start=1):
         pid = sup.children["u_1"]["pid"]
         procs.alive[pid] = False
@@ -530,8 +531,22 @@ def test_crash_backoff_sequence_opens_hourly_circuit(monkeypatch):
     assert emitted[0][0:2] == ("u_1", "runner_spawn_failed")
     assert "API key" in emitted[0][2]
     assert "balance" in emitted[0][2]
-    assert "API Key" in emitted[0][3]["user_text"]
-    assert "额度" in emitted[0][3]["user_text"]
+    assert emitted[0][3]["user_text"] == supervisor_mod.catalog.user_text_for(
+        "runner_spawn_failed", language="zh",
+    )
+    assert "consumer_exited:unknown" in emitted[0][2]
+    # The product interval is independently pinned; deriving every assertion
+    # from the constant would let a regression to 3600 pass unnoticed.
+    assert supervisor_mod._RESTART_CIRCUIT_RETRY_SEC == 300.0
+    for _ in range(3):
+        procs.alive[sup.children["u_1"]["pid"]] = False
+        sup.tick(roster)
+        state = sup._restart_ledger["u_1"]
+        assert state["circuit_open"]
+        assert state["next_retry_at"] - clock["now"] == supervisor_mod._RESTART_CIRCUIT_RETRY_SEC
+        assert f"retrying in {int(supervisor_mod._RESTART_CIRCUIT_RETRY_SEC)}s" in emitted[-1][2]
+        clock["now"] = state["next_retry_at"]
+        sup.tick(roster)
 
 
 def test_healthy_child_clears_restart_history_and_notice(monkeypatch):
@@ -1470,3 +1485,94 @@ def test_spawn_identity_changes_when_identity_model_changes():
          "identity_model": "gemini-2.0-flash"}
     b = dict(a, identity_model="gemini-1.5-pro")
     assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"reason": "whoami_failed", "ts": T0 + 1}, "whoami_failed"),
+    ({"reason": "api_key_invalid", "ts": T0}, "api_key_invalid"),
+    ({"reason": "content_encryption_missing", "ts": T0 + 1}, "content_encryption_missing"),
+    ({"reason": "whoami_failed", "ts": T0 - 1}, "unknown"),
+    ({"reason": "invented", "ts": T0 + 1}, "unknown"),
+    ({"reason": "decrypt_source_unreachable", "ts": T0 + 1}, "unknown"),
+    ({"reason": "whoami_failed", "ts": "2000001"}, "unknown"),
+    ({"reason": "whoami_failed", "ts": float("nan")}, "unknown"),
+    ({"reason": "whoami_failed", "ts": float("inf")}, "unknown"),
+    ({"reason": "whoami_failed", "ts": 10 ** 400}, "unknown"),
+    ({"reason": [], "ts": T0 + 1}, "unknown"),
+    ({}, "unknown"), ([], "unknown"), (None, "unknown"),
+])
+def test_startup_reason_reader_closed_and_fresh(tmp_path, payload, expected):
+    (tmp_path / "startup_exit.json").write_text(json.dumps(payload))
+    assert supervisor_mod._read_startup_exit_reason(str(tmp_path), T0) == expected
+
+
+def test_startup_reason_reader_missing_bad_or_unreadable(tmp_path):
+    assert supervisor_mod._read_startup_exit_reason(str(tmp_path), T0) == "unknown"
+    path = tmp_path / "startup_exit.json"
+    path.write_bytes(b"\xff")
+    assert supervisor_mod._read_startup_exit_reason(str(tmp_path), T0) == "unknown"
+    path.write_text("{bad")
+    assert supervisor_mod._read_startup_exit_reason(str(tmp_path), T0) == "unknown"
+    path.unlink()
+    path.mkdir()
+    assert supervisor_mod._read_startup_exit_reason(str(tmp_path), T0) == "unknown"
+
+
+@pytest.mark.parametrize("provider_reason", [False, True])
+def test_reap_startup_reason_selects_notice_and_lease(tmp_path, monkeypatch, caplog, provider_reason):
+    procs = FakeProcTable()
+    clock = {"now": T0}
+    sup = _sup(procs, clock=lambda: clock["now"])
+    sup.data_root = str(tmp_path)
+    if provider_reason:
+        monkeypatch.setattr(supervisor_mod, "_USER_PROVIDER_STARTUP_REASONS", frozenset({"whoami_failed"}))
+    else:
+        assert supervisor_mod._USER_PROVIDER_STARTUP_REASONS == frozenset()
+    emitted = []
+    monkeypatch.setattr(sup, "_emit_runner_notice", lambda *args, **kwargs: emitted.append((args, kwargs)))
+    roster = _roster("u_1")
+    sup.tick(roster)
+    child = sup.children["u_1"]
+    home = Path(child["home"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "startup_exit.json").write_text(json.dumps({"reason": "whoami_failed", "ts": T0 + 1}))
+    sup._restart_ledger["u_1"] = {"circuit_open": True}
+    clock["now"] += 2
+    procs.alive[child["pid"]] = False
+    with caplog.at_level("INFO", logger=supervisor_mod.log.name):
+        sup.tick(roster)
+    assert leases.get("u_1")["error"] == "restart_backoff:consumer_exited:whoami_failed"
+    assert "whoami_failed" in caplog.text
+    args, kwargs = emitted[-1]
+    assert args[:2] == ("u_1", "runner_spawn_failed")
+    assert "consumer_exited:whoami_failed" in args[2]
+    if provider_reason:
+        assert kwargs["user_text"] == ("AI 助手连续退出，可能是模型 API Key、额度或模型设置问题。"
+                                       "请检查设置；系统会自动重试。")
+    else:
+        assert kwargs["user_text"] == supervisor_mod.catalog.user_text_for("runner_spawn_failed", language="zh")
+
+
+@pytest.mark.parametrize("respawn", [False, True])
+def test_fast_startup_exit_is_newer_than_spawn_anchor(tmp_path, monkeypatch, respawn):
+    procs = FakeProcTable()
+    clock = {"now": T0}
+    sup = _sup(procs, clock=lambda: clock["now"])
+    sup.data_root = str(tmp_path)
+    monkeypatch.setattr(sup, "_emit_runner_notice", lambda *args, **kwargs: None)
+    roster = _roster("u_1")
+    if respawn:
+        sup.tick(roster)
+        roster = [{**roster[0], "api_key": "changed-key"}]
+    def fast_exit(entry, uid, home):
+        pid = procs.spawn(entry, uid, home)
+        Path(home).mkdir(parents=True, exist_ok=True)
+        clock["now"] += 1
+        (Path(home) / "startup_exit.json").write_text(json.dumps({"reason": "whoami_failed", "ts": clock["now"]}))
+        clock["now"] += 1
+        procs.alive[pid] = False
+        return pid
+    sup.spawn_fn = fast_exit
+    sup.tick(roster)
+    sup.tick(roster)
+    assert sup._restart_ledger["u_1"]["last_error"] == "consumer_exited:whoami_failed"

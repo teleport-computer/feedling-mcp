@@ -14,7 +14,101 @@ managed confidential-compute environment.
 Read [architecture and trust boundaries](/docs/architecture) first for the
 logical component, data-flow, and encryption model used by this guide.
 
+## Resident startup during enclave outages
+
+Hosted and self-hosted resident consumers retry the startup decrypt-source probe
+on transport errors and HTTP 429, 502, 503, or 504. The probe shares the runtime
+settings: `FEEDLING_ENCLAVE_FETCH_ATTEMPTS` (default 3), exponential backoff from
+`FEEDLING_ENCLAVE_FETCH_BACKOFF_SEC` (default 0.5 seconds), and
+`FEEDLING_ENCLAVE_CONNECT_TIMEOUT_SEC` / `FEEDLING_ENCLAVE_READ_TIMEOUT_SEC`
+(default 5 / 20 seconds). Other HTTP failures, including deterministic 4xx
+responses, end the probe immediately.
+
+If the probe fails, the consumer logs an error, reports decrypt health as
+`unreachable`, and continues polling. Cycles whose decrypt-history reads fail
+are skipped; later cycles can recover when the source becomes reachable.
+Startup authentication and encryption-module checks still must succeed.
+
+## Agent body generation
+
+Upgrade both backend and consumer for `POST /v1/agent-body/generate`. Hosted
+Model API accounts use their active tested chat route. Resident accounts use
+their own CLI or HTTP agent through a hidden job, even when a server-side model
+credential also exists. An offline or old consumer causes
+`409 agent_body_resident_update_required`. Consumers following `main` need a
+production-channel release; deploying only test does not update them.
+
+The direct ASGI path temporarily sees authorized context; residents read identity
+and memory through their authenticated APIs. Protect plaintext and agent/provider
+credentials on your infrastructure. A generic VPS does not gain confidential-VM
+guarantees by upgrading. The endpoint returns a grid without saving or applying
+a preset. See [the contract](/docs/errors#agent-body-generation).
+
 ## Choose the trust model first
+
+### Resident clients on Windows
+
+Local resident IPC depends on the Python runtime exposing `socket.AF_UNIX`.
+When it is absent, the consumer logs `ipc_unsupported` and disables the listener;
+`io_cli` reports a structured error for `identity-redistill`, `send-file`, and
+`send-image`. No TCP listener is substituted. This is explicit degradation,
+not a claim of full Windows support. Normal polling and text replies use HTTP,
+not this socket; `io_cli send` and `wait-for-wake` remain unsupported verbs.
+
+Both processes honor an explicit `FEEDLING_HOME`. Otherwise Windows uses Python's
+native temporary directory plus `feedling_home_<fingerprint>`; POSIX keeps its
+existing `/tmp/feedling_home_<fingerprint>` default. Choose the same private,
+persistent directory for both processes when state must survive temporary-file
+cleanup. The fingerprint is not an authorization boundary; hosted keyless
+consumers still require per-user pinned paths.
+
+When a CLI driver exits successfully with non-empty stdout but the resident
+cannot parse a deliverable turn, the consumer keeps a local diagnostic copy in
+`$FEEDLING_HOME/reply-parse-failures`. Each `.raw` file is mode `0600`, the
+directory is mode `0700`, each body is capped at 256 KiB, and rotation retains at
+most 20 files and 2 MiB total. A larger body is stored as a bounded prefix; the
+SHA-256 in its filename describes the complete stdout. The corresponding backend
+trace includes the byte length, SHA-256, exit code, driver, parse-empty stage,
+timestamp, the exact first 80 characters, and the local artifact path so an
+operator can correlate the failure directly. It never carries the complete
+stdout. Successful turns and genuinely empty provider responses do not create
+these files.
+
+The current simple/OpenAI HTTP and CLI agent paths already share
+`FEEDLING_AGENT_TURN_TIMEOUT_SEC` (300 seconds by default, minimum 30), bounded
+by any shorter remaining turn deadline. Older simple-HTTP builds used a fixed
+60 seconds. Check the running consumer commit before changing modes. This
+setting cannot extend an upstream server or proxy timeout and is not a
+recommendation to migrate runtimes.
+
+After an ordinary foreground text CLI subprocess reaches that hard timeout,
+supported Codex, Claude, and Pi commands get one fresh, reply-only recovery
+attempt. The recovery has its own 120-second deadline (configurable with
+`FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC`, minimum 30), removes user/project
+tool surfaces, and discards executable actions from the result. It does not
+undo anything the timed-out turn may already have completed; the isolation is
+there to prevent the automatic recovery from repeating it. Attachment turns,
+HTTP/custom drivers, and background/proactive work retain the existing visible
+timeout fallback.
+
+For direct `POST /v1/chat/response`, authenticate with the account's API key and
+send a valid envelope matching `whoami.content_encryption_effective`. A whoami public key
+is an encryption recipient, not an API credential. Plain-text-only chat messages
+(carried inside an envelope) may omit `reply_to_message_id`; file/image
+**followups** require it. Authentication, bootstrap, and envelope validation
+still apply. A 400 response alone does not identify which validation failed.
+
+Unrelated untracked files do not block self-update, but tracked edits still do.
+Checkout refuses to overwrite conflicting untracked or ignored files and logs
+their paths under `self-update checkout failed`; dependency installation and
+restart do not proceed. Older consumers also count untracked files as dirty.
+When an update is blocked, first privately back up
+`consumer.env`, `identity.json`, and local state outside the checkout, then inspect
+`git status`. Do not use `git stash -u`, `git stash -a`, or `git clean` to clear
+the warning, and never commit secrets. Plain `git stash` leaves untracked files
+in place. Agents must not move, stash, or delete operator files without permission.
+
+### Server deployment isolation
 
 The HTTP backend is multi-user and API-key scoped. That is not the same as strong
 tenant isolation for code execution.
@@ -33,14 +127,18 @@ per-tenant secrets and storage, or keep the deployment single-tenant.
 
 On a generic VPS, the local enclave service is software/process separation. It
 does not provide Intel TDX attestation or protection from the machine operator.
-For accounts on the encrypted tier, envelope encryption still protects backups and
-accidental storage exposure, but the host operator controls the processes that can
-request decryption. Accounts on the plaintext tier get no such protection: inline
-bodies are readable in the database, and heavy Chat image/file objects are stored
-as raw bytes in object storage. Database backups, object-storage backups, and
-operators with either form of storage access are plaintext recipients. Decide the
-tier deliberately for the deployment, not per user, when the host operator is not
-the data subject.
+Existing encrypted envelopes still protect backups and accidental storage
+exposure, but the host operator controls the processes that can request
+decryption. With `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`, all known accounts use
+plaintext for new shared content, even if they have a legacy stored `on`
+preference. They cannot opt new content into encryption through the settings API.
+Inline bodies are readable in the database, and heavy Chat image/file objects
+are stored as raw bytes in object storage. Database backups, object-storage
+backups, and operators with either form of storage access are plaintext
+recipients. The ASGI backend reads those accounts' memory cards as plaintext to
+rank keyword memory search; their legacy sealed cards are not searched. Decide whether to enable the deployment gate with that trust boundary
+in mind. The gate remains fail-closed by default; this policy does not convert
+existing ciphertext, and `local_only` still requires device-only encryption.
 
 A managed migration may preserve a historical ciphertext envelope verbatim
 when its enclave recipient can no longer decrypt it. That is a data-retention
@@ -87,13 +185,33 @@ A functional deployment can include:
 | TLS reverse proxy | Any Internet-facing API | Terminate HTTPS and forward only intended ports. |
 | ASGI backend | All API operations | Runs FastAPI under gunicorn/Uvicorn worker; public HTTP default is port 5001. |
 | PostgreSQL | All persistent user state | `DATABASE_URL` is mandatory; there is no current file-persistence fallback. |
-| Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. |
+| Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. With optional hybrid recall enabled it also loads the local embedding model and receives the caller's plaintext derived card vectors from the backend; size its memory and CPU for that. |
 | Runtime V2 worker pool | Hosted `/v1/model_api/chat/send` | Shares PostgreSQL and runtime-token configuration with the backend and publishes worker-capacity heartbeats. |
 | Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. |
 | WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
 | APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
 | Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
+| Enclave diagnostic log collector | Optional operational history | Only validated content-free request logs and fixed worker events from the two enclave containers; local volume 30 days, optional operator R2 with a 90-day bucket lifecycle. |
 | CPU history recorder | Optional private operational history | Provide a protected, path-allowlisted Docker socket proxy and a dedicated persistent volume; expose neither service publicly. |
+
+Database operators can read the `provider_attempts` operational ledger, including
+Runtime V2 Capture/Dream job correlation, provider/model, retry counts, wire
+timings, HTTP status, and closed timeout/error categories. These plaintext
+measurements exclude prompts, replies, URLs, headers, credentials, and raw error
+text. Protect database access and backups accordingly; this does not enable
+export to another service.
+
+The production/test log collector uses a protected socket proxy, a dedicated
+persistent volume, and a separate outbound bridge for R2. It does not join the
+business-service network or mount the Docker socket. Compose bridges do not
+enforce a destination-domain firewall. Leaving `R2_LOGS_BUCKET` empty keeps logs
+in the local volume and disables external uploads. To enable delivery, provide
+that dedicated bucket and existing R2 credentials, grant bucket access, and set
+its **90-day lifecycle expiration** yourself. Content-free diagnostics, including
+route templates and truncated user prefixes, then leave the CVM for operator
+storage. Arbitrary container output is rejected, not exported. Docker logs lost
+before collection cannot be reconstructed; local retention also limits offline
+upload recovery to 30 days. See [the trust boundary](/docs/architecture#enclave-operational-logs-leave-the-vm-only-when-configured).
 
 The managed Phala CPU-history topology is optional operational infrastructure,
 not an application API. A self-hosted operator who adopts it must provide and
@@ -168,9 +286,9 @@ these settings:
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS` | Optional one-generation rotation bridge for durable Perception anchor fingerprints. Set it to the immediately previous runtime-token secret while rolling out a new `FEEDLING_RUNTIME_TOKEN_SECRET`; keep it until all workers use the new secret. It does not authorize runtime tokens. |
 | `FEEDLING_PERCEPTION_REBASELINE_UNKNOWN_KEYS` | Emergency/post-rotation convergence switch, default `0`. After every old backend worker is confirmed stopped, set it to `1` so the next fresh observation of any dormant old-key anchor replaces that row with a non-waking baseline under the current key. Never enable it during a mixed-version rollout. Monitor old key-ID row counts, then disable it after they reach zero. |
-| `FALLBACK_REPLY` / `FALLBACK_REPLY_EN` | Optional Simplified Chinese/default and English visible failure replies. Hosted Runtime V2 selects between them from the turn's locale/account-language policy; resident paths use their current language anchor. Configure both values together so a deployment override cannot reintroduce a one-language fallback. |
-| `FEEDLING_V2_SELF_THINKING` | Kill switch for the self-authored thinking chain (io's own first-person `<think>` summary displayed in place of raw provider chain-of-thought). On by default. On provider/model combinations whose continuation behavior has been verified, a Runtime V2 text-only terminal request starts from an assistant `<think>` prefix and restores that provider-omitted prefix before parsing. A normally completed response that contains no closing thinking tag is treated as an ordinary reply instead of as malformed thinking; a response explicitly cut off at its token limit, or lacking a usable stop signal, remains fail-closed. Ordinary tool and image rounds are never prefixed. Provider/model combinations that reject or ignore assistant continuation retain the existing prompt-only behavior: if foreground Chat omits the block from its final reply, the worker may spend one text-only attempt from the existing turn budget to restate the same format contract; that extra provider request is separately metered and can incur provider charges. Background lanes do not trigger this correction. If the retry is unavailable or still omits a valid block, Runtime V2 delivers the original reply without a thinking attachment or native-reasoning fallback. Set to `0`/`false`/`no`/`off` to restore the legacy native-reasoning display. Applies to both Runtime V2 and resident V1, and does not change what the model reasons — only what the thinking display shows. Turning it off does not disable the leak gate below: a model that emits `<think>` on its own is still stripped before delivery. |
-| `FEEDLING_THINK_GATE` | Kill switch for the thinking-leak gate, on by default. The gate strips every `<think>`/`<reasoning>`/`<thought>` block from user-visible text at all four delivery points (Runtime V2 chat and wake, resident V1 chat, proactive messages) and from assistant history before it is replayed to the model, and fails closed when a block cannot be cleanly resolved. Set it to `0`/`false`/`no`/`off` only to stop the bleeding if the gate misbehaves; that restores the previous parsing, delivery and history behaviour, but does not revert the model-facing instruction, which is governed by `FEEDLING_V2_SELF_THINKING`. |
+| `FALLBACK_REPLY` / `FALLBACK_REPLY_EN` | Optional Simplified Chinese/default and English visible failure replies. Hosted Runtime V2 selects between them from the words the user typed in the latest message, or an attachment's caption (Chinese when they contain Han characters, English when they contain a Latin word), and falls back to the locale/account-language policy when there is no such signal. Resident paths apply the same check to their language anchor and keep the Chinese default when there is no signal. Configure both values together so a deployment override cannot reintroduce a one-language fallback. |
+| `FEEDLING_V2_SELF_THINKING` | Enables the optional persona `aside` field, on by default. Runtime V2 chat and wake use `reply(aside, text)`; resident V1 uses `{"aside":"...","messages":["..."]}`. Missing aside never triggers a format-correction retry or rejects an otherwise usable reply; Runtime V2 shows the thinking-failed marker. Set to `0`/`false`/`no`/`off` to stop requesting and displaying asides. Provider-native reasoning is discarded for display even when this switch is off, and inline thinking tags remain subject to the separate leak gate. No assistant thinking-tag prefix is injected. Historical thinking envelopes remain readable. |
+| `FEEDLING_THINK_GATE` | Kill switch for the thinking-leak gate, on by default. The gate strips every `<think>`/`<reasoning>`/`<thought>`/`<aside>` block from user-visible text at all four delivery points (Runtime V2 chat and wake, resident V1 chat, proactive messages) and from assistant history before it is replayed to the model, and fails closed when a block cannot be cleanly resolved. Set it to `0`/`false`/`no`/`off` only to stop the bleeding if the gate misbehaves; that restores the previous parsing, delivery and history behaviour, but does not revert the model-facing instruction, which is governed by `FEEDLING_V2_SELF_THINKING`. |
 | `FEEDLING_V2_FOREGROUND_SLOTS` / `FEEDLING_V2_WAKE_SLOTS` / `FEEDLING_V2_HEAVY_SLOTS` | Fixed Runtime V2 pool capacities. The supported 8c/16g starting topology is `4/2/2`: four Chat/manual-wake slots, two ambient-wake slots, and two Heavy maintenance slots. Runtime V2 no longer supports the former shared multi-slot child topology. |
 | `FEEDLING_V2_PROFILE_INSTANCE_CONCURRENCY` | Instance-level Profile concurrency. Keep it at `1`; Profile card reads are batched while the other Heavy slot remains available. |
 | `FEEDLING_V2_ENCLAVE_INSTANCE_CONCURRENCY` | Parent-broker Enclave permit total across all slot processes. The `4/2/2` topology uses `4`; do not multiply this value per child. |
@@ -179,25 +297,29 @@ these settings:
 | `FEEDLING_V2_RECENT_TURN_ROW_CAP` | Defensive encrypted-row read cap used while locating complete recent turns (default 512). If the cap cuts the oldest selected turn, Runtime V2 drops that partial turn and records a tail fallback instead of rendering an incomplete group. |
 | `FEEDLING_V2_TAIL_BUDGET_MSGS` | Legacy compaction message threshold only. It is not interpreted as turns; use the two `*_TAIL_MAX_TURNS` settings for replay depth. |
 | `FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS` | Prompt-frontier output reserve (default `4096`). It reduces the input tokens available inside the resolved context window; it does not cap file-generation output. |
-| `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS` | Provider completion budget for Runtime V2 file-capable Chat turns (default `32768`). Keep it distinct from `FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS`: changing this value must not move the prompt input frontier. Provider-specific wire encoders still apply the shared 32,768-token safety ceiling. |
+| `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS` | Provider completion budget for Runtime V2 file-capable Chat turns and regular wakes (default `32768`). Keep it distinct from `FEEDLING_V2_PROMPT_OUTPUT_RESERVE_TOKENS`: changing this value must not move the prompt input frontier. Provider-specific wire encoders still apply the shared 32,768-token safety ceiling. |
 | `FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS` | Lowest-precedence prompt window for a custom or unknown route (code default `65536`; managed Compose default `131072`). Set to `0` for fail-closed resolution. |
 | `FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS` | Minimum route-metadata window Runtime V2 trusts automatically (default `32768`). Smaller values fall through to audited-family or unaudited-route knowledge and emit a content-free warning. Saved routes do not distinguish automatically supplied and explicitly entered values, so the floor applies to both. Re-evaluate it if your route population includes a legitimate smaller-context model. |
 | `FEEDLING_V2_CAPTURE_ENABLED` / `FEEDLING_V2_DREAM_ENABLED` | Deployment gates for the pooled Runtime V2 worker's Memory Garden extraction lanes. Production and pre-production default both worker gates to `1`; test temporarily defaults V2 dream to `0` as an incident-recovery kill switch. User-level capture and dream settings remain separate and independent. Set either worker gate to `0` for an operational kill switch. When Dream is off, an explicit chat `memory_organize` request returns an explainable disabled state and does not enqueue work. |
-| `FEEDLING_V2_DREAM_CARDS_MAX_CHARS` | Maximum rendered characters of complete fetched Memory Garden cards disclosed to one hosted Dream provider call (default `60000`). Runtime V2 stops before the next whole card rather than truncating a card body. |
-| `FEEDLING_DREAM_FUSE_RATIO` / `FEEDLING_DREAM_FUSE_MIN_CARDS` | Dream blast-radius fuse, shared by resident V1 and Runtime V2. A single Dream run that would retire more than `RATIO` (default `0.8`) of the active garden **and** at least `MIN_CARDS` (default `10`) cards fails as a whole without applying anything, instead of partially rewriting the garden. With the default 10-card floor, gardens with fewer than 10 retiring cards cannot trip the fuse; lowering `MIN_CARDS` removes that exemption accordingly. Invalid values fall back to the defaults. |
+| `FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS` | Output-token budget of one hosted Dream provider call (default `12000`, clamped to the shared 32,768-token provider ceiling). If the provider stops at that limit, Dream retries once with a more concise prompt and double the budget (still clamped) before recording `output_truncated`. The value is a cap, not a spend: replies that fit are billed as before. |
+| `FEEDLING_DREAM_FUSE_RATIO` / `FEEDLING_DREAM_FUSE_MIN_CARDS` | Dream blast-radius fuse, shared by resident V1 and Runtime V2. A single Dream run that would retire more than `RATIO` (default `0.8`) of the cards shown to the model **and** at least `MIN_CARDS` (default `10`) cards fails as a whole without applying anything, instead of partially rewriting the garden. With the default 10-card floor, gardens with fewer than 10 retiring cards cannot trip the fuse; lowering `MIN_CARDS` removes that exemption accordingly. Invalid values fall back to the defaults. |
+| `FEEDLING_DREAM_STAGGER` | Defaults to `1`. Spreads automatic Dream runs across the night window (`FEEDLING_DREAM_NIGHT_START_HOUR`–`FEEDLING_DREAM_NIGHT_END_HOUR`, default 02:00–05:00 in the user's timezone) with a per-user offset derived from the user id and the night's local date (fixed within a night, rotating between nights), leaving the last 90 minutes (at most half the window) free for failure-backoff retries. Shared by resident V1 and Runtime V2. Set to `0` only as a kill switch: every eligible user then becomes due at the same moment the window opens, which is the burst this setting exists to prevent. Has no effect when `FEEDLING_DREAM_NIGHT_ONLY=0`. |
+| `FEEDLING_DREAM_MAX_CONCURRENT` | Fleet-wide ceiling on automatic Dream jobs queued or running — resident V1 jobs queued or running plus Runtime V2 jobs claimed or running, or waiting in the queue for less than an hour (a waiting job is claimed as soon as a worker is free, so it counts; one waiting longer means a stalled queue and stops counting) (default `4`, matching the enclave's default four decrypt worker processes: each Dream decrypts its whole garden in one burst). While the ceiling is reached, the scheduler skips enqueueing with reason `dream_concurrency_cap` and retries on its next tick. Resident jobs still active an hour after creation are treated as orphaned and do not hold a slot. The count and the enqueue run under one deployment-wide database lock; a tick that finds another admission in progress skips with reason `dream_admission_busy` and retries on its next tick. User-forced Dream runs are never blocked by it, though they still occupy a slot while active. `0` disables the ceiling. |
 | `FEEDLING_V2_PROFILE_ENABLED` | Defaults to `0`. Enables the low-priority Memory/User profile-generation lane, its post-Chat/dream freshness triggers, and prompt selection for Chat and wake turns. Keep it off until you are ready to send the complete eligible Memory Garden plaintext to each user's configured model provider. Runtime V2 semantic conversation compaction has been removed: a usable Memory/User profile is the only long-term semantic layer, while deterministic history coverage contains counts rather than conversation meaning. Missing, pending, degraded, disabled, invalid, or undecryptable profiles therefore retain only deterministic coverage plus the bounded verbatim tail. Retryable provider failures persist the same delayed Job with five-minute exponential backoff capped at six hours; malformed profile output gets at most three delayed retries. Provider-configuration failures wait for a successful setup or route activation, source failures wait for the Garden witness to change, and delayed Jobs consume no worker slot. |
-| `FEEDLING_V2_PROFILE_MAX_AGE_SEC` | Optional stale-profile floor, default three days. A stale profile is refreshed only after the Garden's content-free row-count or maximum-`updated_at` witness changes; this check is independent of the user's dream setting. MEMORY and STYLE live in the stable system prefix, so each successful refresh invalidates that user's provider prompt cache once. |
+| `FEEDLING_V2_PROFILE_MAX_AGE_SEC` | Retired and no longer read. With profiles enabled, a healthy or empty profile is scheduled for background refresh at the next existing post-turn check when the Garden's content-free row count or maximum `updated_at` changes, without a three-day age floor. Unchanged sources do not trigger a refresh. This is independent of the dream setting; disabled profiles and failed-profile retry gates still apply. Refresh can run more often and incur provider cost; each successful MEMORY/STYLE update changes the user's stable prompt-cache prefix. |
 | `FEEDLING_V2_SANDBOX_PROVIDER` | Defaults to `disabled`. Set to `e2b` only on worker deployments that are allowed to send decrypted artifact bytes to E2B. Text-only turns and virtual text edits do not need it. |
 | `E2B_API_KEY` + `FEEDLING_V2_E2B_TEMPLATE` | Required together when the sandbox provider is `e2b`. The template must implement Feedling's fixed extractor contract; inject the API key through the deployment secret channel. |
 | `FEEDLING_V2_E2B_ALLOW_INTERNET` | Defaults to `0`. Enabling sandbox internet is a deployment-level trust and egress decision, never a model-selected option. |
 | `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED` | Defaults to `0`. Encrypted trajectory capture remains on, but provider-backed offline failure review must stay opt-in because it uses the account's configured provider credential and is not a production retry. |
 | `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` | Must be valid when review is enabled; bounds pending plus running review work across the database-backed fleet. The current default is 64. This is an admission ceiling, not a retention policy. |
-| `FEEDLING_ENCLAVE_URL` | Required for encrypted-record decrypt operations and enclave-backed screen reads. Plaintext-tier content reads stay local and do not depend on this URL; mixed batches send only their sealed partition. Use a private authenticated network path. |
+| `FEEDLING_ENCLAVE_URL` | Required for encrypted-record decrypt operations, enclave-backed screen reads, and nonblank memory queries of accounts not recognized as plaintext. A plaintext account's memory query is ranked in the API over its plaintext cards (its sealed cards are not searched); no-query memory browsing and fetch retain local plaintext-tier reads and sealed-only forwarding. Other query searches send both tiers together for global enclave ranking; use a private authenticated network path. |
 | `FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` | Optional resident idle-probe cadence in seconds (default 210, minimum 5). Keep it below the backend's 300-second freshness window *minus one poll round trip* — the probe only runs on an idle poll cycle, so a value near 300 reports stale health and blocks onboarding. |
 | `FEEDLING_DECRYPT_DEGRADE_AFTER` | Optional number of consecutive claimed-but-unreadable messages before the resident reports `degraded` (default 2, minimum 1). A real ordinary user-message decrypt resets the streak; a server maintenance turn does not. |
 | `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC` | Optional backend persistence window before an explicit decrypt failure can inject a maintenance Chat turn for an established resident (default 1800 seconds, minimum 1). New onboarding remains immediately actionable, and all explicit failures can still produce an in-app notice before this window elapses. |
 | `FEEDLING_AGENT_TURN_TIMEOUT_SEC` | Optional per-turn timeout in seconds for one resident agent call (default 300, minimum 30). It applies to both CLI subprocesses and HTTP agent requests. Raise it for slow self-hosted stacks (cold starts, heavy MCP, long-thinking models); the cap always exists so a hung agent cannot wedge the single-flight chat lane. |
-| `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI` | Defaults to `false`. Set it to `true` only when an `AGENT_MODE=http` agent runs on the same machine, can execute commands in the Feedling checkout, and inherits the resident's `FEEDLING_HOME`. It then receives the local `io_cli` catalog and can stage downloadable files, images, and self-contained `.io.html` Canvas cards. Canvas `send-file` calls include a user-language `--title` and `--subtitle` for the app card. Leave it off for ordinary or remote HTTP model servers. |
+| `FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC` | Optional deadline for the single reply-only recovery after an ordinary foreground text CLI subprocess hits its hard timeout (default 120 seconds, minimum 30). Recovery is limited to Codex, Claude, and Pi commands whose isolation controls are known: it uses a fresh session and clean working directory, removes user/project tool configuration, disables tools or enforces a read-only sandbox, and drops action/tool-call output. It never stacks with the empty-reply retry. HTTP agents, custom CLI drivers, attachment turns, and non-foreground lanes keep the normal visible timeout fallback. |
+| `FEEDLING_CLI_MAX_OUTPUT_BYTES` | Maximum combined stdout/stderr bytes kept per resident CLI subprocess invocation, including streamed calls. pi resends the whole message so far on every token, so a `message_update` stdout line is dropped when the next one parses and carries at least as much text; lines that do not parse and rewrites to shorter text are kept. The limit therefore counts retained content rather than raw transfer. Defaults to 67108864 (64 MiB). Set a positive integer to override; invalid or nonpositive values keep the default. Exceeding the limit kills the process, discards captured output, and reports `cli_output_too_large` as a system failure. Because the killed turn never finished, the resident also drops its resumable agent session, so the next turn starts a fresh session instead of replaying the oversized one. Idle proactive turns use the existing failure backoff. |
+| `FEEDLING_AGENT_HTTP_LOCAL_IO_CLI` | Defaults to `false`. Set it to `true` only when an `AGENT_MODE=http` agent runs on the same machine, can execute commands in the Feedling checkout, and inherits the resident's `FEEDLING_HOME`. It then receives the local `io_cli` catalog and can stage downloadable files, images, and self-contained `.io.html` or `.html` Canvas cards (`.io.html` remains preferred in generation guidance). Canvas `send-file` calls include a user-language `--title` and `--subtitle` for the app card. Leave it off for ordinary or remote HTTP model servers. |
 | `FEEDLING_AGENT_HTTP_LOCAL_FILE_ROOTS` | Required with the local HTTP `io_cli` opt-in when generated files remain in the agent workspace. Set it to the exact workspace root, or a platform path-separated list of narrow roots. `send-file` may read files inside these roots but leaves the originals intact. Never set it to a home directory or filesystem root. |
 | `FEEDLING_AGENT_IMAGE_GENERATION` | Set to `true` only when the configured resident agent entry exposes a callable native image-generation tool and can deliver its PNG, JPEG, or WebP through `io_cli.py send-image`. VPS is only a deployment location and is not treated as proof of support or non-support. The companion decides when to generate an image and calls `io_cli.py generate-image` itself; a selected dedicated image route is the model it draws with, not a path that bypasses it. Residents that advertise neither a dedicated route nor a native capability continue to receive setup guidance. |
 | `FEEDLING_BACKLOG_COLLAPSE_MIN` | Optional threshold for offline-backlog collapse (default 3, `0` disables). When one processing batch holds at least this many stale plain-text user messages, the resident answers them with a single merged agent turn instead of one turn per message. A purely fresh burst (an online user double-texting) never triggers a merge; once a stale pile has triggered, fresh eligible messages in the same batch join that merged turn. |

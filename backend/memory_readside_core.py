@@ -8,10 +8,15 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
+import memory_search_contract as search_contract
 
 from core import envelope as core_envelope
+from core import plaintext_row
 from enclave import readside as enclave_readside
 from memory import service as memory_service
+from memory import card_shape
+from memory import search_rank
+from memgarden import related as mg_related
 from memgarden import timestamps as memory_timestamps
 
 
@@ -61,7 +66,7 @@ def _time_ts(moment: dict) -> float:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return memory_timestamps.now_iso()
 
 
 def _now_ts() -> float:
@@ -108,15 +113,23 @@ def memory_available(
         return False
     if status in _INACTIVE_STATUSES and status not in {"archived", "superseded"}:
         return False
-    if memory_service._memory_is_archived(moment) and not include_archived:
+    # Every io supersede writer (memory/actions.py, V2 commit_capture_batch)
+    # also stamps is_archived/archived_at/archive_reason="superseded_by:<id>" on
+    # the retired card. Those markers are part of the supersede, not a separate
+    # archive: once include_superseded admitted the card, the legacy archive
+    # check must not take it away again, or fetch(include_superseded) and the
+    # related read's explicit supersedes link never return any history.
+    if (memory_service._memory_is_archived(moment) and not include_archived
+            and status != "superseded"):
         return False
     return True
 
 
 def memory_score(moment: dict) -> float:
     importance = _float(moment.get("importance"), 0.5)
-    open_bonus = 0.1 if moment.get("is_open_thread") is True else 0.0
-    return round(open_bonus + importance * _decay_multiplier(moment), 4)
+    # Legacy/unvalidated is_open_thread metadata has no maintained lifecycle.
+    # It must not confer a ranking advantage even when present on stored cards.
+    return round(importance * _decay_multiplier(moment), 4)
 
 
 def ambient_score(moment: dict) -> float:
@@ -195,10 +208,8 @@ def readside_candidates(
             reverse=True,
         )
     if exact_query:
-        # Exact private-content search must inspect every eligible ciphertext.
-        # The caller pages this ordered list through the enclave in bounded
-        # batches, so HARD_MAX remains a per-request resource bound rather than
-        # a recall boundary that can hide an old/low-score match forever.
+        # Search sends the complete corpus for one global enclave ranking;
+        # HARD_MAX only bounds the result count and enclave decrypt chunks.
         return candidates, len(candidates)
     capped_limit = int(ambient_top_n or 0) if ambient and ambient_top_n else effective_readside_limit(limit)
     if capped_limit <= 0:
@@ -242,8 +253,17 @@ def post_enclave_readside(
     except httpx.HTTPError as e:
         raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
     if resp.status_code >= 400:
+        if resp.status_code == 413:
+            try:
+                if resp.json().get("error") == "memory_search_resource_limit":
+                    raise search_contract.SearchLimitExceeded()
+            except (ValueError, AttributeError):
+                pass
         raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
-    response = resp.json()
+    try:
+        response = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("enclave_invalid_readside_response") from exc
     if not isinstance(response, dict):
         raise RuntimeError("enclave_invalid_readside_response")
     return response
@@ -371,11 +391,7 @@ def memory_index_core(
             raise ValueError("invalid ambient_top_n")
     limit = effective_readside_limit(payload.get("limit"))
     query = str(payload.get("query") or "")[:500]
-    # ``limit`` is the caller's requested *result* count. A private-content
-    # query can only be evaluated after enclave decryption, so applying either
-    # it or HARD_MAX to the ciphertext candidates creates deterministic false
-    # negatives. Exact query search therefore walks every eligible card in
-    # score order, using HARD_MAX only as the enclave request page size.
+    # ``limit`` bounds results, never the corpus used for global statistics.
     candidates, user_card_count = readside_candidates(
         memory_service._load_moments(store),
         store.user_id,
@@ -393,20 +409,8 @@ def memory_index_core(
             "query": query,
     }
     if query.strip():
-        items: list = []
-        page_size = readside_hard_max()
-        for offset in range(0, len(candidates), page_size):
-            remaining = limit - len(items)
-            if remaining <= 0:
-                break
-            page = candidates[offset:offset + page_size]
-            items.extend(_memory_index_partition(
-                api_key,
-                page,
-                store.user_id,
-                {**payload_base, "limit": remaining},
-                post=post,
-            ))
+        result = _memory_search(api_key, candidates, store.user_id, payload_base, post=post)
+        items = result.pop("items")
     else:
         items = _memory_index_partition(
             api_key,
@@ -420,8 +424,153 @@ def memory_index_core(
         "limit": limit,
         "truncated": False if query.strip() else user_card_count > len(candidates),
         "user_card_count": user_card_count,
+        **(result if query.strip() else {}),
     }
 
+
+def _plaintext_account(owner_user_id: str) -> bool:
+    from accounts import registry  # lazy: registry imports readside callers at assembly
+
+    return registry.effective_content_encryption(owner_user_id) == "off"
+
+
+def _memory_search(api_key, candidates, owner_user_id, payload, *, post) -> dict:
+    # T779 step 4: a plaintext account ranks its whole plaintext corpus here,
+    # once and globally, with the enclave's own ranking code. Never rank
+    # partitions and merge them: that changes IDF, ranks and the cut.
+    # Sealed-content accounts still send one corpus to the enclave; strip
+    # shadow plaintext from sealed rows using the existing shape guard.
+    plain, sealed, invalid = _partition_memory_candidates(candidates, owner_user_id)
+    by_id = {str(row.get("id") or ""): row for row in plain + sealed}
+    corpus = [by_id[str(row.get("id") or "")] for row in candidates
+              if str(row.get("id") or "") in by_id]
+    if _plaintext_account(owner_user_id):
+        # Same corpus the enclave would have ranked, minus sealed rows: a
+        # plaintext account's sealed cards are no longer searched (approved
+        # T779 change) and are not counted as unreadable either.
+        sealed_rows = {id(row) for row in sealed}
+        return _memory_search_local(
+            [row for row in corpus if id(row) not in sealed_rows],
+            invalid, owner_user_id, payload)
+    request = {**payload, "search_protocol": search_contract.VERSION}
+    search_contract.check_request({**request, "moments": corpus})
+    fallbacks = iter(search_contract.FALLBACKS)
+    while True:
+        try:
+            response = post(api_key, corpus, operation="index", payload=request)
+            break
+        except RuntimeError as exc:
+            # Rolling restart: an enclave that predates this ranker rejects the
+            # protocol with this exact 400. Step down once per older protocol
+            # (memgarden v1, then the pre-memgarden BM25); every other failure
+            # (auth, timeout, 5xx) still propagates.
+            older = next(fallbacks, None)
+            if older is None or not (str(exc).startswith("enclave_http_400:")
+                                     and "memory_search_protocol_unsupported" in str(exc)):
+                raise
+            request = {**payload, "search_protocol": older}
+    # A successful previous-protocol response has this exact envelope. Missing
+    # ranking on that known shape is rolling compatibility, not permission to
+    # swallow HTTP/auth/timeouts or unknown/malformed future protocols.
+    if (not isinstance(response, dict) or response.get("user_id") != owner_user_id
+            or not isinstance(response.get("items"), list)
+            or not isinstance(response.get("unavailable_ids"), list)):
+        raise RuntimeError("enclave_invalid_readside_response")
+    ranking = response.get("ranking", search_contract.LEGACY)
+    if ranking not in search_contract.ACCEPTED:
+        raise RuntimeError("enclave_invalid_readside_response")
+    items = []
+    for item in response["items"]:
+        if not isinstance(item, dict) or str(item.get("id") or "") not in by_id:
+            raise RuntimeError("enclave_invalid_readside_response")
+        clean = _public_memory_item(item)
+        clean.pop("content", None)
+        clean.pop("_search_content", None)
+        clean.pop("_bm25_score", None)
+        items.append(clean)
+    # Preserve enclave BM25 order; _ordered_items would restore importance order.
+    return {"items": items[:int(payload["limit"])], "ranking": ranking,
+            "unavailable_count": len(invalid) + len(response["unavailable_ids"])}
+
+
+
+
+class _SearchRowUnreadable(Exception):
+    pass
+
+
+def _read_search_items(rows: list, owner_user_id: str) -> tuple[list[dict], list[str]]:
+    """``enclave.readside.decrypt_readside_items`` for a sealed-free corpus.
+
+    Row by row the same verdicts: local_only or bodiless rows, rows the enclave
+    would treat as sealed (``is_sealed_row``; here they carry no ``body_ct``, so
+    the enclave's decrypt fails), foreign/ownerless rows and non-object JSON
+    are unavailable; ``body`` wins over ``body_b64``. The item builder runs
+    outside the per-row guard, exactly as in the enclave.
+    """
+    items: list[dict] = []
+    unavailable_ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        memory_id = str(row.get("id") or "")
+        if row.get("visibility") == "local_only" or (
+            not row.get("K_enclave")
+            and row.get("body") is None
+            and row.get("body_b64") is None
+        ):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        try:
+            if plaintext_row.is_sealed_row(row):
+                raise _SearchRowUnreadable("sealed-shaped row without ciphertext")
+            raw = plaintext_row.read_plaintext_row(row, owner_user_id, _SearchRowUnreadable)
+            inner = json.loads(raw.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("memory plaintext is not an object")
+        except (_SearchRowUnreadable, json.JSONDecodeError, ValueError):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        items.append(enclave_readside.build_memory_search_item(row, inner))
+    return items, unavailable_ids
+
+
+def _memory_search_local(corpus, invalid, owner_user_id, payload) -> dict:
+    """``enclave.memory_search.search`` for a plaintext account, in backend.
+
+    Same steps in the same order on the same corpus: request check, item build,
+    one global rank, bucket/thread filter, cut, then the post-processing
+    ``_memory_search`` applies to an enclave answer. Any failure after the
+    request check (the stage that ran in the enclave and answered 5xx) is a
+    ``RuntimeError`` here, so callers map it the same way; the resource limit
+    stays ``SearchLimitExceeded`` (413).
+    """
+    request = {**payload, "search_protocol": search_contract.VERSION}
+    search_contract.check_request({**request, "moments": corpus})
+    # Everything below ran inside the enclave service before: any failure there
+    # was a 5xx the backend saw as RuntimeError (503), except the resource limit
+    # (413). Keep exactly that boundary.
+    try:
+        built, unavailable_ids = _read_search_items(corpus, owner_user_id)
+        ranked = search_rank.rank(built, str(payload.get("query") or "")[:500],
+                                  protocol=search_contract.VERSION)
+        ordered = enclave_readside.memory_index_filter_items(ranked, {**payload, "query": ""})
+        limit = enclave_readside.memory_readside_effective_limit(payload.get("limit"))
+        items = []
+        for item in ordered[:limit]:
+            clean = _public_memory_item(enclave_readside.memory_public_item(item))
+            clean.pop("content", None)
+            clean.pop("_search_content", None)
+            clean.pop("_bm25_score", None)
+            items.append(clean)
+    except search_contract.SearchLimitExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 — was an enclave 5xx
+        raise RuntimeError("readside_local_error") from exc
+    return {"items": items[:int(payload["limit"])], "ranking": search_contract.VERSION,
+            "unavailable_count": len(invalid) + len(unavailable_ids)}
 
 def _bool_payload(value: Any) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
@@ -502,6 +651,40 @@ def memory_fetch_core(
     unavailable_ids = [
         memory_id for memory_id in ids if memory_id in unavailable_set
     ]
+    related_items: list[dict] = []
+    related_status = "not_needed"
+    source_items = [items_by_id[mid] for mid in ids if mid in items_by_id]
+    if any(item.get("threads") or item.get("anchor_memory_ids") or item.get("supersedes")
+           for item in source_items):
+        try:
+            # Reuse the authenticated, lifecycle-filtered index projection;
+            # decrypted bodies stay within the existing enclave boundary.
+            linked_ids = {mid for item in source_items for key in ("anchor_memory_ids", "supersedes")
+                          for mid in mg_related.links(item.get(key))}
+            neighbors = [m for m in moments if memory_available(
+                m, store.user_id, include_superseded=True)]
+            # Explicit links win seats before thread discovery. A superseded
+            # card is returned only along an explicit link, marked historical.
+            neighbors.sort(key=lambda m: (m.get("id") not in linked_ids, str(m.get("id") or "")))
+            bound = readside_hard_max()
+            neighbor_items = _memory_index_partition(
+                api_key, neighbors[:bound], store.user_id, {"limit": bound},
+                post=post_enclave or post_enclave_readside)
+            # memgarden reads canonical lifecycle/summary only; translate io's
+            # legacy archive markers and title-style summaries first.
+            related_items = mg_related.one_hop(
+                [card_shape.to_related_card(item) for item in source_items],
+                [card_shape.to_related_card(item) for item in neighbor_items], cap=7)
+            complete_window = {m.get("id") for m in neighbors[:bound]} <= {i.get("id") for i in neighbor_items}
+            related_status = "bounded" if (len(neighbors) > bound or len(related_items) > 6
+                                             or not complete_window) else "ok"
+            if neighbors and not neighbor_items:
+                related_status = "unavailable"
+            related_items = related_items[:6]
+        except RuntimeError:
+            # Primary fetch remains useful, but missing relation evidence is
+            # explicitly unknown rather than a false claim of no neighbors.
+            related_status = "unavailable"
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
     if referenced_ids:
         now = _now_iso()
@@ -515,11 +698,14 @@ def memory_fetch_core(
                 fresh = memory_service._load_moments(store)
                 for m in fresh:
                     if isinstance(m, dict) and str(m.get("id") or "") in referenced_ids:
+                        # Only the reference stamp: updated_at means "the card
+                        # changed" (profile refresh witness), and a read is not a change.
                         m["last_referenced_at"] = now
-                        m["updated_at"] = now
                 memory_service._save_moments(store, fresh)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
+        "related_items": related_items,
+        "related_status": related_status,
         "missing_ids": missing_ids,
         "unavailable_ids": unavailable_ids,
         "truncation": {

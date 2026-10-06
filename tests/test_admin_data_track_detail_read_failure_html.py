@@ -14,11 +14,14 @@ import db
 
 def test_detail_html_visibly_warns_that_snapshot_is_unread(client, monkeypatch):
     user_id, _ = _register(client)
-    # Warm the legacy store cache before locking frame_envelopes. Otherwise
-    # the HTML route's pre-snapshot compatibility read waits on the same lock
-    # without a statement timeout and the lock expires before the target read.
+    # Establish that the detail snapshot is healthy before the lock-induced
+    # failure; the second request must render that failure rather than true zero.
     assert _detail(client, user_id)["snapshot_read_status"]["level"] == "ok"
-    monkeypatch.setattr(db, "_ADMIN_DATA_TRACK_READ_TIMEOUT_MS", INJECTED_TIMEOUT_MS)
+    monkeypatch.setattr(
+        db,
+        "_ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS",
+        INJECTED_TIMEOUT_MS,
+    )
 
     with RealReadFailure():
         response = client.get(

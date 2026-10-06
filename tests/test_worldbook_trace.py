@@ -16,7 +16,10 @@ _WRITE_EVENT_KEYS = frozenset({
     "trace_id", "turn_id", "detail",
 })
 _WRITE_DETAIL_KEYS = frozenset({"operation", "outcome", "reason", "counts"})
-_MATCH_EVENT_KEYS = _WRITE_EVENT_KEYS | {"job_id"}
+# dur_ms 是 2026-09-07(T501)加的：这条埋点原先不带耗时，于是「每轮预注入到底
+# 贵不贵」在线上无法回答，缓存要不要做只能靠猜。它属于事件契约的一部分，所以
+# 进闭集，而不是当成可有可无的附加字段。
+_MATCH_EVENT_KEYS = _WRITE_EVENT_KEYS | {"job_id", "dur_ms"}
 _MATCH_DETAIL_KEYS = frozenset({
     "operation", "outcome", "reason", "lane", "counts",
 })
@@ -38,6 +41,9 @@ def _assert_closed_write_event(event):
 
 def _assert_closed_match_event(event):
     assert set(event) == _MATCH_EVENT_KEYS
+    # 声明了字段还得真有值：`dur_ms` 为 None 时线上聚合出来跟没埋点一模一样。
+    assert isinstance(event["dur_ms"], (int, float))
+    assert event["dur_ms"] >= 0
     assert set(event["detail"]) == _MATCH_DETAIL_KEYS
     assert set(event["detail"]["counts"]) == _MATCH_COUNT_KEYS
 
@@ -267,3 +273,25 @@ def test_worldbook_admin_projection_exposes_only_closed_enums_and_counts():
     forged_public = data_track._debug_event_public_json(forged)["detail"]
     assert forged_public["outcome"] == "<redacted string len=15>"
     assert forged_public["lane"] == "<redacted string len=12>"
+
+
+def test_match_trace_dur_ms_measures_real_elapsed_time(monkeypatch):
+    """`dur_ms >= 0` 抓不住硬编码 0.0 —— 那样量具死了也全绿。
+
+    这里把 monotonic 换成确定性时钟,断言**精确值**:只有真的用「结束−开始」算出来
+    才对得上。三个出口的键存在性/非 None 由 `_assert_closed_match_event` 继续守。
+    """
+    ticks = iter([10.0, 10.25])
+    monkeypatch.setattr(worldbook_core.time, "monotonic", lambda: next(ticks))
+    events = _capture(monkeypatch)
+
+    worldbook_core.match(
+        _Store(),
+        {"message": "private query"},
+        api_key=None,
+        runtime_token=None,
+        trace_id="trace-duration",
+        lane="chat",
+    )
+
+    assert events[-1]["dur_ms"] == 250.0

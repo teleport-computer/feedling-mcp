@@ -49,7 +49,7 @@ def _docker_socket_path() -> Path | None:
     os.environ.get("FEEDLING_RUN_DOCKER_SOCKET_TESTS") != "1",
     reason="set FEEDLING_RUN_DOCKER_SOCKET_TESTS=1 for the live Docker contract",
 )
-def test_socket_proxy_allows_only_cpu_recorder_reads():
+def test_socket_proxy_allows_only_collector_reads():
     docker_socket = _docker_socket_path()
     if docker_socket is None:
         pytest.skip("Docker Unix socket is unavailable")
@@ -113,6 +113,7 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
             f"-allowfrom={client}",
             "-allowGET=/containers/json",
             r"-allowGET=/containers/[0-9a-f]{64}/stats",
+            r"-allowGET=/containers/[0-9a-f]{64}/logs",
         ).stdout.strip()
         created_containers.append(proxy_id)
 
@@ -146,9 +147,10 @@ def test_socket_proxy_allows_only_cpu_recorder_reads():
             )
             == 200
         )
+        assert _container_status(client, "GET", f"{base_url}/containers/{target_id}/logs?stdout=1&stderr=1&follow=0&timestamps=1&since=0") == 200
         denied_reads = [
             ("GET", f"{base_url}/containers/{target_id}/json"),
-            ("GET", f"{base_url}/containers/{target_id}/logs?stdout=1"),
+
             ("GET", f"{base_url}/images/json"),
             ("GET", f"{base_url}/info"),
             ("GET", f"{base_url}/version"),

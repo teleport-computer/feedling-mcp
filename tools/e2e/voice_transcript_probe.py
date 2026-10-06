@@ -82,9 +82,11 @@ def main() -> int:
     with E2EClient.provision(route="model_api") as c:
         r = c.post("/v1/model_api/setup", json={
             "provider": "openai_compatible",
-            "model": "claude-haiku-4-5-20251001",
-            "api_key": pool["E2E_KEY_HOJIMI"],
-            "base_url": pool["E2E_HOJIMI_BASE"],
+            # 2026-09-14 hojimi 退役;玖时目录里没有 haiku,取该目录里的一个 claude 系
+            # (未比价;这条探针只要一个能做通话转写总结的 claude 模型,不挑档位)。
+            "model": "[AG4]claude-sonnet-4-6",
+            "api_key": pool["E2E_KEY_JIUSHI"],
+            "base_url": pool["E2E_JIUSHI_BASE"],
         })
         if r.status_code != 200:
             print(f"setup 失败 {r.status_code}: {r.text[:200]}")

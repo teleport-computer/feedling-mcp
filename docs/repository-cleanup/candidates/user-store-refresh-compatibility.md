@@ -36,7 +36,7 @@ canonical_owner: self
 - 上述三文件已进入独立 CI batch，并从 `.github/pytest-uncovered-baseline.txt` 移除；
   覆盖棘轮先以 `MAX_EXEMPTED=290 与实际 287 条不符` RED，再收紧到 287 GREEN。
 - PR 前回归暴露出两个 Genesis worker 文件仍 monkeypatch 已退役的 `get_store` seam；
-  7 处替身迁到生产实际调用的 `get_store_shell_only(..., reason=...)` 后，原 11 个失败消失。
+  7 处替身迁到生产实际调用的 `get_store_per_load_mode(..., reason=...)` 后，原 11 个失败消失。
   两文件新增显式 CI batch、移出 uncovered baseline，棘轮先以 287 对实际 285 RED，再收紧
   到 285 GREEN。
 - 广泛回归使用显式本机 PostgreSQL；因另一个 editable package 提供 `tests/__init__.py`，

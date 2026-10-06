@@ -241,8 +241,9 @@ def test_workspace_prompt_jit_injects_complete_genesis_persona(monkeypatch):
     monkeypatch.setattr(
         serve_worker.core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, api_key, *, purpose, runtime_token: (
-            decrypt_calls.append((envelope, api_key, purpose, runtime_token))
+        lambda envelope, api_key, *, purpose, caller_user_id, runtime_token: (
+            decrypt_calls.append((
+                envelope, api_key, purpose, caller_user_id, runtime_token))
             or persona_versions[len(decrypt_calls) - 1].encode("utf-8")
         ),
     )
@@ -265,8 +266,8 @@ def test_workspace_prompt_jit_injects_complete_genesis_persona(monkeypatch):
     assert len(first["identity_card_or_persona"]) > 2_000
     assert second["identity_card_or_persona"] == persona_versions[1].strip()
     assert [call[2:] for call in decrypt_calls] == [
-        ("genesis_persona", "rt-1"),
-        ("genesis_persona", "rt-2"),
+        ("genesis_persona", "u-persona", "rt-1"),
+        ("genesis_persona", "u-persona", "rt-2"),
     ]
 
 

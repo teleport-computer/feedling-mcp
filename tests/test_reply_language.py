@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from chat import reply_language  # noqa: E402
 from chat.reply_language import (  # noqa: E402
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
@@ -17,6 +18,7 @@ from chat.reply_language import (  # noqa: E402
     format_time_anchor,
     garden_language_decision,
     infer_reply_language,
+    proactive_language_system_line,
     reply_language_system_line,
 )
 
@@ -192,9 +194,23 @@ def test_reply_language_system_line_signature_and_production_call_sites_are_clos
                 assert node.keywords == []
 
     assert calls_by_file == {
-        "backend/model_api_runtime/v2/worker.py": 2,
+        # T769: the V2 wake lane moved to proactive_language_system_line.
+        "backend/model_api_runtime/v2/worker.py": 1,
         "tools/chat_resident_consumer.py": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("locale", "expected"),
+    [
+        ("en-US", "Language: talk to the user in the language they use."),
+        ("zh-Hans-CN", "语言：用用户使用的语言跟他说话。"),
+    ],
+)
+def test_proactive_language_system_line_is_one_soft_sentence(locale, expected):
+    line = proactive_language_system_line(infer_reply_language(locale=locale))
+    assert line == expected
+    assert "\n" not in line
 
 
 def test_failure_fallback_reply_selects_paired_shared_copy():
@@ -383,3 +399,48 @@ def test_garden_ignores_renamed_language_metadata() -> None:
         written="今天一直在处理工作和家里的事情，晚上终于有时间坐下来休息一会儿。",
     )
     assert (decision["locale"], decision["basis"]) == ("zh-Hans", "writing_language")
+
+
+# --- T743: failure fallbacks follow the user's latest message ----------------
+# Seven 2026-09-26: 「统一成按用户这句话的语言选」. One judge serves the resident
+# consumer, the V2 in-turn fallback and the V2 terminal-failure sink.
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("你好", "zh-Hans"),
+        ("ok 好的", "zh-Hans"),
+        ("hello", "en"),
+        ("hi", "en"),
+        # Third state: no signal, never a guess.
+        ("", ""),
+        (None, ""),
+        ("😀 123 !?", ""),
+        ("a", ""),
+    ],
+)
+def test_text_language_is_tri_state(text, expected):
+    assert reply_language.text_language(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"user_text": "hello", "archive_language": "zh-Hans-CN"}, "en"),
+        ({"user_text": "你好", "archive_language": "en-US"}, "zh-Hans"),
+        ({"user_text": "😀", "archive_language": "en-US"}, "en"),
+        ({"user_text": "😀", "archive_language": "zh-Hans-CN"}, "zh-Hans"),
+    ],
+)
+def test_failure_fallback_language(kwargs, expected):
+    assert reply_language.failure_fallback_language(**kwargs).language == expected
+
+
+def test_failure_fallback_language_without_signal_is_the_account_policy():
+    for locale, archive in [("en-US", ""), ("zh-Hans-CN", ""), ("", "en-US"),
+                            ("", "zh-Hans-CN"), ("", "")]:
+        assert reply_language.failure_fallback_language(
+            locale=locale, archive_language=archive
+        ) == reply_language.infer_reply_language(
+            locale=locale, archive_language=archive
+        )

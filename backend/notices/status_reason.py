@@ -13,6 +13,8 @@ reason it matches exactly.
 """
 from __future__ import annotations
 
+# migrate 错误码仅用于识别历史 job 终态；老卡迁移机制已删。
+
 from notices import catalog, error_contract
 
 REDACTED = "<redacted>"
@@ -22,7 +24,7 @@ REDACTED = "<redacted>"
 #   proactive/poll_core.py:73,165,214,298   lifecycle terminals
 #   proactive/poll_core.py:312              evaluate_wake_control_v2 rejections
 #   proactive/proactive_core.py:408         gate.HEARTBEAT_THROTTLED_REASON
-#   proactive/capture_jobs.py:215           migrate terminal read back by name
+#   Historical migrate terminals remain readable after the producer was retired.
 #   db.py content_free_failure_code         collapsed-failure placeholder
 PROACTIVE_LIFECYCLE_REASONS = frozenset({
     "agent_greeted",
@@ -47,6 +49,10 @@ PROACTIVE_LIFECYCLE_REASONS = frozenset({
 # append exception text to it (``_agent_call_failed_reason`` deliberately
 # appends ``detail[:400]``, which is how a provider error body reaches this
 # column at all), so the tail is exactly what has to go. The bucket survives.
+# For the capture/dream/migrate ``*_agent_call_failed`` prefixes the status
+# endpoint now stores ``<prefix>:<error class>`` instead
+# (``notices.agent_call_failure``); rows written earlier, and the chat lane's
+# ``agent_call_failed: <text>``, still carry raw tails and rely on this.
 # Producers (kept in sync by tests/test_status_reason_redaction.py):
 #   tools/chat_resident_consumer.py  update_proactive_job_status(..., <reason>)
 RESIDENT_CONSUMER_REASONS = frozenset({
@@ -56,6 +62,11 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "agent_scheduled_wake_actions",
     "agent_sleep",
     "capture_agent_call_failed",
+    # Batch-window paging yielded (user message waiting / paging budget spent).
+    # Written through the constants CAPTURE_DEFERRED_* (not literals), so the
+    # AST scan cannot see them; test_non_literal_producers_are_sanctioned does.
+    "capture_deferred_paging_budget",
+    "capture_deferred_user_chat",
     "capture_invalid_memory_action",
     "capture_memory_actions_applied",
     "capture_memory_actions_failed",
@@ -66,7 +77,15 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "coalesced_into",
     "degenerate_reply_suppressed",
     "dream_agent_call_failed",
+    "dream_context_unavailable",
     "dream_invalid_memory_action",
+    # Dream through the Garden component (open_dream_session): an installed
+    # memgarden that cannot render card bodies, every proposal touching a
+    # TRUNCATED card, and the component's small-garden skip verdict.
+    "dream_kernel_outdated",
+    "dream_truncated_card_rejected",
+    "maintenance_targets_rejected",
+    "not_enough_new_cards",
     "dream_memory_actions_applied",
     "dream_memory_actions_failed",
     "dream_memory_actions_partial",
@@ -74,6 +93,7 @@ RESIDENT_CONSUMER_REASONS = frozenset({
     "dream_no_cards_available",
     "dream_nothing_to_consolidate",
     "empty_agent_reply",
+    "empty_after_reask",
     "introduction_identity_action_failed",
     "legacy_batch_unavailable",
     "memory_identity_action_failed",

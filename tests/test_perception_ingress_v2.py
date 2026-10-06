@@ -7,6 +7,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from core import envelope as core_envelope  # noqa: E402
+from core import enclave as core_enclave  # noqa: E402
 from perception import ingress_v2, service  # noqa: E402
 from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
 from perception.signal_state_v2 import SignalObservationDecision  # noqa: E402
@@ -717,10 +718,75 @@ def test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt(monke
     assert len(failures) == 1
     assert failures[0]["key"] == "location_signal"
     assert failures[0]["reason"] == "decrypt_failed:RuntimeError"
+    assert failures[0]["failure_class"] == "unexpected_decrypt_error"
+    assert failures[0]["detail"] == "RuntimeError"
     # NOT in the wake-audit stream: service._last_wake_ts / _last_v2_wake_ts scan
     # only the newest 50 rows there, so a burst of failures would push the last
     # "wake" row out of the window and silently disable burst/cluster dedup.
     assert fake.read_events("u_decrypt_failure") == []
+
+
+@pytest.mark.parametrize(
+    ("enclave_reason", "expected_detail"),
+    [
+        ("box_seal tag invalid: ", "box_seal_tag_invalid"),
+        ("AEAD verify: Decryption failed.", "aead_verify_failed"),
+        ("envelope missing K_enclave", "envelope_missing_k_enclave"),
+        (
+            "owner mismatch: envelope claims owner=usr_forged_secret "
+            "but caller is u_decrypt_failure",
+            "owner_mismatch",
+        ),
+    ],
+)
+def test_snapshot_v2_classifies_403_decrypt_failures_without_storing_response_text(
+    monkeypatch,
+    enclave_reason,
+    expected_detail,
+):
+    """Four real enclave failure shapes remain distinguishable and content-free."""
+    fake = _Store()
+    trace_events = []
+    response_text = json.dumps({"error": f"decrypt_failed: {enclave_reason}"})
+    response = SimpleNamespace(status_code=403, text=response_text)
+    client = SimpleNamespace(post=lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(core_enclave, "_client", lambda: client)
+    monkeypatch.setattr(
+        core_enclave.debug_trace,
+        "trace_event",
+        lambda _store, **event: trace_events.append(event),
+    )
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave.test")
+
+    results = service.ingest_snapshot_v2(
+        "u_decrypt_failure",
+        [{
+            "key": "location_signal",
+            "envelope": {
+                "id": "loc_403",
+                "owner_user_id": "usr_forged_secret",
+                "body_ct": "ciphertext-must-not-be-persisted",
+            },
+            "changed": True,
+        }],
+        client_ts=500.0,
+        api_key="api-key",
+    )
+
+    assert results["location_signal"] == "accepted"
+    failure = fake.read_decrypt_failures("u_decrypt_failure")[0]
+    assert failure["reason"] == "decrypt_failed:RuntimeError"
+    assert failure["failure_class"] == "enclave_http_403"
+    assert failure["detail"] == expected_detail
+
+    error_event = next(event for event in trace_events if event["status"] == "error")
+    assert error_event["detail"]["failure_class"] == "enclave_http_403"
+    assert error_event["detail"]["failure_detail"] == expected_detail
+    persisted = json.dumps({"failure": failure, "trace": error_event})
+    assert enclave_reason not in persisted
+    assert "usr_forged_secret" not in persisted
+    assert "ciphertext-must-not-be-persisted" not in persisted
 
 
 def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):
@@ -1020,8 +1086,8 @@ def test_report_decrypts_context_snapshot_even_for_resident_chat_users(monkeypat
 
     calls = []
 
-    def fake_decrypt(envelope, api_key, *, purpose):
-        calls.append((purpose, api_key))
+    def fake_decrypt(envelope, api_key, *, purpose, caller_user_id):
+        calls.append((purpose, api_key, caller_user_id))
         return json.dumps({
             "values": {
                 "output_type": "bluetooth",
@@ -1049,7 +1115,11 @@ def test_report_decrypts_context_snapshot_even_for_resident_chat_users(monkeypat
     assert status == 200
     assert body["results"]["audio_route"] == "accepted"
     # 解密真的发生了(经 enclave,带用户 key、按 purpose 归因)
-    assert calls == [("perception:audio_route", "user-api-key")]
+    assert calls == [(
+        "perception:audio_route",
+        "user-api-key",
+        "u_resident_decrypt",
+    )]
     # 明文值展开进 state —— agent 拉 snapshot 不再是 null
     state = fake.get_state("u_resident_decrypt")
     assert state["output_type"]["v"] == "bluetooth"

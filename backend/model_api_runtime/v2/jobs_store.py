@@ -36,12 +36,14 @@ import db
 from chat.reply_language import (
     DEFAULT_FAILURE_FALLBACK_EN,
     DEFAULT_FAILURE_FALLBACK_ZH,
+    failure_fallback_language,
     failure_fallback_reply,
-    infer_reply_language,
 )
 from core import wake_bus
 from memgarden import timestamps as memory_timestamps
+from memory import capture_failure
 from model_api_runtime.v2 import usage_reporting
+from model_api_runtime.v2 import wake_circuit
 from notices import catalog as notices_catalog
 from proactive import capture_daily
 
@@ -172,6 +174,37 @@ class PreemptedJob:
     # AFTER its transaction commits — marking pending mid-transaction would
     # advertise a row that may still roll back.
     recovered_reviews: tuple[tuple[str, str], ...] = ()
+    # 抢占时撞见的是租约已过期的落卡任务：已在同一事务里终结并记了一次落卡失败。
+    # 调用方提交后要调 ``after_capture_crash_recorded``（镜像 capture_state + 同步提示）。
+    capture_failure_state: dict | None = None
+
+
+#: 落卡入队这一次到底发生了什么（Codex 第 13 轮 M1）。通用 ``enqueue_job`` 的
+#: ``(job_id, coalesced)`` 表达不了「旧任务已被终结、这一轮没有任务」，调用方会误报成
+#: 「已合并进一个排队中的任务」。
+#:
+#: - ``created``：新建了一个待跑的落卡任务。
+#: - ``coalesced_active``：合并进一个仍活着的落卡任务（排队中 / 租约内在跑）。
+#: - ``expired_deferred``：撞见租约已过期的旧任务，同一事务里终结 + 记账，这一轮不建新任务；
+#:   ``job_id`` 是那个**已终结**的旧任务。
+#: - ``backoff_deferred``：没有活跃任务，但加锁后重读的 capture_state 显示正处在失败退避里
+#:   （典型：并发的另一次入队 / 回收器刚终结了崩溃任务并记了账），这一轮不建新任务；
+#:   ``job_id`` 为 None。只有调用方传了 ``backoff_now`` 才会出现。
+CaptureEnqueueDisposition = Literal[
+    "created", "coalesced_active", "expired_deferred", "backoff_deferred"
+]
+
+
+@dataclass(frozen=True)
+class CaptureEnqueueResult:
+    job_id: int | None
+    disposition: CaptureEnqueueDisposition
+
+    @property
+    def created(self) -> bool:
+        return self.disposition == "created"
+
+
 # Chat admission and execution use separate columns and clocks. Pending rows
 # have a short queue deadline so an admitted turn cannot wait forever when the
 # fleet dies. Claim starts a distinct owner-fenced execution lease. Workers
@@ -1063,6 +1096,128 @@ def coalesce_or_insert_on_cursor(
     return int(cur.fetchone()["id"]), False
 
 
+# --- 整个 worker 容器死了、租约还没到期：前台抢占怎么认出来 --------------------- #
+#
+# 生产上每个 slot 子进程认领 job 时 claimed_by = ``{worker_id}:{pool}-{index}:{代次 uuid hex}``
+# （turn_child._run），而同一个父进程每 ~10s 往 v2_worker_heartbeats 写 ``{worker_id}:{pool}``
+# 三行（_fleet_heartbeat_loop），Genesis 线程另写 ``{worker_id}:genesis``。worker_id 每次进程
+# 启动都带随机段（runner_identity / _default_worker_id），重启后的新容器**不会**冒用死掉的
+# 那个身份。于是「这个 claim 的主人整个没了」有一个不靠猜的判据：
+#   1. claimed_by 是上面这个生产形状（别的形状一律判不了 → 照旧重投）；
+#   2. 主人所在池的心跳行**存在**（证明登记过这个主人，不是还没来得及写第一拍）；
+#   3. 这个主人的**全部**心跳行（三个池 + genesis）都超过窗口没更新——只一个池的循环卡住
+#      而进程还活着，不算死；Genesis 心跳走独立线程，事件循环卡死时它还在跳；
+#   4. claim 本身也早于窗口（刚认领的 job 不可能已经被一个「窗口前就死了」的主人持有）。
+#
+# 窗口默认 120s，与 Genesis 孤儿回收的 FEEDLING_GENESIS_WORKER_DEAD_SEC 同值同语义：
+# 心跳间隔 10s 的 12 倍；大于 _run_forever 的最长重启退避 30s + slot 排空 12s。
+# 下限 60s。判错（主人其实还活着）的代价与租约回收器判过期相同：这一轮落卡被终结并记
+# 一次失败，存活的子进程提交时被 claimed_by/状态栅栏挡掉，批次协议保证不会双写。
+CAPTURE_OWNER_DEAD_SEC = max(
+    60.0, _positive_float_env("FEEDLING_V2_CAPTURE_OWNER_DEAD_SEC", "120")
+)
+_FLEET_POOLS = ("foreground", "wake", "heavy")
+_FLEET_CLAIM_RE = re.compile(
+    r"^(?P<worker>.+):(?P<pool>foreground|wake|heavy)-[0-9]+:[0-9a-f]{32}$"
+)
+
+
+def fleet_claim_owner(claimed_by: object) -> tuple[str, str] | None:
+    """``(worker_id, pool)`` for a production slot claim; ``None`` when the shape is unknown."""
+    match = _FLEET_CLAIM_RE.fullmatch(str(claimed_by or ""))
+    if match is None:
+        return None
+    return match.group("worker"), match.group("pool")
+
+
+def _capture_owner_dead_sql(claimed_by: object) -> tuple[str, tuple]:
+    """SELECT-list expression (and its params) for "the whole owner is dead".
+
+    Evaluated inside the job-row SELECT of the chat preemption, so the chat send
+    path pays no extra round trip. Reads only the heartbeat table, takes no
+    lock. An unknown claim shape is a constant ``false``.
+    """
+    owner = fleet_claim_owner(claimed_by)
+    if owner is None:
+        return "false AS owner_dead", ()
+    worker, pool = owner
+    family = [f"{worker}:{name}" for name in (*_FLEET_POOLS, "genesis")]
+    return (
+        "(EXISTS (SELECT 1 FROM v2_worker_heartbeats WHERE worker_id=%s) "
+        "AND NOT EXISTS (SELECT 1 FROM v2_worker_heartbeats "
+        "  WHERE worker_id = ANY(%s) "
+        "  AND beat_at > clock_timestamp() - make_interval(secs => %s)) "
+        "AND claimed_at <= clock_timestamp() - make_interval(secs => %s)"
+        ") IS TRUE AS owner_dead",
+        (
+            f"{worker}:{pool}",
+            family,
+            float(CAPTURE_OWNER_DEAD_SEC),
+            float(CAPTURE_OWNER_DEAD_SEC),
+        ),
+    )
+
+
+def _expire_overdue_capture_for_chat_on_cursor(
+    cur: psycopg.Cursor, row: dict
+) -> PreemptedJob | None:
+    """前台聊天抢占时撞见**租约已过期**的落卡任务：终结 + 记一次落卡失败，不重投。
+
+    重投（回到 pending、不加 attempt_count、不记账）对还活着的落卡任务是对的 —— 那只是
+    让位给聊天。但租约已过期说明持有它的 worker 已经崩了/卡死了；这时重投等于替崩溃
+    打掩护：活跃聊天的用户每次在回收器之前发一条消息，失败次数就永远涨不起来（Codex 第 12 轮 C1）。
+
+    调用方（chat 发送事务）已持有 chat fence →（runtime 行）→ 这些 job 行，这里接着拿
+    设置行 ``FOR SHARE`` 和 capture_state，顺序与落卡其他边界一致。runtime 行不再加锁
+    （它必须排在 job 行之前），只读一次用来比对 generation。
+    租约仍有效、但能证明持有它的整个 worker 已死（``_capture_owner_dead_sql``，
+    只读心跳表、不加锁，和取 job 行是同一条查询）的任务同样终结 + 记账；其余租约仍有效的
+    任务走下面原来的重投分支。
+    """
+    owner_dead_sql, owner_dead_params = _capture_owner_dead_sql(row.get("claimed_by"))
+    cur.execute(
+        "SELECT id,user_id,lane,status,claimed_by,attempt_count,"
+        "expected_runtime_generation,"
+        "COALESCE(lease_expires_at,deadline_at) IS NOT NULL "
+        "AND COALESCE(lease_expires_at,deadline_at) <= clock_timestamp() AS overdue, "
+        f"{owner_dead_sql} "
+        "FROM agent_jobs WHERE id=%s",
+        (*owner_dead_params, row["id"]),
+    )
+    job = cur.fetchone()
+    if (
+        job is None
+        or str(job["status"]) != str(row["status"])
+        or job["claimed_by"] != row["claimed_by"]
+    ):
+        return None
+    # 租约没过期、但持有它的整个 worker 已经死了（见 CAPTURE_OWNER_DEAD_SEC）：同样是崩溃，
+    # 同样终结 + 记账。判不了（形状不认识 / 心跳还新 / 刚认领）就照旧走重投。
+    if not bool(job["overdue"]) and not bool(job["owner_dead"]):
+        return None
+    cur.execute(
+        "SELECT hosted_runtime_state,runtime_generation "
+        "FROM v2_runtime_state WHERE user_id=%s",
+        (str(row["user_id"]),),
+    )
+    runtime = cur.fetchone()
+    expired = _expire_overdue_capture_on_cursor(cur, job=dict(job), runtime=runtime)
+    if expired is None:
+        raise RuntimeError(
+            f"active job ownership changed while preempting job {row['id']}"
+        )
+    _row, recovered_reviews, failed_state = expired
+    return PreemptedJob(
+        job_id=int(row["id"]),
+        user_id=str(row["user_id"]),
+        lane="capture",
+        claimed_by=None if row["claimed_by"] is None else str(row["claimed_by"]),
+        recovery="terminal",
+        recovered_reviews=tuple(recovered_reviews),
+        capture_failure_state=failed_state,
+    )
+
+
 def preempt_active_for_chat_on_cursor(
     cur: psycopg.Cursor,
     *,
@@ -1088,6 +1243,11 @@ def preempt_active_for_chat_on_cursor(
     results: list[PreemptedJob] = []
     for row in rows:
         lane = str(row["lane"])
+        if lane == "capture" and str(row["status"]) in {"claimed", "running"}:
+            crashed = _expire_overdue_capture_for_chat_on_cursor(cur, row)
+            if crashed is not None:
+                results.append(crashed)
+                continue
         recovery: Literal["terminal", "requeued"]
         # 重投复用同一个 job_id 并重跑整轮。已经写出去的东西会再写一遍,
         # 而 `get_chat_mutation_recovery_barrier` 只保护 lane='chat',
@@ -1187,6 +1347,242 @@ def preempt_active_for_chat_on_cursor(
     return results
 
 
+def _enqueue_capture_job(
+    user_id,
+    *,
+    reason,
+    trace_id,
+    priority,
+    deadline_at,
+    expected_generation: int | None,
+    backoff_now: float | None = None,
+) -> CaptureEnqueueResult:
+    """落卡 lane 的入队边界（Codex 第 12 轮 C1）。
+
+    通用的 ``coalesce_or_insert_on_cursor`` 撞见租约已过期的 claimed/running 旧任务时，
+    会就地把它改成 expired/lease_timeout 并**立刻建新任务**，不记落卡失败。调度器和
+    租约回收器都是 30 秒一轮，调度器可以一直抢先：
+
+        worker 崩溃 → 调度器收掉旧任务 + 建新任务 → 又崩溃 → …… 失败次数永远是 0
+
+    没有退避、没有提示。这里改成：
+
+    - 锁顺序和落卡其他边界一致：chat fence → runtime 行（``FOR SHARE``）→ job 行 →
+      （设置行 ``FOR SHARE``）→ capture_state。不能先让通用函数锁了 job 行再补拿 fence。
+    - 撞见**同代**、租约已过期的 claimed/running 落卡任务：同一事务里按回收器的方式终结 +
+      记一次不带窗口的失败，**这一轮不建新任务**，返回 ``expired_deferred``。
+      下一轮调度器再决定建不建 —— 那时它能看到刚记下的退避。
+    - 仍在租约内的 claimed/running：直接合并（``input_generation+1``），不再二次读时钟。
+    - **没有活跃任务**且调用方给了 ``backoff_now``（调度器的准入时刻）：建新任务之前，在同一事务、
+      按同一锁顺序（job 行之后）重读 capture_state，用同一个退避判断再过一次闸；处在退避里
+      就返回 ``backoff_deferred``，不建（Codex 第 13 轮 I1）。堵的是这条缝：
+
+          A 锁住过期任务 → 终结 + 记账 → 提交
+          B 在等同一行锁 → 醒来后行已不是 claimed/running → 看到「没有活跃任务」→ 直接建新任务
+
+      B 的调度器是在 A 记账**之前**判的退避，所以绕过了。回收器在调度器判完退避之后提交也是同一条缝。
+      状态没变时这次重判和调度器的结论一样（同一个 now、同一份状态），正常路径不受影响。
+    - 其余情况（排队中 / 代已过期）原样交给通用函数，行为不变。
+
+    ``backoff_now=None``（手动 force、通用 ``enqueue_job`` 调用方）不做这道重判。
+
+    ``expected_generation`` 由调用方给出时（effect outbox），调用方已在外层事务里握着
+    runtime 行锁和 chat fence（``_chat_user_fence_held_by_outer_transaction``），这里只读
+    runtime 行不加锁，fence 也会被跳过，避免自锁。
+    """
+    for attempt in range(4):
+        try:
+            result, expired = _enqueue_capture_once(
+                user_id,
+                reason=reason,
+                trace_id=trace_id,
+                priority=priority,
+                deadline_at=deadline_at,
+                expected_generation=expected_generation,
+                backoff_now=backoff_now,
+            )
+            break
+        except psycopg.errors.UniqueViolation:
+            if attempt == 3:
+                raise
+            continue  # 并发 racer 抢先建了 active job；重读并 coalesce
+    if expired is not None:
+        _row, recovered_reviews, failed_state = expired
+        if recovered_reviews:
+            from tee_shadow import mirror
+
+            for review_user_id, source_job_id in recovered_reviews:
+                mirror.mark_pending(
+                    review_user_id, "v2_trajectory_reviews", source_job_id, "requeue"
+                )
+        if failed_state is not None:
+            after_capture_crash_recorded(
+                str(user_id), int(result.job_id), source="enqueue",
+                failed_state=failed_state,
+            )
+    if result.job_id is not None:
+        # 只有真正新建才会触发 enqueue 钩子（通用 _notify_job_enqueued 的约定）。
+        _notify_job_enqueued(
+            user_id, "capture", reason=reason, trace_id=trace_id,
+            result=(int(result.job_id), not result.created),
+        )
+    return result
+
+
+def enqueue_capture(
+    user_id,
+    *,
+    reason=None,
+    trace_id=None,
+    priority=None,
+    deadline_at=None,
+    expected_generation: int | None = None,
+    backoff_now: float | None = None,
+) -> CaptureEnqueueResult:
+    """落卡调度器的入队入口：返回结构化的 ``CaptureEnqueueResult``（见 CaptureEnqueueDisposition）。
+
+    ``backoff_now`` 传调度器做准入判断时用的那个时刻（手动 force 不传）：没有活跃任务时，
+    建新任务前会拿加锁后重读的 capture_state 按同一个时刻再判一次失败退避。
+    """
+    trace_id = _trace_id_for_enqueue("capture", trace_id)
+    if priority is None:
+        priority = LANE_PRIORITY.get("capture", 0)
+    return _enqueue_capture_job(
+        user_id,
+        reason=reason,
+        trace_id=trace_id,
+        priority=priority,
+        deadline_at=deadline_at,
+        expected_generation=expected_generation,
+        backoff_now=backoff_now,
+    )
+
+
+def _capture_backoff_armed_on_cursor(cur, user_id: str, now_ts: float) -> bool:
+    """建新落卡任务之前，重读 capture_state（``FOR SHARE``）并按调度器同一个退避判断过闸。
+
+    调用方已持 chat fence → runtime 行，且刚确认没有活跃的落卡任务（等过的 job 行锁已释放）。
+    ``FOR SHARE`` 让本事务排在任何还没提交的 capture_state 写入之后（worker 失败 / 回收记账都是
+    job 行 → capture_state 的顺序，不会反过来等本事务持有的锁）。状态行不在 = 没失败过。
+    """
+    from proactive import capture_jobs
+
+    cur.execute(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR SHARE",
+        (str(user_id), _CAPTURE_STATE_KIND),
+    )
+    row = cur.fetchone()
+    doc = row["doc"] if row is not None else None
+    if not isinstance(doc, dict):
+        return False
+    try:
+        streak = int(float(doc.get("capture_fail_streak") or 0))
+        last_failed_at = float(doc.get("last_capture_failed_at") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return capture_jobs.in_failure_backoff(streak, last_failed_at, float(now_ts))
+
+
+def _enqueue_capture_once(
+    user_id,
+    *,
+    reason,
+    trace_id,
+    priority,
+    deadline_at,
+    expected_generation: int | None,
+    backoff_now: float | None = None,
+) -> tuple[CaptureEnqueueResult, tuple | None]:
+    expired: tuple | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT hosted_runtime_state, runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s"
+                    + (" FOR SHARE" if expected_generation is None else ""),
+                    (user_id,),
+                )
+                runtime = cur.fetchone()
+                effective_generation = expected_generation
+                if (
+                    effective_generation is None
+                    and runtime is not None
+                    and str(runtime["hosted_runtime_state"]) == "v2"
+                ):
+                    effective_generation = int(runtime["runtime_generation"])
+                cur.execute(
+                    "SELECT id,user_id,lane,status,claimed_by,attempt_count,"
+                    "expected_runtime_generation "
+                    "FROM agent_jobs "
+                    "WHERE user_id=%s AND lane='capture' "
+                    "AND status IN ('pending','claimed','running') "
+                    "ORDER BY id LIMIT 1 FOR UPDATE",
+                    (user_id,),
+                )
+                existing = cur.fetchone()
+                generation_stale = (
+                    existing is not None
+                    and effective_generation is not None
+                    and (
+                        existing["expected_runtime_generation"] is None
+                        or int(existing["expected_runtime_generation"])
+                        != int(effective_generation)
+                    )
+                )
+                if existing is not None and str(existing["status"]) in {
+                    "claimed",
+                    "running",
+                }:
+                    if not generation_stale:
+                        # 行锁到手之后才读墙钟，和通用函数同一个判断。
+                        cur.execute(
+                            "SELECT COALESCE(lease_expires_at,deadline_at) IS NOT NULL "
+                            "AND COALESCE(lease_expires_at,deadline_at) "
+                            "<= clock_timestamp() AS stale FROM agent_jobs WHERE id=%s",
+                            (existing["id"],),
+                        )
+                        if bool(cur.fetchone()["stale"]):
+                            expired = _expire_overdue_capture_on_cursor(
+                                cur, job=dict(existing), runtime=runtime
+                            )
+                            return CaptureEnqueueResult(
+                                int(existing["id"]), "expired_deferred"
+                            ), expired
+                        cur.execute(
+                            "UPDATE agent_jobs SET input_generation=input_generation+1 "
+                            "WHERE id=%s RETURNING id",
+                            (existing["id"],),
+                        )
+                        return CaptureEnqueueResult(
+                            int(cur.fetchone()["id"]), "coalesced_active"
+                        ), None
+                if (
+                    (existing is None or generation_stale)
+                    and backoff_now is not None
+                    and _capture_backoff_armed_on_cursor(cur, str(user_id), backoff_now)
+                ):
+                    # 调度器判退避之后，另一次入队 / 回收器刚终结崩溃任务并记了账（第 13 轮 I1）。
+                    # 活跃任务属于已过期的 runtime 代时，下面的通用函数会作废它并**建新任务**，
+                    # 同样要过这道闸（Codex review 第 5 轮 M4）。退避里就什么都不动：旧代任务
+                    # 照旧在领取 / 提交时被所有权闸挡掉，退避过后的下一次入队再作废它。
+                    return CaptureEnqueueResult(None, "backoff_deferred"), None
+                job_id, coalesced = coalesce_or_insert_on_cursor(
+                    cur,
+                    user_id,
+                    "capture",
+                    reason=reason,
+                    trace_id=trace_id,
+                    priority=priority,
+                    deadline_at=deadline_at,
+                    expected_generation=effective_generation,
+                )
+    return CaptureEnqueueResult(
+        int(job_id), "coalesced_active" if coalesced else "created"
+    ), expired
+
+
 def enqueue_job(
     user_id,
     lane,
@@ -1218,6 +1614,23 @@ def enqueue_job(
     trace_id = _trace_id_for_enqueue(lane, trace_id)
     if priority is None:
         priority = LANE_PRIORITY.get(lane, 0)
+    if lane == "capture":
+        # 落卡入队可能撞见一个租约已过期的旧任务，终结它要在同一事务里记落卡失败，
+        # 锁顺序和下面的通用路径不同，见 _enqueue_capture_job。其他 lane 不经过这里。
+        # 这里保持通用返回约定 (job_id, 没有新建)；要区分「合并进活任务」和「旧任务已终结、
+        # 这一轮没任务」的调用方（调度器）用 enqueue_capture。不传 backoff_now，不会出现
+        # backoff_deferred，job_id 一定有值。
+        capture = _enqueue_capture_job(
+            user_id,
+            reason=reason,
+            trace_id=trace_id,
+            priority=priority,
+            deadline_at=deadline_at,
+            expected_generation=expected_generation,
+        )
+        if capture.job_id is None:  # pragma: no cover - 不传 backoff_now 时不可达
+            raise RuntimeError("capture enqueue deferred without a job id")
+        return int(capture.job_id), not capture.created
 
     # The result is captured and returned *after* the transaction closes so the
     # enqueue hook below cannot observe a write that later rolls back: a trace
@@ -1481,14 +1894,15 @@ def enqueue_job_with_context_log(
                         payload["agent_job_id"] = int(job_id)
                         cur.execute(
                             "INSERT INTO user_logs "
-                            "(user_id,stream,ts,item_key,doc) "
-                            "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+                            "(user_id,stream,ts,item_key,doc,duration_sec) "
+                            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING seq",
                             (
                                 str(user_id),
                                 str(context_stream),
                                 float(context_ts),
                                 str(int(job_id)),
                                 Jsonb(payload),
+                                db._user_log_duration_sec(str(context_stream), payload),
                             ),
                         )
                         seq = int(cur.fetchone()["seq"])
@@ -1511,8 +1925,8 @@ def enqueue_job_with_context_log(
     from tee_shadow import mirror
 
     mirror.execute(
-        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc,duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (user_id,stream,seq) DO NOTHING",
         (
             str(user_id),
@@ -1521,6 +1935,7 @@ def enqueue_job_with_context_log(
             float(context_ts),
             str(job_id),
             Jsonb(payload),
+            db._user_log_duration_sec(str(context_stream), payload),
         ),
     )
     return job_id, coalesced
@@ -1953,6 +2368,9 @@ def mark_completed(
             row = cur.fetchone()
             if row is None:
                 return False
+            wake_circuit.record_result_on_cursor(
+                cur, user_id=str(row[0]), lane=str(row[1]), job_id=int(job_id),
+            )
             if clear_wake_backoff and str(row[1]) in _FAIL_BACKOFF_WAKE_LANES:
                 _clear_wake_backoff_on_cursor(cur, str(row[0]))
             return True
@@ -2127,6 +2545,9 @@ def finish_wake_job(
                     )
                 if clear_wake_backoff:
                     _clear_wake_backoff_on_cursor(cur, user_id)
+                wake_circuit.record_result_on_cursor(
+                    cur, user_id=user_id, lane="heartbeat", job_id=int(job_id),
+                )
                 if has_late_input:
                     late_generation = (
                         int(row["input_generation"] or 0)
@@ -2208,6 +2629,7 @@ def mark_failed(
     silence and therefore do not get an outbox row.
     """
     recovered_reviews: list[tuple[str, str]] = []
+    circuit_opened = False
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -2245,8 +2667,14 @@ def mark_failed(
                     base_sec=float(wake_backoff_base_sec),
                     cap_sec=float(wake_backoff_cap_sec),
                 )
+            circuit_opened = wake_circuit.record_result_on_cursor(
+                cur, user_id=str(row[1]), lane=str(row[2]), job_id=int(job_id),
+                error_class=error_class,
+            )
             recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
             _queue_failure_review_on_cursor(cur, job_id)
+    if circuit_opened:
+        wake_circuit.publish(str(row[1]), opened=True)
     if recovered_reviews:
         # Must wait until the transaction above has committed — see the
         # docstring on _recover_review_runner_on_cursor for the race this
@@ -2463,6 +2891,528 @@ def _mirror_job_recovery_event(event: dict[str, object]) -> None:
     )
 
 
+def _general_watchdog_recover_on_cursor(
+    cur,
+    *,
+    job_id: int,
+    claimed_by: str,
+    reason: str,
+    on_terminal: Callable[[Any], None] | None = None,
+) -> tuple[str, list[tuple[str, str]]] | None:
+    """Budgeted requeue-or-expire for the general lanes (dream/profile/capture/...).
+
+    Caller holds the job row lock.  ``on_terminal`` runs in the same
+    transaction right after the terminal UPDATE and before the review side
+    effects; only the Capture recovery path uses it (to record the failure).
+    Returns ``(recovery, recovered_reviews)`` or ``None`` when the claim moved.
+    """
+    cur.execute(
+        "UPDATE agent_jobs SET status='pending',created_at=now(), "
+        "last_error=%s,attempt_count=attempt_count+1,"
+        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
+        "WHERE id=%s AND claimed_by=%s "
+        "AND status IN ('claimed','running') "
+        "AND (lane=%s OR attempt_count<%s)",
+        (
+            str(reason)[:500],
+            int(job_id),
+            str(claimed_by),
+            _TRAJECTORY_REVIEW_LANE,
+            int(GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS),
+        ),
+    )
+    if cur.rowcount == 1:
+        return "requeued", _recover_review_runner_on_cursor(cur, int(job_id))
+    cur.execute(
+        "UPDATE agent_jobs SET status='expired',finished_at=now(), "
+        "last_error=%s,attempt_count=attempt_count+1,"
+        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
+        "lease_expires_at=NULL,deadline_at=NULL "
+        "WHERE id=%s AND claimed_by=%s "
+        "AND status IN ('claimed','running')",
+        (
+            GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
+            int(job_id),
+            str(claimed_by),
+        ),
+    )
+    if cur.rowcount != 1:
+        return None
+    if on_terminal is not None:
+        on_terminal(cur)
+    recovered_reviews = _recover_review_runner_on_cursor(cur, int(job_id))
+    _queue_failure_review_on_cursor(cur, int(job_id))
+    return "terminal", recovered_reviews
+
+
+#: 回收落卡任务时单个事务最多等锁多久。回收器是全局一条循环，不能被某一个用户卡住；
+#: 等不到就跳过这一轮，下一轮（默认 30 秒后）再来。
+_CAPTURE_RECOVERY_LOCK_TIMEOUT = "5s"
+
+
+def _capture_allowed_for_crash_accounting_on_cursor(cur, user_id: str) -> bool:
+    """崩溃回收决定「记不记账」时读落卡开关，并和用户关闭落卡**串行**。
+
+    不拿 consent 的 advisory 锁（阻塞式）：provider 调用期间 worker 一直握着它，
+    回收器等它就会被卡住的那个任务拖住。改为给 proactive_settings 行加 ``FOR SHARE``：
+    关闭落卡（``patch_proactive_settings_strict`` 的 ``FOR UPDATE`` / ``set_blob_strict``
+    的 upsert）要改这一行，必须等本事务提交；反过来关闭先提交，这里读到的就是已关闭。
+    所以「读到开着 → 记账」和「关闭」之间不会插进别的顺序（Codex 第 12 轮 I2）。
+    worker 在 provider 调用期间不锁这一行（``lock_row=False``），拿它不会被拖住。
+
+    设置行还不存在（默认开着）时没有行可锁：只**尝试**拿一下 consent 锁（不等待）。
+    拿到 = 此刻没有并发的设置写入，之后的写入会排在本事务后面；拿不到 = 有人正握着它
+    （正在首次写设置行的关闭，或卡住的 worker 还在 provider 调用里握着它），此时开关**说不准**。
+
+    说不准时仍然**记账**（Codex 第 13 轮 I2 的取舍）：租约过期的卡死 worker 恰恰常常还握着
+    consent 锁（卡在 provider 调用里），这时不记账会让「没有设置行的默认用户」（大多数人）的
+    卡死永远进不了退避 —— 第 12 轮要修的问题原样回来。反过来，真碰上一次并发的首次关闭，
+    多记的这一次只影响退避次数：落卡已经关了，调度器不会再建任务；以后重新打开时这次崩溃也
+    确实发生在打开期间。**提示**则不在这里决定：提交后 ``_sync_capture_crash_notice`` 会在
+    consent 锁下重新判断，说不准就不发；关闭提交后自己也会清掉这条提示。
+    """
+    settings_sql = (
+        "SELECT doc FROM user_blobs WHERE user_id=%s "
+        "AND kind='proactive_settings' FOR SHARE"
+    )
+    cur.execute(settings_sql, (str(user_id),))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "SELECT pg_try_advisory_xact_lock("
+            "hashtextextended('capture-consent:' || %s, 0)) AS got",
+            (str(user_id),),
+        )
+        if not bool(cur.fetchone()["got"]):
+            return True
+        # 拿到锁之后再读一次（READ COMMITTED 每条语句看最新提交）：堵住「上面读完、
+        # 拿锁之前，一次关闭刚好插入并提交了设置行」的缝。
+        cur.execute(settings_sql, (str(user_id),))
+        row = cur.fetchone()
+        if row is None:
+            return True
+    doc = row["doc"]
+    if not isinstance(doc, dict):
+        return False
+    return bool(doc.get("capture_enabled", True))
+
+
+def _record_capture_crash_failure_on_cursor(
+    cur, *, job: dict, runtime: dict | None, error: str
+) -> dict | None:
+    """把一次「平台回收掉的落卡任务」记成一次**不带窗口**的落卡失败。
+
+    调用方已按落卡的锁顺序锁好 chat fence → runtime 行 → job 行，并且刚在同一个
+    事务里把这个任务转成终态。任务行的终态转移只会发生一次（行锁 + 状态条件），
+    所以这里天然不会重复记账。
+
+    以下情况**不记**（返回 None），因为这次失败已经不代表用户当前的落卡进度：
+
+    - runtime 不是 V2，或任务的 generation 不是当前 generation（Chat Clear / 切换过）
+    - 这个用户已经有**更新的**落卡任务跑过（id 更大、且不是还在排队）：它的结果
+      （成功清零 / 自己的失败）比这次旧回收更新，不能拿旧的覆盖或叠加
+    - 用户已经关掉落卡：和 worker 取消路径一致，不累计、不发提示
+    """
+    user_id = str(job["user_id"])
+    if runtime is None or str(runtime["hosted_runtime_state"]) != "v2":
+        return None
+    if int(job["expected_runtime_generation"] or 0) != int(
+        runtime["runtime_generation"]
+    ):
+        return None
+    cur.execute(
+        "SELECT 1 FROM agent_jobs WHERE user_id=%s AND lane='capture' "
+        "AND id>%s AND status<>'pending' LIMIT 1",
+        (user_id, int(job["id"])),
+    )
+    if cur.fetchone() is not None:
+        return None
+    if not _capture_allowed_for_crash_accounting_on_cursor(cur, user_id):
+        return None
+    cur.execute(
+        "INSERT INTO user_blobs (user_id,kind,doc) VALUES (%s,%s,'{}') "
+        "ON CONFLICT (user_id,kind) DO NOTHING",
+        (user_id, _CAPTURE_STATE_KIND),
+    )
+    cur.execute(
+        "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+        (user_id, _CAPTURE_STATE_KIND),
+    )
+    failed, _skipped = _capture_failed_state(
+        dict(cur.fetchone()["doc"] or {}),
+        job_id=job["id"],
+        error=str(error),
+        increment_backoff=True,
+        # 不带窗口 = 只累计退避和提示，永不跳过这一批：崩溃/卡死更可能是我们这边的
+        # 问题，拿它当「这批消息有毒」去跳过会丢掉本来保得住的记忆。
+        # 账号原因按**本次**失败重写（崩溃 = 平台问题 → 清空）：最近一次失败是我们这边
+        # 挂了，提示就该说是系统问题，不能还让用户去充值/去设置（Codex 第 12 轮 I1）。
+        window=None,
+    )
+    cur.execute(
+        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+        (Jsonb(failed), user_id, _CAPTURE_STATE_KIND),
+    )
+    return failed
+
+
+def _sync_capture_crash_notice(user_id: str, job_id) -> None:
+    """回收事务提交后，把「记忆整理受阻」提示同步到最新失败次数。纯旁路。
+
+    worker 亲手失败时由 worker._notify_capture_backoff 发提示；崩溃/卡死的任务
+    走不到那里，所以回收路径自己发。重新读一次状态并确认最后一次失败仍是这个
+    任务记的 —— 期间若已有新的落卡成功/失败，就不拿旧次数去覆盖提示。
+
+    和关闭落卡的线性化（Codex 第 12 轮 I2 / 第 13 轮 I2）：
+
+    - **尝试**拿 consent 锁（不等待）。拿不到 = 有人正握着它（最典型的是正在提交的关闭，
+      设置行还不存在时它是唯一的串行点），开关说不准 → 不发。卡死 worker 还握着锁时同样不发，
+      下一次记账会再同步。
+    - 拿到之后读设置（关掉了就不发），并且**握着锁发提示**：关闭要拿同一把锁，只能排在
+      这次发提示之后提交；它提交后会清掉 ``memory_backoff:capture``（``UserStore.save_proactive_settings``），
+      所以不会留下一条「正在自动重试」给已经关掉落卡的人。
+    - 只尝试、从不等待，且不拿 chat fence：发提示本身不碰 consent 锁，也不会被账号删除卡住。
+    """
+    try:
+        from types import SimpleNamespace
+
+        from proactive import capture_jobs
+
+        with _pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        "SELECT pg_try_advisory_xact_lock("
+                        "hashtextextended('capture-consent:' || %s, 0)) AS got",
+                        (str(user_id),),
+                    )
+                    if not bool(cur.fetchone()["got"]):
+                        log.info(
+                            "[v2.capture] crash notice skipped: capture consent busy user=%s job=%s",
+                            user_id,
+                            job_id,
+                        )
+                        return
+                    cur.execute(
+                        "SELECT kind,doc FROM user_blobs WHERE user_id=%s "
+                        "AND kind IN (%s,'proactive_settings')",
+                        (str(user_id), _CAPTURE_STATE_KIND),
+                    )
+                    docs = {str(r["kind"]): r["doc"] for r in cur.fetchall()}
+                    state = docs.get(_CAPTURE_STATE_KIND)
+                    state = state if isinstance(state, dict) else {}
+                    if str(state.get("last_capture_failed_job_id") or "") != str(job_id):
+                        return
+                    # 关掉的人不该再收到「记忆整理受阻、正在重试」。设置行形状不对时不发。
+                    if "proactive_settings" in docs:
+                        settings = docs["proactive_settings"]
+                        if not isinstance(settings, dict) or not bool(
+                            settings.get("capture_enabled", True)
+                        ):
+                            return
+                    capture_jobs.notify_backoff(
+                        SimpleNamespace(user_id=str(user_id)),
+                        lane="capture",
+                        status="failed",
+                        streak=int(state.get("capture_fail_streak") or 0),
+                        account_code=str(state.get("capture_account_error_code") or ""),
+                        skipped=False,
+                    )
+    except Exception as exc:  # noqa: BLE001 — 提示失败绝不影响回收结果
+        log.warning(
+            "[v2.capture] crash recovery notice failed user=%s err=%s",
+            user_id,
+            type(exc).__name__,
+        )
+
+
+def _recover_capture_claim(
+    *,
+    job_id: int,
+    user_id: str,
+    claimed_by: str | None,
+    attempt_count: int,
+    mode: Literal["watchdog", "lease"],
+    reason: str = "slot_watchdog_timeout",
+    now_ts: float | None = None,
+) -> tuple[dict[str, object] | None, dict | None]:
+    """回收一个崩溃/卡死的落卡任务，并在任务**终结**时记一次落卡失败。
+
+    以前 watchdog（``recover_killed_job``）和租约回收器（``reap_stuck_job_rows``）
+    对落卡和其他 lane 一视同仁，只改任务行、不碰 capture_state。于是一批消息只要
+    每次都把 worker 弄崩/卡死：调度器不断重建任务、没有退避、没有提示。
+
+    ## 锁顺序
+
+    和 fail_capture_job 一样：chat fence → runtime 行 → job 行 → capture_state。
+    通用回收是先锁 job 行的，不能在那之后再拿 fence / capture_state（会和落卡提交
+    死锁），所以落卡行从通用路径里摘出来，走这里单独的事务。调用方只做**不加锁**的
+    预读（user_id / attempt_count），加锁后逐项复核：还是同一个 lane、同一个持有者、
+    同一次尝试（attempt_count）、仍是 claimed/running、租约模式下仍已过期 ——
+    任何一项变了就什么都不做。
+
+    runtime 行只拿 ``FOR SHARE``：provider 调用期间 worker 一直握着它的 ``FOR SHARE``，
+    拿 ``FOR UPDATE`` 会让回收器被卡着的那个任务拖住。再加一个短 lock_timeout 兜底。
+
+    ## 什么时候记失败
+
+    只在任务**终结**时记（watchdog 重投预算用完 / 租约过期），重投不记：
+    重投后同一个任务还会再跑、再被回收，每次都记会把一次问题数成好几次，
+    而且 watchdog 和租约回收器可能先后看到同一个卡死任务。
+
+    任务行的转移（requeue / expire、last_error、attempt_count、恢复事件、复核任务）
+    与通用路径逐项一致；返回 ``(和通用路径同形的结果, 记下的失败状态或 None)``。
+    """
+    recovered_reviews: list[tuple[str, str]] = []
+    recovery_event: dict[str, object] | None = None
+    result: dict[str, object] | None = None
+    failed_state: dict | None = None
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT set_config('lock_timeout', %s, true)",
+                    (_CAPTURE_RECOVERY_LOCK_TIMEOUT,),
+                )
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                cur.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR SHARE",
+                    (str(user_id),),
+                )
+                runtime = cur.fetchone()
+                cur.execute(
+                    "SELECT id,user_id,lane,status,claimed_by,attempt_count,"
+                    "expected_runtime_generation,"
+                    "(COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    " AND COALESCE(lease_expires_at, deadline_at) "
+                    "     <= COALESCE(to_timestamp(%s), now())) AS overdue "
+                    "FROM agent_jobs WHERE id=%s FOR UPDATE",
+                    (now_ts, int(job_id)),
+                )
+                job = cur.fetchone()
+                if (
+                    job is None
+                    or str(job["lane"]) != "capture"
+                    or str(job["user_id"]) != str(user_id)
+                    or str(job["status"]) not in {"claimed", "running"}
+                    or str(job["claimed_by"] or "") != str(claimed_by or "")
+                    or int(job["attempt_count"] or 0) != int(attempt_count)
+                    or (mode == "lease" and not bool(job["overdue"]))
+                ):
+                    return None, None
+
+                def _record(terminal_error: str):
+                    def _on_terminal(cur_) -> None:
+                        nonlocal failed_state
+                        failed_state = _record_capture_crash_failure_on_cursor(
+                            cur_, job=job, runtime=runtime, error=terminal_error
+                        )
+
+                    return _on_terminal
+
+                if mode == "watchdog":
+                    general = _general_watchdog_recover_on_cursor(
+                        cur,
+                        job_id=int(job_id),
+                        claimed_by=str(claimed_by),
+                        reason=str(reason),
+                        on_terminal=_record(GENERAL_WATCHDOG_REQUEUE_EXHAUSTED),
+                    )
+                    if general is None:
+                        return None, None
+                    recovery, recovered_reviews = general
+                    result = {
+                        "job_id": int(job_id),
+                        "user_id": str(user_id),
+                        "lane": "capture",
+                        "recovery": recovery,
+                    }
+                    recovery_event = _record_job_recovery_event_on_cursor(
+                        cur,
+                        job_id=int(job_id),
+                        lane="capture",
+                        recovery=recovery,
+                        reason=str(reason),
+                    )
+                else:
+                    expired = _expire_overdue_capture_on_cursor(
+                        cur, job=job, runtime=runtime
+                    )
+                    if expired is None:
+                        return None, None
+                    result, recovered_reviews, failed_state = expired
+    if recovery_event is not None:
+        _mirror_job_recovery_event(recovery_event)
+    if recovered_reviews:
+        from tee_shadow import mirror
+
+        for review_user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                review_user_id, "v2_trajectory_reviews", source_job_id, "requeue"
+            )
+    if failed_state is not None:
+        after_capture_crash_recorded(
+            str(user_id), job_id, source=mode, failed_state=failed_state
+        )
+    return result, failed_state
+
+
+def _expire_overdue_capture_on_cursor(
+    cur, *, job: dict, runtime: dict | None
+) -> tuple[dict, list[tuple[str, str]], dict | None] | None:
+    """把一个已加锁、租约已过期的落卡 claim 终结成 lease_timeout，并记一次不带窗口的失败。
+
+    三条路径共用（Codex 第 12 轮 C1）：租约回收器、调度器入队时撞见的过期任务、
+    前台聊天抢占时撞见的过期任务。调用方已按落卡锁顺序拿好 chat fence →（runtime 行）→
+    job 行，``job`` 是加锁后读出的行（id/user_id/expected_runtime_generation…），
+    ``runtime`` 是同一事务里读到的 runtime 行。
+
+    任务行的变化逐项对齐 reap_stuck_job_rows 里 terminal CTE 对 claimed/running 行
+    做的事：同样的列、同样的 last_error 选择、同样把悬空 MCP 尝试记 unknown、
+    同样建失败复核。返回 ``(和回收器同形的行, 待镜像的复核, 记下的失败状态或 None)``；
+    行已不是 claimed/running 时返回 None。提交后由调用方做 ``after_capture_crash_recorded``。
+    """
+    job_id = int(job["id"])
+    cur.execute(
+        "UPDATE agent_jobs SET status='expired', finished_at=now(), "
+        "attempt_count=attempt_count+1, "
+        "last_error=CASE WHEN EXISTS ("
+        "    SELECT 1 FROM v2_mcp_mutation_attempts a "
+        "    WHERE a.job_id=agent_jobs.id "
+        "      AND (a.outcome IS NULL OR a.outcome='unknown')"
+        "  ) THEN 'mcp_mutation_outcome_unknown' "
+        "  ELSE 'lease_timeout' END "
+        "WHERE id=%s AND status IN ('claimed','running') "
+        "RETURNING id,user_id,lane,last_error,claimed_by",
+        (job_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    cur.execute(
+        "UPDATE v2_mcp_mutation_attempts "
+        "SET outcome='unknown',resolved_at=clock_timestamp() "
+        "WHERE job_id=%s AND outcome IS NULL",
+        (job_id,),
+    )
+    failed_state = _record_capture_crash_failure_on_cursor(
+        cur, job=job, runtime=runtime, error=str(row["last_error"])
+    )
+    recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
+    _queue_failure_review_on_cursor(cur, job_id)
+    return dict(row), list(recovered_reviews), failed_state
+
+
+def after_capture_crash_recorded(
+    user_id: str, job_id, *, source: str, failed_state: dict
+) -> None:
+    """崩溃回收记下落卡失败、事务**提交之后**：打日志、镜像 capture_state、同步提示。纯旁路。"""
+    log.warning(
+        "[v2.capture] crashed capture job counted as failure user=%s job=%s "
+        "mode=%s streak=%s",
+        user_id,
+        job_id,
+        source,
+        failed_state.get("capture_fail_streak"),
+    )
+    _mirror_capture_state_current(str(user_id))
+    _sync_capture_crash_notice(str(user_id), job_id)
+
+
+#: 聊天发送路径上待做的崩溃记账收尾最多排多少条。超出就丢弃并打日志：capture_state 的
+#: TEE 镜像有定期对账补齐，提示会在这个用户下一次记账时重新同步。
+_CAPTURE_POSTCOMMIT_QUEUE_MAX = 256
+_capture_postcommit_queue: Any = None
+_capture_postcommit_start_lock = threading.Lock()
+
+
+def after_capture_crash_recorded_in_background(
+    user_id: str, job_id, *, source: str, failed_state: dict
+) -> bool:
+    """把 ``after_capture_crash_recorded`` 放到后台线程做，不占聊天发送的返回路径（Codex 第 13 轮 M2）。
+
+    前台聊天抢占时终结了崩溃的落卡任务，提交后要镜像 capture_state（TEE 网络 I/O）+ 同步提示
+    （几次 DB 读写）。这些都是纯旁路、结果不影响这次发送，却曾在发送请求里同步做完。
+
+    没有复用 effect outbox / wake bus：它们都是持久化的 V2 effect 或跨进程唤醒，这里两件事都
+    有自己的补偿（镜像有对账，提示下次记账再同步），不值得为它们加一张持久化表。
+    每个进程一个守护线程 + 有界队列；队列满 / 单条失败只打日志。返回是否入队成功。
+    """
+    global _capture_postcommit_queue
+    import queue as _queue
+
+    if _capture_postcommit_queue is None:
+        with _capture_postcommit_start_lock:
+            if _capture_postcommit_queue is None:
+                q: _queue.Queue = _queue.Queue(maxsize=_CAPTURE_POSTCOMMIT_QUEUE_MAX)
+                threading.Thread(
+                    target=_capture_postcommit_loop,
+                    args=(q,),
+                    name="v2-capture-crash-postcommit",
+                    daemon=True,
+                ).start()
+                _capture_postcommit_queue = q
+    try:
+        _capture_postcommit_queue.put_nowait(
+            (str(user_id), job_id, str(source), dict(failed_state))
+        )
+    except _queue.Full:
+        log.warning(
+            "[v2.capture] crash post-commit dropped (queue full) user=%s job=%s mode=%s",
+            user_id,
+            job_id,
+            source,
+        )
+        return False
+    return True
+
+
+def _capture_postcommit_loop(q) -> None:
+    while True:
+        user_id, job_id, source, failed_state = q.get()
+        try:
+            after_capture_crash_recorded(
+                user_id, job_id, source=source, failed_state=failed_state
+            )
+        except Exception as exc:  # noqa: BLE001 — 旁路收尾，绝不让线程退出
+            log.warning(
+                "[v2.capture] crash post-commit failed user=%s job=%s mode=%s err=%s",
+                user_id,
+                job_id,
+                source,
+                type(exc).__name__,
+            )
+        finally:
+            q.task_done()
+
+
+def wait_capture_postcommit_idle(timeout: float = 10.0) -> bool:
+    """测试 / 运维用：等后台崩溃记账收尾队列清空。没启动过视为空闲。"""
+    q = _capture_postcommit_queue
+    if q is None:
+        return True
+    with q.all_tasks_done:
+        return q.all_tasks_done.wait_for(lambda: q.unfinished_tasks == 0, timeout)
+
+
+def _capture_recovery_target(
+    *, job_id: int, claimed_by: str
+) -> dict | None:
+    """不加锁地看一眼：这个待回收的 claim 是不是落卡任务。是就返回 user_id/attempt_count。"""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT user_id,attempt_count FROM agent_jobs "
+                "WHERE id=%s AND claimed_by=%s AND lane='capture' "
+                "AND status IN ('claimed','running')",
+                (int(job_id), str(claimed_by)),
+            )
+            row = cur.fetchone()
+    return dict(row) if row is not None else None
+
+
 def recover_killed_job(
     *,
     job_id: int,
@@ -2470,6 +3420,18 @@ def recover_killed_job(
     reason: str = "slot_watchdog_timeout",
 ) -> dict[str, object] | None:
     """Recover exactly one claim still owned by a killed slot generation."""
+    capture = _capture_recovery_target(job_id=int(job_id), claimed_by=str(claimed_by))
+    if capture is not None:
+        # 落卡要在同一事务里记失败，锁顺序和通用路径相反，见 _recover_capture_claim。
+        result, _failed = _recover_capture_claim(
+            job_id=int(job_id),
+            user_id=str(capture["user_id"]),
+            claimed_by=str(claimed_by),
+            attempt_count=int(capture["attempt_count"] or 0),
+            mode="watchdog",
+            reason=str(reason),
+        )
+        return result
     recovered_reviews: list[tuple[str, str]] = []
     result: dict[str, object] | None = None
     recovery_event: dict[str, object] | None = None
@@ -2628,48 +3590,15 @@ def recover_killed_job(
                     # 持久化进 attempt/effect —— 那是另一件事,不能在这里猜。
                     # 后台复盘由上面那条 failure review 承担。
                 else:
-                    cur.execute(
-                        "UPDATE agent_jobs SET status='pending',created_at=now(), "
-                        "last_error=%s,attempt_count=attempt_count+1,"
-                        "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
-                        "finished_at=NULL,lease_expires_at=NULL,deadline_at=NULL "
-                        "WHERE id=%s AND claimed_by=%s "
-                        "AND status IN ('claimed','running') "
-                        "AND (lane=%s OR attempt_count<%s)",
-                        (
-                            str(reason)[:500],
-                            int(job_id),
-                            str(claimed_by),
-                            _TRAJECTORY_REVIEW_LANE,
-                            int(GENERAL_LEASE_REQUEUE_MAX_ATTEMPTS),
-                        ),
+                    general = _general_watchdog_recover_on_cursor(
+                        cur,
+                        job_id=int(job_id),
+                        claimed_by=str(claimed_by),
+                        reason=str(reason),
                     )
-                    if cur.rowcount == 1:
-                        recovery = "requeued"
-                        recovered_reviews = _recover_review_runner_on_cursor(
-                            cur, int(job_id)
-                        )
-                    else:
-                        recovery = "terminal"
-                        cur.execute(
-                            "UPDATE agent_jobs SET status='expired',finished_at=now(), "
-                            "last_error=%s,attempt_count=attempt_count+1,"
-                            "claimed_by=NULL,claimed_at=NULL,started_at=NULL,"
-                            "lease_expires_at=NULL,deadline_at=NULL "
-                            "WHERE id=%s AND claimed_by=%s "
-                            "AND status IN ('claimed','running')",
-                            (
-                                GENERAL_WATCHDOG_REQUEUE_EXHAUSTED,
-                                int(job_id),
-                                str(claimed_by),
-                            ),
-                        )
-                        if cur.rowcount != 1:
-                            return None
-                        recovered_reviews = _recover_review_runner_on_cursor(
-                            cur, int(job_id)
-                        )
-                        _queue_failure_review_on_cursor(cur, int(job_id))
+                    if general is None:
+                        return None
+                    recovery, recovered_reviews = general
                 result = {
                     "job_id": int(job_id),
                     "user_id": str(row["user_id"]),
@@ -2766,6 +3695,9 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     "               created_at + make_interval(secs => %s) END) "
                     "             <= COALESCE(to_timestamp(%s), now())) "
                     "     OR (status IN ('claimed','running') "
+                    # 落卡的租约过期另走 _reap_overdue_capture_claims（要在同一事务里
+                    # 记落卡失败，锁顺序和这里相反）。排队超时的落卡仍在这里。
+                    "         AND lane<>'capture' "
                     "         AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
                     "         AND COALESCE(lease_expires_at, deadline_at) "
                     "             <= COALESCE(to_timestamp(%s), now())) "
@@ -2814,7 +3746,52 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
             "[v2.reaper] scheduled lease timeout requeued job_ids=%s",
             requeued_scheduled,
         )
+    rows.extend(_reap_overdue_capture_claims(ts))
     return rows
+
+
+def _reap_overdue_capture_claims(ts: float | None) -> list[dict]:
+    """租约过期的落卡任务：逐个走 _recover_capture_claim（终结 + 记一次落卡失败）。
+
+    先不加锁地挑出候选，再每个任务一个事务按落卡锁顺序处理。单个任务出错
+    （例如等锁超时）只记日志、留到下一轮，不挡住其他任务和其他 lane 的回收。
+    """
+    try:
+        with _pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT id,user_id,claimed_by,attempt_count FROM agent_jobs "
+                    "WHERE lane='capture' AND status IN ('claimed','running') "
+                    "AND COALESCE(lease_expires_at, deadline_at) IS NOT NULL "
+                    "AND COALESCE(lease_expires_at, deadline_at) "
+                    "    <= COALESCE(to_timestamp(%s), now()) "
+                    "ORDER BY id",
+                    (ts,),
+                )
+                candidates = [dict(row) for row in cur.fetchall()]
+    except Exception:  # noqa: BLE001 — 通用回收已提交；这里失败不能让本轮 reconcile 跟着跳过
+        log.exception("[v2.reaper] capture lease candidate scan failed; retry next pass")
+        return []
+    reaped: list[dict] = []
+    for candidate in candidates:
+        try:
+            row, _failed = _recover_capture_claim(
+                job_id=int(candidate["id"]),
+                user_id=str(candidate["user_id"]),
+                claimed_by=candidate["claimed_by"],
+                attempt_count=int(candidate["attempt_count"] or 0),
+                mode="lease",
+                now_ts=ts,
+            )
+        except Exception:  # noqa: BLE001 — 一个任务失败不能拖住整轮回收
+            log.exception(
+                "[v2.reaper] capture lease recovery failed job=%s; retry next pass",
+                candidate["id"],
+            )
+            continue
+        if row is not None:
+            reaped.append(row)
+    return reaped
 
 
 def ensure_terminal_failure_outbox(
@@ -3299,21 +4276,20 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
 
 
 def _capture_same_memory(existing: dict, wanted: dict) -> bool:
-    return all(
-        existing.get(key) == wanted.get(key)
-        for key in (
-            "id",
-            "type",
-            "body",
-            "body_ct",
-            "nonce",
-            "K_user",
-            "K_enclave",
-            "visibility",
-            "owner_user_id",
-            "supersedes",
-        )
-    )
+    # Same replay test as the /v1/memory/actions add path, so the two writers
+    # cannot disagree about what counts as "this exact card again".
+    from memory import service as memory_service  # 延迟导入：与本模块既有惯例一致
+
+    return memory_service.same_memory_write(existing, wanted)
+
+
+def _capture_supersede_target_is_active(target: dict) -> bool:
+    # The explicit-write supersede fence's own predicate (status active and no
+    # archive marker), not a copy, so capture and memory.supersede agree on
+    # which cards may still be replaced.
+    from memory import actions as memory_actions  # 延迟导入：与本模块既有惯例一致
+
+    return memory_actions._memory_supersede_target_is_active(target)
 
 
 def _capture_fail_on_cursor(
@@ -3325,24 +4301,54 @@ def _capture_fail_on_cursor(
     claimed_by: str,
     error: str,
     increment_backoff: bool = True,
+    window: dict | None = None,
 ) -> dict:
-    """Fail an already-validated owned Capture job in the caller's txn."""
-    failed = dict(state)
-    failed.update(
-        {
-            "pending_capture_key": "",
-            "capture_fail_streak": int(failed.get("capture_fail_streak") or 0)
-            + (1 if increment_backoff else 0),
-            "last_capture_failed_at": (
-                time.time()
-                if increment_backoff
-                else float(failed.get("last_capture_failed_at") or 0.0)
-            ),
-            "updated_at": datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-        }
+    """Fail an already-validated owned Capture job in the caller's txn.
+
+    ``window`` 给了、且这次要累计退避时，走**落卡毒窗口逃生阀**：同一个游标
+    连续失败到阈值，就在**同一个事务里**把游标推过这批消息。
+
+    ## 为什么 V2 要单独接
+
+    V1 的逃生阀接在 ``proactive.capture_scheduler`` 里。V2 的落卡**不走那里** ——
+    worker 的 ``_record_extraction_status`` 对 lane == "capture" 直接 return，
+    V2 落卡的失败状态走这个持久批次协议。2026-09-14 prod 实测：还卡着的
+    落卡用户抽查 12 个，12 个全是 V2，就是因为逃生阀一直没接到这条路上。
+
+    ## 为什么放在这个事务里
+
+    游标推进、任务标 failed、状态写回必须同成同败。拆开的话，任务标了 failed
+    但游标没推进 → 下次还卡；游标推进了但任务没标 → 同一批被当成还在跑。
+
+    ``window`` 不给时（其余 6 个调用点：落卡被关、批次丢失、游标已被别人推进、
+    校验拒绝…）**行为逐字节不变** —— 那些都不是毒消息场景。
+    """
+    failed, skip_applied = _capture_failed_state(
+        state,
+        job_id=job_id,
+        error=error,
+        increment_backoff=increment_backoff,
+        window=window,
     )
+    if skip_applied:
+        # 跳过的那批如果有 prepared 批次（加密的模型产出），同一事务里删掉。
+        # 不删的话：跳过后用户不再发消息 → 不会有下一个落卡任务 → 也就没有
+        # get_prepared_capture_batch 那次顺带清理 → 已声明丢弃的派生内容永久留库。
+        cur.execute(
+            "DELETE FROM v2_capture_batches WHERE user_id=%s AND status='prepared' "
+            "AND after_seq=%s AND runtime_generation=("
+            "SELECT expected_runtime_generation FROM agent_jobs WHERE id=%s)",
+            (str(user_id),
+             capture_failure.window_after_seq(window),
+             job_id),
+        )
+        # 跳过 = 那一批对话的记忆永久丢了。事务里不发 trace（副作用失败会
+        # 把整个事务带崩），但状态字段是原子写进去的，诊断面看得见。
+        log.warning(
+            "[v2.capture] poison window skipped user=%s job=%s error=%s "
+            "after_seq=%s through_seq=%s",
+            user_id, job_id, error,
+            window.get("after_seq"), window.get("through_seq"))
     cur.execute(
         "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
         (Jsonb(failed), str(user_id), _CAPTURE_STATE_KIND),
@@ -3357,6 +4363,61 @@ def _capture_fail_on_cursor(
     if cur.rowcount != 1:
         raise RuntimeError("capture ownership lost at failure commit")
     return failed
+
+
+def _capture_failed_state(
+    state: dict,
+    *,
+    job_id,
+    error: str,
+    increment_backoff: bool,
+    window: dict | None,
+) -> tuple[dict, bool]:
+    """落卡失败后 capture_state 该变成什么（纯计算，不读写库）。
+
+    worker 亲手报的失败（``_capture_fail_on_cursor``）和平台回收崩溃/卡死任务
+    （``_recover_capture_claim``）共用这一份，两处记的失败状态不会各写各的。
+    返回 ``(新状态, 是否跳过了这一批)``。
+    """
+    failed = dict(state)
+    skip_applied = False
+    if increment_backoff and isinstance(window, dict) and window:
+        # 和 V1 用**同一个**判断函数（memory.capture_failure）—— 两边各写一遍
+        # 必然漂，而漂了不报错（2026-09-13 就这么漂过一次）。
+        patch, _streak, skip_applied = capture_failure.capture_failure_patch(
+            failed, window, now_ts=time.time(), reason=str(error or ""))
+        failed.update(patch)
+    elif increment_backoff:
+        # 没有窗口的失败（批次丢失、游标被推进、provider 前置失败、平台回收崩溃任务…）：
+        # 和 V1 共用 capture_failure.windowless_failure_patch —— 按**本次**原因重写账号分类
+        # （不沿用上一次的「额度不足」，Codex 第 8 轮），非解析失败打断解析连续计数（第 12 轮）。
+        failed.update(
+            capture_failure.windowless_failure_patch(
+                failed, now_ts=time.time(), reason=str(error or "")
+            )
+        )
+    else:
+        failed.update(
+            {
+                "capture_fail_streak": int(failed.get("capture_fail_streak") or 0),
+                "last_capture_failed_at": float(
+                    failed.get("last_capture_failed_at") or 0.0
+                ),
+            }
+        )
+    if increment_backoff:
+        # 让 worker 的用户提示能确认「这次失败确实是本任务累计的」：取消（关闭落卡/停机）
+        # 不累计，失租的旧 worker 也写不到这里 —— 它们都不能拿共享状态里的旧次数去发提示。
+        failed["last_capture_failed_job_id"] = str(job_id)
+    failed.update(
+        {
+            "pending_capture_key": "",
+            "updated_at": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+    )
+    return failed, skip_applied
 
 
 def _capture_owned_job_for_disclosure_on_cursor(
@@ -3595,22 +4656,19 @@ def commit_capture_batch(
                     if halted
                     else _capture_allowed_on_cursor(cur, str(user_id))
                 )
-                raw_seq = state.get("last_captured_until_seq")
-                if str(raw_seq or "").isdigit():
-                    current_seq = int(raw_seq)
-                else:
-                    legacy_id = str(
-                        state.get("last_captured_until_message_id") or ""
-                    )
+                def _seq_for_message_id(message_id: str):
                     cur.execute(
                         "SELECT seq FROM chat_messages WHERE user_id=%s "
                         "AND msg_id=%s",
-                        (str(user_id), legacy_id),
+                        (str(user_id), message_id),
                     )
-                    legacy_row = cur.fetchone()
-                    current_seq = (
-                        int(legacy_row["seq"]) if legacy_row is not None else 0
-                    )
+                    row = cur.fetchone()
+                    return int(row["seq"]) if row is not None else None
+
+                # 必须和 worker 算起点用同一个函数（见 capture_failure.frontier_seq）。
+                # 以前这里只要数字是数字就直接用：数字被写成 0、id 记着真实位置时，
+                # worker 从 id 的位置开始、这里认为是 0 → 永远 frontier_changed → 又卡死。
+                current_seq = capture_failure.frontier_seq(state, _seq_for_message_id)
                 if halted:
                     persisted_state = _cancel_capture_on_cursor(
                         cur,
@@ -3692,6 +4750,7 @@ def commit_capture_batch(
                     ] = []
                     rejection = ""
                     cards_added = 0
+                    retired_in_batch: set[str] = set()
                     # Validate and lock the complete effect set before the first
                     # write.  Semantic poison is rejected durably; transient DB
                     # errors still roll back and retain the prepared journal.
@@ -3733,6 +4792,30 @@ def commit_capture_batch(
                                 ):
                                     rejection = "capture_supersede_not_owned"
                                     break
+                                # The batch was prepared against an earlier Garden
+                                # and survives retries, so the target may have been
+                                # corrected, retired or archived since. Re-check
+                                # under this row lock (the same fence
+                                # memory/actions.py applies as
+                                # supersede_targets_changed): retiring it again
+                                # would re-point superseded_by and leave two active
+                                # successors. The same holds for a second action in
+                                # this batch retiring a target an earlier one took.
+                                # Rejecting the whole batch keeps capture's
+                                # all-or-nothing journal: the next job re-reads the
+                                # current Garden and re-derives this window.
+                                already_ours = (
+                                    existing is not None
+                                    and str(target.get("superseded_by") or "")
+                                    == memory_id
+                                )
+                                if target_id in retired_in_batch or not (
+                                    already_ours
+                                    or _capture_supersede_target_is_active(target)
+                                ):
+                                    rejection = "capture_supersede_target_inactive"
+                                    break
+                                retired_in_batch.add(target_id)
                                 targets_locked.append((target_id, target))
                         if rejection:
                             break
@@ -3749,6 +4832,12 @@ def commit_capture_batch(
                             user_id=str(user_id),
                             claimed_by=str(claimed_by),
                             error=rejection,
+                            # 批次已锁定且 after_seq 就是当前游标（上面校验过），
+                            # 能证明是同一个窗口。不带的话 worker 看到 rejected 直接
+                            # 返回、不会再走带窗口的 fail_capture_job —— 同一窗口
+                            # 每次都被拒，streak 无限涨却永不跳过。
+                            # batch_unavailable / frontier_changed 证明不了是同一窗口，不传。
+                            window=capture_failure.window_from_batch_row(batch),
                         )
                         result = {
                             "committed": False,
@@ -3791,8 +4880,8 @@ def commit_capture_batch(
                                 }
                                 cur.execute(
                                     "INSERT INTO user_logs "
-                                    "(user_id,stream,item_key,doc) "
-                                    "VALUES (%s,'bootstrap_events',%s,%s) "
+                                    "(user_id,stream,item_key,doc,duration_sec) "
+                                    "VALUES (%s,'bootstrap_events',%s,%s,NULL) "
                                     "RETURNING seq",
                                     (
                                         str(user_id),
@@ -3850,8 +4939,8 @@ def commit_capture_batch(
                                 )
                             cur.execute(
                                 "INSERT INTO user_logs "
-                                "(user_id,stream,item_key,doc) "
-                                "VALUES (%s,'memory_changes',%s,%s) RETURNING seq",
+                                "(user_id,stream,item_key,doc,duration_sec) "
+                                "VALUES (%s,'memory_changes',%s,%s,NULL) RETURNING seq",
                                 (str(user_id), change_id, Jsonb(change_doc)),
                             )
                             mirrored_logs.append(
@@ -3873,8 +4962,7 @@ def commit_capture_batch(
                                 "capture_seq_initialized": True,
                                 "last_capture_completed_at": now_ts,
                                 "pending_capture_key": "",
-                                "capture_fail_streak": 0,
-                                "last_capture_failed_at": 0.0,
+                                **capture_failure.SUCCESS_RESET_PATCH,
                                 "updated_at": now_iso,
                             }
                         )
@@ -3918,9 +5006,10 @@ def commit_capture_batch(
         for seq, stream, log_doc, item_key in mirrored_logs:
             mirror.execute(
                 "INSERT INTO user_logs "
-                "(user_id,stream,seq,item_key,doc) OVERRIDING SYSTEM VALUE "
-                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                (str(user_id), stream, seq, item_key, Jsonb(log_doc)),
+                "(user_id,stream,seq,item_key,doc,duration_sec) OVERRIDING SYSTEM VALUE "
+                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (str(user_id), stream, seq, item_key, Jsonb(log_doc),
+                 db._user_log_duration_sec(stream, log_doc)),
             )
     return result
 
@@ -3931,6 +5020,7 @@ def fail_capture_job(
     user_id: str,
     claimed_by: str,
     error: str,
+    window: dict | None = None,
 ) -> bool:
     """Fail + arm backoff only while this worker still owns the Capture job."""
     persisted_state: dict | None = None
@@ -3960,8 +5050,58 @@ def fail_capture_job(
                     user_id=str(user_id),
                     claimed_by=str(claimed_by),
                     error=error,
+                    window=window,
                 )
     if persisted_state is not None:
+        _mirror_capture_state_current(str(user_id))
+    return True
+
+
+def complete_capture_no_work(*, job_id, user_id: str, claimed_by: str) -> bool:
+    """落卡任务发现游标之后没有消息：完成任务，并清掉残留的失败子状态。
+
+    以前走通用 mark_completed，不碰落卡状态：之前的失败次数、账号原因、7 天计时都留着，
+    旧的退避会压着下一条真消息，「记忆整理受阻」提示也永远不消失（Codex 第 10 轮）。
+    没有待处理消息 = 之前失败的那一批已经不存在，清掉是安全的。
+    任务完成和状态清理在同一个事务里。
+    """
+    persisted = False
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                db._lock_chat_user_fence_on_cursor(cur, str(user_id))
+                if _capture_owned_job_on_cursor(
+                    cur, job_id, str(user_id), str(claimed_by)
+                ) is None:
+                    return False
+                cur.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id=%s AND kind=%s FOR UPDATE",
+                    (str(user_id), _CAPTURE_STATE_KIND),
+                )
+                row = cur.fetchone()
+                state = dict(row["doc"] or {}) if row is not None else None
+                if state is not None and any(
+                    state.get(key) not in (None, "", 0, 0.0)
+                    for key in capture_failure.SUCCESS_RESET_PATCH
+                ):
+                    state.update(capture_failure.SUCCESS_RESET_PATCH)
+                    state["updated_at"] = (
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    )
+                    cur.execute(
+                        "UPDATE user_blobs SET doc=%s WHERE user_id=%s AND kind=%s",
+                        (Jsonb(state), str(user_id), _CAPTURE_STATE_KIND),
+                    )
+                    persisted = True
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed', finished_at=now() "
+                    "WHERE id=%s AND status IN ('claimed','running') "
+                    "AND claimed_by=%s AND lease_expires_at > now()",
+                    (job_id, str(claimed_by)),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("capture ownership lost at no-work completion")
+    if persisted:
         _mirror_capture_state_current(str(user_id))
     return True
 
@@ -4282,6 +5422,43 @@ def _scheduled_failure_reply_text(
     )
 
 
+def _terminal_failure_parent_text(user_id: str, parent_id: str) -> str:
+    """The words the user typed in the failed turn, or ``""`` (T743).
+
+    Attachment rows (image/file) keep their payload in ``body_b64`` or
+    ``body_key``; the payload is never the user's words, only the owner's
+    caption is. A text row counts only when its body is stored as plaintext
+    text. Sealed rows, attachments without a caption, other owners and failed
+    reads yield ``""`` so the caller keeps the account language.
+    """
+    from core import envelope as core_envelope
+
+    try:
+        parent = db.chat_get_strict(user_id, parent_id)
+    except Exception:  # noqa: BLE001 — language lookup must not block failure delivery
+        return ""
+    if not isinstance(parent, dict) or parent.get("owner_user_id") != user_id:
+        return ""
+    if str(parent.get("content_type") or "") in {"image", "file"}:
+        # Same projection and shape/owner gate every plaintext caption reader
+        # uses: a sealed caption, a caption owned by someone else or a stale
+        # plaintext body left beside ciphertext all read as "no signal".
+        # A malformed caption row (e.g. a non-numeric caption_v) is "no
+        # signal" too: the language lookup must never delay the delivery.
+        try:
+            caption = core_envelope.caption_envelope_from_row(parent)
+            if caption is None:
+                return ""
+            return core_envelope.read_plaintext_envelope_body(
+                caption, owner_user_id=user_id
+            ).decode("utf-8")
+        except (TypeError, ValueError):
+            return ""
+    if core_envelope.classify_envelope_shape(parent) != "plaintext_text":
+        return ""
+    return str(parent.get("body") or "")
+
+
 def _deliver_terminal_failure_reply(row: dict) -> bool:
     """Write one encrypted failure result exactly once.
 
@@ -4358,7 +5535,15 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         language = accounts_registry._get_user_archive_language(user_id) or ""
     except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
         language = ""
-    reply_language = infer_reply_language(
+    # Seven 2026-09-26 (T743): the retry-later fallback follows the language
+    # of the user's message in this turn; no readable signal keeps the account
+    # language. Scheduled failures have no user message.
+    reply_language = failure_fallback_language(
+        user_text=(
+            _terminal_failure_parent_text(user_id, parent_id)
+            if lane == "chat"
+            else ""
+        ),
         archive_language=language,
     )
     user_text = notices_catalog.user_text_for(
@@ -4388,7 +5573,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             )
         )
     )
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="terminal reply is a cold-safe committed write"
     )
     envelope, error = core_envelope._build_shared_envelope_for_store(
@@ -10760,6 +11945,13 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
 
     返回形状与 ``wake_success_stats`` 一致，便于并排读。
 
+    ``skipped`` / ``skipped_by_lane`` / ``attempted_success_rate``（2026-09-15）：
+    dream 判定「花园太小、没活可干」时终态仍是 ``completed``（不重试、不退避），但
+    ``wake_result='skipped'``——**一次模型都没问**。它仍计入 ``completed`` 与
+    ``success_rate``（不改既有口径），但另给一个剔除 skip 的
+    ``attempted_success_rate = 真跑过的完成 / (真跑过的完成 + failed + expired)``：
+    否则一大批小花园的 skip 会把真在跑的整理失败率稀释掉。
+
     ``failed_reasons``（2026-08-05 dream 阀门重构）：失败侧按 ``last_error`` 首段
     细分。dream 的出口闸从「按提案静默丢」改成了「明显不对就让整个 job 失败」
     （``dream_blast_radius_exceeded`` / ``invalid_card_content*``），不细分的话
@@ -10767,7 +11959,9 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT lane, status, count(*) FROM agent_jobs "
+                "SELECT lane, status, "
+                "count(*) FILTER (WHERE status='completed' AND wake_result='skipped'), "
+                "count(*) FROM agent_jobs "
                 "WHERE lane IN ('capture','dream') "
                 "AND finished_at IS NOT NULL "
                 "AND finished_at > now() - make_interval(hours => %s) "
@@ -10788,11 +11982,15 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
                 (int(within_hours),),
             )
             reason_rows = cur.fetchall()
-    completed = failed = expired = 0
+    completed = failed = expired = skipped = 0
     by_lane: dict[str, dict[str, int]] = {}
-    for lane, status, count in rows:
+    skipped_by_lane: dict[str, int] = {}
+    for lane, status, skipped_count, count in rows:
         count = int(count)
         by_lane.setdefault(lane, {})[status] = count
+        if int(skipped_count):
+            skipped_by_lane[lane] = int(skipped_count)
+            skipped += int(skipped_count)
         if status == "completed":
             completed += count
         elif status == "failed":
@@ -10803,6 +12001,8 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
     for lane, reason, count in reason_rows:
         failed_reasons.setdefault(lane, {})[str(reason)] = int(count)
     denom = completed + failed + expired
+    attempted = completed - skipped
+    attempted_denom = attempted + failed + expired
     return {
         "completed": completed,
         "failed": failed,
@@ -10810,6 +12010,11 @@ def memory_lane_health(*, within_hours: int = 24) -> dict:
         "success_rate": (completed / denom) if denom else None,
         "by_lane": by_lane,
         "failed_reasons": failed_reasons,
+        "skipped": skipped,
+        "skipped_by_lane": skipped_by_lane,
+        "attempted_success_rate": (
+            (attempted / attempted_denom) if attempted_denom else None
+        ),
     }
 
 
@@ -11633,6 +12838,30 @@ def list_workspace_entries(
                             maximum,
                         ),
                     )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def list_canvas_workspace_entries(
+    user_id: str,
+    *,
+    limit: int = 500,
+) -> list[dict]:
+    """List one user's published IO Canvas workspace metadata, newest first.
+
+    This is a metadata-only read: ``content_envelope`` is deliberately absent
+    so a library/index request cannot expose or download Canvas source bodies.
+    """
+    maximum = max(1, min(int(limit), 500))
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT path,revision,mime_type,created_at,updated_at "
+                "FROM v2_workspace_entries "
+                "WHERE user_id=%s AND kind='workspace' "
+                "AND lower(path) LIKE '/workspace/%%.io.html' "
+                "ORDER BY updated_at DESC, path ASC LIMIT %s",
+                (user_id, maximum),
+            )
             return [dict(row) for row in cur.fetchall()]
 
 
@@ -12483,7 +13712,8 @@ def get_wake_schedule(user_id) -> dict | None:
                 "self_wake_last_effect_accepted, proactive_fail_streak, "
                 "proactive_fail_user_seq, pending_followup_generation, "
                 "pending_followup_source_job_id, "
-                "pending_followup_consumed_context_seq, updated_at "
+                "pending_followup_consumed_context_seq, provider_fail_streak, "
+                "wake_circuit_opened_at,wake_circuit_reason,wake_circuit_reset_at, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )
@@ -12701,6 +13931,7 @@ def heartbeat_due_diagnosis(user_id: str, *, now: float | None = None) -> dict:
         return {"present": False}
     sql = (
         "SELECT "
+        "  (schedule.wake_circuit_opened_at IS NOT NULL) AS provider_circuit, "
         "  (schedule.next_heartbeat_at IS NULL) AS unarmed, "
         "  (schedule.next_heartbeat_at IS NOT NULL AND schedule.next_heartbeat_at "
         "     > COALESCE(to_timestamp(%s), now())) AS not_due_yet, "
@@ -12723,7 +13954,7 @@ def heartbeat_due_diagnosis(user_id: str, *, now: float | None = None) -> dict:
     if row is None:
         return {"present": False}
     blockers = [name for name in
-                ("unarmed", "not_due_yet", "payment_cooldown", "dnd", "proactive_backoff")
+                ("unarmed", "not_due_yet", "payment_cooldown", "dnd", "proactive_backoff", "provider_circuit")
                 if bool(row.get(name))]
     return {"present": True, "blocked_by": blockers}
 
@@ -12739,6 +13970,7 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
             cur.execute(
                 "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
                 "WHERE schedule.next_heartbeat_at IS NOT NULL "
+                "AND schedule.wake_circuit_opened_at IS NULL "
                 "AND schedule.next_heartbeat_at "
                 "<= COALESCE(to_timestamp(%s), now()) "
                 "AND (schedule.payment_cooldown_until IS NULL "
@@ -12773,6 +14005,7 @@ def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> lis
             cur.execute(
                 "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
                 "WHERE schedule.next_screen_watch_at IS NOT NULL "
+                "AND schedule.wake_circuit_opened_at IS NULL "
                 "AND schedule.next_screen_watch_at <= COALESCE(to_timestamp(%s), now()) "
                 "AND (schedule.payment_cooldown_until IS NULL "
                 "     OR schedule.payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "

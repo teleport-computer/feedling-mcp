@@ -148,7 +148,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:4e8f4b3
+    image: &enclave-image ghcr.io/teleport-computer/feedling:1f4bafa
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -171,6 +171,18 @@ services:
         # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
         # max 47.7s → 34s chat replies of which pi was only 3.1s.
         FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+        # Hybrid automatic recall (T523 step 4, T739): dense E5 lane fused with
+        # the lexical ranker in this enclave's /v1/chat/history selection. test
+        # only; prod stays off. Both enclave services share this anchor so the
+        # direct (:5003) and custom-domain (:5004) entrypoints recall alike.
+        # MIN_COSINE 0.80 = positive 5th percentile of the dev-set calibration
+        # (reports/T523-calib, disjoint from the T557 acceptance set). The model
+        # is the same baked, SHA-pinned E5 the serve-worker sweep uses; loaded in
+        # a background thread at startup, never on a request; never downloads.
+        FEEDLING_MEMORY_RECALL_HYBRID: "1"
+        FEEDLING_MEMORY_RECALL_MIN_COSINE: "0.80"
+        FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+        HF_HUB_OFFLINE: "1"
         # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
         # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
         # even when the value is empty, so an empty string would make it
@@ -227,7 +239,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:4e8f4b3
+    image: ghcr.io/teleport-computer/feedling:1f4bafa
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -401,9 +413,6 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). Enabled on both test and prod.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Legacy memory migration is opt-in. Empty = off; set to 1 only after
-      # seeded real-device Garden verification passes. Mirror the pooled V2 worker.
-      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS: "${FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS:-}"
@@ -429,7 +438,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:4e8f4b3
+    image: ghcr.io/teleport-computer/feedling:1f4bafa
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -476,6 +485,22 @@ services:
       # Dream is intentionally always on in test after the guarded rewrite
       # passed live convergence and non-destructive merge verification.
       FEEDLING_V2_DREAM_ENABLED: "1"
+      # Memory embedding sweep (T523 step 1b): encode plaintext cards with the
+      # baked local E5 model (deploy/Dockerfile). test only; prod stays off.
+      FEEDLING_MEMORY_EMBEDDING_ENABLED: "1"
+      FEEDLING_EMBED_MODEL_DIR: "/opt/feedling/models/multilingual-e5-small/614241f6"
+      # Plaintext recall (T779 step 2c on window, T785): plaintext accounts get
+      # the cards the serve-worker picks locally; when local selection is
+      # unavailable (timeout/busy/error/not served here) the turn tries the
+      # existing enclave pick. The shadow window (T783) agreed 267/267 with the
+      # enclave. Hybrid settings match the enclave above. test only; prod stays
+      # off. Roll back by setting this to "shadow" or "off".
+      FEEDLING_V2_PLAINTEXT_RECALL: "on"
+      FEEDLING_MEMORY_RECALL_HYBRID: "1"
+      FEEDLING_MEMORY_RECALL_MIN_COSINE: "0.80"
+      # tokenizers pulls huggingface_hub as a hard dependency; we only ever read
+      # the local tokenizer.json. Make "never phones home" a config fact too.
+      HF_HUB_OFFLINE: "1"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
@@ -513,16 +538,17 @@ services:
 
   # --- Content-free CVM CPU history (no public endpoint or alerting). ---
   # Only this proxy holds the Docker socket. Its method/path allowlist exposes
-  # container enumeration and one-shot stats to cpu-recorder, nothing else.
+  # container enumeration/stats and enclave log reads to the two collectors.
   cpu-socket-proxy:
     image: ghcr.io/wollomatic/socket-proxy:1.13.0@sha256:be7a61fc50baf0add95d94442c3d40cddc4594925a564f22ba870eb017ceae9f
     container_name: cpu-socket-proxy
     command:
       - "-loglevel=INFO"
       - "-listenip=0.0.0.0"
-      - "-allowfrom=cpu-recorder"
+      - "-allowfrom=cpu-recorder,log-shipper"
       - '-allowGET=/containers/json'
       - '-allowGET=/containers/[0-9a-f]{64}/stats'
+      - '-allowGET=/containers/[0-9a-f]{64}/logs'
       - "-allowhealthcheck"
       - "-watchdoginterval=60"
       - "-stoponwatchdog"
@@ -549,7 +575,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:4e8f4b3
+    image: ghcr.io/teleport-computer/feedling:1f4bafa
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
@@ -578,6 +604,40 @@ services:
       cpu-socket-proxy:
         condition: service_healthy
 
+  log-shipper:
+    image: ghcr.io/teleport-computer/feedling:1f4bafa
+    container_name: log-shipper
+    command: ["python", "-u", "ops/log_shipper.py"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    cpus: 0.10
+    mem_limit: 128m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      CPU_RECORDER_DOCKER_URL: "http://cpu-socket-proxy:2375"
+      LOG_SHIPPER_CONTAINERS: "feedling-test-enclave-1,feedling-test-enclave-domain-1"
+      LOG_SHIPPER_ENV: "test"
+      LOG_SHIPPER_CVM_NAME: "feedling-io-test"
+      LOG_SHIPPER_RETENTION_DAYS: "30"
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_LOGS_BUCKET: "${R2_LOGS_BUCKET:-}"
+    volumes:
+      - feedling_log_history_test:/var/lib/feedling-logs
+    networks:
+      - cpu-observability
+      # Dedicated outbound bridge for R2; no connection to business default net.
+      # Docker bridge is not a destination-domain firewall.
+      - log-egress
+    depends_on:
+      cpu-socket-proxy:
+        condition: service_healthy
+
 volumes:
   feedling_enclave_data_test:
     name: feedling_enclave_data_test
@@ -589,7 +649,11 @@ volumes:
     name: feedling_ingress_evidences_test
   feedling_cpu_history_test:
     name: feedling_cpu_history_test
+  feedling_log_history_test:
+    name: feedling_log_history_test
 
 networks:
   cpu-observability:
     internal: true
+  log-egress:
+    internal: false

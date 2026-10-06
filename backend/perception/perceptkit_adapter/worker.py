@@ -118,3 +118,69 @@ def run_forever(
 
 __all__ = ["DEFAULT_BATCH", "DEFAULT_LEASE_SECONDS", "DEFAULT_IDLE_SLEEP",
            "run_once", "run_forever"]
+
+
+# ---------------------------------------------------------------------------
+# io 这边的接线（外部审查 F6）
+# ---------------------------------------------------------------------------
+#
+# 上面那两个是框架中立的。下面这两个是 io 的具体接法：从连接池拿一条连接、
+# 用 io 的 WakePort，并且**由 asgi 的 lifespan 真的把它跑起来**。
+#
+# 在这之前只有"这次上报刚产生了新事件"才会顺带把积压的补投一次
+# （ingest 的 dispatch=True）。用户不再产生新数据时，卡住的提醒就一直卡着 ——
+# 投递失败过一次的事件要等到下一次有人给他发新数据才有机会重投，而
+# "他这会儿没在用"恰恰是最常见的情形。
+
+def run_round(*, now: datetime | None = None,
+              batch: int = DEFAULT_BATCH) -> DispatchOutcome | None:
+    """一轮 drain。没启用或没配唤醒时返回 None（不是错误）。"""
+    from .shadow import enabled, wakes_enabled
+    if not enabled() or not wakes_enabled():
+        return None
+
+    import db
+
+    from .storage import PostgresStorage
+    from .wake_port import FeedlingWakePort
+
+    # 每轮拿一条连接、用完还回去。跨轮持有等于一整个 sleep 期间挂着一个
+    # 空闲事务；而 transaction() 又要求所有写在同一条连接上，所以是"每轮一条"。
+    with db.get_pool().connection() as conn:
+        conn.autocommit = True
+        return run_once(
+            storage_factory=lambda: PostgresStorage(conn),
+            wake=FeedlingWakePort(),
+            worker_id=_worker_id(),
+            now=now, batch=batch,
+        )
+
+
+def _worker_id() -> str:
+    """认领租约用的身份。**每个进程一个** —— 两个进程共用一个 id 时，
+    另一个的租约看起来像自己的，会把对方正在投的事件抢过来重投一遍。"""
+    import os
+    import socket
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+async def run_loop(stop_event, *, interval: float) -> None:
+    """常驻循环，由 asgi lifespan 启动。
+
+    一轮失败不结束循环 —— 发件箱会对**所有人**停止排空，而且没有任何地方
+    说得出为什么。
+    """
+    import asyncio
+
+    while not stop_event.is_set():
+        try:
+            outcome = await asyncio.to_thread(run_round)
+            if outcome and outcome.dead:
+                log.warning("perceptkit: %d event(s) went to dead-letter",
+                            len(outcome.dead))
+        except Exception:                      # noqa: BLE001
+            log.exception("perceptkit dispatch round failed; continuing")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass

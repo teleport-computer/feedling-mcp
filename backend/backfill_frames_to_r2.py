@@ -51,6 +51,9 @@ def _migrate_row(user_id: str, frame_id: str, doc: dict, dry_run: bool) -> tuple
     if dry_run:
         return ("dry", raw_len)
     key = object_storage.put_frame_body(user_id, frame_id, body_ct)
+    # Intentionally do not infer a source during this legacy offline backfill.
+    # Such rows remain explicitly legacy_unattributed and fail closed from
+    # photo/screen lists until a trustworthy producer writes their source.
     env_meta = {k: v for k, v in doc.items() if k != "body_ct"}
     with db.get_pool().connection() as conn:
         conn.execute(

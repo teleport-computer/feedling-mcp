@@ -13,11 +13,12 @@ from pathlib import Path
 DOC = Path(__file__).parent.parent / "docs" / "API_ERRORS.md"
 
 MUST_HAVE = {
+    "provider_error_unclassified",
     "internal_error", "invalid_payload", "envelope_missing_fields",
     "thinking_envelope_missing_fields", "anchor_required",
     "unauthorized", "forbidden", "service_busy", "not_found",
     "model_api_key_decrypt_failed", "already_answered",
-    "unsupported_file_type", "invalid_file",
+    "unsupported_file_type", "invalid_file", "content_encryption_on_not_supported",
     # BYOK model catalog (POST /v1/model_api/models) — the client-facing slugs
     # must stay documented; a markdown row alone is not enough, this set guards
     # them. `model_catalog_unsupported` is intentionally absent: it is a 200

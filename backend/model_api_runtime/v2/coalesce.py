@@ -140,8 +140,12 @@ def coalesce_pending(
         # Dropping it here leaves the prompt tail unable to distinguish the
         # active attachment from historical ones, so the worker omits the
         # current pixels/visual observation and the model answers from history.
+        # ``caption``/``unreadable`` say which part of ``content`` the user
+        # actually typed; the failure-language pick reads them (T743).
         for key in (
             "has_image",
+            "caption",
+            "unreadable",
             "image_mime",
             "vision_route_id",
             "has_file",

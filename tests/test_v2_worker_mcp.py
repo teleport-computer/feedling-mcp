@@ -357,6 +357,17 @@ def test_chat_pressure_folded_platform_schema_is_searchable_and_protected(
         base_url="",
         context_window_tokens=40_000,
     )
+    # Pressure is an explicit test constraint. Accepted route metadata can be
+    # raised to an audited family bound, so it cannot force this smaller window.
+    monkeypatch.setitem(
+        worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+        "anthropic:claude-sonnet-4-test", 40_000,
+    )
+    limit = worker.v2_prompt_frontier.resolve_model_limit_from_config(
+        pressure_config, deployment_overrides=worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    assert limit.context_window_tokens == 40_000
+    assert limit.source == "deployment_override"
     calls = _script_provider(monkeypatch, [
         {
             "reply": "",
@@ -782,13 +793,19 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider_failure)
     traces = []
+    loaded_job_ids = []
+
+    async def _load_for_job(_store, *, job_id, **_kwargs):
+        loaded_job_ids.append(job_id)
+        return _FakeMcpTurn([_MCP_SPEC], [])
+
     deps = _deps(
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "ping"}],
-        load_mcp_turn=_make_load_turn_mcp(_FakeMcpTurn([_MCP_SPEC], [])),
         emit_debug_trace=lambda user_id, event_type, **fields: traces.append(
             {"user_id": user_id, "type": event_type, **fields}
         ),
     )
+    deps.load_mcp_turn_for_job = _load_for_job
 
     assert asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
@@ -810,7 +827,11 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
     assert model_events[-1]["status"] == "error"
     assert model_events[-1]["detail"]["finish_reason"] == "http_error"
     assert model_events[-1]["detail"]["status_code"] == 402
-    assert model_events[-1]["detail"]["error_class"] == "ProviderError"
+    assert model_events[-1]["detail"]["error_class"] == "quota_insufficient"
+    assert model_events[-1]["detail"]["exception_type"] == "ProviderError"
+    assert not model_events[0].get("job_id")
+    assert model_events[-1]["job_id"] == str(job["id"])
+    assert loaded_job_ids == [str(job["id"])]
     assert private_provider_body not in repr(model_events)
 
 
@@ -878,6 +899,13 @@ def test_chat_identity_get_result_fences_outbound_but_keeps_local_edits(
         [{"id": "m1", "ts": 10.0, "role": "user", "content": "who are you?"}],
         load_mcp_turn=_make_load_turn_mcp(turn),
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
 
     status = asyncio.run(worker.process_job(
         job,
@@ -1150,6 +1178,17 @@ def test_chat_refuses_folded_platform_call_before_dispatch(monkeypatch):
         base_url="",
         context_window_tokens=40_000,
     )
+    # Pressure is an explicit test constraint. Accepted route metadata can be
+    # raised to an audited family bound, so it cannot force this smaller window.
+    monkeypatch.setitem(
+        worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+        "anthropic:claude-sonnet-4-test", 40_000,
+    )
+    limit = worker.v2_prompt_frontier.resolve_model_limit_from_config(
+        pressure_config, deployment_overrides=worker.PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    assert limit.context_window_tokens == 40_000
+    assert limit.source == "deployment_override"
 
     dispatched = []
     real_dispatch = worker.v2_executor.dispatch_tool_calls
@@ -1200,7 +1239,9 @@ def test_chat_refuses_folded_platform_call_before_dispatch(monkeypatch):
     )
 
 
-def _run_chat_screen_with_mcp(monkeypatch, uid, *, with_frames: bool):
+def _run_chat_screen_with_mcp(
+    monkeypatch, uid, *, with_frames: bool, frame_source: str = "screen"
+):
     """Drive the production chat screen-frame source into the real tool loop."""
     conftest.seed_user(uid)
     _reset(uid)
@@ -1213,8 +1254,16 @@ def _run_chat_screen_with_mcp(monkeypatch, uid, *, with_frames: bool):
         "_screen_share_grounding",
         lambda _uid: {"active": True, "latest_frame_age_sec": 1},
     )
-    frames = [{"id": "f1", "ts": time.time()}] if with_frames else []
-    monkeypatch.setattr(worker.db, "frame_list_meta", lambda _uid: frames)
+    frames = [{"id": "f1", "ts": time.time() - 30}] if with_frames else []
+    monkeypatch.setattr(
+        worker.db,
+        "frame_list_meta",
+        # Missing source deliberately exposes every stored row: this makes the
+        # photo regression test fail if the production call loses its filter.
+        lambda _uid, *, source=None: (
+            frames if source is None or source == frame_source else []
+        ),
+    )
     monkeypatch.setattr(
         worker.db,
         "model_api_active_route_vision_verdict",
@@ -1232,7 +1281,10 @@ def _run_chat_screen_with_mcp(monkeypatch, uid, *, with_frames: bool):
         read_only_names={_MCP_SPEC.name},
     )
     deps = _deps(
-        [{"id": "m1", "ts": 10.0, "role": "user", "content": "你能看到吗？"}],
+        [{
+            "id": "m1", "ts": time.time(), "role": "user",
+            "content": "你能看到吗？",
+        }],
         load_mcp_turn=_make_load_turn_mcp(turn),
     )
     deps.read_screen_frames = lambda _uid, _frame_ids: {
@@ -1262,6 +1314,18 @@ def _run_chat_screen_with_mcp(monkeypatch, uid, *, with_frames: bool):
     )
     offered = {spec.name for spec in calls[0]["tools"]}
     return offered, carried_pixels
+
+
+def test_chat_round_30_seconds_after_photo_does_not_push_screen_message(
+    monkeypatch,
+):
+    _offered, carried_pixels = _run_chat_screen_with_mcp(
+        monkeypatch,
+        "u_chat_recent_photo_only",
+        with_frames=True,
+        frame_source="photo",
+    )
+    assert not carried_pixels
 
 
 def test_chat_live_pixels_keep_read_mcp_but_drop_write_web_and_task(monkeypatch):

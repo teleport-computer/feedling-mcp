@@ -140,6 +140,7 @@ def test_setup_provider_probe_records_paid_attempt_and_usage(
             "output_tokens": 3,
             "total_tokens": 14,
         },
+        "status_code": None,
     }
     assert attempts == [{
         "user_id": uid,

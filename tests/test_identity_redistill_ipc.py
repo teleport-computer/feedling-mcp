@@ -20,7 +20,9 @@ AF_UNIX sockets on tmp_path. Safe to add to conftest's _PURE_UNIT allowlist.
 Run with: pytest tests/test_identity_redistill_ipc.py -v
 """
 import json
+import ntpath
 import os
+import posixpath
 import shutil
 import socket
 import sys
@@ -98,6 +100,63 @@ def _isolate_redistill_state():
 # ---------------------------------------------------------------------------
 # io_cli side: socket round-trip against a stub listener
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("platform,path_module,temp_root", [
+    ("nt", ntpath, "C:\\Users\\Example\\AppData\\Local\\Temp"),
+    ("posix", posixpath, "/ignored-native-temp"),
+])
+def test_resident_home_default_matches_cli(monkeypatch, platform, path_module, temp_root):
+    env = {"FEEDLING_API_KEY": "synthetic-test-key"}
+    fake_os = types.SimpleNamespace(name=platform, path=path_module, environ=env)
+    monkeypatch.setattr(crc, "os", fake_os)
+    monkeypatch.setattr(io_cli, "os", fake_os)
+    monkeypatch.setattr(crc.tempfile, "gettempdir", lambda: temp_root)
+    fp = io_cli.hashlib.sha1(env["FEEDLING_API_KEY"].encode()).hexdigest()[:10]
+    monkeypatch.setattr(crc, "CHECKPOINT_API_KEY_FINGERPRINT", fp)
+    root = temp_root if platform == "nt" else "/tmp"
+    expected = path_module.join(root, f"feedling_home_{fp}")
+    assert crc._resident_home_default() == expected
+    assert io_cli._resident_ipc_home() == expected
+    env["FEEDLING_HOME"] = path_module.join(root, "explicit-private-home")
+    assert io_cli._resident_ipc_home() == env["FEEDLING_HOME"]
+
+
+def test_listener_without_af_unix_logs_degradation_before_touching_files(
+    monkeypatch, tmp_path, caplog,
+):
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *a, **k: pytest.fail("must not bind TCP"))
+    sock = tmp_path / "not-created" / "resident_ipc.sock"
+    crc._redistill_ipc_serve_forever(sock)
+    assert not sock.parent.exists()
+    assert "ipc_unsupported" in caplog.text
+    assert "HTTP polling and text replies do not use this socket" in caplog.text
+
+
+@pytest.mark.parametrize("op", ["redistill", "stage_file", "stage_image"])
+def test_cli_without_af_unix_returns_structured_error(monkeypatch, op):
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *a, **k: pytest.fail("must not bind TCP"))
+    if op == "redistill":
+        reply = io_cli._resident_ipc_request("synthetic material")
+    else:
+        reply = io_cli._resident_ipc_call(op, {"path": "synthetic-private-path"})
+    assert reply["ok"] is False
+    assert reply["error"] == "ipc_unsupported"
+    assert reply["request_id"]
+    assert "synthetic" not in json.dumps(reply)
+    assert "No TCP fallback" in reply["hint"]
+
+
+def test_listener_socket_creation_failure_is_logged(monkeypatch, tmp_path, caplog):
+    def fail_socket(*a, **kw):
+        raise OSError("address family unavailable")
+
+    monkeypatch.setattr(socket, "socket", fail_socket)
+    crc._redistill_ipc_serve_forever(tmp_path / "resident_ipc.sock")
+    assert "address family unavailable" in caplog.text
+    assert "listener disabled" in caplog.text
+
 
 class _StubListener:
     """A minimal one-line-JSON-in / one-line-JSON-out Unix socket server.

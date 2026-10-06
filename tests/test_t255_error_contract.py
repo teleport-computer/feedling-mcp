@@ -103,6 +103,117 @@ def test_registry_views_are_derived_from_error_specs():
     )
 
 
+def test_resident_chat_error_specs_have_english_copy():
+    specs = [spec for spec in error_contract.consumer_specs() if spec.domain == "chat"]
+    assert specs
+    assert [spec.code for spec in specs if not spec.safe_text_en.strip()] == []
+
+
+def test_public_error_specs_with_chinese_copy_have_english_copy():
+    specs = [spec for spec in error_contract.all_specs() if spec.public and spec.safe_text_zh.strip()]
+    assert specs
+    assert [spec.code for spec in specs if not spec.safe_text_en.strip()] == []
+
+
+@pytest.mark.parametrize(("code", "english", "chinese"), [
+    (
+        'model_mismatch',
+        'The runtime did not load the selected model. Pick the model again or try later.',
+        '当前运行时没有成功加载所选模型，请重新选择模型或稍后重试。',
+    ),
+    (
+        'content_filtered',
+        "The model's content policy blocked this reply. Try rephrasing.",
+        '这次回复被模型的内容策略拦下了，换个说法再试。',
+    ),
+    (
+        'rate_limited',
+        'The model service is rate-limited. Wait a few minutes and try again.',
+        '模型服务限流了，稍等几分钟再试。',
+    ),
+    (
+        'upstream_unavailable',
+        'Your model service is temporarily unavailable. It will recover on its own shortly.',
+        '你的模型服务暂时不可用，稍后会自动恢复。',
+    ),
+    (
+        'turn_timeout',
+        'This reply timed out. Try again in a moment.',
+        '这轮回复超时了，稍后再试。',
+    ),
+    (
+        'provider_empty_reply',
+        'Your model service returned an empty reply. Try again later; if it keeps happening, check the stability of your model channel or relay.',
+        '你的模型服务这次返回了空回复，稍后再试；反复出现请检查模型渠道或中转的稳定性。',
+    ),
+    (
+        'cli_output_too_large',
+        'Something went wrong while connecting to the model service.',
+        '连接模型服务时出了问题。',
+    ),
+    (
+        'unknown',
+        'Something went wrong while connecting to the model service.',
+        '连接模型服务时出了问题。',
+    ),
+    (
+        'genesis_failed',
+        'Reading your onboarding files did not finish. You can retry later in the Memory Garden.',
+        '入住材料的文件解读没能完成，可稍后在记忆花园重试。',
+    ),
+    (
+        'genesis_partial',
+        'Your onboarding files were read, but some memories could not be imported.',
+        '入住材料的文件解读完成了，但有部分记忆没能导入。',
+    ),
+    (
+        'import_failed',
+        'Importing the chat history failed. Please try again later.',
+        '聊天记录导入失败了，请稍后重试。',
+    ),
+    (
+        'import_stale',
+        'The chat history import stalled and timed out. Please start it again.',
+        '聊天记录导入卡住已超时，请重新发起。',
+    ),
+    (
+        'memory_backoff',
+        'Memory organizing is temporarily blocked and will retry automatically.',
+        '记忆整理暂时受阻，正在自动重试。',
+    ),
+    (
+        'runner_spawn_failed',
+        "Your AI companion's process failed to start. We are looking into it.",
+        '你的 AI 助手进程启动失败，我们正在处理。',
+    ),
+    (
+        'runner_key_decrypt_failed',
+        "Your AI companion can't start right now (key read failed). We are looking into it.",
+        '你的 AI 助手暂时无法启动（密钥读取失败），我们正在处理。',
+    ),
+    (
+        'runner_degraded',
+        "Some of your AI companion's abilities are temporarily limited and are recovering automatically.",
+        '你的 AI 助手部分能力暂时受限，正在自动恢复。',
+    ),
+])
+def test_error_copy_preserves_approved_english_and_chinese(code, english, chinese):
+    spec = error_contract.require_spec(code)
+    assert spec.safe_text_en == english
+    assert spec.safe_text_zh == chinese
+    assert english != chinese
+    for language in ("en", "en-US"):
+        assert spec.text(language) == english
+        assert catalog.user_text_for(code, language=language) == english
+        if spec.domain == "chat":
+            assert resident._notice_for_code(code, "test detail", language=language).user_text == english
+    for language in ("zh", "zh-CN", ""):
+        assert spec.text(language) == chinese
+        assert catalog.user_text_for(code, language=language) == chinese
+        if spec.domain == "chat":
+            assert resident._notice_for_code(code, "test detail", language=language).user_text == chinese
+
+
 def test_hosted_request_validation_codes_do_not_enter_resident_classifier():
     request_codes = {
         spec.code
@@ -441,3 +552,207 @@ def test_restoring_real_tools_handwritten_view_turns_anti_bypass_red():
         "handwritten registry view" in item
         for item in _anti_bypass_violations(path, mutated)
     )
+
+
+# --- T497:上游「通用 403 体」不再被判成 auth_invalid ------------------------
+#
+# 2026-09-06 线上:一个用户整晚看到「API Key 无效或已过期,请到设置里重新保存。」
+# 这条文案会把人**引向**去重存 key,而 key 从来不是问题所在 —— 库里唯一那条
+# credential 自 7-14 起就没更新过、route 自检返 ok,失败却是间歇的。真相是中转站
+# 因自己的原因回了 403 + 一个没有任何鉴权语义的 OpenAI 风格空壳,而 auth_invalid
+# 的裸 40[13] 分支把它先抓走了。
+#(用户到底有没有真去重存/换过 key,T497 里是 UNMEASURED —— 别把它当事实写。)
+
+_T497_GENERIC_403 = (
+    "feedling:empty_provider_reply: pi agent produced no reply: 403: "
+    '{"message":"Request failed. Please try again later.","type":"api_error",'
+    '"param":"","code":null}'
+)
+# 同一份通用体,只把 message 换成明确的鉴权词:负向先行断言绝不能把真鉴权错误
+# 偷到 upstream_unavailable 去。用「同一份体 + 叠加鉴权词」而不是另起一条
+# "403 Unauthorized",否则测的是另一个形状,证不了这件事。
+_T497_GENERIC_403_WITH_AUTH_WORDS = _T497_GENERIC_403.replace(
+    "Request failed. Please try again later.", "Unauthorized: invalid api key"
+)
+# 下面三条是 r9 复审实跑出来的反例,第一版判据(逐个 403 occurrence + 只看
+# type=api_error)全部漏掉。它们是这条规则真正的边界,单独列出来别被合并掉。
+_T497_API_ERROR_BUT_NOT_GENERIC = (
+    '403: {"message":"Account suspended by provider","type":"api_error"}'
+)
+_T497_GENERIC_403_REPEATED_STATUS = (
+    'HTTP 403: {"message":"Request failed. Please try again later.",'
+    '"type":"api_error","code":"403"}'
+)
+_T497_GENERIC_403_STATUS_LAST = (
+    '{"type":"api_error","message":"Request failed. Please try again later."}'
+    "; status 403"
+)
+# 那句话裸着出现在外层日志里,而 body 的 message 是别的 ⇒ 不是通用体。
+# 判据必须钉在 JSON 的 `message` 字段上,不是文本里任意一处。
+_T497_PHRASE_IN_LOG_BUT_OTHER_BODY = (
+    "HTTP 403: note Request failed. Please try again later. "
+    'body={"message":"something else","type":"api_error"}'
+)
+# 字段冒号两侧带空白仍应识别(容忍空白,不容忍换字段)。
+_T497_GENERIC_403_SPACED = (
+    '403 {"message" : "Request failed. Please try again later." , '
+    '"type" : "api_error"}'
+)
+# This is the string that provider_client._raise_for_provider_status actually
+# exposes to every ProviderError consumer: _response_error_detail has already
+# reduced the JSON body to its message before __str__ is observed.  T497 only
+# exercised the raw-JSON/log shape above, so its green test could not catch the
+# production misclassification.
+_T504_PRODUCTION_GENERIC_403 = (
+    "provider_http_403: Request failed. Please try again later."
+)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (_T497_GENERIC_403, "upstream_unavailable"),
+        (_T497_GENERIC_403_WITH_AUTH_WORDS, "auth_invalid"),
+        ("cli agent exited 1: unexpected status 401 Unauthorized", "auth_invalid"),
+        ("provider_http_403: forbidden", "auth_invalid"),
+        # 只有 api_error 信封、没有那条精确的通用 message ⇒ 规则不得放行
+        (_T497_API_ERROR_BUT_NOT_GENERIC, "auth_invalid"),
+        # 体里再出现一次 403,不得让判据被绕开
+        (_T497_GENERIC_403_REPEATED_STATUS, "upstream_unavailable"),
+        # 状态码写在体后面,顺序不得影响判据
+        (_T497_GENERIC_403_STATUS_LAST, "upstream_unavailable"),
+        # 短语只在外层日志、body message 不同 ⇒ 不得放行
+        (_T497_PHRASE_IN_LOG_BUT_OTHER_BODY, "auth_invalid"),
+        # 字段间空白不影响识别
+        (_T497_GENERIC_403_SPACED, "upstream_unavailable"),
+    ],
+    ids=[
+        "generic_403_body",
+        "generic_403_plus_auth_words",
+        "bare_401",
+        "provider_http_403",
+        "api_error_body_without_generic_message",
+        "generic_403_with_repeated_status",
+        "generic_403_with_status_last",
+        "phrase_in_log_but_other_body_message",
+        "generic_403_with_spaced_fields",
+    ],
+)
+def test_t497_generic_upstream_403_is_not_auth_invalid(text, expected):
+    spec = error_contract.classify_text(text)
+    assert spec is not None, f"no spec matched: {text!r}"
+    assert spec.code == expected
+
+
+def test_t497_rule_requires_the_api_error_envelope_not_just_the_message():
+    """三项条件缺一不可:少了 envelope 同样不改类。"""
+    without_envelope = '403: {"message":"Request failed. Please try again later."}'
+    assert error_contract.classify_text(without_envelope).code == "auth_invalid"
+
+
+def test_t497_auth_words_still_win_even_on_a_genuine_generic_body():
+    """整条就是通用体、但另外带了鉴权词 ⇒ 仍归 auth_invalid。
+
+    安全性质来自 auth_invalid 其余分支与裸 403 分支是并列项:负向断言只掐掉
+    裸 403 这一支,掐不掉 unauthorized / invalid api key 那几支。
+    """
+    text = _T497_GENERIC_403 + " unauthorized"
+    assert error_contract.classify_text(text).code == "auth_invalid"
+
+
+def test_t497_positive_and_negative_forms_share_one_shape():
+    """正向式与 auth_invalid 的负向先行断言必须同源。
+
+    两处各写一遍正则,早晚会各改各的 —— 那时 403 会同时不被两条规则认领(或被
+    两条都认领),而单测若各自写死字面量是看不出来的。所以这里从被测模块**派生**。
+    """
+    shape = error_contract._GENERIC_UPSTREAM_403_SHAPE
+    assert error_contract._GENERIC_UPSTREAM_403 == r"\A" + shape
+    assert error_contract._AUTH_403 == r"\A(?!" + shape + r")[\s\S]*?\b403\b"
+    assert error_contract._AUTH_PROVIDER_HTTP_403 == (
+        r"\A(?!" + shape + r")[\s\S]*?\bprovider_http_403\b"
+    )
+    assert error_contract._GENERIC_UPSTREAM_403_MESSAGE in shape
+    specs = {spec.code: spec for spec in error_contract.all_specs()}
+    assert error_contract._AUTH_403 in specs["auth_invalid"].matcher_pattern
+    assert (
+        error_contract._AUTH_PROVIDER_HTTP_403
+        in specs["auth_invalid"].matcher_pattern
+    )
+    assert (
+        error_contract._GENERIC_UPSTREAM_403
+        in specs["upstream_unavailable"].matcher_pattern
+    )
+
+
+def test_t497_neighbouring_classes_are_untouched():
+    """本次收窄只动 403 一格,相邻的状态码分类不得漂。"""
+    for text, expected in (
+        ("provider_http_502: bad gateway", "upstream_unavailable"),
+        ("exceeded retry limit, last status: 429 Too Many Requests", "rate_limited"),
+        ("cli agent exited 1: unexpected status 403: 额度不足", "quota_insufficient"),
+    ):
+        assert error_contract.classify_text(text).code == expected, text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        (_T504_PRODUCTION_GENERIC_403, "upstream_unavailable"),
+        ("provider_http_403: Unauthorized: invalid API key", "auth_invalid"),
+        ("provider_http_401: Request failed. Please try again later.", "auth_invalid"),
+    ),
+    ids=("generic-403", "auth-403", "generic-message-401"),
+)
+def test_t504_production_provider_error_shape_preserves_auth_boundary(text, expected):
+    spec = error_contract.classify_text(text)
+    assert spec is not None
+    assert spec.code == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "raw_body", "expected"),
+    (
+        (
+            403,
+            '{"message":"Request failed. Please try again later.",'
+            '"type":"api_error"}',
+            False,
+        ),
+        (
+            403,
+            '{"message":"request failed. please try again later.",'
+            '"type":"API_ERROR"}',
+            False,
+        ),
+        (
+            403,
+            '{"message":"Unauthorized: invalid API key",'
+            '"type":"api_error"}',
+            True,
+        ),
+        (
+            401,
+            '{"message":"Request failed. Please try again later.",'
+            '"type":"api_error"}',
+            True,
+        ),
+    ),
+    ids=("generic-403", "case-variant-403", "auth-403", "generic-message-401"),
+)
+def test_t504_shared_provider_auth_boundary_uses_original_body(
+    status, raw_body, expected
+):
+    assert error_contract.provider_response_is_auth_failure(
+        status, raw_body
+    ) is expected
+
+
+def test_pi_unclassified_provider_error_is_registered_without_text_matcher():
+    spec = error_contract.require_spec("provider_error_unclassified")
+    assert spec in error_contract.consumer_specs()
+    assert spec.blame == "provider_transient"
+    assert spec.safe_text_zh == "你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。"
+    assert spec.text("en") == "Your model provider returned an error. Try again later; if it keeps happening, check the provider channel or relay."
+    assert spec not in error_contract.matcher_specs()
+    assert error_contract.classify_text("feedling:pi_provider_error") is None

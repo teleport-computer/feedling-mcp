@@ -23,7 +23,7 @@ MEMORY_SOURCE_VALUES = frozenset({
     "live_conversation",
     "memory_capture",
     "memory_dream",
-    "memory_migrate",
+    "memory_migrate",  # 历史来源，迁移机制已删；保留旧卡溯源。
     "model_api_capture",
     "model_api_correction",
     "model_api_repair",

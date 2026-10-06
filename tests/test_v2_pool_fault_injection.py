@@ -129,6 +129,29 @@ def test_hung_profile_watchdog_recovers_before_replacement_and_preserves_sibling
             lambda: heavy.snapshot() is not None
             and heavy.snapshot().active_job is not None
         )
+        foreground_liveness = {}
+
+        def foreground_ready():
+            nonlocal foreground_liveness
+            foreground_liveness = {
+                f"foreground-{index}": fleet.supervisor(
+                    pool_supervisor.SlotKey("foreground", index)
+                ).poll_liveness()
+                for index in range(4)
+            }
+            # start() seeds a finite heartbeat age before any child message;
+            # wait for actual progress independently of the capacity assertion.
+            return all(
+                liveness["alive"] and liveness["startup_complete"]
+                for liveness in foreground_liveness.values()
+            )
+
+        assert _wait_until(foreground_ready), "\n".join(
+            f"{slot}: alive={liveness['alive']} "
+            f"startup_complete={liveness['startup_complete']} "
+            f"age={liveness['last_progress_age_sec']}"
+            for slot, liveness in foreground_liveness.items()
+        )
         assert fleet.healthy_capacity("foreground", stale_sec=2.0) == 4
         assert all(
             "chat" in fleet.spec(pool_supervisor.SlotKey("foreground", index)).lanes

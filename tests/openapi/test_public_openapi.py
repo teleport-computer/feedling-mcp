@@ -59,6 +59,7 @@ EXPECTED_PUBLIC_OPERATIONS = {
 }
 
 EXPECTED_API_KEY_ONLY_OPERATIONS = {
+    ("post", "/v1/agent-body/generate"),
     ("get", "/v1/web/settings"),
     ("post", "/v1/web/settings"),
     ("post", "/v1/access/link-token"),
@@ -72,6 +73,7 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 }
 
 EXPECTED_CORE_BODY_REFS = {
+    ("post", "/v1/agent-body/generate"): "AgentBodyGenerateRequest",
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("put", "/v1/image-generation/config"): "ImageGenerationConfigUpdateRequest",
     ("post", "/v1/image-generation/config"): "ImageGenerationRouteCreateRequest",
@@ -127,6 +129,21 @@ EXPECTED_HEADER_OPERATIONS = {
 @pytest.fixture(scope="module")
 def public_schema() -> dict[str, Any]:
     return _build_public_schema(_load_schema())
+
+
+def test_memory_search_bm25_contract_and_explicit_resource_failure(public_schema):
+    schemas = public_schema["components"]["schemas"]
+    query = schemas["MemoryIndexRequest"]["properties"]["query"]
+    assert "BM25" in query["description"] and "jieba 0.42.1" in query["description"]
+    result = schemas["MemoryIndexResponse"]["properties"]
+    import memory_search_contract
+    assert result["ranking"]["enum"] == list(memory_search_contract.ACCEPTED) == [
+        "memgarden-bm25-v2+tok:jieba-0.42.1", "memgarden-bm25-v1+tok:jieba-0.42.1",
+        "bm25-jieba-0.42.1-v1", "substring-legacy"]
+    assert "unavailable_count" in result
+    op = public_schema["paths"]["/v1/memory/index"]["post"]
+    assert "413" in op["responses"]
+    assert "memory_search_resource_limit" in op["responses"]["413"]["description"]
 
 
 @pytest.fixture(scope="module")
@@ -214,9 +231,12 @@ def test_public_operation_and_parameter_inventory(
     # validators; only the two config mutations carry request bodies.
     # The authenticated resident generation exchange adds one prompt-bearing
     # operation.
-    # GET /v1/chat/workspace/body adds one bodyless Canvas live-read operation.
-    assert len(operations) == 177
-    assert sum("requestBody" in operation for operation in operations.values()) == 84
+    # GET /v1/chat/workspace/body and GET /v1/chat/canvases add two bodyless
+    # Canvas read operations.
+    # Agent body generation adds one API-key-only JSON operation.
+    # Retiring legacy-card migration removes one GET and two POST operations.
+    assert len(operations) == 176
+    assert sum("requestBody" in operation for operation in operations.values()) == 83
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -421,6 +441,34 @@ def test_chat_memory_and_perception_contracts_are_concrete(
         "$ref": "#/components/schemas/EncryptedEnvelope"
     }
 
+    canvas_index_operation = operations[("get", "/v1/chat/canvases")]
+    assert _parameters(canvas_index_operation, "query") == {}
+    assert canvas_index_operation["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"] == {"$ref": "#/components/schemas/CanvasIndexResponse"}
+    canvas_index = schemas["CanvasIndexResponse"]
+    assert canvas_index["properties"]["canvases"]["maxItems"] == 500
+    assert canvas_index["properties"]["canvases"]["items"] == {
+        "$ref": "#/components/schemas/CanvasIndexEntry"
+    }
+    canvas_entry = schemas["CanvasIndexEntry"]
+    assert set(canvas_entry["required"]) == {
+        "filename",
+        "revision",
+        "mime_type",
+        "created_at",
+        "updated_at",
+        "message_id",
+        "display_title",
+        "display_subtitle",
+    }
+    message_id_types = {
+        item["type"]
+        for item in canvas_entry["properties"]["message_id"]["anyOf"]
+    }
+    assert message_id_types == {"string", "null"}
+    assert "envelope" not in canvas_entry["properties"]
+
     memory_query = _parameters(
         operations[("get", "/v1/memory/list")], "query"
     )
@@ -440,6 +488,10 @@ def test_chat_memory_and_perception_contracts_are_concrete(
 
     memory_index_properties = set(schemas["MemoryIndexRequest"]["properties"])
     memory_fetch_properties = set(schemas["MemoryFetchRequest"]["properties"])
+    assert "query" in memory_index_properties
+    response_fields = schemas["MemoryFetchResponse"]["properties"]
+    assert response_fields["related_items"]["maxItems"] == 6
+    assert set(response_fields["related_status"]["enum"]) == {"ok", "bounded", "unavailable", "not_needed"}
     retired_memory_fields = {
         "include_sensitive",
         "user_explicit_selection",
@@ -571,7 +623,10 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
     assert {"status", "http_status"} <= set(result_schema["required"])
     action_type = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]
-    assert "always create a new card" in action_type["description"]
+    assert "repeated content is not deduplicated" in action_type["description"]
+    assert "idempotency_key replay" in action_type["description"]
+    key = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["idempotency_key"]
+    assert (key["minLength"], key["maxLength"]) == (1, 160)
 
 
 def test_dream_status_documents_monotonic_capture_banner_fields(
@@ -1007,3 +1062,34 @@ def test_resident_vision_probe_result_is_not_public(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
     assert ("post", "/v1/internal/vision/main/test/result") not in operations
+
+
+def test_retired_memory_migration_is_not_advertised(public_schema):
+    assert "/v1/memory/legacy_batch" not in public_schema["paths"]
+    assert "/v1/memory/migration_state" not in public_schema["paths"]
+    action_types = public_schema["components"]["schemas"]["MemoryAction"]["properties"]["type"]["enum"]
+    assert "memory.upgrade" not in action_types
+
+
+def test_provider_probe_failure_contract_is_additive_and_shared():
+    schema = _build_public_schema(_load_schema())
+    failure = schema['components']['schemas']['ProviderTestFailedResponse']
+    assert set(failure['required']) == {'error', 'detail', 'status_code', 'failure_class'}
+    assert failure['properties']['error']['const'] == 'provider_test_failed'
+    assert failure['properties']['status_code']['type'] == ['integer', 'null']
+    assert set(failure['properties']['failure_class']['enum']) == {
+        'auth_invalid', 'quota_insufficient', 'model_not_found', 'rate_limited',
+        'upstream_unavailable', 'provider_config',
+    }
+    for method, path in [
+        ('post', '/v1/model_api/setup'), ('post', '/v1/model_api/test'),
+        ('post', '/v1/model_api/routes'),
+        ('post', '/v1/model_api/routes/{route_id}/test'),
+        ('post', '/v1/model_api/routes/{route_id}/activate'),
+        ('patch', '/v1/model_api/credentials/{credential_id}'),
+    ]:
+        response = schema['paths'][path][method]['responses']['400']
+        assert response['content']['application/json']['schema']['anyOf'] == [
+            {'$ref': '#/components/schemas/ProviderTestFailedResponse'},
+            {'$ref': '#/components/schemas/ErrorResponse'},
+        ]

@@ -20,6 +20,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 import generated_image
+import provider_refusal
 import safe_url_fetch
 from core import net_safety
 from generated_image import (
@@ -35,6 +36,74 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+_MAX_RAW_PROVIDER_ERROR_BODY_CHARS = 64 * 1024
+
+
+PROVIDER_ERROR_TYPES = frozenset({
+    "invalid_request_error", "authentication_error", "permission_error",
+    "not_found_error", "rate_limit_error", "api_error", "overloaded_error",
+    "context_length_exceeded", "insufficient_quota", "invalid_api_key",
+    "request_too_large", "unknown",
+})
+_PROVIDER_ERROR_SIGNATURE_PATTERNS = (
+    ("thinking_forced_tool_choice", r"thinking.*(?:may not|cannot|not supported|does not support|incompatible).*tool_choice|tool_choice.*(?:incompatible|not supported).*thinking"),
+    ("forced_tool_json_mime", r"forced\s+function\s+calling.*(?:mime|json).*(?:unsupported|not supported)"),
+    ("trailing_whitespace", r"(?:final|assistant).*trailing\s+whitespace"),
+    ("tool_use_id_mismatch", r"unexpected\s+tool_use_id|tool_use_id.*(?:not found|missing)|tool_result.*(?:without|must have|matching).*tool_use|tool_use.*(?:without|must have|matching).*tool_result"),
+    ("invalid_tool_schema", r"(?:tools?(?:\[\d+\]|\.\d+)?[.: ]+)?input_schema.*(?:invalid|must|should)|(?:invalid|unsupported).*tool.*schema|tool.*name.*(?:must|match|invalid)"),
+    ("budget_tokens_unsupported", r"budget_tokens.*(?:not supported|unsupported|not permitted|extra)|(?:unsupported|unknown).*budget_tokens"),
+    ("max_tokens_invalid", r"max_tokens.*(?:invalid|must|exceed|greater|less)|(?:invalid|unsupported).*max_tokens"),
+)
+PROVIDER_ERROR_SIGNATURES = frozenset(
+    name for name, _ in _PROVIDER_ERROR_SIGNATURE_PATTERNS
+) | {"unclassified"}
+
+
+def _forces_named_or_required_tool(tool_choice: Any) -> bool:
+    """True for the OpenAI-chat tool choices that force a call.
+
+    ``required`` forces any tool; ``{"type": "function", "function": {"name":
+    ...}}`` forces one named tool. ``auto``/``none``/absent do not force.
+    """
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        return isinstance(function, dict) and bool(str(function.get("name") or "").strip())
+    return False
+
+
+def provider_error_diagnostics(exc: BaseException) -> dict[str, str]:
+    """Project untrusted provider errors into closed, content-free values.
+
+    Raw response bodies remain classification-only, never part of the result.
+    Unknown types/messages are explicitly unknown/unclassified, not copied.
+    """
+    error_type = "unknown"
+    message = str(getattr(exc, "response_detail", "") or "")
+    try:
+        body = json.loads(str(getattr(exc, "raw_response_body", "") or ""))
+    except (ValueError, TypeError, RecursionError):
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        for field in ("type", "code"):
+            value = error.get(field)
+            if isinstance(value, str) and value in PROVIDER_ERROR_TYPES:
+                error_type = value
+                break
+        if isinstance(error.get("message"), str):
+            message = error["message"]
+    # Bounded matching also keeps malformed upstream diagnostics inexpensive.
+    message = message[:4096]
+    signature = "unclassified"
+    for name, pattern in _PROVIDER_ERROR_SIGNATURE_PATTERNS:
+        if re.search(pattern, message, re.IGNORECASE | re.DOTALL):
+            signature = name
+            break
+    return {"provider_error_type": error_type, "error_signature": signature}
+
+
 class ProviderError(Exception):
     def __init__(
         self,
@@ -42,6 +111,7 @@ class ProviderError(Exception):
         *,
         status_code: int | None = None,
         response_detail: str = "",
+        raw_response_body: str = "",
     ):
         super().__init__(message)
         self.status_code = status_code
@@ -49,6 +119,22 @@ class ProviderError(Exception):
         # bounded fragment may enter an operator-only sink; tenant-visible
         # response/trace surfaces must not serialize this attribute.
         self.response_detail = str(response_detail or "")[:240]
+        # Classification-only carrier for callers that must distinguish a real
+        # credential rejection from a relay's generic 403 shell.  The body is
+        # already resident in httpx.Response; retaining a bounded prefix on the
+        # short-lived exception avoids an unbounded second copy.  It must never
+        # enter str/repr, traces, ledgers, notices, stderr, or durable storage.
+        self.raw_response_body = str(raw_response_body or "")[
+            :_MAX_RAW_PROVIDER_ERROR_BODY_CHARS
+        ]
+        # Set only by ``_mark_output_truncation``: an HTTP-2xx success shape
+        # with no usable reply whose provider stop marker says the output-token
+        # cap was hit (typically a thinking model that spent the whole budget
+        # on hidden reasoning). Content-free: normalized stop marker and the
+        # provider's normalized usage counts only.
+        self.output_truncated = False
+        self.stop_reason = ""
+        self.truncation_usage: dict | None = None
 
 
 # --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
@@ -57,8 +143,9 @@ class ProviderError(Exception):
 # blast radius is small. Why it exists: cheap relay providers fail transiently
 # (timeout / 429 / 5xx / empty reply) across the dozens of serial LLM calls a
 # genesis import makes, and today one blip kills the whole job. Retry the
-# transient ones; NEVER retry user-config ones (402 out-of-credits / 401·403 bad
-# key / 4xx config) — those need the user to fix their provider, not us to hammer it.
+# transient ones; NEVER retry user-config/access ones (402 out-of-credits / 401
+# bad key / 403 access or credential rejection / other 4xx config). The finer
+# user-facing classifier separately recognizes the relay's generic 403 shell.
 _RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 415, 422})
@@ -92,6 +179,70 @@ def is_token_limit_stop_reason(value: Any) -> bool:
     }
 
 
+def _mark_output_truncation(
+    exc: ProviderError, *, stop_reason: Any, usage: dict | None
+) -> ProviderError:
+    """Tag a "no usable reply" error whose response stopped at the token cap.
+
+    Every wire parser raises the same ``ProviderError`` (same class, message and
+    ``status_code=None``) when a required reply is empty, so every existing
+    caller keeps its classification, retry and error mapping. The tag only lets
+    a caller that owns an output-budget policy tell "the model ran out of
+    output budget" apart from a relay returning garbage — see
+    ``is_output_truncation_error`` and ``reliable_chat_completion_async``'s
+    ``retry_output_truncation``.
+    """
+    if is_token_limit_stop_reason(stop_reason):
+        exc.output_truncated = True
+        exc.stop_reason = normalize_stop_reason(stop_reason)
+        exc.truncation_usage = dict(usage) if isinstance(usage, dict) else None
+    return exc
+
+
+def is_output_truncation_error(exc: BaseException) -> bool:
+    """A 2xx reply with no usable text that the provider stopped at its output cap."""
+    return isinstance(exc, ProviderError) and getattr(exc, "output_truncated", False) is True
+
+
+# A 400/422 whose provider message says the requested output-token budget is
+# above what this model accepts. Shapes seen across wires: OpenAI "max_tokens is
+# too large: 24000. This model supports at most 16384 completion tokens",
+# Anthropic "max_tokens: 24000 > 16000, which is the maximum allowed number of
+# output tokens", DeepSeek "Invalid max_tokens value, the valid range of
+# max_tokens is [1, 8192]", Bedrock "The maximum tokens you requested exceeds
+# the model limit", Gemini "maxOutputTokens ... must be less than or equal".
+_OUTPUT_BUDGET_FIELD_RE = re.compile(
+    r"max[_ ]?(?:completion[_ ]|output[_ ]|new[_ ])?tokens|maxoutputtokens"
+    r"|maximum (?:number of )?(?:output )?tokens|(?:output|completion) tokens",
+    re.IGNORECASE,
+)
+_OUTPUT_BUDGET_LIMIT_RE = re.compile(
+    r"too (?:large|big|high|many)|exceed|greater than|larger than|at most"
+    r"|maximum allowed|valid range|out of range|must be (?:less|at most|between|<|in)"
+    r"|less than or equal|\d\s*>\s*\d",
+    re.IGNORECASE,
+)
+
+
+def is_output_budget_rejection(exc: BaseException) -> bool:
+    """A 400/422 that rejects the requested output-token budget as too large.
+
+    Only meaningful to a caller that raised its own budget above one the same
+    route already accepted: it can safely fall back to that accepted budget.
+    Content-free: the verdict is derived from the provider's error text, which
+    is not returned.
+    """
+    if not isinstance(exc, ProviderError) or exc.status_code not in {400, 422}:
+        return False
+    text = " ".join(
+        str(part or "")
+        for part in (exc, getattr(exc, "response_detail", ""), exc.raw_response_body)
+    )
+    return bool(
+        _OUTPUT_BUDGET_FIELD_RE.search(text) and _OUTPUT_BUDGET_LIMIT_RE.search(text)
+    )
+
+
 def cap_chat_output_tokens(value: Any) -> int:
     """Clamp to the ceiling; reject invalid/non-positive budgets with ValueError.
 
@@ -113,8 +264,8 @@ def classify_provider_error(exc: BaseException) -> str:
     """Classify an LLM-call failure for retry decisions.
 
     - "transient"       → retry (network/timeout, 429, 5xx, empty / no-usable / bad-json reply)
-    - "provider_config" → DON'T retry; user must fix key / credits / config
-                          (402 out of credits, 401·403 bad key, other 4xx config)
+    - "provider_config" → DON'T retry; key / credits / access / other 4xx config
+                          (the user-facing layer distinguishes generic relay 403)
     - "unknown"         → treat as transient but capped (better a few retries than
                           silently giving up on an unrecognised blip)
     """
@@ -432,24 +583,71 @@ def _runtime_model(provider: str, model: str) -> tuple[str, dict[str, Any]]:
     return raw, {}
 
 
+def _model_name_has_image_output(model: str) -> bool:
+    """Return whether a model id carries one of the existing image markers."""
+    lower = str(model or "").strip().lower()
+    return any(
+        marker in lower
+        for marker in (
+            "image",
+            "flux",
+            "dall-e",
+            "stable-diffusion",
+            "seedream",
+        )
+    )
+
+
 def _model_has_native_image_output(provider: str, model: str) -> bool:
-    """Conservative gate for wires that require explicit image modalities."""
+    """Keep ordinary chat image modalities on their established provider wires."""
     normalized_provider = normalize_provider(provider)
     lower = str(model or "").strip().lower()
     if normalized_provider == "gemini":
         return lower.startswith("gemini-") and "image" in lower
     if normalized_provider in {"openai", "openrouter", "openai_compatible"}:
-        return any(
-            marker in lower
-            for marker in (
-                "image",
-                "flux",
-                "dall-e",
-                "stable-diffusion",
-                "seedream",
-            )
-        )
+        return _model_name_has_image_output(model)
     return False
+
+
+def _relay_serves_dedicated_image_endpoint(provider: str) -> bool:
+    """Bring-your-own-base_url relays whose image model is reached through a
+    dedicated images endpoint (``openrouter`` → ``/images``; ``openai_compatible``
+    → ``/images/generations``; see ``post_dedicated_image``).
+
+    Canonical ``openai`` is deliberately excluded: its reasoning models
+    generate images through the Responses API's hosted image tool, not a
+    dedicated images endpoint, so it keeps the name-marker gate (gpt-image-* →
+    dedicated; gpt-5.6 → Responses image tool).
+    """
+    return normalize_provider(provider) in {"openrouter", "openai_compatible"}
+
+
+def _image_output_wire_enabled(
+    provider: str,
+    model: str,
+    *,
+    image_generation_probe: bool = False,
+) -> bool:
+    """Whether to try the provider's dedicated images endpoint for this call.
+
+    An explicit setup probe is the user declaring "this is my image model", so
+    the dedicated endpoint is tried for any relay-style provider regardless of
+    the model id. The name marker used to gate the probe too, but it only knew
+    ``image``/``flux``/``dall-e``/``stable-diffusion``/``seedream`` — so a real
+    image model whose id carries none of them (measured: ``nai-diffusion-4-5-
+    full`` on a relay serving NovelAI) was reported "can't generate images"
+    before any request left the box, because the probe silently fell through to
+    the chat wire and got no media (T535). Trying the dedicated endpoint is a
+    cheap pre-flight: a genuinely non-image model is still rejected by the 4xx
+    it returns (or by producing no media), so opening the wire cannot pass a
+    model that does not actually generate.
+
+    Outside a probe (a live chat turn), the name marker still governs so an
+    ordinary chat model is never diverted onto the image wire on a hunch.
+    """
+    if image_generation_probe:
+        return _model_name_has_image_output(model) or _relay_serves_dedicated_image_endpoint(provider)
+    return _model_has_native_image_output(provider, model)
 
 
 def public_config(config: dict) -> dict:
@@ -613,12 +811,14 @@ def _response_error_detail(resp: httpx.Response) -> str:
 def _raise_for_provider_status(resp: httpx.Response) -> None:
     if resp.status_code < 400:
         return
+    raw_response_body = resp.text
     detail = _response_error_detail(resp)
     suffix = f": {detail}" if detail else ""
     raise ProviderError(
         f"provider_http_{resp.status_code}{suffix}",
         status_code=resp.status_code,
         response_detail=detail,
+        raw_response_body=raw_response_body,
     )
 
 
@@ -1712,6 +1912,33 @@ def _mark_anthropic_cache_breakpoint(
     return system, updated
 
 
+def _strip_local_schema_markers(schema):
+    """Copy a wire schema without execution-only array-bound markers.
+
+    Property/definition names and literal values are data, not schema keywords.
+    Keep the source intact: local argument validation still needs the marker.
+    This is not Gemini's schema relaxation; standard constraints stay on wire.
+    """
+    if isinstance(schema, list):
+        return [_strip_local_schema_markers(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {}
+    for key, value in schema.items():
+        if key == "enforceItemBounds":
+            continue
+        if key in _OPAQUE_SCHEMA_VALUE_KEYS or key == "enum":
+            out[key] = copy.deepcopy(value)
+        elif (key in _SCHEMA_MAP_KEYS or key in {"dependencies", "dependentRequired"}) and isinstance(value, dict):
+            out[key] = {
+                name: _strip_local_schema_markers(child)
+                for name, child in value.items()
+            }
+        else:
+            out[key] = _strip_local_schema_markers(value)
+    return out
+
+
 def _encode_tools_openai_chat(tools) -> list[dict]:
     return [
         {
@@ -1719,7 +1946,7 @@ def _encode_tools_openai_chat(tools) -> list[dict]:
             "function": {
                 "name": t.name,
                 "description": t.description,
-                "parameters": t.parameters,
+                "parameters": _strip_local_schema_markers(t.parameters),
             },
         }
         for t in tools
@@ -1777,7 +2004,7 @@ def _encode_tools_openai_responses(tools) -> list[dict]:
             "type": "function",
             "name": t.name,
             "description": t.description,
-            "parameters": t.parameters,
+            "parameters": _strip_local_schema_markers(t.parameters),
         }
         for t in tools
     ]
@@ -1827,7 +2054,8 @@ def _encode_tool_results_openai_responses(results) -> list[dict]:
 
 def _encode_tools_anthropic(tools) -> list[dict]:
     return [
-        {"name": t.name, "description": t.description, "input_schema": t.parameters}
+        {"name": t.name, "description": t.description,
+         "input_schema": _strip_local_schema_markers(t.parameters)}
         for t in tools
     ]
 
@@ -1879,7 +2107,7 @@ def _encode_tools_bedrock(tools) -> list[dict[str, Any]]:
             "toolSpec": {
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": {"json": tool.parameters},
+                "inputSchema": {"json": _strip_local_schema_markers(tool.parameters)},
             },
         }
         for tool in tools
@@ -2340,6 +2568,74 @@ def _extract_openai_compatible_reasoning(body: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
+# OpenAI-compatible finish_reason values we pass through as an enum; a relay
+# can put anything here, so everything else collapses to "other".
+_OPENAI_COMPAT_FINISH_REASONS = frozenset({
+    "stop", "length", "content_filter", "tool_calls", "function_call",
+})
+
+
+def _count_or_none(value: Any) -> int | None:
+    """Finite non-negative whole number or None — never fake or raise."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (math.isfinite(value) and value.is_integer()):
+            return None
+        value = int(value)
+    if not isinstance(value, int):
+        try:
+            value = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+    return value if value >= 0 else None
+
+
+def _openai_compat_empty_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
+    """Content-free counts a relay reports beside a (possibly empty) choice.
+
+    T604 (2026-09-16): a relay-fronted Gemini model returned ``content: ""``
+    with ``completion_tokens`` 133–916 for 14 rounds in a row and the trace
+    could not say whether those tokens were hidden thinking or lost text.
+    Relays that front Gemini (new-api style) report the split themselves:
+    ``usage.completion_tokens_details.{reasoning_tokens,text_tokens}`` and,
+    for the gemini channel, ``usage.billing_usage.gemini_usage_metadata``
+    (``candidatesTokenCount`` / ``thoughtsTokenCount``). Project them onto the
+    same keys the native Gemini diagnostics use so the admin trace reads the
+    same way on both wires. Numbers and a closed enum only — no text.
+    """
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    billing = usage.get("billing_usage")
+    billing = billing if isinstance(billing, dict) else {}
+    upstream = billing.get("gemini_usage_metadata")
+    upstream = upstream if isinstance(upstream, dict) else {}
+    thoughts = _count_or_none(upstream.get("thoughtsTokenCount"))
+    if thoughts is None:
+        thoughts = _count_or_none(details.get("reasoning_tokens"))
+    candidates = _count_or_none(upstream.get("candidatesTokenCount"))
+    if candidates is None:
+        candidates = _count_or_none(details.get("text_tokens"))
+    prompt = _count_or_none(upstream.get("promptTokenCount"))
+    if prompt is None:
+        prompt = _count_or_none(usage.get("prompt_tokens"))
+    raw_finish = _extract_openai_compatible_stop_reason(body).lower()
+    finish = (
+        raw_finish if raw_finish in _OPENAI_COMPAT_FINISH_REASONS
+        else ("other" if raw_finish else "")
+    )
+    return {
+        "finish_reason": finish,
+        "prompt_token_count": prompt,
+        "candidates_token_count": candidates,
+        "thoughts_token_count": thoughts,
+        # Whether the relay exposed the upstream Gemini usage block at all, so a
+        # missing split is distinguishable from a reported zero.
+        "upstream_usage_reported": bool(upstream),
+    }
+
+
 def _extract_openai_compatible_stop_reason(body: dict[str, Any]) -> str:
     choices = body.get("choices")
     if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
@@ -2483,11 +2779,177 @@ def _extract_gemini_stop_reason(body: dict[str, Any]) -> str:
     return str(candidates[0].get("finishReason") or "").strip()
 
 
-def _anthropic_supports_thinking(model: str) -> bool:
-    lower = (model or "").lower()
-    return (
-        "claude-3-7" in lower or "claude-sonnet-4" in lower or "claude-opus-4" in lower
+# Gemini safety categories are a CLOSED enum set; only these (and their HIGH/…
+# probability + blocked flag) are projected, never any content. Unknown
+# categories are counted but not named, so a future category cannot smuggle text
+# into the trace.
+_GEMINI_SAFETY_CATEGORIES = (
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+)
+_GEMINI_PROBABILITY_ORDER = ("NEGLIGIBLE", "LOW", "MEDIUM", "HIGH")
+# finishReason is PROVIDER-CONTROLLED free text on the wire — it must never reach
+# a (user-readable) trace verbatim. Only these closed enum values pass through;
+# anything else normalizes to "other" so a hostile/novel value cannot leak text.
+_GEMINI_FINISH_REASONS = frozenset({
+    "FINISH_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "RECITATION",
+    "LANGUAGE", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+    "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",
+    # Observed on Gemini 3.x (T586/T588; also pi-mono#2028), despite its
+    # absence from Google's published finishReason enum.
+    "MALFORMED_RESPONSE",
+})
+
+
+def _normalize_gemini_finish_reason(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    return value if value in _GEMINI_FINISH_REASONS else "other"
+
+
+def _gemini_empty_diagnostics(body: dict[str, Any]) -> dict[str, Any]:
+    """Content-free scalars explaining a Gemini response with no usable text.
+
+    Everything here is an enum, a count, a token number, or a boolean — no reply,
+    reasoning, prompt, or error text — so it is safe to carry through the
+    normalized result into a (gated) trace. Projected here, at the provider seam,
+    because ``_empty_response_shape`` downstream only sees ``ProviderResponse.raw``
+    and must never reach back through ``assistant_turn`` (which carries content).
+    """
+    candidates = body.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    first = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+
+    # Parts: did the model return only ``thought`` parts (reasoning) with no
+    # visible-text part? (A common Gemini "empty" shape.)
+    content = first.get("content")
+    parts = content.get("parts") if isinstance(content, dict) else None
+    parts = parts if isinstance(parts, list) else []
+    visible_text_parts = 0
+    thought_parts = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        has_text = isinstance(text, str) and bool(text.strip())
+        if part.get("thought"):
+            if has_text:
+                thought_parts += 1
+        elif has_text:
+            visible_text_parts += 1
+    # Structural definition (not text-count based): a non-empty parts list where
+    # every part is a dict flagged thought=True — this INCLUDES signature-only
+    # thought parts that carry no text, which a text-count would miss.
+    only_thought_parts = bool(parts) and all(
+        isinstance(part, dict) and bool(part.get("thought")) for part in parts
     )
+
+    # Safety ratings: closed-set categories, highest probability, blocked flags.
+    ratings = first.get("safetyRatings")
+    ratings = ratings if isinstance(ratings, list) else []
+    blocked_known: list[str] = []
+    blocked_unknown = 0
+    max_prob_rank = -1
+    for rating in ratings:
+        if not isinstance(rating, dict):
+            continue
+        category = str(rating.get("category") or "")
+        is_blocked = bool(rating.get("blocked"))
+        if is_blocked:
+            if category in _GEMINI_SAFETY_CATEGORIES:
+                blocked_known.append(category)
+            else:
+                blocked_unknown += 1
+        probability = str(rating.get("probability") or "")
+        if probability in _GEMINI_PROBABILITY_ORDER:
+            max_prob_rank = max(
+                max_prob_rank, _GEMINI_PROBABILITY_ORDER.index(probability)
+            )
+
+    usage = body.get("usageMetadata")
+    usage = usage if isinstance(usage, dict) else {}
+
+    def _count(value: Any) -> int | None:
+        # Pure observability: a malformed provider token count must neither fake a
+        # value (1.5 -> 1, -1 -> 0) nor raise (NaN -> ValueError, Inf ->
+        # OverflowError) and turn a successful parse into a failure. Only a
+        # finite non-negative whole number is a count; everything else is None.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, float):
+            if math.isfinite(value) and value.is_integer() and value >= 0:
+                return int(value)
+            return None
+        return None
+
+    return {
+        "finish_reason": _normalize_gemini_finish_reason(
+            _extract_gemini_stop_reason(body)
+        ),
+        "candidates_count": len(candidates),
+        "only_thought_parts": only_thought_parts,
+        "visible_text_part_count": visible_text_parts,
+        "thought_part_count": thought_parts,
+        "safety_blocked": bool(blocked_known) or blocked_unknown > 0,
+        "safety_blocked_categories": blocked_known,
+        "safety_blocked_unknown_count": blocked_unknown,
+        "safety_max_probability": (
+            _GEMINI_PROBABILITY_ORDER[max_prob_rank] if max_prob_rank >= 0 else ""
+        ),
+        "prompt_token_count": _count(usage.get("promptTokenCount")),
+        "candidates_token_count": _count(usage.get("candidatesTokenCount")),
+        "thoughts_token_count": _count(usage.get("thoughtsTokenCount")),
+    }
+
+
+# Manual enabled+budget_tokens capability, not support for reasoning in general.
+# Sources checked 2026-09-21:
+# [A] https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+# [B] https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html
+# 4.6 still accepts manual mode (deprecated); adaptive-only models must not get it.
+ANTHROPIC_MANUAL_THINKING_CAPABILITIES: dict[str, bool] = {
+    "claude-3-7-sonnet": True,  # [B] extended thinking
+    "claude-sonnet-4": True,  # [A, B] extended only
+    "claude-opus-4": True,  # [A, B] extended only
+    "claude-opus-4-1": True,  # [A] earlier Claude 4 models: extended only
+    "claude-sonnet-4-5": True,  # [A, B] extended only
+    "claude-opus-4-5": True,  # [A, B] extended only
+    "claude-haiku-4-5": True,  # [A, B] extended only
+    "claude-sonnet-4-6": True,  # [A, B] manual accepted, deprecated
+    "claude-opus-4-6": True,  # [A, B] manual accepted, deprecated
+    "claude-opus-4-7": False,  # [A] adaptive only
+    "claude-opus-4-8": False,  # [A] adaptive only
+    "claude-opus-5": False,  # [A] adaptive only
+    "claude-sonnet-5": False,  # [A] adaptive only
+}
+
+
+def _anthropic_supports_thinking(model: str) -> bool:
+    """Resolve only documented manual-thinking families; unknown stays usable.
+
+    Accept dated/latest aliases and Bedrock version/profile decorations, never
+    arbitrary substrings or unlisted minor versions. This shared builder check
+    emits a content-free diagnostic when requested reasoning cannot be resolved.
+    """
+    lower = (model or "").lower()
+    lower = re.sub(r"^(?:(?:us|eu|apac|global|jp|au)\.)?anthropic\.", "", lower)
+    lower = re.sub(r"-v[0-9]+(?::[0-9]+)?$", "", lower)
+    lower = re.sub(r"-(?:[0-9]{8}|latest)$", "", lower)
+    supported = ANTHROPIC_MANUAL_THINKING_CAPABILITIES.get(lower)
+    if supported is None:
+        # Model is configuration metadata. Bound it to the configured model ID
+        # limit and JSON-encode controls; never include prompts, keys or URLs.
+        log.warning("[provider_client] thinking_omitted %s", json.dumps({
+            "reason": "unknown_model", "model": lower[:160],
+        }))
+        return False
+    return supported
 
 
 def _openai_uses_responses_for_reasoning(model: str) -> bool:
@@ -2686,23 +3148,29 @@ def _parse_openai_responses_body(
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_openai_responses(body)
     media = _extract_openai_responses_media(body)
+    stop_reason = str(
+        (
+            body.get("incomplete_details")
+            if isinstance(body.get("incomplete_details"), dict)
+            else {}
+        ).get("reason")
+        or body.get("status")
+        or "",
+    ).strip()
+    usage = _normalize_usage("openai", body.get("usage"))
     if require_reply and not reply and not tool_calls and not media:
-        raise ProviderError("provider response had no usable reply text")
+        raise _mark_output_truncation(
+            ProviderError("provider response had no usable reply text"),
+            stop_reason=stop_reason,
+            usage=usage,
+        )
     output = body.get("output")
     return {
         "reply": reply,
         "reasoning": reasoning,
-        "usage": _normalize_usage("openai", body.get("usage")),
+        "usage": usage,
         "raw_id": body.get("id", ""),
-        "stop_reason": str(
-            (
-                body.get("incomplete_details")
-                if isinstance(body.get("incomplete_details"), dict)
-                else {}
-            ).get("reason")
-            or body.get("status")
-            or "",
-        ).strip(),
+        "stop_reason": stop_reason,
         "provider": "openai",
         "model": model,
         "tool_calls": tool_calls,
@@ -2809,6 +3277,7 @@ def _build_openai_compat_payload(
     prompt_cache_key: str = "",
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
     assistant_prefill: str = "",
 ) -> dict[str, Any]:
     encoded_messages = _encode_messages_openai_chat(messages)
@@ -2830,12 +3299,29 @@ def _build_openai_compat_payload(
         payload.update(extra_body)
     if include_reasoning and provider == "openrouter":
         payload.setdefault("reasoning", {"enabled": True, "exclude": False})
-    if allow_image_output and _model_has_native_image_output(provider, model):
+    if allow_image_output and _image_output_wire_enabled(
+        provider,
+        model,
+        image_generation_probe=image_generation_probe,
+    ):
         payload["modalities"] = ["text", "image"]
     if tools:
         payload["tools"] = _encode_tools_openai_chat(tools)
         if tool_choice is not None:
             payload["tool_choice"] = copy.deepcopy(tool_choice)
+        # DeepSeek supports tools in thinking mode, but its Chat Completions
+        # endpoint rejects native thinking combined with a *forcing* tool
+        # choice: the literal ``required`` and a named function alike (T735:
+        # "Thinking mode does not support this tool_choice" for the Profile
+        # emit_profile call).  Keep thinking for ordinary/auto rounds and
+        # disable it only for the request whose wire contract must force a
+        # tool call.  Key this on the declared provider, never the URL: an
+        # openai_compatible route remains owned by that adapter even when it
+        # happens to point at a DeepSeek host.
+        if normalize_provider(provider) == "deepseek" and _forces_named_or_required_tool(
+            payload.get("tool_choice")
+        ):
+            payload["thinking"] = {"type": "disabled"}
     if cache_key := _cache_key(prompt_cache_key):
         if provider == "openai":
             payload["prompt_cache_key"] = cache_key
@@ -3059,17 +3545,28 @@ def _with_request_diagnostics(
 
 
 def _with_reliable_retry_count(result: Any, retries: int) -> Any:
-    """Fold outer transient retries into the same non-sensitive counter."""
-    if not isinstance(result, dict) or retries <= 0:
+    """Guarantee a dict result carries ``provider_retry_count`` at the reliable
+    wrapper's single success exit, folding outer transient retries onto whatever
+    a wire already recorded.
+
+    This runs on EVERY reliable success (one-shot included), so wires whose own
+    parse path skips ``_with_request_diagnostics`` — the dedicated image wires
+    and Gemini — still report a count (0 on a clean one-shot) instead of an
+    absent field. Doing it here, not per-wire, is what stops a new wire from
+    silently reintroducing the gap.
+    """
+    if not isinstance(result, dict):
         return result
+    retries = max(0, int(retries))
     out = dict(result)
     usage = dict(out.get("usage") or {})
     try:
         inner = max(0, int(usage.get("provider_retry_count") or 0))
     except (TypeError, ValueError, OverflowError):
         inner = 0
-    usage["provider_retry_count"] = inner + int(retries)
-    usage["transient_retry_count"] = int(retries)
+    usage["provider_retry_count"] = inner + retries
+    if retries > 0:
+        usage["transient_retry_count"] = retries
     out["usage"] = usage
     return out
 
@@ -3194,6 +3691,73 @@ def _extend_attempt_trace(
     return ordinals
 
 
+# Set only by ``reliable_chat_completion_async`` while a caller-supplied
+# ``progress_cb`` is active. One outer attempt can contain several bounded HTTP
+# wires (compatibility fallbacks); without a boundary between them a hosted
+# watchdog sees one long silent await and may kill a healthy slot. Task-local,
+# so concurrent turns never see each other's callback.
+_WIRE_START_CB: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "feedling_provider_wire_start_cb", default=None
+)
+
+
+def _notify_wire_start(inner_attempt: int) -> None:
+    callback = _WIRE_START_CB.get()
+    if callback is None:
+        return
+    try:
+        callback(int(inner_attempt))
+    except Exception:  # noqa: BLE001 — observation must never change a request
+        pass
+
+
+# Set only by ``reliable_chat_completion_async(wire_deadline_sec=...)``: a true
+# wall-clock ceiling for ONE HTTP wire (connect + send + the whole buffered
+# response). httpx's ``timeout=`` bounds each phase separately (read = the gap
+# between two received bytes), so a relay that trickles keep-alive bytes can
+# hold one wire far past it. A hosted watchdog whose stall budget is only a
+# little longer than one wire needs this ceiling to be real. Task-local, like
+# ``_WIRE_START_CB``; unset for every other caller (behaviour unchanged).
+_WIRE_DEADLINE_SEC: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "feedling_provider_wire_deadline_sec", default=None
+)
+
+
+async def _post_within_wire_deadline(post: Any, request_payload: dict[str, Any]) -> Any:
+    deadline = _WIRE_DEADLINE_SEC.get()
+    if deadline is None:
+        return await post(request_payload)
+    try:
+        # ``wait_for`` cancels and joins the in-flight request on expiry, so no
+        # paid socket survives as a detached zombie (same as absolute_deadline).
+        return await asyncio.wait_for(post(request_payload), timeout=deadline)
+    except asyncio.TimeoutError as exc:
+        # Same shape as an httpx read timeout wrapped by the wire adapters
+        # (``ProviderError("provider network error: <Name>")``, no status):
+        # ``classify_provider_error`` → transient, ``is_timeout_error`` → True.
+        error = ProviderError("provider network error: WireDeadlineExceeded")
+        error.feedling_timeout_kind = "wire_deadline"
+        raise error from exc
+
+
+def _wire_timeout_kind(exc: BaseException) -> str:
+    """Classify exception types, never provider-controlled exception text."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "feedling_timeout_kind", None) == "wire_deadline":
+            return "wire_deadline"
+        for kind, cls in (("connect", httpx.ConnectTimeout), ("read", httpx.ReadTimeout),
+                          ("write", httpx.WriteTimeout), ("pool", httpx.PoolTimeout)):
+            if isinstance(current, cls):
+                return kind
+        if isinstance(current, (TimeoutError, asyncio.TimeoutError)):
+            return "unknown"
+        current = current.__cause__
+    return "none"
+
+
 async def _traced_async_json_post(
     *,
     trace: list[dict[str, Any]] | None,
@@ -3210,8 +3774,9 @@ async def _traced_async_json_post(
     therefore preserves the exact JSON body without an extra deep-copy of a large
     prompt on the latency-sensitive path.
     """
+    _notify_wire_start(inner_attempt)
     if trace is None:
-        return await post(request_payload), None
+        return await _post_within_wire_deadline(post, request_payload), None
 
     started_ns = time.monotonic_ns()
     entry: dict[str, Any] = {
@@ -3224,17 +3789,19 @@ async def _traced_async_json_post(
         "error_class": None,
         "compatibility_fallback": None,
         "duration_ms": 0.0,
+        "timeout_kind": "none",
         "wire": {
             "encoding": "json_body",
             "payload": request_payload,
         },
     }
     try:
-        response = await post(request_payload)
+        response = await _post_within_wire_deadline(post, request_payload)
     except Exception as exc:  # noqa: BLE001 -- retain evidence, preserve exception
         status = getattr(exc, "status_code", None)
         entry["status"] = int(status) if isinstance(status, int) else None
         entry["error_class"] = classify_provider_error(exc)
+        entry["timeout_kind"] = _wire_timeout_kind(exc)
         entry["duration_ms"] = _attempt_duration_ms(started_ns)
         trace.append(entry)
         raise
@@ -3551,10 +4118,17 @@ def _parse_openai_compat_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
-    reply = _extract_reply(
-        body, required=require_reply and not tool_calls and not media
-    )
     stop_reason = _extract_openai_compatible_stop_reason(body)
+    try:
+        reply = _extract_reply(
+            body, required=require_reply and not tool_calls and not media
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=stop_reason,
+            usage=_normalize_usage(provider, body.get("usage")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -3563,6 +4137,7 @@ def _parse_openai_compat_body(
         "usage": _normalize_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": stop_reason,
+        "openai_compat_diagnostics": _openai_compat_empty_diagnostics(body),
         "provider": provider,
         "model": model,
         "tool_calls": tool_calls,
@@ -3733,6 +4308,15 @@ def _build_anthropic_payload(
             payload["tool_choice"] = {"type": "any"}
         elif tool_choice == "auto":
             payload["tool_choice"] = {"type": "auto"}
+        # Anthropic rejects manual extended thinking with forced tool use.
+        # Decide from the translated wire choice so both required and named
+        # calls retain their forcing contract; ordinary auto/none rounds keep
+        # reasoning. This builder is shared by sync and async callers.
+        if (
+            payload.get("thinking", {}).get("type") == "enabled"
+            and payload.get("tool_choice", {}).get("type") in {"any", "tool"}
+        ):
+            payload.pop("thinking")
     # The opaque affinity key itself is intentionally not sent on Anthropic's
     # wire.  ``cache_control`` lives on the stable system/message content block
     # above; top-level cache_control is not part of the Messages API schema.
@@ -3761,11 +4345,22 @@ def _parse_anthropic_body(
     # and must not be rejected — require reply only when no tool_calls are present.
     tool_calls = _decode_tool_calls_anthropic(body)
     content = body.get("content")
-    reply = _extract_anthropic_reply(
-        body, required=require_reply and not tool_calls
-    )
     stop_reason = str(body.get("stop_reason") or "").strip()
+    refusal = provider_refusal.from_anthropic_body(body)
+    try:
+        reply = _extract_anthropic_reply(
+            body, required=require_reply and not tool_calls
+        )
+    except ProviderError as exc:
+        if refusal is not None:
+            exc.provider_refusal = refusal
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=stop_reason,
+            usage=_normalize_usage("anthropic", body.get("usage")),
+        )
     return {
+        **({"provider_refusal": refusal} if refusal is not None else {}),
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
         ),
@@ -3967,6 +4562,12 @@ def _build_bedrock_payload(
             payload["toolConfig"]["toolChoice"] = {"tool": {"name": tool_choice["function"]["name"]}}
         elif tool_choice == "required":
             payload["toolConfig"]["toolChoice"] = {"any": {}}
+        if thinking_enabled and (
+            {"tool", "any"} & payload["toolConfig"].get("toolChoice", {}).keys()
+        ):
+            # Manual thinking cannot accompany forced tool use on Bedrock.
+            # Retain the translated choice and use its explicit off setting.
+            payload["additionalModelRequestFields"]["thinking"] = {"type": "disabled"}
 
     if _cache_key(prompt_cache_key):
         # Converse evaluates cache checkpoints in tools -> system -> messages
@@ -4048,14 +4649,20 @@ def _parse_bedrock_body(
 ) -> dict[str, Any]:
     tool_calls = _decode_tool_calls_bedrock(body)
     content = _bedrock_output_content(body)
-    return {
-        "reply": _extract_bedrock_reply(
+    stop_reason = str(body.get("stopReason") or "").strip()
+    usage = _normalize_usage("bedrock", body.get("usage"))
+    try:
+        reply = _extract_bedrock_reply(
             body, required=require_reply and not tool_calls
-        ),
+        )
+    except ProviderError as exc:
+        raise _mark_output_truncation(exc, stop_reason=stop_reason, usage=usage)
+    return {
+        "reply": reply,
         "reasoning": _extract_bedrock_reasoning(body),
-        "usage": _normalize_usage("bedrock", body.get("usage")),
+        "usage": usage,
         "raw_id": str(body.get("requestId") or ""),
-        "stop_reason": str(body.get("stopReason") or "").strip(),
+        "stop_reason": stop_reason,
         "provider": "bedrock",
         "model": model,
         "tool_calls": tool_calls,
@@ -4162,6 +4769,7 @@ def _build_gemini_payload(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
     tool_choice: str | dict[str, Any] | None = None,
     assistant_prefill: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
@@ -4181,7 +4789,11 @@ def _build_gemini_payload(
             "thinkingBudget": min(1024, max(128, int(max_tokens) // 2)),
             "includeThoughts": True,
         }
-    if allow_image_output and _model_has_native_image_output("gemini", model):
+    if allow_image_output and _image_output_wire_enabled(
+        "gemini",
+        model,
+        image_generation_probe=image_generation_probe,
+    ):
         generation_config["responseModalities"] = ["TEXT", "IMAGE"]
 
     payload: dict[str, Any] = {
@@ -4226,10 +4838,19 @@ def _parse_gemini_body(
         assistant_payload = {}
     if not isinstance(assistant_payload, dict):
         assistant_payload = {}
-    reply = _extract_gemini_reply(
-        body, required=require_reply and not tool_calls and not media
-    )
     stop_reason = _extract_gemini_stop_reason(body)
+    try:
+        reply = _extract_gemini_reply(
+            body, required=require_reply and not tool_calls and not media
+        )
+    except ProviderError as exc:
+        # Only the closed Gemini enum can reach the marker (MAX_TOKENS ->
+        # "max_tokens"); a novel provider string normalizes to "other".
+        raise _mark_output_truncation(
+            exc,
+            stop_reason=_normalize_gemini_finish_reason(stop_reason),
+            usage=_normalize_usage("gemini", body.get("usageMetadata")),
+        )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
@@ -4242,6 +4863,7 @@ def _parse_gemini_body(
         "model": model,
         "tool_calls": tool_calls,
         "media": media,
+        "gemini_diagnostics": _gemini_empty_diagnostics(body),
         "assistant_turn": {"wire": "gemini", "payload": assistant_payload},
     }
 
@@ -4743,6 +5365,10 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
                            timeout=timeout) as resp:
             status = resp.status_code
             if status >= 400:
+                # Catalog classification intentionally uses status only: 401 is
+                # key rejection, while 403 is the existing access_denied class.
+                # It is not a chat/vision/image sink and therefore does not
+                # retain raw_response_body on this streaming GET exception.
                 raise ProviderError(f"provider_http_{status}", status_code=status)
             for chunk in resp.iter_bytes():
                 if time.monotonic() >= deadline:
@@ -4891,6 +5517,15 @@ def model_catalog_error_slug(exc: BaseException) -> str:
     return "model_catalog_invalid_response"
 
 
+# HTTP timeout for setup's live probe (T754, Seven 09-28: raised from 30 s so
+# slow relay channels such as reverse-proxied "anti"/AG pools can answer).
+# httpx applies it per phase (connect/read/write/pool), not as a deadline for
+# the whole probe, and bounded compatibility retries may add attempts, so the
+# probe can take longer than this in total. The iOS requests that trigger the
+# probe must wait longer than this, or the app gives up first.
+SETUP_PROBE_TIMEOUT_S = 90.0
+
+
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
     # Validates that the key is usable for this model. We deliberately do NOT
     # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-
@@ -4916,7 +5551,7 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
         # since only some upstream channels behind a model id reject it), which read
         # to the user as "sometimes I can add this model, sometimes I can't".
         temperature=None,
-        timeout=30.0,
+        timeout=SETUP_PROBE_TIMEOUT_S,
         require_reply=False,
     )
 
@@ -4976,6 +5611,7 @@ async def _chat_completion_async_impl(
     assistant_prefill: str = "",
     _attempt_trace: list[dict[str, Any]] | None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -5009,7 +5645,11 @@ async def _chat_completion_async_impl(
     if (
         provider in {"openai", "openrouter", "openai_compatible"}
         and allow_image_output
-        and _model_has_native_image_output(provider, request_model)
+        and _image_output_wire_enabled(
+            provider,
+            request_model,
+            image_generation_probe=image_generation_probe,
+        )
     ):
         dedicated_may_fall_back = provider == "openai_compatible"
         payload = _build_openrouter_images_payload(
@@ -5265,6 +5905,7 @@ async def _chat_completion_async_impl(
             include_reasoning=include_reasoning,
             tools=tools,
             allow_image_output=allow_image_output,
+            image_generation_probe=image_generation_probe,
             tool_choice=tool_choice,
             assistant_prefill=effective_prefill,
         )
@@ -5395,6 +6036,7 @@ async def _chat_completion_async_impl(
         prompt_cache_key=config.prompt_cache_key,
         tool_choice=tool_choice,
         allow_image_output=allow_image_output,
+        image_generation_probe=image_generation_probe,
         assistant_prefill=effective_prefill,
     )
 
@@ -5478,6 +6120,7 @@ async def chat_completion_async(
     tools: "list[ToolSpec] | None" = None,
     tool_choice: str | dict[str, Any] | None = None,
     allow_image_output: bool = False,
+    image_generation_probe: bool = False,
     assistant_prefill: str = "",
 ) -> dict[str, Any]:
     """Native async completion, optionally retaining every HTTP attempt.
@@ -5504,6 +6147,7 @@ async def chat_completion_async(
             tools=tools,
             tool_choice=tool_choice,
             allow_image_output=allow_image_output,
+            image_generation_probe=image_generation_probe,
             assistant_prefill=assistant_prefill,
             _attempt_trace=attempt_trace,
         )
@@ -5525,9 +6169,14 @@ async def generate_image_async(
 ) -> dict[str, Any]:
     """Generate one image through a provider-neutral saved route.
 
-    Mainline OpenAI routes use the Responses hosted image tool; dedicated
-    OpenAI/OpenRouter/Gemini-compatible image models use their native image
-    wire. Text-only routes fail before a second paid provider request.
+    Mainline OpenAI routes use the Responses hosted image tool. On a relay
+    (``openai_compatible`` / ``openrouter``) the model id is an explicit image
+    declaration, so the call reaches the provider's dedicated images endpoint
+    regardless of name and is judged by the real response — the endpoint's 4xx
+    or empty media, not a local name guess (T535). On non-relay providers
+    (deepseek / gemini) an image marker in the id still admits the call and a
+    marker-less model fails locally. Either way, only non-empty media proves the
+    route supports image generation.
     """
     provider, model, _ = validate_config(
         config.provider,
@@ -5540,8 +6189,16 @@ async def generate_image_async(
     if len(normalized_prompt) > 16_000:
         raise ProviderError("image prompt too long")
 
-    supported = _model_has_native_image_output(provider, model) or (
-        provider == "openai" and _openai_uses_responses_for_reasoning(model)
+    # A dedicated generate-image call (setup probe or a resident's real
+    # generation) is an explicit image-model declaration, so a relay-style
+    # provider is admitted regardless of the model id (T535). The name marker
+    # still admits image models on non-relay providers (e.g. deepseek /
+    # gemini). A truly non-image model is caught downstream by the endpoint's
+    # 4xx or by producing no media — not by guessing from the name here.
+    supported = (
+        _model_name_has_image_output(model)
+        or _relay_serves_dedicated_image_endpoint(provider)
+        or (provider == "openai" and _openai_uses_responses_for_reasoning(model))
     )
     if not supported:
         exc = ProviderError("image_generation_model_unsupported")
@@ -5564,6 +6221,7 @@ async def generate_image_async(
         include_reasoning=False,
         tools=None,
         allow_image_output=True,
+        image_generation_probe=True,
     )
     if not isinstance(result.get("media"), list) or not result["media"]:
         exc = ProviderError("image_generation_invalid_output")
@@ -5615,17 +6273,49 @@ async def reliable_chat_completion_async(
     base_delay_sec: float = 1.0,
     max_delay_sec: float = 30.0,
     progress_cb: Any = None,
+    refusal_out: Any = None,
+    retry_refusal: bool = True,
     absolute_deadline: float | None = None,
+    retry_output_truncation: bool = True,
+    wire_deadline_sec: float | None = None,
     **kwargs: Any,
 ) -> Any:
     """`chat_completion_async` + bounded retry on *transient* failures only.
+
+    ``refusal_out`` observes explicit policy metadata on each outer attempt,
+    including a refused attempt followed by recovery. It never supplies retry
+    decisions; observer failures are swallowed and no raw policy text is passed.
+
+    ``retry_refusal=False`` lets Capture/Dream stop on the explicit structured
+    refusal metadata recognized by ``provider_refusal.project``. Both empty
+    refusals and refused responses carrying partial text raise on that attempt
+    with ``feedling_error_class == "content_filtered"``. Other callers retain
+    the default policy; this choice is independent of the observer callback.
 
     Same semantics as `reliable_chat_completion`: exponential backoff (base·3^n)
     + jitter, capped; honours 429 Retry-After when present. NEVER retries
     `provider_config` failures. On final failure the raised exception carries
     `.feedling_error_class` ("transient_exhausted" | "provider_config") so the
     caller can label the job/turn.
+
+    ``retry_output_truncation=False`` is for callers that own an output-budget
+    policy (background extraction): a required reply that came back empty with
+    a token-limit stop marker (``is_output_truncation_error``) is raised on the
+    first attempt with ``.feedling_error_class == "output_truncated"`` instead
+    of being retried as a transient shape error. Re-sending the same prompt at
+    the same budget to a thinking model reliably burns the budget again. The
+    default keeps every other caller's retry, classification and labels.
+
+    ``wire_deadline_sec`` caps the wall-clock of every single HTTP wire
+    (compatibility fallbacks included), unlike ``timeout`` which httpx applies
+    per phase. Expiry raises the same no-status ``ProviderError`` a wrapped
+    read timeout does, so retry and classification are unchanged. For callers
+    whose hosted watchdog stall budget must outlast one wire (Heavy pool).
     """
+    if wire_deadline_sec is not None:
+        wire_deadline_sec = float(wire_deadline_sec)
+        if not math.isfinite(wire_deadline_sec) or wire_deadline_sec <= 0:
+            raise ValueError("wire_deadline_sec must be finite and positive")
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
     config = args[0] if args and isinstance(args[0], ProviderConfig) else None
@@ -5655,6 +6345,31 @@ async def reliable_chat_completion_async(
         except Exception:  # noqa: BLE001
             pass
 
+    async def _with_wire_progress(awaitable: Any, attempt: int) -> Any:
+        # Every HTTP wire inside one attempt (compatibility fallbacks included)
+        # is a real progress boundary; report it through the same callback.
+        # Set and reset inside the awaiting task, so ``wait_for``'s child task
+        # and concurrent turns never see a stale callback or wire deadline.
+        if progress_cb is None and wire_deadline_sec is None:
+            return await awaitable
+        cb_token = (
+            _WIRE_START_CB.set(lambda _inner: _progress("wire_start", attempt))
+            if progress_cb is not None
+            else None
+        )
+        deadline_token = (
+            _WIRE_DEADLINE_SEC.set(wire_deadline_sec)
+            if wire_deadline_sec is not None
+            else None
+        )
+        try:
+            return await awaitable
+        finally:
+            if deadline_token is not None:
+                _WIRE_DEADLINE_SEC.reset(deadline_token)
+            if cb_token is not None:
+                _WIRE_START_CB.reset(cb_token)
+
     for attempt in range(1, attempts + 1):
         started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
@@ -5676,7 +6391,9 @@ async def reliable_chat_completion_async(
                 # detached zombie.
                 try:
                     result = await asyncio.wait_for(
-                        chat_completion_async(*args, **attempt_kwargs),
+                        _with_wire_progress(
+                            chat_completion_async(*args, **attempt_kwargs), attempt
+                        ),
                         timeout=remaining,
                     )
                 except asyncio.TimeoutError as timeout_exc:
@@ -5688,7 +6405,21 @@ async def reliable_chat_completion_async(
                         "provider absolute deadline exceeded"
                     ) from timeout_exc
             else:
-                result = await chat_completion_async(*args, **attempt_kwargs)
+                result = await _with_wire_progress(
+                    chat_completion_async(*args, **attempt_kwargs), attempt
+                )
+            refusal = provider_refusal.project(
+                result.get("provider_refusal") if isinstance(result, dict) else None
+            )
+            if not retry_refusal and refusal is not None:
+                # A partial refused answer is not a usable extraction result.
+                # Enter the same exception path as an empty parser refusal,
+                # retaining wire evidence and observing this attempt once.
+                exc = ProviderError("provider_refusal")
+                exc.provider_refusal = refusal
+                _attach_provider_attempt_trace(exc, _attempts_from_result(result))
+                raise exc
+            await provider_refusal.observe(refusal_out, result, attempt)
             _progress("attempt_complete", attempt)
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
@@ -5728,6 +6459,7 @@ async def reliable_chat_completion_async(
                 result = _with_provider_attempt_trace(result, provider_attempt_trace)
             return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
+            await provider_refusal.observe(refusal_out, exc, attempt)
             _progress("attempt_failed", attempt)
             cls = classify_provider_error(exc)
             last_exc = exc
@@ -5735,8 +6467,16 @@ async def reliable_chat_completion_async(
                 absolute_deadline is not None
                 and time.monotonic() >= float(absolute_deadline)
             )
+            truncation_terminal = (
+                not retry_output_truncation and is_output_truncation_error(exc)
+            )
+            refusal_terminal = not retry_refusal and provider_refusal.project(
+                getattr(exc, "provider_refusal", None)
+            ) is not None
             terminal = (
                 cls == "provider_config"
+                or truncation_terminal
+                or refusal_terminal
                 or attempt >= attempts
                 or deadline_exhausted
             )
@@ -5778,8 +6518,12 @@ async def reliable_chat_completion_async(
                 )
             if terminal:
                 exc.feedling_error_class = (
-                    "provider_config"
+                    "content_filtered"
+                    if refusal_terminal
+                    else "provider_config"
                     if cls == "provider_config"
+                    else "output_truncated"
+                    if truncation_terminal
                     else "transient_exhausted"
                 )
                 if provider_attempt_trace is not None:

@@ -592,7 +592,7 @@ async def cancel_voice_call(
                 "replayed": True, "deleted": 0,
                 "retained_covered": 0, "remaining": 0,
             }, 200
-        store = core_store.get_store_shell_only(
+        store = core_store.get_store_per_load_mode(
             user_id,
             reason="voice archive/card writes are cold-safe before cleanup refresh",
         )

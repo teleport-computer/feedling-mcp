@@ -162,71 +162,35 @@ def test_memory_add_route_normalizes_supplied_timestamp(monkeypatch):
     assert body["error"].startswith("occurred_at required")
 
 
-def test_memory_add_truncation_emits_content_free_counts_without_behavior_change(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_v1_truncation")
+def test_memory_add_oversize_returns_content_free_error(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1_oversize")
     saved = _install_memory_action_fakes(monkeypatch, [])
-    events = []
-    monkeypatch.setattr(
-        memory_actions.debug_trace,
-        "trace_event",
-        lambda _store, **event: events.append(event),
-    )
-    secret = "T074_SECRET_MUST_NOT_REACH_TRACE"
+    secret = "SECRET_MUST_NOT_REACH_RECEIPT"
     raw_content = ("x" * 5001) + secret
-
     body, status = memory_actions._execute_memory_actions(store, "api_key", [{
         "type": "memory.add",
-        "memory": {
-            "summary": "Long card",
-            "content": raw_content,
-            "source": "chat",
-        },
+        "memory": {"summary": "Long card", "content": raw_content, "source": "chat"},
     }])
-
-    assert status == 200
-    assert body["status"] == "ok"
-    stored = json.loads(saved[0]["body_ct"])["content"]
-    assert stored == raw_content[:5000]
-    assert events == [{
-        "subsystem": "memory",
-        "type": "memory.content.truncation",
-        "actor": "backend",
-        "status": "warning",
-        "summary": "",
-        "explain": "",
-        "detail": {
-            "route": "memory_actions",
-            "counts": {
-                "original_chars": len(raw_content),
-                "truncated_chars": len(raw_content) - 5000,
-            },
-        },
-    }]
-    assert secret not in json.dumps(events, ensure_ascii=False)
+    assert status == 400
+    assert body["error"] == "memory_content_too_long"
+    assert body["detail"] == {"actual_chars": len(raw_content), "max_chars": 5000}
+    assert saved == []
+    assert secret not in json.dumps(body)
 
 
-def test_memory_add_truncation_trace_failure_does_not_block_write(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_v1_trace_failure")
+def test_rejection_trace_failure_does_not_mask_the_write_error(monkeypatch):
     saved = _install_memory_action_fakes(monkeypatch, [])
-
     def fail_trace(*_args, **_kwargs):
-        raise RuntimeError("trace backend unavailable")
-
+        raise RuntimeError("trace unavailable")
     monkeypatch.setattr(memory_actions.debug_trace, "trace_event", fail_trace)
-    raw_content = "x" * 5017
-
-    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
-        "type": "memory.add",
-        "memory": {
-            "summary": "Long card",
-            "content": raw_content,
-            "source": "chat",
-        },
-    }])
-
-    assert status == 200
-    assert body["status"] == "ok"
-    assert json.loads(saved[0]["body_ct"])["content"] == raw_content[:5000]
+    body, status = memory_actions._execute_memory_actions(
+        types.SimpleNamespace(user_id="usr_rejection_trace"), None,
+        [{"type": "memory.add", "memory": {
+            "summary": "Long card", "content": "x" * 5001, "source": "chat",
+        }}],
+    )
+    assert status == 400 and body["error"] == "memory_content_too_long"
+    assert saved == []
 
 
 def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
@@ -512,7 +476,7 @@ def test_memory_add_always_creates_duplicate_without_decrypting_existing_cards(m
 
     decrypt_calls = []
 
-    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+    def fail_if_decrypted(_user_id, moment, _api_key, runtime_token=""):
         decrypt_calls.append((moment["id"], runtime_token))
         raise AssertionError("memory.add must not decrypt existing cards")
 
@@ -556,7 +520,7 @@ def test_memory_add_prebuilt_envelope_does_not_decrypt_for_duplicate_scan(monkey
     saved = _install_memory_action_fakes(monkeypatch, moments)
     decrypt_calls = []
 
-    def fail_if_decrypted(moment, _api_key, runtime_token=""):
+    def fail_if_decrypted(_user_id, moment, _api_key, runtime_token=""):
         decrypt_calls.append((moment["id"], runtime_token))
         raise AssertionError("prebuilt memory.add must not decrypt for duplicate scan")
 
@@ -712,7 +676,7 @@ def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypa
     saved = _install_memory_action_fakes(monkeypatch, moments)
     decrypt_tokens = []
 
-    def fake_plain(moment, _api_key, runtime_token=""):
+    def fake_plain(_user_id, moment, _api_key, runtime_token=""):
         decrypt_tokens.append(runtime_token)
         return json.loads(moment["body_ct"]), ""
 

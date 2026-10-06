@@ -33,7 +33,9 @@ from db import get_pool  # noqa: E402
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, request):
+    if getattr(request, "param", "rds") == "tee":
+        request.getfixturevalue("tee_primary")
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     registry._users[:] = []
     registry._key_to_user.clear()
@@ -111,6 +113,7 @@ def test_recover_challenge_unknown_pubkey_returns_404(client):
     assert res.status_code == 404
 
 
+@pytest.mark.parametrize("client", ["rds", "tee"], indirect=True)
 def test_recover_full_flow_issues_working_key_for_same_user(client):
     priv, pub_bytes, pub_b64 = _new_keypair()
     user_id, _original_key = _register_with_pubkey(client, pub_b64)

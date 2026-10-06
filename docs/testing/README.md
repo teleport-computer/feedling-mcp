@@ -99,7 +99,7 @@ python3 tools/e2e/p0.py --only anthropic-official,openai-official
 ```sh
 # 真实形态:起一个本地 consumer,走完整回合
 python3 tools/e2e/p0.py --only vps-claude-code
-#   还可以 --only vps-codex / vps-hermes(取决于本机装了哪个 CLI)
+#   还可以 --only vps-codex；Hermes 已免发版 P0（Seven 2026-09-06 定）
 
 # 消费端的守卫测试
 python3 -m pytest -q tests/test_chat_resident_consumer*.py tests/test_consumer_*.py
@@ -128,7 +128,7 @@ Hosted Resident 还要覆盖 supervisor→consumer 接线与 self-update 契约�
 **一条命令,所有格子,一张结果表:**
 
 ```sh
-python3 tools/e2e/p0.py            # 7 个托管 provider + 3 种 VPS 形态
+python3 tools/e2e/p0.py            # 配置中的托管 provider + 2 种 VPS 形态
 python3 tools/e2e/p0.py --list     # 先看有哪些格子、key 齐不齐
 ```
 
@@ -158,6 +158,8 @@ python3 tools/e2e/p0.py --list     # 先看有哪些格子、key 齐不齐
 | `TESTING.md` | **规范**:26 类改动各自要做什么 + 约 80 条通用坑 | 改完代码不确定要测什么时 |
 | `RELEASE_TESTING_PROTOCOL.md` | **规范**:发版分层框架 + 能力矩阵 | 要推生产时 |
 | `CHAT_ACTIVITY_V2_MANUAL.md` | 手工用例:聊天活动轨迹 | 动了 turn-activity 时 |
+| [SELF_THINKING_LANGUAGE_EVAL.md](SELF_THINKING_LANGUAGE_EVAL.md) | 双语 self-thinking 提示词评测方法与执行门禁 | 准备或解读该专题评测时 |
+| [TCP_CONNECT_MONITOR.md](TCP_CONNECT_MONITOR.md) | 独立 TCP 连接观测、读数与首周核验 | 排查连接问题或汇总监控证据时 |
 | `archive/` | 历史报告与模板,**不是规范** | 想看某次是怎么查的 |
 
 ## 跑 E2E 之前:先确认你不会撞上部署重启

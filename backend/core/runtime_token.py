@@ -61,19 +61,31 @@ def mint(
     return f"{payload_b64}.{_sign(secret, payload_b64)}"
 
 
-def verify(secret: bytes, token: str, *, now: float | None = None) -> dict:
-    """Verify signature + expiry; return claims or raise ``TokenError``."""
+def decode_claims(secret: bytes, token: str) -> dict:
+    """Read signature-verified claims without checking expiry. Not authentication."""
     try:
         payload_b64, sig = token.split(".", 1)
     except ValueError as e:
         raise TokenError("malformed_token") from e
-    expected = _sign(secret, payload_b64)
-    if not hmac.compare_digest(expected, sig):
+    try:
+        expected = _sign(secret, payload_b64)
+        matches = hmac.compare_digest(expected, sig)
+    except (UnicodeError, TypeError) as e:
+        raise TokenError("malformed_token") from e
+    if not matches:
         raise TokenError("bad_signature")
     try:
         claims = json.loads(_b64d(payload_b64))
     except Exception as e:  # noqa: BLE001
         raise TokenError("bad_payload") from e
+    if not isinstance(claims, dict):
+        raise TokenError("bad_payload")
+    return claims
+
+
+def verify(secret: bytes, token: str, *, now: float | None = None) -> dict:
+    """Verify signature + expiry; return claims or raise ``TokenError``."""
+    claims = decode_claims(secret, token)
     clock = time.time() if now is None else now
     if clock >= float(claims.get("exp") or 0):
         raise TokenError("token_expired")

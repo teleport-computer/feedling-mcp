@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_current (
   expires_at            TIMESTAMPTZ,
   source_observation_id TEXT,
   source_revision       TEXT,
+  -- 🔴 这条当前值来自**上游的哪条事实**。撤回按 (source, source_event_id)
+  -- 精确匹配找它 —— 少了这两列，撤回记下来了、当前值却一条都重选不了，
+  -- 而且不报错。迁移 0108 给已有库补了这两列；新建的库走的是这份 DDL，
+  -- 两边必须一致。
+  source                TEXT,
+  source_event_id       TEXT,
   version               INT         NOT NULL DEFAULT 0,
   content_digest        TEXT,
   PRIMARY KEY (subject_id, signal, dimension_key)
@@ -126,7 +132,12 @@ CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
   next_attempt_at    TIMESTAMPTZ,
   claim_token        TEXT,
   claimed_by         TEXT,
-  claim_expires_at   TIMESTAMPTZ
+  claim_expires_at   TIMESTAMPTZ,
+  -- 这条事件是被哪条源事实触发的。用户删掉那条数据时，靠它找到这条记录、
+  -- 把快照里的原值抹掉（只留"有过一条已被删除的数据触发过"）。
+  -- 可空：这之前落库的事件没有这个信息，编一个比留空更坏。
+  source             TEXT,
+  source_event_id    TEXT
 );
 
 -- How a worker picks up work: by state and due time. Ordering within one
@@ -134,6 +145,11 @@ CREATE TABLE IF NOT EXISTS perceptkit_event_outbox (
 CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_claimable
   ON perceptkit_event_outbox (delivery_state, next_attempt_at)
   WHERE delivery_state IN ('pending', 'claimed');
+
+-- 抹值是按 (人, 信号, 来源, 样本id) 找行；没有这个索引就是全表扫，
+-- 而撤回发生在用户点"删除"的那一刻，是同步路径。
+CREATE INDEX IF NOT EXISTS perceptkit_event_outbox_source
+  ON perceptkit_event_outbox (subject_id, source, source_event_id);
 
 CREATE TABLE IF NOT EXISTS perceptkit_wake_receipt (
   event_id    TEXT        NOT NULL,
@@ -145,8 +161,14 @@ CREATE TABLE IF NOT EXISTS perceptkit_wake_receipt (
   PRIMARY KEY (event_id, attempt_id)
 );
 
+-- `source` is part of the identity, not a label. Without it a full sync
+-- declaring source='ios' deletes rows that belong to Google: the snapshot
+-- step removes "everything in coverage this round did not mention", and
+-- another source's rows were of course not in this round. The user finds
+-- their other calendar account emptied, irreversibly.
 CREATE TABLE IF NOT EXISTS perceptkit_calendar_mirror (
   subject_id          TEXT        NOT NULL,
+  source              TEXT        NOT NULL,
   source_account_id   TEXT        NOT NULL,
   source_calendar_id  TEXT        NOT NULL,
   source_event_id     TEXT        NOT NULL,
@@ -157,11 +179,14 @@ CREATE TABLE IF NOT EXISTS perceptkit_calendar_mirror (
   source_updated_at   TIMESTAMPTZ,
   last_seen_sync_id   TEXT,
   updated_at          TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, source_account_id, source_calendar_id, source_event_id)
+  PRIMARY KEY (subject_id, source, source_account_id, source_calendar_id,
+               source_event_id)
 );
 
+-- `source` in the key for the same reason as the calendar mirror above.
 CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
   subject_id         TEXT        NOT NULL,
+  source             TEXT        NOT NULL,
   source_account_id  TEXT        NOT NULL,
   source_list_id     TEXT        NOT NULL,
   source_reminder_id TEXT        NOT NULL,
@@ -171,18 +196,45 @@ CREATE TABLE IF NOT EXISTS perceptkit_reminder_mirror (
   source_updated_at  TIMESTAMPTZ,
   last_seen_sync_id  TEXT,
   updated_at         TIMESTAMPTZ,
-  PRIMARY KEY (subject_id, source_account_id, source_list_id, source_reminder_id)
+  PRIMARY KEY (subject_id, source, source_account_id, source_list_id,
+               source_reminder_id)
+);
+
+-- Column names track `SourceSyncState` exactly. They drifted once: the table
+-- said `last_sync_id`/`cursor` while the record said `sync_cursor`, and the
+-- reader passed a keyword the record does not have -- so every read raised.
+-- Nothing called it, so nothing noticed until the sync entry landed.
+--
+-- The failure columns are not optional bookkeeping. Without `last_error_code`
+-- and `last_attempted_at` a failed sync is indistinguishable from one that
+-- never ran, and "the calendar has been failing for three days" cannot be
+-- answered at all.
+-- Facts the source withdrew. Append-only: the observation stays so "why is
+-- there a gap on that day" remains answerable; this table is what keeps the
+-- withdrawn value out of the current projection and the day's aggregate.
+--
+-- `source` is in the key because two sources routinely reuse a
+-- source_event_id, and they are different facts.
+CREATE TABLE IF NOT EXISTS perceptkit_retraction (
+  subject_id      TEXT        NOT NULL,
+  signal          TEXT        NOT NULL,
+  source          TEXT        NOT NULL,
+  source_event_id TEXT        NOT NULL,
+  observed_at     TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (subject_id, signal, source, source_event_id)
 );
 
 CREATE TABLE IF NOT EXISTS perceptkit_sync_state (
-  subject_id             TEXT        NOT NULL,
-  source                 TEXT        NOT NULL,
-  collection_kind        TEXT        NOT NULL,
-  last_sync_id           TEXT,
+  subject_id              TEXT        NOT NULL,
+  source                  TEXT        NOT NULL,
+  collection_kind         TEXT        NOT NULL,
+  sync_cursor             TEXT,
+  coverage_start          TIMESTAMPTZ,
+  coverage_end            TIMESTAMPTZ,
+  snapshot_kind           TEXT,
+  last_attempted_at       TIMESTAMPTZ,
   last_successful_sync_at TIMESTAMPTZ,
-  coverage_start         TIMESTAMPTZ,
-  coverage_end           TIMESTAMPTZ,
-  cursor                 TEXT,
+  last_error_code         TEXT,
   PRIMARY KEY (subject_id, source, collection_kind)
 );
 
@@ -207,6 +259,25 @@ CREATE TABLE IF NOT EXISTS perceptkit_shadow_divergence (
   last_kit       TEXT,
   last_report_id TEXT,
   note           TEXT,
+  -- How far apart the two sides' readings were taken, seconds, for the most
+  -- recent occurrence; and the running max.
+  --
+  -- Without this a `differ` row is unreadable: two paths hold different
+  -- values either because one read the sensor later than the other, or
+  -- because one is wrong -- and the values alone cannot separate those. The
+  -- first is expected on anything that changes by the second; only the
+  -- second is worth acting on. 0.09% of prod comparisons came back `differ`
+  -- with no way to tell which, and that is what blocks retiring the live path.
+  last_skew_sec  DOUBLE PRECISION,
+  max_skew_sec   DOUBLE PRECISION,
+  -- 🔴 两边**各自的**取值时刻，不只是它们的差。
+  --
+  -- 差值回答了「谁读得晚多久」，但丢了两件事：谁更晚（skew 取了绝对值），
+  -- 以及绝对时间（没法和别的东西对时间线）。外部复核要的就是这两格 ——
+  -- 「取值时刻不同」和「其中一条路算错了」，光看值和次数分不开，
+  -- 而分不开就不能下线老路。
+  last_live_at   TIMESTAMPTZ,
+  last_kit_at    TIMESTAMPTZ,
   PRIMARY KEY (subject_id, signal, field, verdict)
 );
 """

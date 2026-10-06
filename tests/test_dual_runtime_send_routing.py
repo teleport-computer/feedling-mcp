@@ -64,6 +64,27 @@ def _fake_envelope(monkeypatch) -> None:
     )
 
 
+def _fail_only_caption_envelope(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def _build(_store, _plaintext, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            return None, "enclave_info_unavailable"
+        return {
+            "id": "u-msg-caption-failure",
+            "body_ct": "c",
+            "nonce": "n",
+            "K_user": "k",
+        }, ""
+
+    monkeypatch.setattr(
+        chat_send_core.core_envelope,
+        "_build_shared_envelope_for_store",
+        _build,
+    )
+
+
 def _pin_tuple(monkeypatch, mode: str, state: str, generation: int = 7) -> None:
     monkeypatch.setattr(
         hosted_config_store, "get_hosted_runtime_control_strict",
@@ -182,6 +203,82 @@ def test_dual_resident_tuple_with_live_supervisor_routes_to_resident(monkeypatch
     assert body["status"] == "processing"
     # handle_send is the resident-only tail — proves resident routing, not V2.
     assert called["driver"] == "claude"
+
+
+def test_dual_resident_caption_failure_emits_turn_correlated_signals(
+    monkeypatch,
+    capsys,
+):
+    uid = "u_dr_resident_caption_failure"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    traces: list[dict] = []
+    monkeypatch.setenv(POLICY_ENV, "dual")
+    _pin_tuple(monkeypatch, RESIDENT, "resident")
+    _fail_only_caption_envelope(monkeypatch)
+    monkeypatch.setattr(
+        chat_send_core.debug_trace,
+        "trace_event",
+        lambda _store, **event: traces.append(event),
+    )
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *a, **k: types.SimpleNamespace(provider="anthropic"),
+    )
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_ensure_model_api_runtime_profile",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        chat_send_core.agent_runtime_cutover,
+        "check_supervisor_live",
+        lambda **kw: (True, ""),
+    )
+    monkeypatch.setattr(
+        chat_send_core.agent_runtime_cutover,
+        "handle_send",
+        lambda _store, row, driver: (
+            {"status": "processing", "user_message": row},
+            202,
+        ),
+    )
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store,
+        api_key="key",
+        runtime_tok="",
+        payload={
+            "message": "resident caption",
+            "image_b64": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode(),
+            "image_mime": "image/png",
+        },
+    )
+
+    assert status == 202
+    turn_id = body["user_message"]["id"]
+    failure_traces = [
+        item for item in traces
+        if item.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_EVENT
+    ]
+    failure_logs = [
+        item for item in db.log_read(uid, "tracking_events", limit=50)
+        if item.get("type") == chat_send_core._CAPTION_ENVELOPE_FAILURE_LOG_TYPE
+    ]
+    assert len(failure_traces) == 1
+    assert len(failure_logs) == 1
+    event = failure_traces[0]
+    tracking = failure_logs[0]
+    assert event["type"] == "chat.caption_envelope_failed"
+    assert event["turn_id"] == event["trace_id"] == turn_id
+    assert event["job_id"] == ""
+    assert tracking["payload"]["turn_id"] == turn_id
+    assert tracking["payload"]["job_id"] == ""
+    assert tracking["type"] == "caption_envelope_failed"
+    stderr = capsys.readouterr().err
+    assert f"turn_id={turn_id}" in stderr
+    assert "job_id=-" in stderr
 
 
 @pytest.mark.parametrize("idempotent_send", [False, True])

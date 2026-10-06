@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -104,6 +107,52 @@ def _wake_job_id(job: dict) -> str:
     return str(job.get("id") or job.get("job_id") or "").strip()
 
 
+# The admin wake-activity surface carries a failure ``reason`` / silence
+# ``reason`` that is a best-effort ``last_error`` marker. ``last_error`` MAY
+# embed a relay's raw error body (quota figures, request fragments) — it is only
+# length-truncated server-side, never reduced to a controlled enum. Echoing it
+# into an E2E failure string would leak that content, so we map it through a
+# closed set of known content-free codes and redact anything else. Over-redacting
+# (an unlisted-but-harmless code becomes "redacted") is the safe direction.
+_SAFE_WAKE_REASON_CODES = frozenset({
+    # agent_jobs status values
+    "failed", "expired", "completed", "pending",
+    # wake_failed:* suppression / integrity codes (pure enums, no interpolation)
+    "wake_failed:choice_invalid",
+    "wake_failed:explicit_silence_suppressed",
+    "wake_failed:degenerate_reply_suppressed",
+    "wake_failed:protocol_fragment_suppressed",
+    "wake_failed:malformed_self_thinking_suppressed",
+    "wake_failed:empty_reply",
+    "wake_failed:v2_summary_frontier_integrity_error",
+    "wake_failed:v2_summary_frontier_exhausted",
+    # lifecycle terminal codes
+    "stale_runtime_generation",
+    "foreground_chat_preempted",
+    "review_runner_failed",
+    "thinking_only_no_reply",
+    # silence reasons
+    "explicit_silence_suppressed",
+    "sleep",
+    "stale_wake_expired",
+    "agent_greeted",
+})
+
+
+def _sanitize_wake_reason(raw: object) -> str:
+    """Reduce a wake failure/silence reason to a content-free code.
+
+    Exact match against the closed set passes through; everything else — a
+    ``providererror`` with an appended raw body, an exception-derived code, any
+    free text — collapses to ``"redacted"``. This NEVER emits an unlisted reason
+    verbatim, so the probe's failure strings stay content-free.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "unspecified"
+    return text if text in _SAFE_WAKE_REASON_CODES else "redacted"
+
+
 def _wake_terminal_state(user: dict, job_id: str) -> tuple[str, str]:
     """Classify one exact V2 wake without treating silence as disappearance."""
     recent = user.get("v2_recent_jobs")
@@ -119,7 +168,7 @@ def _wake_terminal_state(user: dict, job_id: str) -> tuple[str, str]:
         if isinstance(row, dict) and str(row.get("job_id") or "") == wanted
     ]
     if silences:
-        return "silent", str(silences[0].get("reason") or "explicit sleep")
+        return "silent", _sanitize_wake_reason(silences[0].get("reason") or "explicit sleep")
 
     failures = [
         row for row in (activity.get("recent_failures") or [])
@@ -127,7 +176,7 @@ def _wake_terminal_state(user: dict, job_id: str) -> tuple[str, str]:
     ]
     if failures:
         row = failures[0]
-        return "failed", str(row.get("reason") or row.get("status") or "failed")
+        return "failed", _sanitize_wake_reason(row.get("reason") or row.get("status") or "failed")
 
     jobs = [
         row for row in (recent.get("jobs") or [])
@@ -220,29 +269,104 @@ def _wait_out_chat_collision(c, *, window: float | None = None) -> float:
     return wait
 
 
-def _wait_for_proactive_reply(
-    c,
-    proactive_job_id: str,
-    since: float,
-    *,
-    timeout: float | None = None,
-) -> dict:
-    """Wait for the exact legacy/resident proactive job's published reply."""
+def _wait_for_scheduled_fire(c, timer_id: str, *, timeout: float | None = None) -> int:
+    """Wait for the REAL V2 scheduler to fire a due self-wake timer; return the
+    exact ``agent_jobs`` id it enqueued.
+
+    The probe must NOT drive the compatibility ``/v1/proactive/scheduled/fire``
+    endpoint: ``proactive_core.scheduled_fire`` only appends a legacy
+    ``proactive_jobs`` row (``queued_as_compat_job``) that no V2 consumer drains,
+    and it marks the timer ``fired`` so the real scheduler then skips it. The real
+    path is ``serve_worker._fire_scheduled_for_user``, which enqueues a
+    ``scheduled``-lane ``agent_job`` via ``jobs_store.enqueue_job`` and records its
+    bigint id as the timer's ``fired_job_id``. We schedule a due timer and poll
+    ``/v1/proactive/debug`` until that real scheduler attaches ``fired_job_id`` —
+    the exact id the terminal lookup and the reply correlation both key on.
+    """
     budget = _MODEL_TIMEOUT if timeout is None else max(0.0, float(timeout))
     deadline = time.time() + budget
+    wanted = str(timer_id)
     while time.time() < deadline:
-        rows = _history(c, since)
-        replies = [
-            row for row in rows
-            if str(row.get("role") or "") in _AGENT_ROLES
-            and str(row.get("proactive_job_id") or "") == proactive_job_id
-        ]
-        if replies:
-            return min(replies, key=_message_ts)
+        snapshot = _body(
+            c.get("/v1/proactive/debug"),
+            expected=(200,),
+            action="read scheduled-wake debug",
+        )
+        best = 0
+        for row in (snapshot.get("v2_scheduled_wakes") or []):
+            if not isinstance(row, dict) or str(row.get("timer_id") or "") != wanted:
+                continue
+            if str(row.get("status") or "") != "fired":
+                continue
+            try:
+                fired_job_id = int(row.get("fired_job_id") or 0)
+            except (TypeError, ValueError):
+                fired_job_id = 0
+            if fired_job_id > 0:
+                best = max(best, fired_job_id)
+        if best > 0:
+            return best
         time.sleep(2)
     raise _ProbeIssue(
         "PRODUCT_FAIL",
-        f"scheduled job={proactive_job_id} produced no correlated must-deliver reply "
+        f"the V2 scheduler did not fire due timer={wanted} within {budget:.0f}s "
+        f"(no scheduled agent_job id attached — the compat fire path enqueues a "
+        f"legacy job the V2 runtime never drains)",
+    )
+
+
+def _wait_for_scheduled_delivery(
+    c, since: float, fired_job_id: int, *, timeout: float | None = None,
+) -> dict:
+    """Require the EXACT scheduled agent_job to deliver a reply.
+
+    A delivered wake reply carries ``activity_job_id`` equal to its ``agent_jobs``
+    id (``worker._activity_extra`` always emits it; the serve-worker sink persists
+    it onto the chat row). We accept ONLY a reply whose ``activity_job_id`` matches
+    this exact scheduled job — a concurrent heartbeat/manual wake's bubble must
+    never let a scheduled must-deliver pass green while its own job failed. A
+    backend terminal failure/silence for the exact job is surfaced (content-free
+    via the closed-set sanitizer) rather than waited out. ``scheduled`` is a
+    must-deliver lane, so even a legal-sleep silence is a contract violation.
+    """
+    budget = _MODEL_TIMEOUT if timeout is None else max(0.0, float(timeout))
+    deadline = time.time() + budget
+    wanted = str(fired_job_id)
+    terminal_state, terminal_detail = "pending", "job not visible yet"
+    while time.time() < deadline:
+        rows = _history(c, since)
+        exact = [
+            row for row in rows
+            if str(row.get("role") or "") in _AGENT_ROLES
+            and str(row.get("activity_job_id") or "") == wanted
+        ]
+        if exact:
+            return min(exact, key=_message_ts)
+        terminal_state, terminal_detail = _wake_terminal_state(_admin_user(c), wanted)
+        if terminal_state == "failed":
+            raise _ProbeIssue(
+                "PRODUCT_FAIL",
+                f"scheduled must-deliver: wake job={wanted} failed ({terminal_detail})",
+            )
+        if terminal_state == "silent":
+            raise _ProbeIssue(
+                "PRODUCT_FAIL",
+                f"scheduled must-deliver: wake job={wanted} produced no text "
+                f"(silent: {terminal_detail}) — scheduled must deliver",
+            )
+        if terminal_state == "unavailable":
+            raise _ProbeIssue(
+                "BLOCKED_EVIDENCE", f"scheduled must-deliver: {terminal_detail}")
+        time.sleep(2)
+    if terminal_state == "completed_without_output":
+        raise _ProbeIssue(
+            "PRODUCT_FAIL",
+            f"scheduled must-deliver: wake job={wanted} completed without a "
+            f"correlated reply",
+        )
+    raise _ProbeIssue(
+        "PRODUCT_FAIL",
+        f"scheduled must-deliver: wake job={wanted} produced no correlated reply "
         f"within {budget:.0f}s",
     )
 
@@ -349,23 +473,37 @@ def _install_quality_identity(c) -> None:
         "tone_style": "简体中文，克制、具体，不写模板式客服话术。",
         "custom_persona_prompt": (
             "主动开口时称呼用户七七，并自然包含短语‘此刻陪你’；"
-            "用一到两句简体中文，提到当前采用上海时区，不提模型、供应商或系统。"
+            "用一到两句简体中文，按当前本地时间自然提到星期几和时段，不提模型、供应商或系统。"
         ),
         "signature": ["此刻陪你"],
         "dimensions": [{"name": "温和", "value": 82, "description": "具体而不打扰"}],
     }, action="proactive quality")
 
 
-def _admin_user(c) -> dict:
+def _require_admin_token() -> str:
     token = os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
     if not token:
         raise _ProbeIssue("BLOCKED_CREDENTIAL", "FEEDLING_ADMIN_TOKEN is unavailable")
-    response = httpx.get(
-        f"{c.api_url}/v1/admin/data-track/users/{c.user_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=30,
-        verify=False,
-    )
+    return token
+
+
+def _admin_user(c) -> dict:
+    token = _require_admin_token()
+    try:
+        response = httpx.get(
+            f"{c.api_url}/v1/admin/data-track/users/{c.user_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+            verify=False,
+        )
+    except httpx.HTTPError as exc:
+        # A transport failure reading the admin surface is a gap in the evidence,
+        # never a product verdict — classify it instead of letting the raw
+        # httpx error escape and be miscounted as an AGENT_ERROR on the case.
+        raise _ProbeIssue(
+            "BLOCKED_EVIDENCE",
+            f"admin data-track transport failed ({type(exc).__name__})",
+        ) from exc
     body = _body(response, expected=(200,), action="admin data-track user")
     user = body.get("user")
     if not isinstance(user, dict):
@@ -374,6 +512,10 @@ def _admin_user(c) -> dict:
 
 
 def _case_user_turn_priority(c) -> str:
+    # _wait_for_wake_delivery reads the admin surface when no bubble arrives.
+    # Check the token BEFORE enqueuing: blocking mid-wait leaves this manual_wake
+    # in flight and a later case (wake_coalescing) folds into it — T751/T774.
+    _require_admin_token()
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
     collision_wait = _wait_out_chat_collision(c)
@@ -445,13 +587,91 @@ def _case_user_turn_priority(c) -> str:
     )
 
 
+def _server_response_time(response) -> float:
+    """Use the enqueue response's server clock, never the probe host's clock."""
+    try:
+        value = parsedate_to_datetime(response.headers.get("date", ""))
+        if value.tzinfo is None:
+            raise ValueError("missing timezone")
+        return value.timestamp()
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise _ProbeIssue("BLOCKED_EVIDENCE", "quality wake omitted a valid server Date") from exc
+
+
+#: What may follow 「周X早」 for it to read as the greeting itself: end of text,
+#: whitespace or punctuation. A positive list, so no new compound can slip in.
+_WEEKDAY_EARLY_END = r"早(?=$|[\s，,。.！!？?、；;：:…~～—\-])"
+
+
+def _assert_timezone_grounding(text: str, server_started: float, server_finished: float) -> str:
+    """Check a weekday/day-period pair in Shanghai during the measured wake.
+
+    Date has one-second precision; history ts is server-owned. Include both
+    ends of the generation interval so a midnight/period boundary is not a
+    false failure. This is a Chinese lexical check, not a semantic evaluator.
+    Missing clock evidence must not fall back to the machine running the probe.
+    """
+    if (not math.isfinite(server_started) or not math.isfinite(server_finished)
+            or server_started <= 0 or server_finished <= 0
+            or not 0 <= server_finished - server_started <= _MODEL_TIMEOUT + 5):
+        raise _ProbeIssue("BLOCKED_EVIDENCE", "invalid server time interval for quality wake")
+    zone = ZoneInfo("Asia/Shanghai")
+    try:
+        start = datetime.fromtimestamp(server_started - 1, timezone.utc).astimezone(zone)
+        end = datetime.fromtimestamp(server_finished, timezone.utc).astimezone(zone)
+    except (ValueError, OverflowError, OSError) as exc:
+        raise _ProbeIssue("BLOCKED_EVIDENCE", "server time outside supported date range") from exc
+    # Enumerate hours because all vocabulary boundaries fall on whole hours.
+    cursor = start.replace(minute=0, second=0, microsecond=0)
+    while cursor <= end:
+        day = "一二三四五六日"[cursor.weekday()]
+        weekdays = (f"周{day}", f"星期{day}", f"礼拜{day}")
+        if cursor.weekday() == 6:
+            weekdays += ("周天", "星期天", "礼拜天")
+        hour = cursor.hour
+        periods = (
+            ("凌晨", "深夜", "夜里") if hour < 6
+            else ("上午", "早上", "早晨", "清晨") if hour < 12
+            else ("中午", "午间") if hour < 14
+            else ("下午", "午后") if hour < 18
+            else ("晚上", "晚间", "夜晚", "夜里")
+        )
+        # Natural day-period words overlap the canonical prompt labels.
+        # Keep these overlaps hour-bounded, with the same weekday as above.
+        if 5 <= hour < 12:
+            periods += ("清早", "一早", "大早")
+        if hour in (17, 18):
+            periods += ("傍晚",)
+        if hour >= 18:
+            periods += ("今晚", "今夜")
+        if hour >= 22 or hour < 6:
+            periods += ("深夜", "半夜")
+        if hour == 23 or hour < 6:
+            periods += ("午夜",)
+        # A bare 「早」 glued to the weekday and ending the phrase (「周日早，……」)
+        # is a morning greeting. It must be followed by the end, whitespace or
+        # punctuation: 早退/早餐/早起/早就/早点 are words, not a period — T774.
+        weekday_early = 5 <= hour < 12 and any(
+            re.search(re.escape(w) + _WEEKDAY_EARLY_END, text) for w in weekdays)
+        if any(word in text for word in weekdays) and (
+                weekday_early or any(word in text for word in periods)):
+            return f"Asia/Shanghai server_interval={start.isoformat()}..{end.isoformat()}"
+        cursor += timedelta(hours=1)
+    raise _ProbeIssue("PRODUCT_FAIL", f"timezone weekday/day-period mismatch; head={text[:160]!r}")
+
+
 def _case_proactive_message_quality(c) -> str:
+    # _wait_for_wake_delivery reads the admin surface when no bubble arrives.
+    # Check the token BEFORE enqueuing: blocking mid-wait leaves this manual_wake
+    # in flight and a later case (wake_coalescing) folds into it — T751/T774.
+    _require_admin_token()
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "Asia/Shanghai", "ambient": True})
     collision_wait = _wait_out_chat_collision(c)
     started = time.time()
+    response = c.post("/v1/proactive/tick", json={"force": True})
     wake = _body(
-        c.post("/v1/proactive/tick", json={"force": True}),
+        response,
         expected=(200,),
         action="enqueue quality wake",
     )
@@ -459,6 +679,7 @@ def _case_proactive_message_quality(c) -> str:
     job_id = _wake_job_id(job) if isinstance(job, dict) else ""
     if not job_id or job.get("lane") != "manual_wake":
         raise _ProbeIssue("PRODUCT_FAIL", f"quality wake was not enqueued: {wake}")
+    server_started = _server_response_time(response)
     reply = _wait_for_wake_delivery(
         c,
         started,
@@ -469,8 +690,7 @@ def _case_proactive_message_quality(c) -> str:
     required = [value for value in ("七七", "此刻陪你") if value not in text]
     if required:
         raise _ProbeIssue("PRODUCT_FAIL", f"persona/language markers missing: {required}; head={text[:160]!r}")
-    if not any(marker in text for marker in ("上海", "北京时间", "东八区")):
-        raise _ProbeIssue("PRODUCT_FAIL", f"timezone grounding missing; head={text[:160]!r}")
+    grounding = _assert_timezone_grounding(text, server_started, _message_ts(reply))
     forbidden = [
         marker for marker in ("Anthropic", "OpenAI", "OpenRouter", "Gemini", "DeepSeek", "系统提示")
         if marker.lower() in text.lower()
@@ -484,13 +704,26 @@ def _case_proactive_message_quality(c) -> str:
         raise _ProbeIssue("PRODUCT_FAIL", f"one wake produced {len(agents)} agent messages")
     return (
         f"decryptable zh-Hans persona/timezone message; job={job_id}; "
-        f"chars={len(text)}; no spam; collision_wait={collision_wait:.1f}s"
+        f"chars={len(text)}; no spam; collision_wait={collision_wait:.1f}s; {grounding}"
     )
 
 
 def _case_scheduled_must_deliver(c) -> str:
+    # REQUIRES a V2 account. Only the V2 scheduler
+    # (serve_worker._fire_scheduled_for_user) turns a due self-wake timer into a
+    # real `scheduled` agent_job with a fired_job_id; a V1 account drains the
+    # legacy proactive_jobs queue through the resident consumer and never attaches
+    # one. There is no reliable runtime flag on the HTTP surface to assert V2 up
+    # front, so _wait_for_scheduled_fire IS the guard: a non-V2 account yields no
+    # fired_job_id and fails with an explicit V2-requirement message, never a
+    # false delivery. (This case was migrated V1->V2; the old compat fire path it
+    # used to call is the V1 road.)
     _install_quality_identity(c)
     _save_settings(c, {"timezone": "UTC", "scheduled": True})
+    # Capture the delivery watermark BEFORE scheduling: the real scheduler can
+    # fire a due timer and publish its reply between this POST returning and a
+    # later time.time(); a `since` after that publish instant would hide the reply.
+    started = time.time()
     due = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     scheduled = _body(
         c.post("/v1/proactive/scheduled/actions", json={
@@ -510,31 +743,21 @@ def _case_scheduled_must_deliver(c) -> str:
     if row.get("status") != "scheduled" or not timer_id:
         raise _ProbeIssue("PRODUCT_FAIL", f"must-deliver wake was not scheduled: {scheduled}")
 
-    started = time.time()
-    fired = _body(
-        c.post("/v1/proactive/scheduled/fire", json={}),
-        expected=(200,),
-        action="fire must-deliver wake",
-    )
-    fire_rows = fired.get("results") or []
-    jobs = fired.get("jobs") or []
-    fire_row = fire_rows[0] if fire_rows and isinstance(fire_rows[0], dict) else {}
-    job = jobs[0] if len(jobs) == 1 and isinstance(jobs[0], dict) else {}
-    proactive_job_id = str(job.get("job_id") or "")
-    if (
-        int(fired.get("queued") or 0) != 1
-        or len(fire_rows) != 1
-        or fire_row.get("status") != "fired"
-        or str(fire_row.get("timer_id") or "") != timer_id
-        or not proactive_job_id
-    ):
-        raise _ProbeIssue("PRODUCT_FAIL", f"must-deliver wake did not fire exactly once: {fired}")
-
-    reply = _wait_for_proactive_reply(c, proactive_job_id, started)
+    # Do NOT drive /v1/proactive/scheduled/fire: that compat path only appends a
+    # legacy proactive_jobs row the V2 runtime never drains, and it marks the
+    # timer fired so the real scheduler skips it — exactly the dead-exit that made
+    # T560's scheduled_must_deliver look like a delivery failure. Instead wait for
+    # the real V2 scheduler to fire the due timer and attach the exact
+    # scheduled-lane agent_job, then require delivery keyed on that exact
+    # agent_jobs id so a backend terminal failure is attributed (wake_result /
+    # last_error) rather than reported as an opaque "no reply".
+    fired_job_id = _wait_for_scheduled_fire(c, timer_id)
+    reply = _wait_for_scheduled_delivery(c, started, fired_job_id)
     text = _decrypt(c, reply, action="scheduled must-deliver")
     return (
-        f"scheduled must-deliver produced one correlated decryptable reply; "
-        f"timer={timer_id}; job={proactive_job_id}; chars={len(text)}"
+        f"scheduled must-deliver produced a reply correlated to the exact V2 "
+        f"scheduled agent_job; timer={timer_id}; agent_job={fired_job_id}; "
+        f"chars={len(text)}"
     )
 
 
@@ -643,6 +866,21 @@ def _case_stale_wake_expiry(c) -> str:
     return f"stale wake hidden from poll; expired status count {before_expired}->{expired}"
 
 
+def _v2_dream_noop_shape(tick) -> bool:
+    """Exact V2 scheduler-owned no-op as it appears ON THE WIRE.
+
+    proactive_core._v2_dream_scheduler_noop carries job=None internally, but
+    _dream_response_doc only emits a ``job`` object when one exists — so the
+    public contract for "no job" is the key being ABSENT (measured on test,
+    T635 r2). A ``job`` key of any value, an ``enqueued`` that is not exactly
+    False, or a missing/non-dict ``state`` is off-contract."""
+    return (isinstance(tick, dict)
+            and tick.get("enqueued") is False
+            and tick.get("reason") == "v2_scheduler_owned"
+            and "job" not in tick
+            and isinstance(tick.get("state"), dict))
+
+
 def _case_dream_latest_only(c) -> str:
     envelope = c._seal(json.dumps({
         "summary": "Deep probe dream seed",
@@ -660,6 +898,31 @@ def _case_dream_latest_only(c) -> str:
     _body(c.post("/v1/memory/add", json={"envelope": envelope}), expected=(201,), action="seed dream memory")
     first = _body(c.post("/v1/dream/tick", json={"force": True}), expected=(200,), action="first dream tick")
     second = _body(c.post("/v1/dream/tick", json={"force": True}), expected=(200,), action="second dream tick")
+    if first.get("reason") == "v2_scheduler_owned":
+        # Runtime V2 accounts (the default for new hosted accounts): dreaming is
+        # owned by the V2 scheduler, so the public tick — even forced — is a
+        # structured no-op by contract (backend/proactive/proactive_core.py
+        # _v2_dream_scheduler_noop): enqueued=False, job=None, state carried,
+        # and it must stay idempotent. No legacy proactive_jobs dream may be
+        # created or become pollable. (The V1 single-flight assertions below
+        # still apply to resident_cli accounts.)
+        for label, tick in (("first", first), ("second", second)):
+            # Every field is checked explicitly against the wire shape (see
+            # _v2_dream_noop_shape); codex3 review of T635 asked for this.
+            if not _v2_dream_noop_shape(tick):
+                raise _ProbeIssue("PRODUCT_FAIL", f"{label} V2 dream tick off-contract: {tick}")
+        poll = _body(
+            c.get("/v1/proactive/jobs/poll", params={"since": 0, "timeout": 0, "limit": 100}),
+            expected=(200,),
+            action="poll dream jobs",
+        )
+        jobs = poll.get("jobs")
+        if not isinstance(jobs, list):
+            raise _ProbeIssue("PRODUCT_FAIL", f"poll response has no jobs list: {poll}")
+        legacy = [job for job in jobs if not isinstance(job, dict) or job.get("job_kind") == "memory_dream"]
+        if legacy:
+            raise _ProbeIssue("PRODUCT_FAIL", f"V2 account exposed {len(legacy)} legacy/malformed pollable dream job(s)")
+        return "V2 scheduler-owned dream: forced ticks are idempotent structured no-ops, no legacy job pollable"
     if first.get("enqueued") is not True or (first.get("job") or {}).get("job_kind") != "memory_dream":
         raise _ProbeIssue("PRODUCT_FAIL", f"first forced dream did not enqueue: {first}")
     if second.get("enqueued") is not False or second.get("reason") != "dream_already_pending":
@@ -730,7 +993,7 @@ def run_proactive_probe(c, cfg) -> dict:
         cases.extend([
             _case("wake_coalescing_window", lambda: _case_wake_coalescing(c)),
             _case("stale_wake_900s_expiry", lambda: _case_stale_wake_expiry(c)),
-            _case("dream_migrate_latest_only", lambda: _case_dream_latest_only(c)),
+            _case("dream_latest_only", lambda: _case_dream_latest_only(c)),
             _blocked_case(
                 "maintenance_soft_gap_backoff",
                 "the user/admin surfaces expose legacy job aggregates but no controllable resident-consumer soft-gap clock",

@@ -89,6 +89,41 @@ def test_user_store_constructor_and_shell_get_are_sql_free(monkeypatch):
     assert store.loaded_sections() == frozenset()
 
 
+@pytest.mark.parametrize("mode", ["legacy", "selective", "lazy"])
+def test_explicit_bypass_is_sql_free_in_every_mode(monkeypatch, mode):
+    calls = install_counting_loaders(monkeypatch, core_store)
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", mode)
+    core_store._stores.clear()
+
+    store = core_store.get_store_per_load_mode(
+        f"u-shell-{mode}",
+        reason="test direct DB helper",
+        bypass_legacy_hydration=True,
+    )
+
+    assert store.user_id == f"u-shell-{mode}"
+    assert calls == []
+    assert store.loaded_sections() == frozenset()
+    assert core_store.get_store_per_load_mode(
+        f"u-shell-{mode}",
+        reason="test shared shell identity",
+        bypass_legacy_hydration=True,
+    ) is store
+
+
+def test_default_path_preserves_legacy_compatibility(monkeypatch):
+    calls = install_counting_loaders(monkeypatch, core_store)
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "legacy")
+    core_store._stores.clear()
+
+    core_store.get_store_per_load_mode(
+        "u-shell-legacy-default",
+        reason="test default compatibility",
+    )
+
+    assert len(calls) == len(core_store.ALL_STORE_SECTIONS)
+
+
 def test_require_chat_loads_only_chat(monkeypatch):
     calls = install_counting_loaders(monkeypatch, core_store)
     monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", "lazy")

@@ -130,7 +130,7 @@ def test_content_rewrap_to_current_key_rewraps_all_shared_content(client, monkey
     old_keys = _seed_encrypted_content(user_id)
     new_public_key = _b64(b"\x33" * 32)
 
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         assert key == api_key
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
 
@@ -176,7 +176,7 @@ def test_rewrap_partial_failure_persists_successes_and_reports_pending(client, m
     old_keys = _seed_encrypted_content(user_id)
     new_public_key = _b64(b"\x33" * 32)
 
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         if envelope.get("id") == "chat1":
             raise RuntimeError("enclave_error:ReadTimeout")
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
@@ -214,7 +214,7 @@ def test_rewrap_converges_on_retry(client, monkeypatch):
     new_public_key = _b64(b"\x33" * 32)
 
     calls = {"n": 0}
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         # 第一轮 chat1 超时;之后全成。
         if envelope.get("id") == "chat1" and calls["n"] == 0:
             raise RuntimeError("enclave_error:ReadTimeout")
@@ -246,7 +246,7 @@ def test_rewrap_no_progress_returns_failed_and_keeps_key(client, monkeypatch):
     new_public_key = _b64(b"\x33" * 32)
     old_registered = registry._get_user_public_key(user_id)
 
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         raise RuntimeError("enclave_http_502:backend_error timed out")
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
@@ -268,7 +268,7 @@ def test_rewrap_skips_already_current_items_on_second_pass(client, monkeypatch):
     new_public_key = _b64(b"\x33" * 32)
 
     calls = {"n": 0}
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         calls["n"] += 1
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
 
@@ -299,7 +299,7 @@ def test_client_swap_clears_stale_content_pk_fpr_no_false_skip(client, monkeypat
     key_a = _b64(b"\x33" * 32)
 
     calls = {"n": 0}
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         calls["n"] += 1
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
@@ -358,7 +358,7 @@ def test_rewrap_cas_conflict_reencrypts_latest_card_not_stale_one(client, monkey
     concurrent_write_done = {"flag": False}
     decrypt_calls = {"identity1": 0}
 
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         if envelope.get("id") == "identity1":
             decrypt_calls["identity1"] += 1
             if not concurrent_write_done["flag"]:
@@ -424,7 +424,7 @@ def test_rewrap_then_profile_patch_uses_patch_own_cas(client, monkeypatch):
     _seed_encrypted_content(user_id)
     new_public_key = _b64(b"\x33" * 32)
 
-    def fake_decrypt(envelope, key, purpose):
+    def fake_decrypt(envelope, key, purpose, caller_user_id):
         return f"plaintext:{purpose}:{envelope.get('id')}".encode()
 
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)

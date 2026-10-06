@@ -7,7 +7,7 @@ canonical_owner: self
 > `{"error": "<slug>"}` 的 slug 是稳定 API 面：一经写入本表即冻结，废弃走
 > 「新增新 slug、旧 slug 保留」。新增错误返回必须先登记到本表（CONTRIBUTING
 > 有此纪律）。iOS 本地化表以本表为输入；「需本地化」为空的 slug 走通用文案。
-> 对外渲染规则见 docs/FRONTEND_ERROR_CONTRACT.md。
+> 对外渲染规则见 `docs-site/content/docs/errors.mdx`(公开文档,current)。
 >
 > **盘点方法**：`grep -rhoE '"error":\s*"[a-z_0-9]+"' backend/ --include="*.py"`
 > （不要求 `{` 开头，覆盖多行 dict 字面量）+ 单独查 `_bad(`/`json_error(`/
@@ -19,12 +19,40 @@ canonical_owner: self
 > 字段、`admin/data_track.py` 的 trace 反射字段）。状态码从直接返回处/调用处读；
 > 多处不一致的用 `xxx/yyy` 列出全部。blame 只标能明确判定的（基础设施/我方
 > bug → `system`；用户自己的 provider 配置/额度问题 → `user_provider`；纯参数
-> 校验错误不判 blame，留 `—`）。「需本地化」按
-> `docs/FRONTEND_ERROR_CONTRACT.md` §三目录勾选，未在该目录里的留空（多数是
+> 校验错误不判 blame，留 `—`）。「需本地化」由**本表自身**拥有:凡在本表登记
+> 且面向用户的 slug 即勾选,未勾选的留空（多数是
 > 校验类错误，走 `invalid_payload`/`detail` 通用兜底文案，不需要逐条本地化）。
 > `enclave/*` 是独立的 backend↔enclave 内网面，iOS 从不直连，见文末单独一节。
 
+## Agent 拼豆身体生成
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `agent_body_invalid_request` | 400 | — | schema_version/grid_size/client_request_id/allowed_palette 无效 | |
+| `agent_body_resident_update_required` | 409 | — | resident 离线、太旧或未宣告 agent_body_generate_v1 | ✅ |
+| `agent_body_agent_unavailable` | 409 | — | official_import 接入未运行 agent | ✅ |
+| `agent_body_provider_config_failed` | 409 | user_provider | provider 鉴权、额度、权限或配置错误 | ✅ |
+| `agent_body_generation_timeout` | 504 | system | 85 秒截止或不足 25 秒进行修复重试 | ✅ |
+| `agent_body_generation_failed` | 429/502/409/410/503 | provider_transient/system | 429=provider 限流(retryable)、502=provider 失败/空回复或 resident 任务冲突；409/410/503 只出现在 consumer 专用的内部结果口 `/v1/internal/agent-body/generate/result`(reason=consumer_mismatch/expired/state_unavailable 标识绑定、过期、CAS 失败);不返回 rows | ✅ |
+| `agent_body_generation_invalid_output` | 502 | system | 一次修复重试后仍不符合网格硬规则；不返回 rows | ✅ |
+
+## 用户偏好
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `content_encryption_on_not_supported` | 400 | — | 新内容统一明文，设置口不再接受 on；off 或 null/空值清除仍支持，请求拒绝前不写入任何偏好 | |
+
 ## 通用
+
+### 本地 resident CLI（不是 HTTP API）
+
+`ipc_unsupported` 是 `tools/io_cli.py` 的本地 JSON 错误码：当前 Python
+没有 `socket.AF_UNIX`，无法执行依赖 resident IPC 的重蒸馏和附件暂存。
+结果包含 `ok: false`、`request_id` 和不含输入内容的 `hint`；不自动重试或
+改走 TCP。consumer 同时记录 listener disabled 日志。这不是服务端 HTTP
+状态码，也不意味着 HTTP 文本回复不可用。
+
+### HTTP 通用错误
 
 | slug | 状态码 | blame | 说明 | 需本地化 |
 |---|---|---|---|---|
@@ -81,7 +109,7 @@ canonical_owner: self
 | `provider_not_configured` | 409 | user_provider | | ✅ |
 | `provider_not_hostable` | 409 | user_provider | | ✅ |
 | `hosting_runtime_unavailable` | 503 | system | 历史 hosted-supervisor 兼容 slug；Runtime V2 托管路径不再返回（worker 全挂改用 `workers_unavailable`） | ✅ |
-| `provider_test_failed` | 400 | user_provider | 保存/测试 key 时上游拒绝（detail 带 status_code） | |
+| `provider_test_failed` | 400 | 按 failure_class | 保存/测试 key 失败；保留 detail/status_code，增加 failure_class（见下表） | |
 | `cannot_encrypt_provider_key` | 409 | — | 缺 content public key 或 enclave attestation 不可达 | |
 | `route_not_found` | 404 | user_provider | 指定的 route id 不属于该用户或已删除 | |
 | `credential_not_found` | 404 | user_provider | 指定的 credential id 不属于该用户或已删除 | |
@@ -168,10 +196,17 @@ canonical_owner: self
 | `title_required` | 400 | — | | |
 | `description_required` | 400 | — | | |
 | `memory_id_required` | 400 | — | | |
+| `invalid_model_id` | 400 | — | 仅内部 `POST /v1/memory/vectors`(enclave 混合召回,T523):model_id 缺失、非字符串或超过 300 字符 | |
+| `invalid_ids` | 400 | — | 仅内部 `POST /v1/memory/vectors`:ids 不是字符串列表、含空串或超过 200 字符的 id、或超过 2000 个;detail `max` 为上限 | |
 | `patch_required` | 400 | — | | |
 | `summary_required` | 400 | — | | |
 | `supersedes_required` | 400 | — | | |
 | `envelope_id_mismatch` | 400 | — | envelope.id 必须等于目标 memory_id（AEAD-bound） | |
+| `memory_id_conflict` | 409 | — | `memory.add`（actions）与 `/v1/memory/add` 带的 id 已被另一张卡占用；原卡不动、不回显任何卡内容。同一张密文卡原样重发是重放，返回成功不重写 | |
+| `memory_content_too_long` | 400 | — | 明文 action 正文去首尾空白后超过 5000 Unicode 码点；detail 仅含 actual_chars/max_chars，不截断、不改旧卡。信封兼容路径不在此校验范围 | |
+| `memory_idempotency_key_invalid` | 400 | — | action 的可选 idempotency_key 不是非空白字符串，或超过 160 字符 | |
+| `memory_idempotency_conflict` | 409 | — | 同一用户复用已成功 action 的 key，但 JSON 载荷不同；旧回执不变。以上为 item 状态，整批失败遵循 actions 的 HTTP 400 规则 | |
+| `maintenance_targets_rejected` | — | — | MemGarden 0.21.1 的 Dream 提案全部触碰截断或未渲染目标；IO 将任务记为失败、outcome=guard_rejected，不推进整理账本，不是 HTTP 写入错误 | |
 | `action_must_be_object` | 400 | — | | |
 | `actions_required` | 400 | — | | |
 | `unsupported_memory_action` | 400 | — | | |
@@ -187,7 +222,8 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 
 | slug | 状态码 | blame | 说明 | 需本地化 |
 |---|---|---|---|---|
-| `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*` 及任何未知消息）；分诊看 `detail.upstream` | |
+| `readside_unavailable` | 503 | system | readside 失败且消息不在闭集内（含 `enclave_http_*`、`enclave_error:*`、明文账户 backend 搜索组卡失败 `readside_local_error` → `detail.upstream=local_search_error`，及任何未知消息）；分诊看 `detail.upstream` | |
+| `memory_search_resource_limit` | 413 | system | query 全语料超过 4096 卡、32 MiB 内部 JSON 请求或 16 MiB 可搜索 UTF-8 文本；整次失败，不返回局部排名 | |
 | `memory_load_failed` | 503 | system | `memory/service.py` 载入 moments 失败 | |
 | `enclave_unavailable` | 503 | system | 未配置 `FEEDLING_ENCLAVE_URL` | |
 | `api_key_unavailable` | 503 | system | 既无 api_key 也无 runtime token | |
@@ -316,6 +352,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `app_required` | 400 | — | | |
 | `unknown_signals` | 400 | — | agent 感知信号名不识别 | |
 | `unknown_or_unhistorized_signal` | 400 | — | | |
+| `invalid_day` | 400 | — | admin lane-rollup summary 的 `day` 不是 YYYY-MM-DD 有效日期，或不存在前一天 | |
 | `invalid_days` | 400 | — | `days` 查询参数非数字 | |
 
 ## Web 能力（`POST /v1/agent/web/{search,fetch}`，CapabilityResult `error.code`）
@@ -392,6 +429,8 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `unauthorized` | 401 | — | whoami 缓存过、key 已被吊销 |
 | `not_ready` | 503 | system | enclave 尚未完成初始化 |
 | `missing_api_key` | 401 | — | envelope 路由鉴权前置检查缺 api_key |
+| `memory_search_protocol_unsupported` | 400 | — | memory/index 请求了未知的搜索协议版本 |
+| `memory_search_resource_limit` | 413 | system | memory/index 请求体或全语料搜索超过固定资源上限 |
 | `cannot_resolve_user_id` | 401 | — | |
 | `screen_caption_unconfigured` | 503 | — | |
 | `backend_error` | 502 | system | `_errors.py::backend_call_or_error` 兜底；实际 body 是 `backend_error: <httpx 异常文本>`（历史写法，非规范 slug+detail 分离） |
@@ -406,7 +445,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 > `error_class` 字段的取值由 `backend/notices/error_contract.py` 的
 > `ErrorSpec` 注册表唯一拥有；`backend/notices/catalog.py` 的 `_CATALOG`
 > 是派生兼容视图。它只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
-> `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二分类；`severity`
+> `blame` 语义见 `docs-site/content/docs/errors.mdx`(公开文档,current)；`severity`
 > 取值 `error`/`warning`，决定通知中心 UI 展示优先级（`warning` 语气弱化，
 > 不打扰用户）。「状态码」列在本节恒为 `—`（notice 不走 HTTP 状态码，此列
 > 仅为复用上面表格的行格式/守卫测试）。
@@ -424,9 +463,12 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|
+| `wake_provider_circuit_open` | — | user_provider | warning | V2 heartbeat/screen_watch 连续三次额度、鉴权或账户过期失败，持久暂停自动唤醒；新 Chat 或成功保存 active key/route/setup 后 resolve。API 可读，当前 iOS 未渲染 |
 | `model_mismatch` | — | system | error | chat：Runtime V1 Claude Code 的结构化回执显示实际模型与用户配置不同；终止本轮并清理错误模型会话，避免静默降级污染后续对话 |
 | `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
+| `provider_tool_history_rejected` | — | user_provider | error | chat：中转通道拒绝原生工具结果历史；Runtime V2 立即终止本轮而不移除工具重试，并引导用户换模型或稍后重试 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
+| `provider_error_unclassified` | — | provider_transient | error | resident pi：无可用回复且最终 message_end stopReason=error，详情未命中配额/鉴权/上游等既有规则；不同于无错误标记的 provider_empty_reply |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
 | `error_class_unregistered` | — | system | error | vision/image-generation 动态边界收到未注册分类；不透传或保存原始值，只写 content-free 拒绝计数 |
@@ -434,7 +476,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `genesis_partial` | — | system | warning | genesis：蒸馏跑完但有记忆卡片被丢弃（`apply_reducer_output` / `plaintext.py` 直传路径统计 dropped>0） |
 | `import_failed` | — | system | error | history_import：聊天记录导入失败 |
 | `import_stale` | — | system | error | history_import：导入 job 卡在 queued/processing 超过阈值，判定超时失败 |
-| `memory_backoff` | — | system | warning | memory：capture/migrate/dream 三条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避 |
+| `memory_backoff` | — | system；capture 失败原因可识别为账号/模型服务问题时为 user_provider / provider_transient | warning | memory：capture/dream 两条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避。capture 的 `user_text` 会带上错误对照表里的原因（如额度不足）；capture 跳过一批或成功后 resolve |
 | `runner_spawn_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 拉起 per-user 子进程失败 |
 | `runner_key_decrypt_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 为 per-user 子进程解密 provider key 失败 |
 | `runner_degraded` | — | system | warning | **历史兼容，不再产生**：旧 resident 子进程 runtime-token 刷新失败 |
@@ -442,3 +484,35 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `resident_decrypt_source_unavailable` | — | user_environment | warning | chat：resident 明确报告 `degraded`/`unconfigured`/`unreachable`；notice 可立即出现，维护消息仅对新用户立即注入，老用户需持续失败超过宽限期 |
 | `resident_decrypt_health_unreported` | — | user_environment | warning | chat：resident 未上报有效、近期的 decrypt-health；仅发 notice，不生成解密修复文案或聊天维护消息 |
 | `resident_never_claimed` | — | user_environment | error | genesis：resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 |
+
+
+### Model API 凭证探针 failure_class
+
+`provider_test_failed` 的 HTTP 状态仍为 400；`status_code` 是上游状态，
+`failure_class` 是叠加的用户可见分类，不改变 provider_client 的重试分类。
+保存配置、手动测试、路由激活/测试（含带 activate 的加路由）和凭证轮换共用此契约。
+
+| 上游证据 | failure_class | 通知归因 |
+| --- | --- | --- |
+| 401 / 403 | `auth_invalid` | user_provider |
+| 402（含 OpenRouter max_tokens 预扣不足） | `quota_insufficient` | user_provider |
+| 404 | `model_not_found` | user_provider |
+| 429 | `rate_limited` | provider_transient |
+| 408 / 5xx / provider_client 网络失败 | `upstream_unavailable` | provider_transient |
+| 其余状态或无状态的未识别失败 | `provider_config` | user_provider |
+| 404 HTML / non-json response（非 API 地址） | `provider_config`；status_code=null | user_provider |
+
+原有 detail 与 status_code 语义不变。已保存凭证的 route 测试失败时，
+`last_test_error`以 `<failure_class>: ` 开头。
+新凭证保存前失败不改变旧 route 的有效状态。
+失败通知 source=model_api、error_class=failure_class，以
+`model_api:test_failed:<failure_class>` 去重；成功探针仅消除该探针通知前缀，
+删除配置仍清除整个 `model_api:` 前缀。除 provider_config 使用探针专用安全文案和归因外，通知复用 error_contract；
+provider_config 不加入全局运行时分类表，避免改变健康/统计归因。通知不存上游正文。
+
+Setup 与手动 test 的 `model_api.provider_probe.*` trace 在 `detail.status_code`
+记录安全上游状态：仅接受整数 100–599；字符串、布尔值、浮点数、越界值及无状态
+均为 null，不从异常原文猜测。失败终态取 ProviderError.status_code；started、
+success（返回结果未提供 HTTP 状态）和 runtime_fenced 控制事件为 null。
+此诊断字段可区分 401/402/403，不改变原有 error_class、HTTP 回执或重试分类；
+trace 不记录异常消息、response_detail 或原始响应正文。

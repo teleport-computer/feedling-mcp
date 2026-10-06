@@ -386,7 +386,7 @@ def _install_memory_action_adapter(monkeypatch, moments: list[dict], *, user_id:
     monkeypatch.setattr(
         memory_actions,
         "_memory_plain_from_envelope",
-        lambda moment, _api_key, runtime_token="": (
+        lambda _user_id, moment, _api_key, runtime_token="": (
             {
                 "summary": str(moment.get("id") or ""),
                 "content": str(moment.get("id") or ""),

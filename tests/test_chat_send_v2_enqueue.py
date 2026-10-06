@@ -684,3 +684,64 @@ def test_db_action_v2_admission_admits_under_sla(monkeypatch):
     assert len(rows) == 1
     lane, job_status, reason = rows[0]
     assert (lane, job_status, reason) == ("chat", "pending", "chat_send")
+
+
+def test_new_chat_recovers_wake_circuit_but_idempotent_retry_does_not(monkeypatch):
+    from model_api_runtime.v2 import wake_circuit
+    uid = 'u_send_circuit_recovery'
+    _seed(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, 'db_action_v2')
+    _stub_live_overloaded_runtime(monkeypatch, message_id='circuit-chat')
+    def block():
+        with db.get_pool().connection() as conn:
+            conn.execute("INSERT INTO v2_wake_schedule (user_id,wake_circuit_opened_at) "
+                         "VALUES (%s,now()) ON CONFLICT (user_id) DO UPDATE "
+                         "SET wake_circuit_opened_at=now()", (uid,))
+    payload = {'message': 'hi', 'client_msg_id': '00000000-0000-0000-0000-000000000665'}
+    block()
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key='key', runtime_tok='', payload=payload)
+    assert status == 202, body
+    assert not wake_circuit.is_open(uid)
+    block()
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key='key', runtime_tok='', payload=payload)
+    assert status == 202, body
+    assert wake_circuit.is_open(uid)
+
+
+def test_chat_send_survives_circuit_reset_db_failure(monkeypatch, caplog):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from psycopg import OperationalError
+    from model_api_runtime.v2 import wake_circuit
+
+    uid = 'u_send_circuit_reset_failure'
+    _seed(uid)
+    store = core_store.get_store(uid)
+    hosted_config_store.set_hosted_runtime_mode(store, 'db_action_v2')
+    _stub_live_overloaded_runtime(monkeypatch, message_id='circuit-reset-failure')
+    notify = Mock()
+    monkeypatch.setattr(store, 'notify_chat_waiters', notify)
+    connect = Mock(side_effect=OperationalError('private-db-error-sentinel'))
+    # Only the circuit's connection fails; the real primary write still runs.
+    monkeypatch.setattr(wake_circuit, 'db', SimpleNamespace(
+        get_pool=lambda: SimpleNamespace(connection=connect)))
+
+    body, status = chat_send_core.model_api_chat_send_core(
+        store, api_key='key', runtime_tok='', payload={'message': 'hi'})
+
+    assert status == 202, body
+    assert body['status'] == 'processing'
+    connect.assert_called_once_with()
+    notify.assert_called_once_with()
+    with db.get_pool().connection() as conn:
+        jobs = conn.execute(
+            'SELECT lane, status, trace_id FROM agent_jobs WHERE user_id=%s',
+            (uid,),
+        ).fetchall()
+    assert jobs == [('chat', 'pending', 'circuit-reset-failure')]
+    assert 'wake circuit reset failed' in caplog.text
+    assert 'private-db-error-sentinel' not in caplog.text

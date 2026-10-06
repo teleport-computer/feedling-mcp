@@ -71,6 +71,12 @@ canonical_owner: self
 | 销号 | **不删** —— 事后查 bug 用 | T184 决策 |
 | 读侧 | `db.query_trace_events`,admin `/v1/admin/data-track/debug` | `admin/data_track.py` |
 
+管理端 debug 的 `user_id` 是精确匹配，不扩展前缀。指定非空 `user_id` 时，
+JSON 的 `observability.user_exists` 从 `users` 表有界读取，明确区分当前账号存在
+（`true`）和不存在（`false`）；未指定账号时为 `null`。它与当前时间窗、事件筛选和分页
+无关，数据库读取失败仍走错误响应，不伪装成 `false`。HTML 在 `false` 时显示提示。
+已删账号的保留 trace 仍可按完整 ID 查询，不能把 `false` 解读为历史事件不存在。
+
 ⚠️ **第一版此处写的是「2500 条/用户、48 小时、环形 FIFO」并说「这就是待解决的问题」——
 那是 T184 换存储之前的状态,已过时。** 文档说反话比没有文档更坏:它会让读的人
 以为「查三天前」办不到,从而根本不去查。

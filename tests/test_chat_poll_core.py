@@ -101,7 +101,7 @@ def test_pending_messages_no_claim_leaves_it_pending(store):
 
 def test_poll_context_shape(store):
     ctx = chat_poll_core.poll_context(store)
-    assert set(ctx) == {"runtime_v2", "client_release", "user_mcp", "vision_probe", "web_policy"}
+    assert set(ctx) == {"runtime_v2", "client_release", "user_mcp", "vision_probe", "web_policy", "agent_body_job"}
     assert "expected_consumer_commit" in ctx["client_release"]
     assert ctx["user_mcp"] == {"fingerprint": ""}
     # Default account: web preference off → not effective, nothing advertised.
@@ -151,7 +151,7 @@ def test_build_response_contract(store):
     assert set(resp) == {
         "messages", "runtime_v2", "client_release", "user_mcp", "timed_out", "consumer_id", "claimed",
         "agent_status_events", "status_cursor",
-        "vision_probe", "web_policy",
+        "vision_probe", "web_policy", "agent_body_job",
     }
     assert resp["web_policy"] == ctx["web_policy"]
     assert resp["messages"] == [{"id": "m"}]

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import sys
 import uuid
 from pathlib import Path
 
+import httpx
 import pytest
 from nacl.public import PrivateKey
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from tools.e2e import client as client_mod
 from tools.e2e import config, hosted, p0, processing_probe
 from tools.e2e.client import E2EClient, TEST_API, _refuse_prod
 
@@ -219,6 +222,35 @@ def test_p0_blocking_verdict() -> None:
     ])
 
 
+def test_p0_default_run_uses_only_the_two_required_vps_harnesses(monkeypatch):
+    ran = []
+    monkeypatch.setattr(sys, "argv", ["p0.py"])
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(p0, "HOSTED_CELLS", [])
+
+    def run(cell):
+        ran.append(cell.name)
+        return {"cell": cell.name, "result": "ok", "steps": []}
+
+    monkeypatch.setattr(p0, "run_vps_cell", run)
+    assert p0.main() == 0
+    assert ran == ["vps-claude-code", "vps-codex"]
+
+
+def test_p0_list_and_explicit_selection_exclude_hermes(monkeypatch, capsys):
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--list"])
+    assert p0.main() == 0
+    output = capsys.readouterr().out
+    assert "vps-claude-code" in output and "vps-codex" in output
+    assert "vps-hermes" not in output
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--only", "vps-hermes"])
+    with pytest.raises(SystemExit) as exc:
+        p0.main()
+    assert exc.value.code == 2
+    assert "unknown cell(s): vps-hermes" in capsys.readouterr().err
+
+
 # --- hardening batch (codex2 R1 on the shakedown fixes) ----------------------
 
 def _sleepless(monkeypatch):
@@ -226,6 +258,149 @@ def _sleepless(monkeypatch):
     import tools.e2e.client as client_mod
     capture_sleeps(monkeypatch, client_mod, slept)
     return slept
+
+
+def _provision_wire(monkeypatch, tmp_path, register_errors=(), *, who_error=None):
+    """Use the real provision/lifecycle against an isolated HTTP transport."""
+    requests, sleeps, clients = [], [], []
+    errors = iter(register_errors)
+    real_client = httpx.Client
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
+    capture_sleeps(monkeypatch, client_mod, sleeps)
+
+    def handle(request):
+        requests.append(request)
+        if request.url.path == "/v1/users/register":
+            error = next(errors, None)
+            if isinstance(error, Exception):
+                raise error
+            if isinstance(error, int):
+                return httpx.Response(error, json={"error": "registration_failed"})
+            return httpx.Response(201, json={"user_id": "e2e-user", "api_key": "fake-key"})
+        if request.url.path == "/v1/users/whoami":
+            assert list((tmp_path / "orphans").glob("*.json"))
+            if who_error is not None:
+                raise who_error
+            return httpx.Response(200, json={"enclave_content_public_key_hex": "01" * 32})
+        if request.url.path == "/v1/account/reset":
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected HTTP request: {request.method} {request.url.path}")
+
+    def create_client(**kwargs):
+        client = real_client(transport=httpx.MockTransport(handle), **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(client_mod.httpx, "Client", create_client)
+    return requests, sleeps, clients
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectTimeout, httpx.ConnectError])
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_provision_retries_only_registration_connect_failures(monkeypatch, tmp_path, error_type, failures):
+    requests, sleeps, clients = _provision_wire(
+        monkeypatch, tmp_path, [error_type("connect failed")] * failures)
+    with E2EClient.provision(route="model_api") as client:
+        assert client.user_id == "e2e-user"
+        assert client._orphan_file.exists()
+    paths = [r.url.path for r in requests]
+    assert paths == ["/v1/users/register"] * (failures + 1) + ["/v1/users/whoami", "/v1/account/reset"]
+    bodies = [r.content for r in requests if r.url.path == "/v1/users/register"]
+    assert len(set(bodies)) == 1  # Same public key and registration payload on each attempt.
+    assert json.loads(bodies[0])["access_mode"] == "model_api"
+    assert sleeps == [3, 6][:failures]
+    assert not list((tmp_path / "orphans").glob("*.json"))
+    assert all(c.is_closed for c in clients)
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectTimeout, httpx.ConnectError])
+def test_provision_connect_failure_stops_after_three_attempts(monkeypatch, tmp_path, error_type):
+    errors = [error_type(f"attempt {i}") for i in range(3)]
+    requests, sleeps, clients = _provision_wire(monkeypatch, tmp_path, errors)
+    with pytest.raises(error_type) as exc:
+        E2EClient.provision(route="model_api")
+    assert exc.value is errors[-1]
+    assert [r.url.path for r in requests] == ["/v1/users/register"] * 3
+    assert sleeps == [3, 6]
+    assert not list((tmp_path / "orphans").glob("*.json"))
+    assert all(c.is_closed for c in clients)
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout,
+                                       httpx.WriteError, httpx.PoolTimeout, httpx.RemoteProtocolError])
+def test_provision_does_not_retry_other_registration_failures(monkeypatch, tmp_path, error_type):
+    error = error_type("request may have reached the server")
+    requests, sleeps, clients = _provision_wire(monkeypatch, tmp_path, [error])
+    with pytest.raises(error_type) as exc:
+        E2EClient.provision(route="model_api")
+    assert exc.value is error
+    assert [r.url.path for r in requests] == ["/v1/users/register"]
+    assert sleeps == []
+    assert all(c.is_closed for c in clients)
+
+
+@pytest.mark.parametrize("status", [400, 429, 503])
+def test_provision_does_not_retry_registration_http_errors(monkeypatch, tmp_path, status):
+    requests, sleeps, _ = _provision_wire(monkeypatch, tmp_path, [status])
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        E2EClient.provision(route="model_api")
+    assert exc.value.response.status_code == status
+    assert len(requests) == 1
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectTimeout, httpx.ReadTimeout])
+def test_provision_does_not_retry_after_account_creation(monkeypatch, tmp_path, error_type):
+    error = error_type("whoami failed after account creation")
+    requests, sleeps, clients = _provision_wire(monkeypatch, tmp_path, who_error=error)
+    with pytest.raises(error_type) as exc:
+        E2EClient.provision(route="model_api")
+    assert exc.value is error
+    assert [r.url.path for r in requests] == ["/v1/users/register", "/v1/users/whoami", "/v1/account/reset"]
+    assert sleeps == []
+    assert not list((tmp_path / "orphans").glob("*.json"))
+    assert all(c.is_closed for c in clients)
+
+
+@pytest.mark.parametrize("setup_fails", [False, True])
+def test_deep_registration_retry_does_not_restart_provisioned_run(monkeypatch, tmp_path, setup_fails):
+    from tools.e2e import deep
+
+    requests, sleeps, clients = _provision_wire(monkeypatch, tmp_path, [httpx.ConnectTimeout("TLS timeout")])
+    setups, probes = [], []
+    error = httpx.ConnectTimeout("setup failed after account creation")
+
+    def setup(client, *_args):
+        setups.append(client.user_id)
+        if setup_fails:
+            raise error
+        return True, "fake-model", "ok"
+
+    def probe(client, cfg):
+        probes.append(client.user_id)
+        return {"area": "continuity", "cases": [{"name": "control", "result": "PASS", "detail": "ok"}]}
+
+    monkeypatch.setattr(deep, "_setup", setup)
+    monkeypatch.setattr(deep, "run_continuity_probe", probe)
+    # Preserve the real __exit__ behavior without fetching unrelated diagnostics.
+    monkeypatch.setattr(E2EClient, "_capture_failure_evidence", lambda _c: tmp_path / "failure")
+    cell = config.HOSTED_CELLS[0]
+    kwargs = dict(run_invariants=False, areas={"continuity"}, api_url=TEST_API)
+    if setup_fails:
+        with pytest.raises(httpx.ConnectTimeout) as exc:
+            deep.run_provider(cell, {cell.key_env: "fake-provider-key"}, **kwargs)
+        assert exc.value is error
+        assert probes == []
+    else:
+        result = deep.run_provider(cell, {cell.key_env: "fake-provider-key"}, **kwargs)
+        assert result["probes"][0]["cases"][0]["result"] == "PASS"
+        assert probes == ["e2e-user"]
+    assert setups == ["e2e-user"]
+    assert [r.url.path for r in requests] == (
+        ["/v1/users/register"] * 2 + ["/v1/users/whoami"]
+        + ([] if setup_fails else ["/v1/account/reset"]))
+    assert sleeps == [3]
+    assert all(c.is_closed for c in clients)
 
 
 def test_transport_retry_three_attempts_backoff_only_between(monkeypatch) -> None:
@@ -890,3 +1065,155 @@ def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
     assert p0._cleanup_expired_failures() == 0
     assert not (orphans / "usr_expired.json").exists()
     assert not site.exists()
+
+
+# ── T589/T592: reset is not idempotent — a retry after a lost 200 must not crash,
+# and only a key-independent admin 404 may declare the account gone ────────────
+
+def _http_with_script(script):
+    """script: list of (status, body) or an Exception, consumed in order by .request()."""
+    class ScriptedHTTP:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+
+        def request(self, method, url, **_kw):
+            self.calls.append((method, url))
+            item = script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            status, body = item
+            return FakeResponse(status, body)
+
+        def close(self):
+            self.closed = True
+    return ScriptedHTTP()
+
+
+def _teardown_client(monkeypatch, tmp_path, script, oracle):
+    import tools.e2e.client as client_mod
+
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
+    capture_sleeps(monkeypatch, client_mod)      # module-local, never the global time.sleep
+    asked = []
+
+    def _oracle(api_url, user_id, **_kw):
+        asked.append(user_id)
+        return oracle
+    monkeypatch.setattr(client_mod, "admin_confirms_absent", _oracle)
+    client = _client()
+    client._http.close()
+    manifest = client_mod._write_orphan_manifest(TEST_API, client.user_id, client.api_key)
+    http = _http_with_script(script)
+    client._http = http  # type: ignore[assignment]
+    client._orphan_file = manifest
+    return client, http, manifest, asked
+
+
+def test_teardown_lost_response_then_401_with_admin_404_is_clean(monkeypatch, tmp_path) -> None:
+    import httpx
+    # first reset reaches the server (account deleted) but the response is lost
+    # (TransportError) → _request retries → the retry sees 401 on the dead key →
+    # the admin oracle (bound to user_id, not the key) says 404 → clean.
+    client, http, manifest, asked = _teardown_client(
+        monkeypatch, tmp_path,
+        [httpx.ReadTimeout("lost response"), (401, {"error": "unauthorized"})],
+        (True, "admin confirmed 404"),
+    )
+    client.teardown()                                                # must NOT raise
+    assert client._deleted is True and not manifest.exists()
+    assert [m for m, _ in http.calls] == ["POST", "POST"]           # retry, no whoami
+    assert asked == [client.user_id]
+
+
+@pytest.mark.parametrize("oracle", [
+    (False, "admin verification returned 200: {\"user_id\": \"usr_t592\"}"),  # alive, key revoked
+    (None, "admin token unavailable"),                                             # cannot measure
+    (False, "admin verification transport error: boom"),                           # cannot measure
+])
+def test_teardown_401_without_admin_404_keeps_failure_and_manifest(monkeypatch, tmp_path, oracle) -> None:
+    client, http, manifest, asked = _teardown_client(
+        monkeypatch, tmp_path, [(401, {"error": "unauthorized"})], oracle)
+    with pytest.raises(Exception):
+        client.teardown()
+    assert client._deleted is False
+    assert manifest.exists()                                         # leak guard stays
+    assert asked == [client.user_id]
+
+
+def test_teardown_401_never_trusts_whoami_on_the_same_key(monkeypatch, tmp_path) -> None:
+    # codex4 counterexample (T592): a revoked key answers 401 to reset AND whoami
+    # while the account still exists. The oracle says alive → hard failure, and
+    # the client must not have consulted whoami at all.
+    client, http, manifest, asked = _teardown_client(
+        monkeypatch, tmp_path,
+        [(401, {"error": "unauthorized"}), (401, {"error": "unauthorized"})],
+        (False, "admin verification returned 200: alive"))
+    with pytest.raises(Exception):
+        client.teardown()
+    assert manifest.exists()
+    assert all(not url.endswith("/v1/users/whoami") for _, url in http.calls)
+
+
+def test_admin_confirms_absent_only_404_is_true(monkeypatch, tmp_path) -> None:
+    import tools.e2e.client as client_mod
+    token = tmp_path / "tok"; token.write_text("t")
+    seen = {}
+
+    def fake_get(url, **kw):
+        seen["url"] = url; seen["headers"] = kw.get("headers"); seen["kwargs"] = dict(kw)
+        return FakeResponse(seen.pop("status"), {})
+    monkeypatch.setattr(client_mod.httpx, "get", fake_get)
+    for status, expect in ((404, True), (200, False), (500, False)):
+        seen["status"] = status
+        got, _detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=token)
+        assert got is expect, status
+    assert seen["url"].endswith("/v1/admin/data-track/users/usr_x")
+    assert seen["headers"] == {"X-Admin-Token": "t"}
+    assert "verify" not in seen["kwargs"]                            # TLS verification stays on
+
+    def tls_error(url, **kw):
+        raise client_mod.httpx.ConnectError("certificate verify failed")
+    monkeypatch.setattr(client_mod.httpx, "get", tls_error)
+    got, detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=token)
+    assert got is False and "ConnectError" in detail                 # TLS failure ⇒ not confirmed
+    got, detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=tmp_path / "missing")
+    assert got is None and "unavailable" in detail
+
+
+# --- tests/live_web_gate_check.py (manual live tool; T710) ------------------
+
+def _live_web_gate_module():
+    import importlib.util
+
+    path = Path(__file__).parent / "live_web_gate_check.py"
+    spec = importlib.util.spec_from_file_location("live_web_gate_check_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, path
+
+
+def test_live_web_gate_key_prefers_env_then_shared_key_pool(monkeypatch, tmp_path):
+    live, _ = _live_web_gate_module()
+    pool = tmp_path / "keys.env"
+    pool.write_text("E2E_KEY_DEEPSEEK=pool-key\n")
+    monkeypatch.setattr(config, "KEYS_FILE", pool)
+    monkeypatch.setenv("DEEPSEEK_KEY", "env-key")
+    assert live._load_key() == "env-key"
+    monkeypatch.delenv("DEEPSEEK_KEY")
+    assert live._load_key() == "pool-key"
+
+
+def test_live_web_gate_missing_key_names_the_pool_file(monkeypatch, tmp_path):
+    live, _ = _live_web_gate_module()
+    monkeypatch.delenv("DEEPSEEK_KEY", raising=False)
+    monkeypatch.setattr(config, "KEYS_FILE", tmp_path / "absent.env")
+    with pytest.raises(SystemExit, match="absent.env"):
+        live._load_key()
+
+
+def test_live_web_gate_has_no_machine_specific_paths(monkeypatch):
+    monkeypatch.setenv("FEEDLING_TEST_PG", "postgresql://u@db.example:5432/postgres")
+    live, path = _live_web_gate_module()
+    assert live.ADMIN == "postgresql://u@db.example:5432/postgres"
+    assert "/Users/" not in path.read_text(encoding="utf-8")

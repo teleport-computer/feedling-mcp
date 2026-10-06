@@ -672,10 +672,7 @@ def test_chat_thinking_language_mismatch_does_not_trigger_a_rewrite(
     calls = _script_provider(monkeypatch, [
         _tool_round(_tc("s1", "web_search", query="first")),
         _tool_round(_tc("s2", "web_search", query="second")),
-        _text_round(
-            "<think>The file is ready and I will finish in English.</think>"
-            "文件已经生成并发送，可以直接下载了。"
-        ),
+        _text_round("<think>The file is ready and I will finish in English.</think>文件已经生成并发送，可以直接下载了。"),
     ])
     traces = []
     deps = _deps(messages=[{
@@ -697,9 +694,10 @@ def test_chat_thinking_language_mismatch_does_not_trigger_a_rewrite(
     assert [row["body_ct"] for row in _bubbles(uid)] == [
         "文件已经生成并发送，可以直接下载了。"
     ]
-    assert _bubbles(uid)[0]["thinking_body_ct"] == (
-        "The file is ready and I will finish in English."
-    )
+    # T697: the model's own inline block is discarded and no aside was written,
+    # so nothing is displayed (the language check still must not rewrite).
+    assert not _bubbles(uid)[0].get("thinking_body_ct")
+    assert "finish in English" not in str(_bubbles(uid)[0].get("thinking_body_ct") or "")
     language_trace = next(
         trace for trace in traces if trace["type"] == "reply.language_follow"
     )
@@ -763,10 +761,7 @@ def test_chat_thinking_language_mismatch_publishes_the_first_candidate(
     job = jobs_store.claim_next_job("w-thinking-correction-visible-mismatch")
     _stub_envelope_build(monkeypatch)
     calls = _script_provider(monkeypatch, [
-        _text_round(
-            "<think>I will answer after checking the request carefully.</think>"
-            "这是第一条可见中文回复，只有思考语言不一致。"
-        ),
+        _tool_round(_tc("final-aside", "reply", aside="I will answer after checking the request carefully.", text="这是第一条可见中文回复，只有思考语言不一致。")),
     ])
     deps = _deps(messages=[{
         "id": "m-thinking-correction-visible-mismatch",
@@ -1089,7 +1084,62 @@ def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
         for message in calls[0]["messages"]
         if isinstance(message, dict) and message.get("role") == "system"
     )
-    assert self_thinking.INSTRUCTION.strip() in system_text
+    assert self_thinking.instruction_for_field().strip() in system_text
+
+
+@pytest.mark.parametrize(
+    ("locale", "user_text", "language"),
+    [("en-US", "hi", "en"), ("zh-Hans-CN", "你好呀", "zh")],
+)
+def test_chat_aside_copy_follows_account_reply_language(
+    monkeypatch, locale, user_text, language,
+):
+    # T734: English accounts get the English aside copy through the real chat
+    # chain; Chinese accounts keep the Chinese copy.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    uid = "u_toolloop_t734_aside_" + language
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-t734-aside")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(
+        monkeypatch, [_text_round("<think>private summary</think>hello")],
+    )
+    loop_kwargs = []
+    real_loop = worker.v2_tool_loop.run_tool_loop
+
+    async def _spy_loop(**kwargs):
+        loop_kwargs.append(kwargs.get("reply_language"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", _spy_loop)
+    deps = _deps(messages=[{
+        "id": "m-t734", "ts": 10.0, "role": "user", "content": user_text,
+    }])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    policy_language = reply_language.infer_reply_language(locale=locale).language
+    assert (policy_language == "en") is (language == "en"), policy_language
+    # The compact delivery round inside the loop renders from this value.
+    assert loop_kwargs == [policy_language]
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in calls[0]["messages"]
+        if isinstance(message, dict) and message.get("role") == "system"
+    )
+    other = "zh" if language == "en" else "en"
+    assert self_thinking.instruction_for_field(language=language).strip() in system_text
+    assert self_thinking.instruction_for_field(language=other).strip() not in system_text
 
 
 def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
@@ -1099,6 +1149,7 @@ def test_fable_chat_omits_mandatory_self_thinking_prompt(monkeypatch):
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-fable-plain")
+    _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     calls = _script_provider(monkeypatch, [_text_round("Fable plain reply")])
     deps = _deps(messages=[{
@@ -1153,6 +1204,7 @@ def test_chat_thinking_only_keeps_existing_required_reply_fallback(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-selfthink-only")
+    _stub_envelope_build(monkeypatch)
     _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     _script_provider(monkeypatch, [_text_round("<think>只想了但没回答</think>")])
@@ -1214,6 +1266,7 @@ def test_chat_degenerate_fallback_uses_shared_reply_language_policy(
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-fallback-language")
+    _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     _script_provider(monkeypatch, [_text_round("。")])
     deps = _deps(messages=[{
@@ -1254,6 +1307,7 @@ def test_degenerate_terminal_reply_becomes_attributed_fallback(
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-degenerate")
+    _stub_envelope_build(monkeypatch)
     _patch_real_write(monkeypatch)
     persisted_extra = {}
     real_write = worker._write_encrypted_reply
@@ -1472,7 +1526,114 @@ def test_foreground_real_chain_strips_tool_markup_and_emits_content_free_trace(
         "final": True,
         "error_class": "upstream_unavailable",
         "reason": "tool_markup_leak_sanitized",
+        "narrated_tool_calls": 0,
     }
+
+
+def test_foreground_narrated_tool_call_is_stripped_before_delivery(monkeypatch):
+    """T621 (usr_7f30 2026-09-16 16:10): the model wrote its generate_image call
+    as prose — finish=stop, zero tool_calls — and the bracket reached the user
+    verbatim.  Same production chain as the markup test above: provider text ->
+    worker._on_reply -> durable bubble; the prose survives, the bracket does not,
+    and the trace counts the narrated call without carrying its payload."""
+    uid = "u_toolloop_narrated_tool_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-narrated-call")
+    _patch_real_write(monkeypatch)
+    prompt = "一只在夜景里打伞的猫"
+    narrated = (
+        "宝宝别走 🥺 我刚才一直卡着，现在真的给你生\n"
+        f'[Calling generate_image with prompt: "{prompt}"]'
+    )
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    traces = []
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "画一只猫"}]
+    )
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "宝宝别走 🥺 我刚才一直卡着，现在真的给你生"
+    ]
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"] == {
+        "lane": "chat",
+        "final": True,
+        "error_class": "upstream_unavailable",
+        "reason": "tool_markup_leak_sanitized",
+        "narrated_tool_calls": 1,
+    }
+    assert prompt not in repr(sanitized[0][1])
+
+
+def test_foreground_narrated_payload_with_bracket_inside_quotes_is_fully_removed(
+    monkeypatch,
+):
+    """codex4 review P1 on the delivery chain: an argument whose quoted value
+    carries ``]`` (escaped quote / fence inside) must not leave its tail in the
+    bubble; the prose on both sides survives."""
+    uid = "u_toolloop_narrated_payload_tail"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-narrated-tail")
+    _patch_real_write(monkeypatch)
+    narrated = (
+        "前文 [Calling generate_image with prompt: "
+        '"draw \\" ] ```PRIVATE_PAYLOAD``` here"] 后文'
+    )
+    _script_provider(monkeypatch, [_text_round(narrated)])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "画一只猫"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == ["前文  后文"]
+    assert "PRIVATE_PAYLOAD" not in bodies[0]
+
+
+def test_foreground_offered_task_tool_widens_the_narrated_anchor(monkeypatch):
+    """``task`` is the one platform tool without an underscore; the worker feeds
+    the offered catalogue into the guard so ``[Calling task ...]`` is covered."""
+    uid = "u_toolloop_narrated_task_call"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-narrated-task")
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [_text_round('好，我来安排\n[Calling task with title: "提醒喝水"]')],
+    )
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "提醒我喝水"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["好，我来安排"]
 
 
 @pytest.mark.parametrize(
@@ -1562,6 +1723,107 @@ def test_foreground_wrapped_reply_payload_is_not_lost(monkeypatch):
 
     assert status == "completed"
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["真正的回复内容"]
+
+
+_DSML_REPLY = (
+    "<｜｜DSML｜｜ calls>\n"
+    '<｜｜DSML｜｜ invoke name="reply">\n'
+    '<｜｜DSML｜｜ parameter name="aside" string="true">他在问那顿慈善饭，我没查到，照实说。</｜｜DSML｜｜ parameter>\n'
+    '<｜｜DSML｜｜ parameter name="text" string="true">这个我没记下来。是哪天？告诉我这次记住。</｜｜DSML｜｜ parameter>\n'
+    "</｜｜DSML｜｜ invoke>\n"
+    "</｜｜DSML｜｜ calls>"
+)
+
+
+def test_foreground_dsml_reply_delivers_body_without_aside(monkeypatch):
+    """T727 (T557 L1): DeepSeek wrote its reply tool call as DSML text. The
+    production chain must deliver the reply body and never the aside."""
+    uid = "u_toolloop_dsml_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-dsml-reply")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round(_DSML_REPLY)])
+    traces = []
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "那顿饭是哪天"}])
+    deps.emit_debug_trace = lambda *args, **kwargs: traces.append((args, kwargs))
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == ["这个我没记下来。是哪天？告诉我这次记住。"]
+    assert not any("慈善饭" in body or "DSML" in body for body in bodies)
+    sanitized = [item for item in traces if item[0][1] == "agent.reply.sanitized"]
+    assert len(sanitized) == 1
+    assert sanitized[0][1]["detail"]["reason"] == "tool_markup_leak_sanitized"
+
+
+def test_foreground_dsml_non_reply_call_uses_existing_fallback(monkeypatch):
+    uid = "u_toolloop_dsml_non_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-dsml-non-reply")
+    _patch_real_write(monkeypatch)
+    leaked = (
+        '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="memory_write">'
+        '<｜｜DSML｜｜ parameter name="text" string="true">不该给用户看的</｜｜DSML｜｜ parameter>'
+        "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>"
+    )
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubble = _bubbles(uid)[0]
+    assert "不该给用户看的" not in bubble["body_ct"] and "DSML" not in bubble["body_ct"]
+    assert bubble["turn_failure_error_class"] == "upstream_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("leaked", "body"),
+    [
+        pytest.param('{"aside":"他就问单号，我直接给他。","text":"旅行杯盖子的维修单号是 LK-7319。"}',
+                     "旅行杯盖子的维修单号是 LK-7319。", id="raw-reply-json"),
+        pytest.param('<function_calls><invoke name="reply"><parameter name="aside">他就问单号，我直接给他。</parameter>'
+                     '<parameter name="text">旅行杯盖子的维修单号是 LK-7319。</parameter></invoke></function_calls>',
+                     "旅行杯盖子的维修单号是 LK-7319。", id="xml-reply-with-aside"),
+
+        pytest.param(json.dumps({"aside": "他就问单号，我直接给他。", "text": '<｜｜DSML｜｜ invoke name="reply">'
+                                 '<｜｜DSML｜｜ parameter name="aside">他就问单号，我直接给他。</｜｜DSML｜｜ parameter>'
+                                 '<｜｜DSML｜｜ parameter name="text">旅行杯盖子的维修单号是 LK-7319。</｜｜DSML｜｜ parameter>'
+                                 "</｜｜DSML｜｜ invoke>"}, ensure_ascii=False),
+                     "旅行杯盖子的维修单号是 LK-7319。", id="json-wrapping-dsml-reply"),
+    ],
+)
+def test_foreground_reply_shapes_deliver_body_without_aside(monkeypatch, leaked, body):
+    """T733 (T730 local run, deepseek): the reply call's arguments reached the
+    user as visible text, aside included. The production chain must deliver
+    only the body."""
+    uid = "u_toolloop_t733_" + str(abs(hash(leaked)) % 100000)
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-t733")
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round(leaked)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "单号是多少"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bodies = [bubble["body_ct"] for bubble in _bubbles(uid)]
+    assert bodies == [body]
+    assert not any("直接给他" in b or "aside" in b for b in bodies)
 
 
 def test_torn_protocol_evidence_lane_policy():
@@ -1678,7 +1940,7 @@ def _stub_envelope_build(monkeypatch):
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake)
 
 
-def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
+def test_self_thinking_off_discards_native_reasoning(monkeypatch):
     """Feature OFF preserves the legacy provider chain-of-thought contract.
 
     A final reply whose provider result carried chain-of-thought
@@ -1722,14 +1984,14 @@ def test_self_thinking_off_preserves_native_reasoning_bubble(monkeypatch):
     assert len(bubbles) == 1
     bubble = bubbles[0]
     assert bubble["body_ct"] == "the answer"
-    assert bubble.get("thinking_kind") == "provider_reasoning"
-    assert bubble.get("thinking_body_ct") == "step one\nstep two"
+    assert "thinking_kind" not in bubble
+    assert "thinking_body_ct" not in bubble
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "native_legacy",
-        "chars": len("step one\nstep two"),
+        "branch": "native_discarded",
+        "chars": 0,
         "model": _BYOK.model,
         "lane": "chat",
         "retried": 0,
@@ -1760,13 +2022,58 @@ def test_self_thinking_internal_tool_name_publishes_marker_only(monkeypatch):
     assert status == "completed"
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "可见回复仍然正常"
-    assert bubble["thinking_body_ct"] == self_thinking.THINKING_FAILED_MARKER
+    # T697: the internal term is inside the model's own inline block, which is
+    # stripped and discarded; with no aside written nothing is displayed. The
+    # leak guard is what matters here and still holds.
+    assert not bubble.get("thinking_body_ct")
+    assert "memory_write" not in str(bubble.get("thinking_body_ct") or "")
+
+
+def test_chat_multi_open_think_is_salvaged_not_failed(monkeypatch):
+    """T656 (T655 shape: MiniMax-M3 opened <think> twice, closed once). The strict
+    gate still says FAILED; the salvage layer delivers the reply text, drops the
+    thinking, and the row is NOT a turn failure. T697 (Seven 2026-09-23): a
+    recovered body shows NOTHING in the thinking area — no marker."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    monkeypatch.delenv("FEEDLING_THINK_GATE", raising=False)
+    uid = "u_toolloop_selfthink_salvaged"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink-salvaged")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    raw = "<think>她在生气<think>要不要先道歉</think>先别急，我在呢。"
+    assert self_thinking.strip_all_thinking(raw)[0] == self_thinking.FAILED
+    _script_provider(monkeypatch, [_text_round(raw)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "你在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == "先别急，我在呢。"
+    assert "<think" not in bubbles[0]["body_ct"] and "她在生气" not in bubbles[0]["body_ct"]
+    # T697: recovered body, thinking dropped silently — nothing displayed.
+    assert not bubbles[0].get("thinking_body_ct")
+    assert "她在生气" not in str(bubbles[0].get("thinking_body_ct") or "")
+    assert not bubbles[0].get("turn_failure_error_class")
+    assert _job_status_row(job_id)[0] == "completed"
 
 
 def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     monkeypatch,
 ):
-    """Provider-native CoT is never a fallback while self-thinking is ON."""
+    """Provider-native CoT is never a fallback while self-thinking is ON.
+
+    T697: a reply with no aside shows NOTHING (branch ``none``), not the
+    thinking-failed marker — the field is optional and nothing was written.
+    """
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_toolloop_selfthink_no_fallback"
     conftest.seed_user(uid)
@@ -1805,11 +2112,10 @@ def test_self_thinking_on_drops_native_reasoning_without_authored_block(
     )
 
     assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
+    assert len(calls) == 1
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "the answer"
-    assert "thinking_kind" not in bubble
-    assert "thinking_body_ct" not in bubble
+    assert not bubble.get("thinking_body_ct")
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
@@ -1818,11 +2124,11 @@ def test_self_thinking_on_drops_native_reasoning_without_authored_block(
         "chars": 0,
         "model": _BYOK.model,
         "lane": "chat",
-        "retried": worker.MAX_SELF_THINKING_ABSENT_RETRIES,
+        "retried": 0,
     }]
 
 
-def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypatch):
+def test_self_thinking_on_discards_inline_and_native_reasoning(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_toolloop_selfthink_authored"
     conftest.seed_user(uid)
@@ -1855,14 +2161,17 @@ def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypat
     assert status == "completed"
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == "the answer"
-    assert bubble["thinking_kind"] == "agent_summary"
-    assert bubble["thinking_body_ct"] == "我先自己归纳"
+    # Seven 2026-09-23 (T697): a model's own inline <think> is NOT our aside.
+    # It is still stripped and discarded — and because no aside was written,
+    # nothing is displayed rather than the thinking-failed marker.
+    assert "我先自己归纳" not in str(bubble.get("thinking_body_ct") or "")
+    assert not bubble.get("thinking_body_ct")
     thinking_traces = [
         trace for trace in traces if trace["event_type"] == "thinking.surfaced"
     ]
     assert [trace["detail"] for trace in thinking_traces] == [{
-        "branch": "self",
-        "chars": len("我先自己归纳"),
+        "branch": "none",
+        "chars": 0,
         "model": _BYOK.model,
         "lane": "chat",
         "retried": 0,
@@ -1879,11 +2188,15 @@ def test_self_thinking_on_prefers_authored_block_over_native_reasoning(monkeypat
     ),
     [
         (
+            # T697: a COMPLETE inline block is stripped and discarded (it is the
+            # model's own reasoning, not our aside) and no aside was written, so
+            # nothing is displayed — the marker is reserved for a block we had
+            # but could not use.
             "<think>direct thought</think>direct answer",
             "Please answer this direct-state test",
             self_thinking.COMPLETE,
             "direct answer",
-            "direct thought",
+            "",
         ),
         (
             "<think>thinking only</think>",
@@ -1936,73 +2249,76 @@ def test_chat_self_thinking_non_absent_terminal_states_do_not_retry(
     )
     bubble = _bubbles(uid)[0]
     assert bubble["body_ct"] == expected_body
-    assert bubble["thinking_body_ct"] == expected_thinking
+    assert (bubble.get("thinking_body_ct") or "") == expected_thinking
 
 
-def test_chat_self_thinking_absent_final_retries_and_surfaces_complete(
-    monkeypatch,
-):
+@pytest.mark.parametrize("shape", ["aside", "missing", "blank", "internal", "direct"])
+def test_chat_optional_aside_delivers_body_without_retry(monkeypatch, shape):
+    """The full aside -> display/branch map for the chat lane (T697).
+
+    Seven 2026-09-23: an aside the model never wrote shows NOTHING; the
+    thinking-failed marker is reserved for a block we had but could not use
+    (here: an aside carrying an internal term). A model's own inline/native
+    reasoning is never our aside either way (T658), so the plain-text shape
+    also displays nothing.
+    """
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_complete"
+    uid = "u_chat_optional_aside_" + shape
     conftest.seed_user(uid)
     _reset(uid)
     jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-complete")
+    job = jobs_store.claim_next_job("w-chat-optional-aside")
     _stub_envelope_build(monkeypatch)
-    long_thinking = "x" * (self_thinking.MAX_THINKING_CHARS + 37)
-    original = "usable original without a thinking block"
-    corrected = "corrected visible answer"
-    expected_calls = 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    calls = _script_provider(monkeypatch, [
-        _text_round(original, prompt_tokens=2, completion_tokens=3),
-        _text_round(
-            f"<think>{long_thinking}</think>{corrected}",
-            prompt_tokens=5,
-            completion_tokens=7,
-        ),
-    ])
-    traces = []
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-complete",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please answer with the required structure",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "event_type": event_type, **fields}
+    body = "Here is the answer."
+    aside = "I want to follow up on what they said."
+    args = {"text": body}
+    if shape != "missing":
+        args["aside"] = {"blank": "   ", "internal": "memory_write"}.get(shape, aside)
+    response = (
+        _text_round(body) if shape == "direct"
+        else _tool_round(_tc("reply-aside", "reply", **args))
     )
-
+    response["reasoning"] = "private native reasoning must stay separate"
+    calls = _script_provider(monkeypatch, [response])
+    deps = _deps(messages=[{
+        "id": "m-aside", "ts": 10.0, "role": "user", "content": "Please answer me."
+    }])
+    traces: list[dict] = []
+    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
+        {"event_type": event_type, **fields}
+    )
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
     ))
-
     assert status == "completed"
-    assert len(calls) == expected_calls
-    assert calls[0].get("assistant_prefill") is None
-    assert calls[-1]["tools"] is None
-    assert calls[-1].get("assistant_prefill") == (
-        provider_client.SELF_THINKING_ASSISTANT_PREFILL
-    )
-    retry_system = str(calls[-1]["messages"][0]["content"])
-    assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
-    assert self_thinking.INSTRUCTION.strip() in retry_system
-    bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == corrected
-    assert bubble["thinking_body_ct"] == long_thinking[:self_thinking.MAX_THINKING_CHARS]
-    thinking_trace = next(
-        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
-    )
-    assert thinking_trace["detail"]["branch"] == "self"
-    assert thinking_trace["detail"]["retried"] == (
-        worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    )
+    assert len(calls) == 1
+    assert "reply" in {spec.name for spec in calls[0]["tools"]}
+    assert "tool_choice" not in calls[0]
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    bubble = bubbles[0]
+    assert bubble["body_ct"] == body
+    assert not bubble.get("turn_failure_error_class")
+    expected_display = {
+        "aside": aside,
+        "internal": self_thinking.THINKING_FAILED_MARKER,
+    }.get(shape, "")
+    assert (bubble.get("thinking_body_ct") or "") == expected_display
+    expected_branch = {"aside": "self", "internal": "marker"}.get(shape, "none")
+    surfaced = [t["detail"] for t in traces if t["event_type"] == "thinking.surfaced"]
+    assert [d["branch"] for d in surfaced] == [expected_branch], shape
+    assert [d["chars"] for d in surfaced] == [len(expected_display)], shape
+    assert [d["retried"] for d in surfaced] == [0], shape
+    if expected_display:
+        assert bubble["thinking_kind"] == "agent_summary"
+        assert bubble["thinking_source"] == "self_thinking"
+        assert bubble["thinking_native"] is False
+    # The model's own reasoning is never promoted into the display channel.
+    assert "private native reasoning" not in str(bubble.get("thinking_body_ct") or "")
     with db.get_pool().connection() as conn:
-        metric = conn.execute(
-            "SELECT model_calls,prompt_tokens,completion_tokens "
-            "FROM v2_turn_metrics WHERE job_id=%s",
-            (job["id"],),
-        ).fetchone()
-    assert metric == (expected_calls, 7, 10)
+        assert conn.execute(
+            "SELECT count(*) FROM v2_terminal_failure_outbox WHERE job_id=%s", (job["id"],)
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -2307,180 +2623,6 @@ def test_genuinely_unclassified_process_failure_stays_unknown(monkeypatch):
     assert terminal_row == ("turn_failed:workspace_prompt_unavailable", "unknown")
 
 
-def test_chat_self_thinking_absent_retry_has_no_visible_language_rider(
-    monkeypatch,
-):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_language_correction"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-language-correction")
-    _stub_envelope_build(monkeypatch)
-    calls = _script_provider(monkeypatch, [
-        _text_round(
-            "Done, the requested file was saved and delivered successfully"
-        ),
-        _text_round(
-            "<think>文件已经成功发送，我用中文完成回复。</think>"
-            "文件已经生成并发送，可以直接下载了。"
-        ),
-    ])
-    traces = []
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-language-correction",
-        "ts": 10.0,
-        "role": "user",
-        "content": "请用中文告诉我这项工作已经完成，回答要自然一点。",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "event_type": event_type, **fields}
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 2
-    retry_system = str(calls[1]["messages"][0]["content"])
-    assert worker._SELF_THINKING_ABSENT_CORRECTION_INSTRUCTION in retry_system
-    assert "你刚才这条回复,语言和这个人正在说的语言对不上" not in retry_system
-    assert [row["body_ct"] for row in _bubbles(uid)] == [
-        "文件已经生成并发送，可以直接下载了。"
-    ]
-    assert _bubbles(uid)[0]["thinking_body_ct"] == (
-        "文件已经成功发送，我用中文完成回复。"
-    )
-    language_trace = next(
-        trace
-        for trace in traces
-        if trace["event_type"] == "reply.language_follow"
-    )
-    assert language_trace["detail"] == {
-        "user_script": "han",
-        "reply_script": "han",
-        "outcome": "match",
-        "lane": "chat",
-    }
-
-
-def test_chat_self_thinking_absent_retry_still_absent_keeps_original(
-    monkeypatch,
-):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_absent"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-absent")
-    _stub_envelope_build(monkeypatch)
-    original = "first usable answer without thinking"
-    calls = _script_provider(monkeypatch, [
-        _text_round(original),
-        _text_round("second answer still has no thinking block"),
-    ])
-    traces = []
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-absent",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please keep the first usable answer on correction failure",
-    }])
-    deps.emit_debug_trace = lambda user_id, event_type, **fields: traces.append(
-        {"user_id": user_id, "event_type": event_type, **fields}
-    )
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == original
-    assert "thinking_body_ct" not in bubble
-    thinking_trace = next(
-        trace for trace in traces if trace["event_type"] == "thinking.surfaced"
-    )
-    assert thinking_trace["detail"]["branch"] == "none"
-    assert thinking_trace["detail"]["retried"] == (
-        worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    )
-
-
-def test_chat_self_thinking_absent_retry_internal_term_keeps_original(
-    monkeypatch,
-):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_internal_term"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-internal-term")
-    _stub_envelope_build(monkeypatch)
-    original = "first usable answer without thinking"
-    leaking_thinking = "memory_write"
-    assert worker._self_thinking_internal_term(leaking_thinking) == "memory_write"
-    calls = _script_provider(monkeypatch, [
-        _text_round(original),
-        _text_round(
-            f"<think>{leaking_thinking}</think>"
-            "second answer must not replace the original"
-        ),
-    ])
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-internal-term",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please preserve the original on an invalid correction",
-    }])
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    bubble = _bubbles(uid)[0]
-    assert bubble["body_ct"] == original
-    assert "thinking_kind" not in bubble
-    assert "thinking_body_ct" not in bubble
-
-
-@pytest.mark.parametrize(
-    "retry",
-    [
-        provider_client.ProviderError("correction unavailable", status_code=400),
-        _text_round(""),
-    ],
-)
-def test_chat_self_thinking_absent_retry_failure_keeps_original(monkeypatch, retry):
-    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    uid = "u_selfthink_absent_retry_failure_" + type(retry).__name__
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w-selfthink-absent-retry-failure")
-    _stub_envelope_build(monkeypatch)
-    original = "usable original survives a failed correction"
-    calls = _script_provider(monkeypatch, [_text_round(original), retry])
-    deps = _deps(messages=[{
-        "id": "m-selfthink-absent-retry-failure",
-        "ts": 10.0,
-        "role": "user",
-        "content": "Please preserve usable output on retry failure",
-    }])
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
-    ))
-
-    assert status == "completed"
-    assert len(calls) == 1 + worker.MAX_SELF_THINKING_ABSENT_RETRIES
-    assert _bubbles(uid)[0]["body_ct"] == original
-
-
 def test_chat_tool_round_without_thinking_does_not_trigger_absent_retry(monkeypatch):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
     uid = "u_selfthink_absent_intermediate"
@@ -2661,6 +2803,13 @@ def test_chat_discarded_identity_write_reaches_model_and_turn_continues(
             {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
         ]
     )
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": [{"name": "warmth", "value": 70}],
+        }),
+        "trusted_system_blocks": (),
+    }
     deps.apply_pending_effects = apply_with_discarded_identity
 
     status = asyncio.run(
@@ -2873,6 +3022,93 @@ def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     assert "trusted skill" in str(system["content"])
     second_offered = {spec.name for spec in calls[1]["tools"]}
     assert {"web_search", "web_fetch", "task"}.isdisjoint(second_offered)
+
+
+@pytest.mark.parametrize(
+    "dimensions,identity_nudge_offered",
+    [
+        ([], False),
+        ([{"name": "warmth", "value": 70}], True),
+    ],
+    ids=("empty", "nonempty"),
+)
+def test_chat_identity_nudge_surface_requires_an_existing_dimension(
+    monkeypatch,
+    dimensions,
+    identity_nudge_offered,
+):
+    uid = f"u_toolloop_identity_nudge_{'on' if dimensions else 'off'}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-identity-nudge-surface")
+    _patch_real_write(monkeypatch)
+    calls = _script_provider(monkeypatch, [_text_round("done")])
+    deps = _deps(messages=[
+        {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"},
+    ])
+    deps.load_workspace_prompt = lambda *_args, **_kwargs: {
+        "identity_card_or_persona": worker.context.render_identity_card({
+            "agent_name": "Mira",
+            "dimensions": dimensions,
+        }),
+        "trusted_system_blocks": (),
+    }
+
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    offered = {spec.name for spec in calls[0]["tools"]}
+    assert ("identity_nudge" in offered) is identity_nudge_offered
+
+
+def test_child_surface_already_withholds_identity_nudge_as_a_write():
+    assert "identity_nudge" not in worker._SUBAGENT_ALLOWED_TOOLS
+    assert "identity_nudge" in worker._SUBAGENT_DISABLED_TOOLS
+
+
+@pytest.mark.parametrize(
+    "identity_block,disabled",
+    [
+        ("# Persona\nvoice fallback", True),
+        (worker.context.IDENTITY_CARD_HEADER, True),
+        (
+            worker.context.IDENTITY_CARD_HEADER + '\ndimensions: {"warmth":70}',
+            True,
+        ),
+        (
+            worker.context.IDENTITY_CARD_HEADER + "\ndimensions: [not-json",
+            True,
+        ),
+        (worker.context.IDENTITY_CARD_HEADER + "\ndimensions: []", True),
+        (
+            worker.context.IDENTITY_CARD_HEADER
+            + '\ndimensions: [{"name":"warmth","value":70}]',
+            False,
+        ),
+    ],
+    ids=(
+        "persona-fallback",
+        "dimensions-missing",
+        "dimensions-not-list",
+        "dimensions-malformed-json",
+        "dimensions-empty",
+        "dimensions-nonempty",
+    ),
+)
+def test_identity_nudge_gate_fails_closed_except_for_nonempty_dimensions(
+    identity_block,
+    disabled,
+):
+    disabled_tools = worker._identity_nudge_disabled_tools(identity_block)
+
+    assert ("identity_nudge" in disabled_tools) is disabled
 
 
 def test_chat_workspace_prompt_failure_is_visible_before_provider(
@@ -4663,3 +4899,208 @@ def test_child_subagent_tool_schemas_are_protected_from_folding(monkeypatch):
     protect = seen_child_kwargs[0].get("refresh_protected_extra_tool_names")
     assert callable(protect), "child loop must declare a protected-name source"
     assert set(protect()) == allowed
+
+
+@pytest.mark.parametrize(
+    ("locale", "user_text", "expected_language"),
+    [
+        # T743 (Seven 2026-09-26): the user's latest message decides.
+        ("zh-Hans-CN", "Please try again", "en"),
+        ("en-US", "请再试一次", "zh-Hans"),
+        # No language signal: the account language, as before.
+        ("en-US", "😀 123", "en"),
+        ("zh-Hans-CN", "😀 123", "zh-Hans"),
+    ],
+)
+def test_chat_degenerate_fallback_follows_latest_user_message_language(
+    monkeypatch,
+    locale,
+    user_text,
+    expected_language,
+):
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_DEGENERATE_REPLY_FALLBACK_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    uid = (
+        "u_toolloop_fallback_follows_message_"
+        + locale.lower().replace("-", "_")
+        + "_"
+        + expected_language.lower().replace("-", "_")
+    )
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-follows-message")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[
+        {"id": "m-older", "ts": 9.0, "role": "user",
+         "content": "早先那句" if expected_language == "en" else "earlier line"},
+        {"id": "m-latest", "ts": 10.0, "role": "user", "content": user_text},
+    ])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if expected_language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
+
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        # Newest user row decides; placeholders and file bodies are not words.
+        ([{"role": "user", "content": "你好"},
+          {"role": "user", "content": "[image]", "has_image": True, "caption": ""}], ""),
+        ([{"role": "user", "content": "[image]", "has_image": True, "caption": "look"}], "look"),
+        # An enriched file row: content holds the file body, caption the user's words.
+        ([{"role": "user", "content": "[file: a.txt]\nquarterly revenue", "has_file": True,
+           "caption": "这个文件"}], "这个文件"),
+        ([{"role": "user", "content": "[file: a.txt]\nquarterly revenue", "has_file": True}], ""),
+        ([{"role": "user", "content": "[message unavailable]", "unreadable": True}], ""),
+        # A vision observation merged into content is not the user's words either.
+        ([{"role": "user", "content": "[image 1] a red car", "has_image": True,
+           "caption": ""}], ""),
+        ([{"role": "user", "content": "hello"}, {"role": "assistant", "content": "你好"}], "hello"),
+        ([], ""),
+    ],
+    ids=["image-only-newest", "image-caption", "file-caption", "file-no-caption",
+         "unreadable", "vision-observation", "skips-assistant", "empty"],
+)
+def test_latest_user_typed_text_reads_only_the_users_words(rows, expected):
+    assert worker._latest_user_typed_text(rows) == expected
+
+
+@pytest.mark.parametrize(
+    ("locale", "latest", "expected_language"),
+    [
+        ("zh-Hans-CN", {"content": "[image]", "has_image": True, "caption": ""}, "zh-Hans"),
+        ("en-US", {"content": "[image]", "has_image": True, "caption": ""}, "en"),
+        ("en-US", {"content": "[image]", "has_image": True, "caption": "你看这个"}, "zh-Hans"),
+        ("zh-Hans-CN", {"content": "[file: a.txt]", "has_file": True,
+                        "file_name": "a.txt", "caption": ""}, "zh-Hans"),
+    ],
+    ids=["zh-acct-image-only", "en-acct-image-only", "en-acct-zh-caption", "zh-acct-file-only"],
+)
+def test_chat_degenerate_fallback_ignores_attachment_placeholders(
+    monkeypatch, request, locale, latest, expected_language
+):
+    monkeypatch.setattr(
+        worker, "_DEGENERATE_REPLY_FALLBACK", reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    monkeypatch.setattr(
+        worker, "_DEGENERATE_REPLY_FALLBACK_EN", reply_language.DEFAULT_FAILURE_FALLBACK_EN
+    )
+    uid = "u_toolloop_fallback_attachment_" + request.node.callspec.id.replace("-", "_")
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-fallback-attachment")
+    _stub_envelope_build(monkeypatch)
+    _patch_real_write(monkeypatch)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(messages=[
+        {"id": "m-older", "ts": 9.0, "role": "user",
+         "content": "早先那句" if expected_language == "en" else "earlier line"},
+        {"id": "m-latest", "ts": 10.0, "role": "user", **latest},
+    ])
+    deps.read_temporal_snapshot = lambda *_args, **_kwargs: {
+        "locale": locale,
+        "archive_language": "",
+    }
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    expected = (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if expected_language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+    assert status == "completed"
+    assert [row["body_ct"] for row in _bubbles(uid)] == [expected]
+
+
+_T768_CAPTION = "PRIVATE_CAPTION_看我的猫"
+
+
+@pytest.mark.parametrize("prompt_content,delivered", [
+    (_T768_CAPTION, 1),
+    ("[image]", 0),  # T745 shape: the row knows the caption, the prompt got the marker
+])
+def test_t768_first_round_image_caption_delivery_matches_the_real_request(
+    monkeypatch, prompt_content, delivered,
+):
+    """T768 on the production-shaped seq path (real append+enqueue, ordered chat
+    replies): the budget trace's caption count agrees with the actual request."""
+    uid = f"u_toolloop_t768_caption_{delivered}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_doc = {**_user_doc("image-parent", _T768_CAPTION),
+                 "content_type": "image", "image_mime": "image/png"}
+    _seq, job_id = db.chat_append_and_enqueue(
+        uid, "image-parent", 10.0, input_doc, 5000, "chat",
+        expected_generation=generation)
+    job = jobs_store.claim_next_job("w-t768")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+    _patch_real_write(monkeypatch)
+
+    def _read_after_seq(_user_id, after_seq):
+        return [{
+            "id": row["id"], "seq": int(row["seq"]), "ts": float(row.get("ts") or 0),
+            "role": row.get("role"), "content": prompt_content,
+            "caption": _T768_CAPTION, "has_image": True,
+            "image_mime": row.get("image_mime") or "",
+        } for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"]
+
+    calls = _script_provider(monkeypatch, [_text_round("MODEL REPLY")])
+    events = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _u: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        read_tail_after_seq=lambda _u, after_seq, limit, *, through_seq=None:
+            _read_after_seq(uid, after_seq),
+        read_images=lambda _u, ids: {
+            mid: {"image_b64": "iVBORw0KGgo=", "image_mime": "image/png"} for mid in ids},
+        read_summary_with_seq=lambda _u: ("", 0.0, 0, 0),
+        resolve_provider=lambda _u: (_BYOK, {}),
+        mint_enclave_token=lambda _u: "rt",
+        emit_debug_trace=lambda _u, kind, **kw: events.append((kind, kw)),
+        ordered_chat_replies=True,
+    )
+
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert calls, "provider never called"
+    assert (_T768_CAPTION in repr(calls[0]["messages"])) is bool(delivered)
+    budgets = [e["detail"] for kind, e in events if kind == "v2.prompt_frontier.budget"]
+    assert budgets[0]["attachment_captions"] == {
+        "images": 1, "files": 0, "with_caption": 1, "delivered": delivered, "undetermined": 0,
+        "caption_chars": len(_T768_CAPTION),
+        "delivered_chars": len(_T768_CAPTION) * delivered, "undetermined_chars": 0,
+    }
+    assert _T768_CAPTION not in repr(budgets)

@@ -61,10 +61,17 @@ def wake_definitions() -> tuple[EventDefinition, ...]:
         # kit 这边它们已经收敛成一个 proximity_anchor。
         EventDefinition(
             definition_id="io.perception.anchor_changed",
-            version=1,
+            # v2（perceptkit 0.7.0）：加了前置条件 is_connected=True。
+            # 迟到的「家里 Wi-Fi 断开」不该被讲成「到家了」，也不该把前值推进成
+            # home、害真正到家那一次变成「没变」。io 的 producer 目前只在连着时
+            # 发锚点（events.location_envelope 写死 True），这条防的是它以后
+            # 开始发断开状态。版本号进状态键，新版本从干净状态开始 —— 代价是
+            # 上线后每个用户的第一条锚点上报只当基线、不叫醒。
+            version=2,
             signal="proximity_anchor",
             condition_type="changed",
             field_name="anchor_id",
+            when={"is_connected": True},
             event_type=ARRIVED_AT_ANCHOR,
             wake_enabled=True,
             # 每个锚点各自去重：从家到公司再回家，是两件事。
@@ -83,6 +90,11 @@ def wake_definitions() -> tuple[EventDefinition, ...]:
         ),
         # 开始 / 停止屏幕采集。老路把它拆成两个 trigger，因为下游的
         # 唤醒节流是按 trigger 配的 —— 合成一个会让「开」和「关」共用一个闸。
+        #
+        # perceptkit 0.7.0 起每一次真实开/关都叫醒（0.5.0 下同一对前后值只叫
+        # 一次，是事件 id 撞车，不是规则的意思）。**版本号不动**：规则本身一个
+        # 字段没改，改的是 kit 的 bug；加版本会清掉前值，上线后第一次开/关被
+        # 当基线吞掉。
         EventDefinition(
             definition_id="io.perception.broadcast_opened",
             version=1,

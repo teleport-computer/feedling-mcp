@@ -113,7 +113,7 @@ def test_upsert_offloads_body_to_r2(monkeypatch):
     uid = _uid()
     seed_user(uid)
     env = _env(uid, "f1")
-    db.frame_upsert(uid, "f1", 1.0, env)
+    db.frame_upsert(uid, "f1", 1.0, env, source="screen")
 
     # ciphertext landed in R2 as raw decoded bytes
     assert fake.store[("io-image-frames", "frames/%s/f1" % uid)] == base64.b64decode(env["body_ct"])
@@ -124,6 +124,7 @@ def test_upsert_offloads_body_to_r2(monkeypatch):
     assert "body_ct" not in env_meta
     assert env_meta["nonce"] == env["nonce"]
     assert env_meta["owner_user_id"] == uid
+    assert env_meta["source"] == "screen"
 
 
 def test_get_reconstructs_full_envelope(monkeypatch):
@@ -132,7 +133,7 @@ def test_get_reconstructs_full_envelope(monkeypatch):
     uid = _uid()
     seed_user(uid)
     env = _env(uid, "f1")
-    db.frame_upsert(uid, "f1", 1.0, env)
+    db.frame_upsert(uid, "f1", 1.0, env, source="screen")
     assert db.frame_get(uid, "f1") == env  # byte-for-byte, incl body_ct
 
 
@@ -142,7 +143,7 @@ def test_get_retries_one_transient_r2_failure(monkeypatch):
     uid = _uid()
     seed_user(uid)
     env = _env(uid, "f1")
-    assert db.frame_upsert(uid, "f1", 1.0, env) is True
+    assert db.frame_upsert(uid, "f1", 1.0, env, source="screen") is True
     real_get = object_storage.get_frame_body_strict
     calls = {"count": 0}
 
@@ -164,7 +165,9 @@ def test_get_can_distinguish_exhausted_r2_failure_from_missing(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    assert db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1")) is True
+    assert db.frame_upsert(
+        uid, "f1", 1.0, _env(uid, "f1"), source="screen"
+    ) is True
     monkeypatch.setattr(
         object_storage,
         "get_frame_body_strict",
@@ -185,7 +188,7 @@ def test_plaintext_frame_body_is_offloaded_and_reconstructed(monkeypatch):
     uid = _uid()
     seed_user(uid)
     env = _plaintext_env(uid, "plain-f1")
-    db.frame_upsert(uid, "plain-f1", 1.0, env)
+    db.frame_upsert(uid, "plain-f1", 1.0, env, source="screen")
     doc, env_meta, body_key = _row(uid, "plain-f1")
     assert doc is None
     assert body_key == f"frames/{uid}/plain-f1"
@@ -200,7 +203,10 @@ def test_plaintext_frame_r2_integrity_mismatch_fails_closed(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "plain-bad", 1.0, _plaintext_env(uid, "plain-bad"))
+    db.frame_upsert(
+        uid, "plain-bad", 1.0, _plaintext_env(uid, "plain-bad"),
+        source="screen",
+    )
     fake.store[("io-image-frames", f"frames/{uid}/plain-bad")] = b"tampered"
 
     assert db.frame_get(uid, "plain-bad") is None
@@ -212,7 +218,7 @@ def test_caller_dict_not_mutated(monkeypatch):
     uid = _uid()
     seed_user(uid)
     env = _env(uid, "f1")
-    db.frame_upsert(uid, "f1", 1.0, env)
+    db.frame_upsert(uid, "f1", 1.0, env, source="screen")
     assert "body_ct" in env  # upsert must not pop body_ct off the caller's dict
 
 
@@ -223,7 +229,7 @@ def test_get_returns_none_when_r2_body_missing(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
     fake.store.clear()  # the R2 body vanished
     assert db.frame_get(uid, "f1") is None
 
@@ -251,7 +257,7 @@ def test_delete_keeps_r2_when_db_delete_fails(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
     assert ("io-image-frames", "frames/%s/f1" % uid) in fake.store
     monkeypatch.setattr(db, "get_pool", lambda: _BoomPool())
     db.frame_delete(uid, "f1")
@@ -266,12 +272,16 @@ def test_upsert_does_not_overwrite_r2_when_db_write_fails(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1", body=b"AAAA"))
+    db.frame_upsert(
+        uid, "f1", 1.0, _env(uid, "f1", body=b"AAAA"), source="screen"
+    )
     key = ("io-image-frames", "frames/%s/f1" % uid)
     assert fake.store[key] == b"AAAA"
 
     monkeypatch.setattr(db, "get_pool", lambda: _BoomPool())
-    assert db.frame_upsert(uid, "f1", 2.0, _env(uid, "f1", body=b"BBBB")) is False
+    assert db.frame_upsert(
+        uid, "f1", 2.0, _env(uid, "f1", body=b"BBBB"), source="screen"
+    ) is False
     assert fake.store[key] == b"AAAA"  # unchanged — old object not clobbered
 
 
@@ -293,7 +303,7 @@ def test_pointer_row_written_only_after_object_exists(monkeypatch):
         return real_put(Bucket=Bucket, Key=Key, Body=Body, **kw)
 
     fake.put_object = spy_put
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
 
     # at upload time the row was inline (doc present, no pointer yet)
     assert seen["row_at_upload"] == (True, None)
@@ -308,7 +318,7 @@ def test_delete_removes_r2_object(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
     db.frame_delete(uid, "f1")
     assert db.frame_exists(uid, "f1") is False
     assert ("io-image-frames", "frames/%s/f1" % uid) not in fake.store
@@ -320,7 +330,9 @@ def test_prune_removes_r2_objects(monkeypatch):
     uid = _uid()
     seed_user(uid)
     for i in range(4):
-        db.frame_upsert(uid, f"f{i}", float(i), _env(uid, f"f{i}"))
+        db.frame_upsert(
+            uid, f"f{i}", float(i), _env(uid, f"f{i}"), source="screen"
+        )
     evicted = db.frame_prune_to(uid, 2)  # keep newest 2 (f2, f3)
     assert set(evicted) == {"f0", "f1"}
     assert ("io-image-frames", "frames/%s/f0" % uid) not in fake.store
@@ -335,7 +347,7 @@ def test_delete_reaps_both_prefixes(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
     # Simulate the replicator having written the TEE storage-layer body.
     object_storage.put_frame_tee_body(uid, "f1", base64.b64encode(b"sealed").decode())
     assert ("io-image-frames", "frames-tee/%s/f1" % uid) in fake.store
@@ -351,7 +363,9 @@ def test_prune_reaps_both_prefixes(monkeypatch):
     uid = _uid()
     seed_user(uid)
     for i in range(4):
-        db.frame_upsert(uid, f"f{i}", float(i), _env(uid, f"f{i}"))
+        db.frame_upsert(
+            uid, f"f{i}", float(i), _env(uid, f"f{i}"), source="screen"
+        )
         object_storage.put_frame_tee_body(uid, f"f{i}", base64.b64encode(b"s").decode())
     evicted = db.frame_prune_to(uid, 2)  # evict f0, f1
     assert set(evicted) == {"f0", "f1"}
@@ -370,10 +384,10 @@ def test_delete_user_data_does_not_touch_r2(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
-    db.frame_upsert(uid, "f2", 2.0, _env(uid, "f2"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
+    db.frame_upsert(uid, "f2", 2.0, _env(uid, "f2"), source="screen")
     db.delete_user_data(uid)
-    assert db.frame_list_meta(uid) == []
+    assert db.frame_list_meta(uid, source="screen") == []
     assert [k for (b, k) in fake.store if k.startswith("frames/%s/" % uid)]
 
 
@@ -382,8 +396,8 @@ def test_delete_user_frames_purges_r2(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
-    db.frame_upsert(uid, "f2", 2.0, _env(uid, "f2"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
+    db.frame_upsert(uid, "f2", 2.0, _env(uid, "f2"), source="screen")
     db.delete_user_frames(uid)
     assert not [k for (b, k) in fake.store if k.startswith("frames/%s/" % uid)]
 
@@ -393,10 +407,10 @@ def test_list_meta_reads_env_meta_without_r2(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     seed_user(uid)
-    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"), source="screen")
     # drop the R2 object to prove list_meta never reaches for the body
     fake.store.clear()
-    meta = db.frame_list_meta(uid)
+    meta = db.frame_list_meta(uid, source="screen")
     assert len(meta) == 1
     assert meta[0]["id"] == "f1"
     assert meta[0]["owner_user_id"] == uid
@@ -408,7 +422,7 @@ def test_upsert_falls_back_to_inline_doc_on_upload_failure(monkeypatch):
     uid = _uid()
     seed_user(uid)
     env = _env(uid, "f1")
-    db.frame_upsert(uid, "f1", 1.0, env)
+    db.frame_upsert(uid, "f1", 1.0, env, source="screen")
     # upload failed → row keeps inline doc, no pointer; read still works
     doc, env_meta, body_key = _row(uid, "f1")
     assert body_key is None

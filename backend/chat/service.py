@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import db
+import storage_read_trace
 from core import envelope as core_envelope
 from core.store import UserStore
 
@@ -291,7 +292,13 @@ def _body_omit_decision(m: dict, *, include_image_body: bool) -> tuple[bool, str
     return False, "", body_size
 
 
-def hydrate_history_page(msgs: list[dict], *, include_image_body: bool) -> list[dict]:
+def _hydrate_file_item(item: dict, store=None) -> dict:
+    # Bind inside each worker as well: ThreadPoolExecutor does not copy context.
+    with storage_read_trace.bind_store(store):
+        return db.hydrate_chat_file_body(str(item.get("owner_user_id") or ""), item)
+
+
+def hydrate_history_page(msgs: list[dict], *, include_image_body: bool, store=None) -> list[dict]:
     """Pre-fetch — CONCURRENTLY — the R2 bodies this page will actually deliver.
 
     Images live in R2 alongside files, so a page carrying N of them would
@@ -313,9 +320,9 @@ def hydrate_history_page(msgs: list[dict], *, include_image_body: bool) -> list[
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
-                db.hydrate_chat_file_body,
-                str(msgs[i].get("owner_user_id") or ""),
+                _hydrate_file_item,
                 dict(msgs[i]),
+                store,
             ): i
             for i in targets
         }
@@ -330,7 +337,7 @@ def hydrate_history_page(msgs: list[dict], *, include_image_body: bool) -> list[
     return out
 
 
-def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
+def _chat_history_item(m: dict, *, include_image_body: bool = True, store=None) -> dict:
     item = dict(m)
     # iOS ChatMessage.content is non-optional. v1 envelope messages are
     # ciphertext-only at rest and may omit plaintext `content`; always
@@ -368,7 +375,7 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
         # per-page read exit (bounded by the history limit), NOT the full ring, so
         # a bulk/metadata-only load never downloads every historical file.
         if is_pointer:
-            item = dict(db.hydrate_chat_file_body(str(item.get("owner_user_id") or ""), item))
+            item = dict(_hydrate_file_item(item, store))
             item.setdefault("content", "")
             # A failed fetch leaves the pointer in place. Never expose internal
             # storage coordinates or integrity metadata on the public response.

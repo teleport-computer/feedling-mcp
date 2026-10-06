@@ -29,7 +29,7 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
@@ -38,6 +38,7 @@ from psycopg.errors import QueryCanceled
 
 import db
 from admin import admin_core
+from admin import lane_rollup_summary
 from admin import memory_metadata
 from admin import tee_replication as admin_tee_replication
 from admin import plaintext_shadow as admin_plaintext_shadow
@@ -50,6 +51,10 @@ router = APIRouter()
 
 DEBUG_TRACE_REQUEST_TIMEOUT_SEC = 3.0
 DATA_TRACK_REQUEST_TIMEOUT_SEC = db._ADMIN_DATA_TRACK_READ_TIMEOUT_MS / 1000
+DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC = 15.0
+DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC = (
+    db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS / 1000
+)
 
 _ADMIN_SESSION_COOKIE = "admin_session"
 _ADMIN_SESSION_MAX_AGE = 7 * 24 * 60 * 60
@@ -59,12 +64,17 @@ class DataTrackQueryTimeout(RuntimeError):
     """A bounded data-track DB read exceeded its HTTP or PostgreSQL budget."""
 
 
-async def _run_data_track_db(fn, *args):
+async def _run_data_track_db(fn, *args, timeout_seconds: float | None = None, **kwargs):
     try:
         return await threadpool.run_db_bounded(
             fn,
             *args,
-            timeout_seconds=DATA_TRACK_REQUEST_TIMEOUT_SEC,
+            timeout_seconds=(
+                DATA_TRACK_REQUEST_TIMEOUT_SEC
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            **kwargs,
         )
     except (TimeoutError, QueryCanceled) as exc:
         raise DataTrackQueryTimeout from exc
@@ -202,8 +212,14 @@ async def data_track_summary(request: Request):
 
 @router.get("/v1/admin/data-track/users")
 async def data_track_users(request: Request):
+    request_started = time.monotonic()
     _require_admin(request)
-    payload = await _run_data_track_db(admin_core.users_payload, request.url.query)
+    payload = await _run_data_track_db(
+        admin_core.users_payload, request.url.query,
+        request_started=request_started,
+        timeout_seconds=DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC,
+        statement_timeout_ms=int(DATA_TRACK_USERS_REQUEST_TIMEOUT_SEC * 1000),
+    )
     return JSONResponse(payload)
 
 
@@ -383,7 +399,10 @@ async def route_fence_audit(request: Request):
 async def data_track_user(user_id: str, request: Request):
     _require_admin(request)
     body, status = await _run_data_track_db(
-        admin_core.user_payload, request.url.query, user_id
+        admin_core.user_payload,
+        request.url.query,
+        user_id,
+        timeout_seconds=DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC,
     )
     return JSONResponse(body, status_code=status)
 
@@ -462,7 +481,10 @@ async def data_track_user_lookup(request: Request):
 async def data_track_user_page(user_id: str, request: Request):
     _require_admin(request)
     kind, body, status = await _run_data_track_db(
-        admin_core.user_page, request.url.query, user_id
+        admin_core.user_page,
+        request.url.query,
+        user_id,
+        timeout_seconds=DATA_TRACK_DETAIL_REQUEST_TIMEOUT_SEC,
     )
     if kind == "text":
         return PlainTextResponse(body, status_code=status)
@@ -737,6 +759,61 @@ async def lane_rollup(request: Request):
         until_day=(request.query_params.get("until_day") or "").strip(),
         limit=limit,
         offset=offset,
+    )
+    return JSONResponse(payload)
+
+
+_LANE_ROLLUP_SUMMARY_PARAMS = frozenset({"day", "admin_key"})
+
+
+@router.get("/v1/admin/lane-rollup/summary")
+async def lane_rollup_daily_summary(request: Request):
+    """Two Beijing days of memory-lane counts, without user or job identities."""
+    _require_admin(request)
+    unknown = sorted(set(request.query_params) - _LANE_ROLLUP_SUMMARY_PARAMS)
+    if unknown:
+        return JSONResponse(
+            {"error": "unknown_query_params", "params": unknown, "supported": ["day"]},
+            status_code=400,
+        )
+    day = request.query_params.get("day", lane_rollup_summary.default_day())
+    try:
+        if not _LANE_ROLLUP_DAY_RE.fullmatch(day) or date.fromisoformat(day) == date.min:
+            raise ValueError
+    except ValueError:
+        return JSONResponse({"error": "invalid_day"}, status_code=400)
+    return JSONResponse(await threadpool.run_db(lane_rollup_summary.read_summary, day=day))
+
+
+_ENCLAVE_HEALTH_PARAMS = frozenset({"window_minutes", "end_epoch", "admin_key"})
+
+
+@router.get("/v1/admin/enclave-decrypt-health")
+async def enclave_decrypt_health(request: Request):
+    """Admin-only, content-free counts of recorded enclave terminal events."""
+    _require_admin(request)
+    unknown = sorted(set(request.query_params) - _ENCLAVE_HEALTH_PARAMS)
+    if unknown:
+        return JSONResponse({"error": "unknown_query_params", "params": unknown,
+                             "supported": ["end_epoch", "window_minutes"]}, status_code=400)
+    raw = request.query_params.get("window_minutes", "15").strip()
+    try:
+        window_minutes = int(raw)
+    except ValueError:
+        return JSONResponse({"error": "invalid_window_minutes"}, status_code=400)
+    if not 1 <= window_minutes <= 1440 or len(request.query_params.getlist("window_minutes")) > 1:
+        return JSONResponse({"error": "invalid_window_minutes"}, status_code=400)
+    now = None
+    if "end_epoch" in request.query_params:
+        try:
+            epoch = float(request.query_params["end_epoch"])
+            if not math.isfinite(epoch) or epoch < 0 or len(request.query_params.getlist("end_epoch")) > 1:
+                raise ValueError("invalid_end_epoch")
+            now = datetime.fromtimestamp(epoch, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return JSONResponse({"error": "invalid_end_epoch"}, status_code=400)
+    payload = await _run_data_track_db(
+        db.admin_enclave_decrypt_health, window_minutes, now=now,
     )
     return JSONResponse(payload)
 
