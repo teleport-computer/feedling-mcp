@@ -7,9 +7,11 @@ tools/chat_resident_consumer.py:
 Run with: pytest tests/test_consumer_model_call_trace.py -v
 """
 
+import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -43,6 +45,12 @@ except ModuleNotFoundError:
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 
+def _mock_cli_run(monkeypatch, consumer, run):
+    # Mock the CLI invocation boundary; production capture now uses Popen.
+    monkeypatch.setattr(consumer, "_run_cli_subprocess",
+                        lambda cmd, kwargs, **extra: run(cmd, **kwargs))
+
+
 def _recorder():
     calls = []
 
@@ -58,6 +66,102 @@ def _recorder():
     return calls, _fake_emit
 
 
+@pytest.mark.parametrize(
+    ("cmd", "expected_driver"),
+    [
+        (["pi", "--mode", "json"], "pi"),
+        (["claude", "--print"], "claude"),
+        (["codex", "exec", "--json"], "codex"),
+    ],
+)
+@pytest.mark.parametrize("succeeded", [True, False])
+def test_cli_terminal_routes_carry_configured_provider_model_and_lane(
+    monkeypatch, cmd, expected_driver, succeeded
+):
+    """All CLI drivers expose the same route identity on both terminals."""
+    private_output = "PRIVATE USER CONTENT MUST NOT ENTER DETAIL"
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "openrouter",
+            "model": "upstream-model-id",
+            "input_modalities": ["text"],
+            "input_modalities_source": "explicit",
+        },
+    )
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    monkeypatch.setattr(crc, "_emit_recall_completed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(crc, "_recall_turn_reset", lambda: None)
+    result = subprocess.CompletedProcess(
+        args=cmd,
+        returncode=0 if succeeded else 1,
+        stdout=private_output,
+        stderr="",
+    )
+    failure = None if succeeded else subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+
+    crc._emit_cli_model_call_terminal(
+        {
+            "started": True,
+            "started_at": time.monotonic(),
+            "cmd": cmd,
+            "result": result,
+            "lane": "chat",
+        },
+        trace_id=f"trace-{expected_driver}",
+        succeeded=succeeded,
+        failure=failure,
+    )
+
+    assert len(calls) == 1
+    detail = calls[0]["detail"]
+    assert calls[0]["type"] == (
+        "agent.model.call.done" if succeeded else "agent.model.call.error"
+    )
+    assert detail["driver"] == expected_driver
+    assert detail["provider"] == "openrouter"
+    assert detail["model"] == "upstream-model-id"
+    assert detail["lane"] == "chat"
+    assert private_output not in json.dumps(detail)
+
+
+def test_cli_terminal_omits_unknown_route_identity(monkeypatch):
+    """Missing route facts persist as NULL, never as empty-string buckets."""
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "",
+            "model": "",
+            "input_modalities": [],
+            "input_modalities_source": "",
+        },
+    )
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    monkeypatch.setattr(crc, "_emit_recall_completed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(crc, "_recall_turn_reset", lambda: None)
+
+    crc._emit_cli_model_call_terminal(
+        {
+            "started": True,
+            "started_at": time.monotonic(),
+            "cmd": ["pi"],
+            "result": None,
+        },
+        trace_id="trace-missing-route",
+        succeeded=False,
+        failure=RuntimeError("driver failed"),
+    )
+
+    detail = calls[0]["detail"]
+    assert "provider" not in detail
+    assert "model" not in detail
+    assert "lane" not in detail
+
+
 def test_call_agent_cli_emits_start_then_done(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
@@ -66,12 +170,12 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
         args=["mycli", "ask", "hi"], returncode=0,
         stdout='{"type":"result","duration_ms":10}', stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
 
-    crc.call_agent_cli("hi", trace_id="trace-123")
+    crc.call_agent_cli("hi", trace_id="trace-123", lane="chat")
 
     types_seen = [c["type"] for c in calls]
     assert types_seen == ["agent.model.call.start", "agent.model.call.done"]
@@ -85,6 +189,7 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
     assert done["dur_ms"] is not None
     assert done["detail"]["driver"] == "claude"
     assert done["detail"]["rc"] == 0
+    assert done["detail"]["lane"] == "chat"
     assert done["detail"]["thinking_present"] is False
     assert done["detail"]["thinking_source"] == ""
     assert done["detail"]["thinking_len"] == 0
@@ -92,20 +197,25 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
     assert done["content_excerpt"]["stderr_head"] == ""
 
 
-def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
+@pytest.mark.parametrize("aside", ["", "I want to greet them warmly."])
+def test_call_agent_cli_done_trace_observes_only_display_aside(monkeypatch, aside):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "1")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
+    reply = json.dumps({"messages": ["hi"], "aside": aside})
     stdout = "\n".join([
         '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5",'
         '"content":[{"type":"thinking","thinking":"I inspected the latest prompt."}]}}',
-        '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5",'
-        '"content":[{"type":"text","text":"hi"}]}}',
+        json.dumps({"type": "assistant", "message": {
+            "role": "assistant", "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": reply}],
+        }}),
     ])
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0, stdout=stdout, stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -114,9 +224,14 @@ def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
 
     done = calls[1]
     assert done["type"] == "agent.model.call.done"
-    assert done["detail"]["thinking_present"] is True
-    assert done["detail"]["thinking_source"] == "anthropic_thinking"
-    assert done["detail"]["thinking_len"] == len("I inspected the latest prompt.")
+    assert done["detail"]["thinking_present"] is bool(aside)
+    assert done["detail"]["thinking_source"] == ("self_thinking" if aside else "")
+    assert done["detail"]["thinking_len"] == len(aside)
+    # Native reasoning remains diagnostic data; it cannot supply display fields.
+    turn = crc._agent_turn_from_raw(stdout)
+    assert turn.messages == ["hi"]
+    assert turn.thinking_summary == aside
+    assert turn.provider_reasoning_for_diagnostics == "I inspected the latest prompt."
 
 
 def test_call_agent_cli_warns_when_claude_stdout_has_unparsed_thinking_marker(monkeypatch, caplog):
@@ -132,7 +247,7 @@ def test_call_agent_cli_warns_when_claude_stdout_has_unparsed_thinking_marker(mo
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0, stdout=stdout, stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -158,7 +273,7 @@ def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
         seen["env"] = kw.get("env")
         return result
 
-    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    _mock_cli_run(monkeypatch, crc, _fake_run)
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
 
@@ -176,7 +291,7 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=1, stdout="", stderr="boom",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -217,7 +332,7 @@ def test_call_agent_cli_exit_zero_logical_failure_is_not_done(monkeypatch):
         ),
         stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -250,7 +365,7 @@ def test_call_agent_cli_pi_parsed_reply_remains_done(monkeypatch):
         ),
         stderr="",
     )
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -271,7 +386,7 @@ def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     def _raise_timeout(*a, **kw):
         raise subprocess.TimeoutExpired(cmd=["mycli", "ask", "hi"], timeout=120)
 
-    monkeypatch.setattr(crc.subprocess, "run", _raise_timeout)
+    _mock_cli_run(monkeypatch, crc, _raise_timeout)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -312,7 +427,7 @@ def test_call_agent_cli_clamps_subprocess_to_absolute_deadline(monkeypatch):
         seen["timeout"] = kwargs["timeout"]
         return result
 
-    monkeypatch.setattr(crc.subprocess, "run", _fake_run)
+    _mock_cli_run(monkeypatch, crc, _fake_run)
     monkeypatch.setattr(crc, "_emit_debug_trace", lambda *args, **kwargs: None)
 
     crc.call_agent_cli("hi", absolute_deadline=100.25)
@@ -331,9 +446,7 @@ def test_call_agent_cli_expired_absolute_deadline_never_spawns(monkeypatch):
         ),
     )
     monkeypatch.setattr(crc.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(
-        crc.subprocess,
-        "run",
+    _mock_cli_run(monkeypatch, crc,
         lambda *args, **kwargs: pytest.fail("expired deadline must not spawn"),
     )
 
@@ -410,7 +523,7 @@ def test_error_event_carries_error_detail_beyond_the_reply_head_cap(monkeypatch)
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -441,7 +554,7 @@ def test_error_event_extracts_nested_codex_turn_failed_detail(monkeypatch):
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
@@ -462,7 +575,7 @@ def test_error_detail_absent_on_successful_turns(monkeypatch):
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
     monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
-    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+    _mock_cli_run(monkeypatch, crc, lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
     monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)

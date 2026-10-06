@@ -49,6 +49,12 @@ def _now() -> float:
 
 _FUTURE_TS_TOLERANCE_SEC = 60.0  # allow minor client clock skew
 PERCEPTION_INGRESS_RUNTIME_V2_FLAG = "perception_ingress_runtime_v2_enabled"
+PERCEPTION_DECRYPT_FAILURE_CLASSES = core_enclave.DECRYPT_FAILURE_CLASSES | frozenset({
+    "invalid_envelope",
+    "decrypt_skipped",
+    "payload_decode_error",
+    "plaintext_envelope_error",
+})
 
 
 def _coerce_ts(client_ts) -> float:
@@ -87,7 +93,7 @@ def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
         user_store = user_or_store
         if isinstance(user_or_store, str):
             from core import store as core_store  # lazy
-            user_store = core_store.get_store_shell_only(
+            user_store = core_store.get_store_per_load_mode(
                 user_or_store, reason="perception runtime fence is DB-backed"
             )
 
@@ -140,25 +146,52 @@ def _decrypt_signal_payload_v2(
     key: str,
     envelope: Mapping[str, Any],
     *,
+    caller_user_id: str,
     api_key: str | None = None,
     decrypt_envelope: Callable[..., bytes | str | Mapping[str, Any] | list[Any]] | None = None,
-) -> tuple[Any | None, str]:
+) -> tuple[Any | None, str, str, str]:
     if not isinstance(envelope, Mapping):
-        return None, "invalid_envelope"
+        return None, "invalid_envelope", "invalid_envelope", ""
     if (not envelope.get("body") and not envelope.get("body_b64")
             and not api_key and decrypt_envelope is None):
-        return None, "decrypt_skipped"
+        return None, "decrypt_skipped", "decrypt_skipped", ""
     try:
         # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
         # _decrypt_envelope_via_enclave 逐字一致，注入方（测试/上层）不受影响。
-        decrypt = decrypt_envelope or core_envelope.read_envelope_body
-        raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
-        return _decode_decrypted_payload_v2(raw), ""
+        if decrypt_envelope is None:
+            raw = core_envelope.read_envelope_body(
+                dict(envelope),
+                api_key,
+                purpose=f"perception:{key}",
+                caller_user_id=caller_user_id,
+            )
+        else:
+            raw = decrypt_envelope(dict(envelope), api_key, purpose=f"perception:{key}")
+        return _decode_decrypted_payload_v2(raw), "", "", ""
     except Exception as e:
-        return None, f"decrypt_failed:{type(e).__name__}"
+        if isinstance(e, json.JSONDecodeError):
+            failure_class, detail = "payload_decode_error", "invalid_json"
+        elif isinstance(e, ValueError):
+            local_detail = str(e) if str(e) in {
+                "envelope_body_b64_invalid",
+                "envelope_owner_mismatch",
+                "envelope_shape_unrecognized",
+                "plaintext_envelope_required",
+            } else "value_error"
+            failure_class, detail = "plaintext_envelope_error", local_detail
+        else:
+            failure_class, detail = core_enclave.decrypt_failure_metadata(e)
+        return None, f"decrypt_failed:{type(e).__name__}", failure_class, detail
 
 
-def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -> None:
+def _record_decrypt_failure_v2(
+    user_id: str,
+    key: str,
+    reason: str,
+    failure_class: str,
+    detail: str,
+    ts: float,
+) -> None:
     """Make a failed sensitive-signal decrypt visible.
 
     The ingest still answers "accepted" (the report contract is "we took your
@@ -175,6 +208,11 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
     silently disable burst/cluster dedup — precisely when the fleet is already
     unhealthy.
     """
+    stable_failure_class = (
+        failure_class
+        if failure_class in PERCEPTION_DECRYPT_FAILURE_CLASSES
+        else "unexpected_decrypt_error"
+    )
     log.warning("perception v2 decrypt failed for %s key=%s: %s", user_id, key, reason)
     try:
         store.append_decrypt_failure(user_id, {
@@ -182,6 +220,8 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
             "type": "decrypt_failed",
             "key": key,
             "reason": reason,
+            "failure_class": stable_failure_class,
+            "detail": str(detail or "")[:64],
             "ts": ts,
         }, ts)
     except Exception as e:  # observability must never break ingest
@@ -415,9 +455,10 @@ def _ingest_snapshot_v2_inner(
                     results[key] = str(shape_error.get("error") or "invalid_envelope")
                     continue
                 results[key] = "accepted"
-                plaintext, err = _decrypt_signal_payload_v2(
+                plaintext, err, failure_class, failure_detail = _decrypt_signal_payload_v2(
                     key,
                     envelope,
+                    caller_user_id=user_id,
                     api_key=api_key,
                     decrypt_envelope=decrypt_envelope,
                 )
@@ -445,7 +486,14 @@ def _ingest_snapshot_v2_inner(
                     if key in _PERCEPTKIT_DECRYPTED_ENTRIES:
                         shadow_decrypted.append((key, values))
                 else:
-                    _record_decrypt_failure_v2(user_id, key, err, now)
+                    _record_decrypt_failure_v2(
+                        user_id,
+                        key,
+                        err,
+                        failure_class,
+                        failure_detail,
+                        now,
+                    )
                     _record_unavailable_observation_v2(user_id, key, now)
             else:
                 storage_items.append(item)
@@ -492,6 +540,9 @@ _PERCEPTKIT_DECRYPTED_ENTRIES = {
     "location_signal": "observe_location",
     "calendar_next_event": "mirror_calendar",
     "reminders": "mirror_reminders",
+    # 来源撤回：用户在健康 app 里删掉的记录。它**不是**一条观测 ——
+    # 走的是 kit 的撤回通道，不是 ingest。
+    "health_deleted": "apply_deletions",
 }
 
 
@@ -791,7 +842,7 @@ def _app_proactive_settings(user_id: str) -> dict:
     user_state). Lazy import like _fire_wake; failures mean "no block" so a
     broken app layer can't silently kill perception observability."""
     from core import store as core_store  # lazy; assembly loads core first
-    return core_store.get_store_shell_only(
+    return core_store.get_store_per_load_mode(
         user_id, reason="proactive settings are a direct blob read"
     ).load_proactive_settings()
 
@@ -861,7 +912,7 @@ def _settings_v2_for_user(user_id: str):
 
 def _proactive_activation_ready(user_id: str) -> bool:
     from core import store as core_store  # lazy
-    return core_store.get_store_shell_only(
+    return core_store.get_store_per_load_mode(
         user_id, reason="activation readiness uses direct DB/blob helpers"
     ).proactive_activation_ready()
 
@@ -919,6 +970,21 @@ def _perceptkit_owns_wakes() -> bool:
         return False
 
 
+def _live_wake_yields_to_kit(user_id: str, trigger: str) -> bool:
+    """老路这一次唤醒要不要让给 kit。True = 不投。
+
+    V1 老路（``_maybe_wake``）和 V2 兼容投递（``_submit_wake_event_v2_compat``）
+    共用这一个判断。以前只有 V2 那条查了：V1 用户拍一张照片，老路按 30 秒防抖
+    排一条 job、kit 再按照片排一条，同一张照片进队列两次（consumer 的合并窗口
+    兜住了，用户基本无感，但队列和统计里是两条）。
+    """
+    if not _perceptkit_owns_wakes():
+        return False
+    log.info("perceptkit owns wakes; live trigger=%s not delivered (user=%s)",
+             trigger or "?", user_id)
+    return True
+
+
 def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
     """Compatibility output: V2 differ event -> old proactive job queue.
 
@@ -933,9 +999,8 @@ def _submit_wake_event_v2_compat(event, *, from_kit: bool = False) -> bool:
 
     挡在这里而不是挡在 differ：差异要继续算、继续记，只是不投递。
     """
-    if not from_kit and _perceptkit_owns_wakes():
-        log.info("perceptkit owns wakes; live trigger=%s not delivered",
-                 getattr(event, "trigger", "?"))
+    if not from_kit and _live_wake_yields_to_kit(
+            getattr(event, "user_id", ""), getattr(event, "trigger", "")):
         return False
 
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
@@ -1027,7 +1092,7 @@ def _fire_wake_event_v2(event) -> None:
         from hosted import config_store as hosted_config_store  # lazy
         from model_api_runtime.v2 import jobs_store  # lazy
         from proactive import service as proactive_service  # lazy
-        s = core_store.get_store_shell_only(
+        s = core_store.get_store_per_load_mode(
             event.user_id, reason="V2 perception enqueue uses durable helpers"
         )
         if not event.manual and not s.proactive_activation_ready():
@@ -1101,6 +1166,11 @@ def _fire_wake_event_v2(event) -> None:
 
 
 def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
+    # 和 V2 兼容投递同一道闸：kit 接管唤醒后，老路不再落地成 job。
+    # 挡在最前面、不记 suppressed/debounced 事件 —— 与 V2 那条一致，
+    # 这不是「被闸拦下」，是「这件事归 kit 投」。
+    if _live_wake_yields_to_kit(user_id, _legacy_wake_trigger(cap_key, new_v)):
+        return
     block = _wake_block_reason(user_id)
     if block:
         store.append_event(user_id, {
@@ -1189,7 +1259,7 @@ def _fire_wake(
         from core import store as core_store  # lazy
         from core import util as core_util  # lazy
         from proactive import service as proactive_service  # lazy
-        s = core_store.get_store_shell_only(
+        s = core_store.get_store_per_load_mode(
             user_id, reason="legacy perception enqueue is a cold-safe write"
         )
         if not s.proactive_activation_ready():
@@ -1261,19 +1331,78 @@ def _perceptkit_primary() -> bool:
         not in ("0", "false", "no", "off")
 
 
+#: 字段 -> 它的单指标 Capability(查询档)。
+#:
+#: perceptkit 0.4.0（提交 9f999e4）把健康信号拆成单指标：上报键
+#: ``health_vitals / health_body / health_metabolic`` 的 Capability 只当「报告闸」，
+#: 不再带 ``query_tool``；标志挪到了 ``health_resting_hr`` 这些单指标 Capability 上，
+#: 而它们不被任何 Signal 引用。catalog 自己没有「字段 -> 单指标 Capability」的映射，
+#: 所以 ``_wanted_snapshot_fields`` 只按 Signal 的 Capability 判时，这三组共 14 个
+#: 输出字段从不进 pull 快照，agent 投影恒 None——kit / live 两条路一样（T561）。
+#: 这张表让判定落到**字段**上：一个字段的单指标 Capability 有 query_tool 就放它，
+#: 不因此整组放开。表的完整性由 tests/test_perception_wanted_metric_caps.py 对着
+#: 真 catalog 钉住（多一个未映射的输出、少一个 Capability 都会红）。
+QUERY_METRIC_CAPABILITY_BY_FIELD: dict[str, str | None] = {
+    # health_vitals
+    "resting_heart_rate": "health_resting_hr",
+    "current_heart_rate": "health_current_hr",
+    "hrv_sdnn_ms": "health_hrv",
+    "respiratory_rate": "health_respiratory",
+    "oxygen_saturation_pct": "health_oxygen",
+    "vo2_max": "health_vo2max",
+    # catalog 没有 ``steps`` Capability（manifest.minimal 的 steps 信号仍挂在
+    # health_vitals 下）。step_count 在 0.3.0 时就在 pull 快照里，agent 侧
+    # ``steps`` 是既有查询信号且有独立权限键（SIGNAL_PERMISSION_KEYS["steps"]），
+    # 这里按 include_query_tools 收入，恢复原有行为；长期正解是 perceptkit 补
+    # Capability("steps")，届时把这行改成它。
+    "step_count": None,
+    # health_body
+    "weight_kg": "health_weight",
+    "bmi": "health_bmi",
+    "body_fat_pct": "health_body_fat",
+    "height_cm": "health_height",
+    # health_metabolic（血压两个字段是同一次读数，共一个 Capability）
+    "blood_glucose_mmol_l": "health_glucose",
+    "blood_pressure_systolic": "health_blood_pressure",
+    "blood_pressure_diastolic": "health_blood_pressure",
+}
+
+#: 表里映到 None 的字段——没有单指标 Capability 可查，但按查询档收入。
+#: 显式列出，免得 None 被当成「忘了填」。
+QUERY_FIELDS_WITHOUT_METRIC_CAPABILITY: frozenset[str] = frozenset(
+    f for f, cap in QUERY_METRIC_CAPABILITY_BY_FIELD.items() if cap is None
+)
+
+
+def _field_is_query_tool(field: str) -> bool:
+    """字段自己的单指标 Capability 是不是查询档。"""
+    if field not in QUERY_METRIC_CAPABILITY_BY_FIELD:
+        return False
+    cap_name = QUERY_METRIC_CAPABILITY_BY_FIELD[field]
+    if cap_name is None:
+        return True
+    cap = catalog.CAPABILITIES.get(cap_name)
+    return bool(cap and cap.query_tool)
+
+
 def _wanted_snapshot_fields(*, include_query_tools: bool) -> dict[str, float]:
     """这次快照该出现哪些字段，各自的过期秒数是多少。
 
     过期判据仍然按**老路的目录**算。切换要换的是数据来源，不是「什么算过期」;
     两件事一起改，出了问题分不清是谁的。
+
+    Signal 的 Capability 是「报告闸」；查询档可能挂在**字段**自己的单指标
+    Capability 上（QUERY_METRIC_CAPABILITY_BY_FIELD）。cheap ``now``
+    （include_query_tools=False）只看前者，与拆分前逐项相同。
     """
     wanted: dict[str, float] = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
-        if not cap or not (cap.context_field or (include_query_tools and cap.query_tool)):
-            continue
+        signal_wanted = bool(cap and (cap.context_field or (include_query_tools and cap.query_tool)))
         for f in sig.outputs:
-            if f != "user_state":
+            if f == "user_state":
+                continue
+            if signal_wanted or (include_query_tools and _field_is_query_tool(f)):
                 wanted[f] = sig.ttl_sec
     return wanted
 
@@ -1615,9 +1744,13 @@ def photo_evaluate(user_id: str, metadata: dict,
     #
     # Falls back to photo_id for clients that do not send one yet. That is the
     # old behaviour, not a fix -- those clients still double-count on retry.
+    #
+    # The capture time rides along raw and is validated in the adapter; a
+    # missing or unusable one leaves the observation at receive time, which is
+    # what every client before it got.
     _perceptkit_shadow_call(
         "observe_photo", user_id, _photo_identity(metadata, photo_id),
-        occurred_at=now)
+        occurred_at=now, captured_at=metadata.get("occurred_at"))
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
             "sensitive": sensitive, "status": "stored"}, 200
 

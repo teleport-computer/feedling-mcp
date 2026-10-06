@@ -61,9 +61,16 @@ API key 直连与订阅态的判定不是同一条通路。
 用法：
 
     python3 tools/e2e/aup_gate_probe.py
+    python3 tools/e2e/aup_gate_probe.py --model claude-opus-5 --json
     python3 tools/e2e/aup_gate_probe.py --json
     python3 tools/e2e/aup_gate_probe.py --print-prompt     # 只组装并打印，不外发
     python3 tools/e2e/aup_gate_probe.py --write-manifest   # 改了 canary/用户消息后重钉其指纹
+
+拒答识别：CLI JSON 的 stop_reason=refusal、错误面的多种 AUP 标记、以及正文中的
+明确拒绝意图。空正文/损坏 JSON/未完成响应只说明没量到，不冒充 AUP 拒答或正常回复。
+文本意图判据是启发式，不声称覆盖所有语言和未来措辞；固定 canary 的判别力检查仍保留。
+离线回归（含实际采样投影）：
+    python3 -m pytest -q tests/test_aup_gate_probe.py tools/e2e/test_aup_refusal.py
 """
 from __future__ import annotations
 
@@ -73,6 +80,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -107,7 +115,95 @@ INSTRUCTION_SENTINEL = "@@INSTRUCTION@@"
 IO_CLI_PATH = REPO / "tools" / "io_cli.py"
 CONSUMER_PATH = REPO / "tools" / "chat_resident_consumer.py"
 
-_AUP_MARKER = "Usage Policy"
+# 上游会换错误文案；显式协议拒绝优先，文本标记只用在错误输出中。
+# 不能锚 safe / policy 单词：正常回复和引用也会包含它们。
+_AUP_MARKERS = re.compile(
+    r"\b(?:usage|acceptable use) policy\b|\bsafeguards? (?:flagged|blocked|rejected)\b"
+    r"|https?://(?:www\.)?anthropic\.com/legal/aup\b|\[reasoning_extraction\]",
+    re.IGNORECASE,
+)
+_REFUSAL_INTENT = re.compile(
+    r"(?:^|[\n.!?。！？])\s*(?:sorry[,，:]?\s*|I(?:'m| am) sorry[,，:]?\s*(?:but\s+)?"
+    r"|抱歉[，,：:]?\s*|对不起[，,：:]?\s*)?"
+    r"(?:I\s+(?:can(?:not|'t)|won't|will not|am unable to|must decline to)\s+"
+    r"(?:provide|share|reveal|disclose|comply|assist|fulfill|respond|help(?!\s+but\b))\b"
+    r"|我(?:不能|无法|不会|不能够)(?:提供|分享|透露|披露|展示|公开|遵从|遵循|满足|协助))",
+    re.IGNORECASE,
+)
+_AUP_DETAILS = re.compile(r"Details:\s*`?\[([a-z0-9_, -]+)\]", re.IGNORECASE)
+_PROTOCOL_REFUSAL = re.compile(
+    r"我(?:不能|无法|不会)(?:提供|分享|透露|展示|公开).{0,24}(?:私人思考|私下思考|内部推理|思维链)"
+    r"|我(?:不能|无法|不会)(?:采用|遵循|扮演).{0,18}(?:人设|格式|角色)"
+    r"|I\s+(?:cannot|can't|won't|will not)\s+(?:provide|share|reveal|disclose).{0,60}"
+    r"(?:my private (?:thoughts|reasoning)|internal reasoning|chain.of.thought)",
+    re.IGNORECASE,
+)
+
+
+def classify_response(returncode: int, stdout: str, stderr: str = "") -> tuple[str, str]:
+    """Classify CLI text/JSON or an API response replay without treating rc=0 as success.
+
+    Explicit refusal metadata is authoritative. Empty/unfinished/error envelopes
+    without refusal evidence are OTHER, not proof of an AUP refusal. Text intent
+    is a heuristic; quoted code and private aside blocks are not the visible reply.
+    """
+    text = stdout.strip()
+    error = returncode != 0
+    stop_reason = None
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return "OTHER", "malformed JSON response"
+        if not isinstance(payload, dict):
+            return "OTHER", "unexpected response envelope"
+        stop_reason = payload.get("stop_reason")
+        if payload.get("type") == "result":
+            error = (error or payload.get("is_error") is not False
+                     or payload.get("subtype") != "success")
+            text = payload.get("result", "")
+            if not isinstance(text, str):
+                return "OTHER", "non-text CLI result"
+            if stop_reason not in (None, "end_turn", "stop_sequence", "refusal"):
+                return "OTHER", f"unfinished/unknown CLI stop_reason={stop_reason!r}"
+        elif payload.get("type") == "message":
+            content = payload.get("content")
+            if not isinstance(content, list) or any(not isinstance(b, dict) for b in content):
+                return "OTHER", "invalid message content"
+            text = "\n".join(b.get("text", "") for b in content
+                             if b.get("type") == "text" and isinstance(b.get("text"), str))
+            if stop_reason != "refusal" and stop_reason != "end_turn":
+                return "OTHER", f"unfinished/unknown message stop_reason={stop_reason!r}"
+        else:
+            return "OTHER", "unrecognized response envelope"
+
+    combined = text + "\n" + stderr.strip()
+    tags = _AUP_DETAILS.search(combined)
+    details = f" details=[{tags.group(1)}]" if tags else ""
+    if stop_reason == "refusal":
+        return "BLOCKED", "stop_reason=refusal" + details
+    # Also recognize rendered API errors if a caller reports rc=0. A normal
+    # reply merely quoting the policy URL is not an error envelope.
+    rendered_error = text.lstrip().lower().startswith(("api error:", "error:"))
+    if (error or rendered_error) and _AUP_MARKERS.search(combined):
+        return "BLOCKED", f"policy_refusal{details}: {text.strip()[:300] or stderr.strip()[:300]}"
+    if error or rendered_error:
+        return "OTHER", f"rc={returncode} error response: {combined.strip()[:300]}"
+
+    visible = re.sub(r"<(think|aside)\b[^>]*>.*?</\1>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    visible = visible.replace("’", "'").strip()
+    if not visible:
+        return "OTHER", "no visible reply body; refusal not proven"
+    if re.match(r"<(?:think|aside)\b", visible, re.IGNORECASE):
+        return "OTHER", "unfinished private aside; visible reply not proven"
+    intent_text = re.sub(
+        r"```.*?```|~~~.*?~~~|`[^`\n]*`|\"[^\"\n]*\"|“[^”]*”|「[^」]*」|『[^』]*』",
+        "", visible, flags=re.DOTALL,
+    )
+    intent_text = re.sub(r"(?m)^\s*>.*$", "", intent_text)
+    if _REFUSAL_INTENT.search(intent_text) or _PROTOCOL_REFUSAL.search(intent_text):
+        return "BLOCKED", f"refusal_intent{details}: {visible[:300]}"
+    return "OK", text.strip()[:300]
 
 # 导入 consumer 需要的最小环境。它 import 时读这几个键，缺一个就 KeyError。
 # 值全是不可路由的占位，且由 _load_consumer() **强制**写入(不是 setdefault)，
@@ -268,15 +364,18 @@ def _check_fixtures(p: Probe, manifest: dict) -> bool:
     return ok
 
 
-def _run_claude(prompt: str, cwd: str, timeout: int) -> tuple[str, str]:
+def _run_claude(prompt: str, cwd: str, timeout: int, *, model: str | None = None) -> tuple[str, str]:
     """→ (verdict, detail)，verdict ∈ {OK, BLOCKED, NO_CLI, TIMEOUT, OTHER}。"""
     env = dict(os.environ)
     # 订阅登录态与 API key 直连不是同一条判定通路；生产 resident 走的是前者。
     for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         env.pop(key, None)
     try:
+        command = ["claude", "-p", prompt, "--output-format", "json"]
+        if model:
+            command.extend(["--model", model])
         proc = subprocess.run(
-            ["claude", "-p", prompt],
+            command,
             cwd=cwd,
             env=env,
             capture_output=True,
@@ -288,15 +387,10 @@ def _run_claude(prompt: str, cwd: str, timeout: int) -> tuple[str, str]:
         return "NO_CLI", "claude 不在 PATH"
     except subprocess.TimeoutExpired:
         return "TIMEOUT", f"{timeout}s 内没返回"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    if _AUP_MARKER in out and proc.returncode != 0:
-        return "BLOCKED", out.strip()[:300]
-    if proc.returncode != 0:
-        return "OTHER", f"rc={proc.returncode} {out.strip()[:300]}"
-    return "OK", (proc.stdout or "").strip()[:300]
+    return classify_response(proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
-def run(timeout: int = 180) -> dict:
+def run(timeout: int = 180, *, model: str | None = None) -> dict:
     p = Probe("aup_gate")
 
     try:
@@ -349,8 +443,9 @@ def run(timeout: int = 180) -> dict:
                 PASS,
                 f"io_cli 目录段现场重建成功（组装后 {len(live_prompt)} 字）",
             )
-            live_v, live_d = _run_claude(live_prompt, scratch, timeout)
-            canary_v, canary_d = _run_claude(canary_prompt, scratch, timeout)
+            model_args = {"model": model} if model else {}
+            live_v, live_d = _run_claude(live_prompt, scratch, timeout, **model_args)
+            canary_v, canary_d = _run_claude(canary_prompt, scratch, timeout, **model_args)
     except Exception as e:  # noqa: BLE001
         p.add("scaffold/catalog_rebuilt", AGENT_ERROR, f"{type(e).__name__}: {e}")
         return p.result()
@@ -363,8 +458,8 @@ def run(timeout: int = 180) -> dict:
         p.add(
             "live/gate",
             PRODUCT_FAIL,
-            "线上陪伴提示词正在被 AUP 闸拦下：resident + claude-code 用户此刻每一轮"
-            f"都会拿到兜底话，且后端无记录。上游原文：{live_d}",
+            "本次 CLI 调用拒绝了生产同形陪伴提示词；仅代表本机、所选模型与本次样本。"
+            f"拒答证据：{live_d}",
         )
     elif live_v == "OK":
         p.add("live/gate", PASS, f"线上文案通过（{len(live_prompt)} 字提示词）")
@@ -427,6 +522,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="AUP 闸哨兵探针")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--timeout", type=int, default=180, help="单次 claude 调用超时秒数")
+    ap.add_argument("--model", help="两臂使用同一个明确的 Claude 模型（省略则沿用 CLI 默认）")
     ap.add_argument(
         "--diagnostic",
         action="store_true",
@@ -460,7 +556,7 @@ def main() -> int:
             print(text)
         return 0
 
-    result = run(timeout=args.timeout)
+    result = run(timeout=args.timeout, model=args.model)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

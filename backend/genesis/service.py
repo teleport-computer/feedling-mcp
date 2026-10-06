@@ -32,6 +32,7 @@ from model_api_runtime.v2 import profile as v2_profile
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from notices import catalog
 from notices import core as notices
+from notices import error_contract
 from memory.card_leak_signals import IO_LEAK_SIGNALS
 
 GENESIS_STATE_BLOB = "genesis_state"
@@ -124,6 +125,7 @@ FAILED_JOB_STATUS = "failed"
 GENESIS_ERROR_CODES = (
     "distill_model_too_slow",
     "distill_empty_output",
+    "distill_material_too_short",
     "bad_api_key",
     "provider_timeout",
     "provider_quota",
@@ -138,6 +140,9 @@ GENESIS_ERROR_CODES = (
 GENESIS_ERROR_HINTS: dict[str, str] = {
     "distill_model_too_slow": "当前模型无法及时处理文件,请换更快的模型后重试",
     "distill_empty_output": "当前模型没有从非空记忆材料中生成任何卡片,请换模型后重试",
+    # T750-B, Seven 2026-09-28 approved verbatim (the template supplies the
+    # final full stop): very short material where the model found nothing.
+    "distill_material_too_short": "这份材料太短,没找到可以记下的内容。补充一些细节后再导入试试",
     "bad_api_key": "模型 API key 无效或无权限,检查 key",
     # usr_9037eaa8 (2026-07-24): a relay "thinking" model timed out 15+ times
     # in a row; the old "稍后重试" hint sent the user retrying into the same
@@ -166,6 +171,10 @@ GENESIS_ERROR_HINTS_EN: dict[str, str] = {
     ),
     "distill_empty_output": (
         "the model generated no cards from non-empty memory material; switch models and retry"
+    ),
+    "distill_material_too_short": (
+        "This material is too short — nothing worth remembering was found. "
+        "Add some detail and import it again"
     ),
     "bad_api_key": "the model API key is invalid or unauthorized — check the key",
     "provider_timeout": (
@@ -267,9 +276,12 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         (is_empty() true, no exception), the loop returns quietly and the
         caller proceeds with an empty result. all_fact_maps_failed is the
         real, reachable "nothing usable came back" failure signal.
-      - `provider_http_401` / `_403` (provider_client._raise_for_provider_status)
-        -> bad_api_key; `_402` / `_429` -> provider_quota (402 = out of
-        credits, folded into the quota bucket per its user-facing meaning).
+      - `provider_http_401` and credential-bearing `_403`
+        (provider_client._raise_for_provider_status) -> bad_api_key; the known
+        generic relay 403 shell -> internal (the only existing retry-later copy
+        that does not invent a key/quota/model diagnosis); `_402` / `_429` ->
+        provider_quota (402 = out of credits, folded into the quota bucket per
+        its user-facing meaning).
       - httpx timeout / "TimeoutException" in the wrapped message (worker
         call sites wrap as f"...:{type(e).__name__}") -> provider_timeout.
       - `genesis_stale_timeout:...` / `resident_stale_timeout:...` /
@@ -287,13 +299,28 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
 
     if "distill_model_too_slow" in lower:
         return "distill_model_too_slow"
+    if "distill_material_too_short" in lower:
+        return "distill_material_too_short"
     if "distill_empty_output" in lower:
         return "distill_empty_output"
 
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
         if status_code in _BAD_API_KEY_STATUS:
-            return "bad_api_key"
+            raw_body = (
+                getattr(exc, "raw_response_body", "")
+                or getattr(exc, "response_detail", "")
+                or str(exc or "")
+            )
+            if error_contract.provider_response_is_quota_exhausted(
+                status_code, raw_body
+            ):
+                return "provider_quota"
+            if error_contract.provider_response_is_auth_failure(
+                status_code, raw_body
+            ):
+                return "bad_api_key"
+            return "internal"
         if status_code in _PROVIDER_QUOTA_STATUS:
             return "provider_quota"
     if exc is not None and isinstance(exc, httpx.TimeoutException):
@@ -313,7 +340,12 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     if status_match:
         code = int(status_match.group(1))
         if code in _BAD_API_KEY_STATUS:
-            return "bad_api_key"
+            detail = text[status_match.end() :].lstrip(" :")
+            if error_contract.provider_response_is_quota_exhausted(code, detail):
+                return "provider_quota"
+            if error_contract.provider_response_is_auth_failure(code, detail):
+                return "bad_api_key"
+            return "internal"
         if code in _PROVIDER_QUOTA_STATUS:
             return "provider_quota"
 
@@ -325,6 +357,19 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         or "provider returned non-object response" in lower
     ):
         return "model_bad_json"
+
+    # T750: the identity profile's own validation codes
+    # (worker `genesis_profile_invalid:<reject_code>`, profile.py) and
+    # provider_client's empty-reply error used to fall through to "internal",
+    # telling the user our system broke when the model's output was unusable.
+    # prod 30d: 4 profile_invalid + 1 empty reply, all shown as internal.
+    profile_invalid = re.search(r"genesis_profile_invalid:([a-z_]+)", lower)
+    if profile_invalid:
+        if profile_invalid.group(1) in {"reply_empty", "map_reply_empty"}:
+            return "model_empty_output"
+        return "model_bad_json"
+    if "provider response had no usable reply text" in lower:
+        return "model_empty_output"
 
     # I6: worker._classify_fact_map_failures appends the real cause it picked
     # (by priority across every fact-map exception in the batch) as a third
@@ -652,7 +697,11 @@ def load_genesis_staged_payload(
         raise RuntimeError("staged_import_payload_missing")
     try:
         raw = core_envelope.read_envelope_body(
-            envelope, api_key, purpose="genesis_staged_payload")
+            envelope,
+            api_key,
+            purpose="genesis_staged_payload",
+            caller_user_id=str(store.user_id),
+        )
     except ValueError as exc:
         raise RuntimeError(f"staged_import_envelope_invalid:{exc}") from exc
     if _sha256_hex(raw) != str(blob.get("sha256") or ""):
@@ -767,6 +816,7 @@ def load_genesis_checkpoint(
             envelope,
             api_key,
             purpose="genesis_checkpoint",
+            caller_user_id=str(store.user_id),
             runtime_token=runtime_token,
         )
     except ValueError as exc:
@@ -1069,16 +1119,10 @@ def _memory_action_from_output(
     fallback_occurred_at: str = "",
 ) -> dict:
     mem_type = _coerce_memory_type(item.get("type"))
-    if store is not None and item.get("content"):
-        memory_actions.trace_memory_content_truncation(
-            store,
-            item.get("content"),
-            route="genesis_history_import",
-        )
     memory = {
         "type": mem_type,
         "summary": _text(item.get("summary") or item.get("title") or item.get("description"), 2000),
-        "content": str(item.get("content") or "").strip()[:memory_actions.MEMORY_CONTENT_MAX_CHARS],
+        "content": str(item.get("content") or "").strip(),
         "bucket": _text(item.get("bucket"), 80),
         "threads": _memory_threads_from_output(item, preserve_tags=preserve_dates),
         "occurred_at": _memory_occurred_at_from_output(
@@ -2044,8 +2088,7 @@ def render_genesis_profile_source(output: dict) -> tuple[str, int, bool]:
         if not isinstance(item, dict):
             continue
         try:
-            # This is a dry render before publication. The real writer records
-            # truncation observability once; do not double-count it here.
+            # Dry render only; the action executor owns write validation.
             action = _memory_action_from_output(item)
         except ValueError:
             continue
@@ -2205,14 +2248,24 @@ def apply_reducer_output(
     if raw_items is None:
         raw_items = output.get("facts")
     raw_count = len(raw_items) if isinstance(raw_items, list) else 0
-    with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as memory_attempt:
-        memory_count, memory_results = apply_memory_outputs(store, api_key, output)
-        dropped = raw_count - memory_count
-        memory_attempt.finish(
-            "not_provided" if raw_count == 0
-            else "partial" if dropped > 0
-            else "written"
-        )
+    garden_written = output.pop("garden_import", None)
+    if isinstance(garden_written, dict):
+        # 记忆卡已经由 memgarden 导入会话一批一批写过了（分块 worker 那边，带自己的
+        # memory 台账）。这里只记数，不再写、不再开第二条 memory 台账；输出里不许夹带卡。
+        if raw_count:
+            raise ValueError("garden_import_output_must_not_carry_memories")
+        memory_count = max(0, int(garden_written.get("cards_written") or 0))
+        dropped = max(0, int(garden_written.get("dropped") or 0))
+        memory_results = []
+    else:
+        with distillation_ledger.ArtifactAttempt(store, job_id, "memory") as memory_attempt:
+            memory_count, memory_results = apply_memory_outputs(store, api_key, output)
+            dropped = raw_count - memory_count
+            memory_attempt.finish(
+                "not_provided" if raw_count == 0
+                else "partial" if dropped > 0
+                else "written"
+            )
     if dropped > 0:
         notices.emit(store, source="genesis", error_class="genesis_partial",
                      blame="system", severity="warning",

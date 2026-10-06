@@ -128,8 +128,14 @@ def test_commit_mismatch_prompt_appends_dirty_fix_line(monkeypatch):
         {"consumer_id": "vps-resident-c1", "update_stall_reason": "dirty"},
     )
 
-    assert "请转告用户:机器上有未提交改动挡住了自动更新" in prompt
-    assert "由用户自行执行 git stash 或提交后即可恢复" in prompt
+    assert "工作区改动挡住了自动更新" in prompt
+    assert "旧版也会把未跟踪文件算作 dirty" in prompt
+    assert "stash 或提交后即可恢复" not in prompt
+    assert "consumer.env、identity.json" in prompt
+    assert "备份到仓库外的私有位置" in prompt
+    assert "不要为清除此提示运行 git stash -u/-a 或 git clean" in prompt
+    assert "不要提交密钥" in prompt
+    assert "agent 不得自行移动、暂存或删除" in prompt
 
 
 def test_commit_mismatch_prompt_appends_disabled_fix_line(monkeypatch):

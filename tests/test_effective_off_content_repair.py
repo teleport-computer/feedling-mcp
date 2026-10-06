@@ -1,0 +1,465 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+
+from content import plaintext_repair  # noqa: E402
+import migrate_effective_off_content_to_plaintext as cli  # noqa: E402
+
+
+class _Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _Connection:
+    def __init__(self, rows, calls):
+        self.rows = rows
+        self.calls = calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params):
+        self.calls.append((sql, params))
+        return _Rows(self.rows)
+
+
+class _Pool:
+    def __init__(self, rows, calls):
+        self.rows = rows
+        self.calls = calls
+
+    def connection(self):
+        return _Connection(self.rows, self.calls)
+
+
+def test_eligible_users_are_ordered_resumable_and_exclude_explicit_on():
+    calls = []
+    pool = _Pool([("usr_b",), ("usr_c",)], calls)
+
+    assert plaintext_repair.eligible_user_ids(
+        start_after="usr_a", user_limit=2, pool=pool
+    ) == ["usr_b", "usr_c"]
+
+    sql, params = calls[0]
+    assert "ORDER BY user_id" in sql
+    assert "content_encryption" in sql and "<> 'on'" in sql
+    assert params == ("usr_a", 2)
+
+
+def test_dry_run_is_deterministic_and_does_not_probe_health(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a", "usr_b"]
+    )
+    calls = []
+
+    def migrate(user_id, **kwargs):
+        calls.append((user_id, kwargs))
+        return SimpleNamespace(counts={"migratable_shared": 2}, failures=0)
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        health_probe=lambda: pytest.fail("dry-run must not probe enclave")
+    )
+
+    assert calls == [
+        ("usr_a", {"apply": False, "limit": 0, "rate": 1.0, "workers": 1}),
+        ("usr_b", {"apply": False, "limit": 0, "rate": 1.0, "workers": 1}),
+    ]
+    assert result.public_dict() == {
+        "apply": False,
+        "failures": 0,
+        "item_counts": {"migratable_shared": 4},
+        "last_completed_user_id": "usr_b",
+        "users_completed": 2,
+        "users_selected": 2,
+    }
+
+
+def test_apply_waits_for_consecutive_healthy_probes(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
+    )
+    probes = iter([False, True, True])
+    sleeps = []
+    monkeypatch.setattr(
+        plaintext_repair.plaintext_migration,
+        "run",
+        lambda user_id, **kwargs: SimpleNamespace(counts={"migrated": 1}, failures=0),
+    )
+
+    result = plaintext_repair.run(
+        apply=True,
+        health_probe=lambda: next(probes),
+        healthy_streak=2,
+        health_poll_sec=0.25,
+        max_pause_sec=5,
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [0.25, 0.25]
+    assert result.users_completed == 1
+    assert result.failures == 0
+
+
+def test_enclave_health_probe_accepts_internal_self_signed_certificate(monkeypatch):
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave:5003")
+    calls = []
+
+    class Response:
+        status_code = 200
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(plaintext_repair.httpx, "get", fake_get)
+
+    assert plaintext_repair.probe_enclave_health(max_latency_sec=10) is True
+    assert calls == [
+        (
+            "https://enclave:5003/healthz",
+            {"timeout": 10.0, "follow_redirects": False, "verify": False},
+        )
+    ]
+
+
+def test_apply_stops_after_first_failed_user(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a", "usr_b"]
+    )
+    called = []
+
+    def migrate(user_id, **_kwargs):
+        called.append(user_id)
+        return SimpleNamespace(
+            counts={"failed_transform_or_storage": 1}, failures=1
+        )
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        apply=True,
+        health_probe=lambda: True,
+        healthy_streak=1,
+    )
+
+    assert called == ["usr_a"]
+    assert result.failures == 1
+    assert result.users_completed == 0
+    assert result.last_completed_user_id == ""
+
+
+def test_apply_can_continue_after_failed_user_when_requested(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a", "usr_b"]
+    )
+    called = []
+
+    def migrate(user_id, **_kwargs):
+        called.append(user_id)
+        if user_id == "usr_a":
+            return SimpleNamespace(
+                counts={"failed_transform_or_storage": 1}, failures=1
+            )
+        return SimpleNamespace(counts={"migrated": 2}, failures=0)
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        apply=True,
+        continue_on_failure=True,
+        health_probe=lambda: True,
+        healthy_streak=1,
+    )
+
+    assert called == ["usr_a", "usr_b"]
+    assert result.failures == 1
+    assert result.users_completed == 2
+    assert result.last_completed_user_id == "usr_b"
+
+
+def test_failure_log_appends_content_free_item_details(tmp_path, monkeypatch):
+    path = tmp_path / "plaintext-failures.jsonl"
+    monkeypatch.setenv(plaintext_repair.FAILURE_LOG_ENV, str(path))
+
+    plaintext_repair.append_failure_log(
+        run_id="run-1",
+        user_id="usr_a",
+        failures=[
+            {
+                "surface": "chat",
+                "item_id": "42",
+                "status": "failed_transform_or_storage",
+            }
+        ],
+    )
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["run_id"] == "run-1"
+    assert record["user_id"] == "usr_a"
+    assert record["surface"] == "chat"
+    assert record["item_id"] == "42"
+    assert record["status"] == "failed_transform_or_storage"
+    assert record["timestamp"]
+
+
+def test_failure_log_persists_stable_failure_metadata(tmp_path, monkeypatch):
+    path = tmp_path / "plaintext-failures.jsonl"
+    monkeypatch.setenv(plaintext_repair.FAILURE_LOG_ENV, str(path))
+
+    plaintext_repair.append_failure_log(
+        run_id="run-2",
+        user_id="usr_a",
+        failures=[
+            {
+                "surface": "frame",
+                "item_id": "frame-1",
+                "status": "failed_transform_or_storage",
+                "failure_class": "enclave_http_403",
+                "failure_detail": "aead_verify_failed",
+                "retryable": False,
+            }
+        ],
+    )
+
+    record = json.loads(path.read_text().splitlines()[0])
+    assert record["failure_class"] == "enclave_http_403"
+    assert record["failure_detail"] == "aead_verify_failed"
+    assert record["retryable"] is False
+    assert record["remediation"] == "manual_key_recovery"
+
+
+def test_load_retry_items_excludes_deterministic_and_legacy_failures(tmp_path):
+    path = tmp_path / "failures.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"user_id": "usr_a", "item_id": "item-1", "retryable": True}),
+                json.dumps({"user_id": "usr_a", "item_id": "item-2", "retryable": False}),
+                json.dumps({"user_id": "usr_b", "item_id": "item-3"}),
+                "not-json",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert plaintext_repair.load_retry_items(str(path)) == {
+        "usr_a": {"item-1"}
+    }
+
+
+def test_load_retry_items_can_explicitly_include_deterministic_failures(tmp_path):
+    path = tmp_path / "failures.jsonl"
+    path.write_text(
+        json.dumps({"user_id": "usr_a", "item_id": "item-1", "retryable": False})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert plaintext_repair.load_retry_items(
+        str(path), include_non_retryable=True
+    ) == {"usr_a": {"item-1"}}
+
+
+def test_summarize_failure_log_reports_stable_classes_and_unique_items(tmp_path):
+    path = tmp_path / "failures.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"user_id": "usr_a", "item_id": "item-1", "failure_class": "cas_conflict", "retryable": True}),
+                json.dumps({"user_id": "usr_a", "item_id": "item-1", "failure_class": "cas_conflict", "retryable": True}),
+                json.dumps({"user_id": "usr_b", "item_id": "item-2", "failure_class": "enclave_http_403", "retryable": False}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert plaintext_repair.summarize_failure_log(str(path)) == {
+        "records": 3,
+        "unique_items": 2,
+        "retryable_records": 2,
+        "non_retryable_records": 1,
+        "by_failure_class": {"cas_conflict": 2, "enclave_http_403": 1},
+        "by_remediation": {"manual_key_recovery": 1, "retry_automatically": 2},
+        "by_surface": {},
+    }
+
+
+def test_apply_partial_user_stops_without_advancing_resume_cursor(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair,
+        "eligible_user_ids",
+        lambda **_kwargs: ["usr_a", "usr_b", "usr_c"],
+    )
+    called = []
+
+    def migrate(user_id, **_kwargs):
+        called.append(user_id)
+        if user_id == "usr_a":
+            return SimpleNamespace(counts={"migrated": 2}, failures=0)
+        if user_id == "usr_b":
+            return SimpleNamespace(
+                counts={"migrated": 20, "not_attempted_limit": 80},
+                failures=0,
+            )
+        return SimpleNamespace(counts={"migrated": 3}, failures=0)
+
+    monkeypatch.setattr(plaintext_repair.plaintext_migration, "run", migrate)
+
+    result = plaintext_repair.run(
+        apply=True,
+        row_limit=20,
+        health_probe=lambda: True,
+        healthy_streak=1,
+    )
+
+    assert called == ["usr_a", "usr_b"]
+    assert result.public_dict() == {
+        "apply": True,
+        "failures": 0,
+        "item_counts": {"migrated": 22, "not_attempted_limit": 80},
+        "last_completed_user_id": "usr_a",
+        "users_completed": 1,
+        "users_selected": 3,
+    }
+
+
+def test_apply_stops_when_health_does_not_recover(monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        plaintext_repair.FAILURE_LOG_ENV,
+        str(tmp_path / "plaintext-failures.jsonl"),
+    )
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
+    )
+    ticks = iter([0.0, 2.0])
+    monkeypatch.setattr(plaintext_repair.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(
+        plaintext_repair.plaintext_migration,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("unhealthy gate must block migration"),
+    )
+
+    result = plaintext_repair.run(
+        apply=True,
+        health_probe=lambda: False,
+        healthy_streak=1,
+        health_poll_sec=0.1,
+        max_pause_sec=1.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.failures == 1
+    assert result.item_counts == {"failed_health_gate": 1}
+
+
+def test_health_gate_failure_is_persisted_as_retryable_user_record(monkeypatch):
+    monkeypatch.setattr(
+        plaintext_repair, "eligible_user_ids", lambda **_kwargs: ["usr_a"]
+    )
+    logged = []
+    monkeypatch.setattr(
+        plaintext_repair,
+        "append_failure_log",
+        lambda **kwargs: logged.append(kwargs),
+    )
+
+    result = plaintext_repair.run(
+        apply=True,
+        continue_on_failure=True,
+        health_probe=lambda: False,
+        healthy_streak=1,
+        max_pause_sec=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result.failures == 1
+    assert logged == [
+        {
+            "run_id": "",
+            "user_id": "usr_a",
+            "failures": [
+                {
+                    "surface": "user",
+                    "item_id": "",
+                    "status": "failed_health_gate",
+                    "failure_class": "health_gate",
+                    "failure_detail": "enclave_unhealthy",
+                    "retryable": True,
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra", "enabled"),
+    [
+        ([], True),
+        (["--allow-plaintext-rewrite"], True),
+        (
+            [
+                "--allow-plaintext-rewrite",
+                "--confirm-all-effective-off",
+                "ALL-EFFECTIVE-OFF",
+            ],
+            False,
+        ),
+    ],
+)
+def test_cli_apply_requires_all_independent_gates(
+    monkeypatch, capsys, extra, enabled
+):
+    if enabled:
+        monkeypatch.setenv(plaintext_repair.APPLY_ENV, "1")
+    else:
+        monkeypatch.delenv(plaintext_repair.APPLY_ENV, raising=False)
+    monkeypatch.setattr(
+        plaintext_repair,
+        "run",
+        lambda **_kwargs: pytest.fail("gate must precede repair"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--apply", *extra])
+
+    assert exc.value.code == 2
+    assert "requires" in capsys.readouterr().err
+
+
+def test_cli_dry_run_emits_content_free_json(monkeypatch, capsys):
+    report = {
+        "apply": False,
+        "failures": 0,
+        "item_counts": {"migratable_shared": 8},
+        "last_completed_user_id": "usr_b",
+        "users_completed": 2,
+        "users_selected": 2,
+    }
+    monkeypatch.setattr(
+        plaintext_repair,
+        "run",
+        lambda **_kwargs: SimpleNamespace(public_dict=lambda: report, failures=0),
+    )
+
+    assert cli.main(["--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == report

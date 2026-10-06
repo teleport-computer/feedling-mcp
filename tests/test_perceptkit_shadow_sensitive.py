@@ -110,8 +110,11 @@ def test_decrypted_sensitive_signals_reach_the_kit(clean_kit_tables):
     assert "music_playback" in got, f"播放没进 kit：{sorted(got)}"
     assert got["music_playback"]["title"] == "夜空中最亮的星"
     assert "motion_state" in got and got["motion_state"]["state"] == "walking"
-    assert "health_vitals" in got
-    assert got["health_vitals"]["resting_heart_rate"] == 58
+    # 体征在 kit 这一侧按单指标拆开（活路径仍然是一整包）——
+    # 拆出去的那几个也必须都到，只验主信号会漏掉「拆的那一半掉了」。
+    assert "health_resting_hr" in got, f"体征没进 kit：{sorted(got)}"
+    assert got["health_resting_hr"]["resting_heart_rate"] == 58
+    assert got["health_hrv"]["hrv_sdnn_ms"] == 42.5
 
 
 def test_location_arrives_as_coarse_labels_and_nothing_precise(clean_kit_tables):

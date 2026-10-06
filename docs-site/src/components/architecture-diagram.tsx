@@ -89,7 +89,7 @@ export function ArchitectureDiagram() {
               Hold the user API key and content keypair; call HTTPS and WebSocket APIs.
             </Node>
             <Node eyebrow="User-operated option" title="Independent resident consumer">
-              Polls encrypted Chat work and posts encrypted replies from infrastructure the user controls.
+              Polls Chat work and posts replies in the effective content shape from infrastructure the user controls.
             </Node>
           </div>
         </section>
@@ -131,11 +131,16 @@ export function ArchitectureDiagram() {
           <p className="mb-0 mt-3 text-xs leading-5 text-fd-muted-foreground">
             The API also owns authenticated screen WebSocket ingest and wake coordination. The attestation
             endpoint lets audit-aware clients verify the measured deployment and content public key.
+            An internal collector validates enclave diagnostics into a 30-day local volume;
+            configuring its log bucket exports only allowlisted metadata to operator R2.
+            Hosted body generation sends authorized context from the API to the selected model.
+            Resident jobs carry fixed instructions through the consumer mailbox; the resident reads its
+            own context and returns temporary grid indices, which are cleared after delivery.
           </p>
         </section>
 
         <div className="grid gap-0 md:grid-cols-3 md:gap-3">
-          <DownstreamLabel>Ciphertext and metadata</DownstreamLabel>
+          <DownstreamLabel>Content storage · allowlisted diagnostics</DownstreamLabel>
           <DownstreamLabel>Queue, poll, and decrypt</DownstreamLabel>
           <DownstreamLabel>Inference and delivery</DownstreamLabel>
         </div>
@@ -150,7 +155,10 @@ export function ArchitectureDiagram() {
             </h3>
             <div className="grid gap-2">
               <Node title="PostgreSQL">
-                Stores accounts, workflow state, encrypted bodies, and operational metadata.
+                Stores accounts, workflow state, plaintext and legacy encrypted bodies, and operational metadata.
+              </Node>
+              <Node eyebrow="Optional external recipient" title="Operator log bucket">
+                Content-free enclave diagnostics only; operator-configured 90-day lifecycle.
               </Node>
               <Node title="Object storage">
                 Stores enabled large-object flows; encryption depends on the specific workflow.

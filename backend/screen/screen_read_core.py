@@ -134,7 +134,7 @@ def screen_share_grounding(
     """
     if latest_frame_ts is None:
         try:
-            meta = db.frame_list_meta(user_id)
+            meta = db.frame_list_meta(user_id, source="screen")
         except Exception:
             return {}
         if not meta:
@@ -269,10 +269,26 @@ def sources_data(store) -> ScreenResult:
 
 def list_frames(store, limit_raw) -> ScreenResult:
     limit = min(int(limit_raw if limit_raw is not None else 20), 100)
+    try:
+        confirmed_screen_ids = {
+            str(row.get("id") or "")
+            for row in db.frame_list_meta(
+                store.user_id, source="screen", unavailable_raises=True
+            )
+        }
+    except db.FrameReadUnavailable:
+        return ScreenResult(
+            503, json_body={"error": "frame_store_unavailable"}
+        )
     with store.frames_lock:
-        recent = [f.copy() for f in reversed(store.frames_meta)][:limit]
-        latest_ts = store.frames_meta[-1].get("ts") if store.frames_meta else None
-        total = len(store.frames_meta)
+        screen_meta = [
+            f for f in store.frames_meta
+            if str(f.get("id") or f.get("filename") or "").split(".")[0]
+            in confirmed_screen_ids
+        ]
+        recent = [f.copy() for f in reversed(screen_meta)][:limit]
+        latest_ts = screen_meta[-1].get("ts") if screen_meta else None
+        total = len(screen_meta)
     for f in recent:
         f["url"] = frames._frame_url(store, f["filename"])
     share_state = (

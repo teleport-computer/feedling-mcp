@@ -21,6 +21,7 @@ from hosted import image_resize
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import service as memory_service
+from memgarden import timestamps as memory_timestamps
 import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import history_import as hosted_history_import
@@ -107,7 +108,11 @@ def _model_api_recent_recap_chat(store: UserStore, api_key: str | None, limit: i
             continue
         try:
             raw = core_envelope.read_envelope_body(
-                row, api_key, purpose="model_api_recap_history")
+                row,
+                api_key,
+                purpose="model_api_recap_history",
+                caller_user_id=str(store.user_id),
+            )
             item = dict(row)
             item["content"] = raw.decode("utf-8")
             raw_messages.append(item)
@@ -139,7 +144,8 @@ def _model_api_plain_memory_cards(store: UserStore, api_key: str | None) -> list
     for moment in memory_service._active_memory_moments(memory_service._load_moments(store)):
         if not isinstance(moment, dict):
             continue
-        inner, _ = memory_actions_mod._memory_plain_from_envelope(moment, api_key)
+        inner, _ = memory_actions_mod._memory_plain_from_envelope(
+            str(store.user_id), moment, api_key)
         if inner is None:
             continue
         card = {
@@ -199,7 +205,8 @@ def _model_api_memory_quality_scan(
     for moment in moments[:max(1, max_cards)]:
         if not isinstance(moment, dict):
             continue
-        inner, err = memory_actions_mod._memory_plain_from_envelope(moment, api_key)
+        inner, err = memory_actions_mod._memory_plain_from_envelope(
+            str(store.user_id), moment, api_key)
         if inner is None:
             decrypt_errors += 1
             continue
@@ -272,7 +279,7 @@ def _archive_model_api_memory_cards(
     # concurrent writer vs foreground memory.add — the exact collision the plain
     # Lock masked under Flask -w1). RLock lets _append_memory_change re-enter.
     archived = 0
-    now = core_util._now_iso()
+    now = memory_timestamps.now_iso()
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         for idx, moment in enumerate(moments):

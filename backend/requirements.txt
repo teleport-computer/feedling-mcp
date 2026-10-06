@@ -115,8 +115,9 @@ Pillow>=11,<13
 # 什么」切的。所以把这里从 X 升到 Y，io 拿到的是 X..Y 区间里**所有人**的改动，
 # 不只是你要的那一个。
 #
-# 而且 `agent-protocol-core` 和 `memgarden` 在**同一个仓库**里（`self_thinking`
-# 在前者）。io 两个都装，所以只碰了 core 的改动也会跟着进来。
+# （2026-09-04 起 `agent-protocol-core` 已经搬进 backend/agent_protocol_core/，
+# 不再是外部依赖 —— 上面这条「只碰了 core 也会跟着进来」不再适用。
+# 但「升版本会带进别人合进 memgarden main 的改动」这条依然成立。）
 #
 # 升之前先看一眼区间：
 #
@@ -126,7 +127,8 @@ Pillow>=11,<13
 # self-thinking 措辞改动（一行字），io 锁提示词逐字节不变的那组哈希测试红了。
 # 那组测试拦住了它 —— 这正是它存在的理由。真正危险的不是带进来，是带进来而
 # 不知道。
-memgarden==0.15.0
+memgarden==0.23.0
+jieba==0.42.1  # deterministic Chinese BM25 tokenization; hash in requirements.lock
 
 # 感知内核 —— 同样从本仓库提取出去的独立库（perceptkit），走法与上面的
 # memgarden 一致：GitHub Release 的 wheel URL，理由同上（--require-hashes +
@@ -147,4 +149,61 @@ memgarden==0.15.0
 #
 # ⚠️ 0.2.5 那条照片计数的修复会**改变已有数字的含义**：历史上被写成 1 的日子
 # 修不回来（明细只留 7 天，更早的连重算的原料都没有），从上线那天起才对。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.2.7/perceptkit-0.2.7-py3-none-any.whl
+#
+# 0.2.7 → 0.3.0（2026-09-03，外部审查第二轮）。**带破坏性变更**：
+# CalendarEventMirror / ReminderItemMirror 新增必填 source，且它进了唯一身份。
+# 配套迁移是 0107（RDS）/ 0041（tee）—— 少了它，一次 source="ios" 的全量
+# 同步会把概念上属于别的来源的日程一起删掉，不可逆。装着 0.2.7 跑本分支
+# 会在 import 时就炸（缺 StoragePort.delete_source_items）。
+#
+# 0.3.0 → 0.4.0（2026-09-06，外部复核第二轮 + 产品拍板的信号拆分）。
+# **带破坏性变更**，而且这一版的 pin 和代码耦合得比前几次都紧：
+#
+#   健康信号拆成单指标  health_body / health_vitals / health_metabolic
+#                       在**存储侧**拆成十二个（23 信号 → 32）。
+#                       ⚠️ **上报契约没拆** —— 客户端仍然按 HealthKit 的授权
+#                       分组一次报一整包，catalog.SIGNALS 和四张声明表
+#                       (history.SHAPE / attribution / trend_models /
+#                       retention) 仍然按上报键建索引。这两套词表混起来
+#                       在 0.4.0 的开发过程中翻过三次车，每次都不报错。
+#   来源撤回            用户在健康 app 里删掉的记录，这边跟着不作数。
+#                       配套迁移 0108（RDS）/ 0042（tee）。
+#
+# 装着 0.3.0 跑本分支会在 import 时就炸（缺 contracts.Retraction、
+# StoragePort.record_retraction / list_retractions、
+# PerceptionKit.apply_retractions）。
+#
+# 0.4.0 → 0.4.1（2026-09-07）。**带破坏性变更**：`AGGREGATION_VERSION` 1 → 2。
+# 睡眠的聚合语义换了（此前 duration_minutes 取的是各阶段的 max 而不是和，
+# 「昨晚睡了多久」会答 250 而不是 430）。两版聚合是并排存着的，所以读日聚合
+# **必须挑最高版本** —— 配套改动在 perceptkit_adapter/history.py。
+# 装着 0.4.0 跑本分支不会 import 报错，但睡眠会读到空聚合。
+#
+# 0.4.1 → 0.5.0（2026-09-07）。**这次 pin 和代码必须一起改**：
+# io 已经在 presence_recovery 里发 `evidence`，而 0.4.1 的 manifest 没有这个
+# 字段 —— 装着 0.4.1 跑本分支不会报错，但那一格会被当未声明字段静默丢掉，
+# 于是下游又只剩"回来了"可说。
+# 同批还有：EventDefinition 动态装配、Workout 三投影（当日求和而不是取 max）、
+# 累计型允许向下修订（counter_epoch_id）。
+#
+# 0.5.0 → 0.7.0（2026-09-16，跨过 0.6.0）。两个线上唤醒缺陷：
+#
+#   同一个跳变第二次发生被当成重复吞掉  周一 家→公司 叫醒，周二起永远不叫；
+#                                      录屏开/关只在第一次开、第一次关时叫。
+#                                      事件 id 改按触发它的那条观测算。
+#   规则只能看一个字段                  新增 EventDefinition.when（前置条件），
+#                                      锚点规则配 is_connected=True。
+#
+# 配套改动在 perceptkit_adapter/wake_rules.py。无数据迁移，已存事件 id 不变。
+# 0.6.0 那条（manifest 里 SignalDefinition.capability 对 12 条拆分健康信号
+# 换值、catalog 新增 health_steps）顺带带进来。io 的快照字段筛选读的是
+# perceptkit.catalog.SIGNALS，升级前后逐项对比无变化；step_count 改挂
+# health_steps 是另一件事，不在这次。
+# 0.7.0 → 0.9.0（2026-09-23）。外部审查里能在库内修的全部修完（F1–F5/F7/F9–F12）。
+# **这次 pin 和代码必须一起改**：0.9.0 会调宿主的 scrub_event_snapshots
+# 把被删数据触发过的提醒记录里的原值抹掉，而那个方法和它要的两列是这一批
+# 才加的；装着 0.7.0 跑本分支，撤回时那一步直接不存在。
+#
+# ⚠️ 破坏性：observation_id 的算法变了（只影响新写入的行）。入口同时查新旧
+# 两个摘要兜住已落库的数据，否则"每次重传都翻倍"会变成"升级当天翻一次"。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.9.0/perceptkit-0.9.0-py3-none-any.whl

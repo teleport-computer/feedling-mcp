@@ -10,6 +10,7 @@ Run with: pytest tests/test_chat_resident_self_update.py -v
 """
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,6 +101,106 @@ def test_skips_when_working_tree_dirty():
 def test_skips_when_no_relevant_paths_changed():
     # Backend shipped a release that doesn't touch any file the consumer loads.
     assert _call(relevant_changed=False) is False
+
+
+@pytest.fixture
+def update_git_repo(tmp_path, monkeypatch):
+    """Real disposable checkout: never run Git mutations on the product tree."""
+    repo = tmp_path / "consumer-checkout"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Resident Test",
+             "-c", "user.email=resident-test@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *args],
+            check=True, text=True, capture_output=True,
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    (repo / "runtime.py").write_text("old runtime\n")
+    (repo / ".gitignore").write_text("identity.json\n")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    monkeypatch.setattr(crc, "_REPO", repo)
+
+    def target_with(path=None):
+        (repo / "runtime.py").write_text("new runtime\n")
+        if path:
+            destination = repo / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("upstream file\n")
+            git("add", "--force", path)
+        git("add", "runtime.py")
+        git("commit", "--quiet", "-m", "target")
+        target = git("rev-parse", "HEAD")
+        git("checkout", "--quiet", "--detach", base)
+        return target
+
+    return repo, git, base, target_with
+
+
+def test_self_update_preserves_nonconflicting_untracked_and_ignored(update_git_repo):
+    repo, git, _, target_with = update_git_repo
+    target = target_with()
+    for name in ("consumer.env", "identity.json"):
+        (repo / name).write_text("synthetic local state\n")
+    assert crc._git_tree_dirty() is False
+    assert crc._git_checkout(target) is True
+    assert git("rev-parse", "HEAD") == target
+    assert (repo / "runtime.py").read_text() == "new runtime\n"
+    for name in ("consumer.env", "identity.json"):
+        assert (repo / name).read_text() == "synthetic local state\n"
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_self_update_detects_and_preserves_tracked_edits(update_git_repo, staged):
+    repo, git, base, target_with = update_git_repo
+    target = target_with()
+    (repo / "runtime.py").write_text("local edit\n")
+    if staged:
+        git("add", "runtime.py")
+    assert crc._git_tree_dirty() is True
+    # Even an edit racing the dirty check is not discarded by checkout.
+    assert crc._git_checkout(target) is False
+    assert git("rev-parse", "HEAD") == base
+    assert (repo / "runtime.py").read_text() == "local edit\n"
+
+
+@pytest.mark.parametrize("collision", ["untracked", "ignored", "file_to_dir", "dir_to_file"])
+def test_self_update_refuses_local_file_collisions(update_git_repo, monkeypatch, caplog, collision):
+    repo, git, base, target_with = update_git_repo
+    upstream = {
+        "untracked": "consumer.env", "ignored": "identity.json",
+        "file_to_dir": "state/entry.json", "dir_to_file": "state",
+    }[collision]
+    target = target_with(upstream)
+    local = repo / ({"file_to_dir": "state", "dir_to_file": "state/entry.json"}.get(collision, upstream))
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text("synthetic private local state\n")
+    assert crc._git_tree_dirty() is False
+    calls = []
+    monkeypatch.setattr(crc, "_pip_install", lambda req: calls.append("pip"))
+    monkeypatch.setattr(crc.os, "execv", lambda *args: calls.append("exec"))
+    crc._apply_self_update(base, target, {"backend/requirements.txt"})
+    assert calls == []
+    assert git("rev-parse", "HEAD") == base
+    assert local.read_text() == "synthetic private local state\n"
+    assert (repo / "runtime.py").read_text() == "old runtime\n"
+    assert "self-update checkout failed" in caplog.text
+    assert local.relative_to(repo).parts[0] in caplog.text
+    assert "synthetic private local state" not in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["exit", "exception"])
+def test_self_update_dirty_check_fails_closed(monkeypatch, failure):
+    def failed_git(*args, **kwargs):
+        if failure == "exception":
+            raise OSError("synthetic git unavailable")
+        return SimpleNamespace(returncode=1, stdout="")
+    monkeypatch.setattr(crc, "_git", failed_git)
+    assert crc._git_tree_dirty() is True
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +321,13 @@ def test_run_self_update_applies_when_relevant_and_clean(update_seams):
     assert update_seams == ["target99"]
 
 
-def test_run_self_update_skips_when_dirty(update_seams, monkeypatch):
+def test_run_self_update_skips_when_dirty(update_seams, monkeypatch, caplog):
     monkeypatch.setattr(crc, "_git_tree_dirty", lambda: True)
     crc._run_self_update("target99")
     assert update_seams == []  # protect uncommitted edits
+    assert "Back up consumer.env, identity.json" in caplog.text
+    assert "Do not use git stash -u/-a or git clean" in caplog.text
+    assert "do not commit secrets" in caplog.text
 
 
 def test_run_self_update_skips_when_no_relevant_paths(update_seams, monkeypatch):

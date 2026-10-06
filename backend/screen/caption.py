@@ -66,7 +66,7 @@ def _frame_id_from_entry(entry: dict) -> str:
 
 
 def _latest_frame_id(user_id: str) -> str | None:
-    meta = db.frame_list_meta(user_id)  # sorted by ts ascending
+    meta = db.frame_list_meta(user_id, source="screen")  # sorted by ts ascending
     if not meta:
         return None
     return _frame_id_from_entry(meta[-1]) or None
@@ -137,7 +137,7 @@ def caption_frame(user_id: str, api_key: str, frame_id: str | None,
 
 
 def recent_frames(user_id: str, limit: int = 10) -> dict:
-    meta = db.frame_list_meta(user_id)[-max(1, int(limit)):]
+    meta = db.frame_list_meta(user_id, source="screen")[-max(1, int(limit)):]
     frames = []
     for m in reversed(meta):  # newest first
         fid = _frame_id_from_entry(m)

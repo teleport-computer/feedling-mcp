@@ -6,7 +6,7 @@ usr_7f30…(2026-08-13,prod/V2)让伴侣找记忆花园里的几张卡,伴侣回
 
 真实经过是两件事叠在一起:
 
-1. **匹配是字面子串**(`enclave/readside.py` 的 `memory_index_filter_items`:
+1. **当时匹配是字面子串**(`enclave/readside.py` 的 `memory_index_filter_items`:
    `if query not in haystack`,只做 casefold)。卡是中文写的("捏声音"),
    搜英文品牌名本来就该 0 命中 —— 代码完全按设计工作。
 2. **一次未命中之后不许再搜**:当时的工具描述写着
@@ -49,10 +49,11 @@ def test_description_no_longer_forbids_searching_again_after_one_result():
 
 
 def test_description_warns_that_empty_is_not_absent():
-    """0 命中必须被解释成「这个写法没有」,不是「这段记忆没有」。"""
+    """BM25 零命中也不能当作记忆不存在；旧 substring 只作显式滚更回落。"""
     description = _description()
-    assert "substring" in description
-    assert "not that the memory is absent" in description
+    assert "bm25" in description
+    assert "ranking=substring-legacy" in description
+    assert "zero results do not prove the memory is absent" in description
 
 
 def test_description_tells_the_model_to_retry_instead_of_asking_the_user_to_paste():

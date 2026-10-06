@@ -11,7 +11,6 @@ import os
 import threading
 import time
 
-import anyio.to_thread
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -19,6 +18,7 @@ from starlette.responses import JSONResponse
 import worldbook_readside_core
 from enclave import auth, envelope
 from enclave.routes._body import read_json_payload
+from enclave.routes import _reqlog
 from enclave.routes._errors import content_sk_or_503
 
 router = APIRouter()
@@ -125,5 +125,5 @@ async def v1_worldbook_match(request: Request):
         response["unavailable_ids"] = unavailable_ids
         return response
 
-    response = await anyio.to_thread.run_sync(_work)
+    response = await _reqlog.decrypt_job(request, _work)
     return JSONResponse(response)

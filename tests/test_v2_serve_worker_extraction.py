@@ -6,7 +6,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import serve_worker
-from memory.dream_prompt_v1 import build_dream_prompt
 
 
 def test_memory_context_degrades_each_field_independently(monkeypatch):
@@ -83,11 +82,11 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
 
     ctx = serve_worker._read_dream_memory_context("u_ctx_full")
 
-    assert "完整摘要" in ctx["cards"]
-    assert "只有 fetch 才返回的完整正文。" in ctx["cards"]
-    assert "dream-new" in ctx["cards"]
-    assert "上一轮 Dream 卡可在后续运行重新参与整理。" in ctx["cards"]
+    # The reader hands the fetched cards over whole; rendering (with bodies)
+    # and the prompt budget belong to the Garden component.
+    assert "cards" not in ctx
     assert [item["id"] for item in ctx["card_items"]] == ["capture-old", "dream-new"]
+    assert ctx["card_items"][0]["content"] == "只有 fetch 才返回的完整正文。"
     assert [item["occurred_at"] for item in ctx["card_items"]] == [
         "2026-05-01T00:00:00Z",
         "2026-07-01T00:00:00Z",
@@ -95,10 +94,14 @@ def test_dream_context_fetches_full_cards_without_cross_run_cooldown(monkeypatch
     assert ctx["_diagnostic_cards_outcome"] == "ready"
 
 
-def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
+def test_dream_context_does_not_pre_budget_cards(monkeypatch):
+    """Every fetched card reaches the worker, however long. The component
+    applies the Dream prompt budget (and reports what it left out), so a
+    second, different budget here would silently drop cards before it."""
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
-    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 250)
+    assert not hasattr(serve_worker, "_DREAM_CARDS_MAX_CHARS")
+    assert not hasattr(serve_worker, "_render_card_line")
     monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
     monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
     monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
@@ -110,10 +113,9 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
         {
             "id": memory_id,
             "summary": f"摘要-{memory_id}",
-            "content": "正文" * 40,
+            "content": "正文" * 40_000,
             "source": "memory_capture",
             "occurred_at": "2026-07-01T00:00:00Z",
-            "created_at": "2026-07-01T00:00:00Z",
         }
         for memory_id in ("m1", "m2")
     ]
@@ -123,74 +125,75 @@ def test_dream_context_budget_keeps_only_whole_cards(monkeypatch):
 
     ctx = serve_worker._read_dream_memory_context("u_ctx_budget")
 
-    assert [item["id"] for item in ctx["card_items"]] == ["m1"]
-    assert "id=m1" in ctx["cards"]
-    assert "id=m2" not in ctx["cards"]
-    assert ctx["card_items"][0]["content"] == "正文" * 40
-    assert ctx["_diagnostic_cards_outcome"] == "truncated"
+    assert [item["id"] for item in ctx["card_items"]] == ["m1", "m2"]
+    assert ctx["card_items"][1]["content"] == "正文" * 40_000
+    assert ctx["_diagnostic_cards_outcome"] == "ready"
 
 
-def test_dream_context_budget_rejects_oversized_first_card_from_final_prompt(
-    monkeypatch, caplog,
-):
+def _capture_ctx(monkeypatch, index):
     serve_worker.wire_assembly()
     monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "token")
-    monkeypatch.setattr(serve_worker, "_DREAM_CARDS_MAX_CHARS", 150)
     monkeypatch.setattr("memory.memory_core.buckets", lambda *a, **k: ({"buckets": []}, 200))
     monkeypatch.setattr("memory.memory_core.threads", lambda *a, **k: ({"threads": []}, 200))
-    monkeypatch.setattr("identity.identity_core.get_identity", lambda *a, **k: ({}, 200))
-    monkeypatch.setattr(
-        "memory.memory_core.index",
-        lambda *a, **k: ({"items": [{"id": "oversized-first"}]}, 200),
-    )
-    monkeypatch.setattr(
-        "memory.memory_core.fetch",
-        lambda *a, **k: (
-            {
-                "items": [
-                    {
-                        "id": "oversized-first",
-                        "summary": "超限首卡",
-                        "content": "正文" * 100,
-                        "source": "memory_capture",
-                        "created_at": "2026-07-01T00:00:00Z",
-                    }
-                ]
-            },
-            200,
-        ),
-    )
+    calls = []
 
-    with caplog.at_level("WARNING", logger="feedling.runtime_v2.serve_worker"):
-        ctx = serve_worker._read_dream_memory_context("u_ctx_oversized_first")
-    prompt = build_dream_prompt(
-        ai_name=ctx["ai_name"],
-        user_name=ctx["user_name"],
-        cards=ctx["cards"],
-        recent_conversations="",
-        locale="zh-Hans",
-    )
-    empty_prompt = build_dream_prompt(
-        ai_name=ctx["ai_name"],
-        user_name=ctx["user_name"],
-        cards="",
-        recent_conversations="",
-        locale="zh-Hans",
-    )
+    def _index(_store, _api_key, payload, **_k):
+        calls.append(dict(payload))
+        return index() if callable(index) else index
 
-    assert ctx["card_items"] == []
-    assert len(prompt) == len(empty_prompt)
-    assert "oversized-first" not in prompt
-    budget_logs = [
-        record.getMessage()
-        for record in caplog.records
-        if "dream cards truncated" in record.getMessage()
+    def _no_fetch(*_a, **_k):
+        raise AssertionError("capture needs summaries only, never full card bodies")
+
+    monkeypatch.setattr("memory.memory_core.index", _index)
+    monkeypatch.setattr("memory.memory_core.fetch", _no_fetch)
+    return serve_worker._read_memory_context("u_ctx_capture"), calls
+
+
+def test_capture_context_reads_all_existing_cards_for_the_index(monkeypatch):
+    """08-30 起 Capture 不读卡，提示词索引是 (none)、模型只能 add。现在读一次全量
+    index（limit=0 → 读侧硬上限；校验 target 要全部现有卡），只取 id/摘要/桶/重要度。"""
+    ctx, calls = _capture_ctx(monkeypatch, ({
+        "items": [
+            {"id": "m1", "summary": "在字节做产品", "bucket": "工作", "importance": 0.5,
+             "score": 1.0, "created_at": "2026-08-01"},
+            {"id": "m0", "summary": "旧的", "status": "superseded"},
+        ],
+        "user_card_count": 2,
+        "truncated": False,
+    }, 200))
+    assert calls == [{"limit": 0}]
+    assert ctx["capture_cards"] == [
+        {"id": "m1", "summary": "在字节做产品", "bucket": "工作", "importance": 0.5}
     ]
-    assert len(budget_logs) == 1
-    assert "kept=0/1" in budget_logs[0]
-    assert "empty_context=True" in budget_logs[0]
-    assert "oversized-first" not in budget_logs[0]
-    assert ctx["_diagnostic_cards_outcome"] == "truncated"
+    assert ctx["card_items"] == []
+    assert "_diagnostic_cards_outcome" not in ctx
+
+
+def test_capture_context_verified_empty_garden_is_an_empty_list(monkeypatch):
+    ctx, _ = _capture_ctx(
+        monkeypatch, ({"items": [], "user_card_count": 0, "truncated": False}, 200)
+    )
+    assert ctx["capture_cards"] == []
+
+
+def test_capture_context_unreadable_index_is_absent_not_empty(monkeypatch):
+    """读不全就不交：空列表会让任何 supersede 被当成编造，那是把读失败伪装成空花园。"""
+    def _boom():
+        raise RuntimeError("enclave down")
+
+    for index in (
+        ({"items": []}, 200),                        # 200 但没证明是空花园
+        ({"items": [], "user_card_count": 5}, 200),  # 读侧解不开全部卡
+        # 超过读侧硬上限：只回了前一截。当全集交出去，上限之后的真卡会被判成编造。
+        ({"items": [{"id": "m1", "summary": "s"}], "user_card_count": 1001,
+          "truncated": True}, 200),
+        # 缺 truncated 字段同样说不清读全没有。
+        ({"items": [{"id": "m1", "summary": "s"}], "user_card_count": 1}, 200),
+        ({"error": "readside_unavailable"}, 503),
+        _boom,
+    ):
+        ctx, _ = _capture_ctx(monkeypatch, index)
+        assert "capture_cards" not in ctx, index
 
 
 def test_dream_context_distinguishes_empty_index_from_failed_full_card_read(
@@ -208,10 +211,20 @@ def test_dream_context_distinguishes_empty_index_from_failed_full_card_read(
         "identity.identity_core.get_identity", lambda *a, **k: ({}, 200)
     )
     monkeypatch.setattr(
-        "memory.memory_core.index", lambda *a, **k: ({"items": []}, 200)
+        "memory.memory_core.index",
+        lambda *a, **k: ({"items": [], "user_card_count": 0}, 200),
     )
     empty = serve_worker._read_dream_memory_context("u_ctx_empty")
     assert empty["_diagnostic_cards_outcome"] == "empty"
+
+    # 200 + no items is only an empty garden when the live card count says so:
+    # the readside drops every card it cannot decrypt and still answers 200.
+    for unverified in ({"items": []}, {"items": [], "user_card_count": 3}):
+        monkeypatch.setattr(
+            "memory.memory_core.index", lambda *a, _b=unverified, **k: (_b, 200)
+        )
+        unreadable = serve_worker._read_dream_memory_context("u_ctx_unreadable")
+        assert unreadable["_diagnostic_cards_outcome"] == "unavailable"
 
     monkeypatch.setattr(
         "memory.memory_core.index",
@@ -230,8 +243,9 @@ def test_capture_submit_enqueues_a_capture_agent_job(monkeypatch):
     from model_api_runtime.v2 import jobs_store
     serve_worker.wire_assembly()
     calls = []
-    monkeypatch.setattr(jobs_store, "enqueue_job",
-                        lambda u, lane, **kw: calls.append((u, lane)) or ("j1", False))
+    monkeypatch.setattr(jobs_store, "enqueue_capture",
+                        lambda u, **kw: calls.append((u, "capture")) or
+                        jobs_store.CaptureEnqueueResult(1, "created"))
     monkeypatch.setattr("proactive.capture_scheduler.tick_quiet_capture",
                         lambda store, *, now=None, submit=None:
                             submit(

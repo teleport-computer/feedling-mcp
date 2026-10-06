@@ -50,7 +50,7 @@
     },
     {
       "name": "Memory",
-      "description": "Memory records, buckets, threads, and migration state."
+      "description": "Memory records, buckets, and threads."
     },
     {
       "name": "Identity",
@@ -486,6 +486,103 @@
         },
         "x-feedling-contract-level": "documented",
         "description": "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint."
+      }
+    },
+    "/v1/agent-body/generate": {
+      "post": {
+        "summary": "Agent Body Generate",
+        "operationId": "agent_body_generate_v1_agent_body_generate_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentBodyGenerateResponse"
+                }
+              }
+            },
+            "description": "Validated body generated with the active tested chat route. Generation does not save or apply the body."
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or missing, untested, or unreadable model route."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Provider configuration failed, the resident needs an update, or no agent is configured."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Provider rate limit; retryable."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Provider failed or output remained invalid after one repair attempt. No rows."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Generation exceeded its 85-second budget or insufficient budget remains for repair. No rows."
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentBodyGenerateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
       }
     },
     "/v1/agent/perception": {
@@ -989,6 +1086,39 @@
         "x-feedling-contract-level": "compatibility"
       }
     },
+    "/v1/chat/canvases": {
+      "get": {
+        "summary": "Chat Canvases",
+        "operationId": "chat_canvases_v1_chat_canvases_get",
+        "responses": {
+          "200": {
+            "description": "The caller's workspace and chat-delivered Canvas metadata, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasIndexResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "List up to 500 IO Canvases from workspace entries and agent-authored Chat file cards, including Resident and self-hosted deliveries. Workspace entries take precedence for identical filenames; the combined index is ordered by updated_at descending. The .io.html suffix is matched case-insensitively while preserving filename case. Chat-only entries use revision=1, mime_type=text/html, earliest card timestamp for created_at and newest card timestamp for updated_at and message_id. Workspace entries retain their revision/timestamps and newest matching Chat metadata (null when absent). Bodies and envelopes are never returned."
+      }
+    },
     "/v1/chat/history": {
       "get": {
         "summary": "Chat History",
@@ -1244,11 +1374,11 @@
         "operationId": "chat_poll_v1_chat_poll_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Chat work and control-plane context. agent_body_job is null unless bound to this capable consumer.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/ChatPollResponse"
                 }
               }
             }
@@ -1362,7 +1492,7 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_body_generate_v1 enables hidden 24x24 body generation. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
@@ -1518,7 +1648,7 @@
             "name": "X-Feedling-Consumer-Capabilities",
             "in": "header",
             "required": false,
-            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
+            "description": "Comma-separated capabilities advertised by the current official resident poll. agent_body_generate_v1 enables hidden 24x24 body generation. agent_image_generation_v1 means the configured agent entry exposes a callable native image-generation tool; it is not inferred from VPS deployment alone.",
             "schema": {
               "type": "string",
               "maxLength": 500
@@ -1698,7 +1828,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded."
+        "description": "Unless the only_if_unverified short-circuit below applies, insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether that exact reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded. Optional request field only_if_unverified: when it is the JSON literal true and the server already holds a sticky live-loop verification for this user, no ping is inserted and no liveness measurement is taken; the response is passing=true, already_verified=true, loop_alive=null, response_time_sec=null and an empty ping_id. Any other value, or an unverified user, runs the ordinary ping. Intended for automated gate-opening callers such as the hosted runner supervisor, so a runtime restart does not re-probe every resident with a real model call."
       }
     },
     "/v1/chat/workspace/body": {
@@ -2173,7 +2303,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Evaluate resident Dream scheduling. After seven days of persistent account failures, automatic Dream permits at most one recovery probe per Dream minimum interval (23 hours by default). Cooldown ticks return enqueued=false and reason=dream_account_paused without advancing the consolidation ledger or resolving the account notice. force=true bypasses this cooldown. Runtime V2 scheduling is worker-owned and this endpoint returns its existing scheduler-owned no-op."
       }
     },
     "/v1/genesis/imports": {
@@ -2333,7 +2464,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. A non-empty keep-all memory import that produces zero cards fails as distill_empty_output; its job output may include up to six discarded-map diagnostics, each with a reason and a model-output excerpt capped at 500 characters. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default."
+        "description": "Queue an asynchronous plaintext import and immediately publish every material as queued with its total window count. Every processing frame preserves the complete material list while item progress advances. Identity may become ready while processing continues; done is published only after every material window completes. A non-empty keep-all memory import that produces zero cards fails as distill_empty_output, or as distill_material_too_short when the material is at most 500 characters and the model proposed nothing; its job output may include up to six discarded-map diagnostics, each with a reason and a model-output excerpt capped at 500 characters. Only one plaintext import can process per account; a concurrent submission returns 409 import_job_active with active_job_id. A same-host abandoned worker is detected by its exited process and failed immediately as worker_restarted; remote or legacy owners use a bounded heartbeat lease so a live rolling-deploy worker is not killed. A failed matching client_job_id or input is resumed from its encrypted per-window checkpoint, while a completed match returns the existing job. In update_identity mode, the uploaded role card creates an identity when absent or updates the existing card while preserving its relationship anchor by default."
       }
     },
     "/v1/genesis/imports/plaintext/commit": {
@@ -4115,7 +4246,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported."
+        "description": "Apply up to 20 memory actions independently and in order. Retired memory.upgrade actions return unsupported_memory_action (400); legacy cards remain readable through read-side adapters. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported. A memory.add never overwrites a stored card: re-sending the exact same sealed card succeeds with replayed: true and writes nothing, while a different card under an existing id fails that item with memory_id_conflict (409)."
       }
     },
     "/v1/memory/add": {
@@ -4123,6 +4254,16 @@
         "summary": "Memory Add",
         "operationId": "memory_add_v1_memory_add_post",
         "responses": {
+          "200": {
+            "description": "Replay: a card with this envelope id is already stored with exactly this ciphertext. Nothing is written; the stored card is returned with replayed: true.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
           "default": {
             "description": "Error response.",
             "content": {
@@ -4139,6 +4280,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "memory_id_conflict: the envelope id already belongs to a different stored card. The stored card is unchanged and neither card is echoed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -4324,7 +4475,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed."
+        "description": "Fetch full records for selected memory IDs in request order. All shared cards use the same read contract; legacy card-classification metadata is ignored. Inspect the truncation object instead of assuming every requested ID was processed. Optional related_items contains up to six readable one-hop id/summary pointers; related_status distinguishes complete, bounded, unavailable and unnecessary expansion. No recursive fetch is performed."
       }
     },
     "/v1/memory/get": {
@@ -4378,11 +4529,11 @@
         "operationId": "memory_index_v1_memory_index_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Lightweight discovery/search result and explicit ranking mode.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryIndexResponse"
                 }
               }
             }
@@ -4392,6 +4543,16 @@
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "memory_search_resource_limit: complete-corpus resource bound exceeded; no partial search result.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4415,49 +4576,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today."
-      }
-    },
-    "/v1/memory/legacy_batch": {
-      "post": {
-        "summary": "Memory Legacy Batch",
-        "operationId": "memory_legacy_batch_v1_memory_legacy_batch_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Error response.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Memory"
-        ],
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
-              }
-            }
-          }
-        },
-        "x-feedling-contract-level": "compatibility"
+        "description": "Return lightweight memory cards with optional retrieval cues. Nonblank query ranks the complete authorized readable corpus with BM25 (plaintext accounts: plaintext cards, in the backend; otherwise in the enclave), then applies exact bucket/thread filters and the result limit. Blank query preserves browsing. Ranking mode reports rolling-upgrade substring fallback. Empty results do not prove memory absence. Full content is available through fetch. Search exceeding 4096 cards, 32 MiB encoded internal request, or 16 MiB searchable UTF-8 text fails with memory_search_resource_limit (413), never partial-corpus ranking."
       }
     },
     "/v1/memory/list": {
@@ -4548,78 +4667,6 @@
           }
         ],
         "x-feedling-contract-level": "documented"
-      }
-    },
-    "/v1/memory/migration_state": {
-      "get": {
-        "summary": "Memory Migration State Get",
-        "operationId": "memory_migration_state_get_v1_memory_migration_state_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Error response.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Memory"
-        ],
-        "x-feedling-contract-level": "documented"
-      },
-      "post": {
-        "summary": "Memory Migration State Post",
-        "operationId": "memory_migration_state_post_v1_memory_migration_state_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Error response.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "tags": [
-          "Memory"
-        ],
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
-              }
-            }
-          }
-        },
-        "x-feedling-contract-level": "compatibility"
       }
     },
     "/v1/memory/retype": {
@@ -4830,11 +4877,18 @@
             }
           },
           "400": {
-            "description": "Invalid path or request parameter.",
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -5194,6 +5248,23 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -5293,11 +5364,18 @@
             }
           },
           "400": {
-            "description": "Invalid path or request parameter.",
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -5346,11 +5424,18 @@
             }
           },
           "400": {
-            "description": "Invalid path or request parameter.",
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -5471,6 +5556,23 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -5511,6 +5613,23 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration or provider_test_failed. Probe failures include failure_class while preserving detail and status_code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderTestFailedResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -7945,7 +8064,7 @@
           }
         },
         "x-feedling-contract-level": "compatibility",
-        "description": "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes."
+        "description": "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"off\", or null/empty to clear). Requesting \"on\" returns HTTP 400 content_encryption_on_not_supported before any preferences are written; other invalid values also return 400. The response content_encryption is always \"off\". Legacy stored \"on\" does not control new writes and is not rewritten by reads or unrelated preference updates. Existing ciphertext is not converted. Use content_encryption_effective from /v1/users/whoami for the deployment-gated write shape; local_only still requires encryption."
       }
     },
     "/v1/users/public-key": {
@@ -8064,7 +8183,7 @@
           "Accounts"
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference."
+        "description": "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and preferences. content_encryption is a compatibility field reporting \"off\" for known users, including accounts with a legacy stored \"on\" preference. content_encryption_effective is the write shape: \"off\" for every known user when plaintext writes are enabled, otherwise \"on\". Unknown users remain fail-safe \"on\". Treat an absent, empty, or unrecognized effective value as \"on\". Legacy preferences and existing ciphertext are not rewritten; local_only still requires encryption."
       }
     },
     "/v1/vision/config": {
@@ -8891,6 +9010,43 @@
           }
         },
         "title": "ValidationError"
+      },
+      "ProviderTestFailedResponse": {
+        "type": "object",
+        "required": [
+          "error",
+          "detail",
+          "status_code",
+          "failure_class"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "const": "provider_test_failed"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Upstream HTTP status; null for non-API web endpoints or failures without an HTTP status."
+          },
+          "failure_class": {
+            "type": "string",
+            "enum": [
+              "auth_invalid",
+              "quota_insufficient",
+              "model_not_found",
+              "rate_limited",
+              "upstream_unavailable",
+              "provider_config"
+            ],
+            "description": "User-facing probe classification, independent of the provider client's retry classification."
+          }
+        }
       },
       "VoiceCallCancelRequest": {
         "type": "object",
@@ -10003,7 +10159,7 @@
           "include_reasoning": {
             "type": "boolean",
             "default": false,
-            "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought. If the initial final reply omits that block, Runtime V2 may spend one separately metered, text-only provider round from the existing turn budget to restate the same format contract. If that bounded correction is unavailable or still unusable, the original reply is delivered without a thinking attachment or native-reasoning fallback. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
+            "description": "Legacy per-turn reasoning request for Hosted Runtime V2; resident runtimes ignore this field. Display thinking comes only from the optional aside field when self-authored thinking is enabled (the default), with agent_summary/self_thinking provenance and thinking_native=false. A usable reply without aside is delivered with the thinking-failed marker and no format-correction retry. Provider-native reasoning is never displayed, including when self-authored thinking is disabled."
           },
           "image_b64": {
             "type": "string",
@@ -10317,6 +10473,138 @@
             }
           }
         ],
+        "additionalProperties": false
+      },
+      "AgentBodyJob": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "expires_at_epoch",
+          "prompt",
+          "palette_count"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "expires_at_epoch": {
+            "type": "number"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Fixed instructions and palette only; no identity or memory."
+          },
+          "palette_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatPollResponse": {
+        "type": "object",
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "agent_body_job": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentBodyJob"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true
+      },
+      "AgentBodyGenerateRequest": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "grid_size",
+          "client_request_id",
+          "allowed_palette"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "grid_size": {
+            "type": "integer",
+            "enum": [
+              24
+            ]
+          },
+          "client_request_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "\\S"
+          },
+          "allowed_palette": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 255,
+            "items": {
+              "type": "string",
+              "pattern": "^#[0-9A-Fa-f]{6}$"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "AgentBodyGenerateResponse": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "grid_size",
+          "rows",
+          "generation_id"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "grid_size": {
+            "type": "integer",
+            "enum": [
+              24
+            ]
+          },
+          "generation_id": {
+            "type": "string",
+            "pattern": "^agent_body:[0-9a-f]{32}$"
+          },
+          "rows": {
+            "type": "array",
+            "minItems": 24,
+            "maxItems": 24,
+            "description": "Nonempty 24x24 grid. 0 is transparent; 1..len(allowed_palette) index the request palette. At least one cell must be nonzero.",
+            "items": {
+              "type": "array",
+              "minItems": 24,
+              "maxItems": 24,
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              }
+            }
+          }
+        },
         "additionalProperties": false
       },
       "ImageGenerationRequest": {
@@ -10638,6 +10926,95 @@
         },
         "additionalProperties": false
       },
+      "CanvasIndexEntry": {
+        "type": "object",
+        "required": [
+          "filename",
+          "revision",
+          "mime_type",
+          "created_at",
+          "updated_at",
+          "message_id",
+          "display_title",
+          "display_subtitle"
+        ],
+        "properties": {
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Newest matching agent-authored Chat file row, or null when the Canvas has no published attachment row."
+          },
+          "display_title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "display_subtitle": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CanvasIndexResponse": {
+        "type": "object",
+        "required": [
+          "canvases"
+        ],
+        "properties": {
+          "canvases": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/CanvasIndexEntry"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "ChatTransportRequest": {
         "type": "object",
         "required": [
@@ -10951,6 +11328,11 @@
       "MemoryIndexRequest": {
         "type": "object",
         "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Nonblank: global BM25 token ranking over readable card text and retrieval cues (jieba 0.42.1 Chinese, casefolded whole ASCII identifiers). No synonyms, translation or semantic matching. Tokenless nonblank queries return no matches. Very common words (stopwords) are ignored, and a card is returned only when it covers enough of the query (or has strong evidence such as a rare identifier); a query nothing matches returns no items, never filler. Blank/omitted: existing index browsing."
+          },
           "limit": {
             "type": "integer",
             "minimum": 0,
@@ -10979,6 +11361,53 @@
           "bucket": "Collaboration",
           "thread": "communication style"
         }
+      },
+      "MemoryIndexResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "limit",
+          "truncated",
+          "user_card_count"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "description": "Lightweight card projections, no full content or BM25 scores. With query: BM25 descending, occurred_at descending, then ID ascending. Existing item score remains importance/recency, not BM25."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Browse candidate-window truncation. Query evaluates the full corpus or fails explicitly; result top-k is still capped by limit."
+          },
+          "user_card_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ranking": {
+            "type": "string",
+            "enum": [
+              "memgarden-bm25-v2+tok:jieba-0.42.1",
+              "memgarden-bm25-v1+tok:jieba-0.42.1",
+              "bm25-jieba-0.42.1-v1",
+              "substring-legacy"
+            ],
+            "description": "Present for nonblank query. memgarden-bm25-v2+tok:jieba-0.42.1 is the current ranker (shared with automatic recall). memgarden-bm25-v1+tok:jieba-0.42.1, bm25-jieba-0.42.1-v1 and substring-legacy explicitly mark older rankers answered during rolling upgrades."
+          },
+          "unavailable_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Query only: candidate cards unavailable for shape/decryption; these are excluded from corpus statistics, not proven nonmatches. A plaintext account's sealed cards are not searched and not counted."
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryFetchRequest": {
         "type": "object",
@@ -11024,6 +11453,54 @@
           "truncation"
         ],
         "properties": {
+          "related_status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "bounded",
+              "unavailable",
+              "not_needed"
+            ]
+          },
+          "related_items": {
+            "type": "array",
+            "maxItems": 6,
+            "description": "Same-user readable one-hop pointers only, not full bodies. Superseded cards appear only through explicit anchor/supersedes links and are marked historical.",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "summary",
+                "source_id",
+                "relation",
+                "status"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string",
+                  "maxLength": 120
+                },
+                "source_id": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "anchor",
+                    "supersedes",
+                    "thread"
+                  ]
+                },
+                "status": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
           "items": {
             "type": "array",
             "items": {
@@ -11173,14 +11650,20 @@
               "memory.delete",
               "memory.retype"
             ],
-            "description": "Accepted memory.add actions always create a new card; repeated content is not deduplicated."
+            "description": "New memory.add requests create a new card; repeated content is not deduplicated. An identical idempotency_key replay returns the original receipt."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "description": "Optional per-action, per-user replay key. Reuse only with identical JSON action fields (including an existing envelope); a changed payload fails with memory_idempotency_conflict. Replay returns a content-free receipt, replayed=true and no effects, even after card deletion. Not an HTTP header or whole-batch transaction."
           },
           "envelope": {
             "$ref": "#/components/schemas/MemoryEnvelope"
           },
           "memory": {
             "$ref": "#/components/schemas/MemoryRecordInput",
-            "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content."
+            "description": "Plaintext server-encryption compatibility form. Prefer envelope for sensitive content. Content over 5000 Unicode code points after outer whitespace is stripped fails with memory_content_too_long (400), never truncates. Historical full fetch and opaque envelope bodies are not subject to this plaintext validation limit."
           },
           "memory_id": {
             "type": "string"
@@ -11713,6 +12196,16 @@
                     "type": "string"
                   }
                 ]
+              },
+              "source_event_id": {
+                "type": "string",
+                "maxLength": 128,
+                "description": "Stable, non-reversible device identity for this photo, so a re-upload is not counted twice. Optional."
+              },
+              "occurred_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "When the photo was taken, ISO 8601 with a UTC offset. Optional; when missing, lacking an offset, or more than 60 seconds in the future, the server uses the upload time instead."
               }
             },
             "additionalProperties": false

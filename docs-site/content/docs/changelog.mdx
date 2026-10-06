@@ -12,6 +12,1215 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 heartbeat and manual wakes now include a one-round reminder to
+  check a reply against existing identity requirements after their initial look,
+  when that decision has no draft and is not a forced choice or correction.
+  This prompt change aims to improve adherence; it does not guarantee it or add
+  a model call. Other reply paths keep their existing guidance.
+
+- Keyword memory search (`memory_search`, and `memory_index` with a query) for a
+  plaintext account is now ranked in the backend over the account's plaintext
+  cards, with the same ranking code, filters, limits and HTTP errors as the
+  enclave path. For the same plaintext-only set of cards the results are the
+  same as before. The account's remaining sealed cards from before plaintext
+  storage are no longer searched and are not counted in `unavailable_count`;
+  because ranking is computed over the whole set, leaving them out can change the
+  ranking or selection of the remaining cards. Accounts not recognized as plaintext still
+  search in the enclave.
+
+- Runtime V2 can select memory cards for plaintext accounts without the decrypt
+  service, behind `FEEDLING_V2_PLAINTEXT_RECALL` (default `off`, which changes
+  nothing). `shadow` keeps the decrypt-service result and records a content-free
+  `memory.recall.shadow` comparison; `on` serves plaintext accounts locally.
+  Selection code, history window and candidate pool are the ones the decrypt
+  service uses; a plaintext account's remaining sealed cards are left out on
+  this path. Hybrid query vectors come from a loopback encoder in the Runtime V2
+  parent that shares the card-vector sweep's model and runs queries ahead of
+  sweep work.
+
+- Runtime V2 wake lanes (heartbeat, manual wake, scheduled reminders, and screen
+  watch) now wait up to 110 seconds for each provider response instead of 60.
+  Some reasoning models took longer than a minute before responding, and the
+  wake failed as `wake_failed:providererror`; for a scheduled reminder, the
+  reminder was not delivered. Chat keeps the 60-second limit.
+
+- The Runtime V2 `mcp.surface.resolved` debug trace keeps its verdict again. The
+  stored event is capped at 20 detail keys and the tool-surface counters used to
+  come first, so `resolved`, `skipped_count` and `skipped` were dropped from every
+  stored V2 event while `expected` survived. The verdict fields now come first;
+  the ten cap counters (`count_cap`, `char_cap`, `char_cap_skips`,
+  `count_cap_collapses`, `char_cap_collapses`, `expanded`, `collapsed`,
+  `catalog_chars`, `schema_rejected`, `schema_cap_collapsed`) move into one
+  `caps` object; `skipped` becomes a `{server name: kind}` object (at most 20
+  entries, `skipped_count` is the total); and `server_results`, which repeated
+  `expected_servers` plus `skipped`, is no longer included.
+
+- Runtime V2 proactive messages (heartbeat, scheduled, manual wake, and screen
+  watch) no longer receive the fixed reply-language rule tied to the account
+  locale or archive language. They get one soft line asking the model to talk
+  to the user in the language the user uses, and the model chooses the language
+  from the conversation. Chat replies, memory-garden language, and failure
+  fallback copy are unchanged.
+
+- The Runtime V2 debug trace now records, for a chat turn that includes images or
+  files, whether the text the user typed with them reached the model request:
+  `v2.prompt_frontier.budget` gains an `attachment_captions` object with counts
+  and character lengths only, never the caption text: `images`, `files`,
+  `with_caption` (attachments that had typed text), `delivered` (their text is
+  in the attachment's own message in the request), `undetermined` (the text is
+  in the request but that message could equally belong to an earlier one), and
+  the matching `caption_chars`, `delivered_chars`, `undetermined_chars`.
+  Missing = `with_caption` − `delivered` − `undetermined`.
+
+- A Runtime V2 heartbeat or manual wake that looks something up in its first
+  call is now reminded in the next call to end the wake with `reply` or
+  `stay_silent`. Some models answered the lookup result as plain text instead,
+  and the wake then failed as `wake_failed:choice_invalid` without reaching the
+  user.
+
+- A plaintext Genesis import that finishes now reports its final `stage` and
+  per-material `materials` in the same update that marks it `done`.
+  Previously a status read in the brief moment after completion could see
+  `done` with an empty `materials` list (add-memory imports and the full
+  one-pass onboarding path).
+
+- Updated memgarden from 0.22.0 to 0.23.0 (#10, 3e5da470; release preparation #11, fc872478). History import and daily memory capture now keep concrete one-time details of a person's life (what they bought, saw or attended; names, numbers, dates, places) instead of dropping them as one-off events, and are told not to record the companion's own suggestions as the person's facts or to supply a missing year. Dream merges are asked to keep those values. The resident memory recheck pass follows the same rule.
+
+- A long-term-memory import of a sentence or two, where the model finds nothing
+  to remember, now fails as `distill_material_too_short` and asks the user to
+  add some detail, instead of telling them to switch models. It still counts
+  as a failed import and writes no cards.
+
+- The provider test that runs when adding or switching a Model API route now
+  uses a 90-second HTTP timeout (was 30), giving slow relay channels more time
+  before `provider network error: ReadTimeout`. It is not a deadline for the
+  whole test and does not guarantee the route can be added. Clients must wait
+  longer than this; iOS app versions that still use the 60-second system
+  default give up first.
+
+- Genesis import's first model call (the "model too slow" check) now allows
+  120 seconds on `openai_compatible` relay routes instead of 60; other routes
+  keep 60 seconds. Each import model call's content-free record now includes
+  its elapsed time.
+
+- Identity profile generation accepts more well-formed replies: reasoning a
+  relay inlines in `<think>` is stripped first (the same stripper memory-card
+  parsing uses), every `{` in the reply is tried in turn, and extra keys next to
+  `memory` and `style` are ignored and discarded rather than failing the whole
+  reply. Truncated or non-object replies and missing or empty fields still fail.
+
+- Genesis import failures now name the actual cause more often. An identity
+  profile the model returned in an unusable shape is reported as
+  `model_bad_json` and an empty reply as `model_empty_output` (both were an
+  internal error), and relay `403` responses reporting `额度不足` or a required
+  paid plan / deposited balance are reported as quota exhaustion instead of an
+  invalid API key — on every lane that uses the shared classification.
+
+- The resident CLI output limit (`FEEDLING_CLI_MAX_OUTPUT_BYTES`) now counts the
+  content it keeps rather than raw transfer: pi resends the whole reply so far on
+  every token, so a `message_update` line is dropped once a parseable one with no
+  less text supersedes it. Long
+  pi replies (roughly above 16–20 KB of text) no longer fail with
+  `cli_output_too_large`.
+
+- A resident CLI turn killed at the output limit (`cli_output_too_large`) now also
+  drops its resumable agent session, so the next message starts a fresh session
+  instead of replaying the same oversized turn every time.
+
+- Runtime V2 now reads the text a user sends with an image or file when that
+  text is stored in plaintext (content encryption off). Previously the model
+  saw only the attachment marker (`[image]` / `[file: name]`) and not the
+  user's words; encrypted captions were unaffected.
+
+- Runtime V2 retry-later failure replies now follow the language of the words
+  the user typed in the latest message (or an attachment's caption) instead of
+  the account language, using the same language check as resident paths: a
+  Chinese-language account that writes in English receives the English
+  fallback, and vice versa. Messages without a language signal keep the account
+  language. Actionable error-catalog texts are unchanged.
+
+- Hosted Runtime V2 now gives English reply-language accounts the English
+  version of the `aside` guidance (foreground chat, every proactive wake lane,
+  and the screen-watch note). Chinese accounts keep the existing Chinese text
+  unchanged. Previously every account got the Chinese guidance, which could
+  pull English conversations into Chinese replies.
+
+- The enclave `/healthz` adds `rss_kb` (the process's current resident memory)
+  and `recall_hybrid` (`enabled`, `min_cosine`, `embedder_state`,
+  `failure_reason`, and a model-id prefix). It carries no user data and no
+  paths, and is used as deploy-state and capacity evidence for hybrid recall.
+
+- A relay's `403` that explicitly reports an exhausted balance (for example
+  `code: insufficient_user_quota`, 「预扣费额度失败」) is now reported as insufficient
+  quota instead of an invalid API key, on every Model API lane and in credential
+  probes. Other `403` responses keep their existing classification.
+
+- Added disabled-by-default hybrid automatic recall (`FEEDLING_MEMORY_RECALL_HYBRID`).
+  When enabled, the enclave encodes the query with the local E5 model, reads the
+  caller's current-projection card vectors through a new internal backend route,
+  and fuses a cosine lane with the lexical ranker (memgarden 0.22.0). A per-turn
+  budget (default 2 s) bounds the vector read and encoding; any failure keeps the
+  whole turn on the unchanged lexical path and records a content-free fallback
+  reason. Runtime V2 recall traces gain a `selection_mode` field and a nested
+  `hybrid` object only while enabled. The recall trace's event tallies
+  (`tool_result_events`, `provider_requests`) now sit inside `counts`, so the
+  turn's `lane`, `attempt`, `turn_id` and `job_id` are no longer dropped from
+  the stored event.
+  While disabled, recall output is byte-identical to before. Public API unchanged.
+
+- Hosted Runtime V2 no longer shows a reply call's `aside` when a model writes
+  the call as visible text. For XML-style tool markup, when removing the whole
+  block would leave nothing, only the reply's `text` (or its bare body) is kept
+  instead of every parameter. A message that is only a reply-arguments JSON
+  object (`{"aside": ..., "text": ...}`) now shows just its `text`. Markup with
+  other visible prose outside it is still removed as before.
+
+- Heartbeat and manual wake guidance, and the `stay_silent` description, now say
+  that several unanswered messages over a day or two are still not a reason to go
+  quiet, and ask the agent to say something new rather than repeat itself. Wake
+  scheduling and intervals are unchanged; screen-watch wording is unchanged.
+
+- Hosted Runtime V2 now also removes DeepSeek DSML tool-call markup that a model
+  writes into its visible reply. A DSML `reply` call keeps only its `text`
+  payload; the `aside` and any other parameters are never shown. A DSML block
+  without a completed reply body is removed and the existing fallback applies.
+  Fenced code examples are left unchanged.
+
+- Runtime V2 heartbeat and manual wakes now look before deciding: their first
+  provider call omits `reply`/`stay_silent`, then the usual choice is offered.
+  Drafted text from that first call is never delivered directly. Their optional
+  `aside` guidance now asks what makes the agent want to reach out now instead of
+  how it will answer a message. Scheduled and screen-watch wakes are unchanged.
+
+- The probe-local `provider_config` credential-test notice now has English copy
+  and follows the user's stored `archive_language`, like registered probe
+  classes. It remains outside the runtime error registry.
+
+- Runtime V2 Capture now doubles only a truncated reply's re-ask budget
+  (1,500 → 3,000 tokens by default, capped at the provider ceiling), with
+  180-second wire and phase limits. First calls remain at 1,500 tokens and
+  90 seconds. Capture and Dream can fall back once to the original budget
+  after a larger-budget 402, as already supported for too-large 400/422
+  responses. Capture's truncation re-ask and budget fallback each allow one
+  reliable attempt, fitting the existing 1,260-second Heavy pool limit; the
+  global 3,000-second default is unchanged.
+  Already-truncated jobs may spend more tokens or make a budget-fallback call;
+  normal jobs keep their existing call budget.
+
+- Runtime V2 model-call error traces now report shared failure causes in
+  `error_class` instead of Python exception class names. The original name is
+  retained separately as `exception_type`; retry categories remain unchanged.
+
+- Setup and manual Model API probe traces now retain a bounded upstream HTTP
+  `detail.status_code` (integer 100–599 or `null`), distinguishing 401/402/403
+  without storing provider error text or response bodies.
+
+- Resident CLI errors reporting Codex usage exhaustion now use the existing
+  `quota_insufficient` classification and quota notice instead of the generic
+  `unknown` fallback. Temporary rate-limit errors keep their existing class.
+
+- Automatic memory recall now gives the latest user message first priority,
+  then fills remaining seats from the latest two user messages. A long previous
+  topic can no longer displace already selected current-message hits; short
+  follow-ups retain previous-message context. The eight-card cap, relevance
+  gates, and recent-card supplement remain in place. Recall diagnostics label
+  the new host merge rule and preserve the underlying ranking evidence.
+
+- Model API credential probe notices now select existing registry translations
+  using the user's stored `archive_language`. English users receive English text
+  for registered failure classes; the probe-local `provider_config` notice
+  retains its Chinese text and remains outside the runtime error registry.
+
+- Runtime V2 replies whose optional `aside` was never written now display no
+  thinking at all instead of the `（思考没写完）` marker, recorded on the
+  `none` branch. A reply whose inline thinking block was malformed but still
+  yielded a separable body now drops only that stripped block silently — it is
+  not itself a reason for the marker; an aside supplied separately through the
+  reply tool still displays normally. Both chat and wake lanes follow this
+  rule, matching the resident runtime. The marker is reserved for an aside
+  that existed and had to be withheld: one carrying an internal identifier, or
+  a chat reply whose text could not be separated from its thinking at all
+  (still delivered as the honest fallback bubble; the wake lane ends such a
+  turn silently or fails it instead of showing a marker). Provider native
+  reasoning and inline thinking-tag content remain non-display material. The
+  chat lane still records a salvage event on the trajectory for observability;
+  the wake lane does not.
+
+- Runtime V2 Capture and Dream traces now distinguish explicit Anthropic
+  refusals with content-free `memory.extraction.refusal` observations; unknown
+  categories remain `unclassified`. Explicit refusals stop the extraction on
+  that attempt with `content_filtered`, including responses with partial text,
+  and do not count as provider-health failures. Capture uses its existing
+  generic backoff notice and skips the window after six failed jobs; skipped
+  batches produce no memories. Ordinary empty replies, transient service
+  retries, chat, and Resident V1 retain their existing behavior.
+
+- Resident V1 asks for the persona aside as a leading `<aside>…</aside>` block
+  again, on every driver and route (pi and codex no longer use `<think>`).
+  Foreground chat replies follow the block as plain text, with the JSON
+  envelope optional for multi-bubble replies; heartbeat, perception,
+  scheduled, and screen-watch wakes keep their existing JSON reply shapes and
+  permit the same block before the JSON. Screen-watch wakes also carry the
+  Runtime V2 screen-watch aside note (they previously asked for no aside at
+  all). The envelope's `aside` field stays accepted. The JSON-field instruction
+  introduced with `reply(aside, text)` remains Runtime V2's only. A block whose
+  following body fails the leak gate no longer counts as an aside-only reply.
+  Asking CLI models to hand-write their reply inside a JSON string caused
+  turns with unescaped quotes or line breaks to be dropped as `protocol_leak`
+  and replaced by the failure fallback.
+
+- Automatic memory recall uses the latest two non-empty user messages, newest
+  first, so long assistant replies no longer contribute competing query terms.
+  Blank messages and images without captions fall back to earlier user text.
+
+- Runtime V2 Dream doubles its per-wire and phase timeouts from 90 to 180
+  seconds, with matching Heavy-pool watchdog allowances. Capture, profile,
+  chat/wake, resident V1, and Dream's consolidation safety gates retain their
+  existing provider or safety limits.
+
+- Scheduled Runtime V2 reminders use the same configurable output-token budget
+  as heartbeat, manual, and screen-watch wakes, including correction retries,
+  instead of falling back to the legacy 700-token default. Reminder delivery
+  requirements and subagent output policies are unchanged.
+
+- Model API credential probe errors add `failure_class` to distinguish invalid
+  credentials, insufficient credit, missing models, rate limits, temporary
+  provider failures, and other configuration problems. Existing error fields
+  retain their meaning. Saved-route test errors preserve this classification,
+  and deduplicated notices resolve after a successful probe.
+
+- Anthropic and Bedrock requests select manual extended thinking from an explicit
+  model-family capability table. Unknown models omit the thinking parameter and
+  record a content-free diagnostic; model names no longer inherit support by
+  substring. Claude 4.6 retains its supported manual mode. Adaptive-only models
+  do not receive manual thinking parameters; their provider defaults apply.
+
+- Runtime V2 pauses automatic heartbeat and screen-watch calls after three
+  consecutive quota, authentication, or expired-account failures. A newly
+  accepted Chat message or a successful active key/route save clears the
+  persistent circuit; elapsed time alone does not. Scheduled reminders remain
+  eligible. The `wake_provider_circuit_open` warning is written to the notices
+  API and resolved on recovery; the current iOS app does not render this API.
+  Admin user summaries expose `wake_provider_circuit_open_users` (null when
+  the state cannot be measured).
+
+- `GET /v1/chat/canvases` now includes agent-authored `.io.html` Chat cards
+  from Resident and self-hosted delivery alongside workspace entries. Workspace
+  entries win identical filenames; the combined result keeps the newest 500.
+  Chat-only entries include a message ID for body reads, with no body copies or
+  historical backfill. Both database migration chains add a concurrent partial
+  index to avoid scanning unrelated messages.
+
+- Chat attachment delivery now records content-free timing events for object
+  storage GETs (including body reads) and hydration, distinguishing timeouts,
+  missing objects, and upstream server errors without recording keys or content.
+
+- Retrying a failed plaintext onboarding or add-memory job with legacy fact-map
+  progress now resets its encrypted checkpoint and runs the current import
+  engine under the same job ID. Existing cards enter the merge index, and the
+  original onboarding greeting is preserved. Current-engine and update-identity
+  checkpoints retain their normal resume behavior.
+
+- Anthropic requests that force a tool call now omit incompatible manual extended
+  thinking for that request, while retaining the required or named tool choice.
+  The Bedrock adapter explicitly disables manual thinking for forced tool calls.
+  Ordinary auto/none requests keep their configured reasoning. Runtime V2 model
+  call failure traces add closed `provider_error_type` and `error_signature`
+  values to distinguish known request incompatibilities. Unrecognized errors
+  remain `unknown` / `unclassified`; provider error text is not included.
+  Wake failure codes now preserve recognized causes such as insufficient credit
+  for HTTP 400/422 responses instead of always reporting provider incompatibility.
+
+- Runtime V2 chat and wake now share `reply(aside, text)` with optional `aside`;
+  resident V1 accepts `aside` in its reply JSON. Usable replies are delivered
+  when aside is omitted, without an extra aside-format retry. Chat and
+  scheduled turns accept direct text; non-scheduled wake turns retain the
+  explicit `reply`/`stay_silent` decision requirement.
+  A non-scheduled wake's unstructured text is held as a draft and gets at most
+  one correction within the existing turn budget to choose either tool. If the
+  correction remains invalid, the wake fails silently with `choice_invalid`.
+  Content-free traces count drafts and reply, silence, or invalid outcomes.
+  Only the aside field supplies display thinking; native reasoning and inline
+  tag contents are discarded. V1 can recover a complete reply-only JSON
+  envelope from a final unclosed thinking block. Free-text tails and executable
+  action/tool envelopes remain ineligible for this recovery.
+
+- Replies whose `<think>` blocks are malformed (nested, reopened, or cut off
+  before the closing tag — seen from reasoning models behind relays) are no
+  longer replaced by the failure fallback. The strict leak gate still refuses
+  the shape; a salvage pass then drops every thinking block and delivers the
+  remaining reply text on the resident runtime and Runtime V2 chat and wake
+  lanes. Salvaged replies show the thinking-failed marker instead of thinking,
+  are not counted as turn failures, and are recorded as `thinking_gate_salvaged`
+  in resident diagnostics. A reply with no text outside the tags still fails
+  closed, except for the resident reply-only JSON recovery described above.
+
+- Updated memgarden from 0.21.1 to 0.22.0: the release range contains optional vector retrieval (#8, c32f8d60) and release preparation (#9, 05ad1ef3). IO continues using lexical retrieval; vector fusion remains disabled.
+
+- Dream backoff notices now retain account-specific failure guidance. After
+  seven days of persistent account failures, automatic runs switch to recovery
+  probes at the Dream minimum interval (23 hours by default). Cooldown ticks
+  return `dream_account_paused` without changing cards or the consolidation
+  ledger; forced runs bypass the cooldown. Runtime V2 Capture/Dream diagnostics
+  add content-free wire counts, durations, HTTP statuses, and timeout categories
+  to the operator-readable provider ledger. Retry deadlines and Dream write
+  safeguards are unchanged.
+
+- Added disabled-by-default serve-worker preparation of local E5 ONNX vectors for plaintext memories, with versioned projections and bounded scans. Retrieval behavior is unchanged; model/dependency provisioning remains separate.
+- Test deployment now ships the multilingual-e5-small int8 ONNX weights and inference runtime (onnxruntime, tokenizers) in the shared image and enables the serve-worker embedding sweep (`FEEDLING_MEMORY_EMBEDDING_ENABLED=1`). Production stays off; retrieval behavior is unchanged.
+  Rolling back the vector-table migration retains the table and its data; removal requires explicit cleanup.
+
+- `POST /v1/perception/photo/evaluate` documents two optional metadata fields
+  that clients already send: `occurred_at` (when the photo was taken) and
+  `source_event_id` (stable device identity). A valid `occurred_at` now dates
+  the photo in perception history; invalid or missing values fall back to the
+  upload time. The wake for the photo is still raised when it is uploaded.
+
+- Production/test deployment sources add filtered diagnostics for the two enclave
+  containers: 30-day local retention and optional operator R2 delivery with a
+  required 90-day bucket lifecycle. Only validated content-free request metadata
+  and fixed worker lifecycle events are retained; raw logs are rejected. Leaving
+  `R2_LOGS_BUCKET` empty disables external delivery. The architecture and
+  self-hosting guides now describe this metadata export boundary.
+
+- Resident pi failures with a final `stopReason=error` now use
+  `provider_error_unclassified` when no specific provider-error rule matches,
+  instead of reporting an empty reply. The new provider-owned notice says:
+  “你的模型服务返回了错误，稍后再试；反复出现请检查模型渠道或中转。”
+  Existing quota/authentication/upstream rules still take priority; retry
+  behavior is unchanged.
+- Failed pi model-call traces include a bounded `pi_error_head` (up to 300
+  characters of the provider's error message), also visible in admin traces.
+  `pi_stream.schema_version=3` uses scalar block counts and a bounded,
+  comma-separated `stop_reasons` enum string, adds `stop_reason_last`, and
+  retains the earlier scalar fields. Nested `blocks`
+  and list-shaped `stop_reasons` are no longer emitted; historical records
+  are not backfilled.
+
+- Sixteen resident and workflow error notices now have English copy, covering
+  model-service and reply failures, onboarding and chat-history import failures,
+  memory backoff, and companion process startup or degraded operation.
+  The notice catalog returns English copy when English is requested, instead
+  of falling back to Chinese. Chinese copy and error classification remain unchanged.
+
+- Restore account recovery on TEE-primary deployments by adding the missing
+  recovery-challenge table. Recovery has been unavailable since the TEE-primary
+  cutover; the table is created by the normal application-startup migration.
+
+- Hosted Resident crash-loop circuits now retry every five minutes at a fixed
+  interval. Startup exits record bounded per-user reasons; current startup
+  failures use the system-owned spawn-failure notice instead of asking users
+  to check their model API key or balance.
+
+- Retired legacy-card migration endpoints (`/v1/memory/legacy_batch` and `/v1/memory/migration_state`) and the `memory.upgrade` action. Existing legacy cards remain readable and recallable through read-side adapters, without rewriting stored data.
+
+- **Screen-watch wakes follow the same speaking default as regular V2 wakes.**
+  The agent is prompted to say something about what it sees when it wants to;
+  silence is appropriate when it has nothing to say or would break the user's
+  flow. An unanswered previous message alone is not a reason to hold back.
+  Screen-specific guidance to avoid interruptions and repetition, express one
+  coherent thought, and avoid narrating screen observation remains in place.
+
+- Gemini models routed through `openai_compatible` or `openrouter` now use
+  the same `<aside>` rendering as direct Gemini on Runtime V2 and resident V1.
+  Selection uses a case-insensitive `gemini` match in the configured model name
+  only for those two relay providers, addressing the tool-follow-up response
+  failures observed with the previous `<think>` rendering on some relays.
+  Other routes retain their existing rendering, including the resident Claude
+  Code driver rule. Model aliases without `gemini` are outside this rule.
+
+- Resident Canvas requests now accept both `.html` and `.io.html` files at the
+  required-suffix gate and completion check; `.io.html` remains the preferred
+  extension in generation guidance.
+
+- Resident `send-file` diagnostics now distinguish missing or unreadable files
+  (`file_not_found`) from paths outside allowed roots, and record the attempted
+  suffix and required suffixes without recording filenames.
+- Resident CLI subprocesses now cap combined stdout and stderr at 64 MiB per
+  invocation. Exceeding the limit kills the process, discards captured output,
+  and reports `cli_output_too_large`; `FEEDLING_CLI_MAX_OUTPUT_BYTES` overrides
+  the limit with a positive byte count.
+
+- Runtime V2 no longer delivers a *narrated* tool call. When a model writes a
+  call as prose instead of emitting a structured one — for example
+  `[Calling generate_image with prompt: "…"]` at the end of a reply with no
+  tool call attached — nothing ran, and that bracket used to reach the user
+  verbatim. It is now removed before delivery (the surrounding prose is kept),
+  on the chat and wake lanes alike; the existing `agent.reply.sanitized` trace
+  carries a `narrated_tool_calls` count. Only the closed bracketed-verb shape
+  with a tool-looking name is recognized; ordinary bracketed text and fenced
+  code are untouched.
+
+- **Regular V2 wakes suppress bare protocol tokens sent as reply text.**
+  An otherwise valid `reply` whose entire text is a token such as `stay_silent`,
+  `speak`, or `__verify_ack__` now ends silently without retrying or creating
+  a chat bubble. Ordinary sentences containing those words still pass through;
+  foreground chat and explicitly scheduled reminders retain their existing behavior.
+
+- Runtime V2 now validates a generated image inside the image-generation step
+  instead of while publishing the reply. When a provider or relay returns media
+  the runtime cannot decode or normalize, the agent receives an
+  `image_generation_invalid_output` tool error and may retry the generation or
+  reply in text; the turn no longer fails with the generic fallback message
+  after the image had already been generated. The specific reject reason is traced as
+  `agent.image.generate.invalid` (code only, never pixels), and worker failure
+  records may carry a registered `error_detail` code naming the check that raised.
+
+- **Regular V2 wakes let the agent decide whether it wants to reach out.**
+  The instructions remove the fixed recent-contact exception list. Silence is
+  appropriate when the agent has nothing it wants to say or speaking would
+  clearly intrude; an unanswered previous message is not by itself a reason
+  to hold back. The structured reply validation and output budgets are unchanged.
+
+- Long-running memory jobs now refresh a same-user runtime token and retry enclave decryption once after a 401, preventing expired tokens from failing the remaining decryptions when the enclave is slow.
+
+- Resident failure traces now distinguish thinking-tag, protocol-leak, file-reference,
+  and unclassified sanitizer failures. Parse failures include bounded assistant reply
+  excerpts and thinking-tag counts. Pi no-reply failures also report any recognized
+  upstream HTTP status code and class. Error classification, retries, and reply
+  delivery behavior are unchanged.
+
+- History imports now reject individual oversized or idempotency-conflicting cards while saving valid siblings, instead of failing the entire job; an entirely rejected batch still fails and asks the model again on retry.
+
+- Empty-response diagnostics on OpenAI-compatible relays now record the relay's
+  thinking-vs-visible output token split (`provider_thoughts_token_count`,
+  `provider_candidates_token_count`, `provider_prompt_token_count`, and whether
+  the upstream Gemini usage block was reported), on the same fields the native
+  Gemini wire uses. Counts and a closed finish-reason enum only; part-shape and
+  safety fields stay native-Gemini-only rather than being reported as clean.
+
+- **Memory writes no longer silently shorten plaintext card bodies at 5000
+  characters.** Oversize writes return `memory_content_too_long`; full fetch
+  preserves historical longer cards. Optional per-action `idempotency_key`
+  receipts let imports recover a committed write without creating duplicate
+  cards. Storage failures stay failures, even after another card succeeded or
+  multiple retries; they are not reported as completed imports with dropped
+  cards. These receipts do not make an entire batch transactional or provide a
+  persistent checkpoint to the existing in-memory VPS import lane.
+
+- **Dream target filtering now has one owner, MemGarden.** IO no longer
+  duplicates the truncated-target filter. An entirely rejected plan reports
+  `maintenance_targets_rejected` / `guard_rejected`, not a successful empty
+  maintenance run. IO still owns job status, observability and persistence.
+
+- **Users with fewer than about 20 memories now get search and automatic-recall
+  hits that were previously filtered out.** The relevance gate's coverage check
+  weighed query words the Garden never recorded by the real card count, so in a
+  tiny Garden they outweighed the words that did match. Before: a new user whose
+  only card is "likes Americano, no sugar" asks "what coffee do I usually drink in
+  the morning" → `memory_search` returns nothing and automatic recall injects no
+  card. After: the card is returned and recalled. memgarden now counts that
+  check over at least 20 cards; Gardens of 20 or more cards rank exactly as
+  before. `memory_search` responses report
+  `ranking: "memgarden-bm25-v2+tok:jieba-0.42.1"` and recall modes
+  `relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`. During a rolling
+  upgrade an older enclave may still answer `memgarden-bm25-v1+tok:jieba-0.42.1`
+  (accepted, old gate), and a new enclave still serves that protocol to an older
+  backend.
+
+- **History import no longer fails when the account's archive language carries
+  a region tag.** The iOS app stores the device's preferred language (for
+  example `en-US`, `zh-Hans-CN` or `zh-Hant-TW`) as the archive language, and the
+  import passed it unchanged to memgarden, whose bucket lists only exist for `en`
+  and `zh-Hans`. Before: a user whose phone is set to `en-US` imports chat history
+  → the import fails (hosted plaintext genesis after already spending model calls
+  on candidate extraction, every retry failing at the same spot; the legacy
+  upload finished with zero memory cards). After: the import language is
+  normalized to `en` or `zh-Hans` with the same rule daily capture uses (`zh`/`yue`
+  tags → `zh-Hans`, `en` tags → `en`), and the English naming rule now applies
+  to `en-US` too. Covers hosted plaintext genesis, the encrypted chunk worker,
+  `/v1/history_import/upload`, and self-hosted distill (through self-update); jobs
+  already stuck on a raw tag recover on their next retry.
+
+- **Reading or correcting a memory card no longer changes its dates.** Before: a
+  memory fetch stamped the card's `updated_at`, so one read made the next
+  post-turn check regenerate the Runtime V2 profile; and correcting a card dated
+  2024-06-15 through `io_cli memory-patch` or `memory_write` `update` moved it to
+  today. After: a fetch only stamps `last_referenced_at` (now UTC with `Z`), and a
+  plaintext `memory.supersede` without `occurred_at` keeps the replaced card's
+  date; an explicit `occurred_at` still wins. Capture and Dream supersedes carry
+  their own `occurred_at` and are unchanged.
+
+- **Self-hosted history import again tells the model how many memory cards the
+  garden should roughly hold.** Before the import moved to memgarden's import
+  session, the self-hosted (VPS) consumer added a card-count note to the
+  card-writing prompt: how many cards the garden already has, a reference range
+  from the relationship's memory floor to its aspiration, "meet the floor first,
+  write less when the material is thin, never invent". The switch dropped it.
+  Before: a VPS user imports three years of chat into a nearly empty garden → the
+  model has no sense of how much to keep. After: the same note, computed the same
+  way from `/v1/bootstrap/status` once per import job, is passed as memgarden's
+  `ImportRequest.host_note` to every card-writing batch. Self-hosted only; hosted
+  and plaintext imports never had it and are unchanged. It takes effect once the
+  installed memgarden supports `host_note`; on an older memgarden the import runs
+  without the note instead of failing. If the status read fails, there is no note.
+
+- **Runtime V2 capture no longer loses a whole batch when two cards update the
+  same existing card.** Before: in one capture round the model returns two cards
+  that both say they replace the same old card → the batch commit refused the
+  whole batch (an old card can only have one successor) → the same messages
+  failed on every retry until the retry limit skipped them, taking the other good
+  cards in that batch with them. After: the first card replaces the old card, the
+  second is dropped (only its count is recorded in the run trajectory), and the
+  rest of the batch is saved. Resident V1 already dropped only the second card.
+
+- **Resident V1 capture yields to the user while reading a long capture batch.**
+  Since the history-page cap was removed, reading one batch can take many history
+  pages on the same thread that answers chat. Before: a message sent while those
+  pages were being read waited until the whole batch had been read. After: the
+  consumer checks for a waiting user message between pages and, if there is one,
+  pauses the capture job; a single read also stops after the agent-turn time
+  limit. The paused job is reported `skipped` with `capture_deferred_user_chat` or
+  `capture_deferred_paging_budget` — not a failure, no retry backoff, the capture
+  position is unchanged — and the next job for the same batch continues from the
+  page it reached. Resident V1 batch windows also now contain only the rows the
+  backend counted into the batch — user and agent messages from live chat
+  sources, the same set Runtime V2 uses. Before: rows from other sources between
+  two chat messages (for example imported history) were fed to capture too,
+  producing duplicate cards, and in a long window could push the real chat past
+  the window's character limit. After: those rows are left out. Windows from an
+  older backend without batch bounds are unchanged. Applies to hosted V1 runners
+  and self-hosted consumers (through self-update).
+
+- **Capture no longer treats a partial existing-card list as complete.** For a
+  garden with more active cards than the read-side hard maximum (1,000 by
+  default), the existing-card index read returns only the first part and marks it
+  `truncated`. Before: Runtime V2 and resident V1 capture used that part as the
+  full list, so a card that updates a real card beyond it was judged to reference
+  a non-existent card and dropped. After: a truncated (or unmarked) read is
+  treated like an unreadable one — capture runs without the index and leaves
+  target checks to the server.
+
+- **`memory.dream.window_missed` also covers a busy Dream admission.** Before: an
+  account whose last in-window Dream decision was `dream_admission_busy` got no
+  diagnostic when the window closed. After: it records the same event with reason
+  `dream_admission_busy_at_window_end`.
+
+- **Resident V1 capture no longer skips a batch it could not read past a long
+  run of non-chat rows.** The backend sizes a capture batch by counting only chat
+  messages, but the consumer read at most 10 history pages (2,000 rows) to reach
+  the batch's end. Before: more than 2,000 other rows (for example maintenance
+  prompts) between two chat messages → every attempt failed with
+  `capture_window_unavailable` → after the retry limit the batch of up to 60 chat
+  messages was skipped without ever being read, and its memories were lost.
+  After: the consumer keeps paging while the history cursor advances and captures
+  the whole batch. Applies to hosted V1 runners and self-hosted consumers (through
+  self-update); Runtime V2 is unchanged.
+
+- **Nightly memory consolidation (Dream) follows the same naming rule as
+  capture.** Dream prompts in Runtime V2 and resident V1 (hosted runner and
+  self-hosted consumers) used the memory kernel's default naming rule instead of
+  io's. The Chinese wording of the two rules is identical; the English one did
+  not name 「用户」/"user" or the placeholder 「TA」. Before: in an English memory
+  garden, capture was told never to write "the user" or 「TA」 for the person, but
+  the nightly rewrite of the same cards was not. After: Dream receives io's rule
+  too, so a rewritten card keeps calling the person by name. A self-hosted
+  consumer whose installed memory kernel predates this field keeps running
+  Dream with the default rule instead of failing.
+
+- **Memory capture can update an existing card again instead of adding a
+  duplicate.** Since 2026-08-30 the capture prompt in Runtime V2 showed the
+  model an empty existing-memory index, so it could only add cards; resident V1
+  (hosted runner and self-hosted consumers) never had one. Before: the user says
+  "I left ByteDance, joining Tencent next month" while a card says they work at
+  ByteDance → a second, contradicting card. After: the prompt lists up to 60 of
+  the user's active cards (id, bucket, summary; the ones related to the
+  conversation first, at most 16,000 characters, summaries cut at 400) and the
+  model supersedes the ByteDance card. A merge/supersede that names a card the
+  user does not have is re-asked once and, if still wrong, only that card is
+  dropped — in Runtime V2 this previously rejected the whole capture window. If
+  the card list cannot be read completely, capture runs without an index and
+  targets are left to the server's ownership check, as before. Resident V1
+  reports such drops as `supersede_target_unknown` (noop reason and `skipped`
+  count on `POST /v1/proactive/jobs/{job_id}/status`). Capture prompts in both
+  runtimes also use io's naming rule and a sanitized user name again: a stored
+  placeholder name such as 「用户」 is no longer used as the person's name.
+
+- **A memory add can no longer overwrite a stored card.** Before: `memory.add`
+  in `/v1/memory/actions` (and `POST /v1/memory/add`) with an envelope ID that
+  was already stored silently replaced that card; for a superseded card this
+  wiped `superseded_by`, so the old card became active again next to its
+  successor. Now re-sending the exact same sealed envelope succeeds with
+  `replayed: true` and writes nothing, and any other envelope under a stored ID
+  fails with `409 memory_id_conflict` without changing or echoing the stored
+  card. Runtime V2 Capture also re-checks at commit that every card it
+  supersedes is still active; a batch whose target was corrected, superseded or
+  archived after the batch was prepared is rejected as
+  `capture_supersede_target_inactive` and the window is captured again, instead
+  of leaving two active successors. Card `updated_at` (and the `archived_at` /
+  `retyped_at` stamps written with it) is now UTC with a `Z` suffix, matching
+  `created_at`; a new card's two stamps are the same instant. Stored values are
+  not backfilled.
+
+- **Memory Dream now reads each card's body, not just its title.** When Dream
+  tidies the Memory Garden (merge, thicken or supersede), the model now sees
+  every card's summary and full body — in Runtime V2 and in resident V1 (hosted
+  runner and self-hosted consumers alike). Previously Runtime V2 showed only a
+  one-line summary per card and resident V1 cut summaries to 500 and bodies to
+  900 characters inside a 20,000-character list that could stop mid-card, so a
+  rewrite could drop details the model never saw. One Dream run shows at most
+  60 cards and 60,000 characters; cards that do not fit wait for a later run
+  and cannot be retired by this one. A card whose body exceeds 5,000 characters
+  (or summary 2,000) is shown truncated, marked `TRUNCATED`, and may not be
+  changed: such proposals are dropped, and a run where all proposals were
+  dropped fails as `dream_truncated_card_rejected` without advancing the Dream
+  ledger. Resident V1 now also records a too-small garden as a skipped Dream
+  (`status: skipped` with `dream_skip_reason: not_enough_new_cards` on
+  `POST /v1/proactive/jobs/{job_id}/status`) instead of running it, matching
+  Runtime V2. A worker or consumer whose installed `memgarden` cannot render
+  card bodies fails its Dream run with `dream_kernel_outdated` instead of
+  falling back to titles only. The blast-radius fuse now measures against the
+  cards shown to the model. Resident Dream jobs no longer store the model's
+  `questions`. The `FEEDLING_V2_DREAM_CARDS_MAX_CHARS` setting is retired.
+
+- **`memory_fetch` returns superseded history again.** Every card retired by
+  `memory.supersede` (and by Runtime V2 Capture) also carries archive markers, and
+  those markers made it unavailable even when the request asked for
+  `include_superseded`. Before: fetching a replaced card with
+  `include_superseded: true` put it in `unavailable_ids`, and a successor's
+  `related_items` never listed the card it replaced. After: the replaced card is
+  returned with `status: "superseded"`, and the successor's related items include
+  it along the explicit `supersedes` link, as documented. Plain archived cards
+  still need `include_archived`; default index, search, fetch and automatic recall
+  are unchanged.
+
+- **Memory search stops returning loosely related cards, and automatic recall uses
+  the same ranker.** `memory_search` / `memory-index --query` now rank with
+  memgarden's BM25 (`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"`, same jieba
+  0.42.1 tokenizer and formula as before) plus two gates: common function words
+  are ignored, and a card must cover enough of the query or carry strong evidence.
+  Before: asking for something never recorded ("我姐姐叫什么名字") returned every
+  card sharing 我/什么/名字. After: it returns no items. On the synthetic
+  retrieval evaluation (210 cards, 53 queries) recall@5 stays 0.896, MRR 0.806 →
+  0.849, precision@3 0.545 → 0.830, no-hit queries answered empty 1/5 → 4/5; three
+  paraphrase queries that previously ranked answers outside the top five now
+  return nothing. Automatic recall (`context_memories` for V1 resident and V2
+  chat/wake) switched from memgarden's legacy relevance scorer to the same ranker
+  with a looser gate for four-message chat windows: single queries recall@5
+  0.668 → 0.866 and empty-despite-an-answer 9 → 1; chat windows recall@5 0.962 →
+  1.000, MRR 0.515 → 0.923, cards per turn 6.25 → 7.94, and unrelated chit-chat
+  windows answered empty 1/3 → 0/3 (single no-hit queries 4/5 → 3/5); selection
+  is about 3–10× faster. `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0` on the enclave restores the
+  previous selector. `memory_fetch` related items now come from memgarden's
+  one-hop read with unchanged results. A backend and enclave on different
+  versions during a restart still agree on `bm25-jieba-0.42.1-v1`.
+
+- **History imports now write memory cards through Memory Garden's import session.**
+  This covers `POST /v1/genesis/imports/plaintext` (onboarding and `add_memory`),
+  encrypted chunked imports (`POST /v1/genesis/imports`), the resident distill jobs
+  run by self-hosted consumers, and the legacy `POST /v1/history_import/upload`.
+  Cards are judged and written batch by batch, so a retried import continues from
+  the next unfinished batch instead of starting over. Cards are written in the
+  language of the uploaded material (English material no longer yields Chinese cards).
+  Cards already in the garden are shown to the model, so importing the same material
+  again merges into them rather than duplicating them. Card dates come from timestamps
+  in the material. Long-term memory archives imported through
+  `POST /v1/genesis/imports/plaintext` still fall back to the relationship start
+  date; on the legacy upload an undated card stays undated. The Identity Card is
+  derived in a separate step. Response shapes are
+  unchanged. On the legacy upload job, `candidate_count` and
+  `candidate_cluster_count` now report cards judged and written, because there is no
+  separate candidate stage anymore. Imports already in progress with the previous
+  pipeline finish on it. Operator setting `FEEDLING_GARDEN_IMPORT_STRATEGY` can be
+  `two_pass` (the default) or `single_pass`.
+
+- **History imports on the Memory Garden import session keep the protections the
+  previous pipeline had.** Before: after the switch, a card the model wrote as
+  「用户喜欢骑车」 or "The user likes cycling" was stored that way; uploading only a
+  long-term memory archive no longer set the companion's name, days together and
+  relationship anchor on the Identity Card; a batch whose every card was rejected
+  as invalid finished the import as done with zero cards; on the legacy upload a
+  provider error failed the whole job and undated archive cards got the
+  relationship start date. After: these system placeholders are replaced with the
+  person's name (or 「对方」 / "The person" when unknown) before the import session
+  writes a card, on every import path; product terms such as 「用户增长」 are left alone. An archive-only
+  onboarding or chunked import sets the name, days and anchor again. A batch
+  whose every card was rejected fails the import so it can be retried (the retry
+  asks the model again). On the legacy upload a provider error is recorded in the
+  job's `warnings` and the job still completes, and an undated card stays
+  undated.
+
+- **Automatic Memory Dream runs no longer all start when the night window opens.**
+  Each account now has a per-user offset inside the 02:00–05:00 window (in the
+  user's timezone) that stays fixed within a night and rotates between nights,
+  and a fleet-wide ceiling (default 4) limits how many automatic Dream jobs may
+  be queued or running at once (resident V1 queued or running, Runtime V2 queued
+  within the last hour, claimed or running). The count and the enqueue are one
+  decision under a deployment-wide lock, so simultaneous ticks cannot all take
+  the same free slot. An account still capped when the window closes records a
+  `memory.dream.window_missed` diagnostic event. Previously every eligible account became due at 02:00 and the
+  simultaneous whole-garden card reads coincided with enclave decrypt timeouts.
+  `POST /v1/dream/tick` can now answer `enqueued: false` with the reasons
+  `dream_stagger_not_due`, `dream_concurrency_cap` or `dream_admission_busy`
+  (another account's admission was being decided at that moment); all are
+  scheduling delays, not failures. User-requested organize (`force`) bypasses both. New
+  operator settings: `FEEDLING_DREAM_STAGGER` (default on) and
+  `FEEDLING_DREAM_MAX_CONCURRENT` (default `4`, `0` disables).
+
+- Runtime V2 memory capture now counts a crash even when the whole worker died
+  while its job lease was still valid. Previously a user who kept chatting could
+  hand that job back to the queue on every message, so repeated worker crashes on
+  the same capture were never counted and the capture failure notice never
+  appeared. When every heartbeat of the job's owning worker (all pools and its
+  Genesis thread) has been silent for more than two minutes
+  (`FEEDLING_V2_CAPTURE_OWNER_DEAD_SEC`, default 120, minimum 60) and the claim is
+  older than that, sending a chat message ends the job and records one capture
+  failure, exactly as an expired lease does. Jobs whose owner is still beating, or
+  whose owner cannot be identified, are still handed back to the queue.
+
+- Admin Dream success rates no longer count a skipped Dream as a success. A
+  Runtime V2 Dream that finds the Memory Garden too small completes without
+  asking the model; the frozen daily lane cells now record it under the
+  existing `silent_declared` count (it stays in `completed`), and the admin
+  event table reports Dream success as completed runs minus skips, with the
+  skip count shown separately. Days frozen before this change are not
+  rewritten. Heartbeat and other wake lanes are unchanged.
+
+- **Resident V1 memory capture now works through a long backlog oldest-first.**
+  Hosted V1 runners and self-hosted consumers now capture the uncaptured chat in
+  bounded batches of up to 60 messages, starting right after the last captured
+  message, and each successful batch advances the capture cursor only to the end
+  of that batch. While at least one full batch is still waiting, the next batch
+  is scheduled on the next capture tick instead of waiting for the 10-minute
+  minimum interval or for the user to go quiet. Previously a backlog larger than
+  one window (for example after an account or provider problem lasting days)
+  was silently skipped: only the most recent messages were captured and the
+  cursor jumped past the rest. This requires a consumer build that advertises
+  the `capture_batch_window_v1` capability; self-hosted consumers get it through
+  self-update. An older consumer keeps the previous behavior (only the most
+  recent messages after a long backlog are captured), and the backend records a
+  `memory.capture.legacy_window_backlog` diagnostic when that happens. Runtime V2
+  capture is unchanged.
+
+- **New shared content uses plaintext for all known accounts when the deployment
+  gate is enabled.** A legacy stored `content_encryption: "on"` no longer changes
+  the new-write shape. `whoami` reports compatibility `content_encryption: "off"`
+  and effective `off`; the effective value remains `on` for unknown users or a
+  closed deployment gate. `POST /v1/users/preferences` rejects `on` with HTTP 400
+  `content_encryption_on_not_supported` before writing any preference; `off` and
+  null/empty clearing remain supported. Existing preferences and ciphertext are
+  not migrated, and `local_only` still requires encryption.
+
+- Tool schemas sent through OpenAI Chat Completions, OpenAI Responses,
+  Anthropic, and Bedrock now omit the internal `enforceItemBounds` annotation.
+  This prevents compatible relays from rejecting tools because of that local
+  validation marker. Standard constraints remain in the outgoing schemas, and
+  server-side memory tag limits remain enforced; Gemini keeps its existing schema adaptation.
+
+- **Resident Claude Code driver requests the self-authored thinking block as `<aside>`.**
+  The block is the user-visible first-person aside shown under the reply, and the
+  instruction now says so; it is no longer described as private inner thoughts.
+  Anthropic's request safeguards on the Opus 5 family classified the previous
+  `<think>` wording as a request for hidden reasoning and rejected every resident
+  turn. The shared thinking-leak gate now recognises `<aside>` on every path
+  that uses it (Runtime V2 chat and wake, resident V1 chat, proactive messages):
+  an `<aside>…</aside>` block is stripped exactly like `<think>`, and a
+  truncated opener such as `<asid` fails closed instead of reaching the user.
+  Prompt text and driver selection for pi, codex, and Runtime V2 are unchanged.
+
+- Empty-response diagnostics now retain Gemini's `malformed_response` as a
+  recognized `stop_reason`, making it distinguishable from `other` in admin views.
+
+- **Gemini models now receive the self-authored aside block as `<aside>`** on
+  both runtimes (Runtime V2 chat, scheduled wakes, terminal/compact rounds and
+  the missing-block correction; resident V1 with any driver) — the same
+  rendering the resident Claude Code driver already uses. Measured on
+  `gemini-3.6-flash`: swapping only the tag, direct V2-shaped requests answered
+  `finishReason=MALFORMED_RESPONSE` in 7 of 11 HTTP-200 responses with `<think>`
+  and 0 of 13 with `<aside>` (both arms also saw HTTP 503), and replays of one
+  captured pi-wire request answered HTTP 503 in 6 of 10 with `<think>` and 0 of
+  10 with `<aside>`. Selection is by provider (`gemini`); every other provider
+  keeps `<think>` byte for byte, and the `<think>` assistant continuation hint
+  is not sent on `aside` turns. The shared leak gate already recognises
+  `<aside>`.
+
+- **Regular V2 wakes now treat speaking as the default.** Silence requires a
+  concrete reason in the model instructions. The existing structured
+  `reply`/`stay_silent` validation remains in place, and free-form text still
+  cannot become a proactive bubble. Regular wakes now use the same output
+  budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768), so
+  reasoning models have more room to produce a terminal choice. Scheduled
+  reminder behavior and file-output budget precedence are unchanged.
+
+- Memory Dream no longer treats a failed card read as an empty Memory Garden.
+  When reading the cards times out or errors (for example an enclave decrypt
+  timeout), the Dream job now fails with `dream_context_unavailable` (V2 job
+  code `extraction_failed:dream_context_unavailable`), goes through the
+  existing Dream failure backoff, and leaves the "last dreamed" record
+  untouched, so Dream runs again once reading recovers. Previously such a run
+  completed as a no-op (`dream_no_cards_available` on resident V1 and
+  self-hosted consumers) and Dream then stayed silent as `already_dreamed`
+  until enough new cards arrived. A successful HTTP response is not enough:
+  the read also fails when the card index comes back empty while its
+  `user_card_count` reports active cards (for example every card failed to
+  decrypt), when an index item is malformed, or when fetching full cards
+  omits a requested card or reports it in `missing_ids` / `unavailable_ids`.
+  Resident V1 and self-hosted consumers no longer fall back to a card's index
+  summary when its full body is missing, so Dream can no longer rewrite a card
+  it has only seen as a summary. Only a read that reports zero active cards
+  still completes as "no cards". The backend also applies this to status
+  reports from older self-hosted consumers: a "no cards" completion is
+  recorded as `dream_context_unavailable` when the garden has active cards.
+
+- Hosted Runtime V2 background memory jobs (Capture, Dream, profile) are no
+  longer mistaken for stuck when a single provider call needs a compatibility
+  retry (for example a model that rejects `temperature`). Each HTTP request
+  inside a provider attempt now counts as progress for the worker's stall
+  watchdog, so a slow but healthy request is not killed and re-run (which also
+  billed the provider twice). Each of those HTTP requests also has a 90-second
+  wall-clock limit: the provider timeout used to bound only the gap between
+  received bytes, so a relay that kept a request alive by trickling bytes
+  could outlast the stall watchdog. A request cut at that limit is handled
+  like a provider timeout (retried, then `upstream_unavailable`). Stall
+  budgets are unchanged.
+
+- Hosted Runtime V2 Capture and Dream now treat a model reply that stops at the
+  output-token limit without any visible text (typically a thinking model that
+  spent the whole budget on reasoning) as an output truncation instead of an
+  unavailable provider. It is no longer re-sent three times with the same
+  budget; it takes the lane's truncation retry (for Dream, a 24,000-token
+  budget) and, if that also runs out, fails as `output_truncated` rather than
+  `upstream_unavailable`. Stop markers from every supported wire count
+  (`length`, `max_tokens`, `max_output_tokens`). Chat and other provider
+  callers are unchanged.
+
+- Resident (V1 and self-hosted) memory capture, dream and migrate failures
+  caused by the agent call now keep a content-free cause in job status and
+  lane diagnostics, such as `dream_agent_call_failed:auth_invalid`,
+  `…:quota_insufficient`, `…:model_not_found`, `…:rate_limited`,
+  `…:upstream_unavailable` or `…:unknown`, instead of collapsing to
+  `runtime_failed`. The backend classifies the consumer's error text when the
+  status is reported, so older self-hosted consumers are covered, and no
+  provider error text is stored in these fields for new reports. For these
+  memory lanes, a provider error reporting an insufficient balance is classified
+  as `quota_insufficient` even when it arrives with HTTP 401. An account or
+  request class is only assigned with provider error evidence (an HTTP status,
+  a provider error code, or the phrase inside an error field); a keyword that
+  merely appears in echoed request text, such as "quota" or "authentication",
+  is recorded as `…:unknown`. HTTP 403 follows the same rule as chat failure
+  notices. Chinese relay messages are recognized when a status label or JSON
+  error field accompanies them, for example `错误码 401：API 密钥无效`
+  (`auth_invalid`) or `状态码 429：额度不足` (`quota_insufficient`). A resident
+  agent call that times out locally (the CLI process or agent request hitting
+  its time limit) is recorded as `…:turn_timeout`, the same class resident chat
+  uses for that case; it is an operational failure, does not make memory capture
+  wait seven days as an account problem, and is not presented to the user as
+  their model service being unavailable. A timeout accompanied by upstream
+  evidence (an HTTP 5xx status, a gateway timeout, a disconnected stream) is
+  still `…:upstream_unavailable`.
+
+- Operational failure rates in admin lane views and runtime health no longer
+  count memory capture, dream and migrate failures proven to be the user's own
+  account or model setup: `<lane>_agent_call_failed:` `auth_invalid`,
+  `quota_insufficient`, `model_not_found` or `provider_account_expired`
+  (resident V1), and `extraction_failed:auth_invalid`,
+  `extraction_failed:model_not_found` or `provider_setup:*` model API
+  configuration errors (Runtime V2). They are reported as user-unavailable
+  instead, like the equivalent chat failures. Provider outages, rate limits,
+  timeouts, content filtering and unknown causes remain operational failures, and
+  so does `resident_agent_cli_logged_out`, because a hosted runner can print the
+  same "not logged in" message when the platform fails to provide its
+  credentials.
+
+- Hosted Runtime V2 Dream no longer reports a run as completed when the
+  Memory Garden is below the memory kernel's consolidation minimum. Such a run
+  makes no model call and changes no cards; it is now recorded as a completed
+  job with outcome `skipped` / `not_enough_new_cards`, leaves the "last dreamed"
+  record untouched, adds no failure backoff, and is not attempted again until the
+  minimum Dream interval has passed. The consolidation threshold itself is
+  unchanged.
+
+- Hosted Runtime V2 Dream now has room to finish consolidating larger Memory
+  Gardens. Its output budget rises from 4,000 to 12,000 tokens, and a reply that
+  stops at that limit is retried once with a more concise prompt and a
+  24,000-token budget (both capped at the shared 32,768-token provider ceiling).
+  Previously the retry reused the budget that had just truncated, so the same
+  gardens failed with `output_truncated` every night. If the model rejects the
+  larger retry budget as too large (HTTP 400/422), the concise retry is sent
+  again at the 12,000-token budget the model already accepted instead of
+  failing the run as a provider configuration error.
+
+- Memory capture no longer stops permanently when one batch of chat keeps
+  failing. Failures are handled in three classes. If the model output for the
+  same batch is unreadable 3 times in a row, capture skips that batch. Failures
+  caused by the account or model provider (invalid key, insufficient balance,
+  expired login, rate limits, provider unavailable) keep retrying with backoff
+  and capture resumes once the account works again. This class is decided by the
+  same evidence rules as the resident memory-lane failure codes above, for both
+  the raw error text and the stored `capture_agent_call_failed:<class>` code; a
+  keyword that only appears in echoed request text does not count. If such
+  failures persist for 7 days,
+  the oldest pending batch is skipped. Other failures skip
+  the batch after 6 attempts. A skipped batch produces no memories and is
+  recorded in capture diagnostics. While capture is blocked, the app shows a
+  notice naming the cause when it is known. A hosted capture run that crashes or
+  hangs the runtime worker and is recovered by the platform now also counts as a
+  failure (backoff and notice apply), but never causes a batch to be skipped;
+  its notice attributes the problem to the service rather than the account, and
+  it interrupts the count of consecutive unreadable outputs. Turning capture
+  off clears the "capture blocked, retrying" notice.
+  Previously a single bad batch could block all future memories for that account.
+
+- V1 resident proactive wakes now include relevant memory summaries selected
+  against the latest user message in their history snapshot. Heartbeat,
+  scheduled, and screen-watch turns share Chat's rendering and
+  final CLI payload checks. Missing anchors or failed selection remain unknown
+  in diagnostics and do not reuse cards from a previous turn.
+
+- Resident consumers now retry transient startup decrypt-source failures using
+  the runtime enclave retry and timeout settings. A failed probe reports
+  `unreachable` and continues polling instead of exiting, allowing recovery
+  without restarting the consumer. Deterministic HTTP failures are not retried
+  within the probe; cycles with failed decrypt-history reads remain skipped.
+
+- `POST /v1/agent-body/generate` generates a validated 24×24 bead body for
+  hosted and resident accounts, including upgraded self-hosted backends.
+  Hosted accounts use their chat model; residents receive a hidden job through
+  `GET /v1/chat/poll` and run their own agent with locally read identity and memory.
+  Generation does not save or apply a preset; failures never return a local
+  substitute. The API-key-only request has an 85-second budget and at most one
+  repair attempt. Residents must upgrade to advertise `agent_body_generate_v1`;
+  test deployment alone does not update consumers following the production
+  release channel. See [the API contract](/docs/api-reference) and
+  [errors](/docs/errors#agent-body-generation).
+
+- `GET /v1/agent/perception` (and the proactive agent's perception tools) again
+  return the `steps`, `vitals`, `body`, and `metabolic` fields the client reports.
+  Since the perception catalog split health signals into per-metric query
+  capabilities, the pull snapshot only consulted the report-level capability and
+  silently dropped these 14 fields; it now also honours each field's per-metric
+  capability. The cheap `perception.now` snapshot is unchanged.
+
+- **DeepSeek routes no longer remain constrained by an old 64K context value.**
+  Runtime V2 uses a 1,048,576-token audited window for the first-party DeepSeek
+  family, including `deepseek-flash`. At audited destinations, the larger of
+  accepted route metadata and the audited family lower bound now determines
+  the window. Larger metadata and deployment overrides keep their precedence;
+  stored routes are not rewritten. Custom endpoints and OpenRouter's separate
+  DeepSeek window remain unchanged.
+
+- **Resident model-call diagnostics identify their upstream route.** Terminal
+  model-call traces from the Pi, Claude, and Codex CLI runtimes now carry the
+  configured provider and model identifiers, matching the existing V2 trace
+  shape. They also carry the execution lane, so operators can separate chat
+  from background failures without inspecting prompts or model output. Missing
+  route facts remain unset rather than creating an empty-string bucket.
+
+- **Generated images now reach plaintext-tier accounts.** The image-followup
+  validator on `POST /v1/chat/response` accepted only the sealed envelope shape
+  (`body_ct`/`nonce`/`K_user`), so an account on the plaintext storage tier —
+  whose followup envelope is a `body_b64` plaintext shape, the same one file
+  followups already use — had every generated-image reply rejected with
+  `image_followup_envelope_missing_fields` and never received the picture. The
+  validator is now shape-aware (reusing the file-followup gate): a plaintext
+  `body_b64` image envelope is accepted when the account's encryption is off, and
+  the sealed shape keeps its full contract (still requires K_enclave for shared).
+
+- **Memory ranking and V2 profile freshness no longer depend on inactive signals.**
+  Read-side scores ignore legacy `is_open_thread` metadata, including on stored
+  cards. With profiles enabled, a changed Garden row-count or maximum-update
+  witness schedules background profile refresh at the next existing post-turn
+  check without waiting three days. Unchanged sources, disabled profiles and
+  failed-profile retry gates keep their protections. The old
+  `FEEDLING_V2_PROFILE_MAX_AGE_SEC` setting is no longer read. Refresh remains
+  asynchronous and can increase provider work and prompt-cache invalidations;
+  this does not promise an updated profile in the current reply.
+
+- **Foreground CLI timeouts get one side-effect-contained reply recovery.** An
+  ordinary text Chat turn that reaches the resident subprocess timeout can make
+  one fresh reply-only attempt on supported Codex, Claude, or Pi commands. The
+  recovery runs without user/project tools, strips executable action output,
+  and cannot stack with the existing empty-reply retry. Attachment turns,
+  background/proactive work, HTTP agents, and unknown CLI drivers retain the
+  existing visible timeout fallback. Operators can bound the recovery with
+  `FEEDLING_FOREGROUND_TIMEOUT_RECOVERY_SEC` (default 120 seconds, minimum 30).
+
+- **Resident CLI parse failures retain bounded local evidence.** When Codex or
+  Claude exits zero with non-empty structured stdout but no deliverable reply,
+  the resident stores a private, rotated raw artifact under `FEEDLING_HOME`.
+  Backend traces receive correlation metadata plus the exact first 80 characters
+  and local artifact path for direct diagnosis; they never receive the complete
+  stdout. Successful turns and genuinely empty provider responses remain
+  unchanged.
+
+- **Pi stream diagnostics survive trace serialization.** Model-call traces add
+  versioned scalar block counts and stop-reason indicators without storing reply,
+  reasoning, or tool-argument content in those fields. Operators can distinguish
+  thinking-only, tool-call-only, update-only text, and length-stop candidates
+  after persistence. Partial parses remain flagged; historical string-shaped
+  fields are not backfilled, and missing new fields mean unmeasured coverage.
+
+- **Resident agents again receive captions on plaintext-tier images and files.**
+  Plaintext binary history now folds the attachment's plaintext caption into
+  the same `content` field used by encrypted history. Plaintext text messages,
+  encrypted rows in mixed history, captionless attachments, and separately
+  hydrated attachment bodies keep their existing behavior.
+
+- **Resident clients report unsupported local IPC explicitly.** Python runtimes
+  without `AF_UNIX` now log a disabled listener and return `ipc_unsupported`
+  for local attachment/redistill commands; normal HTTP text replies are separate.
+  Windows consumer and CLI defaults agree on the native temporary directory.
+  Update warnings now protect local configuration/state instead of suggesting
+  a generic stash. Unrelated untracked files no longer stall self-update;
+  checkout refuses to overwrite conflicting untracked or ignored files.
+  This does not introduce TCP IPC or full Windows support.
+
+- **Image-model setup no longer rejects valid models by name.** Adding an image
+  model on a relay (`openai_compatible`, which uses `/images/generations`, or
+  `openrouter`, which uses `/images`) now probes that dedicated endpoint
+  regardless of the model id, so a real image model whose name carries none of
+  the known markers (e.g. `nai-diffusion-4-5-full` on a relay serving NovelAI)
+  is tested for real instead of being reported "this model can't generate images"
+  before any request is sent. A model that genuinely cannot generate is still
+  rejected by the endpoint's error or empty result.
+
+- **Memory queries rank token matches with BM25.** Nonblank `query` uses pinned
+  jieba 0.42.1 Chinese segmentation and whole case-insensitive ASCII identifiers.
+  The enclave ranks the complete readable corpus across both storage tiers before
+  applying filters and limit; item `score` keeps its old meaning. Query responses
+  add `ranking` and `unavailable_count`; `substring-legacy` explicitly marks a
+  rolling-upgrade fallback, never an auth/timeout fallback. Search resource limits
+  return HTTP 413 `memory_search_resource_limit` rather than partial rankings.
+  All nonblank queries now require the enclave path, including plaintext-tier
+  cards. Blank-query browsing and fetch are unchanged.
+
+- **Rejected agent replies are traced, and attachments degrade instead of looping.**
+  `POST /v1/chat/response` now records a `chat.response.rejected` route trace
+  (status, error code, followup counts; no content) whenever it answers 4xx.
+  The resident consumer keeps the server's reason in its log, resends a reply
+  whose image/file followups were rejected **without** the attachments, and
+  posts a system notice that the picture/file could not be delivered — instead
+  of re-running the whole turn (which regenerated the image and looped).
+
+- **Injected memory summaries are never truncated, and a profile-covered card
+  keeps its ID.** Summaries up to 300 characters appear whole; a longer one is
+  replaced by its ID, reason and a fetch hint instead of a cut-off sentence. A
+  card whose summary is already verbatim in the profile now keeps its ID with an
+  empty summary, so its fuller body can still be fetched. Arrival accounting
+  matches each rendered card entry against the final provider messages —
+  whitespace-normalized or as an equal JSON object, across string and multi-part
+  content — instead of comparing the whole block for equality. Where that check
+  is cut short or fails, the affected IDs are reported as `unverified_ids` with
+  `injected_is_lower_bound`, so an unchecked turn is no longer indistinguishable
+  from an uninjected one; `injected_chars` is documented as the normalized size
+  of the rendered block, not of the provider payload.
+
+- **Memory recall adds bounded navigation metadata and recent-card context.**
+  Optional encrypted `retrieval_cues` reach search and lightweight indexes;
+  fetch adds up to six readable one-hop pointers with explicit coverage status.
+  V2 supplements its profile with up to three cards created in the last seven
+  days inside the existing eight-card/2500-character limit. Memory capture and
+  dreaming now use memgarden 0.20.0 prompts that generate or repair 3–5 grounded
+  `retrieval_cues` and choose a five-level `importance_level`; cues are navigation
+  hints rather than evidence, and the host maps the level to 0.2–1.0 importance.
+
+- **Memory navigation guidance clarified.** The former literal-substring query
+  contract is superseded by BM25 above (and retained only for rolling compatibility).
+  Empty results do not prove memory absence. Agent guidance describes the navigation order
+  locate → pick → relate (follow `threads`) → fetch, and reads the auto-injected
+  related-memory block as evidence before searching.
+
+- **Runtime V2 now consumes per-turn related-memory summaries.** Enclave selection
+  uses the last four conversation messages. Bounded, non-system memory blocks
+  carry IDs and selection reasons, with full details available through fetch.
+  Recall diagnostics measure actual request inclusion and normalized tool-result
+  completeness, separately from selection. Model guidance requires checking
+  supporting memories before asserting specific remembered facts.
+
+- **Runtime V2 memory results now preserve complete JSON and card content.**
+  Compact index/search views use a 6000-character budget; fetched cards share a
+  12000-character budget without the former per-string 2000-character cut.
+  Overflow drops whole cards with explicit counts, including in mixed tool
+  batches. Public memory HTTP responses and resident CLI output are unchanged.
+  Recall diagnostics separate selection from injection and report unknown
+  counts explicitly instead of presenting missing observations as zero.
+
+- **World Book entries now reach the model on their own.** Matching used to be
+  left to the model: ordinary chat prefetched nothing, and the model was
+  expected to call `worldbook-match` when it judged the setting mattered. In
+  practice it rarely did — of the users who had entries, most never got a single
+  query-bearing match, so carefully written setting data silently never
+  appeared. Every foreground turn now runs the same deterministic scan the
+  proactive lane already used: the recent window is matched against each entry's
+  keywords, `alwaysOn` entries always apply, and matched entries are injected
+  under the existing World Book header with the existing cap and explicit
+  truncation marker. The `worldbook-match` tool still exists for the model to
+  look something up on demand. Only the user's own message and Feedling's own
+  replies are used as matching signals — screen-share text never selects
+  entries. Self-hosted runtimes can restore the old behaviour with
+  `FEEDLING_FOREGROUND_WORLDBOOK_CONTEXT=tool`.
+
+- **Image-generation setup now verifies image-named models across provider
+  families with a real request.** A model id containing an existing image
+  marker is no longer rejected solely because its provider is outside the
+  former local allowlist or, for Gemini, because the id lacks a `gemini-`
+  prefix. The setup check can therefore incur one provider request; it succeeds
+  only when that request returns non-empty image media. Model ids without an
+  image marker are still rejected locally without contacting the provider.
+  Ordinary Chat requests keep their existing provider-specific modality gate.
+
+- **DeepSeek proactive wakes can again complete their required final choice.**
+  When a DeepSeek turn must select a tool, the backend disables native thinking
+  for that one request. Other DeepSeek requests keep their configured thinking
+  behavior, and other providers are unchanged.
+
+- **Image-generation setup errors now preserve actionable provider causes.**
+  HTTP 401/403 credential rejection, 402 quota exhaustion, 404 missing model or
+  endpoint, and 400/415/422 incompatibility now return their existing distinct
+  public error codes instead of collapsing into one model-incompatible result.
+  Chinese and English guidance now tells users which setting to correct.
+
+- **Canvas libraries can now load directly from the current workspace index.**
+  `GET /v1/chat/canvases` returns up to 500 metadata-only IO Canvas entries for
+  the authenticated user, newest workspace update first. It includes the
+  newest matching Chat card identifier and display labels when available, but
+  never returns Canvas bodies or envelopes; a Canvas without a matching Chat
+  row remains visible with nullable card metadata. Suffix matching is
+  case-insensitive and the original filename case is preserved.
+
+- **`POST /v1/chat/verify_loop` accepts `only_if_unverified`.** When the JSON
+  literal `true` is sent and the server already holds a sticky live-loop
+  verification for the user, the endpoint inserts no hidden ping, takes no
+  liveness measurement, and answers `passing: true` with `already_verified:
+  true` (`loop_alive` and `response_time_sec` are `null`). The hosted runner supervisor
+  now sends this flag, so a runtime restart no longer re-probes every resident
+  with a real model call on the user's own key. Requests without the flag are
+  unchanged.
+
+- **A relay's own `403` refusal is no longer reported as an invalid API key.**
+  When an upstream relay declines a request for its own reasons, it can answer
+  `403` with a generic OpenAI-shaped envelope
+  (`{"message":"Request failed. Please try again later.","type":"api_error"}`)
+  that carries no authentication semantics. Chat previously classified any
+  `403` as `auth_invalid`, so this transient relay condition told users their
+  key was invalid or expired and directed them to re-save a key that was never
+  the problem. That exact shape — the `403`, the generic `message` field, and
+  `"type":"api_error"`, in any order — now uses the existing
+  `upstream_unavailable` handling instead. The same distinction now applies to
+  image-generation and vision provider checks, which reuse their existing
+  unavailable guidance instead of adding new copy. A `403` that does carry
+  authentication semantics, such as an invalid or unauthorized key, still
+  uses the lane's authentication error; a different `provider_http_403` body
+  remains fail-closed as authentication-related, and `401` is unchanged.
+
+- **Chat now distinguishes relay tool-history failures from tool-schema
+  incompatibility.** When a relay rejects the native tool-result transcript,
+  Runtime V2 stops after that provider call instead of dropping tools and
+  making a second request that is expected to fail identically. The resulting
+  `provider_tool_history_rejected` notice tells users that tools are temporarily
+  unavailable on the channel and recommends switching models or trying again
+  later.
+
+- **The text you send with an image is now followed again when a dedicated
+  vision model is configured.** Runtime V2 previously handed the main model the
+  observation wrapped in untrusted-data framing with your message beside it,
+  which led models to treat your own words as an instruction injected from the
+  picture and decline to act on them. The observation now reaches the main model
+  as labelled text (`Image 1:`, `Image 2:`, …) followed by your message under an
+  explicit attribution. Images you did not send — `photo_read` and `screen_read`
+  tool results, which may show text written by someone else — keep the untrusted
+  framing, as does the official resident consumer.
+
 - **Hosted Chat now accepts up to nine images in one user turn.** Use the new
   `images` array for multi-image messages; the existing `image_b64` and
   `image_mime` single-image fields remain compatible. Empty arrays, mixed old

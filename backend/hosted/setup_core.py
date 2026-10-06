@@ -36,6 +36,7 @@ from core import util as core_util
 from core import wake_bus
 from core.store import UserStore
 from accounts import onboarding as accounts_onboarding
+from accounts import registry as accounts_registry
 from memory import service as memory_service
 import provider_client
 import provider_attempt_ledger
@@ -48,6 +49,10 @@ from hosted import vision_routing
 from hosted import vision_observer
 from hosted import visual_transport
 from model_api_runtime.v2 import prompt_frontier
+from model_api_runtime.v2 import wake_circuit
+from notices import catalog as notices_catalog
+from notices import error_contract
+from notices import core as notices_core
 
 
 _TEST_PATCHABLE_MODULES = (core_enclave,)
@@ -110,6 +115,7 @@ def _emit_model_api_probe_trace(
     outcome_class: str | None = None,
     usage: dict | None = None,
     error_class: str = "",
+    status_code: object = None,
     dur_ms: float | None = None,
 ) -> None:
     event_type = {
@@ -122,6 +128,12 @@ def _emit_model_api_probe_trace(
         "phase": phase,
         "provider": provider,
         "model": model,
+        # Only a measured HTTP integer may cross this diagnostic boundary.
+        # Never coerce strings/body fragments (or bools) into status evidence.
+        "status_code": (
+            status_code if type(status_code) is int and 100 <= status_code <= 599
+            else None
+        ),
     }
     if usage:
         detail["usage"] = dict(usage)
@@ -185,6 +197,7 @@ def _test_provider_key_observed(
             outcome_class="operational_failure",
             error_class=error_class,
             dur_ms=(time.monotonic() - started) * 1000.0,
+            status_code=exc.status_code,
         )
         raise
 
@@ -569,6 +582,7 @@ def _run_route_vision_test_or_error(
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
+            caller_user_id=str(store.user_id),
             **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as exc:
@@ -914,25 +928,11 @@ def _image_generation_config_payload(store) -> dict:
 
 
 def _image_generation_error_code(exc: BaseException, *, dedicated: bool) -> str:
-    classified = provider_client.classify_provider_error(exc)
-    raw = str(exc).strip().lower()
-    if classified in {"provider_config", "provider_incompatible"} or raw in {
-        "image_generation_model_unsupported",
-        "image_generation_invalid_output",
-    }:
-        return (
-            "image_generation_model_incompatible"
-            if dedicated
-            else "image_generation_model_required"
-        )
-    return {
-        "auth_invalid": "image_generation_auth_invalid",
-        "quota_insufficient": "image_generation_quota_insufficient",
-        "model_not_found": "image_generation_model_not_found",
-        "rate_limited": "image_generation_rate_limited",
-        "upstream_unavailable": "image_generation_unavailable",
-        "turn_timeout": "image_generation_unavailable",
-    }.get(classified, "image_generation_test_failed")
+    return image_generator.classify_image_generation_error(
+        exc,
+        dedicated=dedicated,
+        fallback_code="image_generation_test_failed",
+    )
 
 
 def _test_route_image_generation_or_error(
@@ -940,23 +940,51 @@ def _test_route_image_generation_or_error(
     route: dict,
     caller_api_key: str | None,
 ):
+    attempt_id = image_generator.new_attempt_id()
+    started = time.monotonic()
+    provider = str(route.get("provider") or "")
+    model = str(route.get("model") or "")
+
+    def observe(
+        outcome: str,
+        *,
+        error_category: str = "",
+        provider_called: bool = False,
+        status_code: object = None,
+    ) -> None:
+        image_generator.observe_attempt(
+            store,
+            attempt_id=attempt_id,
+            operation="setup_test",
+            provider=provider,
+            model=model,
+            outcome=outcome,
+            error_category=error_category,
+            provider_called=provider_called,
+            status_code=status_code,
+            dur_ms=(time.monotonic() - started) * 1000.0,
+        )
+
     envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         credential = db.model_api_credential_get(store.user_id, route["credential_id"])
         envelope = (credential or {}).get("api_key_envelope")
     if not isinstance(envelope, dict):
+        observe("failed", error_category="model_api_key_envelope_missing")
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
+            caller_user_id=str(store.user_id),
         ).decode("utf-8")
     except Exception:
+        observe("failed", error_category="model_api_key_decrypt_failed")
         return {"error": "model_api_key_decrypt_failed"}, 400
 
     config = provider_client.ProviderConfig(
-        str(route.get("provider") or ""),
-        str(route.get("model") or ""),
+        provider,
+        model,
         provider_key,
         str(route.get("base_url") or ""),
         context_window_tokens=route.get("context_window_tokens"),
@@ -965,6 +993,15 @@ def _test_route_image_generation_or_error(
 
     def provider_failure(exc: BaseException):
         code = _image_generation_error_code(exc, dedicated=True)
+        provider_called = image_generator.provider_called_for_error(exc)
+        observe(
+            "failed",
+            error_category=code,
+            provider_called=provider_called,
+            status_code=(
+                getattr(exc, "status_code", None) if provider_called else None
+            ),
+        )
         status = (
             "unsupported"
             if code == "image_generation_model_incompatible"
@@ -987,7 +1024,15 @@ def _test_route_image_generation_or_error(
     except Exception as exc:  # noqa: BLE001 - this try contains only provider I/O
         return provider_failure(exc)
 
-    images = image_generator.normalize_provider_media(result)
+    try:
+        images = image_generator.normalize_provider_media(result)
+    except Exception:
+        observe(
+            "failed",
+            error_category="image_generation_processing_failed",
+            provider_called=True,
+        )
+        raise
     if not images:
         return provider_failure(
             provider_client.ProviderError("image_generation_invalid_output")
@@ -998,7 +1043,13 @@ def _test_route_image_generation_or_error(
         str(route["id"]),
         status="ok",
     ):
+        observe(
+            "failed",
+            error_category="model_api_route_write_failed",
+            provider_called=True,
+        )
         return {"error": "model_api_route_write_failed"}, 500
+    observe("ok", provider_called=True)
     return None
 
 
@@ -1028,7 +1079,9 @@ def _resolve_provider_key(store, raw_key: str, existing: dict | None,
         return None, {"error": "api_key required"}, 400
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
-            existing_envelope, caller_api_key,
+            existing_envelope,
+            caller_api_key,
+            caller_user_id=str(store.user_id),
         ).decode("utf-8")
     except Exception as e:
         return None, {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
@@ -1240,7 +1293,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             f"[model_api:{store.user_id}] setup FAILED provider={provider} "
             f"model={model} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return _provider_test_failed_body(e), 400
+        return _record_provider_test_failure(store, e), 400
 
     # `supports_responses` is retired transport metadata: nothing in the backend
     # reads it (not even spawners.consumer_env), and /responses has exactly one
@@ -1338,6 +1391,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             return restore_error
         return {"error": "model_api_route_write_failed"}, 500
     provider_health.record_success(store.user_id)
+    notices_core.resolve(store, "model_api:test_failed:")
 
     # Rollout flags / last_action_trace_* still live in the model_api_runtime blob;
     # seed it so onboarding validate's hosted_runtime step and GET /v1/model_api/runtime
@@ -1353,6 +1407,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     cohort_error = _apply_new_user_v2_default_or_error(store)
     if cohort_error is not None:
         return cohort_error
+    wake_circuit.reset(store.user_id, reason="setup_saved")
     accounts_onboarding._save_onboarding_route(store, "model_api")
     hosted_config_store.enqueue_profile_best_effort(
         store.user_id,
@@ -1808,6 +1863,27 @@ def _looks_like_wrong_api_endpoint(exc: BaseException) -> bool:
     return status == 404 and any(marker in text for marker in _HTML_MARKERS)
 
 
+def _provider_test_failure_class(exc: BaseException) -> str:
+    """User-facing probe outcome; never changes provider retry semantics."""
+    if _looks_like_wrong_api_endpoint(exc):
+        return notices_catalog.PROVIDER_TEST_CONFIG_CLASS
+    status = getattr(exc, "status_code", None)
+    # This prefix is produced by provider_client's network/deadline wrappers,
+    # not a free-text matcher against a provider's arbitrary response body.
+    if (isinstance(status, int) and 500 <= status <= 599) or (
+        status is None and str(exc).startswith("provider network error:")
+    ):
+        return notices_catalog.PROVIDER_TEST_UNAVAILABLE_CLASS
+    if status == 403 and error_contract.provider_response_is_quota_exhausted(
+        status,
+        getattr(exc, "raw_response_body", "") or getattr(exc, "response_detail", ""),
+    ):
+        return "quota_insufficient"
+    return notices_catalog.PROVIDER_TEST_STATUS_CLASSES.get(
+        status, notices_catalog.PROVIDER_TEST_CONFIG_CLASS
+    )
+
+
 def _provider_test_failed_body(exc: BaseException) -> dict:
     """provider key 自测失败的统一响应体 —— 四个入口(保存配置 / 手动测试 /
     加路由 / 改凭证)共用一份判据,否则同一个错误从不同入口进来说法会不一样。
@@ -1820,9 +1896,38 @@ def _provider_test_failed_body(exc: BaseException) -> dict:
     if _looks_like_wrong_api_endpoint(exc):
         return {"error": "provider_test_failed",
                 "detail": _WRONG_API_ENDPOINT_HINT,
-                "status_code": None}
+                "status_code": None,
+                "failure_class": _provider_test_failure_class(exc)}
     return {"error": "provider_test_failed", "detail": str(exc),
-            "status_code": getattr(exc, "status_code", None)}
+            "status_code": getattr(exc, "status_code", None),
+            "failure_class": _provider_test_failure_class(exc)}
+
+
+def _record_provider_test_failure(store, exc: BaseException, *, route_id=None) -> dict:
+    """Keep API, saved probe evidence, and deduplicated notice in agreement.
+
+    Only probes of saved credentials pass a route_id. A rejected replacement
+    key must not revoke the existing route's successful test proof.
+    """
+    body = _provider_test_failed_body(exc)
+    failure_class = body["failure_class"]
+    if route_id is not None:
+        # A failed evidence write can leave stale status, but never reports a
+        # successful probe to the caller: the API still returns its failure.
+        db.model_api_route_mark_test(
+            store.user_id, route_id, status="failed",
+            error=f"{failure_class}: {exc}"[:240],
+        )
+    blame, user_text = notices_catalog.provider_test_notice_for(
+        failure_class,
+        language=accounts_registry._get_user_archive_language(store.user_id) or "",
+    )
+    notices_core.emit(
+        store, source="model_api", error_class=failure_class,
+        blame=blame, severity="warning", user_text=user_text,
+        dedupe_key=f"model_api:test_failed:{failure_class}",
+    )
+    return body
 
 
 def _test_active_route(
@@ -1845,7 +1950,10 @@ def _test_active_route(
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
-            envelope, api_key).decode("utf-8")
+            envelope,
+            api_key,
+            caller_user_id=str(store.user_id),
+        ).decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     try:
@@ -1881,14 +1989,7 @@ def _test_active_route(
             probe_trace_id=probe_trace_id,
         )
     except provider_client.ProviderError as e:
-        # Not checked on purpose: the response below is already an accurate 400
-        # (provider_test_failed) regardless of whether this write lands, so callers
-        # never see a false success here. Worst case on a swallowed write failure is
-        # the route's test_status stays at its pre-test value instead of flipping to
-        # 'failed' — a latent staleness, not a lie told to this caller.
-        db.model_api_route_mark_test(store.user_id, route["id"], status="failed",
-                                     error=str(e)[:240])
-        return _provider_test_failed_body(e), 400
+        return _record_provider_test_failure(store, e, route_id=route["id"]), 400
     # Must check: returning None here tells model_api_test() "success" -> 200. If
     # this write silently fails, test_status never flips to 'ok', so the route can
     # stay excluded from the agent-runtime roster (which gates on test_status='ok')
@@ -1897,6 +1998,7 @@ def _test_active_route(
     if not _mark_route_test_ok(store.user_id, route["id"]):
         return {"error": "model_api_route_write_failed"}, 500
     provider_health.record_success(store.user_id)
+    notices_core.resolve(store, "model_api:test_failed:")
     return None
 
 
@@ -1974,7 +2076,6 @@ def model_api_delete(store) -> tuple[dict, int]:
     # 配置没了,任何 config 期发出的 model_api 通知也随之作废——否则 /v1/notices
     # 会为一个已不存在的 provider 一直显示活跃警告。
     try:
-        from notices import core as notices_core
         notices_core.resolve(store, "model_api:")
     except Exception:
         pass  # 扇出绝不影响 delete 主职责
@@ -2185,7 +2286,10 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
         return {"error": "model_api_key_envelope_missing"}, 404
     try:
         provider_key = core_envelope.decrypt_provider_key_envelope(
-            envelope, caller_api_key).decode("utf-8")
+            envelope,
+            caller_api_key,
+            caller_user_id=str(store.user_id),
+        ).decode("utf-8")
     except Exception as e:
         return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     context_window_tokens, frontier_error = _resolve_route_context_window(
@@ -2211,15 +2315,11 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
             context_window_tokens=context_window_tokens,
         ))
     except provider_client.ProviderError as e:
-        # Not checked on purpose: both callers (route_test, route_activate) already
-        # surface an accurate 400 below regardless of whether this write lands —
-        # no false success. Swallowed failure just leaves test_status stale.
-        db.model_api_route_mark_test(store.user_id, route["id"], status="failed", error=str(e))
         print(
             f"[model_api:{store.user_id}] route test FAILED provider={route['provider']} "
             f"model={route['model']} status_code={e.status_code} detail={str(e)[:160]}"
         )
-        return _provider_test_failed_body(e), 400
+        return _record_provider_test_failure(store, e, route_id=route["id"]), 400
     # Must check: model_api_route_activate() treats a None return here as "test
     # passed" and immediately flips is_active=True. If this write silently fails,
     # test_status never reaches 'ok', so the just-"activated" route is excluded from
@@ -2227,6 +2327,7 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
     # "activated" response — the false-success pattern this pass exists to catch.
     if not _mark_route_test_ok(store.user_id, route["id"]):
         return {"error": "model_api_route_write_failed"}, 500
+    notices_core.resolve(store, "model_api:test_failed:")
     return None
 
 
@@ -2422,7 +2523,10 @@ def model_api_models(store, payload: dict, *, caller_api_key: str | None) -> tup
             return {"error": "model_api_key_envelope_missing"}, 404
         try:
             provider_key = core_envelope.decrypt_provider_key_envelope(
-                envelope, caller_api_key).decode("utf-8")
+                envelope,
+                caller_api_key,
+                caller_user_id=str(store.user_id),
+            ).decode("utf-8")
         except Exception as e:
             return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
     else:
@@ -2487,6 +2591,7 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     cohort_error = _apply_new_user_v2_default_or_error(store)
     if cohort_error is not None:
         return cohort_error
+    wake_circuit.reset(store.user_id, reason="route_activated")
     accounts_onboarding._save_onboarding_route(store, "model_api")
     hosted_config_store.enqueue_profile_best_effort(
         store.user_id,
@@ -2653,7 +2758,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
             ))
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
-            return _provider_test_failed_body(e), 400
+            return _record_provider_test_failure(store, e), 400
 
     active_key_change = bool(
         active and active["credential_id"] == credential_id
@@ -2693,6 +2798,7 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
     if active and active["credential_id"] == credential_id:
         _mark_route_test_ok(store.user_id, active["id"])
         provider_health.record_success(store.user_id)
+        notices_core.resolve(store, "model_api:test_failed:")
 
     # 该 credential 下的非 active route 全部退回 untested（新 key 未在它们上验证过）。
     # Not checked: this is UI-freshness bookkeeping only. Activating any of these
@@ -2705,6 +2811,8 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
     restore_error = _restore_v2_or_error(store, required=restore_v2)
     if restore_error is not None:
         return restore_error
+    if active_key_change:
+        wake_circuit.reset(store.user_id, reason="credential_saved")
     return {"status": "ok"}, 200
 
 

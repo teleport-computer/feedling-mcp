@@ -330,9 +330,6 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). On test for real-device quality comparison.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Legacy memory migration is opt-in. Empty = off; set to 1 only after
-      # seeded real-device Garden verification passes. Mirror the pooled V2 worker.
-      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS: "${FEEDLING_RUNTIME_TOKEN_SECRET_PREVIOUS:-}"

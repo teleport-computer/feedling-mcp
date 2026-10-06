@@ -20,6 +20,7 @@ import time
 import types
 import copy
 import os
+import re
 import sys
 import threading
 import uuid
@@ -263,6 +264,33 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_memory_embedding.py",
+        "test_memory_embedding_real.py",
+        "test_tcp_connect_monitor.py",
+        "test_log_shipper.py",
+        "test_log_shipper_compose.py",
+        "test_enclave_reqlog.py",
+        "test_no_global_mirror_patching.py",
+        "test_mirror_group_capture.py",
+        "test_resident_wake_memory.py",
+        # 纯函数：记忆 lane 的 agent 调用失败归类（Bug 20），零 DB / 零网络。
+        "test_agent_call_failure_codes.py",
+        # 记忆管线日报：fixture + 假 opener，零 DB / 零网络 / 不发飞书。
+        "test_memory_pipeline_daily_report.py",
+        # 纯函数：provider 解析层给「思考吃光输出预算」打标 + 抽取截断重问，MockTransport、零 DB。
+        "test_extraction_output_truncation.py",
+        "test_resident_decrypt_probe_startup.py",
+        "test_memory_search_rank.py",
+        "test_memory_search_readside.py",
+        # memgarden 公开 API 收口（2026-09-15）：纯函数对拍 / 假解密 / AST 扫描，零 DB。
+        "test_memory_related_read.py",
+        "test_enclave_recall_unified.py",
+        "test_recall_select_extraction.py",
+        "test_history_view_extraction.py",
+        "test_plaintext_recall.py",
+        "test_recall_observability.py",
+        "test_memgarden_public_api_only.py",
+        "test_memory_result_budget.py",
         # AUP 哨兵探针自身的回归（2026-08-30 T411）：纯单测，外部边界全 monkeypatch，
         # 零 DB / 零网络 / 不调用 claude。**它最需要能跑的时刻正是本地无 PG 时**——
         # 不登记就会被 collect_ignore 静默跳过，量具的守卫恰好在那时消失。
@@ -285,7 +313,12 @@ if not _provisioned:
         # 会被静默跳过，本地「全绿」就是假的。
         "test_orchestration_is_not_reimplemented.py",
         "test_garden_component_parity.py",
-        "test_memgarden_dream_migrate_golden.py",
+        "test_garden_io_capture_policy.py",
+        # 落卡请求唯一构造点：真组件 + 假 provider，不碰 DB。
+        "test_capture_request_index_and_naming.py",
+        # Dream 共用入口（open_dream_session）：假模型 + 真组件，不碰 DB。
+        "test_garden_dream_session.py",
+        "test_memgarden_dream_golden.py",
         "test_memgarden_policies.py",
         "test_memgarden_capture_golden.py",
         "test_memgarden_prompt_params.py",
@@ -295,6 +328,8 @@ if not _provisioned:
         # and compare pure BoxSeal helpers with current backend/enclave codecs.
         "test_v1_envelope_roundtrip_tool.py",
         "test_frame_envelope_roundtrip_tool.py",
+        # Frame source boundary inventory is a pure AST scan: no DB or network.
+        "test_frame_source_contract.py",
         # Fully monkeypatched consumer prompt-gate unit — no DB, no network.
         "test_user_mcp_wait_hint.py",
         "test_bucket_lang_normalize.py",
@@ -310,6 +345,7 @@ if not _provisioned:
         "test_web_settings_core.py",
         "test_web_execution_core.py",
         "test_object_storage.py",
+        "test_chat_body_read_trace.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
         "test_chat_activity_projection.py",
@@ -344,8 +380,12 @@ if not _provisioned:
         "test_perceptkit_trend_read.py",
         "test_provider_client.py",
         "test_provider_tools_gemini.py",
+        "test_provider_tools_local_markers.py",
         "test_provider_catalog_unit.py",
         "test_provider_health_unit.py",
+        # T504 provider-403 boundary: pure classifiers and monkeypatched sinks;
+        # no database or network access.
+        "test_t504_provider_403_sinks.py",
         "test_provider_usage.py",
         "test_history_import_identity.py",
         "test_model_api_file_payload.py",
@@ -559,6 +599,42 @@ def capture_sleeps(monkeypatch, module, sink=None, *, on_sleep=None):
         f"{module.__name__}'s reference"
     )
     return sink
+
+def capture_mirror_groups(monkeypatch, sink=None):
+    """Capture mirror batches without unrelated background statistics writes.
+
+    ``tee_shadow.mirror`` is process-global: replacing ``execute_many`` with
+    list.append also captures debug_trace's daemon flushes. That made the
+    lane-rollup deletion test fail its exact one-group assertion in main CI
+    (T593), even though deletion itself emitted the correct batch.
+
+    Match the SQL target tables used by db.upsert_trace_write_stats and
+    db.upsert_contract_rejection_stats, never parameter text or the thread name.
+    If ANY statement targets one of those statistics tables, discard the whole
+    group; otherwise preserve its order and parameters. No real mirror writes
+    run unless the caller supplies a sink whose append explicitly forwards them.
+    Returns the supplied append-capable sink, or a new list.
+    """
+    from tee_shadow import mirror
+
+    if sink is None:
+        sink = []
+    stats_target = re.compile(
+        r"^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"
+        r"(?:trace_write_stats|trace_write_stats_health|contract_rejection_stats)"
+        r"(?=\s|\(|$)",
+        re.IGNORECASE,
+    )
+
+    def capture(statements):
+        group = list(statements)
+        if any(stats_target.match(sql) for sql, _params in group):
+            return
+        return sink.append(group)
+
+    monkeypatch.setattr(mirror, "execute_many", capture)
+    return sink
+
 
 def seed_user(user_id: str, **doc) -> None:
     """Test-only: insert a minimal row into the ``users`` table so per-user

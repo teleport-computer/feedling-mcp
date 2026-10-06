@@ -72,7 +72,7 @@ def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list
     chunks = [_chunk(idx) for idx in range(len(chunk_texts))]
     plaintext_by_id = {f"chunk-{idx}": text for idx, text in enumerate(chunk_texts)}
 
-    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
+    monkeypatch.setattr(worker, "get_store_per_load_mode", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no fail")))
     monkeypatch.setattr(
@@ -130,6 +130,44 @@ def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list
         return "rtok"
 
     return apply_payloads, minted, mint
+
+
+def _garden_reply(prompt: str, facts: list[str]) -> str:
+    """分块 worker 的记忆卡走 memgarden 导入会话（默认两段式）：按提示词的输出约定
+    认出是抽候选还是写卡，回对应形状。"""
+    if '{"candidates": []}' in prompt:
+        return json.dumps({"candidates": [
+            {"about": "person", "summary": f, "evidence": f, "occurred_at": None} for f in facts]},
+            ensure_ascii=False)
+    return json.dumps({"cards": [
+        {"action": "add", "type": "fact", "bucket": "饮食", "threads": [], "summary": f,
+         "content": f"{f}，是材料里明确说过的事。", "importance": 0.6, "pulse": 0.3}
+        for f in facts]}, ensure_ascii=False)
+
+
+def _patch_garden_writes(monkeypatch) -> dict:
+    """真引擎 + 真动作映射；只替掉执行器（落库）、已有卡读取（enclave）和身份推导（provider）。"""
+    from genesis import foreground_identity, import_engine
+
+    calls: dict = {"actions": [], "identity": []}
+
+    def execute(_store, _api_key, actions, *, runtime_token=""):
+        assert runtime_token == "rtok"
+        start = len(calls["actions"])
+        calls["actions"].extend(actions)
+        return {"status": "ok", "results": [
+            {"status": "ok", "http_status": 201, "memory": {"id": f"mom_{start + i + 1}"}}
+            for i in range(len(actions))]}, 200
+
+    monkeypatch.setattr(import_engine.memory_actions, "_execute_memory_actions", execute)
+    monkeypatch.setattr(import_engine, "existing_cards", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        foreground_identity, "derive_foreground_identity",
+        lambda **kw: calls["identity"].append(kw) or (
+            {"agent_name": "", "dimensions": [
+                {"name": "Brief", "value": 70, "description": "Short replies"}]}, []),
+    )
+    return calls
 
 
 def test_source_family_accepts_import_suffix_aliases():
@@ -224,7 +262,7 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     apply_payloads = []
     minted = []
 
-    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
+    monkeypatch.setattr(worker, "get_store_per_load_mode", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no fail")))
     monkeypatch.setattr(
@@ -265,12 +303,15 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
         return _Resp({"applied": {"ok": True}})
 
     monkeypatch.setattr(worker.httpx, "post", fake_post)
+    writes = _patch_garden_writes(monkeypatch)
 
     class FakeLLM:
         def complete(self, **kwargs):
             task_id = kwargs["task_id"]
             llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
-            if task_id.startswith("voice-map"):
+            if task_id == "garden-import":
+                text = _garden_reply(kwargs["messages"][0]["content"], ["喜欢喝茶"])
+            elif task_id.startswith("voice-map"):
                 text = json.dumps({
                     "behavior_notes_candidates": ["short replies"],
                     "exemplar_candidates": [{"turns": [{"role": "ta", "text": "嗯"}], "axis": ["shape"]}],
@@ -315,7 +356,15 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     assert voice_inputs == ["text for chunk-0", "text for chunk-1"]
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["persona"]["content"].startswith("## 你是谁")
-    assert reducer_output["memories"][0]["summary"] == "The person likes tea"
+    # 卡已经由导入会话写过：输出里不再夹带卡，只报写了几张
+    assert reducer_output["memories"] == []
+    assert reducer_output["garden_import"] == {"cards_written": 1, "dropped": 0}
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["喜欢喝茶"]
+    assert {a["memory"]["source"] for a in writes["actions"]} == {"genesis_import"}
+    assert not any(c["task_id"].startswith(("fact-map", "fact-write")) for c in llm_calls)
+    # 身份卡另走一次推导（替代 fact_write 顺带产出的那部分）
+    assert reducer_output["identity"]["dimensions"][0]["name"] == "Brief"
+    assert writes["identity"][0]["core_memories"][0]["summary"] == "喜欢喝茶"
     assert "raw_text" not in reducer_output
     assert "chunks" not in reducer_output
 
@@ -550,11 +599,15 @@ def test_history_source_merges_existing_ai_persona_with_voice_exemplars(monkeypa
         },
     )
 
+    _patch_garden_writes(monkeypatch)
+
     class FakeLLM:
         def complete(self, **kwargs):
             task_id = kwargs["task_id"]
             llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
-            if task_id.startswith("voice-map"):
+            if task_id == "garden-import":
+                text = _garden_reply(kwargs["messages"][0]["content"], [])
+            elif task_id.startswith("voice-map"):
                 text = json.dumps({
                     "behavior_notes_candidates": ["短句接住情绪"],
                     "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}], "axis": ["emotion"]}],
@@ -588,136 +641,12 @@ def test_history_source_merges_existing_ai_persona_with_voice_exemplars(monkeypa
 
     assert result["processed"] == 1
     assert [call["task_id"] for call in llm_calls] == [
-        "voice-map-0", "fact-map-0", "voice-reduce-0", "persona-build",
+        "garden-import", "voice-map-0", "voice-reduce-0", "persona-build",
     ]
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["persona"]["source_family"] == "merged"
     assert reducer_output["voice_workset"]["behavior_notes"] == ["短句接住情绪"]
     assert reducer_output["voice_workset"]["exemplars"][0]["founding"] is True
-
-
-def test_foreground_combined_map_extracts_fact_and_voice_in_one_call(monkeypatch):
-    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
-    calls = []
-
-    class FakeLLM:
-        def complete(self, **kwargs):
-            calls.append(kwargs["task_id"])
-            assert kwargs["task_id"] == "combined-map-0"
-            text = json.dumps({
-                "fact_candidates": [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
-                "voice_candidates": {
-                    "behavior_notes_candidates": ["短句接住"],
-                    "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
-                },
-            })
-            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
-
-    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["user: 我叫 Z\nta: 别急,我在。"],
-        source_kind="history",
-        write_core=False,
-        include_voice_candidates=True,
-    )
-
-    assert calls == ["combined-map-0"]
-    assert output["all_fact_candidates"] == [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}]
-    assert output["voice_candidates"] == [{
-        "behavior_notes_candidates": ["短句接住"],
-        "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
-    }]
-
-
-def test_foreground_combined_map_retries_once_when_empty(monkeypatch):
-    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
-    calls = []
-
-    class FakeLLM:
-        def complete(self, **kwargs):
-            calls.append({"task_id": kwargs["task_id"], "idempotency_key": kwargs["idempotency_key"]})
-            if len(calls) == 1:
-                text = json.dumps({"fact_candidates": [], "voice_candidates": {}})
-            elif len(calls) == 2:
-                text = json.dumps({
-                    "fact_candidates": [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
-                    "voice_candidates": {"behavior_notes_candidates": ["直说"], "exemplar_candidates": []},
-                })
-            else:
-                raise AssertionError(kwargs["task_id"])
-            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["user: 我叫 Z"],
-        source_kind="history",
-        llm=FakeLLM(),
-        write_core=False,
-        include_voice_candidates=True,
-    )
-
-    assert [call["task_id"] for call in calls] == ["combined-map-0", "combined-map-0-empty-retry-1"]
-    assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
-    assert output["all_fact_candidates"][0]["summary"] == "用户叫 Z"
-    assert output["voice_candidates"][0]["behavior_notes_candidates"] == ["直说"]
-
-
-def test_keep_all_empty_maps_return_bounded_raw_diagnostics_without_checkpointing():
-    raw = '{"fact_candidates":[],"explanation":"没有提取到候选"}'
-    llm = _FakeLLM([raw, raw])
-    checkpointed = []
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["用户长期居住在上海，也一直从事产品设计。"],
-        source_kind="memory_summary_import",
-        llm=llm,
-        write_core=False,
-        keep_all=True,
-        on_map_completed=lambda idx, mapped: checkpointed.append((idx, mapped)),
-    )
-
-    assert output["all_fact_candidates"] == []
-    assert checkpointed == []
-    assert [item["discard_reason"] for item in output["map_diagnostics"]] == [
-        "empty_fact_candidates",
-        "empty_fact_candidates",
-    ]
-    assert output["map_diagnostics"][0]["raw_output_snippet"] == raw
-    assert output["map_diagnostics"][0]["raw_output_chars"] == len(raw)
-
-
-def test_keep_all_retry_ignores_legacy_empty_map_checkpoint():
-    llm = _FakeLLM([
-        '{"fact_candidates":[{"about":"user","summary":"用户长期居住在上海"}]}'
-    ])
-    checkpointed = []
-
-    output = worker.build_foreground_output_from_texts(
-        user_id="usr_1",
-        job_id="job_1",
-        runtime=types.SimpleNamespace(),
-        chunk_texts=["用户长期居住在上海。"],
-        source_kind="memory_summary_import",
-        llm=llm,
-        write_core=False,
-        keep_all=True,
-        resume_map_outputs={0: {"fact_candidates": []}},
-        on_map_completed=lambda idx, mapped: checkpointed.append((idx, mapped)),
-    )
-
-    assert llm.calls == 1
-    assert output["all_fact_candidates"][0]["summary"] == "用户长期居住在上海"
-    assert checkpointed[0][0] == 0
-    assert output["map_diagnostics"][0]["discard_reason"] == "empty_checkpoint_ignored"
 
 
 def test_fact_write_retries_once_when_empty(monkeypatch):
@@ -737,7 +666,7 @@ def test_fact_write_retries_once_when_empty(monkeypatch):
                 raise AssertionError(kwargs["task_id"])
             return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1",
         job_id="job_1",
         runtime=types.SimpleNamespace(),
@@ -769,7 +698,7 @@ def test_fact_write_rewrites_person_references_but_preserves_product_terms():
                 output_ref=kwargs["task_id"],
             )
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1",
         job_id="job_1",
         runtime=types.SimpleNamespace(),
@@ -809,7 +738,7 @@ def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
             }, ensure_ascii=False)
             return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1", job_id="job_1", runtime=types.SimpleNamespace(),
         fact_candidates=[{"about": "user", "summary": "用户叫 Seven"}], llm=FakeLLM(),
     )
@@ -852,7 +781,7 @@ def test_fact_write_dedups_stable_definitions_across_batches_first_seen_wins(mon
                 }, ensure_ascii=False)
             return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
 
-    output = worker.build_memory_output_from_fact_candidates(
+    output = worker._fact_write(
         user_id="usr_1", job_id="job_1", runtime=types.SimpleNamespace(),
         fact_candidates=[{"about": "user", "summary": s} for s in "abcde"],
         llm=FakeLLM(),
@@ -899,7 +828,7 @@ def test_fact_write_provider_config_error_does_not_retry(monkeypatch):
             raise provider_client.ProviderError("out of credits", status_code=402)
 
     with pytest.raises(provider_client.ProviderError):
-        worker.build_memory_output_from_fact_candidates(
+        worker._fact_write(
             user_id="usr_1",
             job_id="job_1",
             runtime=types.SimpleNamespace(),
@@ -991,27 +920,17 @@ def test_user_profile_source_writes_memory_facts_without_identity_or_persona(mon
         source_kind="user_profile",
         chunk_texts=["用户叫 Seven,喜欢直接反馈。"],
     )
+    writes = _patch_garden_writes(monkeypatch)
 
     class FakeLLM:
         def complete(self, **kwargs):
             task_id = kwargs["task_id"]
-            llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
-            if task_id.startswith("fact-map"):
-                assert "source_kind=user_profile" in kwargs["messages"][1]["content"]
-                text = json.dumps({"fact_candidates": [{"about": "user", "summary": "User likes direct feedback", "evidence": "direct"}]})
-            elif task_id.startswith("fact-write"):
-                payload = json.loads(kwargs["messages"][1]["content"])
-                assert payload["persona_material"] == ""
-                assert payload["memory_summary"] == ""
-                text = json.dumps({
-                    "memories": [{"type": "fact", "summary": "User likes direct feedback", "content": "User likes direct feedback."}],
-                    "identity": {"agent_name": "Seven", "dimensions": [{"name": "Wrong", "value": 90, "description": "from user profile"}]},
-                    "days_with_user": 9,
-                    "relationship_anchor_evidence": "user profile",
-                })
-            else:
-                raise AssertionError(task_id)
-            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=task_id)
+            prompt = kwargs["messages"][0]["content"]
+            llm_calls.append({"task_id": task_id, "prompt": prompt})
+            assert task_id == "garden-import"
+            assert "The source describes itself as: user_profile" in prompt
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["喜欢直接反馈"]), usage={},
+                                         cached=False, output_ref=task_id, stop_reason="stop")
 
     monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
 
@@ -1022,42 +941,92 @@ def test_user_profile_source_writes_memory_facts_without_identity_or_persona(mon
     )
 
     assert result["processed"] == 1
-    assert [call["task_id"] for call in llm_calls] == ["fact-map-0", "fact-write-0"]
+    assert [call["task_id"] for call in llm_calls] == ["garden-import", "garden-import"]
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["source_family"] == "user_profile"
-    assert reducer_output["memories"][0]["summary"] == "The person likes direct feedback"
-    assert "identity" not in reducer_output
+    assert reducer_output["garden_import"]["cards_written"] == 1
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["喜欢直接反馈"]
+    # 用户档案永远不推 TA 的身份，也不出人设
+    assert "identity" not in reducer_output and writes["identity"] == []
     assert "persona" not in reducer_output
 
 
-def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatch):
+def test_chunked_import_rewrites_user_placeholder_before_writing(monkeypatch):
+    """之前（67bf4b96）：分块导入的卡写库前「用户喜欢…」→ 名字未知时「对方喜欢…」；
+    产品词「用户增长」不动。"""
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch, source_kind="user_profile", chunk_texts=["喜欢直接反馈,在做用户增长。"])
+    writes = _patch_garden_writes(monkeypatch)
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["用户喜欢直接反馈,在做用户增长"]),
+                                         usage={}, cached=False, output_ref="x", stop_reason="stop")
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+    result = worker.tick(api_url="http://backend:5001", enclave_url="https://enclave:5003",
+                         mint_runtime_token=mint)
+    assert result["processed"] == 1
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["对方喜欢直接反馈,在做用户增长"]
+
+
+def test_chunked_import_with_every_card_rejected_fails_the_job(monkeypatch):
+    """之前（6972427d）：整段卡全被判不合格 → 任务失败，不是「完成、0 张卡」。"""
+    _install_success_harness(monkeypatch, source_kind="user_profile", chunk_texts=["喜欢直接反馈。"])
+    _patch_garden_writes(monkeypatch)
+    from genesis import import_engine
+
+    monkeypatch.setattr(import_engine.memory_actions, "_execute_memory_actions",
+                        lambda _s, _k, actions, **_kw: ({"results": [
+                            {"status": "error", "error": "memory_card_polluted", "http_status": 422}
+                            for _ in actions]}, 200))
+    failures = []
+    monkeypatch.setattr(worker.service, "mark_failed",
+                        lambda _store, job_id, error, **_kw: failures.append((job_id, error)))
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["喜欢直接反馈"]), usage={},
+                                         cached=False, output_ref="x", stop_reason="stop")
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+    result = worker.tick(api_url="http://backend:5001", enclave_url="https://enclave:5003",
+                         mint_runtime_token=lambda *_a, **_k: "rtok")
+    assert result["failed"] == 1 and result["processed"] == 0
+    assert failures and "GardenImportCardsRejected" in failures[0][1]
+
+
+def test_memory_summary_source_uses_curated_archive_import(monkeypatch):
     llm_calls = []
     apply_payloads, _minted, mint = _install_success_harness(
         monkeypatch,
         source_kind="memory_summary",
-        chunk_texts=["用户在五月反复提到需要稳定陪伴。"],
+        chunk_texts=["- 2024-05-20 第一次独立跑完半程马拉松\n"],
     )
+    writes = _patch_garden_writes(monkeypatch)
+
+    identity_calls = []
 
     class FakeLLM:
         def complete(self, **kwargs):
-            task_id = kwargs["task_id"]
-            llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
-            if task_id.startswith("fact-write"):
-                system = kwargs["messages"][0]["content"]
-                assert prompts.FACT_WRITE_KEEP_ALL_SUFFIX in system
-                assert "`date` or `occurred_at`" in system
-                assert "tags" in system and "threads" in system
-                payload = json.loads(kwargs["messages"][1]["content"])
-                assert payload["fact_digest"] == []
-                assert payload["persona_material"] == ""
-                assert "稳定陪伴" in payload["memory_summary"]
+            if str(kwargs.get("task_id") or "").startswith("fact-write"):
+                # 档案带出 TA 名字那一次（5965e943 / 3fcfc2fc）：同一个 fact_write，卡丢掉。
+                identity_calls.append(json.loads(kwargs["messages"][1]["content"]))
                 text = json.dumps({
-                    "memories": [{"type": "fact", "summary": "User needs stable companionship", "content": "User needs stable companionship."}],
-                    "identity": {"agent_name": "Mira", "dimensions": [{"name": "Wrong", "value": 90, "description": "from memory summary"}]},
-                })
-            else:
-                raise AssertionError(task_id)
-            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=task_id)
+                    "memories": [{"type": "fact", "summary": "不该被写进去的卡", "content": "x"}],
+                    "identity": {"agent_name": "Mira", "dimensions": [
+                        {"name": "Wrong", "value": 90, "description": "from memory summary"}]},
+                    "days_with_user": 400,
+                    "relationship_anchor_evidence": "2024-05 开始聊天",
+                }, ensure_ascii=False)
+                return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref="f",
+                                             stop_reason="stop")
+            prompt = kwargs["messages"][0]["content"]
+            llm_calls.append(prompt)
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["第一次独立跑完半程马拉松"]),
+                                         usage={}, cached=False, output_ref="x", stop_reason="stop")
 
     monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
 
@@ -1068,18 +1037,24 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
     )
 
     assert result["processed"] == 1
-    assert [call["task_id"] for call in llm_calls] == ["fact-write-0"]
+    assert "[The entries they wrote]" in llm_calls[-1]     # 长期记忆档案 → curated_archive
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["source_family"] == "memory_summary"
-    assert reducer_output["memories"][0]["summary"] == "The person needs stable companionship"
+    assert reducer_output["garden_import"]["cards_written"] == 1
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["第一次独立跑完半程马拉松"]
+    # 只上传档案时，TA 的名字 / 认识天数 / 关系锚点照切换前带出来；性格维度不从档案推
+    assert len(identity_calls) == 1 and "半程马拉松" in identity_calls[0]["memory_summary"]
     assert reducer_output["identity"] == {"agent_name": "Mira", "dimensions": []}
+    assert reducer_output["days_with_user"] == 400
+    assert reducer_output["relationship_anchor_evidence"] == "2024-05 开始聊天"
+    assert reducer_output["memories"] == []
     assert "persona" not in reducer_output
 
 
 def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     failures = []
     trace_events = []
-    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
+    monkeypatch.setattr(worker, "get_store_per_load_mode", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error, **_kwargs: failures.append((job_id, error)))
     monkeypatch.setattr(
@@ -1110,7 +1085,7 @@ def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
 
 def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):
     failures = []
-    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
+    monkeypatch.setattr(worker, "get_store_per_load_mode", _store_shell)
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error, **_kwargs: failures.append((job_id, error)))
     monkeypatch.setattr(
@@ -1266,7 +1241,7 @@ def test_reap_stale_atomically_fails_then_syncs_blobs(monkeypatch):
         return list(reaped_rows)
 
     monkeypatch.setattr(worker.db, "genesis_reap_stale_processing_jobs", fake_reap)
-    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
+    monkeypatch.setattr(worker, "get_store_per_load_mode", _store_shell)
     blobs = []
     monkeypatch.setattr(
         worker.service,
@@ -1290,7 +1265,7 @@ def test_reap_stale_blob_sync_failure_still_counts_job_reaped(monkeypatch):
         {"user_id": "usr_b", "job_id": "job_b"},
     ]
     monkeypatch.setattr(worker.db, "genesis_reap_stale_processing_jobs", lambda *a, **k: list(reaped_rows))
-    monkeypatch.setattr(worker, "get_store_shell_only", _store_shell)
+    monkeypatch.setattr(worker, "get_store_per_load_mode", _store_shell)
     synced = []
 
     def flaky_blob(store, job, status):
@@ -1412,3 +1387,52 @@ def test_runtime_for_user_raises_without_active_route(backend_env):
     with pytest.raises(worker.GenesisWorkerError) as exc:
         worker._runtime_for_user(uid, "sk-plain-key")
     assert str(exc.value) == "model_api_not_configured"
+
+
+def test_chunked_import_with_region_tagged_archive_language_writes_cards(monkeypatch):
+    """C1 之前：档案语言 ``zh-Hans-CN`` 原样进导入 → memgarden UnknownBucketLocaleError，
+    分块导入整单失败。之后：导入引擎入口归一成 ``zh-Hans``。"""
+    from hosted import history_import
+
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch, source_kind="user_profile", chunk_texts=["喜欢直接反馈。"])
+    writes = _patch_garden_writes(monkeypatch)
+    monkeypatch.setattr(history_import.registry, "_get_user_archive_language",
+                        lambda _uid: "zh-Hans-CN")
+    prompts: list[str] = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            prompts.append(prompt)
+            return types.SimpleNamespace(text=_garden_reply(prompt, ["喜欢直接反馈"]), usage={},
+                                         cached=False, output_ref="x", stop_reason="stop")
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+    result = worker.tick(api_url="http://backend:5001", enclave_url="https://enclave:5003",
+                         mint_runtime_token=mint)
+    assert result["processed"] == 1
+    assert [a["memory"]["summary"] for a in writes["actions"]] == ["喜欢直接反馈"]
+    assert apply_payloads[0]["reducer_output"]["garden_import"]["cards_written"] == 1
+
+
+
+# T750: Genesis finds the profile JSON with the memory-card parser's public
+# extractor (card_text.extract_json_block), which drops inline <think> first.
+def test_profile_json_reply_drops_a_draft_inside_think():
+    from genesis import worker as genesis_worker
+
+    raw = '<think>草稿 {"memory":"错的","style":"错的"}</think>{"memory":"对的","style":"对的"}'
+    out = genesis_worker._profile_json_reply(raw)
+    assert "错的" not in out
+    assert '"对的"' in out
+
+
+@pytest.mark.parametrize("raw", [
+    '{"memory":"a","style":"b"}',          # nothing to strip
+    "<think>没有闭合 {\"memory\":\"a\"",  # malformed thinking: keep the original
+])
+def test_profile_json_reply_keeps_text_it_cannot_improve(raw):
+    from genesis import worker as genesis_worker
+
+    assert genesis_worker._profile_json_reply(raw) == raw

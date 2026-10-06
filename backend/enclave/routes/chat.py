@@ -7,8 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import time
 from urllib.parse import quote
 
 import anyio.to_thread
@@ -16,14 +14,10 @@ from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from memgarden import observability as mg_observability
-from memgarden.scoring.relevance import (
-    select_context_memories,
-    select_context_memories_with_trace,
-)
-from memory import card_shape
-from core import chat_images
-from enclave import auth, backend_client, envelope, readside
+from core import history_view, plaintext_row
+from memory import recall_select
+from memory.embedding import recall_policy
+from enclave import auth, backend_client, envelope, readside, recall_hybrid
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 from enclave.routes._json import json_response_offthread
 
@@ -31,211 +25,14 @@ router = APIRouter()
 _QUOTED_MEMORY_MAX = 8
 
 
-def _attach_chat_metadata(source: dict, target: dict) -> None:
-    """Carry bounded reply and voice metadata into the decrypt view."""
-    for key, limit in (
-        ("voice_call_id", 96),
-        ("voice_turn_id", 128),
-        ("voice_logical_turn_id", 128),
-        ("voice_turn_status", 24),
-        ("voice_superseded_by", 160),
-        ("reply_to_message_id", 128),
-    ):
-        value = source.get(key)
-        if isinstance(value, str):
-            value = value.strip()
-            if value and len(value) <= limit:
-                target[key] = value
-    for key in ("voice_turn_count", "voice_duration_sec"):
-        value = source.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            target[key] = value
-
-
-def _decrypt_caption(m, authorized_user_id, content_sk, errors):
-    """Decrypt the optional caption envelope (user text sent alongside an
-    image/file). Returns the caption string, or "" when absent/failed."""
-    cap_ct = m.get("caption_body_ct")
-    cap_body = m.get("caption_body")
-    if not cap_ct and cap_body is None:
-        return ""
-    cap_env = {
-        "id": m.get("caption_id") or m.get("id"),
-        "v": int(m.get("caption_v", m.get("v", 1)) or m.get("v", 1)),
-        "body_ct": cap_ct,
-        "body": cap_body,
-        "nonce": m.get("caption_nonce"),
-        "K_enclave": m.get("caption_K_enclave"),
-        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
-    }
-    try:
-        return envelope.read_envelope(
-            cap_env, authorized_user_id, content_sk
-        ).decode("utf-8", errors="replace")
-    except Exception as e:
-        errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
-        return ""
-
-
 def _decrypt_history_items(messages, authorized_user_id, content_sk):
-    """纯同步批解密（在 to_thread 里跑）。函数体 = 旧 L1471-1546 逐字，
-    唯一改动：_decrypt_envelope → envelope.decrypt_envelope、
-    DecryptFailure → envelope.DecryptFailure。返回 (decrypted, errors)。"""
-    decrypted = []
-    errors = []
-    for m in messages:
-        v = int(m.get("v", 0))
-        # Default to "text" for legacy messages stored before the
-        # content_type field was added.
-        ctype = m.get("content_type", "text")
-        # v1+ envelope (v0 plaintext paths were stripped post-migration).
-        if m.get("visibility") == "local_only":
-            entry = {
-                "id": m["id"],
-                "seq": m.get("seq"),
-                "role": m["role"],
-                "ts": m["ts"],
-                "source": m.get("source"),
-                "content": None,
-                "content_type": ctype,
-                "v": v,
-                "visibility": "local_only",
-                "decrypt_status": "local_only_agent_cannot_read",
-            }
-            _attach_chat_metadata(m, entry)
-            decrypted.append(entry)
-            continue
-
-        if m.get("body_omitted"):
-            # The caller asked for the transcript without the heavy bodies
-            # (include_image_body=false). There is no body_ct to decrypt, so this
-            # is an opt-out, NOT a decrypt failure — it must never land in
-            # decrypt_errors. The caption envelope survives body omission, so the
-            # user's actual question is still readable; the pixels are fetched one
-            # message at a time via GET /v1/chat/messages/<id>/body.
-            entry = {
-                "id": m["id"],
-                "seq": m.get("seq"),
-                "role": m["role"],
-                "ts": m["ts"],
-                "source": m.get("source"),
-                "content_type": ctype,
-                "v": v,
-                "visibility": m.get("visibility", "shared"),
-                "decrypt_status": "ok",
-                "body_omitted": True,
-            }
-            reason = m.get("body_omitted_reason")
-            if reason:
-                entry["body_omitted_reason"] = reason
-            if ctype == "image":
-                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
-                if m.get("image_bundle_version"):
-                    mimes = m.get("image_mimes") or []
-                    entry["images"] = [
-                        {"image_omitted": True, "image_mime": str(mime)}
-                        for mime in mimes
-                    ]
-                    entry["image_count"] = len(entry["images"])
-                else:
-                    entry["image_omitted"] = True
-                    entry["image_mime"] = m.get("image_mime") or "image/jpeg"
-                if m.get("vision_route_id"):
-                    entry["vision_route_id"] = str(m["vision_route_id"])
-            elif ctype == "file":
-                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
-                entry["file_omitted"] = True
-                entry["file_mime"] = m.get("file_mime") or "application/octet-stream"
-                entry["file_name"] = m.get("file_name") or "file"
-                if m.get("file_display_title"):
-                    entry["file_display_title"] = m["file_display_title"]
-                if m.get("file_display_subtitle"):
-                    entry["file_display_subtitle"] = m["file_display_subtitle"]
-            else:
-                entry["content"] = None
-            qmids = m.get("quoted_memory_ids")
-            if isinstance(qmids, str) and qmids.strip():
-                entry["quoted_memory_ids"] = qmids.strip()
-            _attach_chat_metadata(m, entry)
-            decrypted.append(entry)
-            continue
-
-        try:
-            plaintext = envelope.read_envelope(m, authorized_user_id, content_sk)
-            entry: dict = {
-                "id": m["id"],
-                "seq": m.get("seq"),
-                "role": m["role"],
-                "ts": m["ts"],
-                "source": m.get("source"),
-                "content_type": ctype,
-                "v": v,
-                "visibility": m.get("visibility", "shared"),
-                "decrypt_status": "ok",
-            }
-            # Carry user-selected memory references (Garden「talk in chat」)
-            # forward; expanded into decrypted cards in _build_context_memories.
-            qmids = m.get("quoted_memory_ids")
-            if isinstance(qmids, str) and qmids.strip():
-                entry["quoted_memory_ids"] = qmids.strip()
-            if ctype == "image":
-                # Image plaintext is raw image bytes (JPEG/PNG/WebP) — surface
-                # as base64 so JSON callers (vision-capable agents, iOS clients
-                # with local copies) can decode and render.
-                # If a caption envelope is present (user sent text alongside the
-                # image), decrypt it and fill content so the agent sees the
-                # user's actual question rather than an empty string.
-                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
-                if m.get("image_bundle_version"):
-                    unpacked = chat_images.decode_image_bundle(plaintext)
-                    entry["images"] = [
-                        {
-                            "image_b64": base64.b64encode(body).decode("ascii"),
-                            "image_mime": mime,
-                        }
-                        for body, mime in unpacked
-                    ]
-                    entry["image_count"] = len(entry["images"])
-                else:
-                    entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
-                    entry["image_mime"] = m.get("image_mime") or "image/jpeg"
-                if m.get("vision_route_id"):
-                    entry["vision_route_id"] = str(m["vision_route_id"])
-            elif ctype == "file":
-                # File plaintext is the raw file bytes — surface as base64 so the
-                # resident consumer can land it on disk / inline it. Caption
-                # (user text alongside the file) decrypts into content, mirroring
-                # the image branch.
-                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
-                entry["file_b64"] = base64.b64encode(plaintext).decode("ascii")
-                entry["file_mime"] = m.get("file_mime") or "application/octet-stream"
-                entry["file_name"] = m.get("file_name") or "file"
-                if m.get("file_display_title"):
-                    entry["file_display_title"] = m["file_display_title"]
-                if m.get("file_display_subtitle"):
-                    entry["file_display_subtitle"] = m["file_display_subtitle"]
-            else:
-                entry["content"] = plaintext.decode("utf-8", errors="replace")
-            _attach_chat_metadata(m, entry)
-            decrypted.append(entry)
-        except envelope.DecryptFailure as e:
-            # Surface the failure per-item so the agent sees partial
-            # progress rather than a blanket 500 on one bad blob.
-            errors.append({"id": m.get("id"), "reason": e.reason})
-            entry = {
-                "id": m["id"],
-                "seq": m.get("seq"),
-                "role": m["role"],
-                "ts": m["ts"],
-                "content": None,
-                "content_type": ctype,
-                "v": v,
-                "decrypt_status": f"error: {e.reason}",
-            }
-            _attach_chat_metadata(m, entry)
-            decrypted.append(entry)
-
-    return decrypted, errors
+    """纯同步批解密（在 to_thread 里跑）：在 enclave 里用本用户的 content_sk 读每一行，
+    组视图交给 core.history_view（T779 第 2a 步抽出，逻辑不变）。返回 (decrypted, errors)。"""
+    return history_view.history_items(
+        messages,
+        lambda env: envelope.read_envelope(env, authorized_user_id, content_sk),
+        envelope.DecryptFailure,
+    )
 
 
 def _quoted_memory_ids(messages: list[dict]) -> list[str]:
@@ -300,74 +97,76 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
 
 
 def _build_context_memories(moments, decrypted, query_args):
-    """纯同步 context_memories 选择（在 to_thread 里跑）。函数体 = 旧
-    L1554-1585 逐字：latest_user_text 从 decrypted 提取，context_mode/
-    want_trace 已由路由层预解析进 query_args dict（不能跨线程读
-    request.query_params）。_load_decrypted_moments 的解密部分 →
-    readside.moments_to_cards(moments, ...)（拉取已上移到路由层）。
-    返回 (context_memories, context_memory_trace | None)。"""
-    latest_user_text = ""
-    for m in reversed(decrypted):
-        if m.get("role") == "user" and m.get("content"):
-            latest_user_text = m["content"]
-            break
+    """纯同步 context_memories 选择（在 to_thread 里跑）：在 enclave 里读卡，
+    挑卡交给 memory.recall_select（T779 第 1 步抽出，逻辑不变）。
+    返回 (context_memories, context_memory_trace, context_memory_log)。"""
+    inner: dict | None = None
+    if query_args.get("hybrid") is None:
+        cards = readside.moments_to_cards(
+            moments, query_args["authorized_user_id"], query_args["content_sk"])
+    else:
+        inner = {}
+        cards = readside.moments_to_cards(
+            moments, query_args["authorized_user_id"], query_args["content_sk"],
+            inner_out=inner)
+    diagnostics = query_args.get("input_fp_out")
+    if diagnostics is None:
+        return recall_select.select_context_memories(
+            cards, decrypted, query_args, inner=inner, encoder=recall_hybrid)
+    # Shadow comparison only (T779 step 2b; the caller asked with
+    # context_input_fp=1). The selection below is the normal one and is always
+    # returned as is. Diagnostics are content-free evidence of what it read and,
+    # when sealed cards were among the candidates, the same selector re-run on
+    # these inputs minus the sealed rows (query vectors reused, never re-encoded).
+    # Any diagnostics failure only marks the comparison unmeasurable.
+    encoder = _MemoEncoder(recall_hybrid)
+    evidence: dict = {}
+    picked, trace, log = recall_select.select_context_memories(
+        cards, decrypted, query_args, inner=inner, encoder=encoder, evidence=evidence)
+    try:
+        sealed_ids = [str(m.get("id") or "") for m in moments
+                      if isinstance(m, dict) and plaintext_row.is_sealed_row(m)]
+        diagnostics["input_fingerprint"] = recall_select.input_fingerprint(
+            decrypted, cards, query_args, evidence=evidence, sealed_ids=sealed_ids)
+        diagnostics["summary"] = recall_select.decision_summary(picked, log)
+        sealed = set(sealed_ids)
+        if sealed & {str(c.get("id") or "") for c in cards}:
+            plain = [c for c in cards if str(c.get("id") or "") not in sealed]
+            n_evidence: dict = {}
+            n_picked, _, n_log = recall_select.select_context_memories(
+                plain, decrypted, query_args, inner=inner, encoder=encoder, evidence=n_evidence)
+            diagnostics["normalized"] = {
+                "input_fingerprint": recall_select.input_fingerprint(
+                    decrypted, plain, query_args, evidence=n_evidence),
+                "summary": recall_select.decision_summary(n_picked, n_log),
+            }
+    except Exception as exc:  # noqa: BLE001 — diagnostics never change the result
+        diagnostics.clear()
+        diagnostics["error"] = f"diagnostics_failed:{type(exc).__name__}"[:80]
+    return picked, trace, log
 
-    context_mode = query_args["context_mode"]
-    want_trace = query_args["want_trace"]
 
-    context_memories: list[dict] = []
-    context_memory_trace: dict | None = None
+class _MemoEncoder:
+    """Delegates to ``inner`` once per query-text tuple, so a normalized re-run
+    reuses the first run's query vectors (or its failure) instead of encoding again."""
 
-    cards = readside.moments_to_cards(
-        moments, query_args["authorized_user_id"], query_args["content_sk"])
-    # 生命周期过滤归宿主 —— **必须在翻译之前**。
-    # 翻译产物里没有 io 的 archive 字段，放到翻译之后就漏了，已归档的卡
-    # 会重新进上下文（codex 2026-08-17 指出）。
-    selectable = [c for c in cards if not card_shape.is_retired(c)]
-    # 翻成内核认的形状：内核只读 summary/content/bucket + 宿主显式给的
-    # search_text，不认 title/her_quote/linked_dimension。
-    garden_cards = [card_shape.to_garden_card(c) for c in selectable]
+    def __init__(self, inner):
+        self._inner = inner
+        self._cache: dict = {}
 
-    # 挑卡用翻译后的卡（内核只认那一种形状），但**注入给模型的是原卡** ——
-    # 原卡带着 title/her_quote 等 io 侧要渲染和留痕的字段，翻译产物只是
-    # 给内核打分用的中间态，不该外流。
-    by_original = {str(c.get("id") or ""): c for c in cards if c.get("id")}
-
-    def _back_to_original(picked: list[dict]) -> list[dict]:
-        out = []
-        for item in picked:
-            src = by_original.get(str(item.get("id") or ""))
-            out.append(dict(src) if src else item)
-        return out
-
-    # 无论调用方要不要实时 trace，都算一条**内容无关**的记录带出去 ——
-    # enclave 没有数据库发不了 debug_trace，由调用方（consumer / hosted turn）落库。
-    started = time.monotonic()
-    selection_trace: dict | None = None
-
-    # Resident 与 Hosted Runtime V2 固定走同一套分桶策略，确保用户切换
-    # runtime 时召回不漂移。context_mode/context_strict 仍作为兼容参数接收，
-    # 但不再选择不同 policy。
-    mode = "bucketed:unified"
-    picked, selection_trace = select_context_memories_with_trace(
-        garden_cards,
-        latest_user_text,
-        # 固定 default；兼容参数不得恢复旧的 strict 分叉。
-        mode="default",
-    )
-    context_memories = _back_to_original(picked)
-    context_memory_trace = selection_trace if want_trace else None
-
-    context_memory_log = mg_observability.injection_record(
-        mode=mode,
-        query=latest_user_text,
-        candidate_pool=len(cards),
-        selection_trace=selection_trace,
-        injected_ids=[str(c.get("id") or "") for c in context_memories],
-        cap=8,
-        duration_ms=(time.monotonic() - started) * 1000.0,
-    )
-    return context_memories, context_memory_trace, context_memory_log
+    def encode_queries(self, embedder, texts, deadline, timing=None):
+        key = tuple(texts)
+        if key not in self._cache:
+            try:
+                self._cache[key] = ("ok", self._inner.encode_queries(embedder, texts, deadline, timing))
+            except recall_policy.Fallback as exc:
+                # A failed first encode is replayed, not retried: the normalized
+                # re-run must see the same mode and add no encoder work.
+                self._cache[key] = ("fallback", exc.reason)
+        kind, value = self._cache[key]
+        if kind == "fallback":
+            raise recall_policy.Fallback(value)
+        return value
 
 
 # HEAD 显式声明（同 frames.py）：Flask 自动给 GET 挂 HEAD，FastAPI 不会；
@@ -419,6 +218,9 @@ async def v1_chat_history(request: Request):
     context_memory_trace: dict | None = None
     listing_task: asyncio.Task | None = None
     quoted_fetch_task: asyncio.Task | None = None
+    # Hybrid recall (T523) is off unless FEEDLING_MEMORY_RECALL_HYBRID is set;
+    # while off this stays None and the path below is unchanged.
+    hybrid_state: dict | None = None
     query_args: dict | None = None
     context_setup_error: Exception | None = None
     # Decrypt-health probes (the resident consumer fires one every
@@ -447,17 +249,26 @@ async def v1_chat_history(request: Request):
         # context_mode/context_strict 只做 wire 兼容解析，不改变挑法。候选池仍可
         # 通过 MEMORY_READSIDE_MODEL_API_LIMIT 调整；enclave 原样转发正整数，
         # backend 对超出 memory/list 支持范围的值显式报错。
-        memory_limit = readside.memory_readside_model_api_limit()
+        memory_limit = recall_select.memory_readside_model_api_limit()
         query_args = {
             "context_mode": context_mode,
+            "context_recent": str(request.query_params.get("context_recent") or "").lower()
+                              in {"1", "true", "yes", "on"},
             "want_trace": want_trace,
             "authorized_user_id": user_id,
             "content_sk": content_sk,
         }
+        # Shadow comparison only (T779 step 2b): without this parameter the
+        # response is unchanged.
+        if str(request.query_params.get("context_input_fp") or "").lower() in {
+                "1", "true", "yes", "on"}:
+            query_args["input_fp_out"] = {}
         if not probe:
             listing_task = asyncio.create_task(backend_client.backend_get(
                 "/v1/memory/list", ctx.forward_headers,
                 params={"limit": str(memory_limit)}))
+            if recall_policy.hybrid_enabled():
+                hybrid_state = recall_hybrid.begin(recall_select.unified_recall_enabled())
             quoted_ids = _quoted_memory_ids(hist.get("messages", []))
             if quoted_ids:
                 # User-selected cards are an exact lookup, not part of the
@@ -517,6 +328,16 @@ async def v1_chat_history(request: Request):
         try:
             listing = await listing_task
             moments = listing.get("moments", []) or []
+            if hybrid_state is not None:
+                if hybrid_state["model_id"] and not hybrid_state["fallback_reason"]:
+                    # Only this turn's plaintext candidates: the backend answers
+                    # the intersection with the caller's eligible cards.
+                    ids = recall_policy.plaintext_candidate_ids(moments, user_id)
+                    if ids:
+                        await recall_hybrid.fetch_vectors(ctx.forward_headers, hybrid_state, ids)
+                    else:
+                        hybrid_state["stored"] = {}
+                query_args["hybrid"] = hybrid_state
             context_memories, context_memory_trace, context_memory_log = await anyio.to_thread.run_sync(
                 _build_context_memories, moments, decrypted, query_args)
         except Exception as e:
@@ -554,6 +375,9 @@ async def v1_chat_history(request: Request):
             payload[key] = hist[key]
     if context_memory_trace is not None:
         payload["context_memory_trace"] = context_memory_trace
+    diagnostics = (query_args or {}).get("input_fp_out")
+    if diagnostics:
+        payload["context_input_diagnostics"] = diagnostics
     # 图片聊天史 payload 可达数 MB（image_b64）——json.dumps 离事件循环
     return await json_response_offthread(payload)
 

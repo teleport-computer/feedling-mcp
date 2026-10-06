@@ -13,12 +13,17 @@ def test_index_wraps_core_body(monkeypatch):
     def fake_index(store, api_key, payload, *, post_enclave):
         captured["payload"] = payload
         captured["post_enclave"] = post_enclave
-        return {"items": [1, 2], "limit": 50}, 200
+        return {"items": [{"id": "1", "summary": "one"}, {"id": "2", "summary": "two"}], "limit": 50}, 200
     monkeypatch.setattr(memory_core, "index", fake_index)
 
     r = cap_memory.index("STORE", api_key="k", runtime_token="rt", params={"limit": 50})
     assert r.ok is True
-    assert r.data == {"items": [1, 2], "limit": 50, "total": 2, "returned": 2}
+    assert r.data["items"] == [
+        {"id": "1", "date": "", "bucket": "", "summary": "one"},
+        {"id": "2", "date": "", "bucket": "", "summary": "two"},
+    ]
+    assert r.data["total"] == r.data["returned"] == 2
+    assert r.data["truncated"] is False
     assert captured["payload"] == {"limit": 50}
     assert callable(captured["post_enclave"])  # closure bound to runtime_token
 
@@ -46,11 +51,14 @@ def test_write_delegates_to_actions(monkeypatch):
 
 def test_index_caps_large_item_list(monkeypatch):
     monkeypatch.setattr(memory_core, "index",
-                        lambda *a, **k: ({"items": list(range(1000)), "limit": 1000}, 200))
+                        lambda *a, **k: ({"items": [{"id": str(i), "summary": "记忆档案"} for i in range(1000)], "limit": 1000}, 200))
     r = cap_memory.index("STORE", params={})
     assert r.ok is True
-    assert len(r.data["items"]) == 50
-    assert r.data["returned"] == r.data["total"] == 1000
+    assert 20 <= len(r.data["items"]) < 1000
+    assert r.data["returned"] == len(r.data["items"])
+    assert r.data["matched"] == r.data["total"] == 1000
+    assert r.data["omitted"] == 1000 - r.data["returned"]
+    assert len(json.dumps(r.data, ensure_ascii=False)) <= 6000
 
 
 def test_search_forwards_query_to_index(monkeypatch):
@@ -58,17 +66,14 @@ def test_search_forwards_query_to_index(monkeypatch):
     def fake_index(store, api_key, payload, *, post_enclave):
         captured["payload"] = payload
         captured["post_enclave"] = post_enclave
-        return {"items": [{"id": "1", "text": "hello"}]}, 200
+        return {"items": [{"id": "1", "summary": "hello"}]}, 200
     monkeypatch.setattr(memory_core, "index", fake_index)
 
     r = cap_memory.search("STORE", api_key="k", runtime_token="rt",
                           params={"query": "hello", "limit": 10})
     assert r.ok is True
-    assert r.data == {
-        "items": [{"id": "1", "text": "hello"}],
-        "total": 1,
-        "returned": 1,
-    }
+    assert r.data["items"] == [{"id": "1", "date": "", "bucket": "", "summary": "hello"}]
+    assert r.data["returned"] == r.data["total"] == 1
     assert captured["payload"] == {"query": "hello", "limit": 10}
     assert callable(captured["post_enclave"])
 
@@ -155,6 +160,8 @@ def test_search_trace_is_distinct_from_index_and_uses_confirmed_hit_count(monkey
     assert search_event["subsystem"] == "memory"
     assert search_event["actor"] == "agent"
     assert search_event["detail"]["counts"] == {"items": 2, "limit": 7}
+    assert search_event["detail"]["ids"] == ["1", "2"]
+    assert search_event["detail"]["ids_omitted"] == 0
     assert search_event["detail"]["query_fingerprint"] == hashlib.sha256(
         "她的生日".encode("utf-8")
     ).hexdigest()[:12]

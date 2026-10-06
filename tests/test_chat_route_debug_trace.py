@@ -175,3 +175,55 @@ def test_resident_chat_response_gate_emits_route_trace(client, monkeypatch):
     assert event["status"] == "blocked"
     assert event["trace_id"] == "user-msg-gated"
     assert event["turn_id"] == "user-msg-gated"
+
+
+def test_resident_chat_response_rejection_emits_route_trace(client, monkeypatch):
+    """T528: a 4xx from write_response used to leave NO route trace, so a reply
+    that kept bouncing (image followups) looked like "agent replied, then
+    nothing". The rejection reason must be on the trace, content-free."""
+    monkeypatch.setattr(
+        boot_gates,
+        "_gate_bootstrap_for_chat",
+        lambda store, allow_verify_reply=False, is_verify_reply=False: None,
+    )
+    user_id, api_key = _register(client)
+    _enable_trace(client, api_key)
+    core_store.get_store(user_id).append_chat(
+        "user", "chat", _env(user_id, "user-msg-2"))
+
+    res = client.post(
+        "/v1/chat/response",
+        headers=_headers(api_key),
+        json={
+            "envelope": _env(user_id, "reply-with-bad-image"),
+            "source": "chat",
+            "reply_to_message_id": "user-msg-2",
+            "image_followups": [
+                {
+                    "envelope": _env(user_id, "img"),
+                    "image_mime": "image/gif",   # not in the accepted set
+                    "image_byte_count": 10,
+                }
+            ],
+        },
+    )
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "invalid image_followup mime"
+
+    event = _wait_for_route_events(client, api_key, ("chat.response.rejected",))[0]
+    assert event["type"] == "chat.response.rejected"
+    assert event["status"] == "error"
+    assert event["trace_id"] == "user-msg-2"
+    assert event["turn_id"] == "user-msg-2"
+    assert event["outcome_class"] == "operational_failure"
+    detail = {k: v for k, v in event["detail"].items() if k != "outcome_class_provenance"}
+    assert detail == {
+        "status": 400,
+        "error": "invalid image_followup mime",
+        "source": "chat",
+        "image_followups": 1,
+        "file_followups": 0,
+    }
+    assert event["detail"]["outcome_class_provenance"] == "explicit"
+    # No ciphertext / body text leaks into the trace.
+    assert "body_ct" not in str(event)

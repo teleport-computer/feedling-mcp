@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from memgarden.prompts.recall_fields import retrieval_cues
+
 
 @dataclass(frozen=True)
 class FieldMap:
@@ -102,12 +104,44 @@ def text_for_match(card: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> str:
         for text in (_clean(card.get(key)) for key in field_map.canonical_match_fields)
         if text
     ]
+    # Optional producer-authored hints are matching data, never card body.
+    # memgarden's normalization: strings only, whitespace-collapsed, <=120
+    # chars, deduplicated, the first five *valid* cues (non-strings and repeats
+    # no longer take a seat, as they did when this sliced before filtering).
+    canonical_parts.extend(retrieval_cues(card.get("retrieval_cues")))
 
     if not canonical_parts:
         return legacy_text
     if not legacy_text.strip():
         return " ".join(canonical_parts)
     return legacy_text + " " + " ".join(canonical_parts)
+
+
+_RETIRED_STATUSES = frozenset({"archived", "superseded", "deleted"})
+
+
+def to_related_card(raw: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> dict:
+    """Translate an io card for ``memgarden.related.one_hop``.
+
+    memgarden only reads canonical lifecycle (``status`` / ``superseded_by`` /
+    ``archived``) and ``summary``. io's legacy archive markers become
+    ``status="archived"``, except a card already ``superseded`` (or otherwise
+    retired) keeps its status: a historical version reachable along an explicit
+    link must not turn into an archived card that never appears. Title-style
+    cards get their summary from :func:`summary_of`. Everything else is copied.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = dict(raw)
+    out["summary"] = summary_of(raw, field_map)
+    legacy_archived = (
+        raw.get("is_archived") is True
+        or str(raw.get("archived_at") or "").strip()
+        or str(raw.get("archive_reason") or "").strip()
+    )
+    if legacy_archived and str(raw.get("status") or "").lower() not in _RETIRED_STATUSES:
+        out["status"] = "archived"
+    return out
 
 
 def has_matchable_text(card: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> bool:
@@ -186,7 +220,6 @@ def to_garden_card(raw: dict, field_map: FieldMap = DEFAULT_FIELD_MAP) -> dict:
 ROLE_TURNING_POINT = "turning_point"
 ROLE_CORRECTION = "correction"
 
-_TURNING_PREFIX = "转折｜"
 _CORRECTION_MARKERS = ("correction", "纠正", "设定更新", "边界更新")
 _CORRECTION_SOURCES = {"model_api_correction", "user_correction", "settings_correction"}
 
@@ -194,21 +227,17 @@ _CORRECTION_SOURCES = {"model_api_correction", "user_correction", "settings_corr
 def roles_of(raw: dict) -> list[str]:
     """io 的卡带哪些角色。
 
-    ⚠️ 现在靠标题前缀 / 来源名判断 —— 这个做法本来就脆弱
-    （codex 2026-08-16 指出：展示文案兼任了协议字段），而且**对新形状的卡完全失效**，
-    因为新卡没有 title。这里是过渡实现：把脆弱的判断收在 io 这一处，
-    内核那边只认干净的 `roles` 字段。
-
-    下一步是让写入端直接产出显式角色，然后这里的前缀分支可以删掉。
+    转折点只认显式 roles，不再从标题前缀猜。没有语义角色的存量卡仍可按
+    最近/相关性召回；这里不回填用户数据。纠正卡保留已有来源兼容规则。
     """
     if not isinstance(raw, dict):
         return []
-    roles: list[str] = []
+    explicit = raw.get("roles")
+    roles = [r for r in (ROLE_TURNING_POINT, ROLE_CORRECTION)
+             if isinstance(explicit, list) and r in explicit]
     title = str(raw.get("title") or "")
-    if title.startswith(_TURNING_PREFIX):
-        roles.append(ROLE_TURNING_POINT)
     source = str(raw.get("source") or "").strip().lower()
-    if source in _CORRECTION_SOURCES or any(m in title.lower() for m in _CORRECTION_MARKERS):
+    if ROLE_CORRECTION not in roles and (source in _CORRECTION_SOURCES or any(m in title.lower() for m in _CORRECTION_MARKERS)):
         roles.append(ROLE_CORRECTION)
     return roles
 
@@ -227,6 +256,8 @@ def is_retired(raw: dict) -> bool:
         return True
     return bool(
         raw.get("is_archived") is True
+        or raw.get("archived") is True
+        or str(raw.get("status") or "").lower() in {"archived", "superseded", "deleted"}
         or str(raw.get("archived_at") or "").strip()
         or str(raw.get("archive_reason") or "").strip()
         or str(raw.get("superseded_by") or "").strip()

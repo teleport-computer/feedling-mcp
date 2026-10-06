@@ -408,3 +408,23 @@ def test_system_role_never_carries_turn_failure(client):
 
     for m in _history(client, api_key):
         assert "turn_failure_error_class" not in m
+
+
+def test_pi_provider_error_registered_failure_survives_response_history(client):
+    from notices import error_contract
+
+    user_id, api_key = _register(client)
+    parent_id = _send_user_msg(client, user_id, api_key, "u_t638")
+    spec = error_contract.require_spec("provider_error_unclassified")
+    res = client.post("/v1/chat/response", json={
+        "envelope": _env(user_id, "r_t638"), "source": "chat",
+        "reply_to_message_id": parent_id,
+        "turn_failure_error_class": spec.code,
+        "turn_failure_blame": "system", "turn_failure_user_text": "untrusted provider text",
+    }, headers=_headers(api_key))
+    assert res.status_code in (200, 201), res.get_data(as_text=True)
+    reply = [m for m in _history(client, api_key) if m.get("role") == "openclaw"][-1]
+    assert reply["turn_failure_error_class"] == spec.code
+    assert reply["turn_failure_blame"] == "provider_transient"
+    assert reply["turn_failure_user_text"] == spec.safe_text_zh
+    assert reply["reply_to_message_id"] == parent_id

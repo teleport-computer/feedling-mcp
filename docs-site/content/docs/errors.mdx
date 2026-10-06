@@ -53,6 +53,181 @@ copy. These rejection counters are best-effort diagnostics: if persistence
 fails, Feedling records a content-free warning in service logs, so dashboard
 totals can be lower than the actual number of rejected values.
 
+A provider `403` whose original body explicitly reports an exhausted balance
+(`insufficient_user_quota`, `insufficient_quota`, `预扣费额度失败`, `余额不足`,
+`额度不足`, or `requires an active paid plan`, as returned by relays; a remaining-balance field alone does not count, and explicit
+invalid-key wording in the same body keeps the authentication reading) is classified as
+quota exhaustion, with the existing quota notice, on chat and wake turns, memory
+extraction, vision, image generation, genesis import, credential probes, and
+resident provider-attempt telemetry.
+Explicit authentication wording in the same body keeps `auth_invalid`, and a `403`
+without either kind of evidence keeps the fail-closed `auth_invalid` default.
+
+Resident CLI failures reporting Codex's `hit your usage limit` message are
+classified as `quota_insufficient` with `blame: "user_provider"` and the existing
+quota notice. This applies with either straight or curly apostrophes in
+`You've` / `You’ve`. Ordinary `429 Too Many Requests` failures retain the
+`rate_limited` classification.
+
 Not every historical route uses the same slug for the same status, and not every
 `429` is transient. See [retry safety](/docs/reliability#retry-safety) before
 retrying a failed write.
+
+## Model API credential probes
+
+Credential probe failures return HTTP `400` with `error: "provider_test_failed"`.
+The additive `failure_class` field distinguishes the following outcomes without
+changing the existing `detail` or upstream `status_code` fields:
+
+| Upstream evidence | `failure_class` |
+| --- | --- |
+| 401, or 403 without explicit balance evidence | `auth_invalid` |
+| 402, including insufficient credit for OpenRouter's output reservation, or a 403 whose body reports an exhausted balance (for example `insufficient_user_quota` / `预扣费额度失败`) | `quota_insufficient` |
+| 404 | `model_not_found` |
+| 429 | `rate_limited` |
+| 408, 5xx, or a provider network failure | `upstream_unavailable` |
+| Other or unrecognized failures | `provider_config` |
+
+A 404 HTML page or a successful HTTP response that is not JSON retains the
+existing non-API-endpoint hint, `status_code: null`, and `provider_config` class.
+This applies to setup, manual tests, route tests and activation, and key rotation.
+It does not change the provider client's retry policy.
+
+Setup and manual-test `model_api.provider_probe.*` trace events include
+`detail.status_code`: the failed probe's upstream HTTP integer (100–599), or
+`null` when unavailable or invalid. Strings, booleans, floats, and out-of-range
+values are discarded. Start, success, and runtime-fence events use `null`; a
+successful probe does not expose its transport status. This distinguishes
+401/402/403 without persisting exception messages, response details, or raw
+provider bodies. Existing error classes and API failure responses are unchanged.
+
+Saved-route test errors carry a `<failure_class>: ` prefix. A rejected replacement
+key leaves the previously saved key and its test status intact. Failures also
+produce a safe user notice, deduplicated by `model_api:test_failed:<failure_class>`;
+a successful probe resolves these probe notices. Registered probe classes use
+the user's stored `archive_language` to select existing registry translations;
+an unset language retains the Chinese default. Other Model API notices remain
+unchanged. The probe-local `provider_config` notice uses configuration-specific
+safe copy selected by the same `archive_language` rule (English for `en*`, Chinese
+otherwise); it is not added to the runtime error registry and does not change
+runtime health or blame classification. Raw upstream response text is not copied
+into the notice.
+
+## Runtime V2 model-call diagnostics
+
+Runtime V2 `agent.model.call.error` events use the shared error vocabulary in
+`detail.error_class`, such as `auth_invalid`, `quota_insufficient`, `rate_limited`,
+and `upstream_unavailable`. Unrecognized causes use `unknown`. The separate
+`provider_error_class` remains the retry category (`transient`, `provider_config`,
+or `unknown`); it does not identify the specific cause.
+
+The original Python exception class name is retained as `exception_type` in the
+stored diagnostic detail and remains redacted in the public trace projection.
+Exception messages and provider response bodies are not copied into these fields.
+This diagnostic change does not alter retries or user-facing failure notices.
+
+## Pi stream diagnostics
+
+For resident clients using the pi driver, `agent.model.call.done` and
+`agent.model.call.error` traces may include `detail.pi_stream.schema_version=3`.
+All fields in this projection are scalars. `text_blocks`, `thinking_blocks`,
+`tool_blocks` (pi `toolCall` blocks), and `other_blocks` count assistant
+`message_end` blocks.
+`stop_reasons` is a comma-separated string of distinct allowlisted reasons in
+encounter order, capped at eight reasons and 80 characters without splitting an
+enum. Unknown reasons become `other`. `stop_reason_first` is the first nonempty
+normalized reason; `stop_reason_last` is the last observed assistant end reason
+(or an empty string when that end has none). `stop_length_seen` and
+`stop_max_tokens_seen` scan all parsed assistant ends, including those beyond
+the summary cap. These shape fields contain no reply text, reasoning text,
+tool arguments, or arbitrary upstream stop-reason strings.
+
+Interpret these as observations, not mutually exclusive diagnoses. Check
+`parse_failed=false`, `parse_error_count=0`, and field types before classifying
+thinking-only or tool-call-only output. `update_text_seen=true` with
+`text_chars_total=0` is an update-only-text candidate, not proof of its cause.
+A length flag can coexist with another shape. A successful model-call trace is
+not proof that the reply was delivered to the user.
+
+Version 3 no longer emits nested `blocks` or list-shaped `stop_reasons`.
+Version 2 includes scalar counts, but its old nested fields may have become
+Python-representation strings after size limiting. Older unversioned traces
+lack these scalar counts. Records are not backfilled: check version and field
+types, and report coverage separately during rolling upgrades.
+
+When a pi turn has no usable reply and the final assistant `message_end` reports
+`stopReason=error`, existing specific classifications (quota, authentication,
+rate limits, and upstream availability) take priority. An unmatched error uses
+`provider_error_unclassified` with `blame=provider_transient`; a turn with no
+error stop reason continues to use `provider_empty_reply`. Trailing user echoes
+or tool results cannot replace that assistant end. If no assistant end exists,
+legacy streams may fall back to the last end without a role field. This changes
+the failure classification, not retry behavior.
+
+For a failed pi model call whose selected end is an error, `detail.pi_error_head`
+contains the first 300 characters of the stripped provider `errorMessage`, if
+present. This field contains provider text and is visible in the trace and
+admin projection. It is separate from the content-free stream shape and does
+not replace the server-authored failure text shown to users. Other trace detail
+strings retain their existing limits (including the separately authorized
+parse-failure reply excerpt).
+
+
+## Agent body generation
+
+`POST /v1/agent-body/generate` accepts `schema_version: 1`, `grid_size: 24`,
+a nonblank `client_request_id` of at most 128 characters, and `allowed_palette`
+with 1–255 `#RRGGBB` colors in index order. Successful `rows` contain exactly
+24 rows of 24 integers: 0 is empty, and 1 through the palette length select colors.
+At least one cell is nonzero. The result includes an opaque `generation_id`.
+`client_request_id` is a diagnostic correlation value, not an idempotency key;
+repeating a request can generate a different body and incur another model call.
+
+The endpoint requires an account API key and rejects runtime tokens. Hosted
+accounts use their active tested chat route, including its reasoning setting.
+The backend reads available identity, genesis persona (up to 6,000 characters),
+and up to 12 memory summaries through existing authenticated readers.
+
+Resident accounts run a hidden generation on their own consumer's normal agent.
+A fresh poll must advertise `agent_body_generate_v1`; the additive
+`agent_body_job` field contains a job ID, expiry, fixed instructions with palette
+colors, and palette count. The consumer reads its identity card and at most 12
+memory summaries, then calls its CLI or HTTP agent in an isolated background
+turn. Known CLI drivers use the existing tool-free profile; HTTP uses its
+existing request protocol. The turn does not enter Chat or post a chat reply.
+Unavailable context is labelled as unavailable.
+
+Resident jobs use the existing user-scoped CAS mailbox, bound to the consumer
+and agent entry. Only fixed instructions and temporary grid indices enter that
+mailbox; identity/persona/memory text does not. The waiting request removes grid
+indices after reading them. Expired payloads are removed by the waiting request
+or the next poll; a process crash can leave expired data until the next access.
+Only a content-free completion receipt is retained. No preset is saved or applied;
+saving remains a client action. Concurrent resident generations cannot overwrite
+an active job or unread result; the extra request receives a failure.
+
+The response deadline is 85 seconds after authenticated handler entry, including
+context reads. Direct provider calls receive at most 70 seconds of network
+inactivity timeout. Invalid output can be repaired once only when at least 25
+seconds remain. The resident converts epoch expiry to a monotonic deadline and
+reserves five seconds for delivery. An in-flight synchronous network call can
+finish after the HTTP deadline; its result is discarded and no repair starts
+afterward. Server grid validation applies to both execution paths.
+
+| Status | Slug | Meaning |
+| --- | --- | --- |
+| `400` | `agent_body_invalid_request` | Request fields fail validation. |
+| `400` | `model_api_not_configured`, `model_api_not_tested`, `model_api_key_envelope_missing`, `model_api_key_decrypt_failed`, `model_api_config_invalid` | The hosted chat route cannot be loaded. |
+| `409` | `agent_body_provider_config_failed` | Check provider credentials, access, quota, or configuration. |
+| `409` | `agent_body_resident_update_required` | The resident is offline, outdated, or has not advertised body generation. |
+| `409` | `agent_body_agent_unavailable` | This import-only account is not running an agent. |
+| `429` | `agent_body_generation_failed` | Provider rate limit; `retryable: true`. |
+| `502` | `agent_body_generation_failed` | Provider failure, empty reply, or unavailable/conflicting resident task. |
+| `502` | `agent_body_generation_invalid_output` | Output violates the grid rules after repair. |
+| `504` | `agent_body_generation_timeout` | Deadline reached or insufficient time remains for repair. |
+
+Every failure omits `rows`; there is no random or template fallback. Generation
+diagnostics contain request/generation identifiers, status, duration, attempt
+count, provider/model, error class, and (on success) a nonzero count and short grid
+hash. Ordinary resident prompt/reply trace excerpts, raw parse-failure archives,
+and model-call logs are suppressed for the hidden generation scope.

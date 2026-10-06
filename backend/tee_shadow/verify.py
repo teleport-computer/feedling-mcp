@@ -42,7 +42,7 @@ import db
 import object_storage
 from plaintext_shadow import config as plaintext_shadow_config
 from plaintext_shadow.config import TargetPolicy
-from tee_replicator import terminal_preservation, transforms
+from tee_replicator import policy, terminal_preservation, transforms
 from tee_replicator import worker as _worker
 from tee_shadow import mirror, reconciler
 from tee_shadow import table_registry as reg
@@ -373,7 +373,12 @@ def _expected_doc(
     一条 "envelope missing body_ct" 让 verify 整趟抛异常、再被 tee_sync_scheduler
     的兜底 except 静默吞掉 → verify_ran 24h 恒 false。
     """
-    if _worker._carries_verbatim(user_id, target_policy):
+    carries_verbatim = (
+        False
+        if target_policy is not None and target_policy.mode == "plaintext_all"
+        else policy.resolve_content_encryption(user_id) != "off"
+    )
+    if carries_verbatim:
         return transforms.carry_verbatim(doc), None
     decrypt = _get_decrypt(decrypt_cache, user_id)
     try:

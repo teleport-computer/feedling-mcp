@@ -139,9 +139,14 @@ MATRIX_CELLS = (
         base_url_env="E2E_RELAY_BASE", model_env="E2E_RELAY_MODEL",
     ),
     MatrixCell(
-        "hojimi-relay", "hojimi-relay", "openai_compatible",
-        "claude-haiku-4-5-20251001", "relay", "E2E_KEY_HOJIMI",
-        base_url_env="E2E_HOJIMI_BASE",
+        "jiushi-relay", "jiushi-relay", "openai_compatible",
+        "[AG4]claude-sonnet-4-6", "relay", "E2E_KEY_JIUSHI",
+        base_url_env="E2E_JIUSHI_BASE",
+    ),
+    MatrixCell(
+        "zhailian-relay", "zhailian-relay", "openai_compatible",
+        "[0.01]限时/claude-opus-5", "relay", "E2E_KEY_ZHAILIAN",
+        base_url_env="E2E_ZHAILIAN_BASE",
     ),
 )
 

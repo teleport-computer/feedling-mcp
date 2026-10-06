@@ -6,6 +6,32 @@ canonical_owner: self
 ---
 
 Memory separates ciphertext storage from enclave-authorized read projections.
+Automatic card selection runs in the decrypt service by default; with the
+operator switch `FEEDLING_V2_PLAINTEXT_RECALL` enabled, Runtime V2 selects cards
+for plaintext accounts next to the data using the same selection code. A
+plaintext account's remaining sealed cards are not selected on that path.
+Keyword search (`memory_search`, and `memory_index` with a query) for a
+plaintext account ranks the account's plaintext cards in the backend with the
+same ranking code the decrypt service uses; its remaining sealed cards are not
+searched. Accounts the server does not recognize as plaintext still search in
+the decrypt service.
+
+V1 hosted and self-hosted resident consumers include relevant memory summaries
+in proactive wake prompts as well as Chat prompts. Heartbeat, scheduled,
+and screen-watch turns select against the latest user message in
+their fetched conversation history, including when that message is older than
+the short displayed transcript. They use the same bounded summary and match-reason
+block as Chat, before the wake context; full card bodies remain available through
+memory-fetch. Historical explicit card references are not treated as new user
+requests. Introduction turns keep their deliberate no-history behavior and do
+not inject this block; Memory Capture and Dream keep their separate maintenance inputs.
+
+Without a user-message anchor or a successful selection response, the wake
+proceeds without that block. Selection stays unknown in diagnostics; a healthy
+empty selection records zero. For Pi, Claude, and Codex CLI turns,
+`memory.context.applied` verifies complete rendered entries in the final driver
+payload, and `memory.recall.completed` reports the number that arrived. This
+proves prepared payload delivery, not that the model used the memory.
 
 Runtime V2 permits memory-card deletion only during foreground Chat, when the
 user is present in the turn. Background heartbeat, scheduled, and manual-wake
@@ -30,6 +56,17 @@ if any batch is incomplete. At most one Profile Job runs in a serve-worker
 instance; the second Heavy slot remains available for Dream, Capture, and other
 maintenance. Provider and write stages report progress so a slow but advancing
 profile is not mistaken for a hung Job.
+
+For a healthy or empty profile, the next existing post-turn check schedules a
+refresh when the Garden's content-free row count or maximum `updated_at` differs
+from the profile's recorded source. It no longer waits for the profile to be
+three days old. This is a background full-Garden refresh, not incremental
+generation on every write or a guarantee that the current reply uses the update.
+Repeated enqueue requests coalesce; disabled profiles, provider-repair gates,
+and scheduled retry backoff remain in force. An unchanged witness does not
+trigger a refresh. Writes that leave both witness values unchanged cannot be
+detected by this check. More frequent source changes can increase provider work
+and invalidate the profile's stable prompt-cache prefix more often.
 
 On Chat and proactive wake turns, non-empty MEMORY and STYLE fields enter the
 trusted system prefix after the current identity card (or transitional Genesis
@@ -70,24 +107,143 @@ contract for direct fetch, ambient recall, profile refresh, Dream, and Capture.
 Legacy card-classification keys in stored envelopes are ignored and are not
 returned by `index` or `fetch`.
 
+The read-side `score` and default candidate ordering no longer add a bonus for
+legacy `is_open_thread=true` metadata. That field has no maintained open/closed
+lifecycle; cards carrying it are scored with the same importance and recency
+decay as other cards. Existing records are not rewritten. Query relevance
+ranking and ambient importance-times-pulse weighting are unchanged.
+
 Runtime V2's `memory_index` tool accepts `bucket` and `thread` filters in
 addition to `limit`, matching the resident CLI's partitioned browsing path.
-Both `memory_index` and `memory_search` results include `total` (the number of
-available Garden cards before the filter) and `returned` (the number matched by
-that call before the model-result display cap). A truncation marker directs the
-model to browse by bucket or thread while the existing result-size limit stays
-unchanged. Specific questions should use `memory_search` followed by
+The V2-only `memory_index` and `memory_search` views contain compact items
+(`id`, event `date`, `bucket`, and the first sentence of `summary`). `total` is
+the available Garden count before filtering, `matched` is the number returned
+by the underlying read, and `returned` is the number of complete items retained
+for the model. `omitted`, `source_truncated`, and `truncated` distinguish the
+model budget from upstream limits. The 6000-character result budget drops
+whole lower-ranked items, never part of a JSON object. Specific questions should use `memory_search` followed by
 `memory_fetch`; broad reviews should reconcile partition counts against
 `total`, without indiscriminately loading every card. Bulk cleanup requests
 belong to `memory_organize`, not a chat-loop sequence of single-card edits.
 
-`memory_search` matches a literal, case-insensitive substring of the card text;
-it applies no synonyms, translation, or stemming. An empty result therefore means
-that exact wording does not appear on any card, not that the memory is missing —
-a card written in one language is not found by searching for the other. The tool
-guidance directs the model to retry with different wording before concluding that
-a memory does not exist; only an identical repeat of the same arguments is
-refused within a turn.
+V2 `memory_fetch` has a 12000-character result budget and preserves each retained
+card's complete read-side content (up to 5000 characters). Cards that do not fit
+are omitted as whole items and counted explicitly. These memory results reserve
+their full budget in addition to the ordinary tool batch's 8000 characters, so
+mixed batches cannot silently slice their JSON. A turn still limits the number
+of tool calls. Existing primary-card fields remain compatible; optional recall
+metadata is described below. Index discovery is allowed once per V2
+loop; after a bounded overview, fetch visible IDs or use a more specific search.
+
+Recall diagnostics distinguish card selection from actual prompt injection.
+Each V2 chat/wake turn can read enclave-selected cards from a sequence-bounded
+history window. Automatic recall in both runtimes first selects relevant cards
+using the latest non-empty user message alone. It then fills remaining seats
+using the latest two non-empty user messages joined newest first, deduplicating
+by card ID within the same eight-card cap. This keeps a long previous topic from
+crowding out the current question, while retaining context for short follow-ups
+such as “what about it?”. Both passes use the existing relevance gate; bucket
+quotas do not admit unrelated cards just to fill seats. Assistant replies never
+supply query text. A blank message or an image without a caption falls back to
+earlier user text; an image caption remains eligible. Current-message hits also
+take priority when the runtime applies its prompt budget. Recall diagnostics
+identify the host merge rule as `host:latest-first-v1`; response traces retain
+the kernel scores and each pass's query fingerprint. The persisted record keeps
+the combined-query fingerprint and content-free counts, never the query text.
+The runtime adds a non-system “相关记忆” data block
+before conversation replay: card ID, the summary, and the selection reason. It
+never substitutes the card body for a missing summary and never truncates a
+summary: summaries up to 300 characters appear whole, and a longer one is
+replaced by its ID and reason plus a fetch hint, because a half sentence is the
+input shape that most invites a model to complete it. The block is limited to
+2500 characters; overflow drops whole lower-ranked cards. Explicitly quoted IDs
+are excluded. A card whose verbatim summary already appears in the profile keeps
+its ID with an empty summary and a “profile already covers this, details can be
+fetched” reason, so the fuller body stays fetchable. This is conservative text
+deduplication, not semantic coverage detection. Models must fetch details and
+must not invent facts absent from their evidence.
+
+V2 also requests a recent-card supplement on each turn. Up to three readable,
+active cards created in the last seven days take priority within the same
+eight-card selection and 2500-character block. This uses creation time, not
+last-fetch/update time, and is bounded by the existing candidate window. Unknown,
+timezone-less or future dates are not treated as recent. The reason label says
+“recent” rather than claiming a query match. This supplements a potentially stale
+profile; it does not regenerate it. Quoted/profile deduplication still applies,
+so three candidates do not imply three actual injections. Older enclave versions
+may ignore the optional `context_recent` request flag.
+
+Cards may carry `retrieval_cues`: up to five short, grounded keywords, aliases,
+answerable questions or known event-time hints, at most 120 characters each.
+The read side includes them in BM25 search and lightweight index projections;
+V2's index also retains up to three thread pointers for navigation. Cues are
+search hints, not independent factual evidence. The pinned memgarden 0.19.0
+producer does not generate this new field; absent cues remain compatible. New
+Capture/Dream cue generation and five-level importance guidance require a later
+reviewed dependency release. No existing user cards are backfilled by this IO change.
+
+`memory_fetch` preserves requested full cards and adds `related_items`, at most
+six one-hop pointers (`id`, summary excerpt, `source_id`, `relation`, `status`).
+Relations are shared threads or explicit `anchor_memory_ids`/`supersedes` links.
+Only same-user readable candidates are considered; local-only, deleted and
+archived cards are excluded. A superseded card is included only through an
+explicit link and is marked `superseded`, not presented as current. Expansion
+does not recurse or mark neighbors as fetched. `related_status` is `ok` when
+the bounded search is complete, `bounded` when the candidate/result window or
+decryption limits coverage, `unavailable` when relation lookup cannot be measured,
+or `not_needed` when fetched cards have no links. In the V2 tool budget, primary
+bodies take precedence and optional pointers may be omitted (`related_omitted`
+when metadata fits). Missing optional metadata is not proof of no relations.
+
+`memory.select.traced` does not claim the selected cards reached the model.
+`memory.recall.completed` records per-execution recall counts, with unknown
+values marked explicitly; automatic injection and user-quoted cards are separate.
+V2 events carry turn/job/attempt coordinates so retries and wake work need not
+be mistaken for additional foreground turns. Search diagnostics record a bounded
+sample of returned card IDs and an omitted-ID count, never the query or card text.
+V2 `memory.context.applied` events report which rendered card entries were found
+in the final provider-request messages and whether profile context was included.
+An entry counts as present when it appears verbatim (whitespace-normalized) or as
+an equal JSON object, so an adapter that re-formats, re-flows or splits content
+into parts does not read as a missing injection, while an edited entry does.
+`injected_chars` is the normalized size of the rendered block reduced to the
+entries that were found, including its frame lines — not the character count of
+the provider payload. When a bound stops that check or it fails, the affected
+IDs are reported in `unverified_ids` with `injected_is_lower_bound` set and any
+`arrival_errors` named: unverified is not the same as absent, and only a complete
+check reports `missing_ids`. Separate
+`memory.recall.tool_result` events record final normalized tool-result
+JSON completeness, returned/omitted counts, result characters, and fetch call-ID
+to requested/returned card-ID bindings, joined by turn/job/attempt. The terminal
+`memory.recall.completed` event contains aggregate counts. These are content-free operational fields,
+not proof of semantic relevance or provider-token usage. The full provider-request
+messages remain in the encrypted trajectory under its existing access controls.
+Automatic selection (V1 resident and V2 chat/wake alike) ranks candidates with the
+same BM25 ranker and tokenizer as `memory_search` (memgarden
+`retrieval.select_context`, jieba 0.42.1), then applies soft quotas for turning
+points and recent cards; every selected card must pass the relevance gate. Its
+gate is looser than search's: the four-message query is mostly everyday chat the
+Garden never recorded, so one strongly matching anchor is enough to recall a
+card. Selection records carry the ranking version in `mode` (for example
+`relevant:unified:memgarden-bm25-v2+tok:jieba-0.42.1+cfg:…`). Operators can
+restore the previous selector with `FEEDLING_MEMORY_RECALL_UNIFIED_RANKER=0` on
+the enclave (default on); search keeps the new ranker either way. A missing or
+failed selection remains unknown, not a measured empty Garden.
+
+`memory_search` uses request-local BM25 token ranking over the complete authorized
+readable Garden. Chinese segmentation uses pinned jieba 0.42.1 (precise mode,
+HMM disabled); ASCII words and whole identifiers such as `NP-4286` and `CR2450`
+are case-insensitive tokens, not substring prefixes. Query terms need not be
+adjacent. Very common function words (我, 什么, the, what …) are dropped from the
+query, and a card is returned only when its matched terms cover at least a quarter
+of the query's weight or it carries strong evidence such as a rare identifier; a
+query nothing matches returns no items rather than loosely related filler. No
+synonyms, translation, stemming, time interpretation, embedding or model is
+involved. A nonblank query with no searchable tokens returns no matches. Empty results do not prove memory absence;
+try different wording or browse a bucket/thread. Only identical repeated
+arguments are refused within a turn. The V2 compact result preserves `ranking`
+and `unavailable_count`, including the explicit `substring-legacy` mode during
+rolling upgrades.
 
 `GET /v1/dream/status` also returns `capture_cards_added` and
 `capture_completed_at`. The count is a monotonic total of cards actually added
@@ -95,9 +251,47 @@ across Capture runs. Clients subtract the total saved when the user last
 dismissed the banner to show the unconfirmed count. A Capture run that adds no
 cards does not change the total or refresh the timestamp.
 
-Hosted Dream maintenance reads complete decrypted candidate cards, stopping
-before the next whole card when the configured prompt budget is reached. Every
-proposed consolidation must explain its rationale. Text overlap is not
+Runtime V2 Capture starts with a 1,500-token output budget and 90-second wire
+and phase timeouts. Only a reply stopped at the output limit triggers a larger
+re-ask: twice the configured Capture budget (3,000 by default), capped by the
+shared provider output ceiling, with 180-second wire and phase timeouts. A
+second truncated reply ends the job with `output_truncated`; the budget does
+not keep increasing. Format or semantic re-asks retain the original limits.
+Only already-truncated jobs can spend more output tokens on this re-ask;
+normal jobs keep their existing budget and number of calls.
+
+If the larger Capture or Dream budget is rejected as too large (400/422), or
+with a payment-required response (402), the same concise prompt gets one
+fallback at the original budget and timeouts. An initial 402 remains a quota
+failure. This fallback can add a provider call; it cannot escalate again.
+
+Runtime V2 Dream retains 180-second wire and phase timeouts; profile generation
+retains 90 seconds. Chat and wake provider timeouts are unchanged. The shared
+Heavy pool retains its limits of 210 seconds without progress and 1,260 seconds
+in total. Capture's complete nominal envelope is 1,206 seconds: the initial
+request allows three reliable attempts, while the truncation re-ask and its
+budget fallback each allow one. Every attempt can still make two compatibility
+wires; each wire reports progress. The envelope includes nominal backoff and a
+120-second setup/write margin. A transient failure on the truncation re-ask or
+its budget fallback therefore ends the job without another reliable attempt;
+normal first calls and format/semantic re-asks keep their existing retries.
+The global absolute timeout default stays at 3,000 seconds. The nominal envelope
+excludes optional provider `Retry-After` delays and does not yet cover Dream's
+full re-ask plus budget-fallback envelope. Dream's output
+budgets, consolidation safety gates, and resident V1 are unchanged.
+
+Dream maintenance, in both Runtime V2 and resident V1 (hosted and
+self-hosted), reads complete decrypted candidate cards and shows the model each
+card's summary and body. The prompt holds at most 60 cards and 60,000
+characters of card text, stopping before the next whole card; a body longer
+than 5,000 characters (or a summary longer than 2,000) is shown truncated and
+marked `TRUNCATED`. Cards that did not fit wait for a later run and can never be
+retired by this one, and a proposal that touches a truncated card is dropped
+before anything is written — if every proposal in a run does, the run fails
+with `dream_truncated_card_rejected` and the Dream ledger does not advance. A
+garden below the consolidation minimum is recorded as skipped, not as a
+completed Dream, in both runtimes. Every proposed consolidation must explain
+its rationale. Text overlap is not
 required: cards may be consolidated when they describe the same event or the
 evolution of one plan, while cards that merely share a broad topic remain
 separate. The model's consolidation judgment is not second-guessed by another
@@ -105,11 +299,12 @@ model call: Dream applies only deterministic exit gates. A proposal is rejected
 when its result text contains an internal card id or a tombstone-style note
 (for example "superseded by \<id\>") instead of real memory content — those
 rejections are bounced back to the model once for a rewrite. A run that would
-retire more than 80% of the active garden (and at least 10 cards) fails as a
-whole without applying anything; both thresholds are deployment-configurable.
+retire more than 80% of the cards shown to the model (and at least 10 cards)
+fails as a whole without applying anything; both thresholds are
+deployment-configurable.
 
 Dream does not impose a per-run consolidation count, a per-proposal retired-card
-count, a cross-run cooldown, or any content-quality judgment on rewrites. It
+count, a cross-run content-rewrite cooldown, or any content-quality judgment on rewrites. It
 still rejects repeated use of one source card within a run and proposals that
 target unknown cards. Every proposal is bound to the card snapshot captured
 before the run and all accepted actions are applied afterward, so a card
@@ -129,10 +324,84 @@ run as using degraded context, so it cannot be mistaken for a model choosing to
 make no changes from a complete input. Card ids, prompts, replies, summaries,
 raw errors, and other memory text are never part of this diagnostic shape.
 
+With tracing enabled, Runtime V2 Capture and Dream emit
+`memory.extraction.refusal` when an Anthropic response explicitly reports
+`stop_reason: refusal`. The
+closed detail contains `runtime`, `lane`, `stop_reason`, `refusal_category`, and
+`attempt` (the outer attempt number within that provider round). Categories are
+`cyber`, `bio`, `frontier_llm`, `reasoning_extraction`, `general_harms`, or
+`unclassified` for missing/unknown values. Neither provider explanations nor
+prompt/reply text enter this event. The admin projection accepts only that exact
+shape plus the database’s closed `outcome_class_provenance` field. Text-only
+refusals and other provider wires are not identified by this marker; absence
+of the event is not proof that no refusal occurred.
+
+Capture and Dream stop the current extraction on this explicit marker, even
+when the refused response contains partial text. They do not retry that
+response or pass its text to the memory parser, and the job fails with
+`extraction_failed:content_filtered`. This policy applies whether tracing is
+enabled or not, and a failing trace sink cannot change it. A refusal proves
+that the provider route answered, so it records provider-health success rather
+than a service failure. Ordinary empty replies and transient service failures
+retain their retry policy; chat, tool calls, and Resident V1 are unchanged.
+
+For Capture, this failure uses the existing non-account backoff and six-failure
+window-skip policy. With default settings, six consecutive refused jobs make
+six provider calls; the five intervening backoffs total 5 hours 10 minutes,
+plus execution and scheduling delays. The third through fifth failures use the
+existing generic memory-backoff notice instead of account-repair guidance.
+The sixth failure advances the cursor past that window and resolves the
+notice: that skipped conversation batch produces no memories. A failure
+without a known window never advances the cursor. Dream retains its normal
+non-account scheduling policy and leaves its source cards unchanged.
+
+Runtime V2 Capture and Dream also record provider wire-attempt metadata in the
+operator-readable `provider_attempts` ledger: job correlation, provider/model,
+outer retry and wire counts, each wire's duration and HTTP status, and closed
+error/timeout categories. Missing traces have null measurements, not zero
+attempts. These fields exclude prompts, replies, URLs, headers, credentials,
+and raw error text. The existing `attempt_n` still counts provider rounds;
+`wire_attempt_count` measures the requests inside a round, including retries.
+
+Dream account failures use the same account-specific backoff notices as Capture,
+including expired-login guidance. After seven days of persistent account
+failures, automatic Dream enters recovery mode: it permits at most one probe per
+Dream minimum interval (23 hours by default), subject to the usual night and
+admission gates. Before recovery mode, a gap of more than 24 hours between
+failures restarts the seven-day clock. Once recovery mode is active, another
+account failure keeps it active even after such a gap; success or a non-account
+failure exits it. Cooldown ticks return `enqueued: false` and
+`reason: dream_account_paused`. This is a scheduling skip, not an operational
+failure. It preserves cards, the consolidation ledger, and the unresolved
+account notice; success clears that notice. An explicit forced run bypasses
+the cooldown. Provider timeouts and Dream's write-safety thresholds are unchanged.
+
+Automatic Dream runs are spread across the night window (02:00–05:00 in the
+user's timezone by default) instead of all becoming due when it opens. Each
+account gets an offset derived from its user id and the night's local date,
+within the first part of the window: it is the same for every tick of one night
+and changes from night to night, so when the ceiling below is saturated the
+accounts left waiting in late slots rotate rather than being the same ones every
+night. The last 90 minutes (at most half the window) are kept free so a failed
+first attempt still has room for its retry backoff. Until the offset arrives,
+`POST /v1/dream/tick` answers `enqueued: false` with reason
+`dream_stagger_not_due`. Separately, no automatic Dream is enqueued while the
+deployment already has its concurrency ceiling of Dream jobs queued or running
+(resident V1 jobs queued or running, Runtime V2 jobs claimed or running or
+waiting in the queue for less than an hour, counted together because both read
+cards through the same enclave); the tick answers `dream_concurrency_cap` and
+the next tick re-evaluates. The count and the enqueue are decided under one
+deployment-wide lock; a tick that meets another admission in progress answers
+`dream_admission_busy` and also re-evaluates next tick. All three are scheduling
+delays, not failures: they do not start backoff or advance the Dream ledger. An
+account whose last decision in the window was still `dream_concurrency_cap` or
+`dream_admission_busy` when the window closes records a content-free
+`memory.dream.window_missed` diagnostic event.
+
 In Runtime V2 chat, the model-facing `memory_organize` tool can force-enqueue a
 Dream run when the user explicitly asks to organize or consolidate their
-memories. It bypasses the automatic scheduler's night window, minimum interval,
-and new-material gates, but not Dream's deterministic exit gates and
+memories. It bypasses the automatic scheduler's night window, stagger offset,
+concurrency ceiling, minimum interval, and new-material gates, but not Dream's deterministic exit gates and
 soft-deletion safeguards.
 Repeated requests coalesce with an active Dream job. If the deployment-wide or
 user-level Dream switch is off, the tool returns an explainable disabled result.
@@ -190,9 +459,12 @@ not a generic service-wide rate limit.
 
 For new cards, datetime-valued `occurred_at` metadata is normalized to the same
 instant in UTC with a `Z` suffix. A date-only `YYYY-MM-DD` value remains
-date-only. The server stamps `created_at` in UTC with a `Z` suffix. Existing
-cards keep their stored timestamp strings when they are retyped, rewrapped, or
-otherwise updated; this does not backfill historical records.
+date-only. The server stamps `created_at` in UTC with a `Z` suffix, and memory
+actions stamp `updated_at` the same way (a new card's two stamps are the same
+instant). Existing cards keep their stored `occurred_at` and `created_at` strings
+when they are retyped, rewrapped, or otherwise updated; this does not backfill
+historical records, so older `updated_at` values may still lack an offset and are
+read as UTC.
 
 ```http
 HTTP/1.1 201 Created
@@ -221,8 +493,15 @@ Content-Type: application/json
 
 The server can generate `moment.id` if it is absent, but a stable unique
 client-generated ID is easier to reconcile after an ambiguous network failure.
-It is not an idempotency guarantee: posting the same payload again can append
-another record, and clients must not rely on the ID to deduplicate requests.
+An add never overwrites a stored card. Re-sending the exact same sealed envelope
+(same id, ciphertext, nonce and wrapped keys) returns `200` with the stored card
+and `replayed: true` and writes nothing. Any other envelope under an ID that is
+already stored — including the ID of a superseded or archived card — fails with
+`409 memory_id_conflict`, leaves the stored card unchanged, and echoes neither
+card. Sealing again produces a new nonce, so a retry must re-send the envelope it
+already built rather than re-encrypting. `memory.add` in `/v1/memory/actions`
+follows the same rule per item. Only the envelope is compared, so the ID is not a
+general request idempotency key.
 
 ## 2. Discover cards with the lightweight index
 
@@ -273,9 +552,39 @@ response's effective `limit` and `truncated` values.
 }
 ```
 
-The body currently accepts a `query` field for compatibility, but it is not used
-to perform semantic or lexical filtering. Do not present `/v1/memory/index` as a
-search endpoint. Select from the returned index in your client or agent.
+A nonblank `query` searches the existing readable summary/content/thread/bucket
+projection plus retrieval cues using **BM25** (`k1=1.2`, `b=0.75`, nonnegative
+IDF). A plaintext account's plaintext cards are ranked in the backend as one
+corpus with one set of statistics; sealed cards left from before plaintext
+storage are not part of that corpus. Otherwise, in the enclave, plaintext-tier and
+sealed cards share one corpus and one set of statistics. Exact `bucket` / `thread` filters select from that ranking;
+`limit` is applied only afterwards. Scores tie by `occurred_at` descending, then
+ID ascending. The existing per-item `score` remains importance/recency, **not**
+BM25. Full content, tokens, postings and BM25 scores are not added to the response.
+Final evidence selection still belongs to your client or agent.
+
+Query responses additionally carry `ranking: "memgarden-bm25-v2+tok:jieba-0.42.1"`
+and `unavailable_count` (candidate cards that could not be read, excluded from
+statistics; a plaintext account's sealed cards are not searched and not counted). The relevance gate's coverage check counts term rarity over at least
+20 cards, so a Garden with only a few cards still finds its answer. During a
+rolling upgrade a response may instead report
+`ranking: "memgarden-bm25-v1+tok:jieba-0.42.1"` (the same ranker with the coverage
+check over the real card count, which could return nothing in Gardens under ~20
+cards), `ranking: "bm25-jieba-0.42.1-v1"` (the previous enclave BM25 without
+stopwords or relevance gate) or `ranking: "substring-legacy"` (the old case-insensitive
+whole-query substring match and importance order). Authentication
+errors, timeouts, and unknown protocols do not silently fall back. Blank or
+omitted `query` retains the existing index browsing path; fetch is unchanged.
+
+Search is bounded to 4096 candidate cards, 32 MiB of encoded internal JSON request,
+and 16 MiB of searchable UTF-8 projection text. Crossing any bound fails the
+whole search with HTTP 413 `memory_search_resource_limit`; no partial-corpus rank
+or false empty result is returned. Reducing `limit` does not reduce the corpus.
+`FEEDLING_MEMORY_READSIDE_HARD_MAX` bounds result count and enclave decrypt chunks,
+not search corpus size. Within the bounds, a query's `truncated: false` means no
+candidate-window truncation, not that every match was returned or every card
+was decryptable; inspect `limit` and `unavailable_count`. These resource bounds
+are not a deployed latency guarantee.
 
 ## 3. Fetch selected content
 
@@ -324,6 +633,10 @@ known records that cannot be returned under some archive, supersession, or
 encryption rules. Compare requested IDs with returned item IDs and treat any
 unaccounted-for ID as not available.
 
+Fetching a card records the read in its `last_referenced_at` (UTC, `Z` suffix).
+A fetch does not change `updated_at`, so reading cards never makes the profile
+refresh witness look like a Garden change.
+
 ## 4. Apply a batch of memory actions
 
 After selecting with `index` and reading the necessary cards with `fetch`, use
@@ -341,6 +654,30 @@ batch returns HTTP `200`; skipped actions do not count as failures. Read every
 `results` entry and the batch `applied_count`, `skipped_count`, and
 `failed_count`; top-level `status` is `ok`, `partial`, or `failed`. Each result
 includes its own `http_status`.
+
+Each action may carry an `idempotency_key` (nonblank string, at most 160 Unicode
+characters). It is scoped to the authenticated user and applies to one action,
+not the whole batch or an HTTP header. Retrying the exact JSON action returns
+the original content-free receipt with `replayed: true` and no new effects;
+reusing its key with changed fields returns item-level
+`memory_idempotency_conflict` (409). Preserve the original envelope when
+retrying: newly encrypting it changes the request. Keys are optional for
+existing callers; imports use stable keys. Failed actions do not consume a key.
+Receipts retain only a request digest and non-content identifiers, not card text
+or the full original response. They remain after card deletion so retries cannot
+resurrect the card; account deletion removes them. Use a new key for a genuinely
+new operation, and fetch the card separately when you need its current contents.
+
+Plaintext action content may contain at most 5000 Unicode code points after
+outer whitespace is stripped (not bytes or model tokens). Oversize content
+returns `memory_content_too_long` with `actual_chars` and `max_chars`; nothing
+is silently shortened, and a rejected supersede leaves the old card unchanged.
+When tracing is enabled, `memory.content.rejected` records only the configured
+character limit and the route, never the rejected body or exception payload.
+This is IO's plaintext-write policy, not a MemGarden limit. Opaque prebuilt
+envelopes retain their existing compatibility path; stored historical long
+cards are returned whole by full fetch. Preview/model-context budgets remain
+separate.
 
 `source` and `capture_mode` are closed enums. Unknown values produce an
 item-level failure (`source_invalid` or `capture_mode_invalid`) rather than
@@ -360,9 +697,12 @@ replaced is unaffected: the rejection requires an internal-id-like hex string
 next to the phrase.
 
 A `memory.supersede` action accepts one source ID or an array of at most 20
-source IDs. An oversized array fails that action with
-`too_many_supersedes` before any card is changed; it is never truncated to a
-successful prefix. On success, `superseded_ids` lists the cards the mutation
+source IDs. A plaintext `memory` successor that omits `occurred_at` (or sends
+it empty) keeps the first source card's `occurred_at`, the same way it inherits
+bucket, threads, importance, and pulse; an explicit `occurred_at` still wins.
+An envelope successor must carry `occurred_at` itself. An oversized array fails
+that action with `too_many_supersedes` before any card is changed; it is never
+truncated to a successful prefix. On success, `superseded_ids` lists the cards the mutation
 actually retired rather than echoing the requested IDs. Every requested source
 must still be active when the mutation commits. If a source is already
 unavailable, the action fails with `supersede_targets_unavailable`; if one
@@ -565,21 +905,19 @@ or update details, and `effects` is the flattened change summary:
 }
 ```
 
-The batch is ordered but not transactional. Execution stops on the first failed
-action and returns that action's HTTP status. Earlier results and effects remain
-committed; they are included in the error response and are not rolled back.
-Split independent writes when partial completion would be hard to reconcile.
+The batch is ordered but not transactional; a failed item does not stop later
+items. Read every result as described above. Earlier successful items are not
+rolled back. Use the per-action replay key for retryable writes; the HTTP
+`Idempotency-Key` header is not supported. Without a replay identity, repeated
+plaintext adds create new cards even if their contents match. Prebuilt envelopes
+are validated from metadata and envelope shape without decrypting their body
+during the add, and exact sealed-card replays follow the ID rule in section 1.
 
-There is no `Idempotency-Key` support and the server does not scan existing
-cards for duplicate content. Every accepted add creates a new memory ID and
-emits a write effect, even when its title and content match an active card.
-Prebuilt envelopes are validated from their plaintext metadata and envelope
-shape without decrypting their body during the add. Read `index` or `fetch`,
-reconcile stable memory IDs, and construct a new batch instead of replaying the
-original blindly.
-
-`memory.upgrade` exists for controlled legacy migration, but it is not part of
-the public Memory workflow and should not be emitted by ordinary clients.
+`memory.upgrade` has been retired and returns HTTP 400 with
+`unsupported_memory_action`. The former `/v1/memory/legacy_batch` and
+`/v1/memory/migration_state` endpoints return HTTP 404. Existing cards with legacy
+`title`/`description` fields remain readable and recallable through the read-side
+adapters; they are not rewritten.
 
 ## Synchronize encrypted records
 
@@ -667,3 +1005,39 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   }
 }
 ```
+
+### Optional vector preparation
+
+The serve-worker contains a vector preparation pass that is disabled by
+default (`FEEDLING_MEMORY_EMBEDDING_ENABLED=0`; the test deployment enables it and
+ships the model weights inside the image). When explicitly enabled with a locally
+provisioned multilingual E5-small ONNX model, it scans active, shared plaintext
+cards in its memory-maintenance user set, encoding at most 32 changed or missing
+cards per user per tick. Encrypted cards are skipped. The application never
+downloads model files; a missing model or inference dependency leaves this pass
+unavailable without replacing vectors with synthetic values.
+
+Derived vectors are stored as little-endian float32 data in `memory_vectors`,
+scoped by user, card and model identity, with the text projection hash. Model
+identity includes the artifact digest, precision and IO projection version.
+Updated cards are re-encoded on a later scan; deleted, retired or private cards
+are pruned by that scan. Account deletion and reset remove the derived rows.
+The worker checks the current card projection again before saving an encoding.
+This preparation pass does not change search, and its batch size is not a
+latency guarantee.
+
+### Optional hybrid automatic recall
+
+Automatic context selection can additionally use these vectors. It is disabled
+by default (`FEEDLING_MEMORY_RECALL_HYBRID=0`) and, while disabled, selection is
+the lexical ranker described above with no change in output. When enabled, the
+enclave encodes the latest user message (and the two-message context when it
+differs) with the local model and fuses a cosine lane with the lexical lane by
+weighted reciprocal-rank fusion; a card qualifies through either lane, cards
+without a current vector are ranked lexically only, and the existing quotas,
+seat rules and fresh-card insertion are unchanged. The cosine threshold
+(`FEEDLING_MEMORY_RECALL_MIN_COSINE`) has no default: without a calibrated value
+the turn stays lexical. Any failure inside the per-turn budget
+(`FEEDLING_MEMORY_RECALL_HYBRID_BUDGET_MS`, default 2000) makes the whole turn
+use the lexical result, and the selection record's `hybrid` entry names the
+reason. `memory_search` and `memory_index` are unaffected.

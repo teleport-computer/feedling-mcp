@@ -21,12 +21,13 @@ import httpx
 import db
 import debug_trace
 import provider_client
-from core.store import get_store_shell_only
-from genesis import checkpoint, foreground, prompts, service
+from core.store import get_store_per_load_mode
+from genesis import checkpoint, prompts, service
 from genesis.llm_client import GenesisLLMClient
 from identity.user_naming import rewrite_user_reference
 from notices import catalog as notices_catalog, core as notices_core
 from model_api_runtime.v2 import profile as v2_profile
+from memgarden.text.card_text import extract_json_block
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
 AI_PERSONA_SOURCE_KINDS = {
@@ -828,6 +829,20 @@ def _fact_write_output_empty(output: dict) -> bool:
     return not str(output.get("relationship_anchor_evidence") or "").strip()
 
 
+def _profile_json_reply(text: str) -> str:
+    """The JSON object of the final profile reply, found the way memory cards find it (T750).
+
+    Only for the JSON request: map summaries are bullet text, and a bullet
+    such as ``- 偏好 {简短} 回复`` must not be cut down to ``{简短}``.
+
+    ``card_text.extract_json_block`` is the memory-card parser's extractor: it
+    drops inline ``<think>`` blocks first, so a relay thinking model's draft
+    object is not read as the answer. When it finds no object at all the
+    original text is passed on unchanged for profile.py to judge.
+    """
+    return extract_json_block(str(text or "")) or text
+
+
 def _complete_text(
     llm: GenesisLLMClient,
     *,
@@ -1303,45 +1318,6 @@ def build_reducer_output_from_texts(
     )
 
 
-def build_memory_output_from_fact_candidates(
-    *,
-    user_id: str,
-    job_id: str,
-    key_prefix: str | None = None,
-    runtime: provider_client.ProviderConfig,
-    fact_candidates: list[dict],
-    known_memories: list[str] | None = None,
-    llm: GenesisLLMClient | None = None,
-    keep_all: bool = False,
-    floor_note: str = "",
-    terms_note: str = "",
-    user_name: str = "",
-) -> dict:
-    """Run the Genesis fact_write step directly for already-mapped candidates.
-
-    Foreground v2 already has all fact candidates after fact_map. This helper lets
-    the route write the full memory set once, without re-mapping the transcript or
-    waiting for voice/persona.
-
-    keep_all (A): long-term-memory archive uploads — write the facts thoroughly rather
-    than filter for brevity. Default False keeps the normal (chat/onboarding) behavior.
-    """
-    llm = llm or GenesisLLMClient()
-    return _fact_write(
-        llm,
-        user_id=user_id,
-        job_id=job_id,
-        key_prefix=key_prefix,
-        runtime=runtime,
-        fact_candidates=[item for item in fact_candidates if isinstance(item, dict)],
-        known_memories=known_memories,
-        keep_all=keep_all,
-        floor_note=floor_note,
-        terms_note=terms_note,
-        user_name=user_name,
-    )
-
-
 def build_memory_recheck_from_material(
     *,
     user_id: str,
@@ -1356,8 +1332,8 @@ def build_memory_recheck_from_material(
     """VPS resident-only second pass: ask whether fact_write missed real memories.
 
     This helper is intentionally not called by the hosted/cloud Genesis flow. The
-    resident consumer can call it after ``build_memory_output_from_fact_candidates``
-    with the original plaintext material plus the just-written cards, then append
+    resident consumer can call it with the original plaintext material plus
+    the just-written cards, then append
     the returned ``memories`` if any. Empty is a valid "nothing missed" result.
     """
     if not str(material or "").strip():
@@ -1608,6 +1584,15 @@ def build_profile_output_from_sources(
         # JSON mode but not forced tool choice.  The shared profile prompt is
         # already strict JSON, so preserve JSON mode and intentionally ignore
         # the optional tool hint instead of rejecting the V2 call contract.
+        # Since T735 the shared final call carries its structure only in the
+        # forced ``emit_profile`` tool (some routes reject tool + JSON mode);
+        # dropping that tool here must bring JSON mode back, or Genesis would
+        # send neither.
+        # The final two-field request is the only one that carries the forced
+        # emit_profile tool; map requests return bullet text (T750).
+        json_request = bool(tools)
+        if tools and response_format is None:
+            response_format = {"type": "json_object"}
         del timeout, tools, tool_choice
         nonlocal call_number
         call_number += 1
@@ -1623,7 +1608,7 @@ def build_profile_output_from_sources(
             response_format=response_format,
             idempotency_key=f"{prefix}:profile:{call_number}",
         )
-        return {"reply": reply}
+        return {"reply": _profile_json_reply(reply) if json_request else reply}
 
     try:
         result = asyncio.run(v2_profile.generate_profile(
@@ -1696,163 +1681,6 @@ def _voice_candidate_from_combined_map(parsed: dict) -> dict:
     return {"behavior_notes_candidates": [], "exemplar_candidates": []}
 
 
-def build_foreground_output_from_texts(
-    *,
-    user_id: str,
-    job_id: str,
-    key_prefix: str | None = None,
-    runtime: provider_client.ProviderConfig,
-    chunk_texts: list[str],
-    source_kind: str = "history",
-    foreground_core_max: int = foreground.FOREGROUND_CORE_MAX,
-    llm: GenesisLLMClient | None = None,
-    write_core: bool = True,
-    include_voice_candidates: bool = False,
-    keep_all: bool = False,
-    user_name: str = "",
-    resume_map_outputs: dict[int, dict] | None = None,
-    on_map_completed: Callable[[int, dict], None] | None = None,
-) -> dict:
-    """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
-
-    fact_map over every chunk ONCE -> pick 3-5 core fact_candidates -> fact_write
-    ONLY those -> identity baseline. Deliberately NO voice_map/voice_reduce/persona
-    /full fact_write: those are the background's job. The returned dict carries the
-    SAME full fact_candidate list + the chosen core so the background partitions
-    against them (one extraction, shared candidates — never a second, divergent run).
-
-    Cache discipline: fact_map uses the SAME idempotency prefix as the background
-    reduce, so the two SHARE the cached extraction. fact_write uses a distinct
-    `:fg` prefix, so the foreground's core write never collides with the
-    background's fact_write batches.
-    """
-    llm = llm or GenesisLLMClient()
-    source_family = _source_family(source_kind)
-    shared_prefix = _idempotency_prefix(job_id, key_prefix)   # shared with background
-    fg_write_prefix = f"{shared_prefix}:fg"                   # distinct fact_write namespace
-
-    fact_candidates: list[dict] = []
-    voice_candidates: list[dict] = []
-    map_diagnostics: list[dict] = []
-    history_windows_total = 0
-    history_windows_failed = 0
-    for idx, text in enumerate(chunk_texts):
-        is_history = source_family == "history"
-        if is_history:
-            history_windows_total += 1
-        diagnostic_count_before = len(map_diagnostics)
-
-        def record_discarded(diagnostic: dict, *, chunk_index: int = idx) -> None:
-            if len(map_diagnostics) >= 6:
-                return
-            map_diagnostics.append({"chunk_index": chunk_index, **diagnostic})
-
-        try:
-            cached = (resume_map_outputs or {}).get(idx)
-            if keep_all and isinstance(cached, dict) and _fact_map_output_empty(cached):
-                _emit_map_discard_diagnostic(
-                    record_discarded,
-                    task_id=f"fact-map-{idx}",
-                    reason="empty_checkpoint_ignored",
-                    raw_output=json.dumps(cached, ensure_ascii=False, separators=(",", ":")),
-                )
-                cached = None
-            if isinstance(cached, dict):
-                facts = cached
-                if include_voice_candidates and is_history and genesis_combined_map_enabled():
-                    voice_candidates.append(_voice_candidate_from_combined_map(facts))
-            elif include_voice_candidates and is_history and genesis_combined_map_enabled():
-                facts = _complete_json_retry_empty(
-                    llm,
-                    user_id=user_id,
-                    job_id=job_id,
-                    task_id=f"combined-map-{idx}",
-                    runtime=runtime,
-                    messages=prompts.combined_map_messages(text, user_name=user_name),
-                    max_tokens=2400,
-                    idempotency_key=f"{shared_prefix}:combined_map:{idx}",
-                    is_empty=_combined_map_empty,
-                    empty_reason="empty_combined_map",
-                    on_discarded=record_discarded,
-                )
-                voice_candidates.append(_voice_candidate_from_combined_map(facts))
-            else:
-                facts = _complete_json_retry_empty(
-                    llm,
-                    user_id=user_id,
-                    job_id=job_id,
-                    task_id=f"fact-map-{idx}",
-                    runtime=runtime,
-                    messages=prompts.fact_map_messages(
-                        _source_tagged_fact_text(source_family, text),
-                        keep_all=keep_all,
-                        user_name=user_name,
-                    ),
-                    max_tokens=1800,
-                    idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
-                    is_empty=_fact_map_output_empty,
-                    empty_reason="empty_fact_candidates",
-                    on_discarded=record_discarded,
-                )
-            if (
-                cached is None
-                and on_map_completed is not None
-                and not (keep_all and _fact_map_output_empty(facts))
-            ):
-                on_map_completed(idx, facts)
-        except provider_client.ProviderError as e:
-            if provider_client.classify_provider_error(e) == "provider_config":
-                raise  # hard error (402/401/403/quota/key) -> caller aborts
-            if len(map_diagnostics) == diagnostic_count_before:
-                _emit_map_discard_diagnostic(
-                    record_discarded,
-                    task_id=f"fact-map-{idx}",
-                    reason=provider_client.classify_provider_error(e),
-                    raw_output="",
-                )
-            if is_history:
-                history_windows_failed += 1  # transient exhausted -> skip this chunk, keep going
-            continue
-        except GenesisWorkerError as e:
-            if len(map_diagnostics) == diagnostic_count_before:
-                _emit_map_discard_diagnostic(
-                    record_discarded,
-                    task_id=f"fact-map-{idx}",
-                    reason=_map_discard_reason(e),
-                    raw_output="",
-                )
-            if is_history:
-                history_windows_failed += 1
-            continue
-        if isinstance(facts.get("fact_candidates"), list):
-            fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
-
-    core = foreground.select_core_for_foreground(fact_candidates, max_n=foreground_core_max)
-    fact_write = _fact_write(
-        llm,
-        user_id=user_id,
-        job_id=job_id,
-        key_prefix=fg_write_prefix,   # distinct -> never collides with background fact_write
-        runtime=runtime,
-        fact_candidates=core,
-        user_name=user_name,
-    ) if write_core else {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
-    return {
-        "memories": fact_write.get("memories") or [],
-        "identity": fact_write.get("identity") or {"agent_name": "", "dimensions": []},
-        "source_kind": source_kind,
-        "source_family": source_family,
-        "foreground": True,
-        # handed to the background so it writes only the rest (structural dedup, Codex #1)
-        "all_fact_candidates": fact_candidates,
-        "core_fact_candidates": core,
-        "voice_candidates": voice_candidates,
-        "map_diagnostics": map_diagnostics,
-        "history_windows_total": history_windows_total,
-        "history_windows_failed": history_windows_failed,
-    }
-
-
 def derive_identity_from_persona(
     *,
     user_id: str,
@@ -1886,6 +1714,41 @@ def derive_identity_from_persona(
     return doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
 
 
+def derive_identity_from_memory_summary(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    material: str,
+    llm: GenesisLLMClient | None = None,
+    user_name: str = "",
+) -> dict:
+    """长期记忆档案里带出来的 TA 名字、认识天数、关系锚点证据。
+
+    切换前这三样是档案那次 fact_write 顺带产出的（5965e943 / 3fcfc2fc 的
+    ``_memory_summary_name_only``：只留名字，不留性格维度）。记忆卡换到 memgarden 导入会话
+    之后，那次调用不再发生；这里原样再跑一次同一个 fact_write（和
+    ``derive_identity_from_persona`` 对人设材料的做法一样），**卡丢掉、只取身份那几样**
+    —— 卡已经由导入会话写过了。一次模型调用。没有名字时返回 {}（从不编造）。"""
+    text = str(material or "").strip()
+    if not text:
+        return {}
+    llm = llm or GenesisLLMClient()
+    doc = _memory_summary_name_only(_fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=f"{_idempotency_prefix(job_id, key_prefix)}:memory_summary_identity",
+        runtime=runtime,
+        fact_candidates=[],
+        memory_summary=text,
+        user_name=user_name,
+    ))
+    return {key: doc[key] for key in ("identity", "days_with_user", "relationship_anchor_evidence")
+            if key in doc}
+
+
 def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
     try:
         resp = httpx.post(
@@ -1901,13 +1764,89 @@ def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output:
     return body if isinstance(body, dict) else {}
 
 
+def _garden_reducer_output(
+    store,
+    job_id: str,
+    *,
+    runtime: provider_client.ProviderConfig,
+    token: str,
+    chunk_texts: list[str],
+    source_kind: str,
+    existing_persona: dict,
+    existing_voice: dict,
+) -> tuple[dict, list[dict]]:
+    """加密分块导入的记忆卡：memgarden 导入会话（和 plaintext genesis、VPS 同一个引擎）。
+
+    之前 vs 之后：之前 fact_map → fact_write 产出卡和身份卡、交给 apply 路由一次写；
+    之后卡在这里一批一批写（runtime token 读已有卡、写 memory action），apply 路由只收
+    人设/语气/身份卡和「写了几张」。身份卡另走 ``foreground_identity`` 推导（只对聊天
+    记录 —— 用户档案/长期记忆档案本来就不该推出 TA 的身份）。
+
+    分块 worker 没有持久 checkpoint（一个 job 一口气跑完，崩了由回收整单重跑），进度只在内存。
+    """
+    from genesis import foreground_identity, import_engine
+    from hosted import history_import
+    from memory import garden_import
+
+    family = _source_family(source_kind)
+    joined = "\n".join(str(t or "") for t in chunk_texts)
+    warnings: list[str] = []
+    messages = history_import._parse_import_history_content(joined, "auto", warnings) if family == "history" else []
+    if not messages:
+        messages = [{"role": "user", "content": joined,
+                     "source": history_import._HISTORY_SOURCE if family == "history"
+                     else f"{family}_import"}]
+    locale = history_import._import_language_for_store(store, messages)
+    state = garden_import.new_state(locale=locale)
+    llm = GenesisLLMClient()
+    sources = [garden_import.ImportSource(
+        key=f"1:{family}", family=family,
+        windows=[t for t in chunk_texts if str(t or "").strip()])]
+    known = import_engine.existing_cards(store, None, runtime_token=token, job_id=job_id)
+    complete = import_engine.llm_complete(llm, user_id=str(store.user_id), job_id=job_id, runtime=runtime)
+    # 台账只包写库、outcome 按这次 run 的差值（Seven b0ef0c24 的口径，见 run_with_memory_ledger）。
+    result = import_engine.run_with_memory_ledger(
+        store, job_id, state,
+        lambda write: garden_import.run_import(
+            sources=sources, state=state, job_key=job_id, owner_key=str(store.user_id),
+            existing_cards=known, complete=complete, write=write, save=lambda _s: None),
+        import_engine.store_writer(store, None, runtime_token=token))
+    cards = [{k: v for k, v in c.items() if k not in {"id", "_source_family"}}
+             for c in (state.get("written") or [])]
+    output = _build_reducer_output(
+        user_id=str(store.user_id), job_id=job_id, runtime=runtime, chunk_texts=chunk_texts,
+        source_kind=source_kind, existing_persona=existing_persona, existing_voice=existing_voice,
+        include_memory=False, llm=llm,
+    ) if family == "history" else {
+        "source_kind": source_kind, "source_family": family,
+        "voice": {"behavior_notes_count": 0, "exemplar_count": 0, "founding_exemplar_count": 0},
+    }
+    output["memories"] = []
+    output["garden_import"] = {"cards_written": result.cards_written, "dropped": result.dropped}
+    if family == "memory_summary":
+        # 只上传长期记忆档案时，TA 的名字 / 认识天数 / 关系锚点照切换前从档案里带出来。
+        output.update(derive_identity_from_memory_summary(
+            user_id=str(store.user_id), job_id=job_id, runtime=runtime,
+            material=_joined_material(chunk_texts), llm=llm))
+    if family == "history":
+        # 切换前 fact_write 从消息时间跨度推「认识几天」；这里直接按解析出的时间戳算。
+        output["days_with_user"] = history_import._history_span_days(messages)
+        identity, id_warnings = foreground_identity.derive_foreground_identity(
+            runtime=runtime, analysis_messages=messages, core_memories=cards,
+            days_with_user=int(output["days_with_user"]), language=locale, max_attempts=1)
+        if foreground_identity.has_identity_signal(identity) and not any(
+                "provider_identity_failed" in str(w) for w in id_warnings):
+            output["identity"] = identity
+    return output, cards
+
+
 def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_token: Callable) -> dict:
     started_at = time.time()
     user_id = str(job.get("user_id") or "")
     job_id = str(job.get("job_id") or "")
     if not user_id or not job_id:
         raise GenesisWorkerError("invalid_claimed_job")
-    store = get_store_shell_only(
+    store = get_store_per_load_mode(
         user_id, reason="genesis state and tracing use direct DB/blob helpers"
     )
     _trace_genesis(
@@ -1945,17 +1884,29 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
     reducer_started_at = time.time()
     _trace_genesis(store, "genesis.worker.reducer.started", job_id=job_id,
                    summary="worker reducer started", detail={"chunk_count": len(chunk_texts)})
-    reducer_output = _build_reducer_output(
-        user_id=user_id,
-        job_id=job_id,
-        runtime=runtime,
-        chunk_texts=chunk_texts,
-        source_kind=str(job.get("source_kind") or "history"),
-        existing_persona=existing_persona,
-        existing_voice=existing_voice,
+    source_kind = str(job.get("source_kind") or "history")
+    if _source_family(source_kind) == "ai_persona":
+        # 人设材料不产出记忆卡（只推身份 + 人设），整段照旧。
+        reducer_output = _build_reducer_output(
+            user_id=user_id,
+            job_id=job_id,
+            runtime=runtime,
+            chunk_texts=chunk_texts,
+            source_kind=source_kind,
+            existing_persona=existing_persona,
+            existing_voice=existing_voice,
+        )
+        garden_cards: list[dict] | None = None
+    else:
+        reducer_output, garden_cards = _garden_reducer_output(
+            store, job_id, runtime=runtime, token=token, chunk_texts=chunk_texts,
+            source_kind=source_kind, existing_persona=existing_persona,
+            existing_voice=existing_voice)
+    profile_source = (
+        {**reducer_output, "memories": garden_cards} if garden_cards is not None else reducer_output
     )
     rendered_cards, _source_count, memory_material = (
-        service.render_genesis_profile_source(reducer_output)
+        service.render_genesis_profile_source(profile_source)
     )
     reducer_output.update(build_profile_output_from_sources(
         user_id=user_id,
@@ -2035,7 +1986,7 @@ def reap_stale_processing_jobs() -> list[dict]:
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
             continue
-        store = get_store_shell_only(
+        store = get_store_per_load_mode(
             user_id, reason="genesis reaper uses direct DB/blob helpers"
         )
         try:
@@ -2098,7 +2049,7 @@ def reclaim_orphaned_processing_jobs(live_worker_ids: list[str]) -> list[dict]:
         if not user_id or not job_id:
             continue
         action = str(job.get("_reclaim_action") or "failed")
-        store = get_store_shell_only(
+        store = get_store_per_load_mode(
             user_id, reason="genesis reclaim uses direct DB/blob helpers"
         )
         # requeued -> back to 'uploaded' (still importing); failed -> terminal.
@@ -2144,7 +2095,7 @@ def reap_stale_resident_jobs() -> list[dict]:
         if not user_id or not job_id:
             continue
         status = str(job.get("status") or "")
-        store = get_store_shell_only(
+        store = get_store_per_load_mode(
             user_id, reason="resident genesis reaper uses direct DB/blob helpers"
         )
         if status == "failed":
@@ -2215,7 +2166,7 @@ def reap_stale_unclaimed_jobs() -> list[dict]:
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
             continue
-        store = get_store_shell_only(
+        store = get_store_per_load_mode(
             user_id, reason="unclaimed genesis reaper uses direct DB/blob helpers"
         )
         try:
@@ -2279,7 +2230,7 @@ def tick(
         except Exception as e:  # noqa: BLE001
             failed += 1
             if user_id and job_id:
-                store = get_store_shell_only(
+                store = get_store_per_load_mode(
                     user_id,
                     reason="genesis failure handling uses direct DB/blob helpers",
                 )

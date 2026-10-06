@@ -32,6 +32,7 @@ import re
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -79,6 +80,25 @@ PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 PHASE2_VERBS = ("send", "wait-for-wake")
 
 _LAST_TOOL_OUTPUT = None
+
+# Only direct literal rejection codes from the resident's stage_file/stage_image
+# handlers are safe to copy into observability.  Those handlers also return
+# ``str(exc)`` for validation and filesystem errors; those values can contain a
+# user path or file name and must stay out of traces.
+_SAFE_ATTACHMENT_REJECTION_CODES = frozenset({
+    "request_id_required",
+    "path_required",
+    "no_active_chat_turn",
+    "path_outside_allowed_file_roots",
+    "file_not_found",
+    "wrong_file_suffix",
+    "file_source_must_be_utf8",
+    "chat_turn_finished",
+    "too_many_staged_files",
+    "path_outside_outbound_dir",
+    "too_many_staged_images",
+    "too_many_staged_attachments",
+})
 
 _MEMORY_BUCKET_CATEGORY = {
     "工作": "work", "work": "work",
@@ -164,6 +184,27 @@ def _materialize_decrypted_image(prefix, body):
     out.pop("image_b64", None)
     out["image_file"] = path
     out["image_hint"] = "Use the Read tool on image_file to view the pixels."
+    return out
+
+
+def _materialize_decrypted_image_bundle(prefix, body):
+    """Save every image in a decrypted chat bundle, or return None."""
+    if not isinstance(body, dict) or not isinstance(body.get("images"), list):
+        return None
+    images = body["images"]
+    if not images:
+        return None
+    materialized = []
+    for index, item in enumerate(images, start=1):
+        if not isinstance(item, dict):
+            return None
+        saved = _materialize_decrypted_image(f"{prefix}_{index}", item)
+        if not isinstance(saved, dict) or not saved.get("image_file"):
+            return None
+        materialized.append(saved)
+    out = dict(body)
+    out["images"] = materialized
+    out["image_count"] = len(materialized)
     return out
 
 
@@ -267,6 +308,16 @@ def _redacted_tool_args(args):
     return out
 
 
+def _attachment_trace_error_code(tool, output):
+    """Return a content-free reason for failed attachment staging."""
+    if tool not in {"send-file", "send-image"}:
+        return None
+    error = output.get("error") if isinstance(output, dict) else None
+    if isinstance(error, str) and error in _SAFE_ATTACHMENT_REJECTION_CODES:
+        return error
+    return "unclassified"
+
+
 def _emit_tool_trace(args, exit_code, dur_ms):
     """Best-effort per-tool trace. Never let observability affect tool output."""
     try:
@@ -284,6 +335,10 @@ def _emit_tool_trace(args, exit_code, dur_ms):
             "result_status": result_status,
             "dur_ms": rounded_ms,
         }
+        if result_status == "err":
+            error_code = _attachment_trace_error_code(tool, _LAST_TOOL_OUTPUT)
+            if error_code is not None:
+                detail["error_code"] = error_code
         _http_json(
             "POST",
             f"{api_url.rstrip('/')}/v1/debug/trace/event",
@@ -309,6 +364,40 @@ def _emit_tool_trace(args, exit_code, dur_ms):
 def _activity_tool_name(args):
     verb = str(getattr(args, "verb", "") or "").strip().lower()
     return verb.replace("-", "_")
+
+
+_TURN_LEDGER_TOOLS = ("memory-index", "memory-fetch")
+
+
+def _append_turn_ledger(args, exit_code):
+    """Append one content-free line per memory read call to the per-turn ledger.
+
+    The V1 consumer sets ``FEEDLING_TURN_LEDGER`` on the driver process for one
+    turn and reads the file back at turn end to build ``memory.recall.completed``
+    (T511). io_cli runs as a subprocess the consumer cannot observe, so this file
+    is the only reliable per-turn count of index/search/fetch calls. Only the
+    tool name and counts are written — never card text or ids. No env = not a
+    consumer turn (V2 / ad-hoc): do nothing. Best-effort: bookkeeping must never
+    change tool output or exit code.
+    """
+    try:
+        path = _env("FEEDLING_TURN_LEDGER")
+        verb = str(getattr(args, "verb", "") or "")
+        if not path or verb not in _TURN_LEDGER_TOOLS:
+            return
+        out = _LAST_TOOL_OUTPUT if isinstance(_LAST_TOOL_OUTPUT, dict) else {}
+        items = out.get("items")
+        rec = {
+            "tool": verb,
+            "query": bool(getattr(args, "query", None)) if verb == "memory-index" else False,
+            "exit": int(exit_code or 0),
+            "ok": bool(out.get("ok")) if out else False,
+            "items": len(items) if isinstance(items, list) else None,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a tool call
+        pass
 
 
 def _memory_activity_metadata(tool_name, output):
@@ -845,7 +934,7 @@ def cmd_photo_read(args):
 
 
 def cmd_chat_image(args):
-    """Pull ONE past chat message's decrypted image by id, saved as a Read-able file.
+    """Pull one past chat message's decrypted image(s) as Read-able files.
 
     Chat-history images are NOT reachable via ``photo-read`` (that command hits the
     perception photo library, not the chat feed). The recent-chat transcript that
@@ -878,6 +967,23 @@ def cmd_chat_image(args):
             "message_id": mid,
             "error": "message not found in recent history",
             "hint": f"only the {args.limit} most recent messages are searched; raise --limit if the image is older",
+        }, 1)
+    if isinstance(msg.get("images"), list):
+        out = _materialize_decrypted_image_bundle(f"chat_{mid}", msg)
+        if out is None:
+            _emit({
+                "ok": False,
+                "message_id": mid,
+                "error_code": "chat_image_bundle_unavailable",
+                "error": "chat image bundle is unavailable",
+            }, 1)
+        _emit({"ok": True, "message_id": mid, **out})
+    if msg.get("image_bundle_version") is not None:
+        _emit({
+            "ok": False,
+            "message_id": mid,
+            "error_code": "chat_image_bundle_unavailable",
+            "error": "chat image bundle is unavailable",
         }, 1)
     if not msg.get("image_b64"):
         _emit({
@@ -1294,14 +1400,15 @@ def _resident_ipc_home():
     /tmp file, not a directory) — this mirrors their exact fingerprint recipe
     (sha1(FEEDLING_API_KEY)[:10]) so io_cli and the consumer, given the same
     env, always agree on the socket path with zero operator configuration,
-    while still keeping co-hosted accounts on the same box from colliding on
-    one socket (the same cross-tenant concern IMAGE_TEMP_DIR's default guards
-    against)."""
+    for a self-hosted account. The fingerprint is a naming convention, not
+    an isolation boundary: hosted/keyless consumers require an explicitly
+    pinned per-user FEEDLING_HOME and OS access controls."""
     raw = _env("FEEDLING_HOME")
     if raw:
         return raw.rstrip("/")
     fp = hashlib.sha1((os.environ.get("FEEDLING_API_KEY") or "").encode()).hexdigest()[:10]
-    return f"/tmp/feedling_home_{fp}"
+    root = tempfile.gettempdir() if os.name == "nt" else "/tmp"
+    return os.path.join(root, f"feedling_home_{fp}")
 
 
 def _resident_ipc_sock_path():
@@ -1314,6 +1421,8 @@ def _resident_ipc_round_trip(sock_path, line, timeout):
     listening; socket.timeout = consumer alive but slow/stuck; other OSError =
     some other local IPC failure). Never touches the network itself — that
     happens consumer-side."""
+    if not hasattr(socket, "AF_UNIX"):
+        raise NotImplementedError("resident IPC requires socket.AF_UNIX")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
@@ -1337,6 +1446,16 @@ def _resident_ipc_round_trip(sock_path, line, timeout):
             pass
 
 
+def _resident_ipc_unsupported(request_id):
+    return {
+        "ok": False, "error": "ipc_unsupported", "request_id": request_id,
+        "hint": "This Python runtime has no AF_UNIX: identity-redistill, "
+                "send-file and send-image cannot use resident IPC. "
+                "Text replies use the consumer HTTP flow, not this socket. "
+                "No TCP fallback is enabled.",
+    }
+
+
 def _resident_ipc_request(material, *, timeout=30.0):
     """Round-trip one redistill request to the resident consumer's local IPC
     listener. Retries ONCE with the SAME request_id on timeout — the consumer
@@ -1356,6 +1475,8 @@ def _resident_ipc_request(material, *, timeout=30.0):
         """(reply_dict_or_None, should_retry). None body ⇒ caller may retry."""
         try:
             raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except NotImplementedError:
+            return _resident_ipc_unsupported(request_id), False
         except (FileNotFoundError, ConnectionRefusedError):
             return {
                 "ok": False, "error": "consumer_not_running", "request_id": request_id,
@@ -1409,6 +1530,8 @@ def _resident_ipc_call(op, payload, *, timeout=30.0):
     def _attempt():
         try:
             raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except NotImplementedError:
+            return _resident_ipc_unsupported(request_id), False
         except (FileNotFoundError, ConnectionRefusedError):
             return {
                 "ok": False,
@@ -2321,6 +2444,7 @@ def main():
             exit_code=exit_code,
         )
         _emit_tool_trace(args, exit_code, duration_ms)
+        _append_turn_ledger(args, exit_code)
 
 
 if __name__ == "__main__":

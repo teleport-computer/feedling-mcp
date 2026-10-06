@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from memory.capture_prompt_v1 import (  # noqa: E402
+from _memgarden_prompt_bindings import (  # noqa: E402
     build_capture_retry_prompt,
     parse_capture_cards,
 )
@@ -37,7 +37,7 @@ from memory.card_leak_signals import IO_LEAK_SIGNALS  # noqa: E402
 # 悄悄测了通用集，而通用集本来就拦不住 io 的残片，测了等于没测。
 card_text_rejection = partial(_kernel_card_text_rejection, signals=IO_LEAK_SIGNALS)
 sanitize_card_labels = partial(_kernel_sanitize_card_labels, signals=IO_LEAK_SIGNALS)
-from memory.dream_prompt_v1 import (  # noqa: E402
+from _memgarden_prompt_bindings import (  # noqa: E402
     build_dream_prompt as _kernel_build_dream_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,

@@ -18,7 +18,7 @@ import os
 import re
 import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Callable, Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chat.reply_language import infer_reply_language, local_time_labels
@@ -64,7 +64,8 @@ AGENT_MEMORY_HEADER = (
     "# 你的记忆\n"
     "你们之间的人、事、约定,你记住的都在这里。\n"
     "像人回忆那样用:该想起时自然带出,不用当清单念。\n"
-    "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。"
+    "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。\n"
+    "涉及具体的人、物、编号、约定,先查再答;查不到就说没记住。"
 )
 USER_PROFILE_HEADER = (
     "# 说话的分寸\n"
@@ -84,6 +85,33 @@ IDENTITY_CARD_RENDER_FIELDS = tuple(dict.fromkeys((
 )))
 
 
+_IDENTITY_CARD_SUBSTANTIVE_FIELDS = tuple(dict.fromkeys((
+    *card_policy.PROFILE_STRING_FIELDS,
+    *card_policy.PROFILE_LIST_FIELDS,
+    "dimensions",
+)))
+
+
+def identity_card_has_substance(card: dict) -> bool:
+    """Ignore empty/default card scaffolding when choosing card over persona."""
+
+    for key in _IDENTITY_CARD_SUBSTANTIVE_FIELDS:
+        value = card.get(key)
+        if key == "agent_name" and str(value or "").strip() == "TA":
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return True
+            continue
+        if isinstance(value, (list, tuple, dict, set)):
+            if value:
+                return True
+            continue
+        if value is not None:
+            return True
+    return False
+
+
 def render_identity_card(card: dict[str, Any]) -> str:
     """Render decrypted card values without inventing prose around them."""
 
@@ -92,7 +120,10 @@ def render_identity_card(card: dict[str, Any]) -> str:
         if key not in card:
             continue
         value = card[key]
-        if value is None or value == "" or value == []:
+        # An empty dimensions list is actionable state: the model needs to see
+        # that there is no existing dimension to nudge. Other empty profile
+        # fields remain omitted so the identity card does not become noise.
+        if value is None or value == "" or (value == [] and key != "dimensions"):
             continue
         lines.append(
             f"{key}: {json.dumps(value, ensure_ascii=False, separators=(',', ':'))}"
@@ -231,8 +262,11 @@ _CHAT_REPLY_POLICY = (
 )
 
 _CHAT_MEMORY_EVIDENCE_POLICY = (
-    "只把搜到的相关记忆当作依据。没搜到相关记忆就直说；别拿无关偏好或事件冒充这个"
-    "问题的答案。"
+    "涉及具体事实(编号、数字、日期、地点、人名、约定、东西放在哪、上面写着什么)，"
+    "只能说记忆卡、「相关记忆」块或 memory_search/memory_fetch 结果里写着的内容。"
+    "没有这些支撑就先去查；查了还没有，就直说不记得、请对方告诉你。"
+    "不要顺着话头猜一个像样的值，也不要往记忆里补它没写的细节(颜色、场景、次数、时间)。"
+    "不确定就说不确定。也别拿无关偏好或事件冒充这个问题的答案。"
 )
 
 _CHAT_MEMORY_POLICY = _join_policy_blocks(
@@ -319,17 +353,32 @@ def _supports_mandatory_self_thinking(provider_config: Any) -> bool:
     return model.rsplit("/", 1)[-1] != "claude-fable-5"
 
 
-def chat_system_prompt(provider_config: Any = None) -> str:
+# Route → protocol tag lives in agent_protocol_core.self_thinking (shared
+# with the resident V1 consumer and the V2 tool loop) so all three cannot drift.
+_ASIDE_TAG_PROVIDERS = self_thinking.ASIDE_TAG_PROVIDERS
+
+
+def self_thinking_tag(provider_config: Any = None) -> str:
+    """Protocol tag for the self-authored aside block of one V2 provider config."""
+    return self_thinking.tag_for_route(
+        getattr(provider_config, "provider", ""),
+        getattr(provider_config, "model", ""),
+    )
+
+
+def chat_system_prompt(
+    provider_config: Any = None, *, language: str | None = None,
+) -> str:
     """Return the topic-grouped foreground policy for the selected V2 model.
 
-    The shared self-thinking instruction remains byte-identical and atomic. It
-    sits beside the reply rules it governs rather than after unrelated memory,
-    screen, file, reminder, and identity policies.
+    The shared self-thinking instruction remains atomic (one rendering, chosen
+    by ``self_thinking_tag``). It sits beside the reply rules it governs rather
+    than after unrelated memory, screen, file, reminder, and identity policies.
     """
     if self_thinking.enabled() and _supports_mandatory_self_thinking(provider_config):
         return _join_policy_blocks(
             _CHAT_REPLY_POLICY,
-            self_thinking.INSTRUCTION,
+            self_thinking.instruction_for_field(language=language),
             _CHAT_POLICY_AFTER_THINKING,
         )
     return CHAT_SYSTEM_PROMPT
@@ -614,6 +663,7 @@ def build_turn_messages(
     trusted_system_blocks: Sequence[str] = (),
     agent_memory: str = "",
     user_profile: str = "",
+    related_memories: str = "",
     worldbook_context: str = "",
     worldbook_context_char_cap: int = WORLD_BOOK_CONTEXT_CHAR_CAP,
     coverage_hole_notice: str = "",
@@ -622,7 +672,10 @@ def build_turn_messages(
     proactive_turn_boundary: bool = False,
     manual_wake: bool = False,
     screen_frame_message: dict[str, Any] | None = None,
+    on_tail_message: Callable[[dict, dict], None] | None = None,
 ) -> list[dict]:
+    """``on_tail_message(row, message)`` sees each conversation row next to the
+    message object rendered for it (T768 caption delivery observation)."""
     if application_data_role not in {"user", "assistant"}:
         raise ValueError("application_data_role must be user or assistant")
     has_runtime_context = bool(
@@ -647,6 +700,11 @@ def build_turn_messages(
     trusted_parts.extend((system_prompt, _RUNTIME_CONTEXT_POLICY))
     trusted_system = "\n\n".join(trusted_parts).strip()
     messages: list[dict] = [{"role": "system", "content": trusted_system}]
+
+    # Retrieved cards are data, not durable privileged instructions. Keep this
+    # per-turn block after profile/system context and before conversation replay.
+    if related_memories:
+        messages.append({"role": application_data_role, "content": related_memories})
 
     bounded_worldbook = bound_worldbook_context(
         worldbook_context,
@@ -695,6 +753,8 @@ def build_turn_messages(
             messages.append({"role": application_data_role, "content": content})
             continue
         messages.append({"role": _norm_role(m.get("role")), "content": content})
+        if on_tail_message is not None:
+            on_tail_message(m, messages[-1])
 
     if coverage_hole_notice.strip():
         messages.append({

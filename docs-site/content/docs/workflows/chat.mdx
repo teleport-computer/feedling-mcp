@@ -17,6 +17,23 @@ the assistant ciphertext is already available. It never returns a plaintext
 assistant reply.
 
 An IO Canvas card may outlive the Chat attachment that first published it.
+Authenticated clients should build the Canvas library from
+`GET /v1/chat/canvases`, which combines the caller's workspace index with
+agent-authored Chat file cards, including Resident and self-hosted deliveries.
+The response contains at most 500 metadata-only entries ordered by `updated_at`
+descending after combining both sources. The `.io.html` suffix match is
+case-insensitive; filenames retain their original case. Workspace entries take
+precedence for identical filenames and keep their revision, MIME type and
+timestamps. Their newest matching Chat card contributes `message_id`,
+`display_title` and `display_subtitle`; these fields are `null` if no card remains.
+
+Chat-only entries use revision `1` and MIME type `text/html`. Each filename's
+first card timestamp becomes `created_at`, while its newest card supplies
+`updated_at`, `message_id` and display metadata. Read these entries through
+`GET /v1/chat/messages/{message_id}/body`. Historical cards are visible without
+a backfill or body copies; deleting their Chat rows removes them from this
+source. Canvas bodies and envelopes never appear in the listing.
+
 Authenticated clients can read the current Canvas source with
 `GET /v1/chat/workspace/body?filename=<original-file_name>`. The endpoint accepts
 only the original `.io.html` basename from the Chat row, derives the private
@@ -210,8 +227,11 @@ model cannot accept images.
 
 When a dedicated route is configured, IO records that exact route before the
 image turn is stored. Runtime V2 or the official resident then sends pixels only
-to that route, asks for a neutral visual observation, marks the result as
-untrusted data, and passes only that text to the main agent. The narrow recovery
+to that route, asks for a neutral visual observation, and passes only that text
+to the main agent. Runtime V2 presents it as labelled text (`Image 1:`,
+`Image 2:`, …) followed by the message the user sent with the images, marked as
+the user's own words; the official resident continues to mark the observation as
+untrusted data. The narrow recovery
 path above receives no additional time budget: the dedicated observation and
 every main-model recovery attempt share one monotonic absolute deadline. If a
 batch contains both successful observations and eligible failures, successful
@@ -474,7 +494,70 @@ be presented as missing configuration.
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below
 the final reply. A separately encrypted `thinking_*` envelope remains the only
-source for display-safe reasoning and must not be merged with tool activity.
+source for the optional persona aside and must not be merged with tool activity.
+
+Runtime V2 chat and wake turns share `reply(aside, text)`: `text` is required,
+while `aside` is optional. The aside is sealed separately with
+`thinking_kind: agent_summary`, `thinking_source: self_thinking`, and
+`thinking_native: false`. A usable reply without an aside is delivered without
+an aside-format correction retry. Chat and scheduled turns also accept usable
+direct text. Non-scheduled wake turns still require an explicit `reply` or
+`stay_silent` decision; unstructured text alone does not publish a bubble. On
+both the chat and wake lanes an aside the model did not write displays
+nothing. A malformed inline thinking block whose reply text could still be
+recovered is dropped silently on its own — the reply is delivered, and if the
+model separately supplied an aside through `reply(aside, text)` that aside
+still displays normally; only when there is no displayable aside at all does
+the thinking area stay empty. `（思考没写完）` is shown only for an aside that
+existed and had to be withheld: one carrying an internal identifier, or a
+chat reply whose text could not be told apart from its thinking at all
+(delivered as the honest fallback bubble; the wake lane instead ends that turn
+silently or fails it, never with a marker).
+
+When a non-scheduled wake produces text without a tool call, the text is held as
+an unpublished draft. If the existing turn budget permits, the model gets at
+most one correction request to call `reply(aside, text)` or `stay_silent`.
+A second unstructured answer fails silently with `choice_invalid`; the draft
+itself is never published. Scheduled reminders and chat keep their direct-text
+behavior. The content-free `wake.direct_text_correction` trace records
+`direct_text_seen`, `corrected_to_reply`, `corrected_to_silent`, or `still_invalid`.
+These describe model decisions, not proof of delivery: selected replies still
+pass the existing content and effect checks. Wake language-follow uses prompt
+guidance and post-publication observation, not a blocking language check.
+
+
+Resident V1 asks its model for the aside as a leading `<aside>` block on every
+driver and route. In foreground chat the reply that follows the block is plain
+text:
+
+```text
+<aside>I want to pick up where we left off.</aside>How did it go?
+```
+
+Foreground replies may still use the JSON envelope for multi-bubble replies.
+Heartbeat, perception, and screen-watch wakes keep their existing reply
+shapes — `{"messages": [...]}` to speak, `{"actions": [{"type":
+"proactive.sleep", ...}]}` to stay quiet. Scheduled reminders keep their own
+rule: they must deliver one `{"messages": [...]}` bubble and never stay quiet.
+On all four wake lanes the optional `<aside>` block is written before the
+JSON. The envelope's `aside` field is also accepted on every lane:
+
+```json
+{"aside": "I want to pick up where we left off.", "messages": ["How did it go?"]}
+```
+
+Foreground prose is deliberately kept outside JSON strings on this runtime:
+CLI models write their reply by hand, and a reply typed inside a JSON string
+breaks on unescaped quotes or line breaks. A `<aside>` block whose following
+body fails the leak gate does not become an aside-only success; the turn
+fails as before and the diagnostic is kept. Resident asides are sanitized and limited to
+700 characters. Provider-native reasoning never becomes a display summary;
+only a tag block parsed locally by the resident, or the JSON `aside` field, does.
+Historical native-reasoning rows remain readable. The tag leak gate still
+strips inline blocks before delivery.
+A resident can recover a complete `messages`/`aside` envelope from an unclosed
+final thinking block; free text, ambiguous JSON, and envelopes containing
+executable actions or tool calls are not recovered.
 
 ## Independent resident loop
 
@@ -617,11 +700,14 @@ stored.
 }
 ```
 
-To send **text alongside an image or file** (a caption), encrypt that text as its
-own envelope and pass it as `caption_envelope` — the same E2E `EncryptedEnvelope`
-shape as the main `envelope`, wrapped to the enclave (`K_enclave`) so it can be
-decrypted into the message's plaintext content. Without it, an image/file message
-carries no accompanying text and the agent sees only the attachment.
+To send **text alongside an image or file** (a caption), pass that text as its
+own `caption_envelope`. When `content_encryption_effective` is `on`, this uses
+`EncryptedEnvelope`, wrapped to the enclave (`K_enclave`). When it is `off`,
+it uses the plaintext text-envelope shape (`body`). With the deployment gate
+enabled, every known account uses `off`, including legacy stored `on` accounts. Both read paths fold the caption into the message's
+plaintext `content`, including on mixed-history pages. Without a caption envelope,
+an image/file message carries no accompanying text and the agent sees only the
+attachment.
 
 ```json
 {
@@ -774,12 +860,23 @@ continuous for 30 minutes before it can inject a repair turn; operators can
 change this persistence window with
 `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC`.
 
-`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row.
+`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row
+unless the `only_if_unverified` short-circuit described below applies.
 The resident's hidden ack must post `source: "verify_ping"` and set
 `reply_to_message_id` to that exact ping ID. An unrelated or stale agent reply
 does not satisfy the probe. The verify response distinguishes `loop_alive`
 (the exact ack arrived) from `passing` (the ack arrived and decrypt policy also
 allows verification); only `passing: true` records the sticky live-loop green.
+
+An automated caller whose only purpose is opening that gate can send
+`only_if_unverified: true`. When the server already holds a sticky live-loop
+verification for the user, it inserts no ping, takes no liveness measurement,
+and answers `passing: true, already_verified: true` with `loop_alive: null`,
+`response_time_sec: null`, and an empty `ping_id` — `passing` then reflects the
+persisted gate, not a fresh exact-ack observation. An unverified user, or any
+value other than the JSON literal `true`, runs the ordinary probe.
+The hosted runner supervisor sends this flag so a runtime restart does not
+re-probe every resident with a real model call on the user's own key.
 
 If a self-hosted resident consumer appears stale while it is still polling, the
 server may claimably inject a user-role maintenance message with
@@ -880,6 +977,12 @@ reply is linked through `reply_to_message_id` and carries
 `turn_failure_user_text`. Provider-configuration failures use actionable text
 from the shared error catalog; transient provider and system failures use the
 standard retry-later fallback while preserving the classified metadata.
+The retry-later fallback is written in the language of the words the user typed
+in that turn, or the caption of an image or file (Chinese when they contain Han
+characters, English when they contain a Latin word); attachment contents never
+count. A message without either signal, an attachment without a caption, or a
+legacy encrypted message falls back to the account language; catalog texts
+keep using the account language.
 If the main model explicitly rejects image input, the failure is classified as
 `vision_model_required`, allowing clients to direct the user to add or select a
 vision-capable model instead of presenting the generic retry-later fallback.

@@ -147,7 +147,7 @@ X-Admin-Token: <FEEDLING_ADMIN_TOKEN>
 ```
 （也接受 `Authorization: Bearer <token>` 或 `?admin_key=<token>`。）
 
-记忆诊断可用 `GET /v1/admin/users/{user_id}/memory-card-metadata` 分页读取逐卡时间与替代关系元数据，并用 `GET /v1/admin/memory-dream-jobs` 分页读取 dream job 的耗时、失败码和 provider/model 标签；`failure_code_provenance` 用 `explicit` / `missing` / `normalized_invalid` 区分显式失败码、缺值和被归一为 `runtime_failed` 的非法值，手工投影未携带来源时显式标为 `unmeasured`，不从失败码反推。其中 `duration_ms` 是 `finished_at - coalesce(started_at, claimed_at, created_at)` 的处理墙钟，`memory_card_count_now` 是查询时当前卡片总数而非该 job 当时的输入量，两者均不返回 prompt、回复或记忆正文。
+记忆诊断可用 `GET /v1/admin/users/{user_id}/memory-card-metadata` 分页读取逐卡时间与替代关系元数据，并用 `GET /v1/admin/memory-dream-jobs` 分页读取 dream job 的耗时、失败码和 provider/model 标签；`failure_code_provenance` 用 `explicit` / `missing` / `normalized_invalid` 区分显式失败码、缺值和被归一为 `runtime_failed` 的非法值，手工投影未携带来源时显式标为 `unmeasured`，不从失败码反推。`status=completed` 的 job 还要看 `outcome`：`skipped`（配 `outcome_reason`，目前只有 `not_enough_new_cards`）表示 job 跑了但记忆内核判定花园卡数不足、没有调用模型、没有整理任何卡，**不能计为一次成功的整理**；空字符串才是真正跑过的整理（含模型选择不整理的 noop）。其中 `duration_ms` 是 `finished_at - coalesce(started_at, claimed_at, created_at)` 的处理墙钟，`memory_card_count_now` 是查询时当前卡片总数而非该 job 当时的输入量，两者均不返回 prompt、回复或记忆正文。
 
 ### 响应 `200`
 

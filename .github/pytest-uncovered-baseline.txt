@@ -8,10 +8,7 @@ tests/test_agent_runtime_discovery.py
 tests/test_agent_runtime_genesis_gate.py
 tests/test_agent_runtime_leases.py
 tests/test_agent_runtime_resolve_cache.py
-tests/test_agent_runtime_supervisor.py
 tests/test_ai_msg_live_activity_gate.py
-tests/test_api_errors_doc.py
-tests/test_asgi_accounts_remaining.py
 tests/test_asgi_agent.py
 tests/test_asgi_bootstrap_post.py
 tests/test_asgi_client_disconnect.py
@@ -25,7 +22,6 @@ tests/test_asgi_hosted_chat_send.py
 tests/test_asgi_hosted_import_validation.py
 tests/test_asgi_hosted_setup.py
 tests/test_asgi_json_content_type.py
-tests/test_asgi_lifespan_loads_users.py
 tests/test_asgi_onboarding_archive.py
 tests/test_asgi_poll_native.py
 tests/test_asgi_proactive_remaining.py
@@ -41,7 +37,6 @@ tests/test_backfill_frames.py
 tests/test_bootstrap_gate_host_route.py
 tests/test_bootstrap_gates.py
 tests/test_bootstrap_status_verify_ping.py
-tests/test_branch_flow_guard.py
 tests/test_bucket_lang_normalize.py
 tests/test_bucket_language_normalize.py
 tests/test_capabilities_registry.py
@@ -50,7 +45,6 @@ tests/test_capability_html_extract.py
 tests/test_capability_wake.py
 tests/test_capture_daily.py
 tests/test_capture_dream_submit_seam.py
-tests/test_capture_failure_backoff.py
 tests/test_capture_source_whitelists_agree.py
 tests/test_card_guard.py
 tests/test_chat_core_file_ingest.py
@@ -70,7 +64,6 @@ tests/test_chat_skipped_message_never_redelivered.py
 tests/test_chat_system_notice_role.py
 tests/test_chat_turn_activity_unit.py
 tests/test_chat_turn_activity_v2.py
-tests/test_chat_turn_failure_fields.py
 tests/test_consumer_state_cas.py
 tests/test_copytext.py
 tests/test_dau_snapshot_scheduler.py
@@ -78,27 +71,21 @@ tests/test_debug_trace_atomic.py
 tests/test_debug_trace_event_route.py
 tests/test_deploy_canary.py
 tests/test_diagnostics_routes.py
-tests/test_dream_card_render_bucket.py
 tests/test_dream_status.py
 tests/test_e2b_template_contract.py
-tests/test_e2e_deep_claude.py
 tests/test_error_slug_convergence.py
 tests/test_exception_handlers.py
 tests/test_expected_consumer_commit.py
 tests/test_file_text.py
 tests/test_gen_url_map.py
 tests/test_generated_image.py
-tests/test_genesis_checkpoint.py
 tests/test_genesis_daemon.py
 tests/test_genesis_daemon_reclaim.py
-tests/test_genesis_dedup.py
 tests/test_genesis_deploy_orphan_p0.py
 tests/test_genesis_distill_acceptance.py
 tests/test_genesis_distill_mode.py
 tests/test_genesis_failure_codes.py
 tests/test_genesis_floor_note.py
-tests/test_genesis_foreground.py
-tests/test_genesis_foreground_worker.py
 tests/test_genesis_keep_all.py
 tests/test_genesis_llm_client.py
 tests/test_genesis_prompts.py
@@ -110,7 +97,6 @@ tests/test_genesis_resident_upload.py
 tests/test_genesis_service.py
 tests/test_genesis_terms_note.py
 tests/test_genesis_unclaimed_reaper.py
-tests/test_genesis_v2_e2e.py
 tests/test_genesis_worker_claim.py
 tests/test_genesis_worker_claim_migration.py
 tests/test_gunicorn_conf.py
@@ -135,7 +121,6 @@ tests/test_loadtest_harness_smoke.py
 tests/test_loadtest_mock_provider.py
 tests/test_log_trim_caps.py
 tests/test_mcp_ca_fetch.py
-tests/test_mcp_core_codex_cert_warning.py
 tests/test_model_api_file_payload.py
 tests/test_model_api_models_route.py
 tests/test_model_api_path.py
@@ -202,7 +187,6 @@ tests/test_users_reload_targeted.py
 tests/test_v2_admission.py
 tests/test_v2_bounded_tail_degrade.py
 tests/test_v2_capacity_health.py
-tests/test_v2_capture_lifecycle.py
 tests/test_v2_chat_clear_fence.py
 tests/test_v2_child_supervisor.py
 tests/test_v2_claim_reservation.py
@@ -210,7 +194,6 @@ tests/test_v2_claim_roundtrips.py
 tests/test_v2_coalesce.py
 tests/test_v2_cursor.py
 tests/test_v2_dependency_direction.py
-tests/test_v2_downloadable_files.py
 tests/test_v2_e2b_template_extractor.py
 tests/test_v2_effect_enqueue.py
 tests/test_v2_effect_id.py
@@ -221,8 +204,6 @@ tests/test_v2_gc_coverage_gate.py
 tests/test_v2_history_readside.py
 tests/test_v2_history_search_store.py
 tests/test_v2_history_search_unit.py
-tests/test_v2_history_tools.py
-tests/test_v2_image_generation_guidance.py
 tests/test_v2_kill_switch.py
 tests/test_v2_kill_switch_web.py
 tests/test_v2_live_genesis_workers.py
@@ -234,7 +215,6 @@ tests/test_v2_optional_anchor.py
 tests/test_v2_p0_aba.py
 tests/test_v2_p0_exactly_once.py
 tests/test_v2_p0_seq_integrity.py
-tests/test_v2_profile.py
 tests/test_v2_profile_cards.py
 tests/test_v2_prompt_invariant.py
 tests/test_v2_provenance.py

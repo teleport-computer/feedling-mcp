@@ -13,8 +13,13 @@ branch_labels = None
 depends_on = None
 
 
+# The RDS 0077 migration creates this byte-identical table under a separate
+# alembic_version chain. A database first initialized as RDS and later promoted
+# to TEE can therefore have the table while alembic_tee_version is still at
+# 0010. Adopt that known-equivalent table so Alembic can transactionally record
+# this revision instead of failing every startup with DuplicateTable.
 _UP = """
-CREATE TABLE perception_signal_state_v2 (
+CREATE TABLE IF NOT EXISTS perception_signal_state_v2 (
     user_id TEXT NOT NULL,
     signal TEXT NOT NULL,
     value_fingerprint TEXT NOT NULL,
@@ -34,4 +39,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP TABLE perception_signal_state_v2")
+    op.execute("DROP TABLE IF EXISTS perception_signal_state_v2")

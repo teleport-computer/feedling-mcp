@@ -226,10 +226,11 @@ def test_report_v2_ingress_forwards_api_key_to_enclave_no_inprocess_plaintext(en
 
     enclave_calls: list = []
 
-    def _fake_enclave_decrypt(envelope, api_key, *, purpose):
+    def _fake_enclave_decrypt(envelope, api_key, *, purpose, caller_user_id):
         # Assert the server handed the enclave the opaque ciphertext, never plaintext.
         assert envelope.get("body_ct") == "CIPHER"
         enclave_calls.append({"api_key": api_key, "purpose": purpose,
+                              "caller_user_id": caller_user_id,
                               "id": envelope.get("id")})
         return json.dumps({"values": {"motion_state": {"state": "walking"}},
                            "message": "from-enclave"}).encode("utf-8")
@@ -248,6 +249,7 @@ def test_report_v2_ingress_forwards_api_key_to_enclave_no_inprocess_plaintext(en
     # / ASGI auth.api_key both resolve to API_KEY here).
     assert [c["api_key"] for c in enclave_calls] == [API_KEY, API_KEY]
     assert all(c["purpose"] == "perception:motion_state" for c in enclave_calls)
+    assert all(c["caller_user_id"] == UID for c in enclave_calls)
     # The stored plaintext came ONLY from the stubbed enclave — not built in-process.
     assert fake.get_state(UID)["motion_state"]["v"] == {"state": "walking"}
     assert fake.get_state(UID)["motion_state"]["msg"] == "from-enclave"

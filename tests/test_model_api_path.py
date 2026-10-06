@@ -95,6 +95,22 @@ def _wait_history_import_job(client, api_key: str, job_id: str, timeout: float =
     raise AssertionError(f"history import job did not finish: {last_job}")
 
 
+def _garden_import_reply(joined: str, cards: list[tuple[str, str]]) -> dict | None:
+    """历史导入走 memgarden 导入会话（两段式：先抽候选、再写卡）。按提示词的输出约定
+    认出是哪一步，回对应形状；不是导入提示词返回 None。"""
+    if '{"candidates": []}' in joined:
+        return {"reply": json.dumps({"candidates": [
+            {"about": "person", "summary": summary, "evidence": summary, "occurred_at": "2026-05-31"}
+            for summary, _content in cards]}, ensure_ascii=False), "usage": {}}
+    if '{"cards": []}' in joined:
+        return {"reply": json.dumps({"cards": [
+            {"action": "add", "type": "fact", "bucket": "偏好与边界", "threads": [],
+             "summary": summary, "content": content, "importance": 0.6, "pulse": 0.3,
+             "occurred_at": "2026-05-31"}
+            for summary, content in cards]}, ensure_ascii=False), "usage": {}}
+    return None
+
+
 def _identity_payload() -> dict:
     names = ["Attentive", "Steady", "Playful", "Protective", "Curious", "Direct", "Tender"]
     return {
@@ -891,7 +907,7 @@ def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypa
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-existing",
+        lambda envelope, key, purpose, caller_user_id: b"sk-existing",
     )
     update = client.post(
         "/v1/model_api/setup",
@@ -938,21 +954,17 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
-            return {
-                "reply": (
-                    '{"memories":['
-                    '{"type":"moment","title":"First import moment","description":"User shared a concrete concern.","occurred_at":"2026-05-31"},'
-                    '{"type":"fact","title":"User preference","description":"User prefers direct answers.","occurred_at":"2026-05-31"}'
-                    "]}"
-                ),
-                "usage": {},
-            }
+        imported = _garden_import_reply(joined, [
+            ("Shared a concrete concern about the API route", "Shared a concrete concern while testing the API route."),
+            ("Prefers direct answers", "Prefers direct answers and asked replies to stay grounded."),
+        ])
+        if imported is not None:
+            return imported
         if "Derive a Feedling Identity Card" in joined:
             return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "I can answer from the imported history now.", "usage": {"total_tokens": 12}}
@@ -1083,23 +1095,19 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
+        imported = _garden_import_reply(joined, [
+            ("Asked to reuse the in-flight import job", "Asked to reuse the in-flight import job instead of starting over."),
+            ("Duplicate start did not duplicate work", "A duplicate start of the import did not duplicate the work."),
+        ])
+        if imported is not None:
             provider_entered.set()
             assert release_provider.wait(timeout=2)
-            return {
-                "reply": (
-                    '{"memories":['
-                    '{"type":"moment","title":"Inflight moment","description":"The job was reused.","occurred_at":"2026-05-31"},'
-                    '{"type":"fact","title":"Inflight fact","description":"Duplicate start did not duplicate work.","occurred_at":"2026-05-31"}'
-                    "]}"
-                ),
-                "usage": {},
-            }
+            return imported
         if "Derive a Feedling Identity Card" in joined:
             return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "Ready.", "usage": {}}
@@ -1145,7 +1153,7 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
     setup = client.post(
         "/v1/model_api/setup",
@@ -1186,26 +1194,23 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
-            assert "Long-term user profile" in joined
-            return {
-                "reply": (
-                    '{"memories":['
-                    '{"type":"moment","title":"JSON import test","description":"User tested JSON export import.","occurred_at":"2026-05-30"},'
-                    '{"type":"fact","title":"Persona preference","description":"User likes durable setup context.","occurred_at":"2026-05-30"}'
-                    "]}"
-                ),
-                "usage": {},
-            }
+        imported = _garden_import_reply(joined, [
+            ("Tested importing a JSON chat export", "Tested importing a JSON chat export into the garden."),
+            ("Prefers durable setup context", "Prefers durable setup context, per the long-term profile."),
+        ])
+        if imported is not None:
+            seen_material.append(joined)
+            return imported
         if "Derive a Feedling Identity Card" in joined:
             return {"reply": json.dumps(_identity_payload()), "usage": {}}
         return {"reply": "ok", "usage": {}}
 
+    seen_material: list[str] = []
     monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
@@ -1250,6 +1255,8 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
     assert job["persona_filename"] == "persona.md"
     assert job["memories_created"] >= 2
     assert job["identity_written"] is True
+    # 用户档案按自己的来源单独进导入会话（不再和聊天记录拼成一个窗口）
+    assert any("Long-term user profile" in text for text in seen_material)
 
 
 def test_wrapped_chat_history_json_parses_without_upload_artifacts():
@@ -1294,17 +1301,6 @@ def test_wrapped_chat_history_json_parses_without_upload_artifacts():
     assert "API onboarding" in messages[0]["content"]
     assert all("BEGIN CHAT HISTORY FILE" not in m["content"] for m in messages)
     assert all("conversation_id" not in m["content"] for m in messages)
-
-    cards = history_import._fallback_memory_cards(
-        messages,
-        date(2026, 5, 31),
-        story_needed=1,
-        about_needed=1,
-        language=history_import._detect_import_language(messages),
-    )
-    assert len(cards) == 2
-    assert not cards[0]["title"].startswith("导入")
-    assert all("BEGIN CHAT HISTORY FILE" not in card["description"] for card in cards)
 
 
 def test_large_history_sampling_keeps_middle_and_latest_messages():
@@ -1877,28 +1873,6 @@ def test_history_import_windows_keep_memory_summary_separate_from_large_history(
     assert any("用户在五月反复提到需要稳定陪伴" in w["text"] for w in windows)
 
 
-def test_memory_summary_fallback_splits_high_recall_cards_without_ai_persona_story_pollution():
-    messages = history_import._persona_support_messages({
-        "ai_persona_content": "TA 叫小哆啦，温柔稳定。",
-        "memory_summary_content": "1. 用户在五月反复提到需要稳定陪伴。\n2. 用户希望重要提醒要直接说。\n3. 他们在一次争执后约定先确认情绪。",
-        "personal_profile_content": "用户喜欢直接反馈。",
-    })
-
-    cards = history_import._fallback_memory_cards(
-        messages,
-        date(2026, 5, 1),
-        story_needed=2,
-        about_needed=2,
-        language="zh-Hans",
-    )
-
-    assert len(cards) >= 4
-    assert not any("温柔稳定" in c["description"] and c["type"] in {"moment", "quote"} for c in cards)
-    assert any("稳定陪伴" in c["description"] for c in cards)
-    assert any("直接" in c["description"] for c in cards)
-    assert all("用户" not in c["description"] for c in cards)
-
-
 def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monkeypatch):
     def fake_chat_completion(cfg, messages, **kwargs):
         return {
@@ -2088,7 +2062,7 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test-secret",
+        lambda envelope, key, purpose, caller_user_id: b"sk-test-secret",
     )
 
     def fake_chat_completion(cfg, messages, **kwargs):

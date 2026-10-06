@@ -128,6 +128,53 @@ def _save_moments(store: UserStore, moments: list):
         db.memory_replace_all(store.user_id, moments)
 
 
+#: The stored fields that identify one sealed card write. The body is sealed
+#: with a fresh random nonce, so equal ciphertext on every one of these fields
+#: can only mean the same request was delivered again. Runtime V2 Capture
+#: (``jobs_store._capture_same_memory``) uses this same set.
+SAME_MEMORY_WRITE_FIELDS = (
+    "id",
+    "type",
+    "body",
+    "body_ct",
+    "nonce",
+    "K_user",
+    "K_enclave",
+    "visibility",
+    "owner_user_id",
+    "supersedes",
+)
+
+
+def same_memory_write(existing: dict, wanted: dict) -> bool:
+    return all(existing.get(key) == wanted.get(key) for key in SAME_MEMORY_WRITE_FIELDS)
+
+
+def insert_new_moment(store: UserStore, moment: dict) -> tuple[str, dict | None]:
+    """Append one new card unless its id is already taken.
+
+    ``memory_replace_all`` keeps the last dict per id, so appending a card whose
+    id exists silently replaces the stored card (and with it any
+    ``superseded_by`` chain). Checked on a fresh load under the mutation fence:
+
+      ("inserted", None)     the card was written
+      ("replay", existing)   the stored card is this exact write; nothing written
+      ("conflict", existing) the id belongs to a different card; nothing written
+    """
+    memory_id = str(moment.get("id") or "")
+    with mutation_lock(store):
+        moments = _load_moments(store)
+        existing = next(
+            (m for m in moments if isinstance(m, dict) and str(m.get("id") or "") == memory_id),
+            None,
+        )
+        if existing is not None:
+            return ("replay" if same_memory_write(existing, moment) else "conflict"), existing
+        moments.append(moment)
+        _save_moments(store, moments)
+    return "inserted", None
+
+
 def _append_memory_change(store: UserStore, entry: dict) -> dict:
     record = {
         "id": uuid.uuid4().hex[:16],

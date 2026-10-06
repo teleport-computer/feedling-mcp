@@ -35,6 +35,7 @@ import uuid
 import db
 import debug_trace
 import generated_image
+import storage_read_trace
 from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
@@ -63,11 +64,36 @@ def _ignore_voice_reply(*_args, **_kwargs) -> bool:
 # avoids making the foundational chat package depend on the voice feature.
 publish_voice_reply = _ignore_voice_reply
 
-_ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 _FILE_NAME_BIDI_CONTROLS = frozenset(
     chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
 )
 _CANVAS_FILENAME_MAX_CHARS = 120
+
+
+def _image_followup_gate_error(gate_err: dict) -> dict:
+    """Re-shape the shared envelope validator's error back to an image-specific
+    body carrying the ``image_followup`` marker.
+
+    The consumer's ``classify_reply_rejection`` recognises an attachment
+    rejection by the substring ``image_followup`` and only then runs the T528
+    drop-attachment recovery (resend without the picture) instead of releasing
+    the whole turn. The generic validator returns marker-less strings
+    (``envelope_missing_fields`` …), so without this remap a rejected sealed
+    image_followup would be classified ``other`` and bypass that recovery. The
+    three sealed bodies are restored verbatim to their pre-T558 wording; any
+    other (plaintext-shape) reason keeps its detail but gains the marker.
+    """
+    err = str(gate_err.get("error") or "")
+    if err == "envelope_missing_fields":
+        return {"error": "image_followup_envelope_missing_fields",
+                "detail": gate_err.get("detail")}
+    if err.startswith("envelope.visibility"):
+        return {"error": "invalid image_followup visibility"}
+    if err == "envelope with visibility=shared requires K_enclave":
+        return {"error": "shared image_followup requires K_enclave"}
+    return {"error": f"image_followup_{err}", **{
+        k: v for k, v in gate_err.items() if k != "error"
+    }}
 
 
 def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | None:
@@ -526,8 +552,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
 
     # Pull this page's R2-offloaded bodies concurrently before rendering; without
     # it each one costs a serial round-trip inside _chat_history_item.
-    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body)
-    out = [chat_service._chat_history_item(m, include_image_body=include_image_body) for m in msgs]
+    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body, store=store)
+    out = [chat_service._chat_history_item(m, include_image_body=include_image_body, store=store) for m in msgs]
     omitted_bodies = sum(1 for m in out if m.get("body_omitted"))
     omitted_image_bodies = sum(
         1
@@ -611,21 +637,36 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
 # --------------------------------------------------------------------------- #
 
 def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
-    try:
-        msg = db.chat_get_strict(store.user_id, str(message_id))
-    except Exception as e:  # noqa: BLE001 — preserve cache fallback on DB blips
-        print(f"[chat/body:{store.user_id}] durable lookup failed, using hot cache: {e}")
-        with store.chat_lock:
-            msg = next(
-                (m for m in store.chat_messages
-                 if str(m.get("id") or "") == str(message_id)),
-                None,
+    with storage_read_trace.observe_read(
+        store, event_type="chat.message_body.read", source="chat_message",
+    ) as observation:
+        observation["lookup_source"] = "durable"
+        observation["is_canvas"] = None
+        try:
+            msg = db.chat_get_strict(store.user_id, str(message_id))
+        except Exception as e:  # noqa: BLE001 — preserve cache fallback on DB blips
+            print(f"[chat/body:{store.user_id}] durable lookup failed, using hot cache: {e}")
+            observation["lookup_source"] = "hot_cache"
+            with store.chat_lock:
+                msg = next(
+                    (m for m in store.chat_messages
+                     if str(m.get("id") or "") == str(message_id)),
+                    None,
+                )
+        # A verify-loop synthetic row is never a legitimate single-body fetch target;
+        # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
+        if not msg or msg.get("source") == "verify_ping":
+            return storage_read_trace.finish_response(
+                observation, {"error": "message_not_found"}, 404,
             )
-    # A verify-loop synthetic row is never a legitimate single-body fetch target;
-    # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
-    if not msg or msg.get("source") == "verify_ping":
-        return {"error": "message_not_found"}, 404
-    return {"message": chat_service._chat_history_item(msg, include_image_body=True)}, 200
+        observation["is_canvas"] = (
+            msg.get("content_type") == "file"
+            and str(msg.get("file_name") or "").casefold().endswith(".io.html")
+        )
+        body = {"message": chat_service._chat_history_item(
+            msg, include_image_body=True, store=store,
+        )}
+        return storage_read_trace.finish_response(observation, body, 200)
 
 
 def _canvas_workspace_path(filename: str) -> str | None:
@@ -661,18 +702,88 @@ def _canvas_workspace_path(filename: str) -> str | None:
 
 def workspace_canvas_body(store: UserStore, filename: str) -> tuple[dict, int]:
     """Return the caller's current opaque Canvas workspace envelope."""
-    path = _canvas_workspace_path(filename)
-    if path is None:
-        return {"error": "invalid_canvas_filename"}, 400
-    row = v2_jobs_store.get_workspace_entry(store.user_id, path)
-    if row is None or str(row.get("kind") or "") != "workspace":
-        return {"error": "workspace_entry_not_found"}, 404
-    return {
-        "filename": filename,
-        "revision": int(row["revision"]),
-        "mime_type": str(row.get("mime_type") or "text/html"),
-        "envelope": dict(row["content_envelope"]),
-    }, 200
+    with storage_read_trace.observe_read(
+        store, event_type="chat.canvas.body", source="workspace",
+    ) as observation:
+        path = _canvas_workspace_path(filename)
+        if path is None:
+            return storage_read_trace.finish_response(
+                observation, {"error": "invalid_canvas_filename"}, 400,
+            )
+        row = v2_jobs_store.get_workspace_entry(store.user_id, path)
+        if row is None or str(row.get("kind") or "") != "workspace":
+            return storage_read_trace.finish_response(
+                observation, {"error": "workspace_entry_not_found"}, 404,
+            )
+        body = {
+            "filename": filename,
+            "revision": int(row["revision"]),
+            "mime_type": str(row.get("mime_type") or "text/html"),
+            "envelope": dict(row["content_envelope"]),
+        }
+        return storage_read_trace.finish_response(observation, body, 200)
+
+
+def _canvas_index_timestamp(value) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def canvas_index(store: UserStore) -> tuple[dict, int]:
+    """Return workspace and chat-delivered Canvas metadata, newest first."""
+    with storage_read_trace.observe_read(
+        store, event_type="chat.canvas.index", source="canvas_index",
+    ) as observation:
+        rows = v2_jobs_store.list_canvas_workspace_entries(store.user_id, limit=500)
+        prefix = "/workspace/"
+        filenames = [str(row["path"])[len(prefix):] for row in rows]
+        message_metadata = db.chat_latest_agent_canvas_metadata_by_name(
+            store.user_id,
+            filenames,
+        )
+        canvases = []
+        for row, filename in zip(rows, filenames):
+            message = message_metadata.get(filename, {})
+            canvases.append({
+                "filename": filename,
+                "revision": int(row["revision"]),
+                "mime_type": str(row["mime_type"]),
+                "created_at": _canvas_index_timestamp(row["created_at"]),
+                "updated_at": _canvas_index_timestamp(row["updated_at"]),
+                "message_id": message.get("message_id"),
+                "display_title": message.get("display_title"),
+                "display_subtitle": message.get("display_subtitle"),
+            })
+        cards = db.chat_latest_agent_canvas_cards(store.user_id, limit=500)
+        for card in cards:
+            canvases.append({
+                "filename": card["filename"],
+                "revision": 1,
+                "mime_type": "text/html",
+                "created_at": _canvas_index_timestamp(card["created_at"]),
+                "updated_at": _canvas_index_timestamp(card["updated_at"]),
+                "message_id": card["message_id"],
+                "display_title": card["display_title"],
+                "display_subtitle": card["display_subtitle"],
+            })
+        # Both sources return aware datetimes. Sort those values rather than their
+        # ISO strings (fractional seconds and timezone offsets need numeric order).
+        updated_by_name = {name: row["updated_at"] for row, name in zip(rows, filenames)}
+        updated_by_name.update({card["filename"]: card["updated_at"] for card in cards})
+        canvases.sort(key=lambda card: (
+            -updated_by_name[card["filename"]].timestamp(), card["filename"],
+        ))
+        selected = canvases[:500]
+        workspace_names = set(filenames)
+        workspace_count = sum(card["filename"] in workspace_names for card in selected)
+        observation.update(
+            workspace_count=workspace_count,
+            chat_card_count=len(selected) - workspace_count,
+            cards=len(selected),
+            # Each source query is independently capped at 500. Saturation is
+            # observable; whether another row exists beyond either cap is not.
+            limit_reached=len(selected) == 500,
+        )
+        return storage_read_trace.finish_response(observation, {"canvases": selected}, 200)
 
 
 # --------------------------------------------------------------------------- #
@@ -840,6 +951,42 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
+def trace_response_rejected(store: UserStore, payload: dict, body: dict, status: int) -> None:
+    """The ``chat.response.rejected`` debug-trace event.
+
+    ``write_response`` answers a malformed reply with a 4xx and NO trace, so a
+    resident consumer whose reply (typically one carrying image/file followups)
+    keeps bouncing shows up in the trace as "agent.reply ok, then nothing" —
+    the turn is released, re-run, and the user never learns why (T528: a hosted
+    user's generated images were staged, sent, and rejected with a bare 400
+    for days). Record the rejection reason here, content-free: only the error
+    code string the route returns, the status, and which followup kinds rode
+    along.
+    """
+    reply_to_message_id = _reply_to_message_id(payload)
+    error = str((body or {}).get("error") or "")[:120]
+    image_followups = payload.get("image_followups")
+    file_followups = payload.get("file_followups")
+    debug_trace.trace_event(
+        store,
+        subsystem="route",
+        type="chat.response.rejected",
+        actor="agent",
+        status="error",
+        outcome_class="operational_failure",
+        trace_id=reply_to_message_id,
+        turn_id=reply_to_message_id,
+        summary=f"reply rejected {int(status)} {error}".strip(),
+        detail={
+            "status": int(status),
+            "error": error,
+            "source": str(payload.get("source") or "chat")[:32],
+            "image_followups": len(image_followups) if isinstance(image_followups, list) else 0,
+            "file_followups": len(file_followups) if isinstance(file_followups, list) else 0,
+        },
+    )
+
+
 def gate_response_dict(
     store: UserStore,
     allow_verify_reply: bool,
@@ -990,22 +1137,22 @@ def write_response(
             followup_envelope = raw_followup.get("envelope")
             if not isinstance(followup_envelope, dict):
                 return {"error": "image_followup envelope required"}, 400
-            missing = [
-                field for field in _ENVELOPE_REQUIRED
-                if not followup_envelope.get(field)
-            ]
-            if missing:
-                return {
-                    "error": "image_followup_envelope_missing_fields",
-                    "detail": missing,
-                }, 400
-            if followup_envelope["visibility"] not in ("shared", "local_only"):
-                return {"error": "invalid image_followup visibility"}, 400
-            if (
-                followup_envelope["visibility"] == "shared"
-                and not followup_envelope.get("K_enclave")
-            ):
-                return {"error": "shared image_followup requires K_enclave"}, 400
+            # Shape-aware, exactly like the file_followup gate above: a sealed
+            # envelope keeps its full contract (body_ct/nonce/K_user + shared⇒
+            # K_enclave via validate_uploaded_envelope), and a plaintext-tier
+            # account's body_b64 image envelope is accepted too. The old
+            # sealed-only `_ENVELOPE_REQUIRED` list rejected every plaintext-tier
+            # image_followup with `image_followup_envelope_missing_fields`, so a
+            # plaintext/mixed-storage user could NEVER receive a generated image
+            # (T558; the T528 degrade notice fired, but the picture never landed).
+            gate_err = core_envelope.validate_uploaded_chat_envelope(
+                followup_envelope,
+                user_id=store.user_id,
+                content_type="image",
+                max_binary_bytes=generated_image.MAX_GENERATED_IMAGE_STORED_BYTES,
+            )
+            if gate_err is not None:
+                return _image_followup_gate_error(gate_err), 400
             conflict = _stale_key_conflict(store, followup_envelope)
             if conflict is not None:
                 return conflict
@@ -1490,6 +1637,34 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
             }, 200
         # else (dual + resident hosted account): fall through to the synthetic
         # ping protocol below, exactly like an explicitly independent account.
+
+    # Opt-in short-circuit for callers whose only purpose is opening the
+    # bootstrap gate (the runner supervisor's autoverify). The resident probe
+    # below is a REAL model call on the user's own key: on 2026-09-04 and
+    # 2026-09-06 every deploy restarted the runner, its in-memory autoverify
+    # state was lost, and all 226 hosted residents were re-probed within 15
+    # minutes — 140 of them (dormant users with dead keys) failed, burning
+    # their credits and showing up as a failure spike. A user the server
+    # already knows to be verified gains nothing from another ping. Default
+    # False keeps the iOS manual check and the bootstrap skill byte-identical.
+    # Only the JSON literal ``true`` opts in. ``"false"`` / ``1`` / ``"yes"`` are
+    # caller mistakes, and a mistake here means "skip the real probe" — so they
+    # must fall through to the ordinary ping, never into the short-circuit.
+    if payload.get("only_if_unverified") is True and (
+        boot_gates._chat_loop_verified_by_server(store)
+    ):
+        # Not a liveness measurement: no ping, no reply, no timing. loop_alive
+        # and response_time_sec are null so a caller cannot mistake this for a
+        # fresh exact-ack observation; passing reflects the persisted gate.
+        return {
+            "loop_alive": None,
+            "response_time_sec": None,
+            "ping_id": "",
+            "timeout_sec": timeout_sec,
+            "suggestions": [],
+            "passing": True,
+            "already_verified": True,
+        }, 200
 
     # append_chat acquires chat_lock internally — don't hold it here or we'd
     # deadlock on the non-reentrant lock.

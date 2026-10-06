@@ -119,6 +119,9 @@ def device_event_observations_v2(event: Mapping[str, Any]) -> tuple[IngressObser
             allow_first_event=True,
         ))
 
+    # ⚠️ 同 perceptkit_adapter/events.py 里那段：**这个分支从来没被走到过**。
+    # iOS 从不在 device event 里发 phash（代码里 0 次，git 全历史也没有），
+    # 所以老路的 screen_phash 唤醒同样是死的。缺的是产出方，不是这一段。
     phash = payload.get("safe_screen_phash") or payload.get("screen_phash")
     broadcast_state = str(payload.get("broadcast_state") or "").strip().lower()
     if phash and broadcast_state in {"on", "broadcasting"}:

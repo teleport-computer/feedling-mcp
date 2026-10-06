@@ -34,15 +34,16 @@ def test_a_plain_signal_only_gets_its_names_changed():
 def test_blood_pressure_gets_its_unit_into_the_name():
     out = dict(backfill.convert("health_metabolic",
                                 {"blood_pressure_systolic": {"max": 118}}))
-    assert "blood_pressure_systolic_mmhg" in out["health_metabolic"]
+    # 血压拆到了自己的信号（来源侧是一次 correlation 读数）。
+    assert "blood_pressure_systolic_mmhg" in out["health_blood_pressure"]
 
 
 def test_body_fat_is_converted_not_just_renamed():
     """老的存百分比，kit 存比率。只改名的话历史里的体脂会变成 1840%。"""
     out = dict(backfill.convert("health_body",
                                 {"body_fat_pct": 18.4, "weight_kg": 68.2}))
-    assert out["health_body"]["body_fat_ratio"] == pytest.approx(0.184)
-    assert out["health_body"]["weight_kg"] == 68.2
+    assert out["health_body_fat"]["body_fat_ratio"] == pytest.approx(0.184)
+    assert out["health_weight"]["weight_kg"] == 68.2
 
 
 def test_steps_move_out_of_vitals_into_their_own_signal():
@@ -57,8 +58,8 @@ def test_steps_move_out_of_vitals_into_their_own_signal():
     }))
     assert out["steps"] == {"step_count": {"total": 9000}}
     # 拆出去之后，原信号里不该再留一份
-    assert "step_count" not in out["health_vitals"]
-    assert "resting_heart_rate" in out["health_vitals"]
+    assert "step_count" not in out["health_resting_hr"]
+    assert "resting_heart_rate" in out["health_resting_hr"]
 
 
 def test_sleep_stages_are_not_added_on_top_of_the_total():

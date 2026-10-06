@@ -1,3 +1,4 @@
+import hashlib
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -450,6 +451,28 @@ def test_identity_dimensions_set_schema_uses_card_policy_contract():
     assert tool_schema.validate_tool_args(
         "identity_dimensions_set", {"dimensions": [], "reason": "   "}
     ) == "identity_dimensions_set requires a non-empty reason"
+
+
+def test_identity_dimensions_set_description_preserves_approved_offer_copy():
+    approved = (
+        "When the persona has no dimensions yet, you may offer once, when it fits "
+        "the conversation, to set up a starting set. Their agreement is the "
+        "explicit request this tool requires — record it in 'reason'. Do not call "
+        "this tool before they agree."
+    )
+    description = tool_schema.DESCRIPTIONS["identity_dimensions_set"]
+
+    assert tool_schema.IDENTITY_DIMENSIONS_EMPTY_OFFER_COPY == approved
+    assert len(approved) == 241
+    assert hashlib.sha256(approved.encode()).hexdigest() == (
+        "1d880cca5ac252b0a1743ec9b8b543dda0f53a1526dcba9d94404a55729849dc"
+    )
+    assert ord(approved[176]) == 0x2014
+    assert approved[191] == approved[198] == "'"
+    assert not set(approved) & {"‘", "’", "“", "”"}
+    assert description.endswith(approved)
+    assert "Use only for an explicit user-requested rewrite." in description
+    assert "and do not raise it again if they decline." not in description
 
 
 def test_identity_dimensions_set_schema_rejects_shared_policy_failures():

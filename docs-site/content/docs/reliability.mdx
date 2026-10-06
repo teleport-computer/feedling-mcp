@@ -86,6 +86,63 @@ Applications should make them configurable for self-hosted deployments.
 
 ## Provider health and proactive retries
 
+The Anthropic and Bedrock adapters add manual extended thinking only for
+explicitly recognized model families with that capability. This includes Claude
+3.7 Sonnet, Sonnet/Opus 4, Opus 4.1, Sonnet/Opus/Haiku 4.5, and Sonnet/Opus 4.6;
+4.6 still accepts manual mode despite its deprecation. Dated/latest model aliases
+and Bedrock profile/version decorations resolve to the same family table.
+Unknown families omit `thinking` and produce a `thinking_omitted` log diagnostic
+with `reason=unknown_model` and the normalized model ID (at most 160 characters),
+without prompt, response, key, or endpoint content. This adapter log is separate
+from per-user flow trace events. Adaptive-only models also omit manual thinking parameters, leaving
+the provider's default behavior in effect. This does not disable a model's
+default reasoning or guarantee that an unknown model accepts other request fields.
+The existing token-budget gate and forced-tool handling still apply: Anthropic
+omits manual thinking for forced tools, while Bedrock explicitly disables it on
+recognized manual-thinking models.
+
+Regular Runtime V2 wakes finish with a structured `reply` or `stay_silent`
+choice. Speaking is the default; silence is the agent's own call when it has
+nothing it wants to say or when speaking would clearly intrude. Unanswered
+messages, even several over a day or two, are not by themselves a reason to stay
+silent; the agent is asked to say something new rather than repeat itself. These are model
+instructions, not new scheduler gates. Missing or invalid choices still
+fail without a visible bubble; free-form text cannot bypass the validated reply
+path. Explicitly scheduled reminders retain their must-deliver behavior.
+A regular wake's otherwise valid `reply` whose entire text is a bare protocol
+token (for example, `stay_silent`) is treated as `stay_silent` and never delivered.
+Heartbeat and manual wakes first make one provider call without `reply` or
+`stay_silent`, so the agent looks at its context before deciding. If it needs no
+lookup, any drafted text stays unpublished and carries into one ordinary decision
+round with both choices offered. If it does look something up, the next round is
+that decision round and carries the same instruction to end the wake with `reply`
+or `stay_silent`; it can still look further. When this decision round has no draft
+and is not a forced choice or direct-text correction, it also reminds the model
+to check a visible reply against the user's existing identity requirements,
+including `custom_persona_prompt`, within the existing safety and tool-use rules.
+This is a prompt reminder, not a guarantee of model adherence or a new retry;
+it disappears after that round. This uses the existing provider-call budget and
+applies only when that budget allows at least three calls. For these two lanes, the
+optional `aside` asks what makes the agent want to reach out now rather than how it
+will answer a message.
+The screen-watch lane follows the same default while keeping its own guidance
+to avoid interrupting the user's flow.
+
+All wake provider calls, including scheduled reminders and correction retries,
+use the same output budget as chat/file turns (`CHAT_OUTPUT_MAX_TOKENS`, default 32,768),
+giving reasoning models room to make the terminal tool call. Operators can tune
+that shared budget with `FEEDLING_V2_FILE_OUTPUT_MAX_TOKENS`. It is separate from
+the prompt-frontier output reserve and does not change the input frontier;
+file-capable calls retain their existing budget precedence. Scheduled reminders
+still require delivery; sharing the budget does not enable a silence choice.
+
+Wake lanes (heartbeat, manual wake, scheduled reminders, and screen watch) give each
+provider request up to 110 seconds in total before it counts as a timeout. Chat keeps
+the 60-second limit on waiting for a response. Retry behavior is unchanged, and each
+attempt counts as progress for the worker's stall watchdog, so a retried request is
+not mistaken for a stuck turn. Nobody is waiting on a wake reply, and reasoning models
+can take longer than a minute before their first response byte.
+
 Feedling tracks whether an account's configured model provider is producing
 usable replies. If an account has no successful provider response for 48 hours
 and its latest failures have continuously required user action for at least one
@@ -154,6 +211,14 @@ floor defaults to 32,768 tokens and can be changed with
 `FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS`. A rejected value
 falls through to the next source and emits a content-free warning containing
 only window counts, the resolved source, and a closed provider class.
+For an audited model at its audited provider endpoint, accepted metadata is
+also compared with the audited family lower bound: the larger value wins.
+Equal or larger metadata keeps the `provider_metadata` source; a raised value
+uses `audited_family`. Deployment overrides still take precedence. This lets
+older routes use updated model knowledge without rewriting their stored values.
+DeepSeek's first-party `deepseek-chat`, `deepseek-reasoner`, `deepseek-flash`,
+and `deepseek-v4` family use a 1,048,576-token audited window. Custom endpoints
+and the separately audited OpenRouter DeepSeek family do not inherit that window.
 
 Runtime V2 takes one temporal snapshot for each chat or wake turn.
 The prompt receives the current UTC time, the user's local IANA timezone and
@@ -221,14 +286,27 @@ lease instead of being killed speculatively. Ownership is checked again in the
 atomic update, and live workers renew only jobs they still own. Done and failed
 jobs release the account slot.
 
-The worker uses the first real model request as a canary with a default
-60-second timeout. A timed-out canary ends the job with
-`distill_model_too_slow`; changing to a faster model is required before retry.
-Malformed JSON response bodies are reported as `model_bad_json`. Other provider
+The worker uses the first real model request as a canary: a single attempt
+with a 60-second timeout, or 120 seconds on `openai_compatible` relay routes,
+where healthy first calls to thinking-capable models regularly take longer. A
+timed-out canary ends the job with `distill_model_too_slow`; changing to a
+faster model is required before retry. Each model call's content-free record
+includes its elapsed time.
+Malformed JSON response bodies are reported as `model_bad_json`. An identity
+profile the model returned but that fails validation (not JSON, a missing or
+empty field, a placeholder, or over its length budget) is also reported as
+`model_bad_json`, and an empty profile or provider reply as `model_empty_output`,
+instead of an internal error. Before a profile reply is validated, reasoning inlined in
+`<think>` is stripped, each `{` is tried in turn, and keys other than `memory`
+and `style` are discarded. Other provider
 configuration failures retain their specific error class and remediation
 guidance.
 For a non-empty long-term-memory (`keep_all`) import, producing zero memory
 cards fails the job as `distill_empty_output` instead of publishing `done`.
+When the material is at most 500 characters and the model cleanly proposed
+nothing (no candidate dropped, no batch failed), the job still fails, as
+`distill_material_too_short`, with copy asking for more detail instead of a
+different model.
 Discarded map attempts add at most six diagnostics to the user-owned job
 output. Each diagnostic includes a discard reason and at most 500 characters
 of the model reply, plus its original length and truncation flag. Empty map
@@ -247,6 +325,18 @@ validation retain the durable `processed_chunks` count and per-material
 `windows_done` / `windows_total` values after failure; only a completed job
 reports 100 percent.
 
+Legacy plaintext onboarding and add-memory checkpoints with fact-map progress
+and no current import-engine marker are an exception: retry keeps the same job
+ID but saves fresh import progress and processes the submitted material again.
+Already written cards remain in the garden and enter the full existing-card
+index for model-directed merging. If that index cannot be read, the existing
+`genesis.garden_import.index_unavailable` fallback uses an empty index, so
+cross-import deduplication is unavailable. The reset emits a content-free
+`genesis.plaintext.legacy_checkpoint_reset` trace with the old phase and progress
+counts. Current-engine retries and update-identity checkpoints retain their
+normal resume behavior. Onboarding still re-derives and replaces identity on
+retry; its existing per-user greeting guard keeps the original greeting.
+
 Estimate/commit jobs retain their opaque staged-upload identifier in trusted
 job metadata until successful completion releases the staged upload. Completed
 persona-voice map windows are checkpointed in the same encrypted envelope as
@@ -259,12 +349,45 @@ persona, user profile, memory summary, then chat history. Material status uses
 `queued`, `processing`, `failed`, or `done`; `cards` reports the durable mapped
 candidate count instead of a placeholder.
 
-Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
+Hosted Resident supervisors open a crash-loop circuit after five failures within
+30 minutes. While open, restart attempts use a fixed five-minute interval;
+ordinary restart backoff and the five-minute healthy reset remain unchanged.
+The consumer records only a closed startup reason and timestamp in its per-user
+`startup_exit.json`; the supervisor ignores missing, malformed or older records.
+Successful startup removes that file. Current startup exits belong to the
+system, so their spawn-failure notice does not blame the user's model settings.
+An unreachable decrypt source continues retrying within the live consumer.
+
+Automatic Runtime V2 heartbeat failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new
 genuine user message invalidates an older delay immediately. Manual wakes and
 screen-watch events bypass this short-horizon guard. Sustained provider
 failures remain the responsibility of the separate provider health circuit.
+
+Runtime V2 also persists a separate provider circuit across heartbeat and
+screen-watch jobs. Three consecutive failures classified as
+`quota_insufficient`, `auth_invalid`, or `provider_account_expired` pause both
+lanes, including jobs already queued. A successful job or another error class
+clears the streak while the circuit is closed. Once open, only a newly accepted
+Chat message or a successful active key, route, or setup save resets it.
+This reset runs after the primary save and is best-effort: a database failure
+is logged without failing the saved Chat or configuration request. The circuit
+may remain open until a later new Chat or active configuration save retries it.
+Idempotent Chat retries and label-only or unsuccessful key saves do not reset
+it; jobs started before a reset cannot re-open it with stale results. Scheduled
+reminders, manual wakes, and Resident are outside this circuit. Generic
+400/404/422 failures retain their existing cooldown/backoff behavior.
+
+Opening writes a `wake_provider_circuit_open` warning to `GET /v1/notices`;
+recovery resolves that warning without adding another notice. Current iOS
+clients do not render this endpoint. The existing best-effort trace/notice
+sinks can omit a transition if a process crashes after the state commits;
+the persistent admission gate does not depend on those sinks. Content-free
+`wake.circuit.open` and `wake.circuit.recover` events record the reason,
+streak, and threshold. Admin data-track user summaries count currently open
+V2 accounts within the selected filters; an unavailable read yields null,
+not zero.
 
 Automatic heartbeat authorization is content-free and fail-closed: the worker
 checks PostgreSQL for at least one genuine user-authored Chat row before loading

@@ -29,6 +29,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode
 
+import admin_read_timing
 import db
 from accounts import registry
 from admin import data_track
@@ -74,9 +75,36 @@ def summary_payload(query_string: str) -> dict:
         return data_track._data_track_payload(include_users=False)
 
 
-def users_payload(query_string: str) -> dict:
-    with bind(query_string):
-        return data_track._data_track_payload(include_users=True)
+def users_payload(
+    query_string: str, *, statement_timeout_ms: int | None = None,
+    request_started: float | None = None,
+) -> dict:
+    started = time.monotonic()
+    request_started = started if request_started is None else request_started
+    # Route entry -> worker entry; includes auth/dispatch as well as queueing.
+    queue_ms = int((started - request_started) * 1000)
+    with admin_read_timing.collect() as timings, bind(query_string):
+        payload = data_track._data_track_payload(
+            include_users=True, statement_timeout_ms=statement_timeout_ms,
+        )
+        # Ends before warning/JSON serialization; those are outside this total.
+        finished = time.monotonic()
+        elapsed_ms = int((finished - started) * 1000)
+        total_ms = int((finished - request_started) * 1000)
+        # Keep historical worker elapsed_ms; total_ms also flags slow queueing.
+        if total_ms > 5000:
+            stages = timings.stages_ms(total_ms=total_ms, queue_ms=queue_ms)
+            # Parsed integer limit is safe and keeps pagination cohorts comparable.
+            limit = data_track._data_track_request_filters()["limit"]
+            log.warning(
+                "[data-track] users slow elapsed_ms=%d budget_ms=5000 limit=%s total_ms=%d stages_ms=%s",
+                elapsed_ms, limit, total_ms, stages,
+            )
+            payload["slow"] = {
+                "elapsed_ms": elapsed_ms, "total_ms": total_ms, "soft_budget_ms": 5000,
+                "stages_ms": stages,
+            }
+        return payload
 
 
 def dau_payload(query_string: str) -> dict:
@@ -876,7 +904,7 @@ def store_evict(user_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="runtime mode control is DB-backed"
     )
     if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
@@ -898,7 +926,7 @@ def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
 
 
 def get_runtime_mode(user_id: str) -> tuple[dict, int]:
-    store = core_store.get_store_shell_only(
+    store = core_store.get_store_per_load_mode(
         user_id, reason="runtime mode control is DB-backed"
     )
     try:
@@ -936,7 +964,7 @@ def get_runtime_allowlist() -> dict:
     for row in rows:
         try:
             mode, state, gen = cs.get_hosted_runtime_control_strict(
-                core_store.get_store_shell_only(
+                core_store.get_store_per_load_mode(
                     row["user_id"],
                     reason="runtime allowlist reconciliation is DB-backed",
                 )

@@ -60,12 +60,22 @@ def identity_init_body() -> dict:
     }
 
 
+def _reply_has_content(m: dict) -> bool:
+    """An agent reply carries content either as an encrypted envelope
+    (``body_ct``, the e2ee/plaintext-off path) or as a plaintext ``body`` (the
+    hosted plaintext-tier path that new accounts default to on Runtime V2).
+    The smoke used to require ``body_ct``, so it silently skipped every V2
+    reply and reported "no reply" though the turn had completed and stored one
+    (T542)."""
+    return bool(m.get("body_ct") or m.get("body"))
+
+
 def newest_openclaw_after(messages: list, after_ts: float) -> dict | None:
     cands = [
         m for m in messages
         if str(m.get("role") or "") in _OPENCLAW_ROLES
         and float(m.get("ts", 0)) > after_ts
-        and (m.get("body_ct") or "")
+        and _reply_has_content(m)
     ]
     if not cands:
         return None
@@ -163,15 +173,62 @@ class SmokeClient:
             raise SmokeError("not-hosted", f"expected 202 hosted, got status={status} body={body}")
         return body
 
-    def poll_reply(self, sess: Session, after_ts: float, timeout: float, interval: float = 3.0) -> str | None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            _, body = self._req("GET", f"/v1/chat/history?since={after_ts}&limit=20", api_key=sess.api_key)
-            msg = newest_openclaw_after(body.get("messages") or [], after_ts)
-            if msg:
-                return crypto.decrypt_reply(msg, sess.sk, sess.pk)
-            time.sleep(interval)
+    def _reply_text(self, msg: dict, sess: Session) -> str:
+        """A plaintext-tier reply (hosted V2 default) has no envelope — read its
+        `body` directly; only decrypt when `body_ct` (e2ee/plaintext-off) is set."""
+        if msg.get("body_ct"):
+            return crypto.decrypt_reply(msg, sess.sk, sess.pk)
+        return str(msg.get("body") or "")
+
+    def reply_for_turn(self, sess: Session, turn_id: str) -> str | None:
+        """The agent reply bound to THIS turn by ``reply_to_message_id``, not the
+        newest agent row after a timestamp — a proactive/unrelated reply must not
+        be attributed to the turn under test."""
+        _, body = self._req("GET", f"/v1/chat/history?since=0&limit=50", api_key=sess.api_key)
+        for m in body.get("messages") or []:
+            if (str(m.get("role") or "") in _OPENCLAW_ROLES
+                    and str(m.get("reply_to_message_id") or "") == turn_id
+                    and _reply_has_content(m)):
+                return self._reply_text(m, sess)
         return None
+
+    def poll_turn(self, sess: Session, turn_id: str, timeout: float,
+                  interval: float = 3.0) -> dict:
+        """Poll the turn to a verdict bound to ``turn_id`` (the sent message id).
+
+        The backend turn-activity ``failure`` field is authoritative (T532/T540):
+        a non-empty failure means the turn failed regardless of complete/phase/job
+        status, even if a nonempty fallback reply was delivered. A settled turn
+        with no failure resolves to its bound reply. Fail closed: an unreadable or
+        never-settling verdict is a failure, not a pass.
+
+        Returns {settled, failed, failure, reply}.
+        """
+        deadline = time.monotonic() + timeout
+        last = "no_response"
+        while time.monotonic() < deadline:
+            status, act = self._req(
+                "GET", f"/v1/chat/turn-activity/{turn_id}", api_key=sess.api_key)
+            if status == 200 and isinstance(act, dict):
+                failure = act.get("failure")
+                if failure:
+                    code = str((failure.get("code") if isinstance(failure, dict) else failure) or "turn_failed")
+                    return {"settled": True, "failed": True, "failure": code, "reply": None}
+                if act.get("complete"):
+                    reply = self.reply_for_turn(sess, turn_id)
+                    if reply is None:
+                        return {"settled": True, "failed": True,
+                                "failure": "complete_without_bound_reply", "reply": None}
+                    return {"settled": True, "failed": False, "failure": None, "reply": reply}
+                last = f"pending(phase={act.get('phase')})"
+            elif status == 404:
+                last = "turn_not_registered_yet"
+            else:
+                last = f"http_{status}"
+            time.sleep(interval)
+        # Fail closed: never treat an unread/unsettled verdict as success.
+        return {"settled": False, "failed": True,
+                "failure": f"verdict_unsettled_timeout:{last}", "reply": None}
 
     def delete_config(self, sess: Session) -> None:
         try:

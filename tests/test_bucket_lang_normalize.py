@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from memgarden.text.card_text import sanitize_card_labels  # noqa: E402
-from memory.capture_prompt_v1 import parse_capture_cards  # noqa: E402
+from _memgarden_prompt_bindings import parse_capture_cards  # noqa: E402
 
 
 # --- 直接测 sanitize_card_labels(lang_text) --------------------------------

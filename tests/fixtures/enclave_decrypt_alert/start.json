@@ -1,0 +1,44 @@
+{
+  "window_minutes": 15,
+  "calculated_at": "2026-09-17T02:45:00+00:00",
+  "current": {
+    "start_at": "2026-09-17T02:30:00+00:00",
+    "end_at": "2026-09-17T02:45:00+00:00",
+    "done": 40,
+    "timeout": 20,
+    "transport_error": 4,
+    "http_401": 2,
+    "http_403": 3,
+    "http_other": 0,
+    "calls": 69,
+    "unavailable": 24,
+    "unavailable_rate": 0.375,
+    "users_affected": 7,
+    "top_purposes": [
+      {
+        "purpose": "memory_action",
+        "count": 20
+      }
+    ]
+  },
+  "previous": {
+    "start_at": "2026-09-17T02:15:00+00:00",
+    "end_at": "2026-09-17T02:30:00+00:00",
+    "done": 70,
+    "timeout": 2,
+    "transport_error": 0,
+    "http_401": 0,
+    "http_403": 0,
+    "http_other": 0,
+    "calls": 72,
+    "unavailable": 2,
+    "unavailable_rate": 0.027777777777777776,
+    "users_affected": 1,
+    "top_purposes": [
+      {
+        "purpose": "memory_action",
+        "count": 2
+      }
+    ]
+  }
+}

@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, quote
 
 from core.reqctx import request
 
+import admin_read_timing
 import db
 import debug_trace
 import provider_attempt_ledger
@@ -31,6 +32,7 @@ from memory import service as memory_service
 from notices import catalog as notices_catalog
 from notices import status_reason as notices_status_reason
 from notices import core as notices_core
+from notices import error_contract as notices_error_contract
 from proactive import service as proactive_service
 from screen import screen_read_core
 from bootstrap import gates as boot_gates
@@ -38,6 +40,7 @@ from core import store as core_store
 from core.store_sections import StoreSection
 from core import util as core_util
 from identity import service as identity_service
+from memory import extraction_trace as memory_extraction_trace
 from memory import dream_trace as memory_dream_trace
 
 
@@ -255,6 +258,49 @@ def _memory_stats(store: UserStore) -> dict:
     }
 
 
+def _capture_window_cursor(job: Mapping[str, Any] | None) -> dict[str, Any]:
+    """落卡窗口的游标，**只取标识和计数，绝不带正文**。
+
+    判断队头阻塞就靠它：连续几个失败任务如果 ``after_*`` 相同，
+    说明游标没推进、同一批消息在被反复重放。
+    """
+    src = job if isinstance(job, Mapping) else {}
+    window = src.get("capture_window")
+    if not isinstance(window, Mapping):
+        window = src.get("window")
+    if not isinstance(window, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("after_message_id", "until_message_id"):
+        value = str(window.get(key) or "")[:160]
+        if value:
+            out[key] = value
+    for key in ("after_seq", "through_seq", "message_count",
+                # 窗口指纹 —— 定位「模型为什么吐出坏 JSON」用。
+                # 全是计数，见 memory/window_fingerprint。
+                "window_chars", "ascii_double_quotes"):
+        raw = window.get(key)
+        if raw is None:
+            continue
+        try:
+            out[key] = int(float(raw))
+        except (TypeError, ValueError):
+            continue
+    raw = window.get("per_kchars")
+    if raw is not None:
+        try:
+            out["per_kchars"] = round(float(raw), 2)
+        except (TypeError, ValueError):
+            pass
+    # roles / sources 是**白名单枚举**（window_fingerprint 已经把未知值
+    # 归成 "other"），所以可以原样带出，不会漏出用户内容。
+    for key in ("roles", "sources"):
+        raw = window.get(key)
+        if isinstance(raw, (list, tuple)):
+            out[key] = sorted(str(x)[:24] for x in raw)[:12]
+    return out
+
+
 def _data_track_capture_doc(value, *, max_items: int = 20):
     if isinstance(value, dict):
         return {
@@ -332,6 +378,15 @@ def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> d
                     or ""
                 ),
                 "capture_result": _data_track_capture_doc(result, max_items=20),
+                # 🔴 窗口游标。**不含任何对话原文**，只有 id / seq / 条数。
+                #
+                # 少了它就只看得到「每天失败几次」，看不出「是不是同一批消息
+                # 在反复失败」—— 而这两件事的处置完全不同：前者是偶发，
+                # 后者是队头阻塞（一条毒消息把这个用户永久锁死）。
+                #
+                # 2026-09-12 查 58 个用户零落卡时踩到：诊断里没有游标，
+                # 因果链只能靠读代码推，没法用数据证实。
+                "capture_window": _capture_window_cursor(job),
                 "memory_action_status": _data_track_capture_doc(
                     job.get("memory_action_status") or {}, max_items=20
                 ),
@@ -1541,7 +1596,12 @@ def _effective_responder(
     }
 
 
-def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
+def _build_data_track_user_fast(
+    user_entry: dict,
+    snap: dict,
+    *,
+    include_validation_steps: bool = False,
+) -> dict:
     snap = dict(snap)
     snap.setdefault(
         "snapshot_read_status",
@@ -1622,7 +1682,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
             "steps_done": steps_done,
             "steps_total": steps_total,
             "next_action": validation.get("next_action", ""),
-            "steps": [],
+            "steps": steps if include_validation_steps else [],
             "stuck_for_sec": stuck_for_sec,
             "consumer_poll_status": validation.get(
                 "consumer_poll_status", "not_applicable"
@@ -2143,7 +2203,215 @@ def _v2_profile_detail(user_id: str) -> dict:
     }
 
 
+def _build_data_track_user_detail(user_entry: dict) -> dict:
+    """Build one detail row without materializing the user's Store caches.
+
+    Production intentionally runs the Store in legacy compatibility mode, where
+    even a three-section ``get_store`` request loads every section.  A heavy
+    user's chat cache can contain megabytes of encrypted envelopes, while this
+    page only renders aggregate counts and timestamps.  Keep the detail path on
+    SQL aggregates and explicitly bounded event reads instead.
+    """
+    user_id = str(user_entry.get("user_id") or "")
+    detail_snapshot = db.admin_data_track_snapshot(
+        [user_id],
+        include_worldbook=True,
+        narrow_app_usage_to_user_stream=True,
+        statement_timeout_ms=db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS,
+    ).get(user_id, {})
+    detail_snapshot_status = dict(
+        detail_snapshot.get("snapshot_read_status") or {
+            "level": "unavailable",
+            "message": "取数状态缺失",
+        }
+    )
+    detail_snapshot["snapshot_read_status"] = detail_snapshot_status
+    row = _build_data_track_user_fast(
+        user_entry,
+        detail_snapshot,
+        include_validation_steps=True,
+    )
+    row["snapshot_read_status"] = detail_snapshot_status
+
+    events_limit = _data_track_query_int(
+        "events_limit",
+        default=50,
+        minimum=1,
+        maximum=500,
+    )
+    tracking_events = db.log_read(
+        user_id,
+        "tracking_events",
+        limit=events_limit,
+    )
+    tracking_events.sort(
+        key=lambda event: core_util._to_epoch(
+            event.get("ts") or event.get("created_at")
+        ),
+        reverse=True,
+    )
+    row["tracking"]["events_limit"] = events_limit
+    row["tracking"]["latest"] = [
+        {
+            "event_id": event.get("event_id", ""),
+            "type": event.get("type", ""),
+            "created_at": event.get("created_at", ""),
+            "source": event.get("source", ""),
+            "route": event.get("route", ""),
+            "app_version": event.get("app_version", ""),
+            "build": event.get("build", ""),
+            "payload": event.get("payload", {}),
+        }
+        for event in tracking_events
+    ]
+
+    bootstrap_events = db.log_read(user_id, "bootstrap_events", limit=50)
+    row["bootstrap_events"]["latest"] = [
+        {
+            "event_type": event.get("event_type", ""),
+            "success": bool(event.get("success")),
+            "timestamp": event.get("timestamp", ""),
+            "has_error": bool(
+                str(event.get("error_message") or "").strip()
+            ),
+        }
+        for event in bootstrap_events
+    ]
+
+    worldbook = dict(detail_snapshot.get("worldbook") or {})
+    row["worldbook"] = {
+        "entries": int(worldbook.get("entries") or 0),
+        "last_updated_at": str(worldbook.get("last_updated_at") or ""),
+        "note": "条目数与最后更新时间;id 与正文不出(id 是用户自定名 = 内容)",
+    }
+    tokens = db.get_blob(user_id, "tokens")
+    row["push"] = _push_stats_from_user_entry({
+        "tokens": tokens if isinstance(tokens, list) else [],
+    })
+
+    # These detail helpers only need ``user_id`` and perform their own direct,
+    # bounded reads. The bypass path preserves process-local
+    # identity/locks without hydrating Store sections, including in legacy mode.
+    store = core_store.get_store_per_load_mode(
+        user_id,
+        reason="admin detail helpers use direct bounded DB reads",
+        bypass_legacy_hydration=True,
+    )
+    genesis = _genesis_stats(store, include_jobs=True)
+    row["genesis"] = genesis
+    row["last_activity_at"] = core_util._epoch_to_iso(_latest_epoch(
+        row.get("last_activity_at"),
+        genesis.get("updated_at"),
+        genesis.get("completed_at"),
+    ))
+
+    daily_days = _data_track_query_int(
+        "days",
+        default=14,
+        minimum=1,
+        maximum=90,
+    )
+    try:
+        row["daily_usage"] = db.admin_data_track_user_daily_usage(
+            user_id=user_id,
+            days=daily_days,
+            tz="Asia/Shanghai",
+            statement_timeout_ms=(
+                db._ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS
+            ),
+        )
+        row["daily_usage_query"] = "ok"
+    except db.AdminDataTrackDailyUsageReadError:
+        row["daily_usage"] = []
+        row["daily_usage_query"] = "failed"
+    row["daily_usage_days"] = daily_days
+    row["runtime"] = _runtime_summary(store)
+    row["model_api_routes"] = _model_api_route_summaries(user_id)
+    row["notice_summaries"] = _notice_summaries(user_id)
+    row["provider_attempt_ledger"] = _provider_attempts_detail(store)
+    row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+    row["v2_recent_jobs"] = _v2_recent_jobs_detail(user_id)
+    row["v2_profile"] = _v2_profile_detail(user_id)
+    row["memory_capture_validation"] = _memory_capture_validation_detail(store)
+    proactive_settings = store.load_proactive_settings()
+    row["v2_wake_activity"] = _v2_wake_activity_detail(user_id)
+    row["v2_wake_schedule"] = _v2_wake_schedule_detail(
+        user_id,
+        proactive_settings,
+    )
+    row["perception_permissions"] = {
+        "permission_states": dict(
+            proactive_settings.get("permission_states") or {}
+        ),
+        "switches": {
+            "ambient_心跳": bool(proactive_settings.get("enabled", True)),
+            "dnd_勿扰": bool(proactive_settings.get("dnd", False)),
+            "scheduled_定时": bool(proactive_settings.get("scheduled", True)),
+            "dream_做梦": bool(proactive_settings.get("dream_enabled", True)),
+            "capture_记忆整理": bool(
+                proactive_settings.get("capture_enabled", True)
+            ),
+            "screen_watch_屏幕观察": bool(
+                proactive_settings.get("screen_watch_enabled", True)
+            ),
+            "photo_wake_照片唤醒": bool(
+                proactive_settings.get("photo_wake_enabled", True)
+            ),
+            "arrival_wake_到达唤醒": bool(
+                proactive_settings.get("arrival_wake_enabled", True)
+            ),
+            "unlock_wake_解锁唤醒": bool(
+                proactive_settings.get("unlock_wake_enabled", True)
+            ),
+        },
+        "wake_directive_configured": bool(
+            str(proactive_settings.get("wake_directive") or "").strip()
+        ),
+        "wake_interval_sec": int(
+            proactive_settings.get("wake_interval_sec") or 0
+        ),
+        "user_state": proactive_settings.get("user_state"),
+        "ai_state": proactive_settings.get("ai_state"),
+        "broadcast_state": proactive_settings.get("broadcast_state"),
+    }
+    try:
+        from perception import service as _perception_service
+        row["perception_freshness"] = (
+            _perception_service.admin_perception_freshness(user_id)
+        )
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        row["perception_freshness"] = {
+            "error": f"{type(e).__name__}:{str(e)[:120]}"
+        }
+
+    detail_blobs = detail_snapshot.get("blobs") or {}
+    identity = (
+        detail_blobs.get("identity")
+        if isinstance(detail_blobs.get("identity"), dict)
+        else None
+    )
+    row["identity"] = {
+        "written": identity is not None,
+        "updated_at": (identity or {}).get("updated_at", ""),
+        "relationship_started_at": (
+            identity or {}
+        ).get("relationship_started_at", ""),
+        "relationship_anchor_source": (
+            identity or {}
+        ).get("relationship_anchor_source", ""),
+        "has_relationship_anchor_evidence": bool(
+            str(
+                (identity or {}).get("relationship_anchor_evidence") or ""
+            ).strip()
+        ),
+    }
+    return row
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
+    if include_detail:
+        return _build_data_track_user_detail(user_entry)
+
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(
         user_id,
@@ -2246,109 +2514,6 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "history_import": history_import,
         "genesis": genesis,
     }
-    if include_detail:
-        daily_days = _data_track_query_int(
-            "days",
-            default=14,
-            minimum=1,
-            maximum=90,
-        )
-        detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
-        detail_snapshot_status = dict(
-            detail_snapshot.get("snapshot_read_status") or {
-                "level": "unavailable",
-                "message": "取数状态缺失",
-            }
-        )
-        detail_snapshot["snapshot_read_status"] = detail_snapshot_status
-        row["snapshot_read_status"] = detail_snapshot_status
-        row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
-        row["screen_frames"] = _data_track_screen_frames_from_snapshot(
-            detail_snapshot
-        )
-        # Same key the list rows carry (_build_data_track_user_fast), so a
-        # client reading one shape can read the other.
-        row["user_mcp"] = _data_track_user_mcp_from_snapshot(detail_snapshot)
-        detail_blobs = detail_snapshot.get("blobs") or {}
-        row["responder"] = _effective_responder(
-            route=route,
-            consumer_state=(
-                detail_blobs.get("consumer_state")
-                if isinstance(detail_blobs.get("consumer_state"), dict)
-                else None
-            ),
-            runtime=detail_snapshot.get("responder_runtime"),
-            snapshot_read_status=detail_snapshot_status,
-        )
-        try:
-            row["daily_usage"] = db.admin_data_track_user_daily_usage(
-                user_id=user_id,
-                days=daily_days,
-                tz="Asia/Shanghai",
-            )
-            row["daily_usage_query"] = "ok"
-        except db.AdminDataTrackDailyUsageReadError:
-            row["daily_usage"] = []
-            row["daily_usage_query"] = "failed"
-        row["daily_usage_days"] = daily_days
-        row["runtime"] = _runtime_summary(store)
-        row["model_api_routes"] = _model_api_route_summaries(user_id)
-        row["notice_summaries"] = _notice_summaries(user_id)
-        row["provider_attempt_ledger"] = _provider_attempts_detail(store)
-        row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
-        row["v2_recent_jobs"] = _v2_recent_jobs_detail(user_id)
-        row["v2_profile"] = _v2_profile_detail(user_id)
-        row["memory_capture_validation"] = _memory_capture_validation_detail(store)
-        _ps = store.load_proactive_settings()
-        # 主动侧的 V2 真相:上面的 `proactive` 块是 V1 口径,对 V2 用户结构性显示 0
-        # (唤醒 job 在 agent_jobs、回复行 source 恒为 model_api)。这两个块补上
-        # 「真跑了多少」与「现在为什么不到期」——2026-08-10 少了它们,我拿 V1 口径
-        # 的 0 差点判成「心跳十天没跑」。
-        row["v2_wake_activity"] = _v2_wake_activity_detail(user_id)
-        row["v2_wake_schedule"] = _v2_wake_schedule_detail(user_id, _ps)
-        row["perception_permissions"] = {
-            # what the device reports it granted (free-form; keys are app-defined,
-            # e.g. photos / screen / location / health / motion / calendar / audio)
-            "permission_states": dict(_ps.get("permission_states") or {}),
-            # per-user autonomy switches (all default on)
-            "switches": {
-                "ambient_心跳": bool(_ps.get("enabled", True)),
-                "dnd_勿扰": bool(_ps.get("dnd", False)),
-                "scheduled_定时": bool(_ps.get("scheduled", True)),
-                "dream_做梦": bool(_ps.get("dream_enabled", True)),
-                "capture_记忆整理": bool(_ps.get("capture_enabled", True)),
-                "screen_watch_屏幕观察": bool(_ps.get("screen_watch_enabled", True)),
-                "photo_wake_照片唤醒": bool(_ps.get("photo_wake_enabled", True)),
-                "arrival_wake_到达唤醒": bool(_ps.get("arrival_wake_enabled", True)),
-                "unlock_wake_解锁唤醒": bool(_ps.get("unlock_wake_enabled", True)),
-            },
-            # User-authored natural language is private content. Data-track may
-            # expose whether it is configured, never the directive itself.
-            "wake_directive_configured": bool(str(_ps.get("wake_directive") or "").strip()),
-            "wake_interval_sec": int(_ps.get("wake_interval_sec") or 0),
-            "user_state": _ps.get("user_state"),
-            "ai_state": _ps.get("ai_state"),
-            "broadcast_state": _ps.get("broadcast_state"),
-        }
-        # Per-field last-report freshness (timestamps only, no values) so support
-        # can tell "device stopped feeding X" from a backend read gap — the two
-        # blind spots that cost us in usr_7f30 / usr_5d3d triage.
-        try:
-            from perception import service as _perception_service
-            row["perception_freshness"] = _perception_service.admin_perception_freshness(
-                str(user_entry.get("user_id") or "")
-            )
-        except Exception as e:  # noqa: BLE001 — observability must never 500 the page
-            row["perception_freshness"] = {"error": f"{type(e).__name__}:{str(e)[:120]}"}
-        row["identity"] = {
-            "written": identity is not None,
-            "updated_at": identity_updated_at,
-            "relationship_started_at": (identity or {}).get("relationship_started_at", ""),
-            "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", ""),
-            "has_relationship_anchor_evidence": bool(
-                str((identity or {}).get("relationship_anchor_evidence") or "").strip()
-            ),
-        }
     return row
 
 
@@ -2594,7 +2759,11 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
     rows.sort(key=sort_tuple)
 
 
-def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
+@admin_read_timing.python_assembly
+def _data_track_payload(
+    *, include_users: bool = True, include_detail_user: str = "",
+    statement_timeout_ms: int | None = None,
+) -> dict:
     filters = _data_track_request_filters()
     # Read-only snapshot: do NOT normalize+persist here. load_users() already
     # normalizes on boot and on every cross-worker reload, so an admin GET must
@@ -2606,6 +2775,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     user_ids = [str(u.get("user_id") or "") for u in users]
     snapshot = db.admin_data_track_snapshot(
         user_ids,
+        statement_timeout_ms=statement_timeout_ms,
         # Fleet-wide users *and* summary paths must stay bounded. One-user
         # detail bypasses this payload and keeps the legacy breakdowns through
         # admin_data_track_snapshot's default True.
@@ -2618,10 +2788,10 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         # latest_ts is not one of _latest_epoch's inputs, so no fleet-wide
         # consumer reads this aggregate. Re-read for the page below.
         include_screen_frames=False,
-        # And bootstrap_events, which has no fleet-wide reader at all. See
-        # db._PAGED_LOG_STREAMS for why it qualifies — in particular why it may
-        # leave the fleet-wide _latest_epoch inputs, and why memory_capture_jobs
-        # is dropped outright instead of being re-read per page.
+        # Bootstrap/tracking/device counts only render on the current page.
+        # Tracking MAX(ts) remains fleet-wide for activity; bootstrap timestamps
+        # are always NULL. See db._PAGED_LOG_STREAMS for the consumer boundary
+        # and why unused memory_capture_jobs is omitted outright.
         include_paged_log_streams=False,
     )
     human_cutoff = time.time() - int(filters.get("human_days") or 7) * 86400
@@ -2641,6 +2811,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
                         "message": "取数状态缺失",
                     }
                 ),
+                "wake_provider_circuit_open": snapshot.get(uid, {}).get("wake_provider_circuit_open"),
                 "provider_state": str(
                     health.get("provider_state") or "ok"
                 ),
@@ -2847,6 +3018,11 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         ),
         "proactive_breakdowns_status": proactive_breakdowns_status,
         "provider_needs_user_action": provider_needs_user_action,
+        "wake_provider_circuit_open_users": (
+            sum(row["wake_provider_circuit_open"] is True for row in rows)
+            if all(row.get("wake_provider_circuit_open") is not None for row in rows)
+            else None
+        ),
         "app_usage": {
             "foreground_sec_total": au_fg_total,
             "sessions_total": au_sessions_total,
@@ -2878,8 +3054,10 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         # filter, no sort key, no summary aggregate — and the fleet-level fields
         # below come from the ids-independent watermark table.
         page_ids = [str(r.get("user_id") or "") for r in page]
+        from model_api_runtime.v2 import jobs_store as v2_jobs_store
         background_report = db.admin_background_lane_users(
             page_ids,
+            classify_v2_code=v2_jobs_store.terminal_outcome_class,
             days=int(filters.get("lane_days") or 7),
         )
         # Same pushdown for the memory breakdowns. The row is rebuilt through
@@ -2930,6 +3108,12 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             if logs:
                 logs_snap["logs"] = {**(snap.get("logs") or {}), **logs}
             row["bootstrap_events"] = _data_track_bootstrap_from_snapshot(logs_snap)
+            # Only counts moved to this page. Fleet tracking/proactive timestamps
+            # already supplied the summary and ordering above.
+            row["tracking"] = _data_track_tracking_from_snapshot(logs_snap)
+            row["proactive"] = _with_proactive_lens(
+                _data_track_proactive_from_snapshot(logs_snap, row["chat"])
+            )
             for status in (memory_read_status, screen_read_status, logs_read_status):
                 if status.get("level") != "ok":
                     row["snapshot_read_status"] = dict(status)
@@ -2956,7 +3140,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             ),
             "denominator": "completed + operational_failures",
             "excluded": (
-                "control_outcomes, user_unavailable, superseded, expired; "
+                "control_outcomes, user_unavailable, superseded; "
+                "V2 expired/unknown failures remain operational; "
                 "nonterminal jobs are reported by the separate stuck metric"
             ),
         }
@@ -3285,10 +3470,61 @@ def _debug_content_summary(value) -> dict:
     return out
 
 
+def _reply_parse_failure_public_detail(value) -> dict:
+    """Expose T539's explicitly approved bounded CLI failure diagnostic."""
+    if not isinstance(value, dict) or set(value) != {
+        "raw_bytes",
+        "raw_sha256",
+        "exit_code",
+        "driver",
+        "parse_empty_stage",
+        "captured_at",
+        "raw_preview",
+        "local_path",
+    }:
+        return {}
+    raw_bytes = value.get("raw_bytes")
+    exit_code = value.get("exit_code")
+    driver = value.get("driver")
+    stage = value.get("parse_empty_stage")
+    captured_at = value.get("captured_at")
+    preview = value.get("raw_preview")
+    local_path = value.get("local_path")
+    if (
+        isinstance(raw_bytes, bool)
+        or not isinstance(raw_bytes, int)
+        or raw_bytes <= 0
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or not isinstance(driver, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", driver) is None
+        or stage not in {
+            "codex_stream",
+            "codex_stream_sanitization",
+            "claude_stream",
+            "claude_stream_sanitization",
+            "pi_stream",
+            "pi_stream_sanitization",
+            "cli_output",
+            "cli_output_sanitization",
+        }
+        or not isinstance(captured_at, str)
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", captured_at) is None
+        or not isinstance(preview, str)
+        or len(preview) > 80
+        or not isinstance(local_path, str)
+        or len(local_path) > 1024
+        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("raw_sha256") or "")) is None
+    ):
+        return {}
+    return dict(value)
+
+
 _EMPTY_RESPONSE_PUBLIC_ENUMS = {
     "stop_reason": frozenset({
         "", "blocklist", "content_filter", "end_turn", "function_call",
         "image_safety", "language", "length", "malformed_function_call",
+        "malformed_response",
         "max_output_tokens", "max_tokens", "other", "pause_turn", "prohibited_content",
         "recitation", "refusal", "safety", "spii", "stop",
         "stop_sequence", "tool_calls", "tool_use",
@@ -3652,7 +3888,57 @@ def _debug_event_public_json(
         public_detail,
         trace_public_fields=trace_public_fields,
     )
-    if ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
+    if isinstance(raw_detail, dict) and isinstance(public_detail, dict):
+        if ev.get("type") == "agent.model.call.error":
+            # T638 / Seven: only this bounded provider excerpt is public.
+            value = raw_detail.get("pi_error_head")
+            if isinstance(value, str) and len(value) <= 300:
+                public_detail["pi_error_head"] = value
+        if ev.get("type") == "resident.send_file.rejected":
+            # Only extension-shaped metadata is exposed, never a full filename.
+            def valid_suffix(value):
+                return isinstance(value, str) and (
+                    value == "" or re.fullmatch(r"\.[a-z0-9.]{1,11}", value) is not None
+                )
+            suffix = raw_detail.get("suffix")
+            if valid_suffix(suffix):
+                public_detail["suffix"] = suffix
+            required = raw_detail.get("required_suffixes")
+            if isinstance(required, list) and all(valid_suffix(item) for item in required):
+                public_detail["required_suffixes"] = required
+        if ev.get("type") in {"agent.turn.failure", "agent.model.call.error", "agent.reply"}:
+            reason = raw_detail.get("sanitizer_reason")
+            if isinstance(reason, str) and reason in notices_error_contract.RESIDENT_SANITIZER_REASONS:
+                public_detail["sanitizer_reason"] = reason
+        if ev.get("type") in {"agent.turn.failure", "agent.model.call.error"}:
+            status_class = raw_detail.get("provider_status_class")
+            if isinstance(status_class, str) and status_class in notices_error_contract.PROVIDER_STATUS_CLASSES:
+                public_detail["provider_status_class"] = status_class
+        if ev.get("type") == "agent.turn.failure" and raw_detail.get("error_class") == "reply_parse_failed":
+            # T617 / explicit trace-content authorization: bounded assistant
+            # excerpts only for this failure, not a general string allowlist.
+            for key, limit in (("raw_reply_head", 300), ("raw_reply_tail", 120)):
+                value = raw_detail.get(key)
+                if isinstance(value, str) and len(value) <= limit:
+                    public_detail[key] = value
+    if ev.get("type") == memory_extraction_trace.REFUSAL_TRACE_TYPE:
+        # Storage adds one closed provenance field to every trace. Validate it
+        # separately so a real persisted event keeps its refusal metadata.
+        candidate = dict(raw_detail) if isinstance(raw_detail, dict) else {}
+        provenance = candidate.pop(db.TRACE_OUTCOME_PROVENANCE_FIELD, None)
+        valid_provenance = isinstance(raw_detail, dict) and (
+            db.TRACE_OUTCOME_PROVENANCE_FIELD not in raw_detail
+            or (
+                isinstance(provenance, str)
+                and provenance in db.TRACE_OUTCOME_PROVENANCE_VALUES
+            )
+        )
+        public_detail = (
+            dict(raw_detail)
+            if valid_provenance and memory_extraction_trace.valid_refusal_detail(candidate)
+            else {}
+        )
+    elif ev.get("type") in memory_dream_trace.DREAM_TRACE_TYPES:
         # Dream rewrites private memory. Its public diagnostic contract is an
         # exact closed shape: any new/unknown key invalidates the whole detail
         # instead of inheriting the generic numeric/boolean projection.
@@ -3682,6 +3968,15 @@ def _debug_event_public_json(
             value = raw_detail.get(key)
             if isinstance(value, str) and value in allowed_values:
                 public_detail[key] = value
+    if (
+        ev.get("type") == "agent.reply.parse_failed"
+        and isinstance(raw_detail, dict)
+    ):
+        # Seven explicitly chose diagnosis-first for this one event: expose the
+        # exact first 80 characters and resident-local artifact path, but only
+        # when the producer's whole closed shape validates. Unknown keys or a
+        # widened preview fail closed to an empty detail object.
+        public_detail = _reply_parse_failure_public_detail(raw_detail)
     if (
         ev.get("type") == "provider.empty_response"
         and isinstance(raw_detail, dict)
@@ -3872,6 +4167,13 @@ def _debug_event_public_json(
         provider_error_class = raw_detail.get("provider_error_class")
         if provider_error_class in {"transient", "provider_config", "unknown"}:
             public_detail["provider_error_class"] = provider_error_class
+        for key, allowed in (
+            ("provider_error_type", v2_worker.provider_client.PROVIDER_ERROR_TYPES),
+            ("error_signature", v2_worker.provider_client.PROVIDER_ERROR_SIGNATURES),
+        ):
+            value = raw_detail.get(key)
+            if isinstance(value, str) and value in allowed:
+                public_detail[key] = value
         error_class = raw_detail.get("error_class")
         if isinstance(error_class, str) and error_class in _known_error_classes():
             public_detail["error_class"] = error_class
@@ -3950,6 +4252,7 @@ def _data_track_debug_flat_payload(
     offset: int,
     page: int,
     user_filter: str,
+    user_exists: bool | None,
     subsystem_filter: str,
     status_filter: str,
     trace_filter: str,
@@ -4105,6 +4408,7 @@ def _data_track_debug_flat_payload(
         },
         "options": _debug_filter_options(option_events),
         "observability": {
+            "user_exists": user_exists,
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
@@ -4147,6 +4451,18 @@ def _data_track_debug_payload() -> dict:
     q = str(filters.get("q") or "").strip().lower()
     since_epoch = float(filters.get("since_epoch") or 0)
 
+    # A deleted account's retained traces remain queryable (T184). Distinguish
+    # an absent exact uid from a live account with no matching events without
+    # making account membership a gate on the trace read. None means no uid filter.
+    user_exists = None
+    if user_filter:
+        connection_timeout, statement_timeout_ms = _debug_db_limits(db_deadline)
+        user_exists = db.user_exists(
+            user_filter,
+            connection_timeout=connection_timeout,
+            statement_timeout_ms=statement_timeout_ms,
+        )
+
     with registry._users_lock:
         live_users = {
             str(user.get("user_id") or ""): dict(user)
@@ -4167,6 +4483,7 @@ def _data_track_debug_payload() -> dict:
             offset=offset,
             page=page,
             user_filter=user_filter,
+            user_exists=user_exists,
             subsystem_filter=subsystem_filter,
             status_filter=status_filter,
             trace_filter=trace_filter,
@@ -4317,6 +4634,7 @@ def _data_track_debug_payload() -> dict:
         },
         "options": _debug_filter_options(all_events_raw),
         "observability": {
+            "user_exists": user_exists,
             "trace_vocabulary": (
                 "ok" if trace_vocabulary is not None else "unavailable"
             ),
@@ -4963,6 +5281,7 @@ _RUNTIME_FAILURE_CODE_MAX = 120
 # 与单回合 trace 共用产生方导出，不在日报投影里另造一套形状/前缀规则。
 _RUNTIME_ERROR_CLASS_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 RUNTIME_OUTCOME_CLASS_LABELS = {
+    "unspecified": "未说明",
     "operational_failure": "执行故障",
     "timeout": "超时 / 失活",
     "control": "控制切流",
@@ -4970,7 +5289,7 @@ RUNTIME_OUTCOME_CLASS_LABELS = {
     "user_unavailable": "明确用户侧不可用",
 }
 RUNTIME_OUTCOME_CLASSES = frozenset(RUNTIME_OUTCOME_CLASS_LABELS)
-RUNTIME_OUTCOME_DEFAULT = "operational_failure"
+RUNTIME_OUTCOME_DEFAULT = "unspecified"
 
 
 def _runtime_operational_rate(lane: dict):
@@ -8767,6 +9086,11 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
         _render_metric("记忆总数", summary["memory_total"]),
         _render_metric("主动任务数", summary["proactive_jobs_total"]),
         _render_metric(
+            "主动唤醒熔断账号行（当前筛选）",
+            summary.get("wake_provider_circuit_open_users")
+            if summary.get("wake_provider_circuit_open_users") is not None else "量不到",
+        ),
+        _render_metric(
             "模型配置待处理",
             summary.get("provider_needs_user_action", 0),
         ),
@@ -8941,7 +9265,7 @@ def _render_data_track_page(payload: dict, funnel: dict | None = None) -> str:
 	  {_render_chat_coverage_note(summary.get("chat_coverage"))}
 	  <div class="note-box"><b>后台道按用户失败率</b><br>
 	  数据来自冻结 <code>lane_daily_rollup</code>，默认最近 {int(filters.get('lane_days') or 7)} 个完整北京日；
-	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；
+	  分母=<code>completed + operational_failures</code>。控制切流、明确用户侧、superseded 不进分母；V2 expired/未知失败仍算运营失败；
 	  pending/claimed/running 不塞进失败率，另由 stuck 指标负责。覆盖不完整时格子明确标 partial，
 	  不会把未量到的 0 冒充健康。可用 <code>lane_days</code> 改窗口。</div>
 	  <div class="sortbar">{sort_controls}</div>
@@ -10213,6 +10537,8 @@ _DEBUG_STEP_LABELS = {
     "route.decided": ("🧭", "路由决策"),
     "context.build": ("📎", "组装上下文"),
     "memory.inject": ("🧠", "自动注入记忆"),
+    "memory.select.traced": ("🧩", "自动挑卡(未注入)"),
+    "memory.recall.completed": ("🧠", "本轮召回"),
     "memory.capture.language": ("🌐", "落卡语言判定"),
     "memory.dream.tick": ("🌙", "做梦判定"),
     "memory.dream.start": ("🌙", "记忆整理 · 开始"),
@@ -10231,6 +10557,7 @@ _DEBUG_STEP_LABELS = {
     "vision.provider.completed": ("👁", "视觉模型 · 调用结束"),
     "agent.image.generate.start": ("🎨", "生图 · 开始"),
     "agent.image.generate.done": ("🎨", "生图 · 成功"),
+    "agent.image.generate.invalid": ("🎨", "生图 · 图片无法处理"),
     "agent.image.generate.failed": ("🎨", "生图 · 失败"),
     # 语音四个失败出口在页面上本来长得一模一样。标签里必须写出
     # 「仍返回 200」——那是这条道最反直觉、最容易被当成成功的地方:
@@ -10245,6 +10572,7 @@ _DEBUG_STEP_LABELS = {
     "agent.model.call.start": ("🧠", "调用模型 · 开始"),
     "agent.model.call.done": ("🧠", "调用模型 · 完成"),
     "agent.model.call.error": ("🧠", "调用模型 · 失败"),
+    "agent.reply.parse_failed": ("🧩", "回复解析失败 · 本机原文"),
     "agent.tool.call": ("🔧", "调用工具"),
     "thinking.surfaced": ("💭", "思考展示 · 分支"),
     "reply.language_follow": ("🌐", "语言跟随"),
@@ -10268,7 +10596,9 @@ _DEBUG_STEP_LABELS = {
     "memory.capture.done": ("🧩", "记忆抓取 · 完成"),
     "memory.index.called": ("🧩", "浏览记忆总览"),
     "memory.search.called": ("🔍", "搜索记忆"),
+    "memory.fetch.called": ("📖", "读取记忆卡"),
     "memory.content.truncation": ("✂️", "记忆卡截断"),
+    "memory.content.rejected": ("⛔", "记忆卡超长拒绝"),
     "identity.dimensions_set": ("🪪", "身份维度重写"),
     "context.truncation": ("✂️", "上下文裁剪"),
 }
@@ -10296,6 +10626,7 @@ def _debug_friendly_step(ev: dict) -> tuple[str, str]:
 
 
 _OUTCOME_CLASS_LABELS = {
+    "unspecified": "未说明",
     "operational_failure": "运行故障",
     "timeout": "超时",
     "control": "闸拦截",
@@ -10565,6 +10896,11 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
     vocabulary_warnings = []
+    if (payload.get("observability") or {}).get("user_exists") is False:
+        vocabulary_warnings.append(
+            "No current account matches this exact user_id. Prefixes are not expanded; "
+            "retained trace events for deleted accounts are still shown when they match the filters."
+        )
     if trace_vocabulary_status != "ok":
         vocabulary_warnings.append(
             "Trace 词表暂不可用；后台任务 lane / enqueue reason 闭集字段未展示，"
@@ -10868,6 +11204,7 @@ _EVENT_MASTER_ACTIONS = (
      "desc": "一次 dream job 的终态。",
      "runtime_metrics": {"runtime_v1": ("dream", None),
                          "runtime_v2": ("dream", None)}},
+    # 历史 job_kind，机制已删；保留历史终态统计口径。
     {"key": "migrate", "label": "记忆整理 · Migrate",
      "desc": "resident 有独立 migrate 终态；V2 maintenance 不是同一动作。",
      "runtime_metrics": {"runtime_v1": ("migrate", None)}},
@@ -10936,7 +11273,15 @@ def _event_path_master_payload(
                 "required_days": int(coverage.get("required_days") or 0),
                 "effective_from": coverage.get("effective_from"),
             }
-        completed = int(counts.get("completed") or 0)
+        # dream 的「花园太小、这次不整理」冻进 silent_declared（completed 仍含它）。
+        # 它一次模型都没问，不是一次成功的整理：成功只数真跑过的完成，skip 单列。
+        # 冻结侧只对 LANE_ROLLUP_SKIP_DECLARED_LANES 给非 0 的 skipped。
+        skipped = int(counts.get("skipped") or 0)
+        completed = max(0, int(counts.get("completed") or 0) - skipped)
+        skip_rule = (
+            "；dream skip（花园太小、没问模型）从 completed 剔除单列"
+            if lane in db.LANE_ROLLUP_SKIP_DECLARED_LANES else ""
+        )
         failed = int(counts.get("failed") or 0)
         expired = int(counts.get("expired") or 0)
         superseded = int(counts.get("superseded") or 0)
@@ -10977,14 +11322,15 @@ def _event_path_master_payload(
                 "state": "metric", "coverage": "green",
                 "success": completed, "failure": operational,
                 "failed": failed, "expired": expired,
-                "superseded": superseded,
+                "superseded": superseded, "skipped": skipped,
                 "raw_non_success": failed,
                 "control_outcomes": control_outcomes,
                 "user_unavailable": user_unavailable,
                 "denominator": completed + operational,
                 "denominator_rule": (
                     "completed + operational failure；control、明确用户侧不可用、"
-                    "superseded 剔除；过去的日子没有回填；"
+                    "superseded 剔除；过去的日子没有回填"
+                    + skip_rule + "；"
                     + (
                         "成员按冻结时 route 资格→接入方式×effective runtime 分层"
                         if path is not None
@@ -11012,7 +11358,7 @@ def _event_path_master_payload(
             "state": "metric", "coverage": "green",
             "success": completed, "failure": failure,
             "failed": failed, "expired": expired,
-            "superseded": superseded,
+            "superseded": superseded, "skipped": skipped,
             "raw_non_success": raw_non_success,
             "control_outcomes": control_outcomes,
             "user_unavailable": user_unavailable,
@@ -11020,6 +11366,7 @@ def _event_path_master_payload(
             "denominator_rule": (
                 "completed + operational failure；control、明确用户侧不可用、"
                 "superseded 剔除；未知码/expired 仍算 operational failure"
+                + skip_rule
             ),
             # 原样透传:上游给什么就带什么,脏数据由 _concentration_line 统一判。
             # ⚠️ 这里**不做**校验,否则「上游没给」和「上游给了但不合法」会在
@@ -11447,6 +11794,8 @@ def _render_event_master_cell(cell: dict, *, action: str, path: str,
             excluded += f" · control {int(cell['control_outcomes'])}（剔除）"
         if no_write:
             excluded += f" · no-write {no_write}（单列剔除）"
+        if int(cell.get("skipped") or 0):
+            excluded += f" · skip {int(cell['skipped'])}（没真跑，剔除）"
         outcomes = cell.get("outcomes") if isinstance(cell.get("outcomes"), dict) else {}
         outcome_detail = ""
         if outcomes:

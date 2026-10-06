@@ -1,0 +1,7 @@
+[开始] enclave 解密超时或传输错误增多
+15 分钟窗口 2026-09-17 10:30–10:45 CST
+超时 20 / 传输错误 4 / 成功 40 → 不可用率 38%
+失败波及用户 7;主要 purpose: memory_action 20
+附注:HTTP 401 ×2 / 403 ×3 / 其他错误 ×0（不参与判定）
+口径:仅已记录的终态 trace；不代表全部调用。
+查:api.feedling.app/admin/data-track 或 phala logs enclave

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 import os
@@ -3890,3 +3891,240 @@ def test_unsafe_heartbeat_terminal_strands_its_perception_context_on_purpose():
 
     # 3) 后台复盘由 failure review 承担，不靠转移 context
     assert _pending_reviews(job_id) == ["pending"]
+
+
+
+def _append_plaintext_user_message(
+    uid: str, body: object, msg_id: str = "parent-user", **extra
+) -> int:
+    """A user row in today's stored shape: plaintext ``body`` (T743)."""
+    doc = {
+        "v": 1,
+        "id": msg_id,
+        "visibility": "shared",
+        "owner_user_id": uid,
+        **extra,
+    }
+    if body is not None:
+        doc["body"] = body
+    core_store.get_store(uid).append_chat("user", "chat", doc, strict=True)
+    seq = db.chat_seq_for_msg_id(uid, msg_id)
+    assert seq is not None
+    return seq
+
+
+def _fail_and_deliver(monkeypatch, uid: str, *, lane: str = "chat") -> str:
+    monkeypatch.setattr(
+        jobs_store,
+        "_TERMINAL_FAILURE_FALLBACK_REPLY",
+        reply_language.DEFAULT_FAILURE_FALLBACK_ZH,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "_TERMINAL_FAILURE_FALLBACK_REPLY_EN",
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN,
+    )
+    encrypted_plaintexts: list[str] = []
+
+    def capture_failure_envelope(store, plaintext, *, item_id=None):
+        encrypted_plaintexts.append(plaintext.decode("utf-8"))
+        return _fake_failure_envelope(store, plaintext, item_id=item_id)
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        capture_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, lane)
+    jobs_store.claim_next_job("w-terminal-message-language")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:runtimeerror",
+        claimed_by="w-terminal-message-language",
+    )
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+    assert result["reply_delivered"] == 1
+    assert len(encrypted_plaintexts) == 1
+    return encrypted_plaintexts[0]
+
+
+def _fallback(language: str) -> str:
+    return (
+        reply_language.DEFAULT_FAILURE_FALLBACK_EN
+        if language == "en"
+        else reply_language.DEFAULT_FAILURE_FALLBACK_ZH
+    )
+
+
+@pytest.mark.parametrize(
+    ("archive_language", "parent", "expected_language"),
+    [
+        # T743 (Seven 2026-09-26): the user's message in this turn decides.
+        ("zh-Hans-CN", {"body": "Are you still there?"}, "en"),
+        ("en-US", {"body": "你还在吗"}, "zh-Hans"),
+        # No language signal: the account language, as before.
+        ("en-US", {"body": "😀 123"}, "en"),
+        ("zh-Hans-CN", {"body": "😀 123"}, "zh-Hans"),
+    ],
+    ids=["zh-acct-en-msg", "en-acct-zh-msg", "en-acct-emoji", "zh-acct-emoji"],
+)
+def test_terminal_failure_fallback_follows_the_turns_user_message(
+    monkeypatch, request, archive_language, parent, expected_language
+):
+    uid = "u_js_terminal_msg_lang_" + request.node.callspec.id.replace("-", "_")
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    parent = dict(parent)
+    _append_plaintext_user_message(uid, parent.pop("body"), **parent)
+
+    assert _fail_and_deliver(monkeypatch, uid) == _fallback(expected_language)
+
+
+@pytest.mark.parametrize("archive_language", ["en-US", "zh-Hans-CN"])
+def test_terminal_failure_fallback_on_a_legacy_sealed_message_uses_account_language(
+    monkeypatch, archive_language
+):
+    """A sealed row cannot be read server-side: account language, never a guess."""
+    uid = "u_js_terminal_msg_lang_sealed_" + archive_language.lower().replace("-", "_")
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    _append_user_message(uid)
+
+    assert _fail_and_deliver(monkeypatch, uid) == _fallback(
+        "en" if archive_language == "en-US" else "zh-Hans"
+    )
+
+
+def test_terminal_failure_fallback_survives_an_unreadable_parent(monkeypatch):
+    """A failed read of the parent keeps the account language and still delivers."""
+    uid = "u_js_terminal_msg_lang_read_error"
+    seed_user(uid, archive_language="zh-Hans-CN")
+    _reset(uid)
+    _append_plaintext_user_message(uid, "Are you still there?")
+    real_get = db.chat_get_strict
+    lookups = []
+
+    def get_with_parent_failure(user_id, message_id):
+        if message_id == "parent-user":
+            lookups.append(message_id)
+            raise RuntimeError("simulated read failure")
+        return real_get(user_id, message_id)
+
+    monkeypatch.setattr(db, "v2_turn_failure_supersede_enabled", lambda: False)
+    monkeypatch.setattr(db, "chat_get_strict", get_with_parent_failure)
+
+    assert _fail_and_deliver(monkeypatch, uid) == _fallback("zh-Hans")
+    assert lookups == ["parent-user"], "the parent message was never looked up"
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"content_type": "text", "body": "hello", "owner_user_id": "u"}, "hello"),
+        # Attachments: only the owner's typed caption; the payload never counts.
+        ({"content_type": "image", "body_key": "r2/k", "caption_body": "look at this",
+          "owner_user_id": "u"}, "look at this"),
+        ({"content_type": "image", "body_key": "r2/k", "owner_user_id": "u"}, ""),
+        ({"content_type": "file", "body_b64": base64.b64encode(b"quarterly revenue").decode(),
+          "caption_body": "这个文件", "owner_user_id": "u"}, "这个文件"),
+        ({"content_type": "file", "body_b64": base64.b64encode(b"quarterly revenue").decode(),
+          "owner_user_id": "u"}, ""),
+        # A binary body on a text row is not typed text either.
+        ({"content_type": "text", "body_b64": base64.b64encode(b"hello").decode(),
+          "owner_user_id": "u"}, ""),
+        ({"content_type": "text", "body_ct": "sealed", "nonce": "n", "owner_user_id": "u"}, ""),
+        ({"content_type": "text", "body": "hello", "owner_user_id": "someone-else"}, ""),
+        ({"content_type": "image", "caption_body": "look", "owner_user_id": "someone-else"}, ""),
+        # The caption's own owner and shape decide, via the shared projection.
+        ({"content_type": "image", "caption_body": "look", "owner_user_id": "u",
+          "caption_owner_user_id": "u"}, "look"),
+        ({"content_type": "image", "caption_body": "look", "owner_user_id": "u",
+          "caption_owner_user_id": "someone-else"}, ""),
+        ({"content_type": "file", "caption_body_ct": "sealed", "caption_body": "stale",
+          "owner_user_id": "u"}, ""),
+        # Malformed caption rows read as no signal instead of raising.
+        ({"content_type": "image", "caption_body": "hello", "caption_v": "bad",
+          "owner_user_id": "u"}, ""),
+        ({"content_type": "image", "caption_body": "hello", "caption_v": ["1"],
+          "owner_user_id": "u"}, ""),
+        ({"content_type": "image", "caption_body": b"\xff", "owner_user_id": "u"}, ""),
+        (None, ""),
+    ],
+    ids=["text", "image-caption", "image-only", "file-caption", "file-only",
+         "text-binary", "sealed", "foreign-text", "foreign-caption",
+         "own-caption-owner", "caption-owned-by-other", "sealed-caption-stale-body",
+         "caption-v-not-a-number", "caption-v-container", "caption-not-text",
+         "missing"],
+)
+def test_terminal_failure_parent_text_reads_only_plaintext_the_user_wrote(
+    monkeypatch, row, expected
+):
+    monkeypatch.setattr(db, "chat_get_strict", lambda _uid, _mid: row)
+    assert jobs_store._terminal_failure_parent_text("u", "parent") == expected
+
+
+@pytest.mark.parametrize(
+    ("archive_language", "content_type", "payload", "caption", "expected_language"),
+    [
+        # English file body + Chinese caption: the caption is the user's words.
+        ("en-US", "file", b"quarterly revenue report", "这个文件帮我看看", "zh-Hans"),
+        # English file body, no caption: no signal ⇒ account language.
+        ("zh-Hans-CN", "file", b"quarterly revenue report", None, "zh-Hans"),
+        # Image bytes that happen to decode as ASCII words must not count.
+        ("zh-Hans-CN", "image", b"JFIF hello world", None, "zh-Hans"),
+        ("zh-Hans-CN", "image", b"JFIF hello world", "what is this", "en"),
+    ],
+    ids=["en-acct-file-zh-caption", "zh-acct-file-only", "zh-acct-image-only",
+         "zh-acct-image-en-caption"],
+)
+def test_terminal_failure_fallback_reads_attachment_captions_not_payloads(
+    monkeypatch, request, archive_language, content_type, payload, caption, expected_language
+):
+    uid = "u_js_terminal_attach_lang_" + request.node.callspec.id.replace("-", "_")
+    seed_user(uid, archive_language=archive_language)
+    _reset(uid)
+    extra = {"file_name": "a.txt", "file_mime": "text/plain"} if content_type == "file" else {}
+    if caption is not None:
+        extra.update({"caption_body": caption, "caption_owner_user_id": uid,
+                      "caption_id": "cap-1", "caption_v": 1, "caption_visibility": "shared"})
+    core_store.get_store(uid).append_chat(
+        "user",
+        "chat",
+        {
+            "v": 1,
+            "id": "parent-user",
+            "body_b64": base64.b64encode(payload).decode("ascii"),
+            "body_size_bytes": len(payload),
+            "visibility": "shared",
+            "owner_user_id": uid,
+        },
+        content_type=content_type,
+        extra=extra,
+        strict=True,
+    )
+    stored = db.chat_get_strict(uid, "parent-user")
+    assert stored["content_type"] == content_type
+    assert ("caption_body" in stored) == (caption is not None), "caption was not stored"
+
+    assert _fail_and_deliver(monkeypatch, uid) == _fallback(expected_language)
+
+
+def test_terminal_failure_with_a_malformed_caption_row_still_delivers(monkeypatch):
+    """A caption the language lookup cannot read must not delay delivery."""
+    uid = "u_js_terminal_msg_lang_bad_caption"
+    seed_user(uid, archive_language="zh-Hans-CN")
+    _reset(uid)
+    _append_plaintext_user_message(uid, "Are you still there?")
+    real_get = db.chat_get_strict
+
+    def get_with_bad_caption(user_id, message_id):
+        row = real_get(user_id, message_id)
+        if message_id == "parent-user" and isinstance(row, dict):
+            row = {**row, "content_type": "image", "caption_body": "hello",
+                   "caption_v": "bad"}
+        return row
+
+    monkeypatch.setattr(db, "v2_turn_failure_supersede_enabled", lambda: False)
+    monkeypatch.setattr(db, "chat_get_strict", get_with_bad_caption)
+
+    assert _fail_and_deliver(monkeypatch, uid) == _fallback("zh-Hans")

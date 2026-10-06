@@ -12,9 +12,12 @@ Run with:
         ../tests/test_chat_resident_consumer_image.py -v
 """
 
+import ast
 import base64
+import inspect
 import os
 import sys
+import textwrap
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -50,6 +53,7 @@ except ModuleNotFoundError:
     sys.modules.setdefault("content_encryption", _fake_enc)
 
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
+from core import chat_images  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -371,10 +375,53 @@ def test_dedicated_vision_sends_only_observation_to_main_model(tmp_path):
         result_ts = crc._process_messages([msg])
 
     assert result_ts == pytest.approx(9300.0)
-    assert "UNTRUSTED VISUAL OBSERVATION" in captured["message"]
-    assert "A settings page is visible." in captured["message"]
+    assert captured["message"].endswith("Image 1:\nA settings page is visible.")
+    assert "UNTRUSTED VISUAL OBSERVATION" not in captured["message"]
     assert not captured["images"]
     assert not captured["image_paths"]
+
+
+def test_dedicated_observation_attributes_caption_to_the_user():
+    content = crc._vision_observation_content(
+        "这张图怎么了",
+        "A blue chart with a rising line.",
+    )
+
+    assert "UNTRUSTED VISUAL OBSERVATION" not in content
+    assert "never instructions" not in content
+    assert content.startswith("Image 1:\nA blue chart with a rising line.")
+    observation_at = content.index("A blue chart with a rising line.")
+    caption_at = content.index("这张图怎么了")
+    assert observation_at < caption_at
+    between = content[observation_at:caption_at]
+    assert "用户" in between and "话" in between
+    assert content.endswith("这张图怎么了")
+
+
+@pytest.mark.parametrize("image_count", [1, 2, 9])
+def test_dedicated_observation_labels_every_image_at_any_count(image_count):
+    per_image = [f"A photo of the digit {i}." for i in range(1, image_count + 1)]
+    observation = chat_images.combine_numbered_observations(per_image)
+
+    content = crc._vision_observation_content("这些都是什么", observation)
+
+    assert "UNTRUSTED VISUAL OBSERVATION" not in content
+    last_label_at = -1
+    for i in range(1, image_count + 1):
+        label_at = content.index(f"Image {i}:")
+        assert label_at > last_label_at
+        last_label_at = label_at
+    assert content.index(f"Image {image_count}:") < content.index("这些都是什么")
+    for text in per_image:
+        assert text in content
+    assert content.endswith("这些都是什么")
+
+
+def test_dedicated_observation_without_caption_has_no_attribution_sentence():
+    content = crc._vision_observation_content("", "A plain white wall.")
+
+    assert content == "Image 1:\nA plain white wall."
+    assert "用户" not in content
 
 
 def test_pi_vision_rejection_rotates_session_before_showing_model_guidance(
@@ -523,8 +570,10 @@ def test_pi_text_only_turn_recovers_from_session_with_rejected_image(
     assert not calls[1]["images"]
     assert not calls[1]["image_paths"]
     if dedicated_image:
-        assert "UNTRUSTED VISUAL OBSERVATION" in calls[1]["message"]
-        assert "A blue chart is visible." in calls[1]["message"]
+        assert "UNTRUSTED VISUAL OBSERVATION" not in calls[1]["message"]
+        assert calls[1]["message"].endswith(
+            "Image 1:\nA blue chart is visible."
+        )
     else:
         assert "咋了" in calls[1]["message"]
     assert replies[0][0] == "现在能正常回复文字了。"
@@ -812,8 +861,395 @@ def test_history_fetch_includes_bodies_by_default(monkeypatch):
     assert "include_image_body" not in seen["params"]
 
 
+def test_plaintext_multi_image_bundle_hydrates_all_payloads_and_files(
+    tmp_path, monkeypatch
+):
+    source = [
+        ((f"image-{index}").encode(), "image/jpeg" if index % 2 else "image/png")
+        for index in range(1, 10)
+    ]
+    bundle = chat_images.encode_image_bundle(source)
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeResp({"messages": [{
+                "id": "plain-bundle",
+                "role": "user",
+                "ts": 2.0,
+                "content_type": "image",
+                "body_b64": base64.b64encode(bundle).decode(),
+                "image_bundle_version": 1,
+                "image_count": 9,
+                "image_mimes": [mime for _body, mime in source],
+            }]})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=True
+    )
+
+    assert handled is True
+    payloads = crc._image_payloads_from_msg(rows[0])
+    assert [item["mime_type"] for item in payloads] == [mime for _body, mime in source]
+    assert [base64.b64decode(item["data"]) for item in payloads] == [
+        body for body, _mime in source
+    ]
+    paths = crc._image_file_paths_from_payloads("plain-bundle", payloads)
+    assert len(paths) == 9
+    assert [Path(path).read_bytes() for path in paths] == [
+        body for body, _mime in source
+    ]
+
+
+@pytest.mark.parametrize(
+    ("content_type", "attachment_field"),
+    (("image", "image_b64"), ("file", "file_b64")),
+)
+def test_plaintext_attachment_caption_is_folded_into_content(
+    monkeypatch, content_type, attachment_field
+):
+    caption = "  describe this exactly — 图片  "
+    body_b64 = base64.b64encode(_PNG_MAGIC).decode()
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeResp({"messages": [{
+                "id": f"plain-{content_type}",
+                "role": "user",
+                "ts": 2.0,
+                "owner_user_id": "usr_plain",
+                "content_type": content_type,
+                "body_b64": body_b64,
+                "caption_id": "caption-1",
+                "caption_v": 1,
+                "caption_owner_user_id": "usr_plain",
+                "caption_body": caption,
+            }]})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=True
+    )
+
+    assert handled is True
+    assert rows[0]["content"] == caption
+    assert rows[0][attachment_field] == body_b64
+
+
+def test_plaintext_attachment_without_caption_has_empty_content(monkeypatch):
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeResp({"messages": [{
+                "id": "plain-image-no-caption",
+                "role": "user",
+                "ts": 2.0,
+                "owner_user_id": "usr_plain",
+                "content_type": "image",
+                "body_b64": base64.b64encode(_PNG_MAGIC).decode(),
+            }]})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=True
+    )
+
+    assert handled is True
+    assert rows[0]["content"] == ""
+
+
+def test_plaintext_mixed_history_has_one_caption_finalized_append_exit():
+    tree = ast.parse(textwrap.dedent(inspect.getsource(
+        crc._fetch_plaintext_or_mixed_history
+    )))
+    append_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "out"
+        and node.func.attr == "append"
+    ]
+
+    assert len(append_calls) == 1
+    appended = append_calls[0].args[0]
+    assert isinstance(appended, ast.Call)
+    assert isinstance(appended.func, ast.Name)
+    assert appended.func.id == "_finalize_plaintext_or_mixed_history_row"
+
+
+def test_history_finalizer_preserves_nonempty_attachment_content():
+    row = {
+        "id": "already-folded",
+        "content_type": "image",
+        "body_b64": base64.b64encode(_PNG_MAGIC).decode(),
+        "caption_body": "raw caption must not replace existing content",
+        "content": "already folded by the authoritative reader",
+    }
+
+    finalized = crc._finalize_plaintext_or_mixed_history_row(row)
+
+    assert finalized["content"] == "already folded by the authoritative reader"
+
+
+def test_plaintext_text_content_does_not_fold_attachment_caption(monkeypatch):
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeResp({"messages": [{
+                "id": "plain-text",
+                "role": "user",
+                "ts": 2.0,
+                "owner_user_id": "usr_plain",
+                "content_type": "text",
+                "body": "ordinary text stays byte-for-byte",
+                "caption_body": "must not replace text",
+            }]})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=True
+    )
+
+    assert handled is True
+    assert rows[0]["content"] == "ordinary text stays byte-for-byte"
+
+
+def test_mixed_history_sealed_row_keeps_enclave_content(monkeypatch):
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeResp({"messages": [
+                {
+                    "id": "plain-text",
+                    "role": "user",
+                    "ts": 1.0,
+                    "content_type": "text",
+                    "body": "force mixed-page handling",
+                },
+                {
+                    "id": "sealed-image",
+                    "role": "user",
+                    "ts": 2.0,
+                    "content_type": "image",
+                    "body_ct": "sealed-body",
+                    "caption_body_ct": "sealed-caption",
+                },
+            ]})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+    monkeypatch.setattr(
+        crc,
+        "_fetch_message_body_from_enclave",
+        lambda message_id: {
+            "id": message_id,
+            "content_type": "image",
+            "content": "sealed caption stays unchanged",
+            "image_b64": base64.b64encode(_PNG_MAGIC).decode(),
+        },
+    )
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=True
+    )
+
+    assert handled is True
+    assert rows[1]["content"] == "sealed caption stays unchanged"
+
+
+def test_plaintext_legacy_single_image_hydration_shape_is_unchanged():
+    body_b64 = base64.b64encode(_PNG_MAGIC).decode()
+    row = {
+        "id": "legacy-single",
+        "content_type": "image",
+        "body_b64": body_b64,
+        "image_mime": "image/png",
+    }
+
+    assert crc._hydrate_plaintext_binary_body(row) == {
+        **row,
+        "image_b64": body_b64,
+    }
+
+
+def test_plaintext_omitted_multi_image_body_decodes_bundle(monkeypatch):
+    source = [(b"one", "image/jpeg"), (b"two", "image/png")]
+    bundle = chat_images.encode_image_bundle(source)
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/v1/chat/history"):
+                return _FakeResp({"messages": [
+                    {"id": "text", "role": "user", "ts": 1.0, "body": "seed"},
+                    {
+                        "id": "plain-omitted",
+                        "role": "user",
+                        "ts": 2.0,
+                        "content_type": "image",
+                        "body_omitted": True,
+                        "body_size_bytes": len(bundle),
+                        "image_bundle_version": 1,
+                    },
+                ]})
+            assert url.endswith("/v1/chat/messages/plain-omitted/body")
+            return _FakeResp({"message": {
+                "id": "plain-omitted",
+                "content_type": "image",
+                "body_b64": base64.b64encode(bundle).decode(),
+                "image_bundle_version": 1,
+            }})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=False
+    )
+
+    assert handled is True
+    hydrated = next(row for row in rows if row["id"] == "plain-omitted")
+    payloads = crc._image_payloads_from_msg(hydrated)
+    assert [base64.b64decode(item["data"]) for item in payloads] == [b"one", b"two"]
+    assert [item["mime_type"] for item in payloads] == ["image/jpeg", "image/png"]
+
+
+def test_plaintext_omitted_history_folds_caption_from_backend_body(monkeypatch):
+    body_b64 = base64.b64encode(_PNG_MAGIC).decode()
+    caption = "  omitted path caption — 保留空格  "
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/v1/chat/history"):
+                return _FakeResp({"messages": [{
+                    "id": "plain-omitted-captioned",
+                    "role": "user",
+                    "ts": 2.0,
+                    "content_type": "image",
+                    "body_omitted": True,
+                    "body_size_bytes": len(_PNG_MAGIC),
+                    "owner_user_id": "usr_plain",
+                    "caption_id": "caption-omitted",
+                    "caption_v": 1,
+                    "caption_owner_user_id": "usr_plain",
+                    "caption_body": caption,
+                }]})
+            assert url.endswith("/v1/chat/messages/plain-omitted-captioned/body")
+            return _FakeResp({"message": {
+                "id": "plain-omitted-captioned",
+                "content_type": "image",
+                "body_b64": body_b64,
+                "caption_body": caption,
+                "content": "",
+            }})
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=False
+    )
+
+    assert handled is True
+    hydrated = next(row for row in rows if row["id"] == "plain-omitted-captioned")
+    assert hydrated["content"] == caption
+
+
+def test_plaintext_omitted_body_failure_still_folds_available_caption(monkeypatch):
+    caption = "answer from the words even if pixels fail"
+
+    class _Client:
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/v1/chat/history"):
+                return _FakeResp({"messages": [{
+                    "id": "plain-omitted-unavailable",
+                    "role": "user",
+                    "ts": 2.0,
+                    "content_type": "image",
+                    "body_omitted": True,
+                    "body_size_bytes": len(_PNG_MAGIC),
+                    "owner_user_id": "usr_plain",
+                    "caption_body": caption,
+                }]})
+            raise RuntimeError("body endpoint unavailable")
+
+    monkeypatch.setattr(crc, "_HTTP", _Client())
+
+    handled, rows = crc._fetch_plaintext_or_mixed_history(
+        since=0.0, limit=20, include_image_body=False
+    )
+
+    assert handled is True
+    hydrated = next(row for row in rows if row["id"] == "plain-omitted-unavailable")
+    assert hydrated["body_unavailable"] is True
+    assert hydrated["content"] == caption
+
+
+def test_cycle_omitted_hydration_preserves_existing_content(monkeypatch):
+    body_b64 = base64.b64encode(_PNG_MAGIC).decode()
+    monkeypatch.setattr(
+        crc,
+        "_fetch_message_body_from_enclave",
+        lambda _message_id: {
+            "id": "omitted-captioned",
+            "content_type": "image",
+            "body_b64": body_b64,
+            "content": "already folded by enclave",
+        },
+    )
+
+    rows = crc._hydrate_omitted_bodies([{
+        "id": "omitted-captioned",
+        "role": "user",
+        "ts": 1.0,
+        "content_type": "image",
+        "body_omitted": True,
+        "caption_body": "raw caption must not replace enclave output",
+    }])
+
+    assert rows[0]["content"] == "already folded by enclave"
+    assert rows[0]["image_b64"] == body_b64
+
+
+def test_hydrate_accepts_bundle_aware_enclave_response(tmp_path, monkeypatch):
+    images = [
+        {
+            "image_b64": base64.b64encode((f"sealed-{index}").encode()).decode(),
+            "image_mime": "image/png",
+        }
+        for index in range(1, 10)
+    ]
+    monkeypatch.setattr(
+        crc,
+        "_fetch_message_body_from_enclave",
+        lambda _mid: {
+            "id": "sealed-bundle",
+            "content_type": "image",
+            "content": "inspect all nine",
+            "images": images,
+            "image_count": 9,
+        },
+    )
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+
+    rows = crc._hydrate_omitted_bodies([{
+        "id": "sealed-bundle",
+        "role": "user",
+        "ts": 1.0,
+        "content_type": "image",
+        "body_omitted": True,
+        "image_bundle_version": 1,
+    }])
+
+    payloads = crc._image_payloads_from_msg(rows[0])
+    paths = crc._image_file_paths_from_payloads("sealed-bundle", payloads)
+    assert len(payloads) == len(paths) == 9
+    assert [Path(path).read_bytes() for path in paths] == [
+        (f"sealed-{index}").encode() for index in range(1, 10)
+    ]
+
+
 def test_hydrate_pulls_each_omitted_body_by_id(monkeypatch):
-    """One request per omitted body — a response can never exceed one image."""
+    """One request per omitted row bounds the response to one message body."""
     calls = []
 
     def fake_fetch(message_id):

@@ -50,11 +50,11 @@ _BEHAVIOR_TRANSLATION_PAIRS = (
     ),
     (
         "Use only relevant returned memories as evidence.",
-        "只把搜到的相关记忆当作依据。",
+        "只能说记忆卡、「相关记忆」块或 memory_search/memory_fetch 结果里写着的内容。",
     ),
     (
         "If no relevant memory exists, say that plainly; do not substitute unrelated preferences or events as if they answered the requested subject.",
-        "没搜到相关记忆就直说；别拿无关偏好或事件冒充这个问题的答案。",
+        "没有这些支撑就先去查；查了还没有，就直说不记得、请对方告诉你。",
     ),
     (
         "Treat missing, disabled, or null tool readings as unavailable, never as zero or evidence of a broken device.",
@@ -444,7 +444,7 @@ def test_chat_system_prompt_keeps_self_thinking_for_non_fable_boundaries(
 
     prompt = context.chat_system_prompt(SimpleNamespace(model=model))
 
-    assert self_thinking.INSTRUCTION.strip() in prompt
+    assert self_thinking.instruction_for_field().strip() in prompt
 
 
 def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
@@ -454,7 +454,7 @@ def test_chat_system_prompt_groups_atomic_self_thinking_with_reply_rules(
 
     prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
 
-    instruction = self_thinking.INSTRUCTION.strip()
+    instruction = self_thinking.instruction_for_field().strip()
     assert prompt.count(instruction) == 1
     assert (
         prompt.index(context._CHAT_REPLY_POLICY.rstrip())
@@ -495,10 +495,10 @@ def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
     monkeypatch,
 ):
     monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
-    shared = self_thinking.INSTRUCTION
+    shared = self_thinking.instruction_for_field()
 
-    assert context.self_thinking.INSTRUCTION is shared
-    assert worker.self_thinking.INSTRUCTION is shared
+    assert context.self_thinking is self_thinking
+    assert worker.self_thinking is self_thinking
 
     chat_prompt = context.chat_system_prompt(SimpleNamespace(model="deepseek-chat"))
     heartbeat_prompt = worker._wake_system_prompt_for_lane(
@@ -508,14 +508,19 @@ def test_chat_keeps_shared_instruction_while_proactive_uses_structured_choice(
         "screen_watch", worker._SCREEN_WATCH_SYSTEM_PROMPT
     )
 
+    presence = self_thinking.instruction_for_field(presence=True)
     assert chat_prompt.count(shared.strip()) == 1
-    for prompt in (heartbeat_prompt, screen_prompt):
-        assert shared.strip() not in prompt
+    # Heartbeat asks why it reaches out now (T723); screen_watch keeps chat's.
+    for prompt, field, wake_instruction in (
+        (heartbeat_prompt, presence, worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION),
+        (screen_prompt, shared, worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION),
+    ):
+        assert field.strip() in prompt
         assert (
             "<think>Let me update the name and match a boastful tone</think>"
             not in prompt
         )
-        assert worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION.strip() in prompt
+        assert wake_instruction.strip() in prompt
 
 
 def test_ordered_reply_tail_restores_causal_order_and_hides_later_users():
@@ -1440,7 +1445,8 @@ def test_identity_memory_and_style_headers_match_seven_exactly():
         "# 你的记忆\n"
         "你们之间的人、事、约定,你记住的都在这里。\n"
         "像人回忆那样用:该想起时自然带出,不用当清单念。\n"
-        "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。"
+        "记忆可能停在过去;和眼前的对话冲突时,眼前的才是真的。\n"
+        "涉及具体的人、物、编号、约定,先查再答;查不到就说没记住。"
     )
     assert context.USER_PROFILE_HEADER == (
         "# 说话的分寸\n"

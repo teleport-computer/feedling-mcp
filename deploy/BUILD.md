@@ -78,9 +78,12 @@ uv pip compile backend/requirements.txt \
 uv pip compile backend/requirements-v2-worker.txt \
     --generate-hashes \
     --python-version 3.12 \
-    --python-platform linux \
+    --python-platform x86_64-manylinux_2_28 \
     --constraint backend/requirements.lock \
     -o backend/requirements-v2-worker.lock
+# (manylinux_2_28, not the generic `linux`: onnxruntime only publishes
+#  manylinux_2_27/2_28 wheels; the python:3.12-slim base is Debian 12,
+#  glibc 2.36, so 2_28 wheels run. The main lock keeps `linux`.)
 
 # Commit both requirements*.txt (source of truth for what we want) and
 # requirements*.lock (exact versions + content hashes we ship with).

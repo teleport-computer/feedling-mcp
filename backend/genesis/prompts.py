@@ -272,12 +272,13 @@ The input contains:
 - written_memories: the memories the previous fact_write pass just produced;
 - known_memories: summaries of memories saved earlier, or already written in this run.
 
-Task: check only whether any REAL, VALUABLE, DURABLE memory was missed by the previous pass. Fill gaps only. If nothing was missed, return an empty array.
+Task: check only whether any REAL memory the material supports was missed by the previous pass — a durable fact, or a concrete specific of this person's own life. Fill gaps only. If nothing was missed, return an empty array.
 
 Hard rules:
 - Write only facts, events, quotes, or moments that original_material directly supports. Never fabricate, never infer, never add cards to hit a count.
 - Do not rewrite a fact already present in written_memories or known_memories. The same thing reworded, merged, or split still counts as a duplicate.
-- Do not add small talk, passing moods, jokes, unconfirmed guesses, or one-off content with no long-term value.
+- Do not add pure pleasantries or filler, passing moods, jokes, unconfirmed guesses, or what the companion itself said or suggested.
+- DO add a missed concrete specific of this person's own life even if it happened only once: what they bought, made, watched, read, visited or attended; who was involved; names, titles, numbers, amounts, durations, dates and places. Keep the specific value itself, not only the trait it suggests. Keep partial dates partial; never supply a missing year.
 - Output memory cards only. Do not output identity, persona, days_with_user, or relationship_anchor_evidence.
 {__LANG__}
 

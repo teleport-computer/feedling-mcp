@@ -86,6 +86,32 @@ def test_safe_failure_codes_are_members_of_the_producer_export():
         assert "private" not in code
 
 
+@pytest.mark.parametrize("status_code", [400, 422])
+@pytest.mark.parametrize("message,expected", [
+    ("Your credit balance is too low to access the Anthropic API.", "quota_insufficient"),
+    ("This tool capability is not supported.", "provider_incompatible"),
+])
+def test_wake_provider_status_preserves_specific_error_class(status_code, message, expected):
+    import httpx
+    import provider_client
+    from admin import data_track
+
+    with pytest.raises(provider_client.ProviderError) as caught:
+        provider_client._raise_for_provider_status(httpx.Response(
+            status_code, json={"error": {
+                "type": "invalid_request_error", "message": message,
+            }},
+        ))
+    code = worker._safe_failure_code("wake_failed", caught.value)
+    assert code == f"wake_failed:{expected}"
+    assert expected in notices_catalog.ERROR_CLASSES
+    assert code in worker.PUBLIC_FAILURE_CODES
+    assert jobs_store._terminal_error_class(
+        code, worker._turn_failure_error_class(caught.value)
+    ) == expected
+    assert data_track._runtime_failure_code(code) == code
+
+
 def test_wake_choice_invalid_crosses_every_terminal_code_boundary():
     exc = tool_loop.WakeChoiceInvalid()
     code = worker._safe_failure_code("wake_failed", exc)
@@ -201,6 +227,9 @@ def test_user_unavailable_outcomes_are_exact_and_producer_registered():
         "turn_failed:model_not_found",
         "turn_failed:image_generation_model_not_found",
     })
+    # 2026-09-15: Seven's exact set plus the separately reviewed, hx-approved
+    # memory-lane block (pinned in tests/test_memory_lane_user_unavailable.py).
+    expected = expected | notices_catalog.MEMORY_LANE_USER_UNAVAILABLE_V2_OUTCOME_CODES
     assert notices_catalog.USER_UNAVAILABLE_V2_OUTCOME_CODES == expected
     assert jobs_store.USER_UNAVAILABLE_OUTCOME_CODES == expected
     assert expected <= worker.PUBLIC_FAILURE_CODES
@@ -270,7 +299,7 @@ def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
             "lane": "chat",
             "error_class": "ProviderError",
             "status_code": 422,
-            "fallback_reason": "tool_schema_rejected",
+            "fallback_reason": "provider_tool_history_rejected",
             "provider_error_class": "provider_config",
             "dur_ms": 321.5,
         },
@@ -284,12 +313,16 @@ def test_provider_attempt_ledger_receives_closed_failure_facts(monkeypatch):
     assert captured["provider"] == "openrouter"
     assert captured["model"] == "relay-model"
     assert captured["status_code"] == 422
-    assert captured["fallback_reason"] == "tool_schema_rejected"
+    assert captured["fallback_reason"] == "provider_tool_history_rejected"
     assert captured["provider_error_class"] == "provider_config"
     assert captured["dur_ms"] == 321.5
     assert (
         provider_attempt_ledger.VALID_FALLBACK_REASONS
         == tool_loop._PROVIDER_ATTEMPT_FALLBACK_REASONS
+    )
+    assert (
+        "provider_tool_history_rejected"
+        in provider_attempt_ledger.VALID_FALLBACK_REASONS
     )
 
 
@@ -784,7 +817,7 @@ def test_prompt_frontier_message_breakdown_uses_only_semantic_closed_names():
         (True, "agent summary", False, "private native cot", "self"),
         (True, "", True, "private native cot", "marker"),
         (True, "", False, "private native cot", "none"),
-        (False, "", False, "private native cot", "native_legacy"),
+        (False, "", False, "private native cot", "native_discarded"),
     ],
 )
 def test_thinking_surface_selector_has_four_explicit_branches(
@@ -810,8 +843,8 @@ def test_thinking_surface_selector_has_four_explicit_branches(
     elif expected == "none":
         assert text == ""
     else:
-        assert text == provider_text
-        assert (kind, source, native) == ("provider_reasoning", None, True)
+        assert text == ""
+        assert (kind, source, native) == ("agent_summary", "self_thinking", False)
 
 
 def test_self_thinking_internal_terms_are_derived_from_tool_specs():
@@ -1118,6 +1151,9 @@ def test_provider_roundtrip_trace_closed_enums_are_admin_readable():
     assert "tool_schema_rejected" in (
         tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
     )
+    assert "provider_tool_history_rejected" in (
+        tool_loop._PROVIDER_FORCE_TEXT_FALLBACK_REASONS
+    )
     captured = []
     deps = _minimal_deps()
     deps.emit_debug_trace = lambda user_id, event_type, **fields: captured.append(
@@ -1379,6 +1415,9 @@ def test_provider_model_call_trace_cap_keeps_head_and_latest_round():
         range(1, 16)
     )
     assert [event["detail"]["round"] for event in model_events[-2:]] == [18, 18]
+    assert {event["detail"]["driver"] for event in model_events} == {"v2"}
+    assert {event["detail"]["provider"] for event in model_events} == {"anthropic"}
+    assert {event["detail"]["model"] for event in model_events} == {"claude-test"}
     summary = next(
         event for event in captured if event["type"] == "mcp.roundtrip.provider"
     )
@@ -1689,3 +1728,167 @@ def test_v2_guard_covers_tool_names_and_field_leaks():
     assert v2_worker._self_thinking_internal_term("我调 memory_write 存一下")
     assert v2_worker._self_thinking_internal_term("session_id: 我看下这个")
     assert v2_worker._self_thinking_internal_term("讨论 system prompt 的设计") is None
+
+
+def test_provider_error_signature_reaches_public_trace_without_raw_body(monkeypatch):
+    import json
+    import httpx
+    import provider_client
+    from admin import data_track
+    import debug_trace
+
+    raw_message = "Thinking may not be enabled when tool_choice forces tool use. PRIVATE-KEY-TEXT"
+    async def reject(*args, **kwargs):
+        provider_client._raise_for_provider_status(httpx.Response(400, json={
+            "error": {"type": "invalid_request_error", "message": raw_message},
+        }))
+    monkeypatch.setattr(provider_client, "chat_completion_async", reject)
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda uid, event_type, **fields: captured.append({
+        "user_id": uid, "type": event_type, **fields,
+    })
+    trace = worker._ProviderRoundtripTrace(deps=deps, user_id="u_signature", lane="heartbeat")
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=provider_client.ProviderConfig("anthropic", "claude-sonnet-4-5", "test-key"),
+            build_messages=lambda transcript: [{"role": "user", "content": "hello"}],
+            dispatch_tools=lambda *a: [], on_reply=lambda *a, **k: None,
+            fold_new_messages=lambda: [], add_usage=lambda usage: None, max_calls=1,
+            on_provider_call_event=trace.record_model_call,
+        ))
+    event, = [row for row in captured if row['type'] == 'agent.model.call.error']
+    event['detail'] = debug_trace._safe_detail(event['detail'])
+    public = data_track._debug_event_public_json(event)
+    assert public['detail']['error_signature'] == 'thinking_forced_tool_choice'
+    assert public['detail']['provider_error_type'] == 'invalid_request_error'
+    assert 'PRIVATE-KEY-TEXT' not in json.dumps(captured)
+    assert raw_message not in json.dumps(public)
+    forged = {**event, 'detail': {
+        **event['detail'], 'provider_error_type': 'private-type',
+        'error_signature': 'private-signature', 'provider_error_message': raw_message,
+    }}
+    safe = data_track._debug_event_public_json(forged)['detail']
+    assert safe.get('provider_error_type') != 'private-type'
+    assert safe.get('error_signature') != 'private-signature'
+    assert 'PRIVATE-KEY-TEXT' not in json.dumps(safe)
+
+
+@pytest.mark.parametrize("lane", ["chat", "heartbeat"])
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "gemini"])
+@pytest.mark.parametrize("status_code,expected,retry_family", [
+    (401, "auth_invalid", "provider_config"),
+    (402, "quota_insufficient", "provider_config"),
+    (429, "rate_limited", "transient"),
+    (503, "upstream_unavailable", "transient"),
+])
+def test_model_call_error_uses_notice_class_through_public_projection(
+    monkeypatch, lane, provider, status_code, expected, retry_family,
+):
+    """Observe the real loop -> worker -> persisted/public trace boundaries."""
+    import json
+    import debug_trace
+    import provider_client
+    from admin import data_track
+
+    private = "PRIVATE_PROVIDER_PAYLOAD_MUST_NOT_BE_EMITTED"
+    failure = provider_client.ProviderError(
+        private, status_code=status_code,
+        response_detail=private, raw_response_body=private,
+    )
+
+    async def reject(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", reject)
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda uid, event_type, **fields: captured.append({
+        "user_id": uid, "type": event_type, **fields,
+    })
+    trace = worker._ProviderRoundtripTrace(
+        deps=deps, user_id="u_model_error", lane=lane,
+        trace_id="trace-model-error", job_id="job-model-error",
+    )
+    with pytest.raises(provider_client.ProviderError) as caught:
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=provider_client.ProviderConfig(provider, "test-model", "test-key"),
+            build_messages=lambda transcript: [{"role": "user", "content": "hello"}],
+            dispatch_tools=lambda *a: [], on_reply=lambda *a, **k: None,
+            fold_new_messages=lambda: [], add_usage=lambda usage: None, max_calls=1,
+            on_provider_call_event=trace.record_model_call,
+        ))
+    assert caught.value is failure
+    event, = [row for row in captured if row["type"] == "agent.model.call.error"]
+    persisted = {**event, "detail": debug_trace._safe_detail(event["detail"])}
+    public = data_track._debug_event_public_json(persisted)
+    for row in (event, persisted, public):
+        assert row["detail"]["error_class"] == expected
+        assert row["detail"]["provider_error_class"] == retry_family
+        assert row["detail"]["status_code"] == status_code
+        assert row["detail"]["lane"] == lane
+    assert event["job_id"] == persisted["job_id"] == "job-model-error"
+    assert len(event["detail"]) <= 20
+    assert event["detail"]["exception_type"] == "ProviderError"
+    assert persisted["detail"]["exception_type"] == "ProviderError"
+    assert public["detail"]["exception_type"] != "ProviderError"
+    assert private not in json.dumps([captured, persisted, public])
+
+
+@pytest.mark.parametrize("failure,expected", [
+    (worker.provider_client.ProviderError("opaque", status_code=401), "auth_invalid"),
+    (worker.provider_client.ProviderError(
+        "opaque", status_code=401, raw_response_body="<html>gateway</html>",
+    ), "auth_invalid"),
+    (worker.provider_client.ProviderError("opaque", status_code=403), "auth_invalid"),
+    (worker.provider_client.ProviderError(
+        "opaque", status_code=403, raw_response_body="<html>gateway</html>",
+    ), "auth_invalid"),
+    (worker.provider_client.ProviderError(
+        "opaque", status_code=403,
+        raw_response_body='{"error":{"type":"api_error","message":"Request failed. Please try again later."}}',
+    ), "upstream_unavailable"),
+    (worker.provider_client.ProviderError("opaque", status_code=402), "quota_insufficient"),
+    (worker.provider_client.ProviderError("opaque", status_code=400), "provider_incompatible"),
+    (worker.provider_client.ProviderError(
+        "Your credit balance is too low to access the Anthropic API.", status_code=400,
+    ), "quota_insufficient"),
+    (worker.provider_client.ProviderError("opaque", status_code=422), "provider_incompatible"),
+    (worker.provider_client.ProviderError("opaque", status_code=408), "provider_timeout"),
+    (worker.provider_client.ProviderError("opaque", status_code=429), "rate_limited"),
+    (worker.provider_client.ProviderError("opaque", status_code=500), "upstream_unavailable"),
+    (worker.provider_client.ProviderError("opaque", status_code=599), "upstream_unavailable"),
+    (worker.provider_client.ProviderError("opaque", status_code=404), "unknown"),
+    (worker.provider_client.ProviderError("model missing 404", status_code=404), "model_not_found"),
+    (worker.provider_client.ProviderError("opaque"), "upstream_unavailable"),
+    (worker.provider_client.httpx.ConnectError("opaque"), "upstream_unavailable"),
+    (TimeoutError("opaque"), "provider_timeout"),
+    (RuntimeError("opaque internal failure"), "unknown"),
+])
+def test_shared_provider_cause_preserves_terminal_turn_classification(failure, expected):
+    from model_api_runtime.v2 import provider_errors
+
+    assert worker._turn_failure_error_class(failure) == expected
+    assert provider_errors.error_class_for_exception(failure) == expected
+    assert expected in notices_catalog.ERROR_CLASSES
+
+
+def test_model_call_cause_rejects_unregistered_strings():
+    from admin import data_track
+    import debug_trace
+
+    trace = worker._ProviderRoundtripTrace(
+        deps=_minimal_deps(), user_id="u_unknown_error", lane="heartbeat",
+    )
+    detail = trace._safe_model_call_detail({
+        "error_class": "PRIVATE_BUT_SLUG_SHAPED",
+        "exception_type": "RuntimeError",
+    })
+    persisted = debug_trace._safe_detail(detail)
+    public = data_track._debug_event_public_json({
+        "type": "agent.model.call.error", "detail": persisted,
+    })
+    assert detail["error_class"] == persisted["error_class"] == "unknown"
+    assert public["detail"]["error_class"] == "unknown"
+    assert persisted["exception_type"] == "RuntimeError"
+    assert public["detail"]["exception_type"] != "RuntimeError"

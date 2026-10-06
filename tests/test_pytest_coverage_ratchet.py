@@ -23,14 +23,19 @@
 """
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
+
+import pytest
 
 # conftest 的 autouse fixture 会 import 后端模块,所以即使本文件只读文本,
 # 也必须自带这行引导 —— 否则收集期就 ModuleNotFoundError。
 # (`tests/conftest.py` 的 `_PURE_UNIT` 注释专门提醒过这一点。)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+# 守卫的判据实现住在 tools/ 里,测试与守卫共用它(见 _ci_named_tests 的注释)。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+
+import ci_executed_tests  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / ".github" / "pytest-uncovered-baseline.txt"
@@ -41,7 +46,7 @@ CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 # ⚠️ 这个数**只许往下改**。调大它意味着又有一个测试文件退出了 CI ——
 # 那需要在 PR 里说明理由,而不是顺手 +1。缩小名单时请一并把这个数改小,
 # 否则棘轮会松掉。
-MAX_EXEMPTED = 279
+MAX_EXEMPTED = 259
 
 
 def _baseline_entries() -> list[str]:
@@ -53,10 +58,14 @@ def _baseline_entries() -> list[str]:
 
 
 def _ci_named_tests() -> set[str]:
-    """ci.yml 里显式点名的测试文件 —— 与守卫用的正则保持一致。"""
-    return set(
-        re.findall(r"tests/test_[A-Za-z0-9_]+\.py", CI_WORKFLOW.read_text())
-    )
+    """CI 真的执行到的测试文件 —— 与守卫共用同一份实现。
+
+    ⚠️ 这里曾经是 `re.findall(..., CI_WORKFLOW.read_text())`,即「文件名在
+    ci.yml 文本里出现过」,并且注释还写着「与守卫用的正则保持一致」——
+    守卫和它的测试一起走在**同一个错判据**上,所以谁都发现不了对方错了。
+    现在两边都 import `tools/ci_executed_tests.py`:判据只有一处,改了必须一起改。
+    """
+    return ci_executed_tests.executed_test_files(CI_WORKFLOW)
 
 
 def test_the_exemption_list_only_ever_shrinks():
@@ -103,3 +112,627 @@ def test_the_ratchet_constant_matches_reality():
         f"MAX_EXEMPTED={MAX_EXEMPTED} 与实际 {actual} 条不符。\n"
         "名单缩小之后请把这个常量一起改小,否则等于给未来预留了免检额度。"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 判据本身的回归:「覆盖」必须是「真的被执行」,不是「名字出现过」。
+#
+# 用合成 workflow 而不是真 ci.yml —— 真文件此刻两种判据同解(452 = 452,零幽灵),
+# 拿它做断言等于零判别力:旧判据也会全绿。合成用例把两者分开。
+#
+# 下面每一行都对应一个真实踩过的形状:前五条是审计里实测出的假绿(命令边界、
+# 管道、行尾注释、echo 里的文件名),F/K/L/M 是修那五条时**自己引入**的假红 ——
+# `\` 续行被当成命令分隔符,真 workflow 的覆盖集从 452 塌到 10。
+# 两个方向都要钉住,只钉一边下次就会从另一边漏。
+# --------------------------------------------------------------------------- #
+
+_GHOST = "tests/test_ghost.py"
+_REAL = "tests/test_real.py"
+
+# 每一行都对应一个真实踩过的形状。前五组是审计一轮报的假绿(命令边界/管道/行尾
+# 注释/echo 里的文件名);重定向、`|&`/`;&`、heredoc 体、跨行引号、--ignore、
+# --collect-only 是审计二轮报的;续行那几条是我**自己修一轮时引入的假红**
+# (`\` 续行被当成命令分隔符,真 workflow 覆盖集从 452 塌到 10)。
+# 两个方向都要钉:只钉一边,下次就从另一边漏。
+_SHAPES = [
+    # —— 真执行,必须算覆盖 ——
+    ("pytest 参数", f"pytest {_REAL}", {_REAL}),
+    ("python -m pytest", f"python -m pytest {_REAL}", {_REAL}),
+    ("env 前缀", f"PYTHONPATH=backend python -m pytest {_REAL} -v", {_REAL}),
+    ("脚本直跑(自定义 runner)",
+     "python tests/test_api.py http://127.0.0.1:5001 --multi-tenant",
+     {"tests/test_api.py"}),
+    ("续行", f"python -m pytest \\\n  {_REAL} \\\n  -v", {_REAL}),
+    ("续行 + tee",
+     f"python -m pytest \\\n  {_REAL} \\\n  -v | tee /tmp/x.log", {_REAL}),
+    ("行尾管道续行", f"cat x |\n  python -m pytest {_REAL}", {_REAL}),
+    ("管道后接 pytest", f"cat x | python -m pytest {_REAL}", {_REAL}),
+    ("heredoc 之后照常解析",
+     f"cat <<EOF\npytest {_GHOST}\nEOF\npytest {_REAL}", {_REAL}),
+
+    # —— 只是被提到 / 明确不执行,不能算覆盖 ——
+    # 这两条原本期望 {_REAL}(只把 ghost 排除掉)。审计四轮指出 &&/|| 是**条件**
+    # 分隔符,`true || pytest x` 里 pytest 根本不执行 —— 可达性没建模就不能只排 ghost。
+    # 于是行为改成:条件命令列里出现 pytest ⇒ 放弃整段。期望随之改成 set()。
+    ("&& 之前的 echo(条件列 ⇒ 放弃)", f"echo {_GHOST} && pytest {_REAL}", set()),
+    ("&& 之后的 echo(条件列 ⇒ 放弃)", f"pytest {_REAL} && echo {_GHOST}", set()),
+    ("换行分隔的另一条命令", f"echo {_GHOST}\npytest {_REAL}", {_REAL}),
+    ("重定向目标 >", f"pytest {_REAL} > {_GHOST}", {_REAL}),
+    ("重定向目标 2>", f"pytest {_REAL} 2> {_GHOST}", {_REAL}),
+    ("重定向目标 &>", f"pytest {_REAL} &> {_GHOST}", {_REAL}),
+    ("|& 复合操作符", f"pytest {_REAL} |& echo {_GHOST}", {_REAL}),
+    (";& 复合操作符", f"pytest {_REAL} ;& echo {_GHOST}", {_REAL}),
+    ("--ignore 的操作数", f"pytest {_REAL} --ignore {_GHOST}", {_REAL}),
+    ("--ignore= 的操作数", f"pytest {_REAL} --ignore={_GHOST}", {_REAL}),
+    ("--deselect 的操作数", f"pytest {_REAL} --deselect {_GHOST}", {_REAL}),
+    ("--collect-only 不执行", f"pytest --collect-only {_GHOST}", set()),
+    ("--co 不执行", f"pytest --co {_GHOST}", set()),
+    ("heredoc 体里的 pytest", f"cat <<EOF\npytest {_GHOST}\nEOF", set()),
+    ("跨行引号中间那行", f'echo "start\npytest {_GHOST}\nend"', set()),
+    ("行尾注释里的 pytest", f"echo ok # pytest {_GHOST}", set()),
+    ("echo 里的 python 调用", f"echo python {_GHOST}", set()),
+    ("引号里的文件名", f'echo "grep {_GHOST}"', set()),
+    # 未知包装器不认 ⇒ 判未覆盖(假红)。方向刻意:漏判只会逼作者去看,
+    # 误判成已覆盖才会让「测试没在跑」永远无人发现。
+    ("未知包装器 xargs(刻意假红)",
+     f"printf {_GHOST} | xargs pytest {_REAL}", set()),
+    # —— 审计三轮报的:选项元数 / 重定向文法 / 多 heredoc ——
+    # `python -X x.py y.py` 真正跑的是 y:-X 把 x 当成了自己的选项值
+    # (拿 python 自己验过:sys._xoptions == {'tests/test_ghost.py': True})。
+    # 「跳过 - 开头的、取第一个非选项」这套是不成立的,所以遇到非零元数/未知选项
+    # 一律放弃整段。
+    ("python -X 吞掉后一个参数(放弃整段)", f"python -X {_GHOST} {_REAL}", set()),
+    ("python 零元数选项照常识别", f"python -u {_REAL}", {_REAL}),
+    (">& 重定向目标", f"pytest {_REAL} >& {_GHOST}", {_REAL}),
+    (">| 重定向目标", f"pytest {_REAL} >| {_GHOST}", {_REAL}),
+    ("<> 重定向目标", f"pytest {_REAL} <> {_GHOST}", {_REAL}),
+    ("一条命令上的多个 heredoc",
+     f"cat <<A <<B\nbody-a\nA\npytest {_GHOST}\nB", set()),
+    ("--setup-only 不执行用例", f"pytest --setup-only {_GHOST}", set()),
+    ("--setup-plan 不执行用例", f"pytest --setup-plan {_GHOST}", set()),
+    # —— 审计四轮报的:短路求值 / heredoc 定界符精确性 / pytest 选项白名单 ——
+    # `true || pytest x` 与 `false && pytest x || true` 都以 0 退出,而 pytest
+    # 一次都没跑。把 &&/|| 当无条件分隔符 = 把「证明没执行」的文件算成已覆盖。
+    # 可达性没有建模,所以条件命令列里出现 pytest ⇒ 放弃整段(真 workflow 实测 0 处)。
+    ("|| 短路:pytest 不会执行", f"true || pytest {_GHOST}", set()),
+    ("&& 短路后接 ||", f"false && pytest {_GHOST} || true", set()),
+    # bash 只对 `<<-` 剥**制表符**,`<<` 要求定界符独占一行且不缩进。
+    # 用 .strip() 会在缩进的 EOF 处提前结束,把后面的数据当命令。
+    # (两条都拿 bash 实跑对过:`<<` + 空格缩进不结束;`<<-` + tab 缩进结束。)
+    ("<< 的定界符必须不缩进", f"cat <<EOF\n  EOF\npytest {_GHOST}\nEOF", set()),
+    ("<<- 剥 tab 后定界符成立",
+     f"cat <<-EOF\n\tEOF\npytest {_GHOST}\nEOF", {_GHOST}),
+    ("--fixtures 只显示不执行", f"pytest --fixtures {_GHOST}", set()),
+    ("--fixtures-per-test 只显示不执行",
+     f"pytest --fixtures-per-test {_GHOST}", set()),
+    # 选项走白名单:真 CI 只用到 `-v`(实测)。未知选项语义没人建模 ⇒ 放弃。
+    ("未知 pytest 选项 ⇒ 放弃整段", f"pytest --wat {_REAL}", set()),
+    ("-v 在白名单里", f"pytest {_REAL} -v", {_REAL}),
+    ("; 是无条件分隔符,照常算", f"echo hi ; pytest {_REAL}", {_REAL}),
+    # —— 审计五轮报的:多行控制流 / 反斜杠 heredoc 定界符 ——
+    # `if false; then pytest x; fi` 与未命中的 case 分支都以 0 退出且 pytest 没跑。
+    # &&/|| 只堵住了单行那一种条件语法。可达性仍不建模,于是**从第一个控制关键字起
+    # 往后一律不计**(前向截断而不是整段放弃:真 workflow 唯一含控制关键字的 step
+    # 其 pytest 在第 1 行、`if` 在第 4 行,实测过,截断后 452 一个不少)。
+    ("if false 分支里的 pytest", f"if false; then\n  pytest {_GHOST}\nfi", set()),
+    ("未命中的 case 分支", f"case x in\n  y) pytest {_GHOST} ;;\nesac", set()),
+    ("for 循环体", f"for f in x; do pytest {_GHOST}; done", set()),
+    ("控制结构**之前**的 pytest 仍保留",
+     f"pytest {_REAL}\nif true; then pytest {_GHOST}; fi", {_REAL}),
+    # `<<\EOF` 与 `<<'EOF'` 一样是带引的定界符(拿 bash 实跑对过:体内那行原样打印,
+    # 说明是数据)。定界符形式认不出来时不再猜,直接放弃整段。
+    ("反斜杠引的 heredoc 定界符",
+     f"cat <<\\EOF\npytest {_GHOST}\nEOF", set()),
+]
+
+
+@pytest.mark.parametrize(
+    "label,script,expected", _SHAPES, ids=[s[0] for s in _SHAPES]
+)
+def test_only_actually_executed_files_count_as_covered(label, script, expected):
+    assert ci_executed_tests.executed_in_script(script) == expected, label
+
+
+def test_the_real_workflow_is_not_shredded_by_the_parser():
+    """真 ci.yml 必须解析出成百个文件。
+
+    修假绿时我把 `\\` 续行当成命令分隔符,真 workflow 的覆盖集从 452 塌到 10,
+    而合成用例全绿 —— 因为它们都是单行。这条守着「别把真文件解析碎了」。
+    """
+    executed = ci_executed_tests.executed_test_files(CI_WORKFLOW)
+
+    assert len(executed) > 300, (
+        f"只从 ci.yml 解析出 {len(executed)} 个被执行的测试文件 —— "
+        "多半是命令切分把真实调用拆碎了,而不是 CI 真的只跑这么几个。"
+    )
+
+
+def test_real_workflow_coverage_stays_within_the_workflow_text():
+    """弱不变量:解析结果是文本里出现过的名字的子集,且文件真实存在。
+
+    ⚠️ 名字和文档都是被审计纠正过的。它**证明不了**真 workflow 上没有假阳性:
+    `executed <= mentioned` 按构造恒真(名字本来就是从这份文本里抽的),
+    而「文件存在」也分不开「被执行」与「仅被提到」—— 真实的假阳性用的就是存在的路径。
+    留着它只是为了拦住「凭空造出仓库里没有的名字」这种解析垃圾,不承担更多。
+    真正拦假阳性的是下面那条对真 ci.yml 做变异的用例。
+    """
+    executed = ci_executed_tests.executed_test_files(CI_WORKFLOW)
+    mentioned = ci_executed_tests.mentioned_test_files(CI_WORKFLOW)
+    dynamic = ci_executed_tests.dynamically_executed_test_files(CI_WORKFLOW)
+
+    # 动态发现的文件是运行时 grep 仓库树挑出来的,**本就不在 workflow 文本里**,
+    # 所以子集关系扩成 `executed <= 文本提到 ∪ 动态发现`;两类以外的名字才算凭空捏造。
+    assert executed <= mentioned | dynamic
+    missing = sorted(name for name in executed if not (ROOT / name).exists())
+    assert missing == [], f"判为「被执行」但仓库里不存在的文件:{missing}"
+
+
+def test_real_workflow_stops_covering_a_file_moved_into_a_comment(tmp_path):
+    """真·假阳性守卫:拿真 ci.yml 做变异。
+
+    合成用例只能证明「这种写法我处理对了」,证明不了在**真文件**这么复杂的
+    上下文里也对。这里把一个真的在跑的测试从它的 pytest 命令里删掉、把名字挪进
+    注释 —— 覆盖集必须**少掉这一个**。旧判据(文本 grep)在同一份变异上仍判它已覆盖,
+    这正是本单要堵的洞。
+    """
+    original = CI_WORKFLOW.read_text()
+    victim = "tests/test_pytest_coverage_ratchet.py"
+    argument = f"            {victim} \\\n"
+    assert original.count(argument) == 1, "变异锚点不唯一,请更新这条用例"
+
+    mutated = original.replace(argument, "")
+    mutated = mutated.replace(
+        "      - name: Guard top-level pytest discovery coverage",
+        f"      # TODO: 恢复 {victim}\n"
+        "      - name: Guard top-level pytest discovery coverage",
+    )
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text(mutated)
+
+    executed = ci_executed_tests.executed_test_files(workflow)
+    mentioned = ci_executed_tests.mentioned_test_files(workflow)
+
+    assert victim not in executed, "从命令里删掉后仍被判已覆盖 —— 假阳性回来了"
+    assert victim in mentioned, "旧判据(文本出现过)在同一变异上仍是绿的"
+    assert ci_executed_tests.executed_test_files(CI_WORKFLOW) - executed == {victim}, (
+        "变异只应影响这一个文件;影响面不同说明解析被这次改动带偏了"
+    )
+
+
+def test_old_criterion_would_have_missed_the_ghosts(tmp_path):
+    """把「旧判据会放行」钉住,免得将来有人悄悄换回文本 grep。"""
+    script = (
+        "echo tests/test_ghost_in_echo.py\n"
+        "# pytest tests/test_ghost_in_comment.py\n"
+        "pytest tests/test_real.py"
+    )
+    body = "\n".join("          " + line for line in script.split("\n"))
+    workflow = tmp_path / "ci.yml"
+    workflow.write_text("jobs:\n  j:\n    steps:\n      - run: |\n" + body + "\n")
+
+    mentioned = ci_executed_tests.mentioned_test_files(workflow)
+    executed = ci_executed_tests.executed_test_files(workflow)
+
+    assert mentioned - executed == {
+        "tests/test_ghost_in_echo.py",
+        "tests/test_ghost_in_comment.py",
+    }
+
+
+def test_step_file_count_labels_match_the_actual_command():
+    """step 名字里的「(N files)」必须等于该 step 真的传给 pytest 的文件数。
+
+    这类数字是装饰性的、没人校验,于是会静静地漂:本次修复时 tier 3 的标签写着
+    71,`run:` 块里实际列着 76 个(差 5,历史累积)。读的人会拿它当清单长度的判据,
+    所以让它自己变红,而不是靠人去数。
+    """
+    import re
+
+    import yaml
+
+    workflow = yaml.safe_load(CI_WORKFLOW.read_text())
+    mismatched = []
+    for job in (workflow.get("jobs") or {}).values():
+        for step in (job.get("steps") or []):
+            if not isinstance(step, dict) or not step.get("run"):
+                continue
+            name = step.get("name") or ""
+            label = re.search(r"\((\d+)\s+files\)", name)
+            if not label:
+                continue
+            actual = ci_executed_tests.executed_in_script(step["run"])
+            if int(label.group(1)) != len(actual):
+                mismatched.append((name, int(label.group(1)), len(actual)))
+
+    assert mismatched == [], (
+        "这些 step 的文件数标签与实际不符(标签, 实际):\n"
+        + "\n".join(f"  {n}: 标签={l} 实际={a}" for n, l, a in mismatched)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 全覆盖断言 + 动态发现识别器的合成用例(T546)
+# ---------------------------------------------------------------------------
+
+def _all_top_level_tests() -> set[str]:
+    """tests/test_*.py(maxdepth 1)—— 与 ci.yml 的 `find tests -maxdepth 1
+    -name 'test_*.py'` 同口径。"""
+    return {("tests/" + p.name) for p in (ROOT / "tests").glob("test_*.py")}
+
+
+def test_every_top_level_test_is_executed_or_exempt():
+    """每个 tests/test_*.py 要么被 CI 执行(字面 ∪ 动态发现),要么在豁免名单里。
+
+    这是 T534/T536「静态盲区」的正面堵口:只要有文件既不跑、又不豁免,它就是
+    「悄悄没跑」的测试,这条让它在 CI 里必须现形。动态 consumer suite 的覆盖现在
+    经 ci_executed_tests 的动态识别器纳入执行面,所以真未跑 = 0。
+    """
+    all_tests = _all_top_level_tests()
+    executed = ci_executed_tests.executed_test_files(CI_WORKFLOW)
+    exempt = set(_baseline_entries())
+    uncovered = sorted(all_tests - executed - exempt)
+
+    assert uncovered == [], (
+        "这些 top-level 测试既不在 CI 执行面(字面 ∪ 动态 grep 发现)、也不在豁免名单里,"
+        "等于悄悄没跑:\n" + "\n".join(uncovered)
+    )
+
+
+def test_disabling_dynamic_discovery_would_strand_the_consumer_suite():
+    """动态发现是 load-bearing:只用字面解析,真 workflow 上会漏掉一批只靠 grep
+    命中的 consumer 测试(当前 ≈53),它们会从已覆盖掉到未覆盖。
+
+    这条把「有人悄悄关掉动态识别」钉成会红:它独立计算「仅字面执行面」与豁免名单之差,
+    断言这个差非空 —— 即存在只靠动态发现才覆盖的文件。配合对 ci_executed_tests
+    的 mutation(dynamic 返回空)会让 test_every_top_level_test_is_executed_or_exempt
+    精确转红,这里则把「缺口确实存在」作为不依赖 mutation 的常驻事实钉住。
+    """
+    import yaml as _yaml
+
+    workflow = _yaml.safe_load(CI_WORKFLOW.read_text())
+    literal_only: set[str] = set()
+    for job in (workflow.get("jobs") or {}).values():
+        for step in (job.get("steps") or []):
+            if isinstance(step, dict) and isinstance(step.get("run"), str):
+                literal_only |= ci_executed_tests.executed_in_script(step["run"])
+
+    exempt = set(_baseline_entries())
+    all_tests = _all_top_level_tests()
+    would_be_uncovered = sorted(all_tests - literal_only - exempt)
+
+    assert would_be_uncovered, (
+        "关掉动态发现后没有任何文件变未覆盖 —— 要么动态 idiom 失效,"
+        "要么它已无独占覆盖(那 full-coverage 断言就完全靠豁免名单兜着,危险)。"
+    )
+
+
+# --- dynamic_executed_in_script 合成用例(codex2 清单) ---
+
+_PRED = r"MARKER_CONSUMER"
+
+
+def _fixture_repo(tmp_path, matching: int, non_matching: int = 1):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    made = []
+    for i in range(matching):
+        f = tests / f"test_match_{i}.py"
+        f.write_text("# MARKER_CONSUMER\nassert True\n")
+        made.append("tests/" + f.name)
+    for i in range(non_matching):
+        (tests / f"test_plain_{i}.py").write_text("assert True\n")
+    return tmp_path, sorted(made)
+
+
+def _dyn(script: str, repo_root) -> set:
+    return ci_executed_tests.dynamic_executed_in_script(script, repo_root)
+
+
+def test_dynamic_bind_and_consume_credits_matches(tmp_path):
+    repo, made = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set(made)
+
+
+def test_dynamic_bind_without_consume_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "echo built"
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_consume_without_bind_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    assert _dyn('python -m pytest "${v[@]}" -v', repo) == set()
+
+
+def test_dynamic_consume_inside_conditional_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if true; then\n"
+        '  python -m pytest "${v[@]}" -v\n'
+        "fi"
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_variable_mismatch_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${other[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_below_min_count_guard_credits_nothing(tmp_path):
+    repo, made = _fixture_repo(tmp_path, matching=2)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if (( ${#v[@]} < 5 )); then\n"
+        "  echo too few\n"
+        "  exit 1\n"
+        "fi\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    # predicate matches only 2 < guard 5 ⇒ CI would exit before pytest ran
+    assert _dyn(script, repo) == set()
+
+
+def test_dynamic_meets_min_count_guard_credits_matches(tmp_path):
+    repo, made = _fixture_repo(tmp_path, matching=6)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if (( ${#v[@]} < 5 )); then\n"
+        "  echo too few\n"
+        "  exit 1\n"
+        "fi\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set(made)
+
+
+def test_dynamic_unsupported_grep_shape_credits_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    # double-quoted predicate / different glob are not the trusted shape
+    script = (
+        'mapfile -t v < <(grep -l -E "MARKER_CONSUMER" tests/unit/*.py | sort)\n'
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+# --- codex2 的 6 个 false-green 反例(固化 state machine 的 fail-closed 语义) ---
+# 早期「全局找 binding + 任意顶层 array token」的实现对这六种脚本都错误 credit 了
+# 全量 predicate 命中;state machine 必须对每一种都返回空集。
+
+def test_fg_consume_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        'python -m pytest "${v[@]}" -v\n'
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)"
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_leading_exit_guard_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "if true; then\n  exit 0\nfi\n"
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_binding_in_dead_false_branch(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "if false; then\n"
+        "  mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "fi\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_collect_only_runs_nothing(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest --collect-only "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_variable_reset_to_empty_after_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "v=()\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_consume_inside_unbalanced_if(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if true; then\n"
+        '  python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_second_unmodelled_mapfile_fails_closed(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "mapfile -t w < <(ls tests)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+# --- round6 反例:benign 首命令不得掩护终止/变量改写(逐 segment 严格校验) ---
+
+def test_fg_direct_exit_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "exit 0\n"
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_benign_prefix_hiding_exit_before_binding(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "printf setup; exit 0\n"
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_benign_prefix_hiding_variable_reset(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf ok; v=()\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_benign_prefix_hiding_false_terminator(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf ok; false\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+# --- round8 反例:printf -v 变量改写 / 可失败 printf / consume 重定向失败 ---
+
+def test_fg_printf_dash_v_rewrites_the_array(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'printf -v v %s ""\n'   # 把数组改写成单元素空串
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_failable_printf_format_before_consume(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf %d nope\n"      # bash -e 下 rc=1,pytest 不可达
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_consume_with_failed_input_redirection(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -v < /definitely/missing/input'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_only_the_exact_ci_running_log_is_accepted(tmp_path):
+    """日志行按**当前 CI 固定 format** verbatim 绑定:真 step 的
+    ``printf 'Running %d resident consumer test files\\n' "${#v[@]}"`` 接受;
+    任何漂移的 format(哪怕同样只有 %d)都 fail closed —— 防止 ``printf -v`` /
+    ``printf --help`` 等用选项冒充 format 溜过去。"""
+    repo, made = _fixture_repo(tmp_path, matching=6)
+    exact = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf 'Running %d resident consumer test files\\n' \"${#v[@]}\"\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(exact, repo) == set(made)
+
+    drifted = exact.replace(
+        "Running %d resident consumer test files", "Running %d files"
+    )
+    assert _dyn(drifted, repo) == set()
+
+
+def test_fg_printf_option_masquerading_as_format(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    for masq in ('printf -v "${#v[@]}"', 'printf --help "${#v[@]}"'):
+        script = (
+            "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+            + masq + "\n"
+            'python -m pytest "${v[@]}" -v'
+        )
+        assert _dyn(script, repo) == set(), masq
+
+
+def test_fg_printf_without_format(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "printf\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_printf_invalid_conversion(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'printf %Q "${#v[@]}"\n'   # bash -e 下 rc=1,pytest 不可达
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_pytest_k_filter_deselects_everything(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" -k __T546_NO_TEST_CAN_MATCH__'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_fg_pytest_ignore_excludes_the_files(tmp_path):
+    repo, _ = _fixture_repo(tmp_path, matching=3)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        'python -m pytest "${v[@]}" --ignore=tests'
+    )
+    assert _dyn(script, repo) == set()
+
+
+def test_exact_real_step_shape_is_accepted(tmp_path):
+    """把真实 step 的完整形状(binding + min-count guard + Running 日志 + consume)
+    当正例钉住,确保 exact recognizer 没收窄到连真 step 都拒。"""
+    repo, made = _fixture_repo(tmp_path, matching=6)
+    script = (
+        "mapfile -t v < <(grep -l -E 'MARKER_CONSUMER' tests/test_*.py | sort)\n"
+        "if (( ${#v[@]} < 5 )); then\n"
+        '  echo "resident consumer test discovery unexpectedly found only ${#v[@]} files"\n'
+        "  exit 1\n"
+        "fi\n"
+        "printf 'Running %d resident consumer test files\\n' \"${#v[@]}\"\n"
+        'python -m pytest "${v[@]}" -v'
+    )
+    assert _dyn(script, repo) == set(made)

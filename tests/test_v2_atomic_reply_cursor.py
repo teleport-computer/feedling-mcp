@@ -772,8 +772,7 @@ def test_atomic_reply_retains_source_history_without_tee_eviction(monkeypatch):
 
     from tee_shadow import mirror
 
-    mirrored: list[list[tuple[str, tuple]]] = []
-    monkeypatch.setattr(mirror, "execute_many", lambda statements: mirrored.append(statements))
+    mirrored = conftest.capture_mirror_groups(monkeypatch)
 
     # The process-wide debug trace stats writer shares this mirror entrypoint
     # and may flush while this test owns the monkeypatch.  Keep an unrelated
@@ -1245,6 +1244,12 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
         user_id=uid,
         claimed_by=str(wake_job["claimed_by"]),
     ) == "completed"
+    # T773: the heartbeat yielded before any model call; it must not read as "spoke".
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT wake_result, wake_result_reason FROM agent_jobs WHERE id=%s",
+            (wake_id,),
+        ).fetchone() == ("skipped", "yielded_to_chat")
 
     chat_job = jobs_store.claim_next_job("chat-after-wake-yield")
     assert chat_job is not None and chat_job["lane"] == "chat"

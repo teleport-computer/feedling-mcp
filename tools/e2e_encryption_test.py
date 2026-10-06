@@ -15,7 +15,7 @@ Prereqs:
   - Python deps: fastapi, nacl, dstack_sdk, httpx, requests
 
 Run:
-  python3 tools/e2e_v2_encryption_test.py
+  python3 tools/e2e_encryption_test.py
 """
 
 from __future__ import annotations
@@ -75,10 +75,13 @@ PASS = "\033[92m✓\033[0m"
 FAIL = "\033[91m✗\033[0m"
 
 _failures = []
+_passes = 0
 
 
 def check(name: str, cond: bool, detail: str = ""):
+    global _passes
     if cond:
+        _passes += 1
         print(f"  {PASS} {name}")
     else:
         print(f"  {FAIL} {name}" + (f" — {detail}" if detail else ""))
@@ -235,14 +238,16 @@ def main():
         check("backend healthy on :5001", ok)
         if not ok:
             print(Path(f"{data_dir}/backend.log").read_text()[-2000:])
-            return
+            print("SETUP FAILED: backend did not become healthy (exit 2)")
+            sys.exit(2)
 
         enclave.start()
         ok = wait_for("http://127.0.0.1:5003/healthz", 15)
         check("enclave ready on :5003", ok)
         if not ok:
             print(Path(f"{data_dir}/enclave.log").read_text()[-2000:])
-            return
+            print("SETUP FAILED: enclave did not become ready (exit 2)")
+            sys.exit(2)
 
         section("Fetch attestation + enclave pubkey")
         att = requests.get("http://127.0.0.1:5003/attestation", timeout=5).json()
@@ -353,7 +358,7 @@ def main():
         # Build a memory envelope. body = JSON {title, description, type}
         mem_plain = {"title": "第一次聊到她奶奶",
                      "description": "她说起奶奶做的包子，停顿了很久。",
-                     "type": "温柔时刻"}
+                     "type": "moment"}
         mem_body = json.dumps(mem_plain, ensure_ascii=False).encode("utf-8")
         K_m = secrets.token_bytes(32); nonce_m = secrets.token_bytes(12)  # ChaCha20-Poly1305 IETF nonce
         mem_id = f"mom_{secrets.token_hex(6)}"
@@ -369,13 +374,25 @@ def main():
             "enclave_pk_fpr": enclave_pk.encode()[:16].hex(),
             "visibility": "shared",
             "owner_user_id": user_id,
-            "occurred_at": "2025-11-03T14:00:00",
+            # memory.actions stores memgarden.timestamps.normalize output:
+            # datetime fixtures use canonical UTC so this is an exact round-trip.
+            "occurred_at": "2025-11-03T14:00:00Z",
             "source": "bootstrap",
+            # memory.actions::_memory_validate_prebuilt_envelope requires
+            # the canonical type as plaintext metadata, outside body_ct.
+            "type": mem_plain["type"],
         }
+        missing_type = {k: v for k, v in mem_env.items() if k != "type"}
+        r = requests.post("http://127.0.0.1:5001/v1/memory/add",
+                          headers={"X-API-Key": api_key},
+                          json={"envelope": missing_type}, timeout=5)
+        check("memory without metadata type rejected with type_required",
+              r.status_code == 400 and r.json().get("error") == "type_required",
+              f"{r.status_code}: {r.text[:120]}")
         r = requests.post("http://127.0.0.1:5001/v1/memory/add",
                           headers={"X-API-Key": api_key},
                           json={"envelope": mem_env}, timeout=5)
-        check("POST memory v1 envelope 200", r.status_code == 201,
+        check("POST memory v1 envelope 201", r.status_code == 201,
               f"{r.status_code}: {r.text[:120]}")
         r = requests.get("http://127.0.0.1:5003/v1/memory/list",
                          headers={"X-API-Key": api_key}, timeout=10)
@@ -389,7 +406,8 @@ def main():
                 check("memory description round-trips",
                       ours[0].get("description") == mem_plain["description"])
                 check("memory occurred_at preserved as metadata",
-                      ours[0].get("occurred_at") == "2025-11-03T14:00:00")
+                      ours[0].get("occurred_at") == mem_env["occurred_at"],
+                      repr(ours[0].get("occurred_at")))
 
         section("Identity: encrypted round-trip via /v1/identity/get")
         # Fresh user so identity isn't already set.
@@ -418,9 +436,28 @@ def main():
             "visibility": "shared",
             "owner_user_id": user3_id,
         }
+        # identity_core::init_identity requires a nonnegative day count and
+        # concrete anchor evidence. This user was just registered above and
+        # has no memories, so its relationship starts today.
+        identity_payload = {
+            "envelope": id_env,
+            "days_with_user": 0,
+            "relationship_anchor_evidence": "E2E fresh registration; no prior memories.",
+        }
+        for field, error in (
+            ("days_with_user", "days_with_user (non-negative int) required at init"),
+            ("relationship_anchor_evidence", "relationship_anchor_evidence required at init"),
+        ):
+            missing_field = {k: v for k, v in identity_payload.items() if k != field}
+            r = requests.post("http://127.0.0.1:5001/v1/identity/init",
+                              headers={"X-API-Key": user3_key},
+                              json=missing_field, timeout=5)
+            check(f"identity without {field} rejected with required-field error",
+                  r.status_code == 400 and r.json().get("error") == error,
+                  f"{r.status_code}: {r.text[:120]}")
         r = requests.post("http://127.0.0.1:5001/v1/identity/init",
                           headers={"X-API-Key": user3_key},
-                          json={"envelope": id_env}, timeout=5)
+                          json=identity_payload, timeout=5)
         check("POST identity v1 envelope 201", r.status_code == 201,
               f"{r.status_code}: {r.text[:120]}")
         r = requests.get("http://127.0.0.1:5003/v1/identity/get",
@@ -445,6 +482,7 @@ def main():
         check("no api_key → 401 (identity)", r.status_code == 401)
 
         section("Summary")
+        print(f"{_passes} passed, {len(_failures)} failed")
         if _failures:
             print(f"{FAIL} {len(_failures)} failed:")
             for f in _failures:

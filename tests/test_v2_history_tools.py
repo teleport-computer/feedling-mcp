@@ -113,11 +113,12 @@ def test_history_search_description_carries_three_state_semantics():
 
 
 def test_history_search_description_states_the_escalation_relationship():
-    """`memory_search` 是默认路径,`history_search` 是**升级**而非平行选项,且两者串行。
+    """记忆卡导航是默认路径,`history_search` 是**升级**而非平行选项,且两者串行。
 
     这三句是产品口径(Seven 2026-08-21:「用户聊到以前的事情时最常用的还是
     memory search……这两个并不是平行关系,95% 的情况 memory search 都能搞定,
-    history search 只是留作备选」),不是措辞偏好。
+    history search 只是留作备选」),不是措辞偏好。T513 将默认入口扩为
+    bucket/thread/search 导航,但没有撤销历史检索的升级关系或同批禁令。
 
     为什么必须单独一条:
     - 2026-08-19 那次改动把「memory tools miss 才用」删掉、换成「Use this directly」,
@@ -130,7 +131,8 @@ def test_history_search_description_states_the_escalation_relationship():
     desc = tool_schema.DESCRIPTIONS["history_search"]
 
     # ① 默认路径是谁
-    assert "memory_search is the normal path" in desc
+    assert "Memory-card navigation is the normal path" in desc
+    assert "memory_search is the normal path" not in desc
     # ② 自己是升级、不是平行选项
     assert "escalation" in desc and "not a parallel option" in desc
     # ③ 串行:不许同批一起调

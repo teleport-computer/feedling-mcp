@@ -13,6 +13,9 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+from conftest import capture_mirror_groups
 
 import httpx
 import pytest
@@ -90,9 +93,7 @@ def mirror_log(monkeypatch):
     """捕获 TEE 双写语句（enabled 与否无关——直接替换执行函数）。"""
     captured: list[tuple[str, tuple]] = []
     monkeypatch.setattr(mirror, "execute", lambda sql, params=(): captured.append((sql, params)))
-    monkeypatch.setattr(
-        mirror, "execute_many",
-        lambda statements: captured.extend(statements))
+    capture_mirror_groups(monkeypatch, SimpleNamespace(append=captured.extend))
     return captured
 
 

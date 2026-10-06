@@ -65,3 +65,19 @@ def test_branch_flow_workflow_cannot_be_skipped_by_deploy_pin_commits() -> None:
     checkout = workflow["jobs"]["branch-flow"]["steps"][0]
     assert checkout["uses"] == "actions/checkout@v4"
     assert checkout["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
+
+
+def test_all_workflow_checkouts_are_trusted_and_credentials_not_persisted():
+    workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["branch-flow"]["steps"]
+    checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
+    assert len(checkouts) == 1
+    for step in checkouts:
+        assert step["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"
+        assert step["with"]["persist-credentials"] == "false"
+    for step in steps:
+        # All PR fields are data passed via env, never shell source interpolation.
+        assert "${{" not in step.get("run", "")
+    validate = steps[-1]
+    assert validate["env"]["HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    assert '"$HEAD_SHA"' in validate["run"]

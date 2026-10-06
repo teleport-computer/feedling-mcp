@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 import db
+import provider_attempt_metadata
 
 
 STREAM = "provider_attempts"
@@ -39,6 +40,7 @@ VALID_FALLBACK_REASONS = frozenset(
     {
         "tagged_images_rejected",
         "tool_schema_rejected",
+        "provider_tool_history_rejected",
     }
 )
 VALID_PROVIDER_ERROR_CLASSES = frozenset(
@@ -108,7 +110,7 @@ def summarize_fallbacks(rows: list[dict]) -> list[dict]:
     """Count provider-error fallback/status pairs in a bounded row window.
 
     This is intentionally not a distribution of every tool-loop degradation:
-    it covers only failed provider calls that caused a deliberate retry.
+    it covers failed provider calls with a closed fallback/closure reason.
     """
     counts: dict[tuple[str, int], int] = {}
     for row in rows:
@@ -210,6 +212,7 @@ def record_runtime_attempt(
     dur_ms: Any = None,
     provider_request_id: str = "",
     ts: float | None = None,
+    attempt_trace: Any = None,
 ) -> bool:
     """Append one server-side provider attempt. Never raises.
 
@@ -220,7 +223,8 @@ def record_runtime_attempt(
 
     For Runtime V2, the database-assigned ``attempt_n`` counts outer tool-loop
     provider rounds. It does not expose or count retries internal to the
-    provider transport client.
+    provider transport client. Capture/Dream additionally project measured wire
+    attempts into ``wire_attempts``; a missing trace stays explicitly unmeasured.
 
     Telemetry must never be able to fail a turn that would otherwise succeed,
     so every failure here is swallowed and reported as ``False``.
@@ -262,6 +266,12 @@ def record_runtime_attempt(
             ),
             "dur_ms": _duration_ms(dur_ms),
         }
+        if lane in {"capture", "dream"}:
+            metadata = provider_attempt_metadata.project(attempt_trace)
+            doc.update(metadata if metadata is not None else {
+                "wire_attempts": None, "wire_attempt_count": None,
+                "outer_attempt_count": None,
+            })
         stored = db.log_append_numbered(
             uid,
             STREAM,

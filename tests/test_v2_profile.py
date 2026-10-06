@@ -26,10 +26,6 @@ def _reply(memory: str = "共同经历与承诺", style: str = "偏好直接温�
         ('{"style":"只有一边"}', "missing_field:memory"),
         ('{"memory":"","style":"有效"}', "field_empty:memory"),
         ('{"memory":"有效","style":17}', "field_empty:style"),
-        (
-            '{"memory":"有效","style":"有效","extra":"不允许"}',
-            "reply_not_json",
-        ),
     ],
 )
 def test_validate_profile_reject_matrix_is_all_or_nothing(raw, expected):
@@ -182,8 +178,13 @@ def test_generate_profile_single_call_returns_overlap_telemetry():
     assert result.provider_calls == 1
     assert result.overlap is not None and result.overlap.would_reject is True
     assert len(calls) == 1
-    assert calls[0][2]["response_format"] == {"type": "json_object"}
-    assert calls[0][2]["tool_choice"]["function"]["name"] == "emit_profile"
+    # T735: structure comes from the forced emit_profile call; JSON response
+    # mode is not sent alongside it (Gemini rejects the combination).
+    assert "response_format" not in calls[0][2]
+    assert calls[0][2]["tool_choice"] == {
+        "type": "function", "function": {"name": "emit_profile"},
+    }
+    assert [tool.name for tool in calls[0][2]["tools"]] == ["emit_profile"]
     assert usages == [{"input_tokens": 10}]
     assert events == [
         (
@@ -235,6 +236,37 @@ def test_generate_profile_accepts_forced_tool_output_without_text_reply():
 
     assert result.fields == {"memory": "长期事实", "style": "沟通方式"}
     assert result.provider_calls == 1
+
+
+@pytest.mark.parametrize(
+    "bad_call",
+    [
+        {"id": "t", "name": "emit_profile", "args": {"memory": "长期事实"}, "args_ok": True},
+        {"id": "t", "name": "emit_profile", "args": {"memory": "长期事实", "style": 7}, "args_ok": True},
+        {"id": "t", "name": "emit_profile", "args": {}, "args_ok": False},
+    ],
+    ids=["missing_style", "style_wrong_type", "malformed_args"],
+)
+def test_forced_tool_output_contract_still_rejects_invalid_args(bad_call):
+    """Dropping JSON response mode (T735) must not loosen the output contract."""
+    calls = []
+
+    async def _llm(_config, _messages, **kwargs):
+        calls.append(kwargs)
+        return {"reply": "", "tool_calls": [dict(bad_call)], "stop_reason": "tool_use"}
+
+    result = asyncio.run(
+        profile.generate_profile(provider_config=object(), rendered_cards="cards", llm=_llm)
+    )
+
+    assert result.fields is None
+    assert result.reject_code
+    assert calls, "the final call must have been made"
+    for kwargs in calls:
+        assert "response_format" not in kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "function", "function": {"name": "emit_profile"},
+        }
 
 
 def test_shape_error_bounces_once_with_content_free_correction():
@@ -488,3 +520,47 @@ def test_fragmentation_prefers_newlines_without_loss_or_reordering():
     assert "".join(fragments) == source
     assert "".join(piece for group in groups for piece in group) == source
     assert all(len(fragment) <= 6 for fragment in fragments)
+
+
+# ---------------------------------------------------------------------------
+# T750: tolerant parsing, with the truly broken twin of every case still failing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Extra keys are ignored (prod: relay models add fields such as "reasoning").
+        '{"memory":"有效","style":"有效","extra":"忽略"}',
+        '{"reasoning":"先想一下","memory":"有效","style":"有效"}',
+        # Prose with a brace before the object used to fail the whole reply.
+        '好的 {这里是说明} 如下:\n{"memory":"有效","style":"有效"}',
+        # A draft object missing a field, then the full answer: the full one wins.
+        '{"memory":"草稿"} 修改后: {"memory":"有效","style":"有效"}',
+        # Fence still accepted.
+        '```json\n{"memory":"有效","style":"有效","note":"x"}\n```',
+    ],
+)
+def test_validate_profile_tolerates_prose_braces_and_extra_keys(raw):
+    fields, reject = profile._validate_profile(raw)
+    assert reject == ""
+    assert fields == {"memory": "有效", "style": "有效"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Truncated / malformed objects are still not JSON.
+        ('{"memory":"有效","style":"有', "reply_not_json"),
+        ('好的 {这里是说明} 但没有答案', "reply_not_json"),
+        ('["memory","style"]', "reply_not_json"),
+        # Only a partial object anywhere: the field check names what is missing.
+        ('说明 {"memory":"有效"} 结束', "missing_field:style"),
+        ('{"memory":"有效","extra":"x"}', "missing_field:style"),
+        # Extra keys never rescue an empty required field.
+        ('{"memory":"有效","style":"","extra":"x"}', "field_empty:style"),
+    ],
+)
+def test_validate_profile_still_rejects_truly_broken_replies(raw, expected):
+    fields, reject = profile._validate_profile(raw)
+    assert fields is None
+    assert reject == expected

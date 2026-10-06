@@ -356,7 +356,7 @@ def _update_steps() -> str:
         "2. 拉取最新代码并切到服务端期望的 commit(见下方 expected_commit)。\n"
         "3. 重装依赖:python -m pip install -r tools/chat_resident_requirements.txt。\n"
         "4. 确认启动环境里 FEEDLING_API_URL、FEEDLING_API_KEY、AGENT_MODE/AGENT_HTTP_URL 或 AGENT_CLI_CMD 仍然有效。\n"
-        "5. 若 FEEDLING_AUTO_UPDATE 被设为 0,与用户确认是否恢复默认自动更新;若 git status 显示工作区有未提交改动,自动更新会跳过——stash 或提交后即可恢复。\n"
+        "5. 若 FEEDLING_AUTO_UPDATE 被设为 0,与用户确认是否恢复默认自动更新;若自动更新被工作区改动挡住,先由用户将配置和本地状态备份到仓库外的私有位置,再检查 git status 与 self-update checkout failed 日志中的冲突路径。不要为清除此提示运行 git stash -u/-a 或 git clean,不要提交密钥;agent 不得自行移动、暂存或删除用户文件。\n"
         "6. 重启 consumer,确认 /v1/chat/poll 请求继续带 X-Feedling-Consumer-Commit。\n"
     )
 
@@ -385,7 +385,12 @@ def _update_stall_fix_line(info: Mapping[str, Any]) -> str:
     执行式框架属遗留问题,另案。"""
     reason = str(info.get("update_stall_reason") or "").strip().lower()
     return {
-        "dirty": "请转告用户:机器上有未提交改动挡住了自动更新,由用户自行执行 git stash 或提交后即可恢复",
+        "dirty": (
+            "请转告用户:机器上的工作区改动挡住了自动更新(旧版也会把未跟踪文件算作 dirty)。"
+            "请先由用户把 consumer.env、identity.json 和本地状态备份到仓库外的私有位置,"
+            "再检查 git status 并决定如何保留改动;不要为清除此提示运行 git stash -u/-a "
+            "或 git clean,不要提交密钥。agent 不得自行移动、暂存或删除这些文件"
+        ),
         "disabled": "请转告用户:自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)",
         "fetch_failed": "请转告用户:机器拉取 GitHub 失败,请用户检查网络/代理",
     }.get(reason, "")

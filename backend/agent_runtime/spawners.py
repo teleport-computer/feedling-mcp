@@ -1088,7 +1088,12 @@ def _genesis_persona_content(user_id: str, api_key: str | None = None,
     def _decrypt(env: dict) -> str:
         from core import envelope as core_envelope
         raw = core_envelope.read_envelope_body(
-            env, api_key, purpose="genesis_persona", runtime_token=runtime_token)
+            env,
+            api_key,
+            purpose="genesis_persona",
+            caller_user_id=str(user_id),
+            runtime_token=runtime_token,
+        )
         return raw.decode("utf-8")
 
     return _persona_from_blob(blob, _decrypt)
@@ -1112,7 +1117,7 @@ def _web_visible_for_user(user_id: str) -> bool:
 
         return bool(
             web_settings_core.get_settings(
-                core_store.get_store_shell_only(
+                core_store.get_store_per_load_mode(
                     user_id, reason="web settings are direct blob reads"
                 )
             ).get("effective")

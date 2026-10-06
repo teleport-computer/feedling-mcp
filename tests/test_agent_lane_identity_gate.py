@@ -35,6 +35,12 @@ import io_cli  # noqa: E402
 import chat_resident_consumer as crc  # noqa: E402
 
 
+def _mock_cli_run(monkeypatch, consumer, run):
+    # Mock the CLI invocation boundary; production capture now uses Popen.
+    monkeypatch.setattr(consumer, "_run_cli_subprocess",
+                        lambda cmd, kwargs, **extra: run(cmd, **kwargs))
+
+
 def _ns(**overrides) -> argparse.Namespace:
     base = dict(
         agent_name=None, self_introduction=None, category=None,
@@ -158,7 +164,7 @@ def _capture_child_env(monkeypatch, tmp_path):
         seen.update(kwargs.get("env") or {})
         return _R()
 
-    monkeypatch.setattr(crc.subprocess, "run", _run)
+    _mock_cli_run(monkeypatch, crc, _run)
     return seen
 
 

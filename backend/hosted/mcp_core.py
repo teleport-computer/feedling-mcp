@@ -386,6 +386,7 @@ def set_enabled(
                 srv["config_envelope"],
                 caller_api_key,
                 purpose="mcp_server_config",
+                caller_user_id=str(store.user_id),
             )
             secret_doc = json.loads(plaintext.decode("utf-8"))
             if not isinstance(secret_doc, dict) or not secret_doc.get("url"):
@@ -460,7 +461,8 @@ def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tupl
     try:
         secret = json.loads(core_envelope.read_envelope_body(
             srv["config_envelope"], caller_api_key,
-            purpose="mcp_server_config").decode("utf-8"))
+            purpose="mcp_server_config",
+            caller_user_id=str(store.user_id)).decode("utf-8"))
         if (
             not isinstance(secret, dict)
             or not isinstance(secret.get("url"), str)

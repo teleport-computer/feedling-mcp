@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -159,7 +161,11 @@ def test_async_reliable_deadline_clamps_per_attempt_timeout(monkeypatch):
         )
     )
 
-    assert result == {"reply": "ok"}
+    # The reliable wrapper now guarantees provider_retry_count on every success
+    # exit (0 on this one-shot), so the passthrough reply is augmented with usage
+    # rather than returned byte-for-byte (T550).
+    assert result["reply"] == "ok"
+    assert result["usage"]["provider_retry_count"] == 0
     assert 0 < timeouts[0] <= 0.5
 
 
@@ -179,6 +185,28 @@ def test_provider_http_error_keeps_bounded_internal_response_detail(status_code)
     assert str(caught.value) == (
         f"provider_http_{status_code}: {upstream_detail[:240]}"
     )
+
+
+def test_provider_http_error_keeps_bounded_raw_body_out_of_str_and_repr():
+    sentinel = "PRIVATE_PROVIDER_BODY_MUST_NOT_ESCAPE"
+    raw_body = json.dumps({
+        "error": {
+            "message": "Request failed. Please try again later.",
+            "type": "api_error",
+            "debug": sentinel,
+        },
+        "padding": "x" * (pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS + 100),
+    })
+
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(httpx.Response(403, text=raw_body))
+
+    exc = caught.value
+    assert exc.raw_response_body == raw_body[: pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS]
+    assert len(exc.raw_response_body) == pc._MAX_RAW_PROVIDER_ERROR_BODY_CHARS
+    assert sentinel in exc.raw_response_body
+    assert sentinel not in str(exc)
+    assert sentinel not in repr(exc)
 
 
 def _fake_client(monkeypatch, response_body: dict) -> list[dict]:
@@ -365,6 +393,219 @@ def test_deepseek_v4_flash_defaults_to_non_thinking(monkeypatch):
     assert result["provider"] == "deepseek"
     assert calls[0]["json"]["model"] == "deepseek-v4-flash"
     assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "wire_model"),
+    [
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek-v4-flash", "deepseek-v4-flash"),
+        ("deepseek-reasoner", "deepseek-v4-flash"),
+    ],
+)
+def test_deepseek_required_tool_choice_disables_thinking_for_that_request(
+    configured_model,
+    wire_model,
+):
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+
+    assert payload["model"] == wire_model
+    assert payload["tool_choice"] == "required"
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "wire_model"),
+    [
+        ("deepseek-flash", "deepseek-flash"),
+        ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek-reasoner", "deepseek-v4-flash"),
+    ],
+)
+def test_deepseek_named_tool_choice_disables_thinking_for_that_request(
+    configured_model,
+    wire_model,
+):
+    """T735: a named forcing choice conflicts with thinking exactly like
+    ``required`` ("Thinking mode does not support this tool_choice")."""
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    named = {"type": "function", "function": {"name": "ping"}}
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice=named,
+    )
+
+    assert payload["model"] == wire_model
+    assert payload["tool_choice"] == named
+    assert payload["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        None,
+        "auto",
+        {"type": "function", "function": {"name": ""}},
+    ],
+)
+def test_deepseek_non_required_tool_choice_preserves_default_thinking(
+    tool_choice,
+):
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice=tool_choice,
+    )
+
+    assert "thinking" not in payload
+    if tool_choice is None:
+        assert "tool_choice" not in payload
+    else:
+        assert payload["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "expected_thinking"),
+    [
+        ("deepseek-v4-flash", {"type": "disabled"}),
+        ("deepseek-reasoner", {"type": "enabled"}),
+    ],
+)
+def test_deepseek_auto_choice_preserves_explicit_model_thinking_mode(
+    configured_model,
+    expected_thinking,
+):
+    request_model, extra_body = pc._runtime_model("deepseek", configured_model)
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model=request_model,
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=extra_body,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="auto",
+    )
+
+    assert payload["tool_choice"] == "auto"
+    assert payload["thinking"] == expected_thinking
+
+
+def test_deepseek_required_choice_without_tools_never_reaches_the_wire():
+    payload = pc._build_openai_compat_payload(
+        provider="deepseek",
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "No tools are offered."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=None,
+        tool_choice="required",
+    )
+
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "openai_compatible"])
+def test_non_deepseek_required_tool_choice_never_injects_thinking(provider):
+    payload = pc._build_openai_compat_payload(
+        provider=provider,
+        model="deepseek-v4-flash-vision-exp",
+        messages=[{"role": "user", "content": "Call ping."}],
+        temperature=None,
+        max_tokens=32,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[ToolSpec("ping", "Ping.", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+
+    assert payload["tool_choice"] == "required"
+    assert "thinking" not in payload
+
+
+def test_deepseek_host_does_not_override_openai_compatible_adapter(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(200, {
+                "id": "chatcmpl-relay-test",
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call-ping",
+                            "type": "function",
+                            "function": {"name": "ping", "arguments": "{}"},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            })
+
+    monkeypatch.setattr(pc, "_shared_async_client", FakeAsyncClient())
+
+    asyncio.run(
+        pc.chat_completion_async(
+            pc.ProviderConfig(
+                "openai_compatible",
+                "deepseek-v4-flash-vision-exp",
+                "sk-relay-test",
+                base_url="https://api.deepseek.com",
+            ),
+            [{"role": "user", "content": "Call ping."}],
+            tools=[ToolSpec(
+                "ping", "Ping.", {"type": "object", "properties": {}}
+            )],
+            tool_choice="required",
+        ),
+    )
+
+    assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
+    assert calls[0]["json"]["tool_choice"] == "required"
+    assert "thinking" not in calls[0]["json"]
 
 
 def test_openrouter_legacy_deepseek_model_maps_to_v4_flash(monkeypatch):
@@ -641,6 +882,165 @@ def test_openai_compat_payload_preserves_forced_tool_choice():
     assert payload["tool_choice"] is not choice
 
 
+def test_manual_thinking_capabilities_have_documented_positive_and_negative_rows():
+    table = pc.ANTHROPIC_MANUAL_THINKING_CAPABILITIES
+    assert table
+    supported = {family for family, enabled in table.items() if enabled}
+    unsupported = {family for family, enabled in table.items() if not enabled}
+    assert supported and unsupported
+    assert all(type(enabled) is bool for enabled in table.values())
+    # Independent official-doc oracle: derived wire tests alone would follow an
+    # erroneous table edit. Pin the documented support, including deprecated 4.6.
+    # https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-extended-thinking.html
+    assert supported == {
+        "claude-3-7-sonnet", "claude-sonnet-4", "claude-opus-4",
+        "claude-opus-4-1", "claude-sonnet-4-5", "claude-opus-4-5",
+        "claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6",
+    }
+    assert unsupported == {
+        "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-sonnet-5",
+    }
+
+
+@pytest.mark.parametrize("family, supported", pc.ANTHROPIC_MANUAL_THINKING_CAPABILITIES.items())
+@pytest.mark.parametrize("prefix,suffix", [
+    ("", ""), ("", "-latest"), ("", "-20250514"),
+    ("anthropic.", ""), ("anthropic.", "-v1"),
+    ("us.anthropic.", "-20250514-v1:0"),
+    ("eu.anthropic.", "-20250514-v1:0"),
+    ("apac.anthropic.", "-20250514-v1:0"),
+    ("global.anthropic.", "-v1:0"),
+    ("jp.anthropic.", "-v1:0"), ("au.anthropic.", "-v1:0"),
+])
+def test_manual_thinking_table_drives_both_payloads(family, supported, prefix, suffix, caplog):
+    # Suffix fixtures exercise normalization, not provider availability of IDs.
+    model = f"{prefix}{family}{suffix}"
+    bedrock = bool(prefix)
+    builder = pc._build_bedrock_payload if bedrock else pc._build_anthropic_payload
+    payload, _, _ = builder(
+        model=model, base_url="https://provider.example", key="synthetic",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=0.2, response_format=None, include_reasoning=True,
+    )
+    container = payload.get("additionalModelRequestFields", {}) if bedrock else payload
+    inference = payload["inferenceConfig"] if bedrock else payload
+    if supported:
+        assert container["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+        assert "temperature" not in inference
+    else:
+        assert "thinking" not in container
+        assert inference["temperature"] == 0.2
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("family,supported", pc.ANTHROPIC_MANUAL_THINKING_CAPABILITIES.items())
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+def test_manual_thinking_table_preserves_forced_tool_contract(family, supported, provider):
+    builder = pc._build_anthropic_payload if provider == "anthropic" else pc._build_bedrock_payload
+    payload, _, _ = builder(
+        model=family if provider == "anthropic" else f"anthropic.{family}",
+        base_url="https://provider.example", key="synthetic",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None, include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice="required",
+    )
+    if provider == "anthropic":
+        assert payload["tool_choice"] == {"type": "any"}
+        assert "thinking" not in payload
+    else:
+        assert payload["toolConfig"]["toolChoice"] == {"any": {}}
+        fields = payload.get("additionalModelRequestFields", {})
+        if supported:
+            assert fields["thinking"] == {"type": "disabled"}
+        else:
+            assert "thinking" not in fields
+
+
+@pytest.mark.parametrize("model", [
+    "claude-sonnet-4-7", "claude-opus-4-99", "claude-sonnet-40",
+    "claude-opus-4-secret", "private/claude-sonnet-4-5",
+    "claude-3-7-unknown", "claude-opus-4-5-20250101-extra", "",
+    "private.anthropic.claude-opus-4-5", "claude-opus-4-5\nsecret",
+    "CLAUDE-SONNET-4-99", "unlisted-" + "x" * 200,
+])
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+def test_unknown_thinking_model_omits_parameter_and_logs_no_content(model, provider, caplog):
+    builder = pc._build_anthropic_payload if provider == "anthropic" else pc._build_bedrock_payload
+    payload, _, _ = builder(
+        model=f"us.anthropic.{model}" if provider == "bedrock" else model,
+        base_url="https://private.example", key="private-key",
+        messages=[{"role": "user", "content": "private-prompt"}],
+        max_tokens=2048, temperature=None, response_format=None, include_reasoning=True,
+    )
+    container = payload.get("additionalModelRequestFields", {}) if provider == "bedrock" else payload
+    assert "thinking" not in container
+    assert len(caplog.records) == 1
+    event, raw_detail = caplog.records[0].getMessage().split(" ", 2)[1:]
+    assert event == "thinking_omitted"
+    assert json.loads(raw_detail) == {"reason": "unknown_model", "model": model.lower()[:160]}
+    assert "\n" not in raw_detail
+    assert all(secret not in caplog.text for secret in (
+        "private-prompt", "private-key", "https://private.example",
+    ))
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+@pytest.mark.parametrize("include_reasoning,max_tokens", [(False, 2048), (True, 1024)])
+def test_known_thinking_model_retains_opt_out_and_budget_gate(provider, include_reasoning, max_tokens, caplog):
+    builder = pc._build_anthropic_payload if provider == "anthropic" else pc._build_bedrock_payload
+    payload, _, _ = builder(
+        model="claude-sonnet-4-6" if provider == "anthropic" else "us.anthropic.claude-sonnet-4-6",
+        base_url="https://provider.example", key="synthetic",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=max_tokens, temperature=0.2, response_format=None,
+        include_reasoning=include_reasoning,
+    )
+    container = payload.get("additionalModelRequestFields", {}) if provider == "bedrock" else payload
+    assert "thinking" not in container
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_unknown_thinking_model_still_completes_request(provider, asynchronous, monkeypatch, caplog):
+    requests = []
+
+    def handler(request):
+        payload = json.loads(request.content)
+        container = payload.get("additionalModelRequestFields", {}) if provider == "bedrock" else payload
+        assert "thinking" not in container
+        requests.append(payload)
+        body = {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"}
+        if provider == "bedrock":
+            body = {"output": {"message": {"content": [{"text": "ok"}]}}, "stopReason": "end_turn"}
+        return httpx.Response(200, json=body)
+
+    config = pc.ProviderConfig(
+        provider=provider, model="us.anthropic.claude-sonnet-4-99" if provider == "bedrock" else "claude-sonnet-4-99",
+        api_key="synthetic", base_url="https://provider.example",
+    )
+    kwargs = {"max_tokens": 2048, "include_reasoning": True}
+    messages = [{"role": "user", "content": "private-prompt"}]
+    if asynchronous:
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                monkeypatch.setattr(pc, "_shared_async_client", client)
+                return await pc.chat_completion_async(config, messages, **kwargs)
+        result = asyncio.run(run())
+    else:
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            monkeypatch.setattr(pc, "_shared_client", client)
+            result = pc.chat_completion(config, messages, **kwargs)
+    assert result["reply"] == "ok"
+    assert len(requests) == 1
+    assert len(caplog.records) == 1
+    assert json.loads(caplog.records[0].getMessage().split(" ", 2)[2]) == {
+        "reason": "unknown_model", "model": "claude-sonnet-4-99",
+    }
+
+
 def test_anthropic_payload_translates_forced_function_tool_choice():
     payload, _url, _headers = pc._build_anthropic_payload(
         model="claude-sonnet-4-5",
@@ -664,6 +1064,118 @@ def test_anthropic_payload_translates_forced_function_tool_choice():
     )
 
     assert payload["tool_choice"] == {"type": "tool", "name": "emit_profile"}
+
+
+@pytest.mark.parametrize("choice, expected", [
+    ("required", {"type": "any"}),
+    ({"type": "function", "function": {"name": "reply"}},
+     {"type": "tool", "name": "reply"}),
+    ({"type": "tool", "name": "reply"}, {"type": "tool", "name": "reply"}),
+])
+def test_anthropic_forced_tool_choice_omits_incompatible_manual_thinking(choice, expected):
+    payload, _, _ = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5", base_url="https://api.anthropic.com/v1",
+        key="sk-test", messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None,
+        include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice=choice,
+    )
+    assert payload["tool_choice"] == expected
+    assert "thinking" not in payload
+    assert payload["tools"][0]["name"] == "reply"
+    assert payload["max_tokens"] == 2048
+
+
+@pytest.mark.parametrize("choice", [None, "auto", "none", {"type": "none"}])
+def test_anthropic_unforced_tools_preserve_manual_thinking(choice):
+    payload, _, _ = pc._build_anthropic_payload(
+        model="claude-sonnet-4-5", base_url="https://api.anthropic.com/v1",
+        key="sk-test", messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None,
+        include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice=choice,
+    )
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+
+
+@pytest.mark.parametrize("choice,expected_choice,expected_thinking", [
+    ("required", {"any": {}}, {"type": "disabled"}),
+    ({"type": "function", "function": {"name": "reply"}},
+     {"tool": {"name": "reply"}}, {"type": "disabled"}),
+    ("auto", None, {"type": "enabled", "budget_tokens": 1024}),
+    (None, None, {"type": "enabled", "budget_tokens": 1024}),
+])
+def test_bedrock_forced_tools_explicitly_disable_manual_thinking(
+    choice, expected_choice, expected_thinking,
+):
+    payload, _, _ = pc._build_bedrock_payload(
+        model="anthropic.claude-sonnet-4-5", base_url="https://bedrock.example",
+        key="synthetic", messages=[{"role": "user", "content": "hello"}],
+        max_tokens=2048, temperature=None, response_format=None,
+        include_reasoning=True,
+        tools=[ToolSpec("reply", "reply", {"type": "object", "properties": {}})],
+        tool_choice=choice,
+    )
+    assert payload["toolConfig"].get("toolChoice") == expected_choice
+    assert payload["additionalModelRequestFields"]["thinking"] == expected_thinking
+    assert payload["toolConfig"]["tools"][0]["toolSpec"]["name"] == "reply"
+    assert payload["inferenceConfig"]["maxTokens"] == 2048
+
+
+@pytest.mark.parametrize("message, signature", [
+    ("Thinking may not be enabled when tool_choice forces tool use.", "thinking_forced_tool_choice"),
+    # T735: DeepSeek's wording for the same conflict.
+    ("Thinking mode does not support this tool_choice", "thinking_forced_tool_choice"),
+    # T735: Gemini rejects a forced call combined with a JSON response mime type.
+    ("Forced function calling (ANY mode) with a response mime type: 'application/json' is unsupported",
+     "forced_tool_json_mime"),
+    # Negatives: the same words without the specific conflict stay unclassified.
+    ("This model does not support this tool_choice value", "unclassified"),
+    ("Function calling with a response mime type is fine", "unclassified"),
+    ("final assistant content cannot end with trailing whitespace", "trailing_whitespace"),
+    ("unexpected tool_use_id in tool_result blocks", "tool_use_id_mismatch"),
+    ("tools.0.input_schema: JSON schema is invalid", "invalid_tool_schema"),
+    ("budget_tokens is not supported", "budget_tokens_unsupported"),
+    ("max_tokens must be greater than 0", "max_tokens_invalid"),
+    ("opaque failure private-user-text sk-secret", "unclassified"),
+])
+def test_provider_error_diagnostics_classifies_without_copying_content(message, signature):
+    response = httpx.Response(400, json={
+        "error": {"type": "invalid_request_error", "message": message},
+    })
+    with pytest.raises(pc.ProviderError) as caught:
+        pc._raise_for_provider_status(response)
+    assert pc.provider_error_diagnostics(caught.value) == {
+        "provider_error_type": "invalid_request_error", "error_signature": signature,
+    }
+
+
+def test_provider_error_diagnostics_rejects_arbitrary_type_and_non_provider_text():
+    error = pc.ProviderError("private exception text", raw_response_body=json.dumps({
+        "error": {"type": "private-type-sk-secret", "message": "private message"},
+    }))
+    assert pc.provider_error_diagnostics(error) == {
+        "provider_error_type": "unknown", "error_signature": "unclassified",
+    }
+    assert pc.provider_error_diagnostics(RuntimeError("max_tokens must be 1")) == {
+        "provider_error_type": "unknown", "error_signature": "unclassified",
+    }
+
+
+def test_provider_error_diagnostics_bounds_untrusted_body_processing():
+    nested = pc.ProviderError("error", raw_response_body="[" * 2000 + "]" * 2000)
+    assert pc.provider_error_diagnostics(nested) == {
+        "provider_error_type": "unknown", "error_signature": "unclassified",
+    }
+    long_message = pc.ProviderError("error", raw_response_body=json.dumps({
+        "error": {"type": "invalid_request_error",
+                  "message": "x" * 4096 + "max_tokens must be greater than 0"},
+    }))
+    assert pc.provider_error_diagnostics(long_message) == {
+        "provider_error_type": "invalid_request_error", "error_signature": "unclassified",
+    }
 
 
 def test_anthropic_payload_encodes_tool_choice_none_with_tools():
@@ -1650,7 +2162,16 @@ def test_generate_image_openai_mainline_uses_hosted_image_tool(monkeypatch):
     assert result["media"][0]["data_base64"] == "aW1hZ2U="
 
 
-def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("deepseek", "deepseek-v4-flash"),
+        ("gemini", "gemini-2.5-flash"),
+    ),
+)
+def test_generate_image_without_name_marker_fails_before_provider_request(
+    monkeypatch, provider, model,
+):
     import asyncio
 
     class ExplodingAsyncClient:
@@ -1664,10 +2185,158 @@ def test_generate_image_deepseek_fails_before_provider_request(monkeypatch):
     with pytest.raises(pc.ProviderError, match="image_generation_model_unsupported"):
         asyncio.run(
             pc.generate_image_async(
-                pc.ProviderConfig("deepseek", "deepseek-v4-flash", "sk-test"),
+                pc.ProviderConfig(provider, model, "sk-test"),
                 "draw a moonlit lake",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("deepseek", "qwen-image-3.0"),
+        ("gemini", "qwen-image-3.0"),
+    ),
+)
+def test_ordinary_chat_keeps_provider_family_image_gate(
+    monkeypatch, provider, model,
+):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError):
+        asyncio.run(
+            pc.chat_completion_async(
+                pc.ProviderConfig(provider, model, "sk-test"),
+                [{"role": "user", "content": "hello"}],
+                allow_image_output=True,
+            )
+        )
+
+    assert len(calls) == 1
+    if provider == "gemini":
+        assert "responseModalities" not in calls[0]["json"]["generationConfig"]
+    else:
+        assert "modalities" not in calls[0]["json"]
+
+
+def test_ordinary_chat_on_relay_keeps_unmarked_model_off_the_image_wire(monkeypatch):
+    """T535 opened the dedicated image endpoint for relay PROBES regardless of
+    the model id. This locks the other side: a normal chat turn on the same
+    relay (no probe) with an unmarked model must NOT be diverted onto the image
+    wire — it stays on /chat/completions with no image modalities, so an
+    ordinary chat model is never billed an image request on a hunch."""
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError):
+        asyncio.run(
+            pc.chat_completion_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "some-text-only-model", "sk-relay", _RELAY_BASE
+                ),
+                [{"role": "user", "content": "hello"}],
+                allow_image_output=True,
+                # image_generation_probe defaults to False: this is a live chat
+                # turn, not a setup probe.
+            )
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/chat/completions")
+    assert "/images/generations" not in calls[0]["url"]
+    assert "modalities" not in calls[0]["json"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "url_marker"),
+    (
+        ("deepseek", "qwen-image-3.0", "/chat/completions"),
+        ("gemini", "qwen-image-3.0", ":generateContent"),
+    ),
+)
+def test_named_image_models_reach_http_across_provider_families(
+    monkeypatch, provider, model, url_marker,
+):
+    import asyncio
+
+    calls: list[dict] = []
+
+    class TripwireAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "json": json, "timeout": timeout})
+            return FakeResponse(401, {"error": {"message": "test rejection"}})
+
+    monkeypatch.setattr(pc, "_shared_async_client", TripwireAsyncClient())
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(provider, model, "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+    assert len(calls) == 1
+    assert url_marker in calls[0]["url"]
+    if provider == "gemini":
+        assert calls[0]["json"]["generationConfig"]["responseModalities"] == [
+            "TEXT",
+            "IMAGE",
+        ]
+    else:
+        assert calls[0]["json"]["modalities"] == ["text", "image"]
+    assert raised.value.status_code == 401
+
+
+def test_newly_admitted_named_model_still_requires_nonempty_media(monkeypatch):
+    import asyncio
+
+    calls: list[str] = []
+
+    class TextOnlyAsyncClient:
+        is_closed = False
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append(url)
+            return FakeResponse(
+                200,
+                {"choices": [{"message": {"content": "I cannot draw that."}}]},
+            )
+
+    monkeypatch.setattr(pc, "_shared_async_client", TextOnlyAsyncClient())
+
+    with pytest.raises(pc.ProviderError, match="image_generation_invalid_output"):
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig("deepseek", "qwen-image-3.0", "sk-test"),
+                "draw a moonlit lake",
+            )
+        )
+
+    assert len(calls) == 1
 
 
 def test_blocking_image_generation_isolates_each_event_loop(monkeypatch):
@@ -1784,6 +2453,58 @@ def test_relay_image_uses_dedicated_endpoint_first(monkeypatch):
 
     assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
     assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_relay_probe_reaches_dedicated_endpoint_for_unmarked_image_model(monkeypatch):
+    """T535: an explicit setup probe declares "this is my image model", so the
+    dedicated /images/generations endpoint is tried for a relay model whose id
+    carries none of the name markers. ``nai-diffusion-4-5-full`` (NovelAI on a
+    relay) used to be reported "can't generate images" before any request left
+    the box, because the probe silently fell through to the chat wire."""
+    import asyncio
+
+    assert not pc._model_name_has_image_output("nai-diffusion-4-5-full")
+
+    def handler(url, payload):
+        assert url.endswith("/images/generations"), url
+        return FakeResponse(200, {"data": [{"b64_json": _TINY_PNG_B64}]})
+
+    calls = _relay_client(monkeypatch, handler)
+
+    result = asyncio.run(
+        pc.generate_image_async(
+            pc.ProviderConfig(
+                "openai_compatible", "nai-diffusion-4-5-full", "sk-relay", _RELAY_BASE
+            ),
+            "draw a small red robot",
+        )
+    )
+
+    assert [c["url"] for c in calls] == [f"{_RELAY_BASE}/images/generations"]
+    assert result["media"][0]["data_base64"] == _TINY_PNG_B64
+
+
+def test_relay_probe_unmarked_model_still_rejected_when_endpoint_denies(monkeypatch):
+    """Opening the wire for unmarked relay models cannot pass a non-image model:
+    a relay that genuinely does not serve images answers the dedicated endpoint
+    with a 4xx that carries no fall-back shape, so the probe still fails."""
+    import asyncio
+
+    def handler(url, payload):
+        return FakeResponse(404, {"error": {"message": "model not found"}})
+
+    _relay_client(monkeypatch, handler)
+
+    with pytest.raises(pc.ProviderError) as raised:
+        asyncio.run(
+            pc.generate_image_async(
+                pc.ProviderConfig(
+                    "openai_compatible", "some-text-only-model", "sk-relay", _RELAY_BASE
+                ),
+                "draw a small red robot",
+            )
+        )
+    assert raised.value.status_code == 404
 
 
 def test_relay_image_falls_back_to_chat_when_dedicated_endpoint_rejects(monkeypatch):
@@ -2788,3 +3509,44 @@ def test_bracketed_non_address_never_escapes_as_a_valueerror():
             pass
         except ValueError as exc:  # pragma: no cover - the regression itself
             raise AssertionError(f"ValueError escaped for {base_url!r}: {exc}") from exc
+
+
+
+# (provider, model, base_url, 2xx body) — one case per chat_completion dispatch
+# branch: anthropic, bedrock, gemini, openai Responses (gpt-5*/o-series),
+# openai chat, and the openai-compatible fallthrough (openai_compatible/deepseek).
+_PROBE_CASES = [
+    ("anthropic", "some-model", "", {"content": [{"type": "text", "text": "ok"}]}),
+    ("bedrock", "some-model", "https://bedrock.example",
+     {"output": {"message": {"content": [{"text": "ok"}]}}}),
+    ("gemini", "some-model", "", {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}),
+    ("openai", "gpt-5.2", "",
+     {"output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}),
+    ("openai", "gpt-4o-mini", "", {"choices": [{"message": {"content": "ok"}}]}),
+    ("openai_compatible", "some-model", "https://relay.example/v1",
+     {"choices": [{"message": {"content": "ok"}}]}),
+    ("deepseek", "some-model", "", {"choices": [{"message": {"content": "ok"}}]}),
+]
+
+
+@pytest.mark.parametrize(("provider", "model", "base_url", "body"), _PROBE_CASES)
+def test_setup_probe_http_timeout_is_90_seconds(monkeypatch, provider, model, base_url, body):
+    # T754 (Seven 09-28): setup's probe passes 90 s as the HTTP timeout (httpx
+    # applies it per phase, not as a whole-call deadline; bounded compatibility
+    # retries may add attempts). Pin the value on every request each dispatch
+    # branch sends.
+    seen: list = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, *, headers=None, json=None, timeout=None):
+            seen.append(timeout)
+            return FakeResponse(200, body)
+
+    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+    pc.test_provider_key(pc.ProviderConfig(provider, model, "sk-x", base_url=base_url))
+    assert seen and all(t == 90.0 for t in seen), seen
+    assert pc.SETUP_PROBE_TIMEOUT_S == 90.0

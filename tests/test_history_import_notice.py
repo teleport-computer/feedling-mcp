@@ -172,7 +172,7 @@ def test_completion_resolves_prior_failure_notice(monkeypatch):
     completion update (history_import.py:3174-3184), via notices.resolve(store,
     'history_import:') keyed off the shared 'history_import:' prefix. Drive completion
     with a fresh_start payload so no history parsing is needed, and monkeypatch the
-    provider/envelope seams (runtime config, candidate extraction, card append,
+    provider/envelope seams (runtime config,
     identity derive/store, greeting) so the run reaches 'completed' without any live
     upstream or encryption."""
     uid = _uid(); seed_user(uid); store = get_store(uid)
@@ -211,10 +211,6 @@ def test_completion_resolves_prior_failure_notice(monkeypatch):
     )
     monkeypatch.setattr(hi.hosted_config_store, "_load_runtime_provider_config",
                         lambda *_a, **_k: object())
-    monkeypatch.setattr(hi, "_extract_memory_candidates_with_provider",
-                        lambda *_a, **_k: ([], []))
-    monkeypatch.setattr(hi, "_ensure_import_minimum_cards", lambda *_a, **_k: [])
-    monkeypatch.setattr(hi, "_append_import_memory_cards", lambda *_a, **_k: [])
     monkeypatch.setattr(hi, "_derive_identity_with_provider", lambda *_a, **_k: ({}, []))
     monkeypatch.setattr(hi, "_store_identity_payload", lambda *_a, **_k: {})
     monkeypatch.setattr(hi, "_generate_model_api_onboarding_greeting",

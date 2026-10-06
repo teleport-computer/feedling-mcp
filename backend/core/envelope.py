@@ -126,6 +126,36 @@ def read_plaintext_envelope_body(
     return envelope["body"].encode("utf-8")
 
 
+def caption_envelope_from_row(row: dict) -> dict | None:
+    """Project one attachment row's optional caption into envelope shape.
+
+    Keep this projection shared by enclave and local plaintext readers: caption
+    storage deliberately mirrors the main envelope under ``caption_*`` names,
+    and letting each read path rebuild it independently is how plaintext binary
+    history lost its caption while the sealed path kept it.
+    """
+    caption_body_ct = row.get("caption_body_ct")
+    caption_body = row.get("caption_body")
+    if not caption_body_ct and caption_body is None:
+        return None
+    return {
+        "id": row.get("caption_id") or row.get("id"),
+        "v": int(row.get("caption_v", row.get("v", 1)) or row.get("v", 1)),
+        "body_ct": caption_body_ct,
+        "body": caption_body,
+        "nonce": row.get("caption_nonce"),
+        "K_enclave": row.get("caption_K_enclave"),
+        "owner_user_id": (
+            row.get("caption_owner_user_id") or row.get("owner_user_id")
+        ),
+    }
+
+
+def read_caption_envelope_text(caption_envelope: dict, read_body) -> str:
+    """Read and UTF-8 decode a projected caption with the caller's reader."""
+    return read_body(caption_envelope).decode("utf-8", errors="replace")
+
+
 def envelope_content_token(envelope: dict) -> str:
     """Hash the authoritative stored shape and body for CAS/idempotency checks."""
     shape = classify_envelope_shape(envelope)
@@ -143,7 +173,8 @@ def envelope_content_token(envelope: dict) -> str:
 
 
 def read_envelope_body(envelope: dict, api_key: str | None, *,
-                       purpose: str, runtime_token: str = "") -> bytes:
+                       purpose: str, caller_user_id: str,
+                       runtime_token: str = "") -> bytes:
     """读出内容行的正文，按行形状路由。
 
     两种形状并存是 TEE 扶正期与 v6 加密可选之后的常态：
@@ -165,15 +196,22 @@ def read_envelope_body(envelope: dict, api_key: str | None, *,
         # 让 tests/test_model_api_profiles_config_store.py 的断言失败。
         kwargs = {"runtime_token": runtime_token} if runtime_token else {}
         return enclave._decrypt_envelope_via_enclave(
-            envelope, api_key, purpose=purpose, **kwargs)
+            envelope,
+            api_key,
+            purpose=purpose,
+            caller_user_id=caller_user_id,
+            **kwargs,
+        )
     return read_plaintext_envelope_body(envelope)
 
 
 def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
+                                  caller_user_id: str,
                                   runtime_token: str = "") -> bytes:
     """取出 BYOK provider key（Task 1.1）。purpose 钉死的薄 wrapper。"""
     return read_envelope_body(envelope, api_key,
                               purpose="model_api_provider_key",
+                              caller_user_id=caller_user_id,
                               runtime_token=runtime_token)
 
 

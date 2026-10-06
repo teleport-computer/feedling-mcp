@@ -5,6 +5,17 @@ set -euo pipefail
 # The push is compare-and-swap: a newer branch head makes this run stop before
 # any CVM mutation. Runner jobs consume the exact emitted commit and never read
 # a moving branch head.
+#
+# Deployment-recovery note (T694, 2026-09-22): this comment is the only change
+# in its commit and exists solely to make the next test->main push match the
+# `detect-cvm-changes` filter (this file is listed in the prod and test
+# filters). Release PR #701 landed on main as dea796d2 with CI red (a docs
+# front-matter failure), so every deploy job was skipped; the follow-up fix
+# landed as fd492e90 with CI green, but the gate compares only the push range
+# (dea796d2..fd492e90 = one markdown file) rather than main against what prod
+# actually runs, so the deploy jobs were skipped again and prod stayed on the
+# previous release. Nothing this script executes changes here. The gate's
+# range comparison is recorded in the fleet backlog as a pipeline gap.
 
 branch="${1:?branch is required}"
 main_compose="${2:?main compose path is required}"

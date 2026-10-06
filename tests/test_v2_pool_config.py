@@ -67,7 +67,7 @@ def test_slots_have_fixed_lane_allowlists_and_initial_budgets(monkeypatch):
     )
     assert (slots["foreground-0"].stall_budget_sec, slots["foreground-0"].absolute_budget_sec) == (240.0, 1500.0)
     assert (slots["wake-0"].stall_budget_sec, slots["wake-0"].absolute_budget_sec) == (240.0, 900.0)
-    assert (slots["heavy-0"].stall_budget_sec, slots["heavy-0"].absolute_budget_sec) == (120.0, 1200.0)
+    assert (slots["heavy-0"].stall_budget_sec, slots["heavy-0"].absolute_budget_sec) == (210.0, 1260.0)
     assert sum("profile" in slot.lanes for slot in config.slots) == 1
 
 
@@ -113,3 +113,68 @@ def test_retired_switches_cannot_change_the_topology(monkeypatch):
     assert [slot.pool for slot in config.slots].count("foreground") == 4
     assert [slot.pool for slot in config.slots].count("wake") == 2
     assert [slot.pool for slot in config.slots].count("heavy") == 2
+
+
+def test_heavy_extraction_slots_outlast_one_provider_wire(monkeypatch):
+    """Each wire reports progress, including compatibility fallback.
+
+    The largest lane deadline plus 30s must fit each extraction slot, and the
+    absolute allowance must cover the existing provider-attempt envelope.
+    """
+    from model_api_runtime.v2 import extraction
+
+    for name in ("FEEDLING_V2_FOREGROUND_SLOTS", "FEEDLING_V2_WAKE_SLOTS", "FEEDLING_V2_HEAVY_SLOTS"):
+        monkeypatch.delenv(name, raising=False)
+    extraction_slots = [
+        slot for slot in RuntimePoolConfig.from_env().slots
+        if slot.lanes & {"capture", "dream"}
+    ]
+
+    assert extraction_slots
+    for slot in extraction_slots:
+        assert slot.stall_budget_sec >= max(
+            extraction.wire_deadline_for_lane(lane)
+            for lane in slot.lanes & {"capture", "dream", "profile"}
+        ) + 30.0, slot.slot_id
+        assert slot.absolute_budget_sec > slot.stall_budget_sec, slot.slot_id
+        assert slot.absolute_budget_sec >= extraction.nominal_provider_envelope_sec()
+
+
+def test_dream_budget_anchors_and_pool_derivation(monkeypatch):
+    from model_api_runtime.v2 import extraction
+
+    assert extraction.DREAM_WIRE_DEADLINE_SEC == 180.0
+    assert extraction.wire_deadline_for_lane("capture") == 90.0
+    assert extraction.wire_deadline_for_lane("profile") == 90.0
+    assert extraction.nominal_provider_envelope_sec() == 1206.0
+    monkeypatch.setattr(extraction, "DREAM_WIRE_DEADLINE_SEC", 220.0)
+    heavy = next(s for s in RuntimePoolConfig.from_env().slots if s.pool == "heavy")
+    assert heavy.stall_budget_sec == 250.0
+    assert heavy.absolute_budget_sec == 1500.0
+
+
+def test_capture_full_retry_envelope_fits_both_watchdogs():
+    from model_api_runtime.v2 import extraction, serve_worker
+
+    # First request: three reliable attempts plus nominal backoff. Truncation
+    # re-ask and budget fallback: one each, still up to two compatibility wires.
+    required = (3 * 2 * 90 + 6) + (1 * 2 * 180) + (1 * 2 * 90) + 120
+    assert required == 1206
+    assert extraction.nominal_provider_envelope_sec() == required
+    assert serve_worker._EXTRACTION_TURN_BUDGET_SEC >= required
+    assert serve_worker._TURN_ABSOLUTE_TIMEOUT_SEC >= required
+    for slot in RuntimePoolConfig.from_env().slots:
+        if "capture" in slot.lanes:
+            assert slot.absolute_budget_sec == 1260 >= required
+            assert slot.stall_budget_sec == 210
+
+
+def test_capture_envelope_tracks_its_actual_wire_and_attempt_limits(monkeypatch):
+    from model_api_runtime.v2 import extraction
+
+    # Default Capture and the old Dream single-call allowance happen to match.
+    # A changed Capture deadline must not hide behind that accidental equality.
+    monkeypatch.setattr(extraction, "WIRE_DEADLINE_SEC", 110.0)
+    assert extraction.nominal_provider_envelope_sec() == 1366.0
+    monkeypatch.setattr(extraction, "CAPTURE_TRUNCATION_MAX_ATTEMPTS", 2)
+    assert extraction.nominal_provider_envelope_sec() == 1949.0

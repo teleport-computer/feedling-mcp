@@ -55,6 +55,123 @@ historical_reason: point-in-time
 
 ## 记录正文（最新的在上面）
 
+## Unreleased
+
+- `GET /v1/chat/canvases` now includes agent-authored `.io.html` Chat cards
+  from Resident and self-hosted delivery alongside workspace entries. Workspace
+  entries win identical filenames; the combined result keeps the newest 500.
+  Chat-only entries include a message ID for body reads, with no body copies or
+  historical backfill. Both database migration chains add a concurrent partial
+  index to avoid scanning unrelated messages.
+
+- T670：聊天附件交付新增 `object_storage.get` 与 `chat.file_body.hydrate`
+  耗时 trace（subsystem=`chat`），只记 dur_ms/bytes/status/error_class，区分
+  超时、404、5xx 和所有权拒绝，覆盖流读取及历史页预取，不记录 key/路径/正文。
+
+- T653：`user_logs` 新增可空 bigint 列 `duration_sec`（app_session_end 的前台时长，写入时由 `db._user_log_duration_sec` 按原 SQL 规则 `^[0-9]{1,10}$` 填，其余流为 NULL；迁移 alembic 0112 / alembic_tee 0047 幂等回填 85k 行，不重写表）。
+- T653：新增局部覆盖索引 `ix_user_logs_app_session_end_usage (user_id, ts) INCLUDE (duration_sec)`（CONCURRENTLY），管理端 fleet `app_usage` 聚合改读该列、走 Index Only Scan；输出列/语义不变（NULL 计 0、仍计 session）。
+- T653：管理端 data-track 连接租约 `SET jit = off`（fleet 聚合的 JIT 编译曾占 0.76s），随 statement_timeout 一起 RESET。
+- T653：仅 `GET /v1/admin/data-track/users` 的 HTTP 与 SQL 预算放宽到 15s 作兜底（其余 data-track 端点仍 5s）；超过 5s 时记 warning 并在响应顶层附加仅此时出现的 `slow: {elapsed_ms, soft_budget_ms: 5000}`。15s 只覆盖 fleet snapshot，分页段仍 5s 租约。
+- T653：切换窗口说明：迁移回填之后、新代码上线之前由旧代码写入的 app_session_end 行 `duration_sec` 为 NULL（该窗口时长计 0）；重跑迁移里的回填语句（`0112_user_logs_duration_sec.BACKFILL_SQL`，幂等）即可补齐，之后须 `VACUUM (ANALYZE) user_logs`（迁移本身已带）——回填改写过的页会丢 all-visible 位，不 VACUUM 则覆盖索引退化为逐行回表。
+- T651：V2 看门狗故障注入测试先等待四个 foreground 子进程真实报告就绪，超时输出逐槽 liveness；保留健康容量与 2 秒心跳阈值断言。
+- T649：拼豆身体生成的完成 trace 增加闭集 repair_reason / invalid_reason，记录首轮及最终 rows 校验失败原因，不记录行号或模型原文；resident 仅记录后端最终校验原因。
+- T649：拼豆身体的 Model API 调用固定关闭 thinking，避免 Anthropic 直连将输出额度全部用于推理而无正文；保留 8192 token 上限和现有生成提示。
+
+## 2026-09-21 — 自动召回查询优先用户消息（T684）
+
+- `_build_context_memories` 改取最近两条非空 user/human 消息，最新在前；assistant/agent/openclaw 回复不再参与查询，空句与无 caption 图片回退到此前用户文本。memgarden、cap、排名参数和注入渲染不变。补长回复干扰、图片/空串及角色守卫，同步公开 memory 工作流；线上三格验收另在 test 部署后记录。
+
+## 2026-09-17
+
+### [FIX] T638：resident pi 上游错误分型与可持久化诊断
+- pi 最终 message_end 为 error 且无可用回复时，未命中既有规则的错误归 provider_error_unclassified；quota/auth/5xx 等规则优先级与重试行为不变，V2 不变。Seven 已逐字批准新中文文案。
+- agent.model.call.error 增加 strip 后头 300 字的 pi_error_head；debug_trace 小表放宽长度，admin 仅在该事件放行。完整事件验证 20 键上限和二次截断。
+- pi_stream schema_version=3 删除 blocks，stop_reasons 改为≤80 字、去重保序的枚举字符串；新增 stop_reason_last，保留 T543 既有标量字段，历史数据不回填。
+- 同步公开 errors/changelog 与错误分类目录；派单限定现有 consumer/emitter/admin 写站点，未在本次拆分这些超大历史模块。
+
+## 2026-09-15 — 历史导入换到 memgarden 导入会话（IO-6）
+
+**[DECISION] 托管 plaintext genesis、VPS resident 蒸馏、加密分块导入和旧 `/v1/history_import/upload` 的记忆卡，统一改走 memgarden `import_session`（`backend/memory/garden_import.py`）；默认 `two_pass`。**
+
+- 之前三套判断标准（genesis fact_map/fact_write 提示词、旧上传入口的候选打分、日常落卡的 capture 提示词）并存；现在导入这一段只剩 memgarden 一份。io 保留解析、按来源分组、切窗、调模型、写库、加密存进度。
+- 默认 `two_pass` 的依据（合成材料、同一模型、每种 3 次）：两种策略质量打平且都好于旧流水线（英文材料不再写成中文卡、再导入不复制花园）；多窗材料上 single_pass 每窗改写已写的卡，输出 token 反而多 51%。放弃：只换 fact_write 保留 fact_map（半拟合）、single_pass 默认。回滚闸 `FEEDLING_GARDEN_IMPORT_STRATEGY=single_pass`。
+- 兼容：checkpoint 带引擎标记；已有旧流水线进度的在途 job 在旧流水线上跑完。导入进度（含两段式候选）存进既有加密 genesis checkpoint，信封/AAD 未改。
+- 身份卡改为独立推导（`foreground_identity`），不再从写卡那一步顺带产出。VPS 的收口复查保留；floor note 随 fact_write 退役。未定问题见 `docs/HISTORY_IMPORT_GARDEN_SESSION.md`。
+- 需要 memgarden 0.21.0（宿主驱动导入）。
+
+## 2026-09-15 — 显式 off 用户的历史内容单用户明文化迁移
+
+**[DONE] 新增默认 dry-run、三闸 apply 的单用户迁移工具，处理 Chat（含 R2 与 thinking/caption）、Memory、World Book、Identity 和 Frame。**
+
+- 只接受精确 `--user`，apply 时要求数据库中显式 `content_encryption=off`、命令行 `--allow-plaintext-rewrite` 和环境变量 `FEEDLING_ENABLE_PLAINTEXT_CONTENT_MIGRATION=1`；默认输出仅含分类计数。
+- 内联行使用 exact-old-doc CAS，并在写事务内再次锁定/校验用户偏好；`local_only` 或缺 `K_enclave` 的内容保留不动。Chat R2 复用既有 upload guard；Frame 写入独立 `frames-plaintext` 键，CAS 成功后才退役旧密文对象。
+- 支持 `--limit` canary 和 `--rate` 限速；运维步骤记录在 `CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`。
+
+## 2026-09-12 — 空回复 trace 补 raw_stop_reason(被 "other" 掩盖的原始值)（T568)
+
+**[DONE] 当 **Gemini** 的 finishReason 被闭集归一成 "other" 时,空回复 trace 额外带明文 `raw_stop_reason` 字段,记下 **Gemini 的原始 finishReason**(**仅 Gemini**;其余 provider 的未知 stop 一律保持 "other"、不加该字段),供生产环境定位。**
+
+背景:T550 把 finishReason 闭集 normalize(未知→"other")以保持 trace content-free。归因要分清:**T567 用自有 E2E key 直连只直接实测到 MAX_TOKENS**(已在闭集内的机制),闭集外的 "other" 原始值**未能直接复现**;而生产那批 "other-9" 是「非空、闭集外」这一点,是**从 T550 的归一代码路径推断的**(缺失/空→归一成 ""、非空且不在闭集→归一成 "other"),**不是 T567 直接测到的原始值**。结论:只看归一后的 "other" 无法定位具体是哪个原始 finishReason。Seven 2026-09-10 定的 trace-content 政策:trace/遥测为排查方便可带原始值,不必刻意避开。Seven 授权的范围是 **Gemini 的 finishReason**。据此:
+
+- `tool_loop._empty_response_shape` / `worker._empty_response_trace_detail`:**仅当**①响应是真 Gemini 响应(provider_client 产出的 `gemini_diagnostics` 自有结构在场)且 ②归一后的 `stop_reason == "other"`(闭集把一个真实非空 stop 标记掩掉)时,才额外加 `raw_stop_reason` 字段,带 Gemini 原始 finishReason(原样,未闭集化)。**非 Gemini provider(relay / OpenAI 兼容 / Anthropic)的未知 stop 标记一律保持闭集 "other"、不加 raw 字段**——它们的 stop 串可能夹带上游原始错误正文,不在 Seven 的授权内、不开新明文面。被识别/为空的 stop 原因也不加(值本就在 `stop_reason` 里)⇒ 对非-"other"/非-Gemini 的既有 trace 零改动。
+- ⚠️这**局部反转**了 T550 entry 里「finishReason 闭集 normalize,绝不透传 provider 原文」那一条——但只对这一个字段、只对 Gemini、只在 "other" 掩盖态、且按 Seven 的新 trace 政策与 Gemini-only 授权。其余 `provider_*` 诊断字段保持 content-free 不变。
+- 键数:仅 "other" + gemini 诊断在场时达到 20 键,正好在 `_safe_detail` 的 20 键上限内;`raw_stop_reason` 放在 provider 诊断 update 之前,确保不被上限丢掉。
+- 测试:**raw-正向(Gemini)在 `test_t550…`**——Gemini 未知 finishReason 下 `raw_stop_reason` 带原始值且过 `_safe_detail` 存活、识别态(MAX_TOKENS)不加、键上限,外加 Gemini-scoped 镜像(同一 marker:Gemini 侧带 raw / 非 Gemini 侧不带)。**raw-负向镜像在 `test_v2_tool_loop` 的 content-free 合同**——非 Gemini scripted provider 的未知 stop 仍收敛成 "other" 且**不**加 `raw_stop_reason`,reasoning/messages 正文绝不进 trace。突变验证:去掉 Gemini 门控 ⇒ 镜像 + 非 Gemini 合同双红;detail 的 raw 改用归一值冒充 ⇒ other 正向测试红。
+- 部署:先 test;main/prod 由 Seven 另行确认。
+
+## 2026-09-10 — gemini 空回复根因观测 + 传输层重试计数入 trace（T550 A,观测)
+
+**[DONE·观测] 空回复现在带 content-free 根因标量;每次 provider 调用带 transport_retry_count 明文字段。**
+
+背景:T538 查明 gemini-3.6-flash 对 FACT/CONT payload ~27% turn 返 content-empty,但为什么返空未知（trace 不记 finishReason/safety/思考与输出 token）,且 503 重试几次也判不出(provider_roundtrips 刻意 exclude transport retries)。
+
+变更（均 content-free,只加观测,不改回复行为;不做第二次 correction）:
+- A① `provider_client.py` 新增 `_gemini_empty_diagnostics`,在 provider seam 把 finishReason(**闭集 normalize**,未知→other,绝不透传 provider 原文)、safety 类别(闭集)+ blocked/最高 probability、candidates 数、是否**结构上只含 thought parts**(非空 parts 且每个有效 part thought=True,含 signature-only)、prompt/candidates/**thoughts** token 数投影进 normalized result(`gemini_diagnostics`);`tool_loop._empty_response_shape` 提进 shape;`worker._empty_response_trace_detail` 拍平成**顶层** `provider_*` 标量(+ 闭集 bounded 的 safety 类别名单)写入 **`provider.empty_response`** 事件(6 base+13 = 19 键,在 `_safe_detail` 的 20 键上限内)。绝不回读带内容的 `assistant_turn`;non-gemini 不加任何 `provider_*` 键。
+- A② `tool_loop` 在 **provider 调用边界**给 `agent.model.call.done` 事件加精简的 `empty` 标记 + `transport_retry_count`:done 取**本次 result** 的 normalized `provider_retry_count`(retries-beyond-initial,one-shot=0,严格整数——负/非整/NaN→None);`error` 事件取 exception attempt envelope 里 **`kind=http_attempt` 计数 − 1**(不数 outer_attempt);未知一律 None(绝不强写 0),对所有 provider 生效。`worker._safe_model_call_detail` 白名单转发。**done 事件保持精简(不塞全部诊断)**——13 项诊断塞进去会到 22 键、被 `_safe_detail` 静默截断,故根因诊断专走 `provider.empty_response`,done 事件只说「本轮空+重试 N 次」并指向该事件。
+- A③ 新标量放顶层,过 `_safe_detail` 不被拍平(T543 同坑);safety 类别闭集 + 计数,超集不静默截断。
+- 稳健性:`provider_retry_count` 由 **reliable_chat_completion_async 的统一成功出口**保证——`_with_reliable_retry_count` 现对任意 dict result 恒写该字段(inner compatibility 计数 + outer transient retry;one-shot 成功=0),sync/async 两个出口都过它。故那些自身 parse 路径不走 `_with_request_diagnostics` 的 wire——**Gemini** 与**专用 image wire**(openrouter /images、openai_compatible /images/generations)——one-shot 成功也报 transport_retry_count=0(不再缺失/None)。在总出口统一保证、而非逐 wire 补,避免新增 wire 再次静默漏报。empty-diagnostics 的 token `_count` 与 transport 计数一样严格——只收 non-bool、finite、非负整数,1.5/-1/NaN/Inf 一律 None(纯观测不伪造值、不因畸形 usage 把成功解析变异常)。error 事件的 transport_retry_count 由真实 attempt envelope(kind=http_attempt 计数−1)派生,已用真实 run_tool_loop+MockTransport 传输失败端到端钉住(删注入即红)。
+
+测试:`tests/test_t550_empty_diagnostics_and_retry.py` 走全链(raw gemini body → parse → shape → detail → 公开 `_safe_detail`)覆盖空回复四类(safety-block/预算被思考吃光/只含思考块/其他)+ 标量存活 + 未知 safety 类别只计数不命名 + non-gemini 无 `provider_*` 键;A② 覆盖 one-shot=0/重试=N/未知=省略/error-from-envelope/全 provider 镜像。mutation:去掉任一投影字段⇒对应断言转红(已验)。
+
+未做（留后续,不在本变更）:B 根因复现(T538 探针 N≥30 读原始响应按 finishReason/thinking 占比分类空回复成因 + 对最高类候选修法)——待网络窗口;C 明确不做第二次 correction。
+
+
+## 2026-09-10 — CI 执行面纳入动态发现（T546）
+
+**[DONE] 修正 ci_executed_tests.py 对 `mapfile`+`grep` 动态发现的失明；真未跑 = 0（不是 ~54）。**
+
+`.github/workflows/ci.yml` 的 resident consumer regression suite 不字面点名测试文件，
+而是运行时发现：`mapfile -t consumer_tests < <(grep -l -E '<predicate>' tests/test_*.py | sort)`，
+再 `python -m pytest "${consumer_tests[@]}"`。`tools/ci_executed_tests.py` 原先只解析
+字面 pytest 参数，看不到 `${var[@]}`，且那条 pytest 位于 `if (( … ))` 守卫之后（通用
+解析器在 `if` 处 forward-stop）——所以 **53 个其实在跑的文件被算成没跑**（这正是 T534/T536
+「~54 个没跑」的来源：静态盲区，不是真没跑）。
+
+变更：
+- `tools/ci_executed_tests.py` 新增独立的精确动态识别器 `dynamic_executed_in_script`
+  （及 `dynamically_executed_test_files`）：**不改**通用 `executed_in_script` 的
+  `if`/forward-stop 语义；只在 `mapfile -t VAR < <(grep -l -E 'PRED' tests/test_*.py [| sort])`
+  绑定、且同一 VAR 被**顶层** `pytest "${VAR[@]}"` 消费时 credit；predicate 用 argv 调
+  `grep`（非 `shell=True`）对仓库 `tests/test_*.py` 求值,与 CI 同工具;min-count 守卫不满足、
+  变量错配、未消费、消费位于 if/case/loop 内、grep 形状不符 —— 一律不 credit（fail closed）。
+  `executed_test_files` = 字面 ∪ 动态。
+- `tests/test_pytest_coverage_ratchet.py` 新增 `test_every_top_level_test_is_executed_or_exempt`
+  （每个 tests/test_*.py 要么在执行面、要么在豁免名单；当前真未跑=0）、
+  `test_disabling_dynamic_discovery_would_strand_the_consumer_suite`（把「关掉动态发现 ⇒ ≈53
+  变未覆盖」钉成常驻事实），以及动态识别器的合成用例（bind+consume=credit、bind未consume=0、
+  consume未bind=0、consume在条件内=0、变量错配=0、低于/满足 min-count 守卫、grep 形状不符=0）。
+  已本地 mutation 验证:禁用动态识别 ⇒ full-coverage 断言精确转红(≈53)。
+
+**遗留(本 PR 不改,列出供后续逐项处理):** 当前有 9 个测试文件既被显式点名、又被
+consumer predicate 动态命中,因而在 CI 里**跑两遍**(轻微浪费,不是覆盖缺口 —— 动态识别器
+上线后两处都计入执行面):`test_card_leak_signals_wired`、`test_card_user_referent`、
+`test_current_state_docs`、`test_dual_runtime_coexistence`、`test_io_cli_auth`、
+`test_perception_prompt_golden`、`test_pre_runtime_preflight`、`test_reply_language`、
+`test_t534_caption_hop_trace`。建议后续**逐项核对各自显式步骤的 env(PYTHONPATH /
+FEEDLING_TEST_PG 等)**再决定是否从显式步骤移除、只保留 consumer suite 跑;不在本 PR 批量删,
+以免不同 env 变体下的覆盖被误减。
+
+
 ## 2026-08-29 — 收敛 `UserStore` 定向刷新接口
 
 **[DONE] 跨 worker 的 frames/blob 定向刷新不再为旧测试适配器绕过 section 状态。**

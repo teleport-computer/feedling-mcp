@@ -367,8 +367,8 @@ def append_v2_wake_context(
     payload = dict(context)
     payload["agent_job_id"] = int(agent_job_id)
     sql = (
-        "INSERT INTO user_logs (user_id,stream,ts,item_key,doc) "
-        "VALUES (%s,%s,%s,%s,%s) RETURNING seq"
+        "INSERT INTO user_logs (user_id,stream,ts,item_key,doc,duration_sec) "
+        "VALUES (%s,%s,%s,%s,%s,NULL) RETURNING seq"
     )
     params = (
         str(user_id),
@@ -385,8 +385,8 @@ def append_v2_wake_context(
     from tee_shadow import mirror
 
     mirror.execute(
-        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc,duration_sec) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s,NULL) "
         "ON CONFLICT (user_id,stream,seq) DO NOTHING",
         (
             str(user_id),
@@ -512,7 +512,7 @@ def read_app_closes(user_id: str, limit: int = 100, since_epoch: float = 0.0) ->
 # photos never appear among screen frames.
 
 def put_photo_envelope(user_id: str, frame_id: str, ts: float, env: dict) -> bool:
-    return frame_upsert(user_id, frame_id, ts, env)
+    return frame_upsert(user_id, frame_id, ts, env, source="photo")
 
 
 def get_photo_envelope(user_id: str, frame_id: str) -> dict | None:

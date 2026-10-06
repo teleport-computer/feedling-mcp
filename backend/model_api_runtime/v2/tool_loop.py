@@ -4,11 +4,13 @@ all side effects injected. One loop for every model — no is_official branch.""
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 import inspect
 import json
 import posixpath
 import re
 import time
+import unicodedata
 from provider_types import (
     ProviderResponse,
     ToolCall,
@@ -21,9 +23,11 @@ from capabilities import result_budget
 from capabilities import tool_schema
 from agent_protocol_core import protocol_leak, self_thinking
 from chat import language_follow
+from model_api_runtime.v2 import provider_errors
 from model_api_runtime.v2 import prompt_frontier
 from model_api_runtime.v2 import provenance
 from model_api_runtime.v2 import tool_surface
+from model_api_runtime.v2 import memory_recall
 import provider_client
 
 
@@ -46,6 +50,36 @@ def _without_tagged_image_messages(messages, tag_key: str) -> list:
 _CATALOG = None  # built lazily/once
 _SEARCH_RESULT_URL_RE = re.compile(r'"url"\s*:\s*("(?:\\.|[^"\\])*")')
 _WORKSPACE_REVISION_RE = re.compile(r"\brevision\s+(\d+)\b", re.IGNORECASE)
+_PROTOCOL_TOKEN_REPLY_NAMES = frozenset({
+    "stay_silent", "reply", "speak", "stay_quiet", "proactive_sleep", "sleep",
+})
+_PROTOCOL_TOKEN_REPLY_RE = re.compile(r"__\w+__")
+
+
+def _normalize_protocol_token_reply(text: str) -> str:
+    # Underscores belong to sentinel names. Strip only surrounding punctuation,
+    # then canonicalize the approved space/dot/hyphen spelling variants.
+    def is_wrapper(char: str) -> bool:
+        return char != "_" and (
+            char.isspace() or char == "`"
+            or unicodedata.category(char).startswith("P")
+        )
+
+    start, end = 0, len(text)
+    while start < end and is_wrapper(text[start]):
+        start += 1
+    while end > start and is_wrapper(text[end - 1]):
+        end -= 1
+    return " ".join(text[start:end].lower().split()).translate(
+        str.maketrans({" ": "_", ".": "_", "-": "_"})
+    )
+
+
+def _is_protocol_token_reply(text: str) -> bool:
+    token = _normalize_protocol_token_reply(text)
+    return token in _PROTOCOL_TOKEN_REPLY_NAMES or bool(
+        _PROTOCOL_TOKEN_REPLY_RE.fullmatch(token)
+    )
 
 # Provider output is untrusted even after its tool names/arguments validate.  These
 # defaults bound both fan-out and how much observation text one native exchange can
@@ -144,26 +178,17 @@ _NAMED_TOOL_CHOICE_PROVIDERS = frozenset(
     }
 )
 _WAKE_REPLY_TOOL = "reply"
-_WAKE_REPLY_TOOL_SPEC = ToolSpec(
+_REPLY_TOOL_SPEC = ToolSpec(
     name=_WAKE_REPLY_TOOL,
     description=(
-        "Reply when you want to speak and end this proactive wake turn. "
-        "Use stay_silent instead when quiet company feels right this time."
+        "Reply with what you want to say and end this turn."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "think": {
+            "aside": {
                 "type": "string",
-                "minLength": 1,
-                "description": (
-                    "Your thinking in this moment — why you want to speak and what "
-                    "you mean to say. They can open and read this in the app. Write "
-                    "`think` entirely in their language — the language they speak "
-                    "to you — and in your usual voice with them: everyday intent "
-                    "only, with no tool names, parameters, field names, identity "
-                    "cards, or other internal terms."
-                ),
+                "description": self_thinking.ASIDE_FIELD_DESCRIPTION,
             },
             "text": {
                 "type": "string",
@@ -176,15 +201,29 @@ _WAKE_REPLY_TOOL_SPEC = ToolSpec(
                 ),
             }
         },
-        "required": ["think", "text"],
+        "required": ["text"],
         "additionalProperties": False,
     },
 )
 _WAKE_CHOICE_INSTRUCTION = (
-    "When you are done looking around, end the wake by calling exactly one of the "
-    "two tools: reply with what you want to say, or stay_silent with a short note "
-    "on why not this time."
+    "When you are done looking around, end the wake by calling reply if there "
+    "is anything you want to say to them. Call stay_silent only if you honestly "
+    "have nothing to say, or speaking would clearly intrude."
 )
+_WAKE_PERSONA_REPLY_REMINDER = (
+    "If you choose to reply, check the complete visible text against the user's "
+    "existing requirements in the identity context (including custom_persona_prompt), "
+    "while preserving the safety and tool-use rules already given."
+)
+_WAKE_DIRECT_TEXT_CORRECTION = (
+    "Your previous assistant text is an unpublished draft, not a message already "
+    "sent. Decide once: call reply with the complete text you want them to see "
+    "and an optional aside, or call stay_silent if you choose not to disturb "
+    "them. Do not return another plain-text draft or call other tools."
+)
+_WAKE_DIRECT_TEXT_OUTCOMES = frozenset({
+    "direct_text_seen", "corrected_to_reply", "corrected_to_silent", "still_invalid",
+})
 _EMPTY_RESPONSE_CORRECTION = (
     "The previous response completed without visible text or a client tool call. "
     "Complete the user's request now. Return either non-empty visible answer text "
@@ -208,6 +247,7 @@ _CONTENT_FREE_STOP_REASONS = frozenset(
         "length",
         "max_output_tokens",
         "malformed_function_call",
+        "malformed_response",
         "max_tokens",
         "other",
         "pause_turn",
@@ -239,6 +279,7 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
     {
         "none",
         "tool_schema_rejected",
+        "provider_tool_history_rejected",
         "final_reply_correction",
         _PROVIDER_CALL_REJECTION_REASON_INVALID_OR_OVER_BUDGET_TOOL_EXCHANGE,
         _PROVIDER_CALL_REJECTION_REASON_REPEATED_INVALID_TOOL_ARGUMENTS,
@@ -246,14 +287,17 @@ _PROVIDER_FORCE_TEXT_FALLBACK_REASONS = frozenset(
         "other",
     }
 )
-# Provider calls that failed, but for which the loop deliberately made a
-# degraded retry.  These values are mirrored into the plaintext attempt ledger;
-# keep them as producer-owned closed metadata, never exception text.
+# Closed reasons attached to failed provider calls. Most cause a degraded
+# retry; provider_tool_history_rejected deliberately terminates without one.
+# These values are mirrored into the plaintext attempt ledger; keep them as
+# producer-owned closed metadata, never exception text.
 _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES = "tagged_images_rejected"
 _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA = "tool_schema_rejected"
+_PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY = "provider_tool_history_rejected"
 _PROVIDER_ATTEMPT_FALLBACK_REASONS = frozenset({
     _PROVIDER_ATTEMPT_FALLBACK_TAGGED_IMAGES,
     _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA,
+    _PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY,
 })
 # Keep the producer inventory separate from the public vocabulary. A regression
 # test compares the two so adding a classification branch cannot silently turn a
@@ -338,6 +382,25 @@ def _memory_discovery_call_key(tool_call) -> tuple[str, str] | None:
     )
 
 
+_PROVIDER_TOOL_HISTORY_REJECTION_MARKERS = (
+    "function_response.name: [required_field_missing]",
+    "function call is missing a thought_signature in functioncall parts",
+    "please ensure that function call turn comes immediately after a user turn "
+    "or after a function response turn",
+)
+
+
+def _is_provider_tool_history_rejection(
+    exc: provider_client.ProviderError,
+) -> bool:
+    """Return whether a relay rejected the native tool-result transcript."""
+    detail = str(exc).lower()
+    return any(
+        marker in detail
+        for marker in _PROVIDER_TOOL_HISTORY_REJECTION_MARKERS
+    )
+
+
 def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bool:
     """Should a tools-enabled 400/422 be retried once WITHOUT tools?
 
@@ -347,10 +410,12 @@ def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bo
     Dropping tools then re-sends the identical bad history — a second billed
     call that 400s again and masks the real error as 'tool_schema_rejected'. The
     provider surfaces its error body in the ProviderError message
-    (``provider_http_400: <detail>``), and content errors don't mention
-    tools/functions, so this gate keeps the genuine tool-schema fallback while
-    letting a content error propagate on its first call."""
+    (``provider_http_400: <detail>``). Some transcript rejections do mention
+    functions, so those exact observed families must be excluded before the
+    broader schema hints are evaluated."""
     detail = str(exc).lower()
+    if _is_provider_tool_history_rejection(exc):
+        return False
     return "tool" in detail or "function" in detail
 
 
@@ -994,7 +1059,7 @@ def _normalize_tool_results(
                 "...[memory result truncated; this query returned "
                 f"{returned if isinstance(returned, int) else '?'} of "
                 f"{total if isinstance(total, int) else '?'} total cards. "
-                "Use memory_index with bucket or thread filters to browse partitions.]"
+                "Fetch visible ids or use memory_search with a narrower query.]"
             )
         else:
             markers.append(_RESULT_TRUNCATION_MARKER)
@@ -1074,21 +1139,20 @@ class ValidatedFinalReply(str):
     """
 
 
-class ValidatedWakeReply(str):
-    """A proactive reply whose text came from the structured ``reply`` tool.
-
-    Non-scheduled wake delivery is fail-closed at the worker boundary: plain
-    provider text, including text accompanying an ordinary tool call, is never
-    authorized to become a bubble.  A ``str`` subtype preserves the callback
-    contract while carrying that provenance through the ordinary final-effect
-    path. ``thinking`` is kept off the string value so it can only reach the
-    separately sealed thinking envelope, never the visible bubble payload.
-    """
+class ValidatedReply(str):
+    """Terminal reply text with an aside kept outside the visible string."""
 
     def __new__(cls, text: str, *, thinking: str):
         value = super().__new__(cls, text)
         value.thinking = thinking
         return value
+
+
+class ValidatedWakeReply(ValidatedReply):
+    """An explicit reply-tool decision authorized by the tool loop.
+
+    Plain provider text is never authorized to become a proactive bubble.
+    """
 
 
 class CanvasDeliveryIncomplete(FileDeliveryIncomplete):
@@ -1122,20 +1186,99 @@ class FinalReplyCorrectionRejected:
     """The one rewrite was usable text but failed the caller's acceptance gate."""
 
 
+def _transport_retry_count_from_usage(usage: object) -> int | None:
+    """This call's transport retries beyond the initial request (0 on a one-shot
+    success), from the normalized usage's ``provider_retry_count`` — which the
+    provider seam sets for EVERY provider and which counts hidden SDK retries as
+    well as our transient retries. ``None`` when the provider did not report it
+    (never invent 0). Read at the call boundary, not from the turn aggregate."""
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("provider_retry_count")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        # A malformed float must not be coerced (1.5 -> 1, NaN -> ValueError) or
+        # fake a one-shot 0; only a finite non-negative whole number is a count.
+        if math.isfinite(value) and value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    return None
+
+
+def _transport_retry_count_from_error(exc: BaseException) -> int | None:
+    """Transport retries beyond the initial request for a FAILED call, derived
+    from the exception's own attempt envelope (``len(attempts) - 1``). ``None``
+    when the envelope is absent — never reuse accumulated turn state or invent 0."""
+    envelope = provider_client.runtime_provider_attempt_trace(exc)
+    if not isinstance(envelope, dict):
+        return None
+    attempts = envelope.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    # The envelope interleaves http_attempt and outer_attempt records; only the
+    # HTTP attempts are real transport requests, so retries-beyond-initial is the
+    # HTTP-attempt count minus one (a single request => 0 retries).
+    http_attempts = sum(
+        1 for entry in attempts
+        if isinstance(entry, dict) and entry.get("kind") == "http_attempt"
+    )
+    if http_attempts <= 0:
+        return None
+    return http_attempts - 1
+
+
 def _empty_response_shape(pr: ProviderResponse) -> dict[str, object]:
-    """Return content-free diagnostics for a provider success with no output."""
+    """Diagnostics for a provider success with no output.
+
+    Mostly content-free (enums/counts/bools). ``raw_stop_reason`` is the one
+    field that carries a provider's verbatim stop marker, and only for real
+    Gemini responses: Seven's authorization is the Gemini finishReason
+    specifically, so an unknown Gemini ``finishReason`` that ``stop_reason``
+    collapsed to "other" is surfaced raw (per the 2026-09-10 trace-content
+    policy), while every other provider's unknown stop marker stays closed to
+    "other" — a relay/OpenAI-compatible stop string can embed a raw upstream
+    error body and must not open a new plaintext surface. ``stop_reason`` keeps
+    the closed-set value for enum consumers. (T568.) Once a reason such as
+    ``malformed_response`` is recognized instead of folded to "other", it is
+    visible in ``stop_reason`` and no longer gets a ``raw_stop_reason`` field.
+    """
     raw_stop_reason = str(pr.raw.get("stop_reason") or "").strip().lower()
-    return {
-        "stop_reason": (
-            raw_stop_reason
-            if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
-            else ("other" if raw_stop_reason else "")
-        ),
+    normalized_stop = (
+        raw_stop_reason
+        if raw_stop_reason in _CONTENT_FREE_STOP_REASONS
+        else ("other" if raw_stop_reason else "")
+    )
+    shape: dict[str, object] = {
+        "stop_reason": normalized_stop,
         "has_visible_text": bool(pr.text.strip()),
         "reasoning_present": bool(str(pr.raw.get("reasoning") or "").strip()),
         "tool_call_count": len(pr.tool_calls),
         "completion_tokens": pr.usage.completion_tokens,
     }
+    # Surface the verbatim marker ONLY for a real Gemini response (the owned
+    # ``gemini_diagnostics`` shape set by provider_client._parse_gemini_body) whose
+    # reason the closed set collapsed to "other". Scope is deliberate: Seven
+    # authorized the Gemini finishReason specifically, and a non-Gemini unknown
+    # stop marker (relay / OpenAI-compatible / Anthropic) can carry a raw upstream
+    # error body, so those stay closed to "other" with no raw field. Recognized /
+    # empty reasons already show themselves in ``stop_reason``. (T568.)
+    if normalized_stop == "other" and isinstance(
+        pr.raw.get("gemini_diagnostics"), dict
+    ):
+        shape["raw_stop_reason"] = str(pr.raw.get("stop_reason") or "").strip()
+    # Provider-owned content-free root-cause diagnostics (Gemini: finishReason /
+    # safety categories / thought-only shape / token split; OpenAI-compatible
+    # relays: the thinking-vs-visible token split they report, T604), projected
+    # at the provider seam so this never reaches back through content.
+    diagnostics = pr.raw.get("gemini_diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = pr.raw.get("openai_compat_diagnostics")
+    if isinstance(diagnostics, dict):
+        shape["provider_diagnostics"] = dict(diagnostics)
+    return shape
 
 
 def _with_system_suffix(messages: list, suffix: str) -> list:
@@ -1162,6 +1305,42 @@ def _with_system_suffix(messages: list, suffix: str) -> list:
     return updated
 
 
+def _provider_error_facts(exc: BaseException) -> dict[str, object]:
+    """Derive closed failure metadata without trusting exception text.
+
+    Module level so every V2 lane that calls a provider (tool loop, Profile)
+    projects a failed call through the same closed vocabulary.
+    """
+    status_code = getattr(exc, "status_code", None)
+    try:
+        timed_out = provider_client.is_timeout_error(exc)
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+        timed_out = False
+    try:
+        error_family = provider_client.classify_provider_error(exc)
+    except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+        error_family = "unknown"
+    return {
+        "finish_reason": (
+            "timeout"
+            if timed_out
+            else (
+                "http_error"
+                if isinstance(status_code, int)
+                and not isinstance(status_code, bool)
+                else "provider_error"
+            )
+        ),
+        "status_code": status_code,
+        "error_class": provider_errors.error_class_for_exception(exc),
+        "exception_type": type(exc).__name__,
+        # Retry family is independent of the shared notice cause above.
+        "provider_error_class": error_family,
+        **provider_client.provider_error_diagnostics(exc),
+    }
+
+
+@memory_recall.traced
 async def run_tool_loop(
     *,
     provider_config,
@@ -1175,6 +1354,7 @@ async def run_tool_loop(
     on_provider_tool_surface=None,
     on_provider_call_event=None,
     on_empty_provider_response=None,
+    on_wake_direct_text_correction=None,
     on_provider_success=None,
     on_provider_failure=None,
     fold_before_first: bool = False,
@@ -1194,22 +1374,26 @@ async def run_tool_loop(
     # dispatch_tools closure; this parameter controls only the provider surface.
     memory_delete_allowed: bool = False,
     on_stay_silent=None,
-    # Non-scheduled proactive callers enable this for the whole turn. Ordinary
-    # tools remain available while the model gathers context; only the terminal
-    # decision must be exactly one reply/stay_silent tool call. Keeping this
-    # explicit (instead of inferring it from require_reply=False) preserves the
-    # foreground and scheduled contracts, which share this loop but continue to
-    # accept ordinary terminal text.
+    # Non-scheduled wakes require an explicit reply/stay_silent choice. A
+    # terminal plain-text response remains an unpublished draft and gets at
+    # most one correction within the existing provider-call budget.
     regular_wake_choice_required: bool = False,
+    # Presence wakes withhold reply/stay_silent from their first provider call so
+    # the model looks at its context before deciding (prod T723: GLM decided in
+    # one call 96% of the time and chose silence 93% of the time).
+    wake_look_first: bool = False,
+    reply_tool_enabled: bool = False,
+    # Output capacity is independent of whether this lane requires a terminal
+    # reply/stay_silent choice. Scheduled wakes need the same shared budget.
+    wake_output_budget_required: bool = False,
     include_reasoning: bool = False,
-    # Self-authored thinking: when True, NEVER request provider-native reasoning —
-    # not via include_reasoning, and NOT via reasoning_effort either. The model then
-    # has no separate native-CoT channel and emits its thinking in the reply's
-    # <think> block instead (which the seal surfaces). This is what aligns V2 with
-    # the V1 resident: without it a reasoning-capable model (e.g. sonnet) puts its
-    # thought in the native channel — shown raw, often in the wrong language — and
-    # skips the <think>. Default False → other lanes unchanged.
+    # Preserve the existing provider-request policy: aside-enabled turns do
+    # not explicitly request a second native reasoning channel. Any native
+    # reasoning still returned is diagnostic input only, never display text.
     suppress_native_reasoning: bool = False,
+    # ``ReplyLanguage.language`` of the turn; selects the zh/en aside copy the
+    # compact delivery round re-attaches (T734).
+    reply_language: str | None = None,
     # Whether a text-free provider reply is an immediate ERROR. Defaults to
     # True for foreground chat. Wake passes False so this loop can inspect an
     # empty 200 and force the bounded reply/stay_silent choice itself; the
@@ -1271,6 +1455,12 @@ async def run_tool_loop(
     on_prompt_frontier_exhaustion=None,
     on_prompt_frontier_exhausted_detail=None,
     absolute_deadline: float | None = None,
+    # One bound for every provider HTTP wire of this loop: the httpx timeout,
+    # the true wall-clock wire deadline, and a watchdog progress boundary at
+    # every attempt and wire. The hosted stall clock then sees at most one wire
+    # of silence. None keeps the provider_client defaults (60s httpx timeout, no
+    # wire deadline, no per-attempt progress); wake lanes pass a value.
+    provider_wire_timeout_sec: float | None = None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -1363,6 +1553,8 @@ async def run_tool_loop(
         raise ValueError(
             "regular_wake_choice_required requires on_stay_silent"
         )
+    if wake_look_first and not regular_wake_choice_required:
+        raise ValueError("wake_look_first requires regular_wake_choice_required")
     if tool_result_char_cap < MIN_TOOL_RESULT_ERROR_QUOTA:
         raise ValueError("tool_result_char_cap is too small for stable error results")
     if (
@@ -1403,6 +1595,13 @@ async def run_tool_loop(
     empty_response_retry_instruction = ""
     wake_choice_retry_used = False
     wake_choice_required = False
+    wake_direct_text_seen = False
+    wake_direct_text_pending = False
+    wake_direct_text_draft = ""
+    # Needs one look round, one decision round and one spare correction round.
+    wake_look_first_pending = bool(wake_look_first and max_calls >= 3)
+    wake_look_first_decide = False
+    wake_look_first_draft = ""
     final_reply_correction_request: FinalReplyCorrectionRequest | None = None
     final_reply_correction_instruction = ""
     external_content_seen = False
@@ -1528,7 +1727,11 @@ async def run_tool_loop(
 
         if not suppress_native_reasoning or not require_self_thinking:
             return instruction
-        return instruction.rstrip() + "\n\n" + self_thinking.INSTRUCTION.strip()
+        return (
+            instruction.rstrip()
+            + "\n\n"
+            + self_thinking.instruction_for_field(language=reply_language).strip()
+        )
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
         suffixes = frozenset(
@@ -1652,6 +1855,19 @@ async def run_tool_loop(
         except Exception:  # noqa: BLE001
             pass
 
+    # Kept out of provider_kwargs: these configure the retry wrapper, not the
+    # request, and must reach both reliable call sites (incl. tagged-image retry).
+    provider_wire_kwargs: dict = (
+        {
+            "wire_deadline_sec": provider_wire_timeout_sec,
+            "progress_cb": lambda stage, attempt: _progress(
+                f"provider_{stage}_{attempt}"
+            ),
+        }
+        if provider_wire_timeout_sec is not None
+        else {}
+    )
+
     async def _trajectory(event_kind: str, payload: dict) -> None:
         # Unlike cheap progress telemetry this callback is the encrypted flight
         # recorder. Production awaits its durable append at causal boundaries;
@@ -1670,6 +1886,14 @@ async def run_tool_loop(
             if inspect.isawaitable(emitted):
                 await emitted
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
+            pass
+
+    async def _emit_wake_direct_text(outcome: str) -> None:
+        if on_wake_direct_text_correction is None:
+            return
+        try:
+            await on_wake_direct_text_correction(outcome, round_number=attempts)
+        except Exception:  # diagnostics cannot change delivery
             pass
 
     async def _emit_provider_tool_surface(
@@ -1692,33 +1916,6 @@ async def run_tool_loop(
             )
         except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
             pass
-
-    def _provider_error_facts(exc: BaseException) -> dict[str, object]:
-        """Derive closed failure metadata without trusting exception text."""
-        status_code = getattr(exc, "status_code", None)
-        try:
-            timed_out = provider_client.is_timeout_error(exc)
-        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
-            timed_out = False
-        try:
-            error_family = provider_client.classify_provider_error(exc)
-        except Exception:  # noqa: BLE001 - diagnostics cannot alter a turn
-            error_family = "unknown"
-        return {
-            "finish_reason": (
-                "timeout"
-                if timed_out
-                else (
-                    "http_error"
-                    if isinstance(status_code, int)
-                    and not isinstance(status_code, bool)
-                    else "provider_error"
-                )
-            ),
-            "status_code": status_code,
-            "error_class": type(exc).__name__,
-            "provider_error_class": error_family,
-        }
 
     async def _record_required_file_missing(round_number: int) -> None:
         nonlocal required_file_missing_recorded
@@ -1784,6 +1981,19 @@ async def run_tool_loop(
         if on_tool_event is not None:
             await on_tool_event(tc, event_kind, payload)
 
+    async def _finish_stay_silent(tc: ToolCall, reason: str) -> LoopOutcome:
+        await _tool_event(tc, "tool_call_started", {})
+        await _trajectory(
+            "stay_silent_planned",
+            {"round": attempts, "call_id": tc.id, "reason": reason},
+        )
+        if on_stay_silent is None:
+            raise RuntimeError("stay_silent callback is unavailable")
+        await on_stay_silent(reason)
+        silent_result = ToolResult(call_id=tc.id, content="ok: staying silent")
+        await _tool_event(tc, "tool_call_result", {"result": silent_result})
+        return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
+
     while attempts < max_calls:
         _progress("round_boundary")
         if attempts > 0 or fold_before_first:
@@ -1848,11 +2058,15 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        if wake_direct_text_pending:
+            # Keep provider-authored draft out of the trusted system suffix and
+            # out of durable conversation history. Frontier budgeting sees it.
+            messages = [*messages, {"role": "assistant", "content": wake_direct_text_draft}]
         turn_catalog = _turn_catalog()
-        if regular_wake_choice_required:
+        if regular_wake_choice_required or reply_tool_enabled:
             turn_catalog = [
                 spec for spec in turn_catalog if spec.name != _WAKE_REPLY_TOOL
-            ] + [_WAKE_REPLY_TOOL_SPEC]
+            ] + [_REPLY_TOOL_SPEC]
         wake_choice_tool_available = any(
             spec.name == tool_schema.STAY_SILENT_TOOL for spec in turn_catalog
         )
@@ -1867,6 +2081,29 @@ async def run_tool_loop(
             wake_choice_required = True
             force_text_fallback = False
             force_text_fallback_reason = ""
+        look_first_round = bool(
+            wake_look_first_pending
+            and not wake_choice_required
+            and not wake_direct_text_pending
+        )
+        if look_first_round:
+            look_catalog = [
+                spec for spec in turn_catalog
+                if spec.name not in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+            ]
+            if look_catalog:
+                turn_catalog = look_catalog
+            else:
+                # Nothing to look with: an empty tool list is not a valid wire.
+                look_first_round = False
+                wake_look_first_pending = False
+        look_first_decide_round = wake_look_first_decide
+        if look_first_decide_round and wake_look_first_draft:
+            # Same boundary as a direct-text draft: never persisted, never sent.
+            messages = [
+                *messages,
+                {"role": "assistant", "content": wake_look_first_draft},
+            ]
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -1914,6 +2151,18 @@ async def run_tool_loop(
                 identity_write_failed_instruction,
                 empty_response_retry_instruction,
                 _WAKE_CHOICE_INSTRUCTION if wake_choice_required else "",
+                _WAKE_DIRECT_TEXT_CORRECTION if wake_direct_text_pending else "",
+                (
+                    (
+                        _WAKE_DIRECT_TEXT_CORRECTION
+                        if wake_look_first_draft
+                        else _WAKE_CHOICE_INSTRUCTION + " " + _WAKE_PERSONA_REPLY_REMINDER
+                    )
+                    if look_first_decide_round
+                    and not wake_choice_required
+                    and not wake_direct_text_pending
+                    else ""
+                ),
                 final_reply_correction_instruction,
                 terminal_text_instruction,
             )
@@ -2164,7 +2413,7 @@ async def run_tool_loop(
                     except Exception:
                         pass
                 raise exc
-            tools = [_WAKE_REPLY_TOOL_SPEC, stay_silent_spec]
+            tools = [_REPLY_TOOL_SPEC, stay_silent_spec]
             surface_candidate_tools = list(tools)
             surface_reason = "wake_choice_required"
             forced_delivery_tool = ""
@@ -2294,7 +2543,7 @@ async def run_tool_loop(
             if terminal_schema_guard
             else completed_memory_discovery_tools
         )
-        if regular_wake_choice_required:
+        if regular_wake_choice_required and not look_first_round:
             required_schema_names = set(required_schema_names) | {
                 _WAKE_REPLY_TOOL,
                 tool_schema.STAY_SILENT_TOOL,
@@ -2525,22 +2774,14 @@ async def run_tool_loop(
             # parser return any structurally valid success so an abnormal HTTP
             # 200 is not retried as though it were a transient network failure.
             provider_kwargs = {"tools": tools, "require_reply": False}
+            if provider_wire_timeout_sec is not None:
+                provider_kwargs["timeout"] = provider_wire_timeout_sec
             if terminal_schema_guard and tools is not None:
                 provider_kwargs["tool_choice"] = "none"
             if wake_choice_required:
                 provider_kwargs["tool_choice"] = "required"
             if file_delivery_choice_required:
                 provider_kwargs["tool_choice"] = "required"
-            if suppress_native_reasoning and terminal_text_round:
-                # A continuation prefix is safe only once the loop has made
-                # this a text-only terminal request. Live Anthropic testing
-                # showed that adding it to an ordinary tool round can produce
-                # a mismatched </thinking> block or a prefix-only tool turn.
-                # Unsupported provider/model pairs discard this hint in the
-                # payload builder and therefore retain their exact old request.
-                provider_kwargs["assistant_prefill"] = (
-                    provider_client.SELF_THINKING_ASSISTANT_PREFILL
-                )
             if allow_image_output and not terminal_text_round:
                 provider_kwargs["allow_image_output"] = True
             if (
@@ -2580,13 +2821,24 @@ async def run_tool_loop(
                 # tools and truncates even modest documents into malformed
                 # JSON. File generation owns a separate output budget: the
                 # prompt frontier's reserve is input accounting, and increasing
-                # it would silently evict otherwise usable history. Wake/child/
-                # screen lanes omit on_file_reply and keep their existing limits.
+                # it would silently evict otherwise usable history. This branch
+                # keeps priority over the wake-budget branch below.
                 provider_kwargs["max_tokens"] = (
                     min(file_output_max_tokens, 512)
                     if compact_delivery_phase
                     else file_output_max_tokens
                 )
+            elif regular_wake_choice_required or wake_output_budget_required:
+                # Prod 2026-09-07..14 trace: of 425 silent_empty_response events
+                # on choice_invalid jobs, 421 were length + reasoning_present
+                # + completion_tokens>=700. Wake lanes used provider_client's
+                # 700-token default, leaving reasoning models no room to choose
+                # reply/stay_silent. Reuse the established chat/file output
+                # budget; keep input reserve accounting independent.
+                # Scheduled reminders need that capacity too. Keep this opt-in:
+                # an unconditional else would also raise subagent output limits,
+                # outside their existing per-call reservation policy.
+                provider_kwargs["max_tokens"] = file_output_max_tokens
             if on_provider_tool_surface is not None:
                 candidate_names = {
                     str(spec.name) for spec in surface_candidate_tools
@@ -2653,11 +2905,31 @@ async def run_tool_loop(
                 base_delay_sec=0.2,
                 max_delay_sec=1.0,
                 absolute_deadline=absolute_deadline,
+                **provider_wire_kwargs,
                 **provider_kwargs,
             )
         except Exception as exc:
+            if wake_direct_text_pending:
+                # This correction has one provider attempt, including failure;
+                # compatibility fallbacks must not create another correction.
+                await _emit_wake_direct_text("still_invalid")
+                await _provider_call_event("error", {
+                    "round": attempts, **_provider_error_facts(exc),
+                })
+                if on_provider_failure is not None:
+                    try:
+                        await on_provider_failure(exc)
+                    except Exception:
+                        pass
+                raise
+            provider_tool_history_rejected = (
+                isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and _is_provider_tool_history_rejection(exc)
+            )
             tagged_image_rejected = (
-                not tagged_image_fallback_active
+                not provider_tool_history_rejected
+                and not tagged_image_fallback_active
                 and _has_tagged_image_message(messages, tagged_image_message_key)
                 and getattr(exc, "status_code", None) in {400, 404, 415, 422}
             )
@@ -2705,6 +2977,7 @@ async def run_tool_loop(
                         base_delay_sec=0.2,
                         max_delay_sec=1.0,
                         absolute_deadline=absolute_deadline,
+                        **provider_wire_kwargs,
                         **provider_kwargs,
                     )
                     # A successful text-only retry confirms that the rejected
@@ -2720,13 +2993,36 @@ async def run_tool_loop(
                 provider_error = exc
         if provider_error is not None:
             exc = provider_error
+            provider_tool_history_rejected = (
+                isinstance(exc, provider_client.ProviderError)
+                and exc.status_code in {400, 422}
+                and _is_provider_tool_history_rejection(exc)
+            )
+            # Defense in depth: the classifier already excludes these exact
+            # transcript failures. Keep the branch gate too, so broadening the
+            # schema heuristic later cannot silently restore the billed retry.
             tool_schema_rejected = (
-                tools is not None
+                not provider_tool_history_rejected
+                and tools is not None
                 and isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
                 and attempts < max_calls
+                # A regular wake gets one useful schema recovery: its broad
+                # first-round catalog may collapse to the minimal
+                # reply/stay_silent choice. Once that forced choice is already
+                # on the wire there is no smaller valid wake surface to try.
+                # Retrying would send the identical rejected request until the
+                # whole turn budget is exhausted (15 calls in production).
+                and not wake_choice_required
                 and _is_probably_tool_schema_rejection(exc)
             )
+            if (
+                provider_tool_history_rejected
+                and provider_surface_detail is not None
+            ):
+                provider_surface_detail["force_text_fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY
+                )
             await _emit_provider_tool_surface(provider_surface_detail)
             provider_error_facts = _provider_error_facts(exc)
             provider_call_dur_ms = (
@@ -2741,6 +3037,7 @@ async def run_tool_loop(
                         getattr(provider_config, "model", "") or ""
                     ),
                     **provider_error_facts,
+                    "transport_retry_count": _transport_retry_count_from_error(exc),
                     "dur_ms": provider_call_dur_ms,
                 },
             )
@@ -2756,7 +3053,11 @@ async def run_tool_loop(
                 ],
                 "dur_ms": provider_call_dur_ms,
             }
-            if tool_schema_rejected:
+            if provider_tool_history_rejected:
+                provider_error_detail["fallback_reason"] = (
+                    _PROVIDER_ATTEMPT_FALLBACK_TOOL_HISTORY
+                )
+            elif tool_schema_rejected:
                 provider_error_detail["fallback_reason"] = (
                     _PROVIDER_ATTEMPT_FALLBACK_TOOL_SCHEMA
                 )
@@ -2855,24 +3156,10 @@ async def run_tool_loop(
                 continue
             raise provider_error
         raw_finish_reason = str(result.get("stop_reason") or "").strip().lower()
-        await _provider_call_event(
-            "done",
-            {
-                "round": attempts,
-                "provider": provider_name,
-                "model": str(getattr(provider_config, "model", "") or ""),
-                "finish_reason": (
-                    raw_finish_reason
-                    if raw_finish_reason in _CONTENT_FREE_STOP_REASONS
-                    else ("other" if raw_finish_reason else "unspecified")
-                ),
-                "dur_ms": (
-                    time.monotonic() - provider_call_started_at
-                ) * 1000,
-            },
-        )
-        _progress("provider_complete")
-        add_usage(result.get("usage"))
+        # Determine empty-ness BEFORE emitting the done event, so the provider
+        # call event itself records whether this call produced usable output and
+        # (when empty) carries the content-free root-cause diagnostics. The same
+        # value still gates the success callback below.
         upstream_response_envelope = protocol_leak.is_upstream_response_envelope(
             result.get("reply")
         )
@@ -2884,6 +3171,31 @@ async def run_tool_loop(
             or result.get("tool_calls")
             or result.get("media")
         )
+        done_detail: dict[str, object] = {
+            "round": attempts,
+            "provider": provider_name,
+            "model": str(getattr(provider_config, "model", "") or ""),
+            "finish_reason": (
+                raw_finish_reason
+                if raw_finish_reason in _CONTENT_FREE_STOP_REASONS
+                else ("other" if raw_finish_reason else "unspecified")
+            ),
+            "transport_retry_count": _transport_retry_count_from_usage(
+                result.get("usage")
+            ),
+            "empty": not raw_has_usable_output,
+            "dur_ms": (
+                time.monotonic() - provider_call_started_at
+            ) * 1000,
+        }
+        # The empty marker + transport_retry_count make the done event say
+        # "this call produced no usable output, after N transport retries"; the
+        # full content-free root-cause diagnostics ride the dedicated
+        # ``provider.empty_response`` event (which on_empty_provider_response
+        # emits) to stay under _safe_detail's 20-key cap.
+        await _provider_call_event("done", done_detail)
+        _progress("provider_complete")
+        add_usage(result.get("usage"))
         if (not require_reply or raw_has_usable_output) and on_provider_success is not None:
             try:
                 await on_provider_success()
@@ -2915,6 +3227,92 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        if look_first_decide_round:
+            wake_look_first_decide = False
+            wake_look_first_draft = ""
+        if look_first_round:
+            wake_look_first_pending = False
+            early_decision_calls = [
+                tc for tc in pr.tool_calls
+                if tc.name in {_WAKE_REPLY_TOOL, tool_schema.STAY_SILENT_TOOL}
+            ]
+            early_decision_only = bool(pr.tool_calls) and len(
+                early_decision_calls
+            ) == len(pr.tool_calls)
+            if (not pr.tool_calls and not pr.media) or early_decision_only:
+                # No lookup was wanted. A decision attempted before it was
+                # offered is not a protocol violation: carry any drafted text
+                # (plain text or reply.text) as an unpublished draft into one
+                # ordinary decision round; from there the existing direct-text
+                # and empty-response paths apply unchanged.
+                early_reply_text = next(
+                    (
+                        str((tc.args or {}).get("text") or "")
+                        for tc in early_decision_calls
+                        if tc.name == _WAKE_REPLY_TOOL
+                        and isinstance(tc.args, dict)
+                    ),
+                    "",
+                )
+                draft_source = early_reply_text or (
+                    pr.text if not upstream_response_envelope else ""
+                )
+                wake_look_first_decide = True
+                wake_look_first_draft = (
+                    draft_source[:max_assistant_tool_text_chars]
+                    if draft_source.strip()
+                    else ""
+                )
+                await _trajectory("wake_look_first", {
+                    "round": attempts,
+                    "tool_call_count": len(pr.tool_calls),
+                    "early_decision": early_decision_only,
+                    "provider_text_present": bool(wake_look_first_draft),
+                })
+                await _emit_provider_tool_surface(provider_surface_detail)
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("wake_look_first_decide_boundary")
+                continue
+            # A real lookup: the next round still decides, so it carries the same
+            # choice instruction (no draft). Prod 2026-09-25..28: every GLM
+            # choice_invalid heartbeat looked something up here and then answered
+            # the lookup result in plain text; none took the draft path (T770).
+            wake_look_first_decide = True
+        if (
+            regular_wake_choice_required and not wake_direct_text_seen
+            and not pr.tool_calls and not pr.media and pr.text.strip()
+            and not upstream_response_envelope
+        ):
+            wake_direct_text_seen = True
+            await _emit_wake_direct_text("direct_text_seen")
+            await _trajectory("wake_choice_response", {
+                "round": attempts, "choice": "invalid",
+                "tool_call_count": 0, "provider_text_present": True,
+            })
+            await _emit_provider_tool_surface(provider_surface_detail)
+            if (
+                provider_name in _NAMED_TOOL_CHOICE_PROVIDERS
+                and wake_choice_tool_available and attempts < max_calls
+                and tool_calls_used < max_tool_calls_per_turn
+            ):
+                wake_direct_text_pending = True
+                wake_direct_text_draft = pr.text[:max_assistant_tool_text_chars]
+                wake_choice_required = True
+                wake_choice_retry_used = True
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
+                _progress("wake_direct_text_correction_boundary")
+                continue
+            await _emit_wake_direct_text("still_invalid")
+            exc = WakeChoiceInvalid()
+            if on_provider_failure is not None:
+                try:
+                    await on_provider_failure(exc)
+                except Exception:
+                    pass
+            raise exc
+
         regular_terminal_choice_present = bool(
             regular_wake_choice_required
             and len(pr.tool_calls) == 1
@@ -2973,7 +3371,7 @@ async def run_tool_loop(
                 for tc in pr.tool_calls
                 if tc.name not in mcp_names
                 and not (
-                    regular_wake_choice_required
+                    (regular_wake_choice_required or reply_tool_enabled)
                     and tc.name == _WAKE_REPLY_TOOL
                 )
                 and (
@@ -3088,10 +3486,46 @@ async def run_tool_loop(
                     "unavailable_tool_call_counts": unavailable_call_counts,
                 }
             )
-        await _emit_provider_tool_surface(
-            provider_surface_detail,
-            surface_rejection_reasons,
-        )
+        if not (wake_choice_required or wake_reply_call_present):
+            await _emit_provider_tool_surface(
+                provider_surface_detail,
+                surface_rejection_reasons,
+            )
+
+        # Chat and scheduled turns may finish through the same reply schema.
+        # Only consume an offered, sole, structurally valid call. Other calls
+        # retain the ordinary rejected-exchange handling and bounded fallback.
+        if (
+            reply_tool_enabled
+            and not regular_wake_choice_required
+            and not terminal_text_round
+            and not surface_exchange_rejected
+            and len(pr.tool_calls) == 1
+            and pr.tool_calls[0].name == _WAKE_REPLY_TOOL
+        ):
+            reply_call = pr.tool_calls[0]
+            reply_text = reply_call.args.get("text")
+            if (
+                reply_call.args_ok
+                and set(reply_call.args) <= {"aside", "text"}
+                and isinstance(reply_text, str)
+                and reply_text.strip()
+                and len(reply_text) <= max_assistant_tool_text_chars
+                and not pr.media
+            ):
+                aside = reply_call.args.get("aside")
+                tool_calls_used += 1
+                pr = ProviderResponse(
+                    text=ValidatedReply(
+                        reply_text.strip(),
+                        thinking=aside.strip() if isinstance(aside, str) else "",
+                    ),
+                    tool_calls=[], usage=pr.usage, raw=pr.raw,
+                    assistant_turn=None, media=(),
+                )
+            else:
+                validation_errors[reply_call.id] = "reply requires non-empty text"
+                surface_exchange_rejected = True
 
         structured_wake_reply = False
         if wake_choice_required or wake_reply_call_present:
@@ -3109,15 +3543,15 @@ async def run_tool_loop(
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"think", "text"}
+                and set(selected_call.args) <= {"aside", "text"}
                 else None
             )
             selected_reply_thinking = (
-                selected_call.args.get("think")
+                selected_call.args.get("aside")
                 if selected_call is not None
                 and selected_call.name == _WAKE_REPLY_TOOL
                 and selected_call.args_ok
-                and set(selected_call.args) <= {"think", "text"}
+                and set(selected_call.args) <= {"aside", "text"}
                 else None
             )
             reply_text = (
@@ -3137,16 +3571,29 @@ async def run_tool_loop(
                 and selected_call.args_ok
                 else ""
             )
-            valid_reply_choice = bool(
+            valid_reply_shape = bool(
                 selected_call is not None
                 and selected_call.id
                 and len(wake_reply_calls) == 1
-                and reply_thinking
                 and reply_text
                 and not pr.media
                 and len(reply_text) <= max_assistant_tool_text_chars
                 and tool_calls_used < max_tool_calls_per_turn
             )
+            valid_reply_choice = bool(
+                valid_reply_shape
+                and not _is_protocol_token_reply(reply_text)
+            )
+            silent_from_protocol_token = valid_reply_shape and not valid_reply_choice
+            if silent_from_protocol_token:
+                token = _normalize_protocol_token_reply(reply_text)
+                silent_reason = f"reply text was a bare protocol token: {token}"
+                if provider_surface_detail is not None:
+                    # Sentinel interiors are an open set of provider text, so
+                    # plaintext telemetry uses a fixed bucket for that family.
+                    provider_surface_detail["protocol_token_reply"] = (
+                        token if token in _PROTOCOL_TOKEN_REPLY_NAMES else "__sentinel__"
+                    )
             valid_silent_choice = bool(
                 selected_call is not None
                 and selected_call.id
@@ -3159,6 +3606,10 @@ async def run_tool_loop(
                 )
                 is None
             )
+            await _emit_provider_tool_surface(
+                provider_surface_detail,
+                surface_rejection_reasons,
+            )
             await _trajectory(
                 "wake_choice_response",
                 {
@@ -3167,9 +3618,13 @@ async def run_tool_loop(
                         _WAKE_REPLY_TOOL
                         if valid_reply_choice
                         else (
-                            tool_schema.STAY_SILENT_TOOL
-                            if valid_silent_choice
-                            else "invalid"
+                            "silent_from_protocol_token"
+                            if silent_from_protocol_token
+                            else (
+                                tool_schema.STAY_SILENT_TOOL
+                                if valid_silent_choice
+                                else "invalid"
+                            )
                         )
                     ),
                     "tool_call_count": len(pr.tool_calls),
@@ -3177,6 +3632,10 @@ async def run_tool_loop(
                 },
             )
             if valid_reply_choice:
+                if wake_direct_text_pending:
+                    await _emit_wake_direct_text("corrected_to_reply")
+                    wake_direct_text_pending = False
+                    wake_direct_text_draft = ""
                 tool_calls_used += 1
                 # Feed the selected text into the ordinary terminal-text path.
                 # Any provider text beside the call is only a preamble, exactly
@@ -3194,9 +3653,21 @@ async def run_tool_loop(
                 )
                 wake_choice_required = False
                 structured_wake_reply = True
-            elif valid_silent_choice:
+            elif valid_silent_choice or silent_from_protocol_token:
+                if wake_direct_text_pending:
+                    await _emit_wake_direct_text("corrected_to_silent")
+                    wake_direct_text_pending = False
+                    wake_direct_text_draft = ""
                 wake_choice_required = False
+                if silent_from_protocol_token:
+                    tool_calls_used += 1
+                    return await _finish_stay_silent(selected_call, silent_reason)
             else:
+                direct_correction_failed = wake_direct_text_pending
+                if direct_correction_failed:
+                    await _emit_wake_direct_text("still_invalid")
+                    wake_direct_text_pending = False
+                    wake_direct_text_draft = ""
                 can_retry_wake_choice = (
                     not wake_choice_retry_used
                     and attempts < max_calls
@@ -3218,7 +3689,7 @@ async def run_tool_loop(
                 )
                 exc = (
                     ProviderEmptyReply("empty_reply")
-                    if provider_returned_nothing
+                    if provider_returned_nothing and not direct_correction_failed
                     else WakeChoiceInvalid()
                 )
                 if on_provider_failure is not None:
@@ -4021,17 +4492,7 @@ async def run_tool_loop(
             )
         for tc in stay_silent_calls:
             reason = str(tc.args.get("reason") or "").strip()
-            await _tool_event(tc, "tool_call_started", {})
-            await _trajectory(
-                "stay_silent_planned",
-                {"round": attempts, "call_id": tc.id, "reason": reason},
-            )
-            if on_stay_silent is None:
-                raise RuntimeError("stay_silent callback is unavailable")
-            await on_stay_silent(reason)
-            silent_result = ToolResult(call_id=tc.id, content="ok: staying silent")
-            await _tool_event(tc, "tool_call_result", {"result": silent_result})
-            return LoopOutcome("", attempts, "stay_silent", replied_intermediate)
+            return await _finish_stay_silent(tc, reason)
 
         file_completion_message = ""
         file_completion_validated = False
@@ -4137,9 +4598,9 @@ async def run_tool_loop(
                 tc.args.get("completion_message") or ""
             ).strip()
             thinking_status, _thinking, visible_completion = (
-                self_thinking.strip_all_thinking(completion_message)
+                self_thinking.strip_all_thinking_or_salvage(completion_message)
             )
-            if thinking_status == self_thinking.COMPLETE:
+            if thinking_status in {self_thinking.COMPLETE, self_thinking.SALVAGED}:
                 completion_message = visible_completion
             elif thinking_status in {self_thinking.SILENT, self_thinking.FAILED}:
                 completion_message = ""

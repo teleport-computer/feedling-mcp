@@ -28,6 +28,9 @@ ENCRYPTED_SIGNAL_KEYS_V2 = frozenset({
     "health_metabolic",
     "health_cycle",
     "health_mood",
+    # 用户在健康 app 里删掉的样本 id。不是一条观测，是一条"之前那条不作数了"。
+    # 走加密：被删的是哪条健康记录，本身就是健康信息。
+    "health_deleted",
 })
 IGNORED_SIGNAL_KEYS_V2 = frozenset({"unsupported"})
 
@@ -52,6 +55,10 @@ EXPECTED_REPORT_KEYS_V2 = (
     "health_cycle",
     "health_mood",
     "unsupported",
+    # ⚠️ `health_deleted` **刻意不在这张表里**。这里列的是「一份完整报告里
+    # 应该出现的键」，而删除只在真有删除时才发 —— 加进来会让每一份正常报告
+    # 都被判成"缺了一个键"。它在 ENCRYPTED_SIGNAL_KEYS_V2 里（要加密），
+    # 在 service._PERCEPTKIT_DECRYPTED_ENTRIES 里（要路由），就够了。
 )
 
 DIFFER_INPUTS_BY_IOS_KEY_V2 = {

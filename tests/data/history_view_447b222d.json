@@ -1,0 +1,188 @@
+{
+ "generated_from": "447b222d8c1ba19525eb6d1d74d6bac1be7ecd96",
+ "view": {
+  "decrypted": [
+   {
+    "content": "担心咪咪最近不吃饭",
+    "content_type": "text",
+    "decrypt_status": "ok",
+    "id": "m1",
+    "role": "user",
+    "seq": 1,
+    "source": "chat",
+    "ts": 1790000001.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "content": "是咪咪吗？吃饭情况持续几天了？",
+    "content_type": "text",
+    "decrypt_status": "ok",
+    "id": "m2",
+    "role": "agent",
+    "seq": 2,
+    "source": "chat",
+    "ts": 1790000002.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "content": "这是它今天的饭盆",
+    "content_type": "image",
+    "decrypt_status": "ok",
+    "id": "m3",
+    "image_b64": "iVBORw0KGgp4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4",
+    "image_mime": "image/png",
+    "role": "user",
+    "seq": 3,
+    "source": "chat",
+    "ts": 1790000003.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "content": "",
+    "content_type": "image",
+    "decrypt_status": "ok",
+    "id": "m4",
+    "image_count": 2,
+    "images": [
+     {
+      "image_b64": "iVBORw0KGgp4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4",
+      "image_mime": "image/png"
+     },
+     {
+      "image_b64": "/9j/eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eQ==",
+      "image_mime": "image/jpeg"
+     }
+    ],
+    "role": "user",
+    "seq": 4,
+    "source": "chat",
+    "ts": 1790000004.0,
+    "v": 1,
+    "visibility": "shared",
+    "vision_route_id": "vr1"
+   },
+   {
+    "content": "兽医给的化验单",
+    "content_type": "file",
+    "decrypt_status": "ok",
+    "file_b64": "JVBERi0xLjQgeA==",
+    "file_display_title": "化验单",
+    "file_mime": "application/pdf",
+    "file_name": "vet.pdf",
+    "id": "m5",
+    "role": "user",
+    "seq": 5,
+    "source": "chat",
+    "ts": 1790000005.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "content": "封存的图片说明",
+    "content_type": "image",
+    "decrypt_status": "ok",
+    "id": "m6",
+    "image_b64": "c2VhbGVkIGltYWdlIGJ5dGVzIGFyZSBub3QgYW4gaW1hZ2U=",
+    "image_mime": "image/jpeg",
+    "role": "user",
+    "seq": 6,
+    "source": "chat",
+    "ts": 1790000006.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "body_omitted": true,
+    "body_omitted_reason": "include_image_body_false",
+    "content": "省略正文的图片说明",
+    "content_type": "image",
+    "decrypt_status": "ok",
+    "id": "m7",
+    "image_mime": "image/jpeg",
+    "image_omitted": true,
+    "quoted_memory_ids": "card_1,card_2",
+    "role": "user",
+    "seq": 7,
+    "source": "chat",
+    "ts": 1790000007.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "body_omitted": true,
+    "content": "省略正文的文件说明",
+    "content_type": "file",
+    "decrypt_status": "ok",
+    "file_mime": "text/plain",
+    "file_name": "notes.txt",
+    "file_omitted": true,
+    "id": "m8",
+    "role": "user",
+    "seq": 8,
+    "source": "chat",
+    "ts": 1790000008.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "body_omitted": true,
+    "content": null,
+    "content_type": "text",
+    "decrypt_status": "ok",
+    "id": "m9",
+    "role": "user",
+    "seq": 9,
+    "source": "chat",
+    "ts": 1790000009.0,
+    "v": 1,
+    "visibility": "shared"
+   },
+   {
+    "content": null,
+    "content_type": "text",
+    "decrypt_status": "local_only_agent_cannot_read",
+    "id": "m10",
+    "role": "user",
+    "seq": 10,
+    "source": "chat",
+    "ts": 1790000010.0,
+    "v": 1,
+    "visibility": "local_only"
+   },
+   {
+    "content": null,
+    "content_type": "text",
+    "decrypt_status": "error: AEAD verify: Decryption failed.",
+    "id": "m11",
+    "role": "user",
+    "seq": 11,
+    "ts": 1790000011.0,
+    "v": 1
+   },
+   {
+    "content": "我每天练 guitar 多久？",
+    "content_type": "text",
+    "decrypt_status": "ok",
+    "id": "m12",
+    "reply_to_message_id": "m2",
+    "role": "user",
+    "seq": 12,
+    "source": "chat",
+    "ts": 1790000012.0,
+    "v": 1,
+    "visibility": "shared",
+    "voice_call_id": "call-1",
+    "voice_turn_count": 3
+   }
+  ],
+  "errors": [
+   {
+    "id": "m11",
+    "reason": "AEAD verify: Decryption failed."
+   }
+  ]
+ }
+}

@@ -60,7 +60,8 @@ def test_readers_reject_shapes_that_cannot_exist(bogus):
     放松这一条，上面那三个真实反例又会静默通过，而假信封写的断言验不到真实路径。
     """
     with pytest.raises(ValueError, match=_UNRECOGNIZED):
-        core_envelope.read_envelope_body(bogus, "ak", purpose="guard")
+        core_envelope.read_envelope_body(
+            bogus, "ak", purpose="guard", caller_user_id="usr_guard")
 
 
 @pytest.mark.parametrize("bogus", [

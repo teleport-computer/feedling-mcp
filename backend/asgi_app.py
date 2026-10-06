@@ -53,6 +53,7 @@ _ASGI_PACKAGES = (
     "genesis.routes_asgi",
     "onboarding_archive.routes_asgi",
     "hosted.setup_routes_asgi",
+    "hosted.agent_body_routes_asgi",
     "hosted.mcp_routes_asgi",
     "hosted.chat_routes_asgi",
     "hosted.history_import_asgi",
@@ -175,7 +176,7 @@ def _emit_job_enqueued_trace(user_id: str, lane: str, *, reason: str, trace_id: 
     from core import store as _wire_core_store
 
     _diagnostics_core.emit_trace_event_payload(
-        _wire_core_store.get_store_shell_only(
+        _wire_core_store.get_store_per_load_mode(
             user_id, reason="debug trace is a durable log write"
         ),
         {

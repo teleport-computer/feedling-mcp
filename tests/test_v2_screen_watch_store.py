@@ -135,7 +135,7 @@ def test_startup_seed_repairs_null_clocks_and_reaches_a_real_enqueued_job(
     monkeypatch.setattr(
         serve_worker.db,
         "frame_list_meta",
-        lambda user_id: [
+        lambda user_id, *, source: [
             {"filename": f"{user_id}-fresh.env.json", "ts": now, "app": None}
         ],
     )

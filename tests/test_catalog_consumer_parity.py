@@ -14,6 +14,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 # tools/chat_resident_consumer.py 在 import 时需要一批环境变量默认值（照抄
 # tests/test_consumer_error_classify.py 的既有写法，保持两处环境一致）。
 _ENV_DEFAULTS = {
@@ -37,10 +39,27 @@ except ModuleNotFoundError:
     sys.modules["content_encryption"] = _fake_enc
 
 from notices import catalog  # noqa: E402
+from notices import agent_call_failure  # noqa: E402
 from notices import core  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
+
+
+_PROVIDER_TOOL_HISTORY_REJECTION_DETAILS = (
+    "provider_http_400: The GenerateContentRequest proto is invalid:\n"
+    "  * contents[2].parts[0].function_response.name: "
+    "[REQUIRED_FIELD_MISSING]",
+    "provider_http_400: Function call is missing a thought_signature in "
+    "functionCall parts. This is required for tools to work correctly, and "
+    "missing thought_signature may lead to degraded model performance. "
+    "Additional data, function call `default_api:memory_write` , position 2. "
+    "Please refer to https://***.dev/***/***/*** for more details.",
+    "provider_http_400: Provider API error: Provider API error: Please ensure "
+    "that function call turn comes immediately after a user turn or after a "
+    "function response turn. (request id: "
+    "20260903134117388340505BvsDKsJo)",
+)
 
 
 def test_catalog_covers_all_consumer_error_classes():
@@ -51,6 +70,10 @@ def test_catalog_covers_all_consumer_error_classes():
 def test_user_unavailable_v1_reasons_are_producer_registered():
     producer_codes = set(crc.CONSUMER_ERROR_CLASSES) | set(
         worker.PUBLIC_FAILURE_CODES
+    ) | set(
+        # 2026-09-15: V1 memory-lane reasons are produced by the backend's
+        # status-endpoint normalizer, not the consumer (catalog memory-lane block).
+        agent_call_failure.PUBLIC_REASON_CODES
     )
     missing = set(catalog.USER_UNAVAILABLE_V1_REASONS) - producer_codes
     assert not missing, f"用户侧豁免未由产生方导出: {sorted(missing)}"
@@ -128,6 +151,33 @@ def test_image_generation_configuration_catalog_is_actionable_and_bilingual():
         ) != catalog.user_text_for(error_class, language="zh-Hans")
 
 
+def test_image_generation_status_specific_copy_matches_approved_contract():
+    expected = {
+        "image_generation_model_incompatible": (
+            "这个模型或接口不支持生图，请换一个模型。",
+            "This model or endpoint can't generate images. Try another model.",
+        ),
+        "image_generation_auth_invalid": (
+            "API Key 被拒绝，请检查 Key 和权限。",
+            "API key rejected. Check the key and its permissions.",
+        ),
+        "image_generation_quota_insufficient": (
+            "额度或余额不足，请充值后重试。",
+            "Insufficient quota or balance. Top up and retry.",
+        ),
+        "image_generation_model_not_found": (
+            "找不到该模型或接口地址，请检查模型名和 Base URL。",
+            "Model or endpoint not found. Check the model name and Base URL.",
+        ),
+    }
+
+    for error_class, (expected_zh, expected_en) in expected.items():
+        assert catalog.user_text_for(
+            error_class, language="zh-Hans"
+        ) == expected_zh
+        assert catalog.user_text_for(error_class, language="en-US") == expected_en
+
+
 def test_every_direct_terminal_chat_notice_is_bilingual():
     direct_notice_classes = set(jobs_store._DIRECT_NOTICE_ERROR_CLASSES)
     direct_notice_classes.update(
@@ -170,6 +220,7 @@ def _consumer_blame_map() -> dict[str, str]:
     out.setdefault("platform_execution_timeout", "system")
     out.setdefault("provider_timeout", "provider_transient")
     out.setdefault("provider_empty_reply", "provider_transient")
+    out.setdefault("provider_error_unclassified", "provider_transient")
     out.setdefault("reply_parse_failed", "system")
     out.setdefault("model_not_found", "user_provider")  # 裸 404+model 分支，和规则表一致
     out.setdefault("unknown", "system")
@@ -211,6 +262,30 @@ def test_timeout_notice_classes_have_non_retry_loop_text():
     assert catalog.user_text_for("provider_timeout") == (
         "你配置的模型服务这次没有及时响应。请先检查模型渠道稳定性，不要连续重发。"
     )
+
+
+@pytest.mark.parametrize("detail", _PROVIDER_TOOL_HISTORY_REJECTION_DETAILS)
+def test_provider_tool_history_rejection_has_exact_actionable_notice(detail):
+    expected_code = "provider_tool_history_rejected"
+    expected_zh = (
+        "模型似乎调用工具出错了，这个通道暂时无法使用工具，换个模型或稍后重试。"
+    )
+    expected_en = (
+        "The model seems to have hit an error calling tools, so tools are "
+        "temporarily unavailable on this channel. Switch models or try again "
+        "later."
+    )
+
+    assert catalog.classify_upstream(detail) == expected_code
+    assert catalog.classify_upstream(detail) != "provider_incompatible"
+    assert (
+        crc.classify_agent_error(RuntimeError(detail)).error_class
+        == expected_code
+    )
+    assert catalog.user_text_for(expected_code, language="zh-Hans") == expected_zh
+    assert catalog.user_text_for(expected_code, language="en-US") == expected_en
+    assert catalog.blame_for(expected_code) == "user_provider"
+    assert f"turn_failed:{expected_code}" in worker.PUBLIC_FAILURE_CODES
 
 
 def test_classify_upstream_mirrors_consumer_on_samples():

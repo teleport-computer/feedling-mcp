@@ -7,6 +7,22 @@ canonical_owner: self
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
+## Synchronous agent body generation
+
+`POST /v1/agent-body/generate` returns a validated grid without saving a preset.
+Hosted requests run inside the managed confidential-VM boundary: ASGI reads the
+caller's authorized identity/persona/memory context and calls the active chat
+provider directly, outside the Chat queue. The decrypt service retains the
+content private keys.
+
+For resident accounts, the user-scoped CAS consumer mailbox carries fixed
+instructions and palette colors. The bound consumer reads identity and memory
+at its own authenticated boundary and runs its agent. A temporary grid result
+passes through the mailbox to the waiting API request, then is removed. Expiry
+is enforced on reads; after a process crash cleanup occurs at the next access.
+The result never becomes a Chat row or memory. Both paths share the server grid
+validator. See [the contract](/docs/errors#agent-body-generation).
+
 ## Multi-worker chat consistency
 
 PostgreSQL is the durable source of truth for chat. Each backend worker keeps a bounded per-user hot projection and advances it with versioned change events delivered through PostgreSQL `LISTEN/NOTIFY`. Notifications are only wake hints: workers verify durable versions, apply contiguous events, and fall back to a bounded snapshot when events are missing, reset, or too far behind.
@@ -34,7 +50,7 @@ worker, while still waking parked pollers. This changes query timing and worker
 cache shape only: PostgreSQL authority, API behavior, encryption, isolation,
 trust boundaries, and deployment topology are unchanged.
 
-Feedling separates ciphertext persistence from authorized decryption and agent
+Feedling separates content persistence from authorized decryption and agent
 execution. Managed production uses a main confidential VM for the public API and
 trusted-decrypt service, separate confidential-VM capacity for hosted agents,
 and external persistence and delivery services.
@@ -63,12 +79,13 @@ deployment topology.
 | --- | --- | --- |
 | Client app or integration | Own the user credential and content keypair; call HTTP or WebSocket operations | Plaintext created or displayed by that client, plus encrypted envelopes |
 | TLS ingress | Terminate the public API certificate and route configured traffic | Transport plaintext inside the managed confidential-VM boundary |
-| ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext |
+| ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext, including a plaintext account's memory cards while ranking its keyword search |
 | Attested decrypt service | Own the content private key and authorize envelope decryption or read-side projection | Plaintext while servicing an authorized operation |
-| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in whichever shape the owning user's tier selects, plus plaintext IDs, timestamps, types, status, and other operational metadata |
-| Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
-| Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
+| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in the deployment-gated write shape, plus legacy ciphertext, and plaintext IDs, timestamps, types, status, and other operational metadata |
+| Object storage | Offload enabled large-object flows | Screen and Chat objects use the effective write shape; plaintext media are raw bytes, while legacy ciphertext remains encrypted |
+| Hosted runner | Poll work, assemble authorized context, invoke an agent, and return a result in the effective write shape | Plaintext selected for an agent turn, the provider credential, and authenticated API traffic |
 | Managed CPU recorder | Retain bounded host and per-container CPU history without a public endpoint | Infrastructure identifiers and numeric CPU/load samples only; no application content |
+| Enclave log collector | Retain allowlisted enclave diagnostics on a 30-day local volume and optionally in operator R2 | Content-free request fields (including a truncated user prefix) and fixed worker lifecycle events; never raw container logs |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
 | ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
 | Provider-chosen image URL | Serve a generated image that the provider returned as a link instead of inline bytes | The URL the provider chose — including any path or query it encoded — plus ordinary request metadata such as the Host header and the deployment's outbound address. No Feedling-held credential, cookie, prompt, or request body is attached. Only the image endpoint's `data[].url` is eligible, it must resolve to a publicly routable address, redirects are not followed, and the bytes must decode as a PNG, JPEG or WebP within fixed size and time budgets |
@@ -77,7 +94,28 @@ The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
 that every identifier, status field, compatibility payload, normalized signal,
 or diagnostic upload is encrypted — nor that every protected body is encrypted,
-since [content encryption is a per-user preference](#content-encryption-is-a-per-user-preference).
+since [new shared content uses plaintext when the deployment gate is open](#new-shared-content-uses-plaintext).
+
+### Enclave operational logs leave the VM only when configured
+
+Separately from enclave logs, the database's operator-readable `provider_attempts`
+ledger stores Runtime V2 Capture/Dream job correlation, provider/model, retry and
+wire counts, wire duration, HTTP status, and closed error/timeout categories.
+This is plaintext operational metadata. Its wire projection excludes request
+and response bodies, URLs, headers, credentials, and raw exception text; missing
+traces remain explicitly unmeasured. It adds no storage recipient or network hop.
+
+The production and test Compose sources include a log collector for only the
+`enclave` and `enclave-domain` containers. It validates a closed request-log
+schema and re-encodes worker lifecycle events; raw paths, credentials, content,
+full user IDs, exception text and unrecognized lines are not exported. These
+diagnostics include timestamps, route templates, timings, status, purpose and a
+truncated user prefix, so they remain operational metadata visible to the operator.
+They are retained in a local volume for 30 days. When `R2_LOGS_BUCKET` is configured,
+they leave the confidential VM for the operator's R2 bucket, whose lifecycle must
+be set to 90 days. This is a separate recipient and retention boundary from
+content storage. Without that bucket setting, the collector remains local-only;
+it does not create or configure the bucket or its lifecycle.
 
 ## Core data flows
 
@@ -86,24 +124,44 @@ since [content encryption is a per-user preference](#content-encryption-is-a-per
 1. The client sends a message or attachment over HTTPS to
    `POST /v1/model_api/chat/send`.
 2. Inside the managed main VM, the API validates the request, creates a shared
-   encrypted envelope, appends the user turn, and wakes the hosted queue.
+   envelope in the effective write shape, appends the user turn, and wakes the
+   hosted queue.
 3. A Runtime V2 parent assigns the durable job to one of four foreground
    single-slot child processes and mints a scoped runtime token for that turn.
    PostgreSQL remains authoritative for the claim, and a cancellation bus can
    target the exact child owner.
-4. The decrypt service opens the required shared envelopes. The runner sends the
+4. The decrypt service opens required shared ciphertext; plaintext records are
+   read under the same tenant boundary. The runner sends the
    plaintext prompt and selected context to the configured model provider.
-5. The runner encrypts the assistant result into a new user-owned envelope before
+   Keyword memory search for a plaintext account is ranked in the ASGI API with
+   the decrypt service's own ranking code; that account's remaining sealed cards
+   are not searched. Automatic memory-card selection runs in the decrypt service by default. An
+   operator switch (`FEEDLING_V2_PLAINTEXT_RECALL`, off by default) lets the
+   Runtime V2 child select cards for plaintext accounts itself, from the same
+   history and memory pages, with the same selection code. Query vectors then
+   come from a loopback-only encoder in the Runtime V2 parent, which holds the
+   only embedding model; child processes never load it. Encrypted accounts and
+   turns whose history includes sealed rows keep the decrypt-service path.
+5. The runner wraps the assistant result in the effective write shape before
    it is persisted. The original send remains asynchronous and returns `202`.
 
-The model provider is an external plaintext recipient. Envelope encryption
-protects persisted content and the storage path; it does not hide the prompt
+The model provider is an external plaintext recipient. For encrypted records,
+envelope encryption protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that
 notification text also passes through the external push provider.
 
 A selected dedicated image observer is normally the only model provider that
-receives an image's pixels; the main provider receives an untrusted text
-observation. If the observer is rate-limited, temporarily unavailable, empty, or
+receives an image's pixels; the main provider receives a text observation
+instead. In Runtime V2 that observation reaches the main model as labelled text
+(`Image 1:`, `Image 2:`, …) followed by the user's own message under an explicit
+attribution sentence. It is not wrapped in the untrusted-data framing used for
+`photo_read` and `screen_read` tool results: those are images the model chose to
+look at and may show text written by someone other than the user, whereas an
+image sent in chat arrives with the sender's own words. Applying the stricter
+framing to a user's own caption made models read that caption as an instruction
+injected from the picture and decline to act on it. The official resident
+consumer still applies the untrusted framing on its own path.
+If the observer is rate-limited, temporarily unavailable, empty, or
 explicitly truncated, Runtime V2 may disclose only those failed images to the
 exact current main route, and only while that route's exact image-control verdict
 is still `ok`. Authentication, quota, route, compatibility, image-read, and
@@ -160,6 +218,13 @@ proactive promotion terminalizes the wake without advancing the cursor. Both
 forms recheck the source-job owner and input frontier in the publication
 transaction.
 
+Automatic V2 heartbeat and screen-watch admission also consults a persistent
+provider circuit in PostgreSQL. Owned job terminalization updates the shared
+failure streak in the same transaction; scheduler polling and queued-job
+execution both reject an open circuit. Explicit user input or a successful
+active provider configuration save resets it. This adds no service or trust
+boundary; see [recovery behavior](/docs/reliability).
+
 Every Chat and proactive wake turn decrypts the current agent identity card just
 in time and places its complete readable view in the trusted system prefix. An
 absent, unreadable, local-only, or still-default card falls back to the encrypted
@@ -205,8 +270,9 @@ the worker image rather than changing a runtime flag.
 The bounded Memory/Style profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
 The two field bodies are separate content records that follow the owner's
-effective content shape: encrypted users store shared ciphertext envelopes,
-while plaintext users store `body` values in the same document. The PostgreSQL
+effective content shape: `on` stores shared ciphertext envelopes, while `off`
+stores `body` values in the same document. With the deployment gate enabled,
+all known users use `off` for new writes. The PostgreSQL
 primary and TEE mirror preserve that selected shape verbatim. Field character
 counts, state, disabled status, source-card counts, and generation/retry
 timestamps remain plaintext routing and observability metadata. A stale CAS
@@ -366,6 +432,12 @@ plaintext operational metadata such as job ID, material kind, window counts,
 status, and hashes. Candidate text is not written into the job JSON or progress
 fields. An authorized retry decrypts the checkpoint inside the trusted boundary
 and skips completed windows; successful completion deletes the checkpoint.
+Legacy fact-map checkpoints reused by plaintext onboarding or add-memory jobs
+are first replaced with fresh encrypted import progress. These jobs reprocess
+the submitted material using the current engine and its full existing-card
+index; cards already written are retained. A content-free reset trace records
+only fixed reason/engine/phase values and progress counts. Current-engine and
+update-identity checkpoints keep their existing resume behavior.
 Resident-sealed imports and their local plaintext boundary are unchanged.
 
 Managed clients can first call the plaintext estimate endpoint. The API parses
@@ -417,13 +489,12 @@ account's chat route, provider URL, or credential.
    concurrent cancel cannot downgrade or partially delete a successful call.
 7. Archived calls stay readable: `GET /v1/voice/transcripts` lists them and
    `GET /v1/voice/transcripts/{call_id}` returns the shape-aware content envelope
-   (ciphertext for encrypted-tier accounts, plaintext for plaintext-tier
-   accounts). The agent reaches the same archive through the
+   (legacy ciphertext or new plaintext when the deployment gate is enabled). The agent reaches the same archive through the
    `voice_transcript_list` / `voice_transcript_read` tools, and memory cards
    distilled from a call carry that call's id so it can go back to the source.
-   For encrypted-tier accounts the server stores and serves ciphertext; for
-   plaintext-tier accounts the promoted TEE database stores the plaintext
-   envelope under the same tenant-bound schema. Transcript trust
+   Existing encrypted transcripts remain ciphertext; new effective-plaintext
+   transcripts are stored in the promoted TEE database under the same
+   tenant-bound schema. Transcript trust
    boundary: the transcript is client-supplied plaintext (chat rows are
    ciphertext the server cannot read); an authenticated user can therefore
    only shape their own summary and delete their own call rows. Known
@@ -456,14 +527,35 @@ encrypted and expires automatically.
 4. A `local_only` body remains client-readable but is unavailable to agent-side
    index and fetch operations.
 
+Nonblank memory queries send the complete eligible corpus (both plaintext-tier
+and sealed rows) to the enclave in one authenticated request. It decrypts in
+bounded chunks, computes request-local jieba/BM25 statistics across all readable
+cards, then filters and selects top-k. No user token index, postings, or decoded
+search-body cache is persisted or exported to the backend. Only the bundled
+jieba dictionary is process-shared and prewarmed at startup. Request, card-count
+and searchable-text limits fail explicitly rather than rank a partial corpus.
+Browse without a query and fetch retain the existing tier partitioning. The
+transport trust boundary and deployment topology do not change; plaintext-tier
+query searches now also require the authenticated enclave path.
+
 The operator-only debug trace distinguishes an executed memory search from an
 index overview. It records the returned-card count, requested limit, and a
-12-hex SHA-256 prefix of the trimmed search query; it never records the query
+12-hex SHA-256 prefix of the trimmed search query, ranking mode and unavailable
+count; it never records the query
 text. Repeated Runtime V2 discovery calls that reuse an earlier result carry a
 separate content-free reuse flag. The fingerprint is operational metadata: it
 lets an authorized administrator compare whether two searches used the same
 trimmed query during the trace-retention window, but it is not ciphertext and
 must not be exposed through a public debug route.
+
+Runtime V2 also requests enclave-selected context using the current turn's
+sequence frontier. Summary-only related-memory blocks stay at application-data
+authority, after the profile/system prefix and before conversation replay; they
+do not add retrieved instructions to the privileged prefix. The existing TDX
+worker assembles this plaintext for the authorized provider, without new storage,
+decryption keys, or a backend plaintext index. Operational recall diagnostics
+contain IDs, counts and lengths measured at the provider-request/tool-result
+boundary; full messages remain in the existing encrypted trajectory.
 
 In managed deployments, each trace event is an append-only row in the selected
 primary PostgreSQL database. The RDS and TEE migration chains carry the same
@@ -561,32 +653,40 @@ component ever sees plaintext. Hosted Chat, enclave-backed read projections,
 normalized Perception processing, user-approved diagnostics, and external
 inference each have an explicit plaintext boundary.
 
-### Content encryption is a per-user preference
+### New shared content uses plaintext
 
-Protected-body encryption is moving from an always-on property to a per-user
-choice with two storage tiers:
+With the plaintext-write deployment gate enabled, every known account writes new
+shared content as plaintext, including accounts with a legacy stored `on`
+preference. Existing ciphertext remains readable; this policy change does not
+rewrite stored preferences or convert old records. Both stored shapes remain
+supported:
 
-| Tier | Stored shape | Who can read the body |
+| Shape | Stored body | Who can read the body |
 | --- | --- | --- |
 | Encrypted | Dual-recipient envelope (`body_ct`, `K_user`, `K_enclave`) | The user's device, and the measured decrypt service for `shared` records |
 | Plaintext | UTF-8 `body`, or strict-base64 `body_b64` for binary media, alongside `id`, `owner_user_id`, and `visibility` | The service, within the same tenant-isolation boundary as every other row |
 
-Two `whoami` fields describe this. `content_encryption` is the user's stated
-preference. `content_encryption_effective` is the shape a client must actually
-write, and it is the only one a write path may act on — a deployment that has
-not enabled plaintext storage reports `on` regardless of the preference, so a
-client that ships support for plaintext ahead of the server still writes
-envelopes. Treat an absent, empty, or unrecognized value as `on`.
+`whoami.content_encryption` is a compatibility field reporting `off` for known
+users. `content_encryption_effective` is the write shape: it reports `off` for
+known users when the deployment gate is open, and `on` when the gate is closed.
+Unknown users remain fail-safe encrypted, including registry misses during
+registration. Treat an absent, empty, or unrecognized effective value as `on`.
 
-The deployment gate is closed by default and opens only when
-`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. The test and pre-production
-environments enable it. Production exposes a separate fail-closed release
-variable, forwards one value to the API and every worker/runner, and rejects an
-open gate unless the database schema selector is `tee`. Even in an enabled
-deployment, an explicit encrypted-tier account or an unknown user remains
-fail-safe encrypted; existing ciphertext is not rewritten by the gate.
+`POST /v1/users/preferences` accepts `content_encryption: "off"`, or null/empty
+to clear the legacy preference. Requesting `on` returns HTTP 400
+`content_encryption_on_not_supported` before any preference is written. Updating
+another preference does not rewrite a stored `on`; the response still reports
+`content_encryption: "off"`.
 
-Two boundaries hold in both tiers:
+The deployment gate remains closed by default and opens only when
+`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. Test and pre-production enable it.
+Production forwards one fail-closed release value to the API and every
+worker/runner, and rejects an open gate unless the database schema selector is
+`tee`. This change does not alter that gate or initiate a ciphertext backfill.
+Legacy replication and explicit migration policies remain separate from the
+new-write policy.
+
+Two boundaries continue to hold:
 
 - A record is never silently downgraded. If a user's effective shape is `on` and
   the decrypt service is unreachable, the write fails rather than falling back to
@@ -1051,3 +1151,52 @@ It does not claim that every field or compatibility upload is encrypted, that a
 Runtime V2 turn process is a hostile-code sandbox, that external model
 providers cannot see inference plaintext, or that process liveness proves full
 service readiness.
+
+### Optional memory embedding preparation
+
+A serve-worker-only maintenance pass can prepare vectors for active shared
+plaintext memories. It defaults off and has no model files or inference
+libraries added to the default image by this change. A provisioned local ONNX
+CPU model is loaded lazily in serve-worker; backend request workers do not load
+it, and the enclave loads it only when hybrid recall (below) is enabled. No
+external embedding API or runtime model download is used. Encrypted memories
+remain outside this preparation pass.
+
+`memory_vectors` stores sensitive derived data in the configured primary
+database, in plaintext float32 form, under user/card/model keys and a projection
+hash. Both database migration chains define the table. There are no card write
+hooks or vector job queues: bounded periodic scans detect changes and prune
+ineligible rows. This is a rebuildable index, not a source of truth. Future
+readers must check current authorization, lifecycle and projection hash rather
+than treating a stored row as proof of eligibility. Normal database trust and
+backup protections apply to these vectors; the additional enclave encryption
+path is not used.
+
+### Optional hybrid automatic recall
+
+Automatic recall (the context memories attached to `GET /v1/chat/history` in the
+enclave) can fuse dense vectors with the lexical ranker. It is disabled by
+default (`FEEDLING_MEMORY_RECALL_HYBRID=0`); while disabled the enclave loads no
+model, performs no vector read and recall output is unchanged. When enabled:
+
+- The enclave loads the same local E5 model in a background thread at startup
+  (never on a request) and encodes the query text inside the enclave. The query
+  text never leaves the enclave for this purpose.
+- After its memory list read, the enclave asks the backend for the vectors of
+  this turn's plaintext-tier candidates only (their ids; never enclave-encrypted
+  or `local_only` cards), with the same forwarded end-user credentials, through
+  an internal route (`POST /v1/memory/vectors`, not part of the public API). The
+  backend identifies the user only from those credentials, re-derives the
+  eligible set from the user's current cards on every request, and returns the
+  intersection of the requested ids with that set, only for rows whose
+  projection hash matches the current card; it never returns a user's whole
+  vector set. The enclave recomputes each
+  hash from its own decrypted card and drops any vector that does not match.
+  This path therefore carries plaintext derived vectors from the primary
+  database into the enclave; the vectors are derived only from plaintext-tier
+  cards.
+- One turn has one bounded budget (default 2 seconds) for the vector read and
+  query encoding. A missing model, busy encoder, timeout, read failure or
+  vector-contract error makes the whole turn use the unchanged lexical path; the
+  content-free selection record carries the fallback reason and timings, never
+  text or vectors.

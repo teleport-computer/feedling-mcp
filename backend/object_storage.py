@@ -30,10 +30,13 @@ the legacy inline-``doc`` behaviour, so local dev / tests work without R2.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import secrets
 import threading
+
+import storage_read_trace
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +45,7 @@ _KEY_PREFIX = "frames"
 # bucket (D4). The ciphertext here is sealed with the enclave's storage key, not
 # the E2E content key — it is never the raw ``body_ct`` under _KEY_PREFIX.
 _TEE_KEY_PREFIX = "frames-tee"
+_PLAINTEXT_KEY_PREFIX = "frames-plaintext"
 _client_lock = threading.Lock()
 _cached_client = None
 
@@ -130,6 +134,39 @@ def frame_key(user_id: str, frame_id: str) -> str:
     return f"{_KEY_PREFIX}/{user_id}/{frame_id}"
 
 
+def frame_plaintext_key(user_id: str, frame_id: str, raw: bytes) -> str:
+    """A distinct, retry-stable key for plaintext frame migration.
+
+    It must never alias the authoritative legacy ciphertext key.  The digest
+    makes retries converge on one object without placing content in the key.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("raw must be bytes")
+    digest = hashlib.sha256(raw).hexdigest()
+    return f"{_PLAINTEXT_KEY_PREFIX}/{user_id}/{frame_id}/{digest}"
+
+
+def frame_body_key_owned_by(key: str, user_id: str) -> bool:
+    if not key or not user_id:
+        return False
+    return any(
+        key.startswith(f"{prefix}/{user_id}/")
+        for prefix in (_KEY_PREFIX, _PLAINTEXT_KEY_PREFIX)
+    )
+
+
+def put_frame_plaintext_body(user_id: str, frame_id: str, raw: bytes) -> str:
+    """Upload plaintext under a key distinct from the legacy ciphertext."""
+    key = frame_plaintext_key(user_id, frame_id, raw)
+    _client().put_object(
+        Bucket=_bucket(),
+        Key=key,
+        Body=raw,
+        ContentType="application/octet-stream",
+    )
+    return key
+
+
 def put_frame_body(user_id: str, frame_id: str, body_ct_b64: str) -> str:
     """Upload the decoded ciphertext bytes; return the R2 object key.
 
@@ -179,7 +216,13 @@ def get_frame_body_strict(user_id: str, frame_id: str) -> str | None:
     cursor already advanced past them). The tee_replicator needs the
     distinction — an orphan is skipped as pending, while a transient/config
     R2 error must freeze the cursor and be retried."""
-    key = frame_key(user_id, frame_id)
+    return get_frame_body_by_key_strict(frame_key(user_id, frame_id), user_id)
+
+
+def get_frame_body_by_key_strict(key: str, user_id: str) -> str | None:
+    """Fetch an owned legacy or migrated frame object by persisted key."""
+    if not frame_body_key_owned_by(key, user_id):
+        raise ValueError("foreign_frame_body_key")
     try:
         resp = _client().get_object(Bucket=_bucket(), Key=key)
     except Exception as e:  # noqa: BLE001
@@ -188,6 +231,17 @@ def get_frame_body_strict(user_id: str, frame_id: str) -> str | None:
         raise
     raw = resp["Body"].read()
     return base64.b64encode(raw).decode("ascii")
+
+
+def delete_frame_body_key(key: str, user_id: str) -> bool:
+    """Delete one owned legacy/migrated frame object, returning confirmation."""
+    if not frame_body_key_owned_by(key, user_id):
+        return False
+    try:
+        _client().delete_object(Bucket=_bucket(), Key=key)
+    except Exception:  # noqa: BLE001 - caller retains/retries cleanup intent
+        return False
+    return True
 
 
 def get_frame_body(user_id: str, frame_id: str) -> str | None:
@@ -228,12 +282,11 @@ def delete_frame_tee_body(user_id: str, frame_id: str) -> None:
 
 
 def delete_user_frames(user_id: str) -> None:
-    """Delete every object under ``frames/<user_id>/`` AND the TEE storage-layer
-    mirror ``frames-tee/<user_id>/`` (account reset must reap both prefixes)."""
+    """Delete legacy, migrated-plaintext, and TEE frame objects for a user."""
     try:
         client = _client()
         bucket = _bucket()
-        for key_prefix in (_KEY_PREFIX, _TEE_KEY_PREFIX):
+        for key_prefix in (_KEY_PREFIX, _TEE_KEY_PREFIX, _PLAINTEXT_KEY_PREFIX):
             prefix = f"{key_prefix}/{user_id}/"
             token = None
             while True:
@@ -473,22 +526,29 @@ def get_chat_body_bytes(key: str, user_id: str) -> bytes | None:
     pointer's explicit format marker.  Ownership rejection, missing objects and
     transient fetch failures retain the legacy ``None`` behavior.
     """
-    if not chat_key_owned_by(key, user_id):
-        if key:
-            log.error(
-                "[r2] get_chat_body_bytes refused foreign key %s for user %s",
-                key,
-                user_id,
-            )
-        return None
-    try:
-        resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
-    except Exception as e:  # noqa: BLE001
-        if _is_not_found(e):
+    with storage_read_trace.observe(user_id) as observation:
+        if not chat_key_owned_by(key, user_id):
+            observation.update(status="refused_foreign_key", error_class=None)
+            if key:
+                log.error(
+                    "[r2] get_chat_body_bytes refused foreign key %s for user %s",
+                    key,
+                    user_id,
+                )
             return None
-        log.error("[r2] get_chat_body_bytes(%s) failed: %s", key, e)
-        return None
-    return resp["Body"].read()
+        try:
+            resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
+        except Exception as e:  # noqa: BLE001
+            observation.update(storage_read_trace.failure(e))
+            if _is_not_found(e):
+                return None
+            log.error("[r2] get_chat_body_bytes(%s) failed: %s", key, e)
+            return None
+        # Include streaming-body time. Read failures still propagate as before,
+        # but both this observation and the hydrate observation record them.
+        raw = resp["Body"].read()
+        observation["bytes"] = len(raw)
+        return raw
 
 
 def delete_chat_body(key: str, user_id: str) -> bool:

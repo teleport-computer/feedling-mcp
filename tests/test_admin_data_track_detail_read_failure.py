@@ -165,7 +165,11 @@ def _healthy_then_broken(client, monkeypatch) -> tuple[dict, dict, int]:
     assert _daily_sum(healthy) == expected
     assert healthy["responder"]["effective_responder"] == "hosted_v1"
 
-    monkeypatch.setattr(db, "_ADMIN_DATA_TRACK_READ_TIMEOUT_MS", INJECTED_TIMEOUT_MS)
+    monkeypatch.setattr(
+        db,
+        "_ADMIN_DATA_TRACK_DETAIL_READ_TIMEOUT_MS",
+        INJECTED_TIMEOUT_MS,
+    )
     with RealReadFailure():
         broken = _detail(client, user_id)
 

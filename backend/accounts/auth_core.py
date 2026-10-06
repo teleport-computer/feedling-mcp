@@ -163,7 +163,7 @@ def resolve_user(
         if not user_id or registry._user_entry_snapshot(user_id) is None:
             raise AuthError(401, "unauthorized", "unknown_user")
         return AuthResult(
-            store=core_store.get_store_shell_only(
+            store=core_store.get_store_per_load_mode(
                 user_id, reason="authentication returns identity, locks, and waiters"
             ),
             user_id=user_id,
@@ -178,7 +178,7 @@ def resolve_user(
     if not user_id:
         raise AuthError(401, "unauthorized", "bad_api_key")
     return AuthResult(
-        store=core_store.get_store_shell_only(
+        store=core_store.get_store_per_load_mode(
             user_id, reason="authentication returns identity, locks, and waiters"
         ),
         user_id=user_id,
