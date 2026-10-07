@@ -847,7 +847,7 @@ def test_chat_tool_surface_keeps_memory_delete(monkeypatch):
     assert chat_ops == ["add", "update", "delete"]
 
 
-def test_chat_worldbook_is_pull_only_and_available_as_native_tool(
+def test_chat_worldbook_is_automatic_and_still_available_as_native_tool(
     monkeypatch,
 ):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
@@ -867,7 +867,8 @@ def test_chat_worldbook_is_pull_only_and_available_as_native_tool(
 
     def read_worldbook(*args, **kwargs):
         eager_reads.append((args, kwargs))
-        raise AssertionError("foreground world book must be pull-only")
+        assert args == (uid, [])
+        return {"block": "<world_book>Luna is queen of the Moon Court.</world_book>"}
 
     def run_capability(action_type, store, **kwargs):
         capability_calls.append((action_type, kwargs))
@@ -903,7 +904,8 @@ def test_chat_worldbook_is_pull_only_and_available_as_native_tool(
     )
 
     assert status == "completed"
-    assert eager_reads == []
+    assert len(eager_reads) == 1
+    assert eager_reads[0][1]["runtime_token"] == "rt"
     assert capability_calls[0][0] == "worldbook_match"
     assert capability_calls[0][1]["params"] == {"query": "Luna"}
     assert any(tool.name == "worldbook_match" for tool in calls[0]["tools"])
@@ -912,7 +914,7 @@ def test_chat_worldbook_is_pull_only_and_available_as_native_tool(
         for content in _tool_result_contents(calls[1])
     )
     provider_messages = calls[0]["messages"]
-    assert not any(
+    assert any(
         isinstance(message, dict)
         and str(message.get("content") or "").startswith(
             v2_context.WORLD_BOOK_CONTEXT_HEADER + "\n"
@@ -964,9 +966,7 @@ def test_worldbook_pull_result_is_bounded_before_next_provider_call(monkeypatch)
     deps = _deps(messages=turn_messages)
     deps.read_summary = lambda _uid: ("", 0.0, 0)
     deps.read_tail = lambda _uid, _after_ts, _limit: list(turn_messages)
-    deps.read_worldbook_context = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("foreground world book must be pull-only")
-    )
+    deps.read_worldbook_context = lambda *_args, **_kwargs: {"block": ""}
 
     status = asyncio.run(
         worker.process_job(
