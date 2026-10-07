@@ -293,6 +293,18 @@ tail without inventing a semantic replacement. Any bounded-tail coverage-hole
 count remains a separate late data block, so it cannot perturb the stable
 prefix.
 
+On Runtime V2 foreground chat and voice turns, applicable World Book entries
+are read from a fresh owner-scoped snapshot before the first model request.
+Enabled `alwaysOn` entries apply every turn; keyword entries match the newest
+five real text-chat messages through the turn's frozen sequence boundary.
+This matching window is independent of summary coverage and prompt-history
+trimming. Screen observations, tool results, and summaries are excluded.
+The `worldbook_match` tool remains available for additional lookup.
+World Book content remains non-privileged application data with the existing
+24,000-character cap and prompt-budget truncation markers. Partial or failed
+reads carry an explicit notice; an unavailable source is not an empty book.
+Compaction changes conversation coverage, not the original World Book records.
+
 Because MEMORY and STYLE are part of the system prefix, each successful profile
 refresh changes that user's provider prompt-cache prefix once. Other users'
 caches are unaffected, and subsequent turns reuse the refreshed prefix until the

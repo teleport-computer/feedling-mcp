@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -2415,6 +2416,27 @@ def _refresh_store_channel(user_id: str, channel: str) -> bool:
         reason="notify",
         strict=False,
     )
+
+
+@dataclass(frozen=True)
+class WorldBookSnapshot:
+    """Detached readside data; never a registered UserStore or writable cache."""
+
+    user_id: str
+    world_books: tuple[dict, ...]
+    world_books_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def read_worldbook_snapshot(user_id: str) -> WorldBookSnapshot:
+    """Read only WORLD_BOOKS from the owner-scoped authority, in every load mode.
+
+    Foreground matching must observe committed edits without relying on cache
+    invalidation. Do not hydrate or overwrite the shared UserStore: this narrow
+    snapshot has no other sections or write methods. Database failures propagate.
+    """
+    owner = str(user_id)
+    entries = db.world_book_load_strict(owner)
+    return WorldBookSnapshot(owner, tuple(dict(entry) for entry in entries))
 
 
 def _get_or_create_store(user_id: str) -> UserStore:

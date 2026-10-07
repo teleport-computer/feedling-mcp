@@ -12,6 +12,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 foreground chat and voice turns now directly inject applicable
+  World Book entries, without requiring a model tool call. Enabled `alwaysOn`
+  entries apply every turn; keywords match the newest five real text-chat
+  messages independently of conversation compaction and prompt-history trimming.
+  Screen observations, tool results, and summaries are not matching signals.
+  The `worldbook_match` tool remains available for additional lookup. Reads use the
+  current source so edits and deletions apply on the next turn; conversation
+  compaction never rewrites World Book entries. Existing context limits and
+  truncation markers still apply, and unavailable or partial reads are marked
+  explicitly. This restores automatic World Book injection; it
+  does not guarantee model adherence or fix every long-conversation failure.
+
 - Resident startup and idle health checks now read authenticated backend history
   for effective-off accounts, including with no enclave URL. The existing health
   header adds `backend_ready`, `backend_unreachable`, and `backend_degraded`;

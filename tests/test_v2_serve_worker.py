@@ -2380,11 +2380,8 @@ def test_kill_switch_unwires_the_push_dep(monkeypatch):
 
 
 def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
-    store = object()
     observed = {}
-    monkeypatch.setattr(
-        serve_worker.core_store, "get_store", lambda uid, **_kwargs: store
-    )
+    monkeypatch.setattr(serve_worker.db, "world_book_load_strict", lambda uid: [])
 
     def match(candidate_store, payload, *, api_key, runtime_token):
         observed.update({
@@ -2405,8 +2402,10 @@ def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
     )
 
     assert result == {"block": "<world_book>matched</world_book>"}
+    snapshot = observed.pop("store")
+    assert snapshot.user_id == "u-worldbook"
+    assert snapshot.world_books == ()
     assert observed == {
-        "store": store,
         "payload": {"messages": messages},
         "api_key": None,
         "runtime_token": "runtime-secret",
@@ -2419,9 +2418,7 @@ def test_worldbook_reader_forwards_current_turn_and_runtime_token(monkeypatch):
 
 def test_worldbook_reader_forwards_trusted_trace_context(monkeypatch):
     observed = {}
-    monkeypatch.setattr(
-        serve_worker.core_store, "get_store", lambda uid, **_kwargs: f"store:{uid}"
-    )
+    monkeypatch.setattr(serve_worker.db, "world_book_load_strict", lambda uid: [])
 
     def match(store, payload, **kwargs):
         observed.update(store=store, payload=payload, **kwargs)
@@ -2439,8 +2436,10 @@ def test_worldbook_reader_forwards_trusted_trace_context(monkeypatch):
         },
     )
 
+    snapshot = observed.pop("store")
+    assert snapshot.user_id == "u-worldbook"
+    assert snapshot.world_books == ()
     assert observed == {
-        "store": "store:u-worldbook",
         "payload": {"messages": []},
         "api_key": None,
         "runtime_token": "runtime-secret",

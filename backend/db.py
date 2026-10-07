@@ -17668,15 +17668,41 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def world_book_chat_signals(user_id: str, through_seq: int, *, limit: int = 5) -> list[dict]:
+    """Newest real text-chat records, independent of prompt/summary coverage.
+
+    Filter before LIMIT so maintenance/tool/archive rows cannot consume the
+    matching window. Preserve durable seq order and distinct repeated messages.
+    """
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq,doc FROM chat_messages WHERE user_id=%s AND seq<=%s "
+            "AND lower(COALESCE(doc->>'role','')) IN ('user','human','assistant','openclaw','agent') "
+            "AND COALESCE(doc->>'source','') NOT IN "
+            "('verify_ping','resident_maintenance','voice_call_transcript',"
+            "'screen','screen_watch','tool_result','system') "
+            "AND COALESCE(doc->>'content_type','') NOT IN ('image','file') "
+            "ORDER BY seq DESC LIMIT %s",
+            (str(user_id), int(through_seq), max(1, min(int(limit), 5))),
+        ).fetchall()
+    return [{**dict(row[1]), "seq": int(row[0])} for row in reversed(rows)]
+
+
+def world_book_load_strict(user_id: str) -> list[dict]:
+    """Read current owner-scoped envelopes or propagate a storage failure."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT doc FROM world_book_entries WHERE user_id = %s "
+            "ORDER BY updated_at, entry_id",
+            (user_id,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def world_book_load(user_id: str) -> list[dict]:
+    """Legacy fail-soft loader; per-turn V2 reads use the strict variant."""
     try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                "SELECT doc FROM world_book_entries WHERE user_id = %s "
-                "ORDER BY updated_at, entry_id",
-                (user_id,),
-            ).fetchall()
-        return [r[0] for r in rows]
+        return world_book_load_strict(user_id)
     except Exception as e:
         log.error("[db] world_book_load(%s) failed: %s", user_id, e)
         return []
