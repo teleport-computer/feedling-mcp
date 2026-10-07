@@ -5114,11 +5114,10 @@ def _read_worldbook_context(
     """Match a fresh owner-scoped snapshot, preserving read failures.
 
     A turn must observe committed edits/deletions without depending on cache
-    invalidation delivery. The isolated store is only a readside snapshot;
+    invalidation delivery. The core-owned data snapshot has no store cache;
     matching retains the existing plaintext/enclave authentication paths.
     """
-    snapshot = core_store.UserStore(str(user_id))
-    snapshot.world_books = db.world_book_load_strict(str(user_id))
+    snapshot = core_store.read_worldbook_snapshot(str(user_id))
     if through_seq is not None and snapshot.world_books:
         # Read original text only: no quoted-memory expansion, image/file
         # captions, screen observations, tool output, or compaction summary.

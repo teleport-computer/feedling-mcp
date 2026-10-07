@@ -29,6 +29,57 @@ from test_v2_worker_tool_loop import (
 )
 
 
+@pytest.mark.parametrize("mode", ["legacy", "selective", "lazy"])
+def test_worldbook_snapshot_is_owner_scoped_without_store_or_section_loading(
+    monkeypatch, mode
+):
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", mode)
+    cached = core_store.UserStore("snapshot-owner")
+    cached.world_books = [{"id": "cached-old"}]
+    monkeypatch.setitem(core_store._stores, "snapshot-owner", cached)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("snapshot must not construct or hydrate UserStore")
+
+    monkeypatch.setattr(core_store, "UserStore", forbidden)
+    monkeypatch.setattr(core_store, "get_store", forbidden)
+    monkeypatch.setattr(core_store, "get_store_per_load_mode", forbidden)
+    monkeypatch.setattr(cached, "ensure_sections", forbidden)
+    rows = [{"id": "current-owner-entry"}]
+    reads = []
+
+    def load(owner):
+        reads.append(owner)
+        return rows if owner == "snapshot-owner" else []
+
+    monkeypatch.setattr(db, "world_book_load_strict", load)
+    snapshot = core_store.read_worldbook_snapshot("snapshot-owner")
+    other = core_store.read_worldbook_snapshot("other-owner")
+    assert reads == ["snapshot-owner", "other-owner"]
+    assert snapshot.user_id == "snapshot-owner"
+    assert snapshot.world_books == ({"id": "current-owner-entry"},)
+    assert other.user_id == "other-owner" and other.world_books == ()
+    assert core_store._stores["snapshot-owner"] is cached
+    assert cached.world_books == [{"id": "cached-old"}]
+    assert not hasattr(snapshot, "chat_messages")
+    assert not hasattr(snapshot, "upsert_world_book")
+    rows[0]["id"] = "edited"
+    assert snapshot.world_books == ({"id": "current-owner-entry"},)
+    assert core_store.read_worldbook_snapshot("snapshot-owner").world_books == (
+        {"id": "edited"},
+    )
+    rows.clear()
+    assert core_store.read_worldbook_snapshot("snapshot-owner").world_books == ()
+
+    def failed_read(owner):
+        raise RuntimeError("snapshot_database_unavailable")
+
+    monkeypatch.setattr(db, "world_book_load_strict", failed_read)
+    with pytest.raises(RuntimeError, match="snapshot_database_unavailable"):
+        core_store.read_worldbook_snapshot("snapshot-owner")
+    assert cached.world_books == [{"id": "cached-old"}]
+
+
 @pytest.fixture
 def worldbook_turn(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
