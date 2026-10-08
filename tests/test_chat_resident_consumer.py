@@ -16778,3 +16778,92 @@ def test_prefers_english_is_the_shared_text_language_judge():
         assert crc._prefers_english(text) == (
             reply_language.text_language(text) == "en"
         ), text
+
+
+@pytest.mark.parametrize(
+    "results,success,outcome,accepted,terminal_errors,advance",
+    [
+        ([200], True, None, 1, [], True),
+        ([200, 200], True, None, 2, [], True),
+        (["already_answered"], False, "skipped", 0, ["already_answered"], True),
+        (["bootstrap_incomplete"], False, "skipped", 0, ["bootstrap_incomplete"], True),
+        (["voice_turn_superseded"], False, "skipped", 0, ["voice_turn_superseded"], True),
+        ([200, "already_answered"], False, "partial", 1, ["already_answered"], True),
+        (["already_answered", 200], False, "partial", 1, ["already_answered"], True),
+        (["already_answered", "already_answered"], False, "skipped", 0, ["already_answered"], True),
+        ([200, 503], False, "partial", 1, [], True),
+        ([503, 200], False, "partial", 1, [], True),
+        ([503], False, None, 0, [], False),
+    ],
+)
+def test_foreground_turn_success_requires_accepted_replies(
+    monkeypatch, results, success, outcome, accepted, terminal_errors, advance,
+):
+    """Generation is not delivery; a partial multi-bubble write is not full success."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    traces = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    pending = iter(results)
+
+    def post_reply(*args, **kwargs):
+        result = next(pending)
+        response = MagicMock()
+        response.status_code = result if isinstance(result, int) else 409
+        response.json.return_value = (
+            {"id": "accepted-reply"} if result == 200
+            else {"error": result, "reply_status": "replied"}
+        )
+        if result == 503:
+            response.raise_for_status.side_effect = RuntimeError("synthetic unavailable")
+        return crc._handle_post_reply_response(response)
+
+    msg = {"id": "delivery-parent", "role": "user", "content": "hello", "ts": 100.0}
+    with patch.object(crc, "call_agent", return_value={"messages": ["reply " + str(i) for i in range(len(results))]}), \
+         patch.object(crc, "post_reply", side_effect=post_reply) as posted:
+        latest = crc._process_messages([msg])
+    assert posted.call_count == len(results)
+    assert latest == (100.0 if advance else 0.0)
+    assert (crc._msg_key(msg) in crc._seen_ids) == advance
+    successes = [row for row in traces if row[0][1] == "agent.turn.success"]
+    assert len(successes) == int(success)
+    deliveries = [row for row in traces if row[0][1] == "agent.turn.reply_delivery"]
+    if outcome is None:
+        assert deliveries == []
+    else:
+        assert len(deliveries) == 1
+        args, event = deliveries[0]
+        assert event["status"] == "warning"
+        assert event["trace_id"] == "delivery-parent"
+        assert event["detail"] == {
+            "lane": "chat", "foreground": True, "outcome": outcome,
+            "planned_reply_count": len(results), "accepted_reply_count": accepted,
+            "terminal_errors": terminal_errors,
+        }
+
+
+@pytest.mark.parametrize("kind", ["maintenance", "actions"])
+def test_no_visible_reply_turn_keeps_existing_success_semantics(monkeypatch, kind):
+    """Legitimate maintenance/action-only work is not a rejected reply."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    traces = []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    msg = {"id": "no-visible-reply", "role": "user", "content": "hello", "ts": 100.0}
+    result = {"messages": [], "actions": []}
+    if kind == "maintenance":
+        msg["source"] = crc.RESIDENT_MAINTENANCE_SOURCE
+    else:
+        result["actions"] = [{"type": "memory.add", "content": "synthetic"}]
+    with patch.object(crc, "call_agent", return_value=result), \
+         patch.object(crc, "execute_agent_actions", return_value={"outcomes": [], "effects": []}) as actions, \
+         patch.object(crc, "post_reply") as posted:
+        assert crc._process_messages([msg]) == 100.0
+    posted.assert_not_called()
+    assert actions.call_count == int(kind == "actions")
+    assert len([row for row in traces if row[0][1] == "agent.turn.success"]) == 1
+    assert not [row for row in traces if row[0][1] == "agent.turn.reply_delivery"]
