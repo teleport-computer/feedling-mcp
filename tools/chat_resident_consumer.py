@@ -1579,8 +1579,20 @@ def _consumer_commit() -> str:
 # live process (Seven's VPS, 2026-07-22). A live re-read would then report a
 # commit we are not actually running, and worse, let the self-update equality
 # check believe "already on target" and never re-exec into the new code.
-_ENV_COMMIT = os.environ.get("FEEDLING_CONSUMER_COMMIT")
-RUNNING_COMMIT = _ENV_COMMIT if _ENV_COMMIT is not None else _consumer_commit()
+def _startup_commit() -> str:
+    # The runner image ships FEEDLING_GIT_COMMIT and no .git directory. An
+    # explicit consumer override still wins, including an explicit unknown.
+    # Only a checkout with neither variable may derive its startup identity
+    # from git; an unversioned image must not borrow an unrelated checkout SHA.
+    for name in ("FEEDLING_CONSUMER_COMMIT", "FEEDLING_GIT_COMMIT"):
+        value = os.environ.get(name)
+        if value is not None:
+            value = value.strip()
+            return "" if value.lower() in ("", "dev", "unknown") else value
+    return _consumer_commit()
+
+
+RUNNING_COMMIT = _startup_commit()
 
 # Poll-only compatibility claim: when the updater deliberately skips a backend
 # target because the release changes nothing this consumer loads, it advertises

@@ -1570,6 +1570,11 @@ def _renew_loop(*, sup, interval: float, stop_event) -> None:
 
 
 def main() -> int:
+    # Capture the image's build identity once. Heartbeats must not acquire a
+    # different version if the environment changes under the running process.
+    build_version = os.environ.get("FEEDLING_GIT_COMMIT", "").strip()
+    if build_version.lower() in ("", "dev", "unknown"):
+        build_version = None
     logging.basicConfig(
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -1712,7 +1717,7 @@ def main() -> int:
             heartbeat_owner, host=hostname, host_all=host_all_active,
             pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
-            version=None, ts=ts)
+            version=build_version, ts=ts)
 
     # The heartbeat loop's shared 90s retention default removes legacy
     # PID-keyed rows before the 300s deployment grace ends.
