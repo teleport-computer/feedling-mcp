@@ -22514,6 +22514,7 @@ def _process_messages(messages: list) -> float:
         posted_any = False
         posted_replies: list[str] = []
         terminal_response_error = False
+        terminal_response_errors: set[str] = set()
         for idx, reply in enumerate(replies):
             try:
                 post_kwargs = {}
@@ -22581,6 +22582,7 @@ def _process_messages(messages: list) -> float:
                         "voice_turn_superseded",
                     }:
                         terminal_response_error = True
+                        terminal_response_errors.add(result["error"])
                         log.info(
                             "reply terminally skipped reason=%s; advancing past message",
                             result.get("error"),
@@ -22622,6 +22624,26 @@ def _process_messages(messages: list) -> float:
         for _posted_reply in posted_replies:
             _remember_worldbook_signal("assistant", _posted_reply, ts=time.time())
 
+        # Model output is not delivery evidence. A terminal conflict still
+        # settles the checkpoint, but must not enter the success denominator.
+        # Likewise, one accepted bubble does not make a partial write complete.
+        # No-reply action/maintenance turns retain their existing semantics.
+        reply_delivery_incomplete = bool(replies) and len(posted_replies) < len(replies)
+        if reply_delivery_incomplete:
+            _emit_debug_trace(
+                "agent", "agent.turn.reply_delivery", trace_id=trace_id,
+                status="warning",
+                summary="reply delivery partial" if posted_any else "reply delivery skipped",
+                detail={
+                    "lane": "chat",
+                    "foreground": True,
+                    "outcome": "partial" if posted_any else "skipped",
+                    "planned_reply_count": len(replies),
+                    "accepted_reply_count": len(posted_replies),
+                    "terminal_errors": sorted(terminal_response_errors),
+                },
+            )
+
         if dropped_attachments_error is not None and posted_any:
             _notify_dropped_attachments(
                 dropped_attachments_error,
@@ -22634,7 +22656,7 @@ def _process_messages(messages: list) -> float:
                 lane="chat",
                 trace_id=trace_id,
             )
-        elif pending_failure_notice is None:
+        elif pending_failure_notice is None and not reply_delivery_incomplete:
             _emit_agent_turn_success(
                 foreground=True,
                 lane="chat",
