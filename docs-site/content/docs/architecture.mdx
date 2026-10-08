@@ -305,6 +305,14 @@ World Book content remains non-privileged application data with the existing
 reads carry an explicit notice; an unavailable source is not an empty book.
 Compaction changes conversation coverage, not the original World Book records.
 
+Client synchronization through `GET /v1/worldbook/list` also reads the current
+authenticated owner's committed envelopes directly from PostgreSQL on every
+request. It does not depend on worker-local projection hydration or notification
+delivery. The successful response remains `{"envelopes": [...]}` with the original
+envelopes; an empty list means the read succeeded and found no entries. A failed
+storage read returns `503` with `worldbook_read_unavailable`, without a cached
+or empty success response.
+
 Because MEMORY and STYLE are part of the system prefix, each successful profile
 refresh changes that user's provider prompt-cache prefix once. Other users'
 caches are unaffected, and subsequent turns reuse the refreshed prefix until the

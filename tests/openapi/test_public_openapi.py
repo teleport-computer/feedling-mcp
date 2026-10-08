@@ -722,6 +722,16 @@ def test_error_response_supports_unified_and_mcp_shapes(
     ]
 
 
+def test_worldbook_list_documents_authoritative_read_and_unavailable(public_schema):
+    responses = public_schema["paths"]["/v1/worldbook/list"]["get"]["responses"]
+    success = responses["200"]["content"]["application/json"]["schema"]
+    assert success["required"] == ["envelopes"]
+    assert success["properties"]["envelopes"]["type"] == "array"
+    failure = responses["503"]["content"]["application/json"]
+    assert failure["schema"] == {"$ref": "#/components/schemas/ErrorResponse"}
+    assert failure["example"] == {"error": "worldbook_read_unavailable"}
+
+
 def test_mcp_probe_and_approval_contract_matches_runtime_limits(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],

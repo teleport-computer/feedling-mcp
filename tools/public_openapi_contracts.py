@@ -2869,6 +2869,27 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/worldbook/list"): {
+        "200": {
+            "description": (
+                "Current committed World Book envelopes for the authenticated owner. "
+                "Read from PostgreSQL on each request, independent of worker caches. "
+                "An empty envelopes list means the successful read found no entries."
+            ),
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["envelopes"],
+                "properties": {"envelopes": {"type": "array", "items": {"type": "object", "additionalProperties": True}}},
+            }}},
+        },
+        "503": {
+            "description": "worldbook_read_unavailable: authoritative storage could not be read; no empty or cached success is returned.",
+            "content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+                "example": {"error": "worldbook_read_unavailable"},
+            }},
+        },
+    },
     ("post", "/v1/memory/turn-selection"): {
         "200": {
             "description": "Selection and content-free page identity, with the complete selection trace.",

@@ -23,6 +23,7 @@ import time
 
 from content.content_core import _apply_envelope_fields, _swap_envelope_missing
 from core import envelope as core_envelope
+from core import store as core_store
 import debug_trace
 import worldbook_readside_core
 
@@ -193,9 +194,13 @@ def _validate_content_cap_with_enclave(
 
 
 def list_envelopes(store) -> tuple[dict, int]:
-    with store.world_books_lock:
-        envelopes = [dict(item) for item in store.world_books]
-    return {"envelopes": envelopes}, 200
+    # Auth may return a cold shell in lazy/selective mode. Even a hydrated
+    # worker cache may miss another worker's committed write or deletion.
+    try:
+        snapshot = core_store.read_worldbook_snapshot(store.user_id)
+    except Exception:  # noqa: BLE001 — never turn an unreadable list into []
+        return {"error": "worldbook_read_unavailable"}, 503
+    return {"envelopes": list(snapshot.world_books)}, 200
 
 
 def upsert(
