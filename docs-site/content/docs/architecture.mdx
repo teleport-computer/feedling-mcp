@@ -819,6 +819,14 @@ cutoff-based admission is fail-closed: accounts outside the configured cohort,
 without an eligible route, or on an invalid rollout configuration remain on the
 separate resident execution path.
 
+The hosted Resident supervisor confirms that the old consumer process has stopped
+before releasing its in-flight reply claims or starting a replacement after a
+configuration change. A failed or unconfirmed stop keeps the process tracked for
+retry; roster removal and shutdown do not release its lease on that attempt.
+This local stop check does not provide fencing across a lease expiry or network
+partition. Reply finalization still rejects writes to an already answered parent;
+a later normal reply cannot overwrite an existing failure reply.
+
 Feedling does not represent this as per-user microVM or per-user hardware-enclave
 isolation. Keep hosted execution restricted to supported agent entry points, and
 use a separately reviewed container or microVM boundary before offering

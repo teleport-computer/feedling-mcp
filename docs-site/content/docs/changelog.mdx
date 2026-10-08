@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Resident configuration changes now wait for confirmed consumer exit
+  before releasing reply claims or starting a replacement. Failed stops remain
+  tracked for retry, including roster removal, lost leases, and shutdown.
+  Existing reply-finalization rules remain unchanged; this does not recover
+  replies already rejected after a failure reply was stored.
+
 - Runtime V2 foreground chat and voice turns now directly inject applicable
   World Book entries, without requiring a model tool call. Enabled `alwaysOn`
   entries apply every turn; keywords match the newest five real text-chat
