@@ -439,6 +439,22 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001 — introduction is best-effort, spawn must continue
             log.warning("introduction enqueue failed for %s: %s", user_id, e)
 
+    def _stop_child(self, user_id: str, child: dict) -> bool:
+        """Called under _lock. Keep tracking until the stop is confirmed."""
+        if self.children.get(user_id) is not child:
+            return False
+        try:
+            self.kill_fn(child["pid"])
+            if not self.alive_fn(child["pid"]):
+                return True
+        except Exception as exc:  # noqa: BLE001 — retry this child, not the whole roster
+            log.warning("consumer stop unconfirmed for %s pid=%s error=%s",
+                        user_id, child["pid"], type(exc).__name__)
+            return False
+        log.warning("consumer stop unconfirmed for %s pid=%s still alive",
+                    user_id, child["pid"])
+        return False
+
     def tick(self, roster: list[dict], *, pre_spawn=None) -> None:
         """One supervision pass: heartbeat live children, reap dead ones, drop
         children whose user left the roster, and acquire+spawn for any user we
@@ -459,17 +475,20 @@ class Supervisor:
         for user_id, child in tracked:
             if user_id not in roster_uids:
                 log.info("user %s left the roster; terminating its consumer", user_id)
-                self.kill_fn(child["pid"])
-                leases.release(user_id, self.owner, now=self._now())
                 with self._lock:
+                    if not self._stop_child(user_id, child):
+                        continue
+                    leases.release(user_id, self.owner, now=self._now())
                     self.children.pop(user_id, None)
                     self._restart_ledger.pop(user_id, None)
                 self._keyless_since.pop(user_id, None)
         for user_id in deferred_users:
             if user_id in roster_uids:
                 continue
-            leases.release(user_id, self.owner, now=self._now())
             with self._lock:
+                if user_id in self.children:
+                    continue  # a failed stop still owns this execution
+                leases.release(user_id, self.owner, now=self._now())
                 self._restart_ledger.pop(user_id, None)
 
         spawned_this_tick = 0
@@ -489,10 +508,10 @@ class Supervisor:
                     # window). Kill our now-orphaned child so we don't double-run
                     # alongside the new owner ("exactly one consumer per user").
                     log.warning("lost lease for %s; terminating orphaned child", user_id)
-                    self.kill_fn(child["pid"])
                     with self._lock:
-                        self.children.pop(user_id, None)
-                        self._restart_ledger.pop(user_id, None)
+                        if self._stop_child(user_id, child):
+                            self.children.pop(user_id, None)
+                            self._restart_ledger.pop(user_id, None)
                 elif _spawn_identity(entry) != _spawn_identity(child["entry"]):
                     self._mark_child_healthy(user_id, child, now=self._now())
                     # Config changed for a still-running user (driver/provider/model/
@@ -514,12 +533,11 @@ class Supervisor:
                     # an unexpected child exit.
                     spawn_ok = False
                     with self._lock:
-                        self.kill_fn(child["pid"])
-                        # kill_fn is synchronous (ProcessSpawner.kill: terminate→
-                        # wait, escalate SIGKILL→wait; _signal_kill: poll-to-exit
-                        # then SIGKILL) — the old consumer is dead here. NOW it's
-                        # safe to release any in-flight reply claim it held: no
-                        # live holder remains to double-run the turn
+                        if not self._stop_child(user_id, child):
+                            continue
+                        # Stop AND liveness were checked before releasing the old
+                        # consumer's in-flight reply claims. A failed stop keeps
+                        # the child tracked and cannot grant a second execution
                         # (chat/service.py:66-70's double-provider-burn risk).
                         # This lets the fresh consumer pick the message up on its
                         # next poll instead of waiting out CHAT_POLL_CLAIM_TTL_SEC
@@ -706,8 +724,7 @@ class Supervisor:
             # nobody took is reclaimed by renew_many, not killed here.
             log.warning("renew lost lease for %s; terminating orphaned child", user_id)
             with self._lock:
-                if self.children.get(user_id) is child:
-                    self.kill_fn(child["pid"])
+                if self._stop_child(user_id, child):
                     self.children.pop(user_id, None)
                     self._restart_ledger.pop(user_id, None)
 
@@ -715,13 +732,15 @@ class Supervisor:
         with self._lock:
             items = list(self.children.items())
             deferred_users = set(self._restart_ledger) - set(self.children)
-            self.children.clear()
-            self._restart_ledger.clear()
-        for user_id, child in items:
-            self.kill_fn(child["pid"])
-            leases.release(user_id, self.owner)
-        for user_id in deferred_users:
-            leases.release(user_id, self.owner)
+            for user_id, child in items:
+                if not self._stop_child(user_id, child):
+                    continue
+                leases.release(user_id, self.owner)
+                self.children.pop(user_id, None)
+                self._restart_ledger.pop(user_id, None)
+            for user_id in deferred_users:
+                leases.release(user_id, self.owner)
+                self._restart_ledger.pop(user_id, None)
 
 
 # ---- real-process wiring ----

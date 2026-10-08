@@ -1576,3 +1576,109 @@ def test_fast_startup_exit_is_newer_than_spawn_anchor(tmp_path, monkeypatch, res
     sup.tick(roster)
     sup.tick(roster)
     assert sup._restart_ledger["u_1"]["last_error"] == "consumer_exited:whoami_failed"
+
+
+@pytest.mark.parametrize("stop_mode", ["still_alive", "raises"])
+@pytest.mark.parametrize("operation", ["config", "removed", "lost_tick", "lost_renew", "shutdown"])
+def test_unconfirmed_stop_retains_child_and_blocks_replacement(monkeypatch, stop_mode, operation):
+    """A failed stop must not grant a second execution or forget the first."""
+    procs = FakeProcTable()
+    clock = {"now": T0}
+    sup = _sup(procs, clock=lambda: clock["now"])
+    roster = _roster("u_stop", "u_healthy")
+    sup.tick(roster)
+    old = sup.children["u_stop"]
+    expired = []
+    monkeypatch.setattr(supervisor_mod.db, "chat_expire_reply_claims", expired.append)
+
+    def failed_stop(pid):
+        if pid == old["pid"]:
+            if stop_mode == "raises":
+                raise TimeoutError("termination unconfirmed")
+            return
+        procs.kill(pid)
+
+    sup.kill_fn = failed_stop
+    if operation.startswith("lost"):
+        clock["now"] += 400
+        assert leases.acquire("u_stop", lease_owner="sup_B", runtime_home="/peer", driver="pi", ttl=300, now=clock["now"])
+    changed = [dict(roster[0], model="changed"), roster[1]]
+    if operation == "config":
+        sup.tick(changed)
+    elif operation == "removed":
+        # Even a restart-ledger entry must not release a still-live child's lease.
+        sup._restart_ledger["u_stop"] = {"next_retry_at": T0 + 10}
+        sup.tick([roster[1]])
+    elif operation == "lost_tick":
+        sup.tick(roster)
+    elif operation == "lost_renew":
+        sup.renew_live()
+    else:
+        sup.shutdown()
+    assert sup.children["u_stop"] is old
+    assert procs.is_alive(old["pid"])
+    assert len(procs.spawned) == 2
+    assert expired == []
+    expected_owner = "sup_B" if operation.startswith("lost") else "sup_A"
+    assert leases.get("u_stop")["lease_owner"] == expected_owner
+    if operation != "shutdown":
+        assert leases.get("u_healthy")["lease_expires_at"].timestamp() == clock["now"] + 300
+    else:
+        assert leases.get("u_healthy")["lease_owner"] is None
+
+    # A later confirmed stop recovers without losing track or releasing a peer's lease.
+    sup.kill_fn = procs.kill
+    if operation == "config":
+        sup.tick(changed)
+        assert len(procs.spawned) == 3
+        assert expired == ["u_stop"]
+        assert sup.children["u_stop"]["pid"] != old["pid"]
+    elif operation == "removed":
+        sup.tick([roster[1]])
+    elif operation == "lost_tick":
+        sup.tick(roster)
+    elif operation == "lost_renew":
+        sup.renew_live()
+    else:
+        sup.shutdown()
+    assert not procs.is_alive(old["pid"])
+    if operation != "config":
+        assert "u_stop" not in sup.children
+        assert leases.get("u_stop")["lease_owner"] == ("sup_B" if operation.startswith("lost") else None)
+
+
+def test_unconfirmed_config_stop_keeps_claim_during_concurrent_renew(monkeypatch):
+    import threading
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    roster = _roster("u_stop")
+    sup.tick(roster)
+    old = sup.children["u_stop"]
+    renew_started = threading.Event()
+    renew_done = threading.Event()
+    errors = []
+    def renew():
+        renew_started.set()
+        try:
+            sup.renew_live()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            renew_done.set()
+    thread = threading.Thread(target=renew)
+    def stuck_stop(pid):
+        thread.start()
+        assert renew_started.wait(2)
+        # The old process stays alive while renewal waits for the stop decision.
+    sup.kill_fn = stuck_stop
+    released = []
+    monkeypatch.setattr(supervisor_mod.db, "chat_expire_reply_claims", released.append)
+    try:
+        sup.tick([dict(roster[0], model="changed")])
+    finally:
+        thread.join(2)
+    assert renew_done.is_set() and not errors
+    assert sup.children["u_stop"] is old
+    assert len(procs.spawned) == 1
+    assert released == []
+    assert leases.get("u_stop")["lease_owner"] == "sup_A"
