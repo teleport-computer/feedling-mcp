@@ -199,6 +199,108 @@ def test_upsert_then_list_parity(user):
     assert {k: envelopes[0][k] for k in env} == env
 
 
+@pytest.mark.parametrize("mode", ["legacy", "selective", "lazy"])
+@pytest.mark.parametrize("reader_state", ["cold", "loaded_empty"])
+def test_list_reads_committed_envelope_across_worker_caches(
+    user, monkeypatch, mode, reader_state,
+):
+    """Two real stores share PG, not memory; requests keep the real auth path."""
+    uid, key = user
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", mode)
+    core_store._stores.pop(uid, None)
+    reader = core_store.get_store(uid)
+    if reader_state == "loaded_empty":
+        from core.store_sections import StoreSection
+        reader.ensure_sections({StoreSection.WORLD_BOOKS}, reason="first_use", strict=True)
+    assert reader.world_books == []
+    core_store._stores.pop(uid)
+    env = _env(uid, "cross-worker", body_ct="unaltered-ciphertext")
+    assert _asgi("POST", "/v1/worldbook/upsert", headers=_headers(key), json_body=env) == (
+        200, {"id": "cross-worker"},
+    )
+    writer = core_store._stores[uid]
+    assert writer is not reader
+    expected = db.world_book_load_strict(uid)
+    assert len(expected) == 1
+    assert {k: expected[0][k] for k in env} == env
+    # Route the next authenticated request to the other worker's existing store.
+    core_store._stores[uid] = reader
+    assert reader.world_books == []
+    assert _asgi("GET", "/v1/worldbook/list", headers=_headers(key)) == (
+        200, {"envelopes": expected},
+    )
+    # Keep a stale populated reader through an update and then a deletion.
+    from core.store_sections import StoreSection
+    reader.note_section_change(StoreSection.WORLD_BOOKS)
+    reader.ensure_sections({StoreSection.WORLD_BOOKS}, reason="first_use", strict=True)
+    assert reader.world_books == expected
+    core_store._stores[uid] = writer
+    updated = {**env, "body_ct": "updated-ciphertext"}
+    assert _asgi("POST", "/v1/worldbook/upsert", headers=_headers(key),
+                 json_body=updated)[0] == 200
+    current = db.world_book_load_strict(uid)
+    assert current[0]["body_ct"] == "updated-ciphertext"
+    core_store._stores[uid] = reader
+    assert reader.world_books == expected
+    assert _asgi("GET", "/v1/worldbook/list", headers=_headers(key)) == (
+        200, {"envelopes": current},
+    )
+    core_store._stores[uid] = writer
+    assert _asgi("DELETE", "/v1/worldbook/delete?id=cross-worker",
+                 headers=_headers(key)) == (200, {"ok": True})
+    assert db.world_book_load_strict(uid) == []
+    core_store._stores[uid] = reader
+    assert reader.world_books == expected
+    assert _asgi("GET", "/v1/worldbook/list", headers=_headers(key)) == (
+        200, {"envelopes": []},
+    )
+
+
+@pytest.mark.parametrize("mode", ["legacy", "selective", "lazy"])
+@pytest.mark.parametrize("cache_state", ["cold", "populated"])
+def test_list_storage_failure_never_reports_successful_empty_or_stale_list(
+    user, monkeypatch, mode, cache_state,
+):
+    uid, key = user
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", mode)
+    assert _asgi("POST", "/v1/worldbook/upsert", headers=_headers(key),
+                 json_body=_env(uid, "retained"))[0] == 200
+    if cache_state == "cold":
+        core_store._stores.pop(uid)
+
+    def unavailable(_uid):
+        raise RuntimeError("private database details must not enter API response")
+
+    monkeypatch.setattr(db, "world_book_load_strict", unavailable)
+    assert _asgi("GET", "/v1/worldbook/list", headers=_headers(key)) == (
+        503, {"error": "worldbook_read_unavailable"},
+    )
+
+
+@pytest.mark.parametrize("mode", ["legacy", "selective", "lazy"])
+def test_list_owner_is_bound_to_auth_not_query_or_cached_envelopes(user, monkeypatch, mode):
+    uid, key = user
+    monkeypatch.setenv("FEEDLING_STORE_LOAD_MODE", mode)
+    registered = make_client().post("/v1/users/register", json={
+        "public_key": _b64(b"\x22" * 32), "archive_language": "en",
+    })
+    assert registered.status_code == 201
+    other = registered.get_json()
+    other_uid, other_key = other["user_id"], other["api_key"]
+    assert other_uid != uid
+    for owner, credential in [(uid, key), (other_uid, other_key)]:
+        assert _asgi("POST", "/v1/worldbook/upsert", headers=_headers(credential),
+                     json_body=_env(owner, "same-id", body_ct=owner))[0] == 200
+    expected_a, expected_b = db.world_book_load_strict(uid), db.world_book_load_strict(other_uid)
+    assert len(expected_a) == len(expected_b) == 1
+    for owner, credential, foreign, expected in [
+        (uid, key, other_uid, expected_a), (other_uid, other_key, uid, expected_b),
+    ]:
+        core_store._stores.pop(owner, None)
+        assert _asgi("GET", f"/v1/worldbook/list?user_id={foreign}&owner_user_id={foreign}",
+                     headers=_headers(credential)) == (200, {"envelopes": expected})
+
+
 # --------------------------------------------------------------------------- #
 # upsert validation parity (400, no state mutation)
 # --------------------------------------------------------------------------- #

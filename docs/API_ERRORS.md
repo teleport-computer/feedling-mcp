@@ -288,6 +288,7 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `content_too_long` | 400 | — | 超字数上限（detail.max_chars） | |
 | `worldbook_validate_failed` | 400 | — | | |
 | `worldbook_write_failed` | 500 | system | 世界书条目未能持久化；不会写入进程内缓存 | |
+| `worldbook_read_unavailable` | 503 | system | 世界书列表无法从持久化权威源读取；不返回成功空列表或缓存旧内容 | |
 | `worldbook_match_unavailable` | 503 | system | | |
 
 ## 蒸馏 / 导入（genesis）

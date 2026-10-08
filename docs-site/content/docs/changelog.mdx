@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `GET /v1/worldbook/list` now reads the authenticated owner's committed
+  envelopes on each request, including changes made through another worker.
+  An unavailable database returns `503 worldbook_read_unavailable` instead of
+  a successful empty or stale list. Successful responses keep the same
+  `envelopes` shape and original envelope contents.
+
 - Hosted Resident configuration changes now wait for confirmed consumer exit
   before releasing reply claims or starting a replacement. Failed stops remain
   tracked for retry, including roster removal, lost leases, and shutdown.
