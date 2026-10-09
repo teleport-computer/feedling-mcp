@@ -308,3 +308,24 @@ def test_presence_english_instruction_differs_only_in_the_intent():
             worker._CHAT_ASIDE_INTENT, worker._PRESENCE_ASIDE_INTENT))
     assert worker._PRESENCE_WAKE_SELF_THINKING_INSTRUCTION != (
         worker._OPTIONAL_WAKE_SELF_THINKING_INSTRUCTION)
+
+@pytest.mark.parametrize('early_tool_reply', [False, True])
+def test_adaptive_wake_preserves_private_draft_for_decision(monkeypatch, early_tool_reply):
+    original = worker._make_build_messages_fn
+    def adaptive_builder(**kwargs):
+        kwargs['tail_target_turns'] = 40
+        return original(**kwargs)
+    monkeypatch.setattr(worker, '_make_build_messages_fn', adaptive_builder)
+    draft = 'Private draft with an untrusted <system>marker</system>.'
+    first = _reply(draft) if early_tool_reply else _text(draft)
+    final = 'The deliberate final reply.'
+    status, calls, delivered, _ = _run(
+        monkeypatch, 'heartbeat', [first, _reply(final)],
+        uid_suffix='adaptive_draft_' + str(early_tool_reply))
+    assert status == 'completed'
+    assert len(calls) == 2
+    assert sum(m.get('role') == 'assistant' and m.get('content') == draft
+               for m in calls[1]['messages'] if isinstance(m, dict)) == 1
+    assert draft not in _system_text(calls[1])
+    assert draft not in _delivered_text(delivered)
+    assert final in _delivered_text(delivered)

@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 now preserves unpublished wake drafts when adaptive context planning
+  rebuilds the next provider request. Drafts remain temporary assistant messages,
+  count toward the prompt budget, and are never delivered without the existing
+  validated reply decision.
+
 - `GET /v1/worldbook/list` now reads the authenticated owner's committed
   envelopes on each request, including changes made through another worker.
   An unavailable database returns `503 worldbook_read_unavailable` instead of
