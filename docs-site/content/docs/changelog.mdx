@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Model route activation/test diagnostics now correlate the route and server
+  request with probe timing and safe exception categories. Unknown HTTP phases
+  remain explicit; this does not change timeouts, validation, or rollback behavior.
+
 - Runtime V2 now preserves unpublished wake drafts when adaptive context planning
   rebuilds the next provider request. Drafts remain temporary assistant messages,
   count toward the prompt budget, and are never delivered without the existing
