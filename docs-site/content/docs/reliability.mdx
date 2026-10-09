@@ -114,7 +114,10 @@ token (for example, `stay_silent`) is treated as `stay_silent` and never deliver
 Heartbeat and manual wakes first make one provider call without `reply` or
 `stay_silent`, so the agent looks at its context before deciding. If it needs no
 lookup, any drafted text stays unpublished and carries into one ordinary decision
-round with both choices offered. If it does look something up, the next round is
+round with both choices offered. These private drafts remain assistant messages
+when adaptive context planning rebuilds the next request, count toward its input
+budget, and are not saved in conversation history or promoted to system instructions.
+If it does look something up, the next round is
 that decision round and carries the same instruction to end the wake with `reply`
 or `stay_silent`; it can still look further. When this decision round has no draft
 and is not a forced choice or direct-text correction, it also reminds the model

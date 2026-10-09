@@ -6638,7 +6638,10 @@ def _make_build_messages_fn(
                 v2_tool_surface.DEFAULT_COLLAPSE_POLICY
             ),
             system_suffix: str = "",
+            transient_messages: list[dict] | None = None,
         ) -> tuple[list, Any, dict]:
+            # Private round drafts are budgeted in every candidate, but never
+            # folded into user history, the native transcript, or system text.
             rendered_transcript: list = []
             for item in transcript:
                 if isinstance(item, ToolExchange):
@@ -6660,7 +6663,7 @@ def _make_build_messages_fn(
                 messages = _base(
                     selected,
                     worldbook_char_cap=worldbook_char_cap,
-                ) + rendered_transcript
+                ) + rendered_transcript + list(transient_messages or ())
                 messages = v2_tool_loop._with_system_suffix(
                     messages,
                     system_suffix,

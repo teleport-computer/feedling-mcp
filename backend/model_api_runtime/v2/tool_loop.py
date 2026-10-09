@@ -2058,10 +2058,12 @@ async def run_tool_loop(
                             await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        transient_messages: list[dict] = []
         if wake_direct_text_pending:
             # Keep provider-authored draft out of the trusted system suffix and
             # out of durable conversation history. Frontier budgeting sees it.
-            messages = [*messages, {"role": "assistant", "content": wake_direct_text_draft}]
+            transient_messages.append({"role": "assistant", "content": wake_direct_text_draft})
+            messages = [*messages, *transient_messages]
         turn_catalog = _turn_catalog()
         if regular_wake_choice_required or reply_tool_enabled:
             turn_catalog = [
@@ -2100,10 +2102,9 @@ async def run_tool_loop(
         look_first_decide_round = wake_look_first_decide
         if look_first_decide_round and wake_look_first_draft:
             # Same boundary as a direct-text draft: never persisted, never sent.
-            messages = [
-                *messages,
-                {"role": "assistant", "content": wake_look_first_draft},
-            ]
+            draft_message = {"role": "assistant", "content": wake_look_first_draft}
+            transient_messages.append(draft_message)
+            messages = [*messages, draft_message]
         # Reserve the configured final provider attempt for a terminal reply.
         # ``max_calls`` is the deployment-configurable stop threshold; the loop
         # must not grow an unbounded second budget after reaching it.
@@ -2607,6 +2608,7 @@ async def run_tool_loop(
             elif callable(adaptive_planner):
                 messages, frontier_plan, tail_window = adaptive_planner(
                     transcript=list(transcript),
+                    transient_messages=transient_messages,
                     tools=tools,
                     required_tool_names=required_schema_names,
                     protected_tool_names=protected_extra_names,
