@@ -6,10 +6,15 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 
 import recover as recovery
 
 REPO = 'teleport-computer/feedling-mcp'
+RECONCILED_RUN = 38077149919
+RECONCILED_CODE = 'f0d84a4634480fac03a9a6c60049f8e5cad4d694'
+RECONCILED_ARTIFACT = 11678942435
+RECONCILED_DIGEST = 'sha256:669d80b8b83ace3f9d9608541d8d9b61774b02cf3d35bea595e0b4fb88272a73'
 NONCE = 638  # Three failed transactions consumed 635..637. Drift requires new review.
 RUNNER = '130fdfc6-5736-4cdc-9d0f-a35af8957cf2'
 DIGEST = 'sha256:302a3a02be35f461db2c720ff7f39ede07454cf5777099d3aaf274cc0d578842'
@@ -53,6 +58,56 @@ def context():
     return stage, sha
 
 
+def verify_reconciled_zero_send():
+    """The only reviewed exception: exact pre-send failed run, no generic retry input."""
+    run_id = str(RECONCILED_RUN)
+    run = api('actions/runs/' + run_id)
+    if (run['id'] != RECONCILED_RUN or run['head_sha'] != RECONCILED_CODE
+            or run['run_attempt'] != 1 or run['event'] != 'workflow_dispatch'
+            or run['conclusion'] != 'failure'
+            or run['display_title'] != 'T800 recovery authorize-main'):
+        raise recovery.Stop('reconciled_run_identity_changed')
+    jobs = api('actions/runs/' + run_id + '/jobs?per_page=100')['jobs']
+    target = [j for j in jobs if j['name'] == 'T800 incident recovery']
+    if len(target) != 1 or target[0]['conclusion'] != 'failure':
+        raise recovery.Stop('reconciled_job_changed')
+    expected = {'Prepare exact main transaction without broadcasting': 'failure',
+                'Durably archive intent before any send': 'skipped',
+                'Single main transaction send': 'skipped',
+                'Existing post-deploy gate or runner stage': 'skipped'}
+    for name, conclusion in expected.items():
+        steps = [s for s in target[0]['steps'] if s['name'] == name]
+        if len(steps) != 1 or steps[0]['conclusion'] != conclusion:
+            raise recovery.Stop('reconciled_send_exclusion_missing')
+    artifacts = api('actions/runs/' + run_id + '/artifacts?per_page=100')
+    if artifacts['total_count'] != 1 or len(artifacts['artifacts']) != 1:
+        raise recovery.Stop('reconciled_artifact_set_changed')
+    artifact = artifacts['artifacts'][0]
+    if (artifact['id'] != RECONCILED_ARTIFACT or artifact['expired']
+            or artifact['digest'] != RECONCILED_DIGEST
+            or artifact['name'] != 't800-stage-' + run_id):
+        raise recovery.Stop('reconciled_artifact_identity_changed')
+    with tempfile.TemporaryDirectory(prefix='t800-zero-send-') as tmp:
+        command(['gh', 'run', 'download', run_id, '--repo', REPO,
+                 '--name', artifact['name'], '--dir', tmp])
+        files = sorted(str(p.relative_to(tmp)) for p in Path(tmp).rglob('*'))
+        if files != ['failure.json']:
+            raise recovery.Stop('reconciled_intent_or_other_file_present')
+        if json.loads((Path(tmp) / 'failure.json').read_text()) != {
+                'result': 'STOP', 'reason': 'HTTPError', 'retry_authorized': False}:
+            raise recovery.Stop('reconciled_failure_changed')
+    value = {'run_id': RECONCILED_RUN, 'code_sha': RECONCILED_CODE,
+             'artifact_id': RECONCILED_ARTIFACT, 'artifact_digest': RECONCILED_DIGEST,
+             'result': 'EXACT_PRIOR_PRE_SEND_FAILURE_RECONCILED',
+             'nonce_still_required': NONCE, 'generic_retry_authorized': False}
+    path = OUT / 'reconciled.json'
+    if path.exists():
+        if json.loads(path.read_text()) != value:
+            raise recovery.Stop('reconciliation_record_changed')
+    else:
+        save('reconciled', value)
+
+
 def no_prior_attempt(stage):
     """Fail closed on any earlier same-stage dispatch, even failed before mutation.
 
@@ -61,6 +116,7 @@ def no_prior_attempt(stage):
     Same run reruns rejected by context(), and CI deploy-cvm lock serializes recovery.
     """
     current = int(os.environ['GITHUB_RUN_ID'])
+    reconciled_seen = False
     for page in range(1, 11):
         data = api('actions/workflows/ci.yml/runs?event=workflow_dispatch&per_page=100'
                    '&created=%3E%3D2026-10-10&page=' + str(page))
@@ -68,8 +124,14 @@ def no_prior_attempt(stage):
         for run in runs:
             if (run['id'] != current and run['id'] < current
                     and run['display_title'] == 'T800 recovery ' + stage):
-                raise recovery.Stop('prior_attempt_reconcile_do_not_retry')
+                if stage == 'authorize-main' and run['id'] == RECONCILED_RUN:
+                    verify_reconciled_zero_send()
+                    reconciled_seen = True
+                else:
+                    raise recovery.Stop('prior_attempt_reconcile_do_not_retry')
         if len(runs) < 100:
+            if stage == 'authorize-main' and not reconciled_seen:
+                raise recovery.Stop('required_reconciled_run_missing')
             return
     raise recovery.Stop('history_limit')
 

@@ -1,5 +1,5 @@
 """Fixed T800 Sepolia authorization recovery. PLAN_ONLY unless root runs --run."""
-import argparse, hashlib, json, os, signal, subprocess, time, urllib.request
+import argparse, hashlib, json, os, signal, subprocess, time, urllib.request, urllib.error
 from pathlib import Path
 from eth_account import Account
 from eth_abi import encode
@@ -13,6 +13,8 @@ SOURCE='08b2629670ab753413bfe804b99b90697bc1c579'
 YAML='https://github.com/teleport-computer/feedling-mcp/raw/'+PIN+'/deploy/docker-compose.phala.yaml'
 DATA='0x'+(keccak(text='addComposeHash(bytes32,string,string)')[:4]+encode(['bytes32','string','string'],[bytes.fromhex(HASH),PIN,YAML])).hex()
 ALLOWED='0x'+keccak(text='isAppAllowed(bytes32)')[:4].hex()+HASH
+USER_AGENT='feedling-t800-recovery/1'
+RPC_METHODS=frozenset({'eth_chainId','eth_call','eth_getTransactionCount','eth_estimateGas','eth_gasPrice','eth_sendRawTransaction','eth_getTransactionReceipt'})
 MAX_GAS=3000000
 MAX_GAS_PRICE=100000000 # 0.1 gwei => maximum .0003 Sepolia ETH, not gas-used estimate
 class Stop(Exception):pass
@@ -22,12 +24,18 @@ class RPC:
   self.url=url;self.count=0
   self.open=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
  def __call__(self,method,params):
+  if method not in RPC_METHODS:raise Stop('rpc_method_forbidden')
   self.count+=1
   if self.count>50:raise Stop('rpc_cap')
-  req=urllib.request.Request(self.url,data=json.dumps({'jsonrpc':'2.0','id':self.count,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json'})
-  with self.open.open(req,timeout=10) as r:
-   raw=r.read(65537)
-   if len(raw)>65536:raise Stop('rpc_body_cap')
+  req=urllib.request.Request(self.url,data=json.dumps({'jsonrpc':'2.0','id':self.count,'method':method,'params':params}).encode(),headers={'Content-Type':'application/json','User-Agent':USER_AGENT})
+  try:
+   with self.open.open(req,timeout=10) as r:
+    raw=r.read(65537)
+    if len(raw)>65536:raise Stop('rpc_body_cap')
+  except urllib.error.HTTPError as exc:
+   raise Stop('rpc_'+method+'_http_'+str(int(exc.code))) from None
+  except urllib.error.URLError:
+   raise Stop('rpc_'+method+'_transport_error') from None
   d=json.loads(raw)
   if 'error' in d:raise Stop('rpc_error')
   if 'result' not in d:raise Stop('rpc_shape')
@@ -46,9 +54,15 @@ def live_preflight():
  cvm=subprocess.run(['phala','cvms','get','0711c9a4-afdc-40c6-ba49-d8cb95f7e850','-j','--api-key',os.environ['PHALA_CLOUD_API_KEY']],capture_output=True,text=True,timeout=20,check=True)
  if json.loads(cvm.stdout).get('compose_hash')!=HASH:raise Stop('live_compose_changed')
  opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
- with opener.open('https://api.feedling.app/healthz',timeout=10) as res:
-  raw=res.read(65537)
-  if len(raw)>65536:raise Stop('health_body_cap')
+ try:
+  req=urllib.request.Request('https://api.feedling.app/healthz',headers={'User-Agent':USER_AGENT})
+  with opener.open(req,timeout=10) as res:
+   raw=res.read(65537)
+   if len(raw)>65536:raise Stop('health_body_cap')
+ except urllib.error.HTTPError as exc:
+  raise Stop('health_http_'+str(int(exc.code))) from None
+ except urllib.error.URLError:
+  raise Stop('health_transport_error') from None
  health=json.loads(raw)
  if health.get('release',{}).get('git_commit')!=SOURCE:raise Stop('live_source_changed')
 

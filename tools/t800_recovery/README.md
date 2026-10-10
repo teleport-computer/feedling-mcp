@@ -57,8 +57,8 @@ replacement, automatic resend or signed-rawtx artifact. Lower estimates/prices u
 the originally frozen limits; higher needs stop. The intent artifact survives a
 runner crash before/after broadcast, and is available for transaction-hash reconciliation.
 
-Every rerun (`run_attempt>1`) is rejected. Every earlier same-stage incident dispatch
-blocks a new dispatch, even an earlier failed preflight, across code branches.
+Every rerun (`run_attempt>1`) is rejected. Every earlier same-stage incident dispatch blocks a new dispatch across code branches,
+with exactly one reviewed exception below for the failed pre-send run38077149919.
 Fixed nonce and current pending/latest equality also prevent replacement sends.
 History reads are bounded and incomplete history fails closed. A failed attempt
 requires root read-only reconciliation and a newly reviewed recovery decision;
@@ -103,3 +103,28 @@ Local verification (no secrets/network):
 `python -m pytest -q tools/t800_recovery` and `actionlint -shellcheck='' .github/workflows/ci.yml`.
 No API, architecture, production configuration semantics or public documentation change.
 Permanent generic publisher gas/retry remediation stays a separate T800 test PR follow-up.
+
+## Explicit zero-send reconciliation after run38077149919
+
+The first authorize-main attempt stopped in prepare with HTTPError; artifact
+11678942435 contains only failure.json, and intent-upload/send were skipped.
+Read-only nonce latest/pending remained638 and main hash remained unauthorized.
+The code now requires this exact failed run to remain in history and verifies its
+old codeSHA f0d84a4634480fac03a9a6c60049f8e5cad4d694, attempt1, failed prepare,
+skipped archive/send/postdeploy, exact single artifact ID/digest, and sole
+failure.json content. Any drift, extra intent, deleted history, or another earlier
+authorize-main run blocks execution. This is not a user-selectable retry bypass.
+The safe reconciled.json receipt is archived; all nonce/owner/hash guards remain.
+
+Verified-TLS local control reproduced RPC403 for urllib's default User-Agent and
+200 for the explicit `feedling-t800-recovery/1` application User-Agent; the same
+health endpoint returned200 for both. Original CI lacked per-request diagnostics,
+so this is a reproduced transport cause, not conclusive attribution of its exact
+HTTPError. RPC now sends this honest application identifier without changing URL,
+credentials, TLS verification, targets or signing semantics. Any future RPC/health
+HTTP error records only fixed operation and numeric HTTP status; transport errors
+record fixed operation/type, never URLs/queries/headers/body.
+
+Root must approve the NEW reviewed codeSHA and a new one-time stage decision
+before dispatch. Do not rerun the failed workflow or use its old code ref. This
+revision alone grants no chain-send or deployment permission.
