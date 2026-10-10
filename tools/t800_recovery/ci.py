@@ -191,6 +191,64 @@ def verify_runner_zero_send():
         save('runner-reconciled', value)
 
 
+RUNNER_LIMITS_RUN = 38079458231
+RUNNER_LIMITS_CODE = '33d8af1b077945349787700bc721e4680569dc8c'
+RUNNER_LIMITS_ARTIFACT = 11678584685
+RUNNER_LIMITS_DIGEST = 'sha256:243ff59cae0d8d8c3883a1a803d50caf3e38d8095eddca896a8f32abd8416657'
+# A new explicit reviewed intent, not adaptive fee escalation. Maximum 0.0000072 ETH.
+RUNNER_NEW_INTENT = {k: v for k, v in RUNNER_FAILED_INTENT.items() if k != 'hash'}
+RUNNER_NEW_INTENT.update(gas=2400000, gas_price=3000000, maximum_cost_wei=7200000000000)
+
+
+def verify_runner_limits_failure():
+    run_id = str(RUNNER_LIMITS_RUN)
+    run = api('actions/runs/' + run_id)
+    if (run['id'] != RUNNER_LIMITS_RUN or run['head_sha'] != RUNNER_LIMITS_CODE
+            or run['run_attempt'] != 1 or run['event'] != 'workflow_dispatch'
+            or run['conclusion'] != 'failure' or run['display_title'] != 'T800 recovery authorize-runner'):
+        raise recovery.Stop('runner_limits_run_changed')
+    jobs = api('actions/runs/' + run_id + '/jobs?per_page=100')['jobs']
+    target = [j for j in jobs if j['name'] == 'T800 incident recovery']
+    if len(target) != 1 or target[0]['conclusion'] != 'failure':
+        raise recovery.Stop('runner_limits_job_changed')
+    expected = {'Prepare exact main transaction without broadcasting': 'failure',
+                'Durably archive intent before any send': 'skipped',
+                'Single main transaction send': 'skipped',
+                'Existing post-deploy gate or runner stage': 'skipped'}
+    for name, conclusion in expected.items():
+        steps = [x for x in target[0]['steps'] if x['name'] == name]
+        if len(steps) != 1 or steps[0]['conclusion'] != conclusion:
+            raise recovery.Stop('runner_limits_steps_changed')
+    artifacts = api('actions/runs/' + run_id + '/artifacts?per_page=100')
+    if artifacts['total_count'] != 1 or len(artifacts['artifacts']) != 1:
+        raise recovery.Stop('runner_limits_artifacts_changed')
+    a = artifacts['artifacts'][0]
+    if a['id'] != RUNNER_LIMITS_ARTIFACT or a['digest'] != RUNNER_LIMITS_DIGEST or a['expired'] or a['name'] != 't800-stage-' + run_id:
+        raise recovery.Stop('runner_limits_artifact_changed')
+    with tempfile.TemporaryDirectory(prefix='t800-limits-reconcile-') as tmp:
+        command(['gh', 'run', 'download', run_id, '--repo', REPO, '--name', a['name'], '--dir', tmp])
+        if sorted(str(x.relative_to(tmp)) for x in Path(tmp).rglob('*')) != ['failure.json', 'runner-reconciled.json']:
+            raise recovery.Stop('runner_limits_file_set_changed')
+        if json.loads((Path(tmp) / 'failure.json').read_text()) != {'result': 'STOP', 'reason': 'frozen_limits_insufficient', 'retry_authorized': False}:
+            raise recovery.Stop('runner_limits_reason_changed')
+        prior = {'run_id': RUNNER_FAILED_RUN, 'code_sha': RUNNER_FAILED_CODE,
+                 'intent_hash': RUNNER_FAILED_INTENT['hash'], 'nonce': RUNNER_NONCE,
+                 'result': 'EXACT_DOWNLOAD_FAILURE_RECONCILED', 'generic_retry_authorized': False}
+        if json.loads((Path(tmp) / 'runner-reconciled.json').read_text()) != prior:
+            raise recovery.Stop('runner_limits_prior_intent_changed')
+    value = {'run_id': RUNNER_LIMITS_RUN, 'code_sha': RUNNER_LIMITS_CODE,
+             'artifact_id': RUNNER_LIMITS_ARTIFACT, 'artifact_digest': RUNNER_LIMITS_DIGEST,
+             'superseded_intent_hash': RUNNER_FAILED_INTENT['hash'],
+             'gas': RUNNER_NEW_INTENT['gas'], 'gas_price': RUNNER_NEW_INTENT['gas_price'],
+             'result': 'EXACT_PREPARE_LIMITS_FAILURE_RECONCILED', 'generic_retry_authorized': False}
+    path = OUT / 'runner-limits-reconciled.json'
+    if path.exists():
+        if json.loads(path.read_text()) != value:
+            raise recovery.Stop('runner_limits_reconciliation_changed')
+    else:
+        save('runner-limits-reconciled', value)
+
+
 def no_prior_attempt(stage):
     """Fail closed on any earlier same-stage dispatch, even failed before mutation.
 
@@ -201,6 +259,7 @@ def no_prior_attempt(stage):
     current = int(os.environ['GITHUB_RUN_ID'])
     reconciled_seen = False
     runner_reconciled_seen = False
+    runner_limits_seen = False
     for page in range(1, 11):
         data = api('actions/workflows/ci.yml/runs?event=workflow_dispatch&per_page=100'
                    '&created=%3E%3D2026-10-10&page=' + str(page))
@@ -214,12 +273,15 @@ def no_prior_attempt(stage):
                 elif stage == 'authorize-runner' and run['id'] == RUNNER_FAILED_RUN:
                     verify_runner_zero_send()
                     runner_reconciled_seen = True
+                elif stage == 'authorize-runner' and run['id'] == RUNNER_LIMITS_RUN:
+                    verify_runner_limits_failure()
+                    runner_limits_seen = True
                 else:
                     raise recovery.Stop('prior_attempt_reconcile_do_not_retry')
         if len(runs) < 100:
             if stage == 'authorize-main' and not reconciled_seen:
                 raise recovery.Stop('required_reconciled_run_missing')
-            if stage == 'authorize-runner' and not runner_reconciled_seen:
+            if stage == 'authorize-runner' and not (runner_reconciled_seen and runner_limits_seen):
                 raise recovery.Stop('required_runner_reconciled_run_missing')
             return
     raise recovery.Stop('history_limit')
@@ -314,11 +376,11 @@ def main_transaction(phase, *, runner=False):
     nonce = RUNNER_NONCE if runner else NONCE
     options = {'target': RUNNER_TARGET, 'preflight': runner_preflight} if runner else {}
     if runner:
-        # Preserve the exact previously archived transaction identity; no repricing.
-        options['frozen_intent'] = RUNNER_FAILED_INTENT
+        # Explicit newly reviewed limits; no automatic repricing between prepare/send.
+        options['frozen_intent'] = RUNNER_NEW_INTENT
     if phase == 'prepare':
         value = recovery.recover(rpc, account, nonce, save, prepare_only=True, **options)
-        if runner and json.loads((OUT / 'intent.json').read_text()) != RUNNER_FAILED_INTENT:
+        if runner and {k: v for k, v in json.loads((OUT / 'intent.json').read_text()).items() if k != 'hash'} != RUNNER_NEW_INTENT:
             raise recovery.Stop('runner_frozen_intent_changed')
         if value['result'] != 'INTENT_ONLY':
             raise recovery.Stop('already_allowed_reconcile_without_send')
@@ -333,7 +395,7 @@ def main_transaction(phase, *, runner=False):
         else:
             save(name, value)
     options['frozen_intent'] = frozen
-    if runner and frozen != RUNNER_FAILED_INTENT:
+    if runner and {k: v for k, v in frozen.items() if k != 'hash'} != RUNNER_NEW_INTENT:
         raise recovery.Stop('runner_frozen_intent_changed')
     result = recovery.recover(rpc, account, nonce, verify, **options)
     if result['result'] != 'HASH_AUTHORIZED_ONLY':

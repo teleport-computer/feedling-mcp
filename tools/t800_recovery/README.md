@@ -168,3 +168,20 @@ hash and all intent fields, without repricing. Any evidence/chain drift stops.
 This is a new root-reviewed one-attempt dispatch, never an automatic rerun;
 future same-stage attempts block. The independent pre-send failure reproduction
 is necessary context: absence from one RPC alone does not prove zero sends.
+
+The original-intent recovery run `38079458231` then stopped before preparing a
+new intent with `frozen_limits_insufficient`; archive/send were skipped. Read-only
+measurement found unchanged estimate1,943,685 but doubled gas price2,000,032 wei,
+2 wei above the old2,000,030 bound. The exact CI instantaneous quote was not
+archived, so this measurement supports the fee-drift diagnosis without inventing
+an original quote.
+
+A separately reviewed replacement intent uses fixed gas2,400,000 and
+price3,000,000 wei (0.003gwei), maximum0.0000072 ETH, within the original3Mgas/
+0.1gwei caps. This explicitly supersedes the earlier same-hash requirement; the
+old intent remains immutable evidence and must still be absent on-chain. No
+automatic fee changes occur. The new prepared hash is archived before send and
+all prepared fields must stay equal in send. Exact run38079458231, its sole
+artifact ID/digest/file set, reason and relation to the old intent must be
+revalidated, in addition to the earlier download-failure evidence. Any other
+attempt or missing evidence blocks. Root alone authorizes this new intent.
