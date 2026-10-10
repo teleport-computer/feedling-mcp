@@ -79,15 +79,13 @@ endif
 ifndef YAML_URL
 	$(error YAML_URL not set)
 endif
-	@echo ">>> Adding compose_hash $(COMPOSE_HASH) on $(CHAIN)"
-	FEEDLING_COMPOSE_HASH=$(COMPOSE_HASH) \
-	FEEDLING_GIT_COMMIT=$(COMMIT) \
-	FEEDLING_COMPOSE_YAML_URL=$(YAML_URL) \
-	forge script script/AddComposeHash.s.sol \
-		--rpc-url $(RPC_URL) \
-		--private-key $(PRIVATE_KEY) \
-		--broadcast \
-		-vvv
+	@FEEDLING_PUBLISH_CHAIN="$(CHAIN)" \
+	FEEDLING_PUBLISH_RPC_URL="$(RPC_URL)" \
+	FEEDLING_COMPOSE_HASH="$(COMPOSE_HASH)" \
+	FEEDLING_GIT_COMMIT="$(COMMIT)" \
+	FEEDLING_COMPOSE_YAML_URL="$(YAML_URL)" \
+	FEEDLING_PUBLISH_EVIDENCE_DIR="$${FEEDLING_PUBLISH_EVIDENCE_DIR:-$$(git rev-parse --path-format=absolute --git-path compose-publish-evidence)}" \
+	python3 ../deploy/compose_publisher.py
 
 # -----------------------------------------------------------------------------
 # Read-only helpers

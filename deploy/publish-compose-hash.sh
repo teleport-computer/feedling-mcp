@@ -92,11 +92,10 @@ if [ -n "${FEEDLING_CVM_ID:-}" ]; then
   COMPOSE_HASH="0x${LIVE_HASH}"
   HASH_SOURCE="live-cvm:$FEEDLING_CVM_ID"
 else
-  COMPOSE_HASH="0x$(
-python3 <<PY
+  COMPOSE_HASH=$(
+python3 - "$APP_COMPOSE_FILE" "$COMPOSE_FILE" <<'PY'
 import hashlib, json, pathlib, yaml, sys
-app_compose_path = "$APP_COMPOSE_FILE"
-compose_yaml_path = "$COMPOSE_FILE"
+app_compose_path, compose_yaml_path = sys.argv[1:]
 
 if app_compose_path:
     app_compose = json.loads(pathlib.Path(app_compose_path).read_text())
@@ -127,7 +126,8 @@ else:
 canonical = json.dumps(app_compose, separators=(",", ":"), sort_keys=True)
 print(hashlib.sha256(canonical.encode()).hexdigest())
 PY
-)"
+)
+  COMPOSE_HASH="0x$COMPOSE_HASH"
   HASH_SOURCE="synthesized from $COMPOSE_FILE (offline mode)"
 fi
 
@@ -145,34 +145,14 @@ echo ">>> yaml_url      : $YAML_URL"
 echo ">>> chain         : $CHAIN"
 echo
 
-# Idempotency guard: skip the on-chain call if this hash is already authorized.
-# `addComposeHash` reverts with AlreadyApproved(hash) on duplicates, which
-# turns a re-run of tier-2 CI into red builds for no reason. A read-only
-# `isAppAllowed` check avoids that entirely.
-#
-# Env is populated either by CI (GH repo secrets/vars) or by contracts/.env
-# when run locally. If neither set things, we skip the check — worst case
-# is the pre-guard behavior (revert on duplicate).
+# Publisher validates chain/owner/hash, estimates with a hard cap, journals the
+# exact signed intent, broadcasts once and verifies receipt plus authorization.
 if [ -z "${FEEDLING_APP_AUTH_CONTRACT:-}" ] && [ -f "$REPO_ROOT/contracts/.env" ]; then
   set -a; . "$REPO_ROOT/contracts/.env"; set +a
 fi
-
-RPC_VAR="$(echo "$CHAIN" | tr '[:lower:]' '[:upper:]')_RPC_URL"
-RPC_URL="${!RPC_VAR:-}"
-
-if [ -n "${FEEDLING_APP_AUTH_CONTRACT:-}" ] && [ -n "$RPC_URL" ]; then
-  # `cast` auto-reads $CHAIN as a network alias and rejects our chain names —
-  # unset it just for this call.
-  ALREADY=$(env -u CHAIN cast call "$FEEDLING_APP_AUTH_CONTRACT" \
-    "isAppAllowed(bytes32)(bool)" "$COMPOSE_HASH" --rpc-url "$RPC_URL" 2>/dev/null || true)
-  if [ "$ALREADY" = "true" ]; then
-    echo ">>> compose_hash already authorized on $CHAIN — skipping on-chain publish"
-    exit 0
-  fi
-fi
-
-cd "$REPO_ROOT/contracts"
-make add-hash CHAIN="$CHAIN" \
-  COMPOSE_HASH="$COMPOSE_HASH" \
-  COMMIT="$GIT_COMMIT" \
-  YAML_URL="$YAML_URL"
+export FEEDLING_PUBLISH_CHAIN="$CHAIN"
+export FEEDLING_COMPOSE_HASH="$COMPOSE_HASH"
+export FEEDLING_GIT_COMMIT="$GIT_COMMIT"
+export FEEDLING_COMPOSE_YAML_URL="$YAML_URL"
+export FEEDLING_PUBLISH_EVIDENCE_DIR="${FEEDLING_PUBLISH_EVIDENCE_DIR:-$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-path compose-publish-evidence)}"
+exec python3 "$REPO_ROOT/deploy/compose_publisher.py"
