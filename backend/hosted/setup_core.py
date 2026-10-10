@@ -2806,13 +2806,18 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
         if frontier_error is not None:
             return frontier_error
         try:
-            provider_client.test_provider_key(provider_client.ProviderConfig(
-                active["provider"],
-                active["model"],
-                raw_key,
-                active["base_url"],
-                context_window_tokens=context_window_tokens,
-            ))
+            _test_provider_key_observed(
+                store,
+                provider_client.ProviderConfig(
+                    active["provider"],
+                    active["model"],
+                    raw_key,
+                    active["base_url"],
+                    context_window_tokens=context_window_tokens,
+                ),
+                operation="credential_patch",
+                route_context=_route_probe_context(active["id"]),
+            )
         except provider_client.ProviderError as e:
             # 不落库：旧 key 与旧 test_status 都保持原样，用户不会掉出 roster。
             return _record_provider_test_failure(store, e), 400
