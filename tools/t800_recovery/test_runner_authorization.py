@@ -46,7 +46,8 @@ def test_runner_previous_is_fixed_old_reviewed_stage(monkeypatch,tmp_path):
  monkeypatch.setattr(ci,'OUT',tmp_path);monkeypatch.setenv('T800_PREVIOUS_RUN',ci.RUNNER_PREVIOUS_RUN);monkeypatch.setenv('GITHUB_RUN_ID','99999999999')
  monkeypatch.setattr(ci,'api',lambda path:{'jobs':[{'name':'T800 incident recovery','conclusion':'success'}]} if '/jobs?' in path else {'event':'workflow_dispatch','head_sha':ci.RUNNER_PREVIOUS_CODE,'run_attempt':1,'display_title':'T800 recovery runner'})
  def download(*a,**kw):
-  d=tmp_path/'previous';d.mkdir(exist_ok=True)
+  from pathlib import Path
+  d=Path(a[0][-1]);d.mkdir(exist_ok=True)
   (d/'stage.json').write_text(json.dumps({'stage':'runner','code_sha':ci.RUNNER_PREVIOUS_CODE,'source':r.SOURCE,'pin':r.PIN,'result':'STAGE_COMPLETE'}))
   (d/'runner-next.json').write_text(json.dumps({'runner':ci.RUNNER,'compose_hash':ci.RUNNER_HASH,'result':'FREEZE_AND_REVIEW_RUNNER_AUTHORIZATION','deployment_acceptance':False}))
  monkeypatch.setattr(ci,'command',download)
@@ -65,6 +66,8 @@ def test_ci_runner_prepare_archive_send(monkeypatch,tmp_path):
  monkeypatch.setenv('PRIVATE_KEY','fake');monkeypatch.setenv('ETH_SEPOLIA_RPC_URL','https://fake.invalid')
  f=RunnerRPC();s=Signer();monkeypatch.setattr(r,'Account',SimpleNamespace(from_key=lambda _:s));monkeypatch.setattr(r,'RPC',lambda _:f)
  monkeypatch.setattr(ci,'runner_preflight',lambda:None)
+ seed=RunnerRPC();r.recover(seed,s,640,seed.save,target=ci.RUNNER_TARGET,preflight=lambda:None,prepare_only=True)
+ monkeypatch.setattr(ci,'RUNNER_FAILED_INTENT',seed.saved['intent'])
  ci.main_transaction('prepare',runner=True)
  assert f.sent==0
  f.saved['intent']=json.loads((tmp_path/'intent.json').read_text())

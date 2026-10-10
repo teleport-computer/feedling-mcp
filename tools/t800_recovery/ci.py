@@ -118,6 +118,79 @@ def verify_reconciled_zero_send():
         save('reconciled', value)
 
 
+RUNNER_FAILED_RUN = 38079057709
+RUNNER_FAILED_CODE = 'ba28299977a3d38894a0870b791217e937ce876f'
+RUNNER_FAILED_INTENT = json.loads(Path(__file__).with_name('runner-failed-intent.json').read_text())
+RUNNER_FAILED_ARTIFACTS = {
+    't800-intent-38079057709': (11680125231, 'sha256:18c764188f09fa5b7ccdabaaec9238724400609cf8222a6e12451e4400c441fe'),
+    't800-stage-38079057709': (11679955558, 'sha256:3ddf4ad0d86170addc4b05e3bec66d7b5e21375da4eee74c7c127cb1c3adbb31'),
+}
+
+
+def verify_runner_zero_send():
+    """Only the independently reproduced pre-transaction download failure.
+
+    Artifact identity, exact intent and current chain absence are all necessary;
+    none alone proves no send. A signed intent is not permission for another tx.
+    """
+    run_id = str(RUNNER_FAILED_RUN)
+    run = api('actions/runs/' + run_id)
+    if (run['id'] != RUNNER_FAILED_RUN or run['head_sha'] != RUNNER_FAILED_CODE
+            or run['run_attempt'] != 1 or run['event'] != 'workflow_dispatch'
+            or run['conclusion'] != 'failure' or run['display_title'] != 'T800 recovery authorize-runner'):
+        raise recovery.Stop('runner_reconciled_run_changed')
+    jobs = api('actions/runs/' + run_id + '/jobs?per_page=100')['jobs']
+    target = [j for j in jobs if j['name'] == 'T800 incident recovery']
+    if len(target) != 1 or target[0]['conclusion'] != 'failure':
+        raise recovery.Stop('runner_reconciled_job_changed')
+    expected = {'Prepare exact main transaction without broadcasting': 'success',
+                'Durably archive intent before any send': 'success',
+                'Single main transaction send': 'failure',
+                'Existing post-deploy gate or runner stage': 'skipped'}
+    for name, conclusion in expected.items():
+        steps = [x for x in target[0]['steps'] if x['name'] == name]
+        if len(steps) != 1 or steps[0]['conclusion'] != conclusion:
+            raise recovery.Stop('runner_reconciled_steps_changed')
+    artifacts = api('actions/runs/' + run_id + '/artifacts?per_page=100')
+    if artifacts['total_count'] != 2 or len(artifacts['artifacts']) != 2:
+        raise recovery.Stop('runner_reconciled_artifacts_changed')
+    seen = set()
+    for artifact in artifacts['artifacts']:
+        name = artifact['name']
+        if (name in seen or name not in RUNNER_FAILED_ARTIFACTS or artifact['expired']
+                or (artifact['id'], artifact['digest']) != RUNNER_FAILED_ARTIFACTS[name]):
+            raise recovery.Stop('runner_reconciled_artifact_changed')
+        seen.add(name)
+        with tempfile.TemporaryDirectory(prefix='t800-runner-reconcile-') as tmp:
+            command(['gh', 'run', 'download', run_id, '--repo', REPO, '--name', name, '--dir', tmp])
+            files = sorted(str(x.relative_to(tmp)) for x in Path(tmp).rglob('*'))
+            expected_files = ['intent.json'] if name.startswith('t800-intent-') else ['failure.json', 'intent.json']
+            if files != expected_files or json.loads((Path(tmp) / 'intent.json').read_text()) != RUNNER_FAILED_INTENT:
+                raise recovery.Stop('runner_reconciled_intent_changed')
+            if len(files) == 2 and json.loads((Path(tmp) / 'failure.json').read_text()) != {
+                    'result': 'STOP', 'reason': 'CalledProcessError', 'retry_authorized': False}:
+                raise recovery.Stop('runner_reconciled_failure_changed')
+    rpc = recovery.RPC(os.environ['ETH_SEPOLIA_RPC_URL'])
+    if int(rpc('eth_chainId', []), 16) != recovery.CHAIN:
+        raise recovery.Stop('runner_reconciled_chain_changed')
+    for method in ('eth_getTransactionByHash', 'eth_getTransactionReceipt'):
+        if rpc(method, [RUNNER_FAILED_INTENT['hash']]) is not None:
+            raise recovery.Stop('runner_prior_transaction_present_no_resend')
+    if any(int(rpc('eth_getTransactionCount', [recovery.OWNER, tag]), 16) != RUNNER_NONCE for tag in ('latest', 'pending')):
+        raise recovery.Stop('runner_reconciled_nonce_changed')
+    if rpc('eth_call', [{'to': recovery.CONTRACT, 'data': RUNNER_TARGET[2]}, 'latest']) != '0x' + '0'*64:
+        raise recovery.Stop('runner_reconciled_allowed_changed')
+    value = {'run_id': RUNNER_FAILED_RUN, 'code_sha': RUNNER_FAILED_CODE,
+             'intent_hash': RUNNER_FAILED_INTENT['hash'], 'nonce': RUNNER_NONCE,
+             'result': 'EXACT_DOWNLOAD_FAILURE_RECONCILED', 'generic_retry_authorized': False}
+    path = OUT / 'runner-reconciled.json'
+    if path.exists():
+        if json.loads(path.read_text()) != value:
+            raise recovery.Stop('runner_reconciliation_changed')
+    else:
+        save('runner-reconciled', value)
+
+
 def no_prior_attempt(stage):
     """Fail closed on any earlier same-stage dispatch, even failed before mutation.
 
@@ -127,6 +200,7 @@ def no_prior_attempt(stage):
     """
     current = int(os.environ['GITHUB_RUN_ID'])
     reconciled_seen = False
+    runner_reconciled_seen = False
     for page in range(1, 11):
         data = api('actions/workflows/ci.yml/runs?event=workflow_dispatch&per_page=100'
                    '&created=%3E%3D2026-10-10&page=' + str(page))
@@ -137,11 +211,16 @@ def no_prior_attempt(stage):
                 if stage == 'authorize-main' and run['id'] == RECONCILED_RUN:
                     verify_reconciled_zero_send()
                     reconciled_seen = True
+                elif stage == 'authorize-runner' and run['id'] == RUNNER_FAILED_RUN:
+                    verify_runner_zero_send()
+                    runner_reconciled_seen = True
                 else:
                     raise recovery.Stop('prior_attempt_reconcile_do_not_retry')
         if len(runs) < 100:
             if stage == 'authorize-main' and not reconciled_seen:
                 raise recovery.Stop('required_reconciled_run_missing')
+            if stage == 'authorize-runner' and not runner_reconciled_seen:
+                raise recovery.Stop('required_runner_reconciled_run_missing')
             return
     raise recovery.Stop('history_limit')
 
@@ -166,19 +245,19 @@ def previous(stage, sha):
     matching = [j for j in jobs if j['name'] == 'T800 incident recovery']
     if len(matching) != 1 or matching[0]['conclusion'] != 'success':
         raise recovery.Stop('prior_stage_not_successful')
-    dest = OUT / 'previous'
-    command(['gh', 'run', 'download', run_id, '--repo', REPO, '--name',
-             't800-stage-' + run_id, '--dir', str(dest)])
-    value = json.loads((dest / 'stage.json').read_text())
-    expected = {'stage': PREVIOUS[stage], 'code_sha': sha, 'source': recovery.SOURCE,
-                'pin': recovery.PIN, 'result': 'STAGE_COMPLETE'}
-    if any(value.get(k) != v for k, v in expected.items()):
-        raise recovery.Stop('prior_evidence_mismatch')
-    if stage == 'authorize-runner':
-        frozen = json.loads((dest / 'runner-next.json').read_text())
-        if frozen != {'runner': RUNNER, 'compose_hash': RUNNER_HASH, 'result': 'FREEZE_AND_REVIEW_RUNNER_AUTHORIZATION', 'deployment_acceptance': False}:
-            raise recovery.Stop('runner_prior_hash_changed')
-
+    with tempfile.TemporaryDirectory(prefix='t800-previous-') as tmp:
+        dest = Path(tmp)
+        command(['gh', 'run', 'download', run_id, '--repo', REPO, '--name',
+                 't800-stage-' + run_id, '--dir', str(dest)])
+        value = json.loads((dest / 'stage.json').read_text())
+        expected = {'stage': PREVIOUS[stage], 'code_sha': sha, 'source': recovery.SOURCE,
+                    'pin': recovery.PIN, 'result': 'STAGE_COMPLETE'}
+        if any(value.get(k) != v for k, v in expected.items()):
+            raise recovery.Stop('prior_evidence_mismatch')
+        if stage == 'authorize-runner':
+            frozen = json.loads((dest / 'runner-next.json').read_text())
+            if frozen != {'runner': RUNNER, 'compose_hash': RUNNER_HASH, 'result': 'FREEZE_AND_REVIEW_RUNNER_AUTHORIZATION', 'deployment_acceptance': False}:
+                raise recovery.Stop('runner_prior_hash_changed')
 
 def assert_release():
     if command(['git', 'rev-parse', 'HEAD'], cwd='release').strip() != recovery.PIN:
@@ -234,8 +313,13 @@ def main_transaction(phase, *, runner=False):
     rpc = recovery.RPC(os.environ['ETH_SEPOLIA_RPC_URL'])
     nonce = RUNNER_NONCE if runner else NONCE
     options = {'target': RUNNER_TARGET, 'preflight': runner_preflight} if runner else {}
+    if runner:
+        # Preserve the exact previously archived transaction identity; no repricing.
+        options['frozen_intent'] = RUNNER_FAILED_INTENT
     if phase == 'prepare':
         value = recovery.recover(rpc, account, nonce, save, prepare_only=True, **options)
+        if runner and json.loads((OUT / 'intent.json').read_text()) != RUNNER_FAILED_INTENT:
+            raise recovery.Stop('runner_frozen_intent_changed')
         if value['result'] != 'INTENT_ONLY':
             raise recovery.Stop('already_allowed_reconcile_without_send')
         return
@@ -248,7 +332,10 @@ def main_transaction(phase, *, runner=False):
                 raise recovery.Stop('intent_changed')
         else:
             save(name, value)
-    result = recovery.recover(rpc, account, nonce, verify, frozen_intent=frozen, **options)
+    options['frozen_intent'] = frozen
+    if runner and frozen != RUNNER_FAILED_INTENT:
+        raise recovery.Stop('runner_frozen_intent_changed')
+    result = recovery.recover(rpc, account, nonce, verify, **options)
     if result['result'] != 'HASH_AUTHORIZED_ONLY':
         raise recovery.Stop('authorization_not_this_attempt')
     save('transaction', result)

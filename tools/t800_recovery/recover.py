@@ -14,7 +14,7 @@ YAML='https://github.com/teleport-computer/feedling-mcp/raw/'+PIN+'/deploy/docke
 DATA='0x'+(keccak(text='addComposeHash(bytes32,string,string)')[:4]+encode(['bytes32','string','string'],[bytes.fromhex(HASH),PIN,YAML])).hex()
 ALLOWED='0x'+keccak(text='isAppAllowed(bytes32)')[:4].hex()+HASH
 USER_AGENT='feedling-t800-recovery/1'
-RPC_METHODS=frozenset({'eth_chainId','eth_call','eth_getTransactionCount','eth_estimateGas','eth_gasPrice','eth_sendRawTransaction','eth_getTransactionReceipt'})
+RPC_METHODS=frozenset({'eth_chainId','eth_call','eth_getTransactionCount','eth_estimateGas','eth_gasPrice','eth_sendRawTransaction','eth_getTransactionReceipt','eth_getTransactionByHash'})
 MAX_GAS=3000000
 MAX_GAS_PRICE=100000000 # 0.1 gwei => maximum .0003 Sepolia ETH, not gas-used estimate
 class Stop(Exception):pass

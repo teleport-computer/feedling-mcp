@@ -151,3 +151,20 @@ never retried. The prepare/archive/single-send controls and gas caps are unchang
 Live running CVM/hash/image tag and registry digest are checked again before each
 signing phase. Successful hash authorization does not prove Hosted instances or
 runtime health. Root and the independent reviewer own subsequent acceptance.
+
+The first runner authorization run `38079057709` prepared and archived intent but
+failed before entering the transaction function: both phases downloaded prior
+stage evidence into one directory, and gh's second extraction rejected existing
+files. Each phase now downloads and validates into a new temporary directory.
+A subprocess exclusive-extraction two-phase test guards this regression; the
+same actual gh download and validation were also verified twice locally.
+
+Only this exact failed run at code `ba28299977a3d38894a0870b791217e937ce876f`
+is reconciled, by fixed artifact IDs/digests, exact file sets/failure/intent, and
+live chain checks (intent transaction and receipt absent, nonce640 latest=pending,
+runner hash unallowed). The original public intent is frozen in
+`runner-failed-intent.json`; recovery must produce the identical signed transaction
+hash and all intent fields, without repricing. Any evidence/chain drift stops.
+This is a new root-reviewed one-attempt dispatch, never an automatic rerun;
+future same-stage attempts block. The independent pre-send failure reproduction
+is necessary context: absence from one RPC alone does not prove zero sends.

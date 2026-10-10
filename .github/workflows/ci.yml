@@ -156,6 +156,7 @@ jobs:
             t800-evidence/stage.json
             t800-evidence/failure.json
             t800-evidence/reconciled.json
+            t800-evidence/runner-reconciled.json
           if-no-files-found: warn
           retention-days: 90
 
