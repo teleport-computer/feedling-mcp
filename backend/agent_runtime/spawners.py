@@ -1259,8 +1259,10 @@ def _signal_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True  # EPERM does not prove exit; never permit a replacement.
 
 
 # How long to wait for a graceful SIGTERM exit before escalating to SIGKILL.
@@ -1271,24 +1273,33 @@ _KILL_GRACE_SEC = 3.0
 
 
 def _signal_kill(pid: int) -> None:
-    """SIGTERM a pid we don't hold a Popen handle for, escalating to SIGKILL if it
-    doesn't exit within the grace window (the no-handle fallback path — e.g. after
-    a supervisor restart, or the container strategy)."""
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return  # already gone / not ours
-    deadline = time.monotonic() + _KILL_GRACE_SEC
-    while time.monotonic() < deadline:
+    """Return only after exit is confirmed; failures leave the caller tracking pid."""
+    def exited() -> bool:
+        # Reap our own child if the Popen handle was lost. For non-children,
+        # kill(0) remains conservative (an unreaped zombie is still present).
         try:
-            os.kill(pid, 0)
-        except OSError:
-            return  # exited on SIGTERM
-        time.sleep(0.1)
-    try:
-        os.kill(pid, signal.SIGKILL)  # ignored SIGTERM → force
-    except OSError:
-        pass
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                return True
+        except ChildProcessError:
+            pass
+        return not _signal_alive(pid)
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if exited():
+            return
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + _KILL_GRACE_SEC
+        while True:
+            if exited():
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+    raise TimeoutError(f"process {pid} termination unconfirmed")
 
 
 class ProcessSpawner:
@@ -1335,16 +1346,14 @@ class ProcessSpawner:
         if proc is None:
             _signal_kill(pid)
             return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=_KILL_GRACE_SEC)
-                except subprocess.TimeoutExpired:
-                    proc.kill()  # SIGTERM ignored / wedged → force, then reap
-                    proc.wait(timeout=_KILL_GRACE_SEC)
-        except Exception:  # noqa: BLE001
-            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=_KILL_GRACE_SEC)
+            except subprocess.TimeoutExpired:
+                proc.kill()  # SIGTERM ignored / wedged → force, then reap
+                proc.wait(timeout=_KILL_GRACE_SEC)
+        # Keep the handle on ANY failure so a later attempt can stop/reap it.
         self._procs.pop(pid, None)
 
 

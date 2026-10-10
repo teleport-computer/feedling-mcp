@@ -5109,12 +5109,33 @@ def _read_worldbook_context(
     *,
     runtime_token: str,
     trace_context: dict | None = None,
+    through_seq: int | None = None,
 ) -> dict:
-    """Match this foreground turn against the user's encrypted World Book."""
+    """Match a fresh owner-scoped snapshot, preserving read failures.
+
+    A turn must observe committed edits/deletions without depending on cache
+    invalidation delivery. The core-owned data snapshot has no store cache;
+    matching retains the existing plaintext/enclave authentication paths.
+    """
+    snapshot = core_store.read_worldbook_snapshot(str(user_id))
+    if through_seq is not None and snapshot.world_books:
+        # Read original text only: no quoted-memory expansion, image/file
+        # captions, screen observations, tool output, or compaction summary.
+        messages = []
+        for row in db.world_book_chat_signals(user_id, through_seq):
+            text = core_envelope.read_envelope_body(
+                row, None, purpose="v2_worldbook_signal",
+                caller_user_id=user_id, runtime_token=runtime_token,
+            ).decode("utf-8")
+            # Probe identity comes from the source filter, never body text:
+            # a genuine conversation can discuss the literal probe marker.
+            if text.strip():
+                messages.append({
+                    "role": "user" if row.get("role") in {"user", "human"} else "assistant",
+                    "content": text,
+                })
     body, status = worldbook_core.match(
-        core_store.get_store(
-            str(user_id), require={StoreSection.WORLD_BOOKS}
-        ),
+        snapshot,
         {"messages": list(messages or [])},
         api_key=None,
         runtime_token=str(runtime_token or ""),

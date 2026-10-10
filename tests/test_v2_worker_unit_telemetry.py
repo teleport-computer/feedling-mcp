@@ -1558,6 +1558,29 @@ def test_worldbook_tool_result_observation_contains_shape_only():
     assert private_context not in repr(observation)
 
 
+@pytest.mark.parametrize("state", ["UNAVAILABLE", "PARTIAL"])
+def test_worldbook_read_failure_marker_is_warning_not_success(state):
+    from admin import data_track
+    traces = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda uid, event_type, **fields: traces.append(
+        {"type": event_type, **fields}
+    )
+    sink = worker._ledger_tapped_sink(
+        None, deps=deps, user_id="u-worldbook-warning", lane="chat",
+        trace_id="trace-warning", job_id="job-warning",
+    )
+    content = (worker.context.WORLD_BOOK_CONTEXT_HEADER
+               + f"\n[WORLD BOOK CONTEXT {state}: source unavailable.]"
+               + "\nPRIVATE_PARTIAL_BODY")
+    asyncio.run(sink("provider_request", {"messages": [{"role": "user", "content": content}]}))
+    event = next(event for event in traces if event["type"] == "worldbook.context.applied")
+    assert event["status"] == "warning"
+    assert event["detail"]["read_" + state.lower()] is True
+    assert data_track._debug_event_public_json(event)["detail"]["read_" + state.lower()] is True
+    assert "PRIVATE_PARTIAL_BODY" not in repr(event)
+
+
 def test_post_fold_checkpoint_exhaustion_is_content_free_degradation(monkeypatch):
     recorded = {}
 

@@ -12,11 +12,85 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Model route activation/test diagnostics now correlate the route and server
+  request with probe timing and safe exception categories. Unknown HTTP phases
+  remain explicit; this does not change timeouts, validation, or rollback behavior.
+
+- Runtime V2 now preserves unpublished wake drafts when adaptive context planning
+  rebuilds the next provider request. Drafts remain temporary assistant messages,
+  count toward the prompt budget, and are never delivered without the existing
+  validated reply decision.
+
+- `GET /v1/worldbook/list` now reads the authenticated owner's committed
+  envelopes on each request, including changes made through another worker.
+  An unavailable database returns `503 worldbook_read_unavailable` instead of
+  a successful empty or stale list. Successful responses keep the same
+  `envelopes` shape and original envelope contents.
+
+- Hosted Resident configuration changes now wait for confirmed consumer exit
+  before releasing reply claims or starting a replacement. Failed stops remain
+  tracked for retry, including roster removal, lost leases, and shutdown.
+  Existing reply-finalization rules remain unchanged; this does not recover
+  replies already rejected after a failure reply was stored.
+
+- Runtime V2 foreground chat and voice turns now directly inject applicable
+  World Book entries, without requiring a model tool call. Enabled `alwaysOn`
+  entries apply every turn; keywords match the newest five real text-chat
+  messages independently of conversation compaction and prompt-history trimming.
+  Screen observations, tool results, and summaries are not matching signals.
+  The `worldbook_match` tool remains available for additional lookup. Reads use the
+  current source so edits and deletions apply on the next turn; conversation
+  compaction never rewrites World Book entries. Existing context limits and
+  truncation markers still apply, and unavailable or partial reads are marked
+  explicitly. This restores automatic World Book injection; it
+  does not guarantee model adherence or fix every long-conversation failure.
+
+- Resident startup and idle health checks now read authenticated backend history
+  for effective-off accounts, including with no enclave URL. The existing health
+  header adds `backend_ready`, `backend_unreachable`, and `backend_degraded`;
+  the backend accepts them only for server-authoritative effective-off accounts.
+  A valid empty history page proves backend read readiness, not decryption.
+  Backend health never consumes or publishes shared enclave health, and a mode
+  change invalidates the previous route's local evidence. Startup failures keep
+  polling for recovery; encrypted/unknown routes retain their existing probes.
+
+- Upgraded Resident consumers read effective-off accounts' history and omitted
+  plaintext bodies directly from the authenticated backend, even without an
+  enclave URL. Backend read failures no longer fall back to enclave history.
+  Old sealed rows remain unreadable with cursor metadata preserved and cannot
+  supply conversation context, Capture input, or a memory-selection anchor.
+  Hydrated attachments no longer trigger a second body fetch. Encrypted and
+  unknown accounts retain their existing history paths. The separate
+  memory-selection fallback is unchanged.
+
+- The test deployment now wires `TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL` to the
+  backend. It defaults to `off`, accepts only `off`, `shadow`, or `on`, and
+  rejects invalid values before deployment. Changing the variable requires a
+  normal redeployment; this configuration support does not itself enable local
+  selection or change production or pre deployments.
+
 - Runtime V2 heartbeat and manual wakes now include a one-round reminder to
   check a reply against existing identity requirements after their initial look,
   when that decision has no draft and is not a forced choice or correction.
   This prompt change aims to improve adherence; it does not guarantee it or add
   a model call. Other reply paths keep their existing guidance.
+
+- Resident consumers can get per-turn memory cards for plaintext accounts from
+  the backend instead of the decrypt service: new `POST /v1/memory/turn-selection`
+  behind `FEEDLING_RESIDENT_PLAINTEXT_RECALL` (default `off`: the route answers
+  `409 not_served` and residents keep their decrypt-service path). `shadow`
+  returns the decrypt-service result and records a content-free
+  `memory.resident_recall.shadow` comparison; `on` returns the backend's
+  selection, falling back to the decrypt service once if it is unavailable.
+  Selection is lexical only, on the same history page (limit 4, the resident's
+  window) with the same selection code; no embedding model is loaded in the
+  backend. The consumer uses the route only for accounts its whoami cache marks
+  plaintext; a `404` or `409` sends it to the decrypt service, any other failure
+  is recorded as unknown without a second decrypt-service request.
+  The route bounds streamed request bodies and selection waiting after
+  authentication, including queueing. Shadow comparisons and diagnostics use
+  bounded background jobs; sealed-card comparisons use the enclave's frozen
+  normalized inputs.
 
 - Keyword memory search (`memory_search`, and `memory_index` with a query) for a
   plaintext account is now ranked in the backend over the account's plaintext

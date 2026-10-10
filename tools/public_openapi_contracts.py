@@ -158,16 +158,21 @@ DECRYPT_HEALTH_HEADERS = [
         "X-Feedling-Decrypt-Status",
         _schema(
             "string",
-            enum=["ok", "degraded", "unconfigured", "unreachable"],
+            enum=["ok", "degraded", "unconfigured", "unreachable",
+                  "backend_ready", "backend_unreachable", "backend_degraded"],
         ),
-        "Current resident decrypt-source health. Report this on poll heartbeats; "
+        "Resident read-source health. backend_ready means authenticated backend history "
+        "was read with a valid page, not that ciphertext was decrypted; backend_unreachable "
+        "and backend_degraded report backend read failures. The backend accepts these "
+        "three statuses only for server-authoritative effective-off accounts. Legacy "
+        "decrypt statuses retain their meanings. Report this on poll heartbeats; "
         "omitting it on a later official poll clears the previous report to unknown.",
         example="ok",
     ),
     _header(
         "X-Feedling-Decrypt-Checked-At",
         TIMESTAMP,
-        "Unix epoch seconds when the resident last confirmed the reported decrypt status. "
+        "Unix epoch seconds when the resident last confirmed the reported read-source status. "
         "The backend treats missing, invalid, future, or stale values as unknown.",
         example=1784625600.125,
     ),
@@ -196,6 +201,13 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("before", TIMESTAMP, "Return older messages with ts strictly less than this watermark; takes precedence over since.", example=1783962000.0),
         _query("include_image_body", _schema("boolean", default=True), "Set false to omit image and oversized inline bodies.", example=False),
         _query("include_image_bodies", BOOL, "Compatibility alias for include_image_body.", deprecated=True),
+    ],
+    ("post", "/v1/memory/turn-selection"): [
+        _header("X-Recall-Deadline-Ms", _schema("integer", minimum=0),
+                "The resident's remaining budget for this selection in milliseconds; the "
+                "server caps it at 4000 ms (default 3000) and reserves 150 ms for the response. "
+                "Starts after authentication and includes body reads and worker queueing; "
+                "an exhausted budget is not extended.", example=3000),
     ],
     ("get", "/v1/identity/changes"): [
         _query("limit", _schema("integer", minimum=1, maximum=200, default=50), "Maximum changes to return.", example=50),
@@ -1778,6 +1790,16 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": False,
     },
+    "MemoryTurnSelectionRequest": {
+        "type": "object",
+        "required": ["message_id", "seq"],
+        "properties": {
+            "message_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775806},
+        },
+        "additionalProperties": False,
+        "example": {"message_id": "msg_abc123", "seq": 1042},
+    },
     "MemoryFetchRequest": {
         "type": "object",
         "required": ["ids"],
@@ -2530,6 +2552,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("delete", "/v1/chat/history"): "ChatHistoryClearRequest",
     ("post", "/v1/memory/index"): "MemoryIndexRequest",
     ("post", "/v1/memory/fetch"): "MemoryFetchRequest",
+    ("post", "/v1/memory/turn-selection"): "MemoryTurnSelectionRequest",
     ("post", "/v1/memory/actions"): "MemoryActionsRequest",
     ("post", "/v1/memory/add"): "MemoryAddRequest",
     ("post", "/v1/memory/retype"): "MemoryRetypeRequest",
@@ -2647,7 +2670,8 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ),
     ("get", "/v1/bootstrap/status"): "Return server-observed onboarding progress. Resident routes include decrypt_source_ready, decrypt_health, and decrypt_health_policy; a fresh resident poll report is required for new-account completion.",
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
-    ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
+    ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report read-source status (including backend readiness for effective-off accounts) and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
+    ("post", "/v1/memory/turn-selection"): "Per-turn memory selection for a plaintext resident account: the cards picked for this message, selected by the backend with the lexical ranker on the same history page the enclave read used (before_seq = seq + 1, limit 4). Returns 409 not_served when the account is not plaintext or the feature is off (the enclave was not called; the resident keeps its enclave path), 503 recall_unavailable on exhausted budget, capacity, or selection failure (at most one backend enclave fallback when budget remains; the consumer must not retry), and 422 message_not_in_window when the message is not in that page.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): (
@@ -2845,6 +2869,58 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/worldbook/list"): {
+        "200": {
+            "description": (
+                "Current committed World Book envelopes for the authenticated owner. "
+                "Read from PostgreSQL on each request, independent of worker caches. "
+                "An empty envelopes list means the successful read found no entries."
+            ),
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["envelopes"],
+                "properties": {"envelopes": {"type": "array", "items": {"type": "object", "additionalProperties": True}}},
+            }}},
+        },
+        "503": {
+            "description": "worldbook_read_unavailable: authoritative storage could not be read; no empty or cached success is returned.",
+            "content": {"application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+                "example": {"error": "worldbook_read_unavailable"},
+            }},
+        },
+    },
+    ("post", "/v1/memory/turn-selection"): {
+        "200": {
+            "description": "Selection and content-free page identity, with the complete selection trace.",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["source", "messages", "context_memories", "context_memory_trace",
+                             "context_memory_log"],
+                "properties": {
+                    "source": {"type": "string", "enum": ["local", "enclave_fallback", "enclave_shadow"]},
+                    "messages": {"type": "array", "items": {
+                        "type": "object", "required": ["id", "role", "seq"],
+                        "properties": {"id": {"type": "string"}, "role": {"type": "string"},
+                                       "seq": {"type": ["integer", "null"]}},
+                        "additionalProperties": False,
+                    }},
+                    "context_memories": {"type": ["array", "null"], "items": {"type": "object"}},
+                    "context_memory_trace": {"type": ["object", "null"]},
+                    "context_memory_log": {"type": ["object", "null"]},
+                },
+            }}},
+        },
+        **{code: {"description": description,
+                  "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}}
+           for code, description in {
+               "400": "request_invalid: invalid message_id, seq, or body.",
+               "409": "not_served: feature off or account not plaintext; enclave was not contacted.",
+               "413": "request_too_large: body exceeds 1024 bytes.",
+               "422": "message_not_in_window: message does not belong to the fixed user-bound page.",
+               "503": "recall_unavailable: deadline, capacity, or selection failure; do not retry the enclave.",
+           }.items()},
+    },
     ("get", "/v1/chat/poll"): {
         "200": {
             "description": "Chat work and control-plane context. agent_body_job is null unless bound to this capable consumer.",

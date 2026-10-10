@@ -293,3 +293,20 @@ def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
     assert watermark == 5
     assert snapshot == 8
     assert [row["seq"] for row in rows if row["seq"] > watermark] == [6, 7, 8]
+
+def test_adaptive_round_draft_is_budgeted_without_persisting_or_changing_role():
+    builder = worker._make_build_messages_fn(
+        system_prompt='system', summary='', tail=_turn(1),
+        tail_target_turns=40, application_data_role='assistant')
+    draft = {'role': 'assistant', 'content': 'private draft ' * 30}
+    kwargs = dict(transcript=[], tools=None, model_limit=_limit(32768),
+                  output_reserve_tokens=4096, safety_margin_tokens=None,
+                  utf8_bytes_per_token=4.0, image_reserve_tokens=1024)
+    messages, _, _ = builder.plan_provider_round(**kwargs, transient_messages=[draft])
+    assert messages[-1] == draft
+    later, _, _ = builder.plan_provider_round(**kwargs)
+    assert draft not in later
+    assert draft not in builder([])
+    with pytest.raises(prompt_frontier.PromptFrontierExhausted):
+        builder.plan_provider_round(
+            **kwargs, transient_messages=[{'role':'assistant','content':'draft ' * 100000}])

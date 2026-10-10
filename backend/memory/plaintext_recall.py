@@ -33,6 +33,9 @@ MODES = ("off", "shadow", "on")
 
 # The enclave's request options for Runtime V2 (serve_worker._read_context_memories).
 V2_QUERY_ARGS = {"context_mode": "", "context_recent": True, "want_trace": True}
+# What the resident consumer's per-turn enclave read asks for (T779 step 3):
+# no context_mode/context_strict, no context_recent, context_trace=1.
+RESIDENT_QUERY_ARGS = {"context_mode": "", "context_recent": False, "want_trace": True}
 
 
 LOCAL_TIMEOUT_ENV = "FEEDLING_V2_PLAINTEXT_RECALL_TIMEOUT_MS"
@@ -69,6 +72,9 @@ def run_bounded(fn, timeout: float, permit: threading.BoundedSemaphore):
     The thread owns ``permit`` until ``fn`` really returns, so a caller that
     stops waiting never frees capacity that is still in use.
     """
+    if timeout <= 0:
+        return "timeout", None
+    end = time.monotonic() + timeout
     if not permit.acquire(blocking=False):
         return "busy", None
     box: dict = {}
@@ -76,15 +82,22 @@ def run_bounded(fn, timeout: float, permit: threading.BoundedSemaphore):
 
     def work():
         try:
-            box["value"] = fn()
+            if time.monotonic() >= end:
+                box["timeout"] = True
+            else:
+                box["value"] = fn()
         except BaseException as exc:  # noqa: BLE001 — handed back to the waiter
             box["error"] = exc
         finally:
-            done.set()
             permit.release()
+            done.set()
 
-    threading.Thread(target=work, name="plaintext-recall-bounded", daemon=True).start()
-    if not done.wait(max(0.0, timeout)):
+    try:
+        threading.Thread(target=work, name="plaintext-recall-bounded", daemon=True).start()
+    except Exception as exc:
+        permit.release()
+        return "error", exc
+    if not done.wait(max(0.0, end - time.monotonic())) or box.get("timeout"):
         return "timeout", None
     if "error" in box:
         return "error", box["error"]
@@ -263,8 +276,14 @@ class Deps:
     encoder: object = None
 
 
-def select(user_id: str, through_seq: int, deps: Deps) -> LocalResult:
-    """Select this turn's context cards here, or raise NotServedHere."""
+def select(user_id: str, through_seq: int, deps: Deps, *,
+           query_args: dict | None = None, hybrid: bool | None = None) -> LocalResult:
+    """Select this turn's context cards here, or raise NotServedHere.
+
+    ``query_args`` defaults to the V2 window; the resident path passes
+    ``RESIDENT_QUERY_ARGS``. ``hybrid=None`` follows the deployment switch;
+    ``False`` forces the lexical ranker for this call only (no encoder call,
+    no vector read) without touching process-wide configuration."""
     started = time.monotonic()
     if deps.effective_mode(user_id) != "off":
         raise NotServedHere("account_encrypted")
@@ -273,11 +292,13 @@ def select(user_id: str, through_seq: int, deps: Deps) -> LocalResult:
         raise NotServedHere("sealed_history")
     decrypted, _errors = history_view.history_items(rows, _row_reader(user_id), PlaintextReadFailure)
     moments = deps.list_moments(user_id, recall_select.memory_readside_model_api_limit())
-    query_args = {**V2_QUERY_ARGS, "authorized_user_id": user_id, "content_sk": None}
+    query_args = {**(V2_QUERY_ARGS if query_args is None else query_args),
+                  "authorized_user_id": user_id, "content_sk": None}
+    use_hybrid = recall_policy.hybrid_enabled() if hybrid is None else bool(hybrid)
     hybrid = None
     encoder = None
     inner = None
-    if recall_policy.hybrid_enabled():
+    if use_hybrid:
         inner = {}
     cards, sealed = plaintext_cards(moments, user_id, inner_out=inner)
     if inner is not None:

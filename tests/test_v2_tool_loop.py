@@ -155,8 +155,9 @@ class _AdaptiveBuildMessages(_RecordingBuildMessages):
         utf8_bytes_per_token,
         image_reserve_tokens,
         system_suffix="",
+        transient_messages=(),
     ):
-        messages = [{"role": "system", "content": "base"}]
+        messages = [{"role": "system", "content": "base"}, *transient_messages]
         if system_suffix:
             messages[0]["content"] += "\n\n" + system_suffix
         plan = tool_loop.prompt_frontier.plan_provider_round(

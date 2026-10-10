@@ -321,7 +321,14 @@ _E_WAKE_DRAFT = "宝贝还在睡呢，让她多休息会儿吧。"
     ("empty", _A_WAKE_DRAFT),
     ("other_tool", _E_WAKE_DRAFT),
 ])
-def test_direct_wake_draft_gets_one_explicit_decision(monkeypatch, outcome, draft):
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_direct_wake_draft_gets_one_explicit_decision(monkeypatch, outcome, draft, adaptive):
+    if adaptive:
+        original = worker._make_build_messages_fn
+        def adaptive_builder(**kwargs):
+            kwargs['tail_target_turns'] = 40
+            return original(**kwargs)
+        monkeypatch.setattr(worker, '_make_build_messages_fn', adaptive_builder)
     monkeypatch.setattr(worker, "_TURN_MAX_LLM_CALLS", 8)
     uid = "u_wake_draft_" + outcome
     conftest.seed_user(uid)

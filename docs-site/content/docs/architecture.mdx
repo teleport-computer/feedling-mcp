@@ -293,6 +293,26 @@ tail without inventing a semantic replacement. Any bounded-tail coverage-hole
 count remains a separate late data block, so it cannot perturb the stable
 prefix.
 
+On Runtime V2 foreground chat and voice turns, applicable World Book entries
+are read from a fresh owner-scoped snapshot before the first model request.
+Enabled `alwaysOn` entries apply every turn; keyword entries match the newest
+five real text-chat messages through the turn's frozen sequence boundary.
+This matching window is independent of summary coverage and prompt-history
+trimming. Screen observations, tool results, and summaries are excluded.
+The `worldbook_match` tool remains available for additional lookup.
+World Book content remains non-privileged application data with the existing
+24,000-character cap and prompt-budget truncation markers. Partial or failed
+reads carry an explicit notice; an unavailable source is not an empty book.
+Compaction changes conversation coverage, not the original World Book records.
+
+Client synchronization through `GET /v1/worldbook/list` also reads the current
+authenticated owner's committed envelopes directly from PostgreSQL on every
+request. It does not depend on worker-local projection hydration or notification
+delivery. The successful response remains `{"envelopes": [...]}` with the original
+envelopes; an empty list means the read succeeded and found no entries. A failed
+storage read returns `503` with `worldbook_read_unavailable`, without a cached
+or empty success response.
+
 Because MEMORY and STYLE are part of the system prefix, each successful profile
 refresh changes that user's provider prompt-cache prefix once. Other users'
 caches are unaffected, and subsequent turns reuse the refreshed prefix until the
@@ -417,6 +437,33 @@ pooled `serve-worker`; their user-level consent gates remain independent.
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
+
+Upgraded Resident consumers (hosted and independent) read conversation history
+and omitted plaintext bodies from the authenticated backend when whoami reports
+`content_encryption_effective=off`. These history reads do not retry through the
+enclave: backend failure remains a read failure, while old sealed rows retain
+their cursor metadata but are unreadable and excluded from conversation context,
+Capture input, and per-turn memory selection anchors. Encrypted and unknown
+accounts retain the existing mixed-page and enclave history paths. Startup and
+idle health probes follow the same effective account mode: `backend_ready`
+means a valid authenticated backend history read, including an empty page;
+`backend_unreachable` and `backend_degraded` report read failures. These
+account-local results never consume or publish the runner-shared enclave health
+cache. Mode changes invalidate local health and probe throttling. This does not
+remove the separate memory-selection fallback or prove old ciphertext readable.
+
+Resident consumers (hosted and independent) ask for each turn's memory cards.
+By default the decrypt service selects them. An operator switch
+(`FEEDLING_RESIDENT_PLAINTEXT_RECALL`, off by default) lets the backend select
+cards for plaintext accounts itself through `POST /v1/memory/turn-selection`,
+on the same history page and with the same selection code, using the lexical
+ranker only: the backend loads no embedding model for this and reads no card
+vectors. For those accounts the backend reads the account's plaintext cards and
+the history page to make the selection. A consumer calls this route only for an
+account it knows to be plaintext; encrypted or unknown accounts keep the
+decrypt-service path and do not depend on the route. When the backend's own
+selection is unavailable it falls back to the decrypt service once; it is the
+only side that falls back.
 
 ### Genesis plaintext imports
 
@@ -780,6 +827,14 @@ cutoff-based admission is fail-closed: accounts outside the configured cohort,
 without an eligible route, or on an invalid rollout configuration remain on the
 separate resident execution path.
 
+The hosted Resident supervisor confirms that the old consumer process has stopped
+before releasing its in-flight reply claims or starting a replacement after a
+configuration change. A failed or unconfirmed stop keeps the process tracked for
+retry; roster removal and shutdown do not release its lease on that attempt.
+This local stop check does not provide fencing across a lease expiry or network
+partition. Reply finalization still rejects writes to an already answered parent;
+a later normal reply cannot overwrite an existing failure reply.
+
 Feedling does not represent this as per-user microVM or per-user hardware-enclave
 isolation. Keep hosted execution restricted to supported agent entry points, and
 use a separately reviewed container or microVM boundary before offering
@@ -1121,7 +1176,7 @@ enabled capability:
 | Account and storage API | Authenticated request plus a successful write/read round trip through PostgreSQL |
 | Memory index and fetch | Storage round trip plus a successful authorized decrypt projection |
 | Hosted Chat | Database, decrypt service, a fresh runtime heartbeat for the user's fenced runtime (Runtime V2 worker heartbeat and capacity, or V1 resident supervisor heartbeat during the dual-runtime window), queue processing, provider call, and encrypted assistant result |
-| Independent resident Chat | Fresh official poll plus a fresh `ok` decrypt-health report, an exact-parent verify-ping reply, and an encrypted ordinary reply |
+| Independent resident Chat | Fresh official poll plus a fresh `ok` decrypt-health report or server-validated effective-off `backend_ready`, an exact-parent verify-ping reply, and an ordinary reply in the account's effective content mode |
 | Screen ingestion | Authenticated WebSocket ingest plus frame persistence and, when needed, decrypt retrieval |
 | Push delivery | Valid device token and a confirmed provider delivery attempt |
 
@@ -1134,7 +1189,9 @@ capability-level checks above.
 The resident decrypt-health headers are an operational self-report used to
 prevent live-loop-only false greens. They do not move the decrypt trust boundary
 and are not attestation: phase one may report `ok` after a successful
-reachability probe. A future encrypted challenge can provide stronger proof
+reachability probe. `backend_ready` proves only the backend read route; the
+server checks effective-off eligibility before accepting it, while legacy
+decrypt reports retain their rollout semantics. A future encrypted challenge can provide stronger proof
 that the resident opened ciphertext for the account.
 
 ## Security boundary summary

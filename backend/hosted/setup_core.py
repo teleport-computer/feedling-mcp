@@ -19,12 +19,15 @@ is ever introduced here. Module-level references (``provider_client``,
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
 import time
 import uuid
 from functools import wraps
+
+import httpx
 
 import db
 import debug_trace
@@ -117,6 +120,8 @@ def _emit_model_api_probe_trace(
     error_class: str = "",
     status_code: object = None,
     dur_ms: float | None = None,
+    route_context: dict | None = None,
+    exception_type: str = "unknown",
 ) -> None:
     event_type = {
         "started": "model_api.provider_probe.started",
@@ -135,11 +140,18 @@ def _emit_model_api_probe_trace(
             else None
         ),
     }
+    if route_context is not None:
+        detail.update({key: route_context.get(key) for key in ("route_id", "request_id")})
+        detail["http_phase"] = "unknown"  # No transport-phase measurement here.
+        detail["exception_type"] = exception_type if exception_type in {
+            "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout",
+            "ConnectError", "ReadError", "ProviderError",
+        } else "unknown"
     if usage:
         detail["usage"] = dict(usage)
     if error_class:
         detail["error_class"] = error_class
-    debug_trace.trace_event(
+    _probe_observation(debug_trace.trace_event,
         store,
         subsystem="model_api",
         type=event_type,
@@ -153,46 +165,93 @@ def _emit_model_api_probe_trace(
     )
 
 
+def _probe_observation(callback, *args, **kwargs):
+    """Observation failures must not alter validation or repeat a provider call."""
+    try:
+        return callback(*args, **kwargs)
+    except Exception:
+        # No exception message: observer failures can themselves contain secrets.
+        print("[model_api_probe] observation_failed")
+        return None
+
+
+def _route_probe_context(route_id) -> dict:
+    from asgi.context import current_request_id
+
+    try:
+        safe_route = str(uuid.UUID(str(route_id)))
+    except (ValueError, TypeError, AttributeError):
+        safe_route = None
+    request_id = current_request_id.get()
+    return {
+        "route_id": safe_route,
+        "request_id": request_id if re.fullmatch(r"req_[0-9a-f]{8}", request_id or "") else None,
+    }
+
+
+def _probe_exception_type(exc: BaseException) -> str:
+    cause = exc.__cause__
+    for kind in (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout,
+                 httpx.PoolTimeout, httpx.ConnectError, httpx.ReadError):
+        if isinstance(cause, kind):
+            return kind.__name__
+    return "ProviderError" if isinstance(exc, provider_client.ProviderError) else "unknown"
+
+
 def _test_provider_key_observed(
     store,
     config: provider_client.ProviderConfig,
     *,
     operation: str,
     probe_trace_id: str | None = None,
+    route_context: dict | None = None,
 ) -> dict:
     """Run one paid provider probe with gated trace plus an always-on ledger row."""
     trace_id = probe_trace_id or _model_api_probe_trace_id()
+    if route_context is not None:
+        # These identifiers are generated/validated locally, never taken from a header/body.
+        trace_id += f":{route_context['route_id'] or 'unknown'}:{route_context['request_id'] or 'unknown'}"
+    observed_model = ("sha256:" + hashlib.sha256(config.model.encode()).hexdigest()
+                      if route_context is not None else config.model)
     started = time.monotonic()
-    _emit_model_api_probe_trace(
+    _probe_observation(_emit_model_api_probe_trace,
         store,
         probe_trace_id=trace_id,
         operation=operation,
         provider=config.provider,
-        model=config.model,
+        model=observed_model,
         phase="started",
+        route_context=route_context,
     )
     try:
         result = provider_client.test_provider_key(config)
     except provider_client.ProviderError as exc:
         outcome, error_class = _model_api_probe_error(exc)
-        provider_attempt_ledger.record_runtime_attempt(
+        if route_context is not None:
+            error_class = provider_client.classify_provider_error(exc)
+            outcome = error_class
+        _probe_observation(provider_attempt_ledger.record_runtime_attempt,
             store.user_id,
             parent_key=trace_id,
             trigger=_MODEL_API_PROBE_TRIGGER,
             outcome=outcome,
             provider=config.provider,
-            model=config.model,
+            model=observed_model,
             lane=operation,
             runtime="hosted_setup",
             error_class=error_class,
+            status_code=exc.status_code,
+            dur_ms=(time.monotonic() - started) * 1000.0,
         )
-        _emit_model_api_probe_trace(
+        _probe_observation(_emit_model_api_probe_trace,
             store,
             probe_trace_id=trace_id,
             operation=operation,
             provider=config.provider,
-            model=config.model,
+            model=observed_model,
             phase="finished",
+            route_context=route_context,
+            exception_type=_probe_exception_type(exc),
             status="error",
             outcome_class="operational_failure",
             error_class=error_class,
@@ -202,29 +261,31 @@ def _test_provider_key_observed(
         raise
 
     usage = _model_api_probe_usage(result)
-    provider_attempt_ledger.record_runtime_attempt(
+    _probe_observation(provider_attempt_ledger.record_runtime_attempt,
         store.user_id,
         parent_key=trace_id,
         trigger=_MODEL_API_PROBE_TRIGGER,
         outcome="ok",
         provider=config.provider,
-        model=config.model,
+        model=observed_model,
         lane=operation,
         runtime="hosted_setup",
         input_tokens=usage["input_tokens"],
         output_tokens=usage["output_tokens"],
         total_tokens=usage["total_tokens"],
+        dur_ms=(time.monotonic() - started) * 1000.0,
         provider_request_id=(
-            str(result.get("raw_id") or "") if isinstance(result, dict) else ""
+            str(result.get("raw_id") or "") if route_context is None and isinstance(result, dict) else ""
         ),
     )
-    _emit_model_api_probe_trace(
+    _probe_observation(_emit_model_api_probe_trace,
         store,
         probe_trace_id=trace_id,
         operation=operation,
         provider=config.provider,
-        model=config.model,
+        model=observed_model,
         phase="finished",
+        route_context=route_context,
         usage=usage,
         dur_ms=(time.monotonic() - started) * 1000.0,
     )
@@ -2275,7 +2336,7 @@ def memory_capture_jobs(store, limit_raw) -> tuple[dict, int]:
 # saved keys and several routes at once.
 
 
-def _test_route_or_error(store, route: dict, caller_api_key: str | None):
+def _test_route_or_error(store, route: dict, caller_api_key: str | None, *, operation: str = "route_test"):
     """对一条 route 跑真实测活。成功回写 test_status='ok' 并返回 None；
     失败回写 'failed' 并返回 (error_body, status)。"""
     envelope = route.get("api_key_envelope")
@@ -2307,18 +2368,14 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
         )
         return frontier_error
     try:
-        provider_client.test_provider_key(provider_client.ProviderConfig(
+        _test_provider_key_observed(store, provider_client.ProviderConfig(
             route["provider"],
             route["model"],
             provider_key,
             route["base_url"],
             context_window_tokens=context_window_tokens,
-        ))
+        ), operation=operation, route_context=_route_probe_context(route["id"]))
     except provider_client.ProviderError as e:
-        print(
-            f"[model_api:{store.user_id}] route test FAILED provider={route['provider']} "
-            f"model={route['model']} status_code={e.status_code} detail={str(e)[:160]}"
-        )
         return _record_provider_test_failure(store, e, route_id=route["id"]), 400
     # Must check: model_api_route_activate() treats a None return here as "test
     # passed" and immediately flips is_active=True. If this write silently fails,
@@ -2561,7 +2618,7 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
     if not route:
         return {"error": "route_not_found"}, 404
 
-    err = _test_route_or_error(store, route, caller_api_key)
+    err = _test_route_or_error(store, route, caller_api_key, operation="route_activate")
     if err is not None:
         return err
 

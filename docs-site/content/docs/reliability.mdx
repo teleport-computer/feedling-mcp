@@ -60,6 +60,18 @@ clearly temporary, use exponential backoff with full jitter. A reasonable client
 starting sequence is approximately 1, 2, 4, 8, then 16 seconds, randomized from
 zero to the current cap. This is client guidance, not a server SLA.
 
+## Model route probe diagnostics
+
+Route activation and explicit route tests retain their validation and rollback
+behavior. When debug tracing is enabled, provider-probe events include the saved
+route ID, the server-generated request ID when available, start/finish state,
+elapsed time, and a closed exception category. The append-only provider-attempt
+ledger links the same probe even when debug tracing is disabled. These diagnostics
+hash the model label and omit credentials, private URLs, and raw request, response,
+or exception text. `http_phase: "unknown"` means the transport phase was not
+measured; a read timeout alone does not establish where the provider stalled.
+Observation failures do not retry the provider or change the validation result.
+
 ## Timeouts and long polling
 
 Both Chat and proactive job polls accept a `timeout` in seconds, default to 30,
@@ -114,7 +126,10 @@ token (for example, `stay_silent`) is treated as `stay_silent` and never deliver
 Heartbeat and manual wakes first make one provider call without `reply` or
 `stay_silent`, so the agent looks at its context before deciding. If it needs no
 lookup, any drafted text stays unpublished and carries into one ordinary decision
-round with both choices offered. If it does look something up, the next round is
+round with both choices offered. These private drafts remain assistant messages
+when adaptive context planning rebuilds the next request, count toward its input
+budget, and are not saved in conversation history or promoted to system instructions.
+If it does look something up, the next round is
 that decision round and carries the same instruction to end the wake with `reply`
 or `stay_silent`; it can still look further. When this decision round has no draft
 and is not a forced choice or direct-text correction, it also reminds the model

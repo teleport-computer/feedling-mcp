@@ -97,6 +97,7 @@ EXPECTED_CORE_BODY_REFS = {
 }
 
 EXPECTED_HEADER_OPERATIONS = {
+    ("post", "/v1/memory/turn-selection"): {"x-recall-deadline-ms"},
     ("get", "/v1/chat/poll"): {
         "x-feedling-consumer",
         "x-feedling-consumer-id",
@@ -235,8 +236,10 @@ def test_public_operation_and_parameter_inventory(
     # Canvas read operations.
     # Agent body generation adds one API-key-only JSON operation.
     # Retiring legacy-card migration removes one GET and two POST operations.
-    assert len(operations) == 176
-    assert sum("requestBody" in operation for operation in operations.values()) == 83
+    # 177 and 84 bodies since POST /v1/memory/turn-selection (T788, resident
+    # per-turn selection for plaintext accounts; JSON body, one header).
+    assert len(operations) == 177
+    assert sum("requestBody" in operation for operation in operations.values()) == 84
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -301,7 +304,13 @@ def test_every_success_response_has_a_nonempty_media_schema(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
     for key, operation in operations.items():
-        assert "422" not in operation.get("responses", {}), key
+        if key == ("post", "/v1/memory/turn-selection"):
+            response = operation["responses"]["422"]
+            assert response["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ErrorResponse"}
+            assert "message_not_in_window" in response["description"]
+        else:
+            assert "422" not in operation.get("responses", {}), key
         success_responses = [
             (status, response)
             for status, response in operation.get("responses", {}).items()
@@ -711,6 +720,16 @@ def test_error_response_supports_unified_and_mcp_shapes(
         "user_environment",
         "system",
     ]
+
+
+def test_worldbook_list_documents_authoritative_read_and_unavailable(public_schema):
+    responses = public_schema["paths"]["/v1/worldbook/list"]["get"]["responses"]
+    success = responses["200"]["content"]["application/json"]["schema"]
+    assert success["required"] == ["envelopes"]
+    assert success["properties"]["envelopes"]["type"] == "array"
+    failure = responses["503"]["content"]["application/json"]
+    assert failure["schema"] == {"$ref": "#/components/schemas/ErrorResponse"}
+    assert failure["example"] == {"error": "worldbook_read_unavailable"}
 
 
 def test_mcp_probe_and_approval_contract_matches_runtime_limits(

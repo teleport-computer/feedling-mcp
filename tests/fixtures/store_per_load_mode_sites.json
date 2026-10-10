@@ -53,6 +53,11 @@
     },
     {
       "count": 1,
+      "path": "backend/chat/resident_recall_core.py",
+      "reason": "resident plaintext recall reads the page the enclave reads"
+    },
+    {
+      "count": 1,
       "path": "backend/genesis/worker.py",
       "reason": "genesis failure handling uses direct DB/blob helpers"
     },

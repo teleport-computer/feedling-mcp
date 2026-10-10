@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import signal
 import sys
 from pathlib import Path
 
@@ -1573,3 +1574,47 @@ def test_container_env_file_drops_newline_injecting_value(monkeypatch):
     # the poisoned key is dropped, not emitted broken
     lines = dict(ln.split("=", 1) for ln in body.splitlines() if ln)
     assert "ANTHROPIC_API_KEY" not in lines
+
+
+@pytest.mark.parametrize("failure", ["wait", "terminate"])
+def test_process_spawner_retains_handle_when_stop_unconfirmed(failure):
+    class StuckProcess:
+        pid = 123456
+        def poll(self):
+            return None
+        def terminate(self):
+            if failure == "terminate":
+                raise PermissionError("denied")
+        def kill(self):
+            pass
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("synthetic", timeout)
+
+    sp = spawners.ProcessSpawner()
+    proc = StuckProcess()
+    sp.register(proc)
+    with pytest.raises((subprocess.TimeoutExpired, PermissionError)):
+        sp.kill(proc.pid)
+    assert sp._procs[proc.pid] is proc
+    assert sp.is_alive(proc.pid)
+
+
+def test_signal_permission_failure_is_not_process_exit(monkeypatch):
+    def denied(*args):
+        raise PermissionError("denied")
+    monkeypatch.setattr(spawners.os, "kill", denied)
+    assert spawners._signal_alive(123456)
+    with pytest.raises(PermissionError):
+        spawners._signal_kill(123456)
+
+
+def test_signal_kill_requires_exit_after_sigkill(monkeypatch):
+    signals = []
+    monkeypatch.setattr(spawners.os, "kill", lambda pid, sig: signals.append(sig))
+    def not_our_child(*args):
+        raise ChildProcessError()
+    monkeypatch.setattr(spawners.os, "waitpid", not_our_child)
+    monkeypatch.setattr(spawners, "_KILL_GRACE_SEC", 0)
+    with pytest.raises(TimeoutError):
+        spawners._signal_kill(123456)
+    assert signal.SIGKILL in signals

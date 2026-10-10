@@ -10,6 +10,45 @@ Automatic card selection runs in the decrypt service by default; with the
 operator switch `FEEDLING_V2_PLAINTEXT_RECALL` enabled, Runtime V2 selects cards
 for plaintext accounts next to the data using the same selection code. A
 plaintext account's remaining sealed cards are not selected on that path.
+Resident consumers can likewise get plaintext accounts' per-turn cards from the
+backend (`POST /v1/memory/turn-selection`, operator switch
+`FEEDLING_RESIDENT_PLAINTEXT_RECALL`, off by default), selected with the lexical
+ranker on the same history page; encrypted accounts keep the decrypt-service
+path.
+
+The upgraded Resident history reader separately uses only the backend for
+accounts explicitly reporting `content_encryption_effective=off`. Old sealed
+history remains unreadable and is excluded from conversation context and
+Capture input; such a row cannot initiate per-turn selection. History or body
+read failures do not trigger enclave retries. A failed history page remains
+distinct from an empty page so the poll checkpoint can retry. This does not
+change the selection route's compatibility fallbacks described below, or the
+history path for encrypted and unknown accounts.
+
+For this resident route, `off` returns `409 not_served` without contacting the
+decrypt service; `shadow` returns the decrypt service's result and schedules a
+bounded local comparison; `on` serves the local lexical result, with at most
+one backend-owned decrypt-service fallback when budget remains. A consumer
+falls back itself only for `404` (an older backend) or `409`. A timeout, `503`,
+authentication error, or other failure is an unknown result, not an empty pick,
+and the consumer does not issue another decrypt request.
+
+The request body is limited to 1024 bytes, including streamed requests. The
+`X-Recall-Deadline-Ms` budget starts after authentication and covers body reads,
+worker queueing, account-mode checks, and selection/fallback waiting. It defaults
+to 3000 ms, is capped at 4000 ms, and reserves 150 ms for returning the response;
+an exhausted budget is never extended. Authentication, network transit and
+serialization are outside this budget. Timed-out work retains its concurrency
+permit until it actually exits: this bounds outstanding work rather than
+cancelling a running database query or CPU operation. Diagnostics are best
+effort and use bounded background jobs, so they cannot delay a selected result.
+
+Shadow comparison uses the enclave's frozen input fingerprints. An active
+hybrid selection is recorded as a policy difference; a lexical fallback can be
+compared after removing only hybrid-policy fields. If sealed cards were present,
+the comparison uses the enclave's normalized result from the same original
+inputs with those cards excluded. Missing evidence is not counted as agreement.
+
 Keyword search (`memory_search`, and `memory_index` with a query) for a
 plaintext account ranks the account's plaintext cards in the backend with the
 same ranking code the decrypt service uses; its remaining sealed cards are not

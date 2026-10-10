@@ -29,6 +29,88 @@ If the probe fails, the consumer logs an error, reports decrypt health as
 are skipped; later cycles can recover when the source becomes reachable.
 Startup authentication and encryption-module checks still must succeed.
 
+For an effective-off account, startup instead makes one authenticated backend
+history read (`limit=1`, omitted image bodies, 10-second timeout), even without
+an enclave URL. A valid page, including an empty page, reports `backend_ready`;
+HTTP, transport, JSON or page-shape failure reports `backend_unreachable`.
+Failure logs an error and continues polling; it is not a hard startup block.
+Idle checks use the same account-local backend route. These results never read
+or write the runner's shared enclave health file. A whoami mode change clears
+the previous route's health and probe throttle before another poll report.
+Consecutive unreadable claimed messages report `backend_degraded`; only an
+actual successful message read clears that degradation, not a reachability probe.
+
+## Resident plaintext history
+
+Upgraded consumers read history and omitted plaintext bodies from the
+authenticated backend when whoami reports `content_encryption_effective=off`,
+including when `FEEDLING_ENCLAVE_URL` is unset. Backend history failures keep the
+poll checkpoint for retry; a successful empty page can advance it. An unavailable
+individual body stays unreadable without blocking other rows. Old sealed rows
+are not decrypted: their identifiers and sequence metadata remain for cursor
+progress, but they cannot supply conversation context, Capture text, or a
+per-turn memory-selection anchor. Encrypted and unknown accounts keep their
+existing decrypt-service paths.
+
+This history policy is independent of the memory-selection switch below.
+Startup and health probes follow the account mode described above; other
+Resident operations, including the separate memory-selection fallback, may
+still depend on the enclave. Plaintext history and attachments are visible to
+the authenticated backend and resident host; neither an ordinary VPS nor this
+routing change adds a hardware confidentiality boundary.
+
+## Resident plaintext memory selection
+
+An upgraded consumer uses `POST /v1/memory/turn-selection` only when whoami
+explicitly reports plaintext content encryption. The backend operator can set
+`FEEDLING_RESIDENT_PLAINTEXT_RECALL=off|shadow|on` (default `off`; redeploy to
+change it). Encrypted and unknown accounts retain their existing decrypt-service
+path. This switch is independent of Runtime V2 recall and does not install an
+embedding model or enable vector preparation.
+
+The repository's test deployment accepts the GitHub repository variable
+`TEST_FEEDLING_RESIDENT_PLAINTEXT_RECALL`. Unset or empty means `off`; otherwise
+it must be exactly `off`, `shadow`, or `on` (lowercase, without surrounding
+whitespace). The test deployment rejects other values before calling the
+deployment command. The value is passed only to the test backend through the
+normal compose deployment. Changing the variable alone does not update running
+workers: redeploy, then verify the existing workers' mode and the Hosted or
+self-hosted consumer version separately. Production and pre deployment wiring
+are unchanged.
+
+Start with `shadow` to observe comparisons, then enable `on` after the relevant
+checks pass. Shadow still returns the decrypt-service result; a missing
+background comparison is unmeasured, and a comparable result is not necessarily
+an equal result. Verify the actual backend response and memory injected by the
+consumer for the same turn before claiming that it used local selection.
+Rollback uses `off` followed by the same normal redeployment and runtime
+verification; it does not require changing account encryption or stored data.
+
+With `on`, the backend reads that account's plaintext history and memory cards
+to select lexical matches. Remaining sealed cards are excluded from local
+selection; a selection page containing sealed history still uses the existing
+decrypt-service fallback. That selection-route behavior is separate from the
+consumer history reader's unreadable-row policy above.
+Protect plaintext access at the backend as well as at the resident process.
+A generic host provides no additional hardware trust boundary through this
+switch. See [the selection and fallback contract](/docs/workflows/memory).
+
+The lexical tokenizer loads its dictionary separately in each backend worker
+on first use; the default-off route does not load it. Measure per-worker memory
+growth and other-request latency before enabling it across a deployment.
+Per worker, account checks and local selections each allow two outstanding jobs,
+enclave calls four, and shadow and response diagnostics one each. A timed-out
+job keeps its permit until it finishes; overload returns an unavailable result
+or skips optional diagnostics rather than queueing unlimited work.
+
+Hosted consumers upgrade through the runner release; independent consumers must
+upgrade on their own machines. Old consumers continue to work through the
+decrypt service. Assess migration over seven days, tracking hosted and
+independent residents separately: every active plaintext resident must have
+new-route records and plaintext resident selection requests at the decrypt
+service must reach zero before claiming the migration complete. Missing
+diagnostics are not evidence of zero traffic.
+
 ## Agent body generation
 
 Upgrade both backend and consumer for `POST /v1/agent-body/generate`. Hosted
@@ -477,9 +559,10 @@ traffic until all enabled capabilities pass:
   Runtime V2 worker heartbeat, or a V1 resident supervisor heartbeat during the
   dual-runtime window) and a test turn produces an encrypted assistant
   response; or the resident consumer polls with fresh
-  `X-Feedling-Decrypt-Status: ok` and
+  `X-Feedling-Decrypt-Status: ok` (enclave path) or `backend_ready`
+  (effective-off backend path), with fresh
   `X-Feedling-Decrypt-Checked-At` headers, passes `POST /v1/chat/verify_loop`,
-  and replies to an ordinary encrypted test turn.
+  and replies to an ordinary test turn in the account's effective content mode.
 - Provider cache telemetry reports the expected route and usage fields. Where
   prompt caching matters operationally, run a two-turn cache-hit canary against
   the exact provider/model; do not infer a live hit from unit tests. The

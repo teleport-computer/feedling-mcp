@@ -13,6 +13,8 @@ a short ``run_db`` hop, then the coroutine parks holding nothing.
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 
 import db
 from fastapi import APIRouter, Depends, Query, Request
@@ -29,6 +31,7 @@ from chat import chat_core
 from chat import consumer as chat_consumer
 from chat import poll_core as chat_poll_core
 from chat import resident_maintenance
+from chat import resident_recall_core
 from chat import service as chat_service
 from runtime.waiters import registry
 
@@ -150,6 +153,50 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
 async def chat_message(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     body, status = await threadpool.run_db(chat_core.write_message, auth.store, payload)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/memory/turn-selection")
+async def resident_turn_selection(request: Request, auth: AuthResult = Depends(require_auth)):
+    """Per-turn card selection for plaintext resident accounts (T788); contract
+    in ``chat.resident_recall_core``. Bound streamed bytes and the total wait,
+    including body reads and the worker queue, after authentication."""
+    deadline = resident_recall_core.deadline_seconds(request.headers.get("x-recall-deadline-ms"))
+    end = time.monotonic() + deadline
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = resident_recall_core.MAX_BODY_BYTES + 1
+    if declared > resident_recall_core.MAX_BODY_BYTES:
+        return JSONResponse({"error": "request_too_large"}, status_code=413)
+    if deadline <= 0:
+        return JSONResponse({"error": "recall_unavailable"}, status_code=503)
+    try:
+        async with asyncio.timeout(deadline):
+            raw = bytearray()
+            async for chunk in request.stream():
+                if len(raw) + len(chunk) > resident_recall_core.MAX_BODY_BYTES:
+                    return JSONResponse({"error": "request_too_large"}, status_code=413)
+                raw.extend(chunk)
+            try:
+                payload = json.loads(raw or b"{}")
+            except ValueError:
+                return JSONResponse({"error": "request_invalid", "detail": "invalid_body"},
+                                    status_code=400)
+            parsed, error = resident_recall_core.parse_request(payload)
+            if parsed is None:
+                return JSONResponse({"error": "request_invalid", "detail": error}, status_code=400)
+
+            def select():
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return {"error": "recall_unavailable"}, 503
+                return resident_recall_core.select_for_turn(auth.store, parsed, remaining)
+
+            body, status = await threadpool.run_db_bounded(
+                select, timeout_seconds=max(0.0, end - time.monotonic()))
+    except TimeoutError:
+        return JSONResponse({"error": "recall_unavailable"}, status_code=503)
     return JSONResponse(body, status_code=status)
 
 

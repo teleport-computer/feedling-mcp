@@ -2333,7 +2333,8 @@ class TurnDeps:
     # {"block": str, "matched_names": [...]}.
     #
     # **Every lane where the companion speaks in its own voice calls it.** chat
-    # passes this turn's user text; wake lanes pass the reminder note (scheduled)
+    # passes a frozen seq boundary for a separate real-chat matching window;
+    # wake lanes pass the reminder note (scheduled)
     # or an empty list (heartbeat / manual_wake / screen_watch) — an empty list
     # is precisely what selects alwaysOn-only. See `_run_wake` for why the
     # signal differs per lane.
@@ -5264,6 +5265,8 @@ def _ledger_tapped_sink(
                             status=(
                                 "warning"
                                 if observation["truncated"]
+                                or observation.get("read_unavailable")
+                                or observation.get("read_partial")
                                 else "ok"
                             ),
                             summary="",
@@ -5430,10 +5433,10 @@ class _AttachmentCaptionProbe:
 def _worldbook_context_observation(provider_request: dict) -> dict | None:
     """Describe only a World Book block that reached a provider request.
 
-    Wake lanes carry eager context as an application-data string. Foreground
-    Chat carries a pull result inside a native ``ToolExchange``. Inspecting the
+    Chat and wake lanes carry direct context as application data; an optional
+    lookup can also carry a native ``ToolExchange``. Inspecting the
     trusted in-memory shape here avoids copying any content into plaintext
-    telemetry; only the carrier length and truncation bit leave this function.
+    telemetry; only carrier length and truncation/read-state flags leave it.
     """
     for message in provider_request.get("messages") or ():
         if isinstance(message, dict):
@@ -5443,11 +5446,17 @@ def _worldbook_context_observation(provider_request: dict) -> dict | None:
             header = context.WORLD_BOOK_CONTEXT_HEADER + "\n"
             if not content.startswith(header):
                 continue
-            return {
+            observation = {
                 "source": "eager_context",
                 "carrier_chars": len(content),
                 "truncated": context.WORLD_BOOK_TRUNCATION_MARKER in content,
             }
+            body = content[len(header):]
+            if body.startswith("[WORLD BOOK CONTEXT UNAVAILABLE:"):
+                observation["read_unavailable"] = True
+            elif body.startswith("[WORLD BOOK CONTEXT PARTIAL:"):
+                observation["read_partial"] = True
+            return observation
         if not isinstance(message, ToolExchange):
             continue
         result_by_id = {str(result.call_id): result for result in message.results}
@@ -6629,7 +6638,10 @@ def _make_build_messages_fn(
                 v2_tool_surface.DEFAULT_COLLAPSE_POLICY
             ),
             system_suffix: str = "",
+            transient_messages: list[dict] | None = None,
         ) -> tuple[list, Any, dict]:
+            # Private round drafts are budgeted in every candidate, but never
+            # folded into user history, the native transcript, or system text.
             rendered_transcript: list = []
             for item in transcript:
                 if isinstance(item, ToolExchange):
@@ -6651,7 +6663,7 @@ def _make_build_messages_fn(
                 messages = _base(
                     selected,
                     worldbook_char_cap=worldbook_char_cap,
-                ) + rendered_transcript
+                ) + rendered_transcript + list(transient_messages or ())
                 messages = v2_tool_loop._with_system_suffix(
                     messages,
                     system_suffix,
@@ -15218,11 +15230,50 @@ async def process_job(
         else:
             summary, tail = "", []
 
-        # Foreground World Book reads are model-visible and pull-only through
-        # worldbook_match. This avoids decrypting and injecting unrelated lore
-        # on every API-key chat/voice turn. The wake lane intentionally keeps
-        # its eager empty-message read above so alwaysOn entries still apply.
+        # World Book is independently rebuilt from authoritative entries and a
+        # frozen real-chat window, never from the compacted/budgeted replay.
+        # The assembly reader excludes screen/tool/summary text from matching.
         worldbook_context = ""
+        if deps.read_worldbook_context is not None:
+            try:
+                async with enclave_sem:
+                    wb = await asyncio.to_thread(
+                        deps.read_worldbook_context,
+                        user_id,
+                        [],
+                        runtime_token=runtime_token,
+                        through_seq=(
+                            int(cursor_seq) if int(cursor_seq or 0) > 0
+                            else await asyncio.to_thread(db.chat_max_seq, user_id)
+                        ),
+                        trace_context={
+                            "trace_id": str(job.get("trace_id") or ""),
+                            "job_id": str(job_id),
+                            "lane": "chat",
+                        },
+                    )
+                if not isinstance(wb, dict) or not isinstance(wb.get("block"), str):
+                    raise ValueError("worldbook_response_invalid")
+                worldbook_context = wb["block"].strip()
+                if wb.get("unavailable_ids") or wb.get("rejected_over_cap"):
+                    # Prioritize the partial-read notice ahead of content;
+                    # budget exhaustion still has an explicit truncation marker.
+                    worldbook_context = (
+                        "[WORLD BOOK CONTEXT PARTIAL: some entries could not be "
+                        "read or exceeded the entry limit.]\n" + worldbook_context
+                    ).strip()
+            except Exception as exc:  # noqa: BLE001 -- explicit degraded context
+                log.warning(
+                    "[v2.worldbook] chat match unavailable user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
+                # Unavailable is different from a successful empty match. No
+                # exception text or entry identifiers enter the prompt/log.
+                worldbook_context = (
+                    "[WORLD BOOK CONTEXT UNAVAILABLE: the current settings "
+                    "could not be read; do not assume the World Book is empty.]"
+                )
 
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
