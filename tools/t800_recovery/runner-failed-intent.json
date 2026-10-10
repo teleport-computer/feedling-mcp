@@ -1,0 +1,15 @@
+{
+  "hash": "0xf7e61e18b94609407ce62846edb44abb36dc0f7f403ec933ac0e04d89862b39a",
+  "chain": 11155111,
+  "contract": "0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F",
+  "compose_hash": "eaa4091cbf5a295abda701cbadc020e0145fbc926bd133437a8d5b71de55d6b2",
+  "source": "08b2629670ab753413bfe804b99b90697bc1c579",
+  "pin": "1962fba419350d5bb33738cda94342df81ccd931",
+  "calldata_sha256": "dc0997a0cd380e00df01971518a69e245115560e73e84ac16407518a33937d34",
+  "nonce": 640,
+  "estimate": 1943685,
+  "fresh_estimate": 1943685,
+  "gas": 2332422,
+  "gas_price": 2000030,
+  "maximum_cost_wei": 4664913972660
+}
