@@ -66,21 +66,22 @@ def live_preflight():
  health=json.loads(raw)
  if health.get('release',{}).get('git_commit')!=SOURCE:raise Stop('live_source_changed')
 
-def recover(rpc,account,expected_nonce,save,sleep=time.sleep,preflight=live_preflight, prepare_only=False, frozen_intent=None):
+def recover(rpc,account,expected_nonce,save,sleep=time.sleep,preflight=live_preflight, prepare_only=False, frozen_intent=None, target=None):
+ compose_hash, calldata, allowed_data = target or (HASH, DATA, ALLOWED)
  if account.address.lower()!=OWNER:raise Stop('signer_mismatch')
  preflight()
  if int(rpc('eth_chainId',[]),16)!=CHAIN:raise Stop('chain_mismatch')
  def gates():
   owner=rpc('eth_call',[{'to':CONTRACT,'data':'0x8da5cb5b'},'latest'])
   if owner.lower()!='0x'+'0'*24+OWNER[2:]:raise Stop('owner_mismatch')
-  allowed=rpc('eth_call',[{'to':CONTRACT,'data':ALLOWED},'latest'])
+  allowed=rpc('eth_call',[{'to':CONTRACT,'data':allowed_data},'latest'])
   if allowed not in ('0x'+'0'*64,'0x'+'0'*63+'1'):raise Stop('allowed_shape')
   return allowed.endswith('1')
  if gates():return {'result':'ALREADY_ALLOWED_NO_SEND','sends':0}
  latest=int(rpc('eth_getTransactionCount',[OWNER,'latest']),16)
  pending=int(rpc('eth_getTransactionCount',[OWNER,'pending']),16)
  if latest!=pending or pending!=expected_nonce:raise Stop('nonce_conflict')
- call={'from':OWNER,'to':CONTRACT,'data':DATA,'value':'0x0','gas':hex(MAX_GAS)}
+ call={'from':OWNER,'to':CONTRACT,'data':calldata,'value':'0x0','gas':hex(MAX_GAS)}
  estimate=int(rpc('eth_estimateGas',[call,'latest']),16);gas=gas_limit(estimate)
  call['gas']=hex(gas)
  if rpc('eth_call',[call,'latest'])!='0x':raise Stop('simulation_shape')
@@ -92,14 +93,15 @@ def recover(rpc,account,expected_nonce,save,sleep=time.sleep,preflight=live_pref
  preflight()
  # Re-read authorization and nonce immediately before signing; no concurrent sender allowed.
  if gates():return {'result':'ALREADY_ALLOWED_NO_SEND','sends':0}
- if int(rpc('eth_getTransactionCount',[OWNER,'pending']),16)!=expected_nonce:raise Stop('nonce_changed')
+ if any(int(rpc('eth_getTransactionCount',[OWNER,tag]),16)!=expected_nonce for tag in ('latest','pending')):raise Stop('nonce_changed')
  # Re-estimate right before signing; changing conditions must not bypass the cap.
  fresh=int(rpc('eth_estimateGas',[call,'latest']),16)
  if gas_limit(fresh)>gas:raise Stop('estimate_increased')
- tx={'chainId':CHAIN,'nonce':expected_nonce,'to':CONTRACT,'data':DATA,'value':0,'gas':gas,'gasPrice':price}
+ if any(int(rpc('eth_getTransactionCount',[OWNER,tag]),16)!=expected_nonce for tag in ('latest','pending')):raise Stop('nonce_changed')
+ tx={'chainId':CHAIN,'nonce':expected_nonce,'to':CONTRACT,'data':calldata,'value':0,'gas':gas,'gasPrice':price}
  signed=account.sign_transaction(tx);txhash='0x'+signed.hash.hex().removeprefix('0x')
  # Persist exact identity before the only send. Never save key/raw signed transaction.
- save('intent',{'hash':txhash,'chain':CHAIN,'contract':CONTRACT,'compose_hash':HASH,'source':SOURCE,'pin':PIN,'calldata_sha256':hashlib.sha256(bytes.fromhex(DATA[2:])).hexdigest(),'nonce':expected_nonce,'estimate':estimate if frozen_intent is None else frozen_intent['estimate'],'fresh_estimate':fresh if frozen_intent is None else frozen_intent['fresh_estimate'],'gas':gas,'gas_price':price,'maximum_cost_wei':gas*price})
+ save('intent',{'hash':txhash,'chain':CHAIN,'contract':CONTRACT,'compose_hash':compose_hash,'source':SOURCE,'pin':PIN,'calldata_sha256':hashlib.sha256(bytes.fromhex(calldata[2:])).hexdigest(),'nonce':expected_nonce,'estimate':estimate if frozen_intent is None else frozen_intent['estimate'],'fresh_estimate':fresh if frozen_intent is None else frozen_intent['fresh_estimate'],'gas':gas,'gas_price':price,'maximum_cost_wei':gas*price})
  if prepare_only:return {'result':'INTENT_ONLY','sends':0,'hash':txhash}
  result=rpc('eth_sendRawTransaction',['0x'+signed.raw_transaction.hex().removeprefix('0x')])
  if result.lower()!=txhash.lower():raise Stop('send_hash_mismatch')

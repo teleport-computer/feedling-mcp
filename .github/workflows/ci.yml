@@ -23,7 +23,7 @@ on:
         description: "T800 only; root authorizes one stage at a time"
         type: choice
         default: plan
-        options: [plan, authorize-main, attestation, canary, runner]
+        options: [plan, authorize-main, attestation, canary, runner, authorize-runner]
       recovery_code_sha:
         description: "Full independently reviewed recovery-code SHA (must equal dispatch ref)"
         type: string
@@ -95,7 +95,7 @@ jobs:
         if: inputs.recovery_stage != 'plan'
         run: npm install -g phala@1.1.19
       - name: Prepare exact main transaction without broadcasting
-        if: inputs.recovery_stage == 'authorize-main'
+        if: inputs.recovery_stage == 'authorize-main' || inputs.recovery_stage == 'authorize-runner'
         env:
           PRIVATE_KEY: ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL: ${{ vars.ETH_SEPOLIA_RPC_URL }}
@@ -103,7 +103,7 @@ jobs:
         run: python tools/t800_recovery/ci.py prepare
       - name: Durably archive intent before any send
         id: intent
-        if: inputs.recovery_stage == 'authorize-main'
+        if: inputs.recovery_stage == 'authorize-main' || inputs.recovery_stage == 'authorize-runner'
         uses: actions/upload-artifact@v4
         with:
           name: t800-intent-${{ github.run_id }}
@@ -111,7 +111,7 @@ jobs:
           if-no-files-found: error
           retention-days: 90
       - name: Single main transaction send
-        if: inputs.recovery_stage == 'authorize-main'
+        if: inputs.recovery_stage == 'authorize-main' || inputs.recovery_stage == 'authorize-runner'
         env:
           T800_INTENT_ARTIFACT_ID: ${{ steps.intent.outputs.artifact-id }}
           PRIVATE_KEY: ${{ secrets.ETH_DEPLOYER_KEY }}
@@ -119,7 +119,7 @@ jobs:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
         run: python tools/t800_recovery/ci.py send
       - name: Existing post-deploy gate or runner stage
-        if: inputs.recovery_stage != 'plan' && inputs.recovery_stage != 'authorize-main'
+        if: inputs.recovery_stage != 'plan' && inputs.recovery_stage != 'authorize-main' && inputs.recovery_stage != 'authorize-runner'
         env:
           ETH_SEPOLIA_RPC_URL: ${{ vars.ETH_SEPOLIA_RPC_URL }}
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}

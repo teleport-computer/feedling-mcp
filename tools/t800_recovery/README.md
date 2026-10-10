@@ -128,3 +128,26 @@ record fixed operation/type, never URLs/queries/headers/body.
 Root must approve the NEW reviewed codeSHA and a new one-time stage decision
 before dispatch. Do not rerun the failed workflow or use its old code ref. This
 revision alone grants no chain-send or deployment permission.
+
+### Runner authorization (separately reviewed after actual deployment)
+
+`authorize-runner` authorizes only runner CVM
+`130fdfc6-5736-4cdc-9d0f-a35af8957cf2`, live hash
+`eaa4091cbf5a295abda701cbadc020e0145fbc926bd133437a8d5b71de55d6b2`.
+It requires exact prior runner run `38078351673`, reviewed code
+`933bae8f8107cb360c80f5b70c1e6be62dcec4b1`, and its matching runner-next artifact.
+The new dispatch itself must use its newly reviewed code SHA. Product source/pin,
+contract and owner remain fixed; metadata URL names `docker-compose.phala.prod.runner.yaml`.
+Main authorization is a prerequisite, never a substitute runner target.
+
+Nonce `640` is fixed, not derived automatically. Nonce639 was independently found
+in transaction `0xe57880da245e178a225fef9c565ea6796e224ced2979e483ae7a3be91463d2cc`
+and matched Rokku CI run38077762030, targeting a different contract/project.
+The shared owner can transact concurrently outside this workflow's lock. Latest
+and pending must both match the frozen nonce, including after final estimation;
+any drift stops without signing/sending or incrementing. A remaining race after
+that check requires root coordination; unknown outcomes are reconciled by hash,
+never retried. The prepare/archive/single-send controls and gas caps are unchanged.
+Live running CVM/hash/image tag and registry digest are checked again before each
+signing phase. Successful hash authorization does not prove Hosted instances or
+runtime health. Root and the independent reviewer own subsequent acceptance.

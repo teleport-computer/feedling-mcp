@@ -1,2 +1,4 @@
 eth-account==0.13.7
 cryptography==46.0.7
+
+PyYAML==6.0.3

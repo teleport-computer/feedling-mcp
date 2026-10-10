@@ -7,6 +7,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import yaml
+from eth_abi import encode
+from eth_utils import keccak
 
 import recover as recovery
 
@@ -20,8 +23,15 @@ RUNNER = '130fdfc6-5736-4cdc-9d0f-a35af8957cf2'
 DIGEST = 'sha256:302a3a02be35f461db2c720ff7f39ede07454cf5777099d3aaf274cc0d578842'
 BASELINE = '2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620'
 ENCLAVE = 'https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network'
-STAGES = ('plan', 'authorize-main', 'attestation', 'canary', 'runner')
-PREVIOUS = {'attestation': 'authorize-main', 'canary': 'attestation', 'runner': 'canary'}
+RUNNER_HASH = 'eaa4091cbf5a295abda701cbadc020e0145fbc926bd133437a8d5b71de55d6b2'
+RUNNER_NONCE = 640  # nonce639 independently reconciled to Rokku CI38077762030.
+RUNNER_PREVIOUS_RUN = '38078351673'
+RUNNER_PREVIOUS_CODE = '933bae8f8107cb360c80f5b70c1e6be62dcec4b1'
+RUNNER_YAML = 'https://github.com/teleport-computer/feedling-mcp/raw/' + recovery.PIN + '/deploy/docker-compose.phala.prod.runner.yaml'
+RUNNER_DATA = '0x' + (keccak(text='addComposeHash(bytes32,string,string)')[:4] + encode(['bytes32','string','string'], [bytes.fromhex(RUNNER_HASH), recovery.PIN, RUNNER_YAML])).hex()
+RUNNER_TARGET = (RUNNER_HASH, RUNNER_DATA, '0x' + keccak(text='isAppAllowed(bytes32)')[:4].hex() + RUNNER_HASH)
+STAGES = ('plan', 'authorize-main', 'attestation', 'canary', 'runner', 'authorize-runner')
+PREVIOUS = {'attestation': 'authorize-main', 'canary': 'attestation', 'runner': 'canary', 'authorize-runner': 'runner'}
 OUT = Path('t800-evidence')
 
 
@@ -142,6 +152,10 @@ def previous(stage, sha):
     run_id = os.environ['T800_PREVIOUS_RUN']
     if not run_id.isdecimal() or int(run_id) >= int(os.environ['GITHUB_RUN_ID']):
         raise recovery.Stop('invalid_prior_run')
+    if stage == 'authorize-runner':
+        if run_id != RUNNER_PREVIOUS_RUN:
+            raise recovery.Stop('runner_prior_run_changed')
+        sha = RUNNER_PREVIOUS_CODE
     run = api('actions/runs/' + run_id)
     if (run['event'] != 'workflow_dispatch' or run['head_sha'] != sha
             or run['run_attempt'] != 1
@@ -160,6 +174,10 @@ def previous(stage, sha):
                 'pin': recovery.PIN, 'result': 'STAGE_COMPLETE'}
     if any(value.get(k) != v for k, v in expected.items()):
         raise recovery.Stop('prior_evidence_mismatch')
+    if stage == 'authorize-runner':
+        frozen = json.loads((dest / 'runner-next.json').read_text())
+        if frozen != {'runner': RUNNER, 'compose_hash': RUNNER_HASH, 'result': 'FREEZE_AND_REVIEW_RUNNER_AUTHORIZATION', 'deployment_acceptance': False}:
+            raise recovery.Stop('runner_prior_hash_changed')
 
 
 def assert_release():
@@ -188,15 +206,36 @@ def archived_intent():
         raise recovery.Stop('intent_artifact_mismatch')
 
 
-def main_transaction(phase):
+def runner_preflight():
+    # Main remains an independently authorized prerequisite, never the runner target.
+    recovery.live_preflight()
+    authorized()
+    value = json.loads(command(['phala', 'cvms', 'get', RUNNER, '-j', '--api-key', os.environ['PHALA_CLOUD_API_KEY']]))
+    if value.get('vm_uuid') != RUNNER or value.get('status') != 'running' or value.get('compose_hash') != RUNNER_HASH:
+        raise recovery.Stop('runner_live_identity_changed')
+    compose = value['compose_file']
+    if isinstance(compose, str):
+        compose = json.loads(compose)
+    services = yaml.safe_load(compose['docker_compose_file'])['services']
+    image = 'ghcr.io/teleport-computer/feedling-agent-runner:08b2629'
+    if set(services) != {'agent-runner'} or services['agent-runner']['image'] != image:
+        raise recovery.Stop('runner_live_image_changed')
+    manifest = command(['docker', 'buildx', 'imagetools', 'inspect', image])
+    if re.findall(r'^Digest:\s+(sha256:[0-9a-f]{64})\s*$', manifest, re.MULTILINE) != [DIGEST]:
+        raise recovery.Stop('runner_image_digest_changed')
+
+
+def main_transaction(phase, *, runner=False):
     def expire(*args):
         raise recovery.Stop('transaction_deadline_reconcile_no_retry')
     signal.signal(signal.SIGALRM, expire)
     signal.alarm(150)
     account = recovery.Account.from_key(os.environ['PRIVATE_KEY'])
     rpc = recovery.RPC(os.environ['ETH_SEPOLIA_RPC_URL'])
+    nonce = RUNNER_NONCE if runner else NONCE
+    options = {'target': RUNNER_TARGET, 'preflight': runner_preflight} if runner else {}
     if phase == 'prepare':
-        value = recovery.recover(rpc, account, NONCE, save, prepare_only=True)
+        value = recovery.recover(rpc, account, nonce, save, prepare_only=True, **options)
         if value['result'] != 'INTENT_ONLY':
             raise recovery.Stop('already_allowed_reconcile_without_send')
         return
@@ -209,7 +248,7 @@ def main_transaction(phase):
                 raise recovery.Stop('intent_changed')
         else:
             save(name, value)
-    result = recovery.recover(rpc, account, NONCE, verify, frozen_intent=frozen)
+    result = recovery.recover(rpc, account, nonce, verify, frozen_intent=frozen, **options)
     if result['result'] != 'HASH_AUTHORIZED_ONLY':
         raise recovery.Stop('authorization_not_this_attempt')
     save('transaction', result)
@@ -325,12 +364,12 @@ def execute(phase):
     OUT.mkdir(exist_ok=True, mode=0o700)
     no_prior_attempt(stage)
     previous(stage, sha)
-    if stage == 'authorize-main':
+    if stage in ('authorize-main', 'authorize-runner'):
         assert_release()
         if phase not in ('prepare', 'send'):
             raise recovery.Stop('invalid_phase')
         try:
-            main_transaction(phase)
+            main_transaction(phase, runner=True) if stage == 'authorize-runner' else main_transaction(phase)
         finally:
             signal.alarm(0)
         if phase == 'prepare':
