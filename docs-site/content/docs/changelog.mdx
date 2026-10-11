@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Wake direct-text correction failures retain the configured model route,
+  current-call duration, and transport retry evidence in operator error traces.
+  Unknown retry evidence stays unknown; calls and failure behavior are unchanged.
+
 - Test runner compose authorization has an explicit, operator-approved recovery
   path for an archived pre-send stop. It preserves the frozen transaction,
   records persistent target claims, and refuses automatic retries or repricing.
