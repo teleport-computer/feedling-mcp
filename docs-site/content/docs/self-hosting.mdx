@@ -695,6 +695,22 @@ health before declaring the deployment complete. An absent naturally occurring
 diagnostic event remains unmeasured; do not generate paid or user-facing work to
 fill that gap.
 
+## Runtime V2 provider call errors
+
+The operator event `agent.model.call.error` retains the configured provider and
+model, including failures during a wake direct-text correction. Its duration is
+elapsed time for the current logical provider call, not the whole wake. Transport
+retry counts are included only when the private attempt envelope records HTTP
+attempts; absent evidence remains unknown, even when the correction allows only
+one attempt. Error categories remain closed and exclude response bodies,
+credentials, endpoints, and unpublished drafts.
+
+These best-effort events preserve available job and trace linkage. An earlier
+`agent.model.call.done` can precede a correction failure; it does not mean the
+job completed. Analyses that join only completed model calls cannot attribute
+all failures. This metadata change does not add calls, retries, or fallbacks,
+and does not backfill historical traces.
+
 ## Runtime V2 exception observations
 
 The operator trace event `v2.failure.observed` records exceptions caught by chat,
