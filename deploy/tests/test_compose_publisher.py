@@ -606,3 +606,70 @@ def test_only_test_main_runner_configure_expanded_gas_cap():
         for name in ["deploy-test-cvm", "deploy-test-runner-cvm"]
         for phase in ["prepare", "send"]
     )
+
+
+@pytest.mark.parametrize("drift", ["gas", "fee", "both"])
+def test_archived_intent_drift_records_exact_pre_send_comparison(tmp_path, drift):
+    run(Fake(), tmp_path, phase="prepare")
+    original = (tmp_path / "intent.json").read_bytes()
+    frozen = json.loads(original)
+    archived_bytes = bytes(original)
+    f = Fake()
+    base = f.__call__
+    estimate = frozen["estimate"] + (1 if drift in {"gas", "both"} else 0)
+    price = 1500001 if drift in {"fee", "both"} else 1000000
+
+    def changed(method, args):
+        if method == "eth_estimateGas":
+            return hex(estimate)
+        if method == "eth_gasPrice":
+            return hex(price)
+        return base(method, args)
+
+    archives_checked = []
+
+    def archived():
+        assert (tmp_path / "intent.json").read_bytes() == archived_bytes
+        archives_checked.append(True)
+
+    with pytest.raises(p.Stop, match="^frozen_limits_insufficient$"):
+        run(changed, tmp_path, phase="send", archived=archived)
+    assert archives_checked == [True]
+    assert f.sent == 0
+    assert not (tmp_path / "claim.json").exists()
+    assert not (tmp_path / "broadcast-started.json").exists()
+    assert (tmp_path / "intent.json").read_bytes() == original
+    detail = json.loads((tmp_path / "frozen-limits-check.json").read_text())
+    assert detail == {
+        "result": "STOP",
+        "phase": "send_preflight",
+        "estimate": estimate,
+        "required_gas": p.gas_limit(estimate),
+        "frozen_gas": frozen["gas"],
+        "gas_cap": p.MAX_GAS,
+        "required_gas_price": price * 2,
+        "frozen_gas_price": frozen["gas_price"],
+        "gas_price_cap": p.MAX_PRICE,
+        "gas_sufficient": drift == "fee",
+        "fee_sufficient": drift == "gas",
+        "sends": 0,
+    }
+
+
+def test_drift_diagnostic_io_error_keeps_original_stop(tmp_path, monkeypatch):
+    run(Fake(), tmp_path, phase="prepare")
+    original = (tmp_path / "intent.json").read_bytes()
+    f = Fake()
+    base = f.__call__
+
+    def changed(method, args):
+        return hex(1500001) if method == "eth_gasPrice" else base(method, args)
+
+    def unavailable(*args):
+        raise OSError("offline simulated storage failure")
+
+    monkeypatch.setattr(p.Journal, "write", unavailable)
+    with pytest.raises(p.Stop, match="^frozen_limits_insufficient$"):
+        run(changed, tmp_path, phase="send")
+    assert f.sent == 0
+    assert (tmp_path / "intent.json").read_bytes() == original
