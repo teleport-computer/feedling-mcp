@@ -10,9 +10,78 @@ import subprocess
 import zipfile
 from pathlib import Path
 
-from compose_publisher import Stop
+from compose_publisher import MAX_CONFIGURED_GAS, MAX_PRICE, Stop
 
 REPO = "teleport-computer/feedling-mcp"
+
+
+def verify_frozen_limits_diagnostic(raw, frozen):
+    """Admit only the producer's exact pre-send numeric failure evidence.
+
+    This is supporting evidence, never permission to replace a frozen transaction.
+    Original intent/source checks and all current recovery preflights still apply.
+    """
+    reason = "recovery_invalid_frozen_limits_diagnostic"
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise Stop(reason)
+            result[key] = value
+        return result
+
+    try:
+        detail = json.loads(raw, object_pairs_hook=unique_object)
+    except (ValueError, UnicodeError):
+        raise Stop(reason) from None
+    integers = {
+        "estimate",
+        "required_gas",
+        "frozen_gas",
+        "gas_cap",
+        "required_gas_price",
+        "frozen_gas_price",
+        "gas_price_cap",
+        "sends",
+    }
+    if (
+        not isinstance(detail, dict)
+        or set(detail)
+        != integers | {"result", "phase", "gas_sufficient", "fee_sufficient"}
+        or any(type(detail[key]) is not int for key in integers)
+        or any(
+            type(detail[key]) is not bool
+            for key in ("gas_sufficient", "fee_sufficient")
+        )
+        or detail["result"] != "STOP"
+        or detail["phase"] != "send_preflight"
+        or detail["sends"] != 0
+    ):
+        raise Stop(reason)
+    gas, price = detail["required_gas"], detail["required_gas_price"]
+    if (
+        not 0 < detail["estimate"]
+        or gas != (detail["estimate"] * 120 + 99) // 100
+        or not 0 < gas <= detail["gas_cap"] <= MAX_CONFIGURED_GAS
+        or not 0 < price
+        or price % 2 != 0
+        or (price // 2) * 3 > MAX_PRICE
+        or detail["gas_price_cap"] != MAX_PRICE
+        or detail["frozen_gas"] != frozen["gas"]
+        or detail["frozen_gas_price"] != frozen["gas_price"]
+        or frozen["maximum_cost_wei"]
+        != detail["frozen_gas"] * detail["frozen_gas_price"]
+    ):
+        raise Stop(reason)
+    gas_sufficient = gas <= frozen["gas"] <= detail["gas_cap"]
+    fee_sufficient = price <= frozen["gas_price"] <= MAX_PRICE
+    if (
+        detail["gas_sufficient"] != gas_sufficient
+        or detail["fee_sufficient"] != fee_sufficient
+        or (gas_sufficient and fee_sufficient)
+    ):
+        raise Stop(reason)
 
 
 class GitHubRecovery:
@@ -106,8 +175,11 @@ class GitHubRecovery:
             auth,
             f'compose-publish-{auth["source_run"]}-deploy-test-runner-cvm-1',
         )
-        if set(evidence) != {key + "/intent.json", key + "/failure.json"}:
-            # A claim/broadcast/receipt/result, extra file or incomplete archive cannot pass.
+        required = {key + "/intent.json", key + "/failure.json"}
+        diagnostic = key + "/frozen-limits-check.json"
+        if set(evidence) not in (required, required | {diagnostic}):
+            # Only the qualified diagnostic may accompany the original two files.
+            # Claims, broadcast evidence, unknown entries and incomplete sets fail closed.
             raise Stop("recovery_original_broadcast_or_unknown")
         if evidence[key + "/intent.json"] != intent_raw:
             raise Stop("recovery_original_intent_changed")
@@ -117,6 +189,8 @@ class GitHubRecovery:
             "retry_authorized": False,
         }:
             raise Stop("recovery_original_stop_unqualified")
+        if diagnostic in evidence:
+            verify_frozen_limits_diagnostic(evidence[diagnostic], auth["intent"])
         # One complete original intent history, including expired artifacts.
         from urllib.parse import urlencode
 

@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 
 from model_api_runtime.v2 import serve_worker
 
@@ -16,10 +18,11 @@ def test_genesis_thread_dormant_when_prereqs_missing(monkeypatch):
     assert serve_worker._start_genesis_thread("w1") is None
 
 
-def test_genesis_thread_starts_and_stops(monkeypatch):
+@pytest.mark.parametrize("enclave_url", ["https://enclave", ""])
+def test_genesis_thread_starts_and_stops(monkeypatch, enclave_url):
     monkeypatch.setenv("FEEDLING_GENESIS_WORKER_ENABLED", "1")
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "s3cret")
-    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enclave")
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", enclave_url)
     monkeypatch.setenv("FEEDLING_API_URL", "https://api")
     monkeypatch.setenv("FEEDLING_GENESIS_WORKER_INTERVAL_SEC", "0.01")
 
@@ -27,10 +30,12 @@ def test_genesis_thread_starts_and_stops(monkeypatch):
     beats: list[tuple] = []
     seen = {}
 
+    expected_url = enclave_url
+
     def _fake_run_loop(*, api_url, enclave_url, mint_genesis, interval, stop_event,
                        worker_id="", list_live_workers=None, on_beat=None):
         assert api_url == "https://api"
-        assert enclave_url == "https://enclave"
+        assert enclave_url == expected_url
         seen["worker_id"] = worker_id
         seen["live_callable"] = callable(list_live_workers)
         if on_beat:

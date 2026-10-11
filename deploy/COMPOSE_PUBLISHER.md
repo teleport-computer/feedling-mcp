@@ -81,3 +81,13 @@ Historical failed transaction calldata is public regression data; tests do not
 replay it on a network. No chain writes or paid model calls are part of this
 suite. Live test deployment and on-chain integration require coordinator-owned
 execution after review and cannot be inferred from offline green results.
+
+### Frozen-limit diagnostic archives
+
+The test-runner recovery reader also accepts the publisher's optional
+`frozen-limits-check.json` beside the original `intent.json` and `failure.json`.
+It checks the exact schema and types, zero-send preflight failure, arithmetic,
+frozen limits/cost binding, and gas/fee sufficiency booleans. Original two-file
+archives remain supported. The diagnostic never replaces authorization or
+current preflights, and no other extra file or attempt marker is permitted.
+This does not reprice transactions, raise caps, or release consumed claims.

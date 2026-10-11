@@ -11326,6 +11326,7 @@ def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[
                 UPDATE genesis_import_jobs AS j SET
                     status = 'processing',
                     error = '',
+                    metadata = COALESCE(j.metadata, '{}'::jsonb) - 'managed_worker_execution',
                     output = jsonb_build_object('stage', 'worker_claimed'),
                     worker_claimed_by = %s,
                     worker_claimed_at = now(),
@@ -11353,6 +11354,7 @@ def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[
         placeholders = ", ".join(["(%s, %s)"] * len(out))
         mirror_sql = (
             "UPDATE genesis_import_jobs SET status = 'processing', error = '', "
+            "metadata = COALESCE(metadata, '{}'::jsonb) - 'managed_worker_execution', "
             "output = jsonb_build_object('stage', 'worker_claimed'), "
             "worker_claimed_by = %s, worker_claimed_at = now(), updated_at = now() "
             f"WHERE (user_id, job_id) IN ({placeholders})"
@@ -11405,6 +11407,7 @@ def genesis_reclaim_orphaned_processing_jobs(
             WITH picked AS (
                 SELECT user_id, job_id FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND NOT (COALESCE(metadata, '{{}}'::jsonb) ? 'managed_worker_execution')
                   AND COALESCE(worker_claimed_by, '') <> ''
                   AND NOT (worker_claimed_by = ANY(%s))
                   AND worker_claimed_at < now() - make_interval(secs => %s)
@@ -11524,6 +11527,7 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 SELECT user_id, job_id
                 FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'managed_worker_execution')
                   AND COALESCE(resident_consumer_id, '') = ''
                   AND updated_at < now() - make_interval(secs => %s)
                 ORDER BY updated_at ASC
@@ -11940,6 +11944,7 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
           AND status IN ('created', 'uploading', 'uploaded', 'failed')
+          AND NOT (COALESCE(metadata,'{}'::jsonb) ? 'managed_worker_execution')
         RETURNING *
         """
     )
@@ -11947,6 +11952,8 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
     with get_pool().connection() as conn:
         cur = conn.execute(sql, params)
         result = _genesis_row(cur, cur.fetchone())
+    if result is None:
+        return None
     from tee_shadow import mirror
     mirror.execute(sql, params)
     return result
@@ -11960,6 +11967,7 @@ def genesis_set_job_status(
     error: str = "",
     output: dict | None = None,
     processed_chunks: int | None = None,
+    reject_managed: bool = False,
 ) -> dict | None:
     sql = (
         """
@@ -11975,6 +11983,7 @@ def genesis_set_job_status(
             processed_chunks = COALESCE(%s, processed_chunks),
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
+          AND (NOT %s OR NOT (COALESCE(metadata,'{}'::jsonb) ? 'managed_worker_execution'))
         RETURNING *
         """
     )
@@ -11986,6 +11995,7 @@ def genesis_set_job_status(
         processed_chunks,
         user_id,
         job_id,
+        reject_managed,
     )
     with get_pool().connection() as conn:
         try:
@@ -12001,6 +12011,8 @@ def genesis_set_job_status(
                 raise GenesisRedistillJobActive(redistill["job_id"]) from None
             raise
         result = _genesis_row(cur, cur.fetchone())
+    if result is None:
+        return None
     from tee_shadow import mirror
     mirror.execute(sql, (
         status,
@@ -12010,6 +12022,7 @@ def genesis_set_job_status(
         processed_chunks,
         user_id,
         job_id,
+        reject_managed,
     ))
     return result
 

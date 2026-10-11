@@ -269,6 +269,14 @@ def test_memory_load_strict_propagates_while_legacy_loader_is_explicitly_fail_so
 
 def _db_blob_call_sites(method: str) -> set[tuple[str, str]]:
     sites: set[tuple[str, str]] = set()
+
+    def callees(func):
+        if isinstance(func, ast.IfExp):
+            yield from callees(func.body)
+            yield from callees(func.orelse)
+        else:
+            yield func
+
     for path in _BACKEND.rglob("*.py"):
         if path.name == "db.py":
             continue
@@ -283,18 +291,40 @@ def _db_blob_call_sites(method: str) -> set[tuple[str, str]]:
             visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_Call(self, node):  # noqa: N802 - ast visitor API
-                func = node.func
-                if (
+                if any(
                     isinstance(func, ast.Attribute)
                     and func.attr == method
                     and isinstance(func.value, ast.Name)
                     and func.value.id == "db"
+                    for func in callees(node.func)
                 ):
                     sites.add((str(path.relative_to(_BACKEND)), ".".join(stack)))
                 self.generic_visit(node)
 
         Visitor().visit(ast.parse(path.read_text()))
     return sites
+
+
+def test_blob_write_scanner_counts_conditional_callees_not_references(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_BACKEND", tmp_path)
+    (tmp_path / "writers.py").write_text(
+        "def direct():\n"
+        "    db.set_blob('u', 'kind', {})\n"
+        "def strict_if():\n"
+        "    (db.set_blob if managed else managed.write)('u', 'kind', {})\n"
+        "def strict_else():\n"
+        "    (managed.write if managed else db.set_blob)('u', 'kind', {})\n"
+        "def mixed():\n"
+        "    (managed.write if managed else "
+        "(db.set_blob if strict else db.set_blob_best_effort))('u', 'kind', {})\n"
+        "def references():\n"
+        "    writer = db.set_blob\n"
+        "    other(db.set_blob_best_effort)\n"
+    )
+    assert _db_blob_call_sites("set_blob") == {
+        ("writers.py", name) for name in ("direct", "strict_if", "strict_else", "mixed")
+    }
+    assert _db_blob_call_sites("set_blob_best_effort") == {("writers.py", "mixed")}
 
 
 def test_blob_write_callers_keep_strict_and_best_effort_contracts_explicit():

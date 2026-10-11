@@ -16,6 +16,10 @@ change must not be interpreted as an API guarantee.
   current-call duration, and transport retry evidence in operator error traces.
   Unknown retry evidence stays unknown; calls and failure behavior are unchanged.
 
+- Test runner compose recovery accepts strictly validated frozen-limit diagnostics
+  alongside the original intent and failure archive, while retaining the same
+  transaction, authorization checks, and one-attempt claim.
+
 - Test runner compose authorization has an explicit, operator-approved recovery
   path for an archived pre-send stop. It preserves the frozen transaction,
   records persistent target claims, and refuses automatic retries or repricing.
@@ -60,6 +64,12 @@ change must not be interpreted as an API guarantee.
   truncation markers still apply, and unavailable or partial reads are marked
   explicitly. This restores automatic World Book injection; it
   does not guarantee model adherence or fix every long-conversation failure.
+
+- Enabled managed Genesis workers can process eligible plaintext uploaded/backfill
+  jobs without an enclave URL. Status/list output adds optional
+  `managed_unavailable` diagnostics. Claim-bound output application prevents
+  replay and stale writes; recovery after execution preserves partial effects
+  and fails without automatic retry. No deployment is implied by this entry.
 
 - Resident startup and idle health checks now read authenticated backend history
   for effective-off accounts, including with no enclave URL. The existing health

@@ -7,6 +7,24 @@ canonical_owner: self
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
+## Managed Genesis without an enclave URL
+
+The explicitly enabled Genesis worker in the V2 host can process uploaded or
+backfill jobs without an enclave URL only when effective write policy is off and
+all required inputs are locally readable plaintext. A serializable PostgreSQL
+snapshot binds chunks, authenticated provider credentials, persona, voice,
+identity and the complete relevant Garden. Sealed, foreign, malformed or
+unavailable dependencies leave the job uploaded without provider work.
+
+The worker commits an execution boundary before provider calls, then binds each
+artifact mutation to its private claim on the same database connection. Identity
+uses exact-document compare-and-swap, and Garden mutations reuse the existing
+per-user memory fence. Different artifacts commit separately: a later failure
+can leave earlier writes and usage records intact. Started or applying work is
+never automatically replayed after interruption. This plaintext path does not
+provide an enclave decryption or confidentiality guarantee. Configured-enclave,
+direct plaintext API threads and Resident queues retain their own execution paths.
+
 ## Synchronous agent body generation
 
 `POST /v1/agent-body/generate` returns a validated grid without saving a preset.

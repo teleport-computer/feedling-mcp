@@ -87,10 +87,14 @@ def run_persona_backfill(store, identity_plain: dict | None) -> dict | None:
 
     import base64
     import db
+    import genesis_managed_store
     from core import envelope as core_envelope
     from genesis import service as genesis_service
 
     mhash = material_sha256(material)
+    managed = genesis_managed_store.find_managed_backfill(store.user_id, _SOURCE_KIND, mhash)
+    if managed is not None:
+        return managed
 
     # Idempotency: a non-failed backfill job for this exact material means it's
     # already in-flight/done — skip (lazy trigger fires every tick). Match on
@@ -101,7 +105,12 @@ def run_persona_backfill(store, identity_plain: dict | None) -> dict | None:
         if str(job.get("source_kind") or "") != _SOURCE_KIND:
             continue
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
-        if meta.get("material_sha256") == mhash and str(job.get("status") or "") in _INFLIGHT_OR_DONE:
+        if meta.get("material_sha256") == mhash and (
+            str(job.get("status") or "") in _INFLIGHT_OR_DONE
+            or genesis_managed_store.MARKER in meta
+        ):
+            # The lazy backfill trigger must not replay possibly executed managed
+            # work by manufacturing a new job after terminal failure.
             return job
 
     envelope, err = core_envelope._build_shared_envelope_for_store(store, material.encode("utf-8"))
