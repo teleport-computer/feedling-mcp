@@ -339,11 +339,13 @@ def _build_memory_envelope_for_store(
     inner: dict,
     *,
     item_id: str | None = None,
+    local_only: bool = False,
 ) -> tuple[dict | None, str]:
     return core_envelope._build_shared_envelope_for_store(
         store,
         json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         item_id=item_id,
+        **({"local_only": True} if local_only else {}),
     )
 
 
@@ -448,6 +450,7 @@ def _memory_add_action(
     *,
     api_key: str | None = None,
     runtime_token: str = "",
+    local_only: bool = False,
 ) -> tuple[dict, list[dict], int]:
     if isinstance(action.get("envelope"), dict):
         return _memory_add_envelope_action(
@@ -488,7 +491,7 @@ def _memory_add_action(
     inner = _memory_inner_from_action(
         {**raw, "type": mem_type, "title": title, "description": description},
     )
-    envelope, env_err = _build_memory_envelope_for_store(store, inner)
+    envelope, env_err = _build_memory_envelope_for_store(store, inner, **({"local_only": True} if local_only else {}))
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.add"}, [], 409
     envelope["type"] = mem_type
@@ -640,6 +643,7 @@ def _memory_supersede_action(
     action: dict,
     *,
     runtime_token: str = "",
+    local_only: bool = False,
 ) -> tuple[dict, list[dict], int]:
     if isinstance(action.get("envelope"), dict):
         return _memory_supersede_envelope_action(store, action)
@@ -735,7 +739,7 @@ def _memory_supersede_action(
         raw_for_inner["pulse"] = old_cards[0].get("pulse")
 
     inner = _memory_inner_from_action(raw_for_inner)
-    envelope, env_err = _build_memory_envelope_for_store(store, inner)
+    envelope, env_err = _build_memory_envelope_for_store(store, inner, **({"local_only": True} if local_only else {}))
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.supersede"}, [], 409
     envelope["type"] = mem_type

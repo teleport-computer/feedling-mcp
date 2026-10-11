@@ -61,6 +61,12 @@ change must not be interpreted as an API guarantee.
   explicitly. This restores automatic World Book injection; it
   does not guarantee model adherence or fix every long-conversation failure.
 
+- Enabled managed Genesis workers can process eligible plaintext uploaded/backfill
+  jobs without an enclave URL. Status/list output adds optional
+  `managed_unavailable` diagnostics. Claim-bound output application prevents
+  replay and stale writes; recovery after execution preserves partial effects
+  and fails without automatic retry. No deployment is implied by this entry.
+
 - Resident startup and idle health checks now read authenticated backend history
   for effective-off accounts, including with no enclave URL. The existing health
   header adds `backend_ready`, `backend_unreachable`, and `backend_degraded`;

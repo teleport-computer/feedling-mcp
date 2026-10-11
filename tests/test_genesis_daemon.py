@@ -14,7 +14,7 @@ from genesis import daemon
     ("0", "s", "https://e", False),
     ("false", "s", "https://e", False),
     ("1", "", "https://e", False),
-    ("1", "s", "", False),
+    ("1", "s", "", True),
     ("1", "   ", "https://e", False),
 ])
 def test_should_start(enabled, secret, url, expected):

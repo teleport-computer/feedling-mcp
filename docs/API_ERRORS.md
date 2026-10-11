@@ -308,6 +308,10 @@ debug-trace 的 `detail.upstream` 承载（同样是闭集标签，不是上游�
 | `turn_activity_not_found` | 404 | — | No authenticated V1/V2 user turn belongs to this id | |
 | `invalid_activity_event` | 400 | — | V1 resident activity transition has invalid identifiers or state | |
 | `activity_event_rejected` | 409 | — | V1 event conflicts with runtime ownership or an existing invocation | |
+| `managed_claim_requires_outputs` | 409 | — | Managed job 不接受 finalize；仅当前 worker 可用 capability 提交 outputs | |
+| `managed_claim_rejected` | 409 | — | outputs 的 capability 缺失、过期、伪造或 apply 已开始；不可回退旧写入 | |
+| `managed_dependency_unavailable` | 409 | — | Managed apply 的策略或依赖已变化，停止后续写入 | |
+| `managed_apply_failed` | 500 | — | Managed apply 失败，已有部分写入保留；先读 job 状态，不自动重放 | |
 | `genesis_job_not_found` | 404 | — | plaintext job 状态/chunk 上传路径（同语义、不同 slug 名） | |
 | `ciphertext_sha256_mismatch` | 400 | — | | |
 | `chunk_envelope_required` | 400 | — | genesis 分片上传信封校验族（下 9 行同族，见 genesis/service.py raise 点） | |
