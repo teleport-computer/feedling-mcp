@@ -660,6 +660,13 @@ on Sepolia. It accepts an exact, reviewed authorization document and its SHA-256
 binding the original artifacts and transaction, the execution commit, a unique
 recovery ID, and an expiry no more than one hour after issuance. It only accepts
 the original pre-send `frozen_limits_insufficient` stop with no attempt markers.
+Both the original two-file intent/failure archive and an archive containing its
+optional `frozen-limits-check.json` diagnostic are supported. The diagnostic must
+match the publisher's exact schema, integer and boolean types, pre-send phase,
+zero-send result, frozen gas/fee values, and failed comparison arithmetic. It is
+supporting evidence only: original intent bytes, source authorization, current
+preflight checks, and the persistent claim remain required. Unknown extra files,
+malformed or inconsistent diagnostics, and attempt markers are rejected.
 An already-authorized compose returns without signing or sending. Otherwise,
 recovery keeps the original transaction hash, nonce, gas limit, and fee; drift or
 unknown evidence stops execution. Recovery does not deploy or restart a CVM.
