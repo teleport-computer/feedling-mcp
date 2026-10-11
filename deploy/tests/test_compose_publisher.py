@@ -116,7 +116,7 @@ def run(f, tmp_path, attempt="1", signer=SIGNER, **kwargs):
         journal=p.Journal(tmp_path),
         sleep=lambda _: None,
         run_attempt=attempt,
-        **kwargs
+        **kwargs,
     )
 
 
@@ -537,3 +537,72 @@ def test_make_add_hash_routes_to_safe_publisher_without_key_argument():
     assert r.returncode == 0, r.stderr
     assert "python3 ../deploy/compose_publisher.py" in r.stdout
     assert "DO_NOT_EXPOSE" not in r.stdout and "--broadcast" not in r.stdout
+
+
+class LargeHistory(Fake):
+    """Actual test-contract releaseCount2051 estimate; rejects insufficient bound."""
+
+    def __call__(self, method, args):
+        if method == "eth_estimateGas":
+            if int(args[0]["gas"], 16) < 6108259:
+                raise p.Stop("eth_estimateGas_rpc_-32000")
+            return hex(6108259)
+        return super().__call__(method, args)
+
+
+def test_large_test_history_default_stops_then_reviewed_cap_prepares(tmp_path):
+    with pytest.raises(p.Stop):
+        run(LargeHistory(), tmp_path / "default", phase="prepare")
+    assert not (tmp_path / "default" / "intent.json").exists()
+    rpc = LargeHistory()
+    assert run(rpc, tmp_path / "test", phase="prepare", gas_cap=8_000_000)["sends"] == 0
+    intent = json.loads((tmp_path / "test" / "intent.json").read_text())
+    assert intent["estimate"] == 6108259 and intent["gas"] == 7329911
+    assert run(rpc, tmp_path / "test", phase="send", gas_cap=8_000_000)["sends"] == 1
+    assert rpc.sent == 1
+
+
+@pytest.mark.parametrize("cap", [0, -1, True, 8000001, "8000000"])
+def test_invalid_configured_cap_never_calls_rpc(tmp_path, cap):
+    def no_rpc(*args):
+        raise AssertionError("invalid cap reached RPC")
+
+    with pytest.raises(p.Stop, match="invalid_gas_cap"):
+        run(no_rpc, tmp_path, gas_cap=cap)
+
+
+def test_expanded_cap_still_rejects_estimate_headroom_overflow(tmp_path):
+    rpc = Fake()
+
+    def oversized(method, args):
+        return hex(7_000_000) if method == "eth_estimateGas" else rpc(method, args)
+
+    with pytest.raises(p.Stop, match="gas_cap_exceeded"):
+        run(oversized, tmp_path, gas_cap=8_000_000)
+    assert rpc.sent == 0 and not (tmp_path / "intent.json").exists()
+
+
+def test_send_rejects_frozen_intent_above_reduced_cap(tmp_path):
+    run(LargeHistory(), tmp_path, phase="prepare", gas_cap=8_000_000)
+    with pytest.raises(p.Stop):
+        run(LargeHistory(), tmp_path, phase="send")
+    assert not (tmp_path / "broadcast-started.json").exists()
+
+
+def test_only_test_main_runner_configure_expanded_gas_cap():
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    found = []
+    for name, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            env = step.get("env", {})
+            if "FEEDLING_PUBLISH_MAX_GAS" in env:
+                assert env["FEEDLING_PUBLISH_MAX_GAS"] == 8_000_000
+                assert "vars.TEST_" in env["FEEDLING_APP_AUTH_CONTRACT"]
+                found.append((name, env["FEEDLING_PUBLISH_PHASE"]))
+    assert sorted(found) == sorted(
+        (name, phase)
+        for name in ["deploy-test-cvm", "deploy-test-runner-cvm"]
+        for phase in ["prepare", "send"]
+    )

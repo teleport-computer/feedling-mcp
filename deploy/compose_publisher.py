@@ -19,6 +19,7 @@ from eth_utils import keccak
 
 CHAINS = {"eth_sepolia": 11155111, "base_sepolia": 84532, "base": 8453}
 MAX_GAS = 3_000_000
+MAX_CONFIGURED_GAS = 8_000_000
 MAX_PRICE = 100_000_000  # 0.1 gwei; hard cap, not the default price
 
 
@@ -86,11 +87,11 @@ class Journal:
             os.close(fd)
 
 
-def gas_limit(estimate):
+def gas_limit(estimate, gas_cap=MAX_GAS):
     if type(estimate) is not int or estimate <= 0:
         raise Stop("invalid_gas_estimate")
     gas = (estimate * 120 + 99) // 100
-    if gas > MAX_GAS:
+    if gas > gas_cap:
         raise Stop("gas_cap_exceeded")
     return gas
 
@@ -110,7 +111,10 @@ def publish(
     phase="publish",
     archived=lambda: None,
     prior=lambda: None,
+    gas_cap=MAX_GAS,
 ):
+    if type(gas_cap) is not int or not 0 < gas_cap <= MAX_CONFIGURED_GAS:
+        raise Stop("invalid_gas_cap")
     if (
         chain not in CHAINS
         or not re.fullmatch("0x[0-9a-fA-F]{40}", contract)
@@ -192,16 +196,16 @@ def publish(
         "to": contract,
         "data": data,
         "value": "0x0",
-        "gas": hex(MAX_GAS),
+        "gas": hex(gas_cap),
     }
     estimate = int(rpc("eth_estimateGas", [call, "latest"]), 16)
-    gas = gas_limit(estimate)
+    gas = gas_limit(estimate, gas_cap)
     price = int(rpc("eth_gasPrice", []), 16) * 3  # bounded fixed headroom; no repricing
     if not 0 < price <= MAX_PRICE:
         raise Stop("fee_cap_exceeded")
     if frozen is not None:
         if (
-            not gas <= frozen["gas"] <= MAX_GAS
+            not gas <= frozen["gas"] <= gas_cap
             or not (price // 3) * 2 <= frozen["gas_price"] <= MAX_PRICE
         ):
             raise Stop("frozen_limits_insufficient")
@@ -213,7 +217,7 @@ def publish(
         raise Stop("simulation_failed")
     if allowed():
         return {"result": "ALREADY_AUTHORIZED", "sends": 0}
-    if gas_limit(int(rpc("eth_estimateGas", [call, "latest"]), 16)) > gas:
+    if gas_limit(int(rpc("eth_estimateGas", [call, "latest"]), 16), gas_cap) > gas:
         raise Stop("gas_estimate_increased")
     if int(rpc("eth_gasPrice", []), 16) * 2 > price:
         raise Stop("fee_changed_beyond_headroom")
@@ -431,6 +435,7 @@ def main():
             phase=os.environ.get("FEEDLING_PUBLISH_PHASE", "publish"),
             archived=archived_in_ci,
             prior=prior_in_ci,
+            gas_cap=int(os.environ.get("FEEDLING_PUBLISH_MAX_GAS", str(MAX_GAS))),
         )
         if os.environ.get("GITHUB_OUTPUT") and result["result"] == "PREPARED_NOT_SENT":
             key = target_key()
