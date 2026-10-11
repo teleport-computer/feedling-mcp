@@ -85,6 +85,8 @@ DIFFER_INPUTS_BY_IOS_KEY_V2 = {
     "health_metabolic": ("health_metabolic",),
     "health_cycle": ("health_cycle",),
     "health_mood": ("health_mood",),
+    # A deletion is an operation, not a new value for the differ.
+    "health_deleted": (),
 }
 
 WAKE_POLICY_BY_IOS_KEY_V2 = {
@@ -107,6 +109,7 @@ WAKE_POLICY_BY_IOS_KEY_V2 = {
     "health_metabolic": "pull_only_after_decrypt",
     "health_cycle": "pull_only_after_decrypt",
     "health_mood": "pull_only_after_decrypt",
+    "health_deleted": "retraction_only_after_decrypt",
     "unsupported": "ignored",
 }
 
