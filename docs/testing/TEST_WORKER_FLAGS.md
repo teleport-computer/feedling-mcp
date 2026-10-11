@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Test worker process flag observation
 
 This is an operator diagnostic, not a live-test admission or launcher receipt.
