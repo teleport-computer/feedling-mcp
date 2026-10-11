@@ -370,6 +370,33 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "GenesisManagedUnavailable": {
+        "type": "object", "additionalProperties": False,
+        "required": ["reason", "dependency", "checked_at"],
+        "properties": {
+            "reason": {"type": "string", "description": "Content-free reason, such as enclave_required, dependency_unavailable, dependency_invalid, or dependency_changed."},
+            "dependency": {"type": "string", "description": "The unavailable dependency category; never the dependency content or credential."},
+            "checked_at": {"type": "string", "format": "date-time", "description": "Time of the represented eligibility check, not a worker heartbeat."},
+        },
+    },
+    "GenesisPublicJob": {
+        "type": "object", "additionalProperties": True,
+        "properties": {
+            "job_id": {"type": "string"}, "status": {"type": "string"},
+            "metadata": {"type": "object", "description": "Operational metadata. Private worker execution capabilities and witnesses are omitted."},
+            "output": {"type": "object", "additionalProperties": True, "properties": {
+                "managed_unavailable": {"$ref": "#/components/schemas/GenesisManagedUnavailable"},
+            }},
+        },
+    },
+    "GenesisJobResponse": {
+        "type": "object", "additionalProperties": True,
+        "properties": {"job": {"$ref": "#/components/schemas/GenesisPublicJob"}},
+    },
+    "GenesisJobListResponse": {
+        "type": "object", "additionalProperties": True,
+        "properties": {"jobs": {"type": "array", "items": {"$ref": "#/components/schemas/GenesisPublicJob"}}},
+    },
     "ProviderTestFailedResponse": {
         "type": "object",
         "required": ["error", "detail", "status_code", "failure_class"],
@@ -2890,6 +2917,19 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             }},
         },
     },
+    ("get", "/v1/genesis/imports"): {
+        "200": {"description": "Import jobs, including optional managed eligibility diagnostics.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenesisJobListResponse"}}}},
+    },
+    ("get", "/v1/genesis/imports/{job_id}"): {
+        "200": {"description": "Import state. A managed job with unavailable dependencies remains uploaded; execution after provider start is not automatically replayed.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenesisJobResponse"}}}},
+    },
+    ("post", "/v1/genesis/imports/{job_id}/outputs"): {
+        "409": {"description": "Managed jobs require the worker's private current execution capability. Missing, stale or invalid authority, a duplicate in-flight apply, or changed dependencies are rejected without legacy fallback.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+    },
+
     ("post", "/v1/memory/turn-selection"): {
         "200": {
             "description": "Selection and content-free page identity, with the complete selection trace.",
@@ -3400,9 +3440,13 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     },
     ("post", "/v1/genesis/imports/{job_id}/finalize"): {
         "202": {
-            "description": "Upload finalized and awaiting reducer output.",
+            "description": "Upload finalized and awaiting reducer output. A previously managed job rejects finalize with 409; deliberate retry requires a new import job and may incur provider cost again.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        }
+        },
+        "409": {
+            "description": "Missing chunks or managed_claim_requires_outputs: a managed job cannot be finalized or applied inline.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
     ("post", "/v1/genesis/persona_backfill"): {
         "202": {

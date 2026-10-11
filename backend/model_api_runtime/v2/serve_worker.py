@@ -6768,8 +6768,7 @@ def _start_genesis_thread(worker_id: str):
         if enabled:
             log.warning(
                 "[v2.serve_worker] FEEDLING_GENESIS_WORKER_ENABLED set but "
-                "prerequisites missing (need FEEDLING_RUNTIME_TOKEN_SECRET + "
-                "FEEDLING_ENCLAVE_URL) — genesis worker dormant"
+                "runtime-token secret missing — genesis worker dormant"
             )
         return None
 

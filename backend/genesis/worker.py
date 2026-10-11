@@ -482,7 +482,10 @@ def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.Provid
     # base_url/test_status key names the rest of this function already expects.
     # It also carries api_key_envelope (ciphertext) — never touch/log that; the
     # decrypted key arrives separately as provider_key.
-    config = db.model_api_active_route(user_id)
+    return _runtime_from_config(db.model_api_active_route(user_id), provider_key)
+
+
+def _runtime_from_config(config: dict | None, provider_key: str) -> provider_client.ProviderConfig:
     if not isinstance(config, dict):
         raise GenesisWorkerError("model_api_not_configured")
     if config.get("test_status") != "ok":
@@ -1749,12 +1752,12 @@ def derive_identity_from_memory_summary(
             if key in doc}
 
 
-def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
+def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict, *, managed_witness=None) -> dict:
     try:
         resp = httpx.post(
             f"{api_url.rstrip('/')}/v1/genesis/imports/{job_id}/outputs",
             headers=_headers(runtime_token),
-            json={"reducer_output": output},
+            json={"reducer_output": output, **({"managed_execution": managed_witness} if managed_witness is not None else {})},
             timeout=60,
         )
         resp.raise_for_status()
@@ -1774,6 +1777,7 @@ def _garden_reducer_output(
     source_kind: str,
     existing_persona: dict,
     existing_voice: dict,
+    managed=None,
 ) -> tuple[dict, list[dict]]:
     """加密分块导入的记忆卡：memgarden 导入会话（和 plaintext genesis、VPS 同一个引擎）。
 
@@ -1782,7 +1786,7 @@ def _garden_reducer_output(
     人设/语气/身份卡和「写了几张」。身份卡另走 ``foreground_identity`` 推导（只对聊天
     记录 —— 用户档案/长期记忆档案本来就不该推出 TA 的身份）。
 
-    分块 worker 没有持久 checkpoint（一个 job 一口气跑完，崩了由回收整单重跑），进度只在内存。
+    分块 worker 没有持久 checkpoint，进度只在内存。managed 本地路径执行后不自动重跑。
     """
     from genesis import foreground_identity, import_engine
     from hosted import history_import
@@ -1796,21 +1800,27 @@ def _garden_reducer_output(
         messages = [{"role": "user", "content": joined,
                      "source": history_import._HISTORY_SOURCE if family == "history"
                      else f"{family}_import"}]
-    locale = history_import._import_language_for_store(store, messages)
+    locale = (history_import.import_language_with_archive(messages, managed[0].locale)
+              if managed else history_import._import_language_for_store(store, messages))
     state = garden_import.new_state(locale=locale)
     llm = GenesisLLMClient()
     sources = [garden_import.ImportSource(
         key=f"1:{family}", family=family,
         windows=[t for t in chunk_texts if str(t or "").strip()])]
-    known = import_engine.existing_cards(store, None, runtime_token=token, job_id=job_id)
+    known = managed[0].cards if managed else import_engine.existing_cards(store, None, runtime_token=token, job_id=job_id)
     complete = import_engine.llm_complete(llm, user_id=str(store.user_id), job_id=job_id, runtime=runtime)
     # 台账只包写库、outcome 按这次 run 的差值（Seven b0ef0c24 的口径，见 run_with_memory_ledger）。
+    if managed:
+        from genesis import managed_memory
+        writer = managed_memory.store_writer(store, job_id, managed[1])
+    else:
+        writer = import_engine.store_writer(store, None, runtime_token=token)
     result = import_engine.run_with_memory_ledger(
         store, job_id, state,
         lambda write: garden_import.run_import(
             sources=sources, state=state, job_key=job_id, owner_key=str(store.user_id),
             existing_cards=known, complete=complete, write=write, save=lambda _s: None),
-        import_engine.store_writer(store, None, runtime_token=token))
+        writer)
     cards = [{k: v for k, v in c.items() if k not in {"id", "_source_family"}}
              for c in (state.get("written") or [])]
     output = _build_reducer_output(
@@ -1840,7 +1850,7 @@ def _garden_reducer_output(
     return output, cards
 
 
-def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_token: Callable) -> dict:
+def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_token: Callable, managed=None) -> dict:
     started_at = time.time()
     user_id = str(job.get("user_id") or "")
     job_id = str(job.get("job_id") or "")
@@ -1859,28 +1869,38 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
             "total_chunks": int(job.get("total_chunks") or 0),
         },
     )
-    service.write_genesis_state(store, {**job, "status": "processing"}, status="processing")
+    if not managed:
+        service.write_genesis_state(store, {**job, "status": "processing"}, status="processing")
     total_chunks = int(job.get("total_chunks") or 0)
     if total_chunks <= 0:
         raise GenesisWorkerError("empty_import")
-    missing = db.genesis_missing_chunk_seqs(user_id, job_id, total_chunks)
-    if missing:
-        raise GenesisWorkerError(f"missing_chunks:{len(missing)}")
-    chunks = db.genesis_list_chunks(user_id, job_id)
-    if total_chunks and len(chunks) != total_chunks:
-        raise GenesisWorkerError(f"chunk_count_mismatch:{len(chunks)}:{total_chunks}")
+    if managed:
+        from genesis import managed_execution
+        prepared, witness, token = managed
+        runtime, chunk_texts = prepared.runtime, prepared.texts
+        existing_persona, existing_voice = prepared.persona, prepared.voice
+        chunks = chunk_texts
+        started = managed_execution.begin_execution(store, job_id, witness)
+        service.write_genesis_state(store, started, status="processing")
+    else:
+        missing = db.genesis_missing_chunk_seqs(user_id, job_id, total_chunks)
+        if missing:
+            raise GenesisWorkerError(f"missing_chunks:{len(missing)}")
+        chunks = db.genesis_list_chunks(user_id, job_id)
+        if total_chunks and len(chunks) != total_chunks:
+            raise GenesisWorkerError(f"chunk_count_mismatch:{len(chunks)}:{total_chunks}")
 
-    token = _mint(mint_runtime_token, user_id)
-    _trace_genesis(store, "genesis.worker.token.minted", job_id=job_id, summary="runtime token minted")
-    provider_key = _fetch_provider_key(api_url, enclave_url, token, store=store, job_id=job_id)
-    _trace_genesis(store, "genesis.worker.provider_key.loaded", job_id=job_id,
-                   summary="provider key loaded", detail={"has_provider_key": bool(provider_key)})
-    runtime = _runtime_for_user(user_id, provider_key)
-    chunk_texts = _decrypt_chunks(enclave_url, token, chunks, store=store, job_id=job_id)
-    _trace_genesis(store, "genesis.worker.chunks.decrypted", job_id=job_id,
-                   summary="encrypted chunks decrypted", detail={"chunk_count": len(chunk_texts)})
-    existing_persona = _existing_persona_material(user_id, enclave_url, token, store=store, job_id=job_id)
-    existing_voice = _existing_voice_workset(user_id, enclave_url, token, store=store, job_id=job_id)
+        token = _mint(mint_runtime_token, user_id)
+        _trace_genesis(store, "genesis.worker.token.minted", job_id=job_id, summary="runtime token minted")
+        provider_key = _fetch_provider_key(api_url, enclave_url, token, store=store, job_id=job_id)
+        _trace_genesis(store, "genesis.worker.provider_key.loaded", job_id=job_id,
+                       summary="provider key loaded", detail={"has_provider_key": bool(provider_key)})
+        runtime = _runtime_for_user(user_id, provider_key)
+        chunk_texts = _decrypt_chunks(enclave_url, token, chunks, store=store, job_id=job_id)
+        _trace_genesis(store, "genesis.worker.chunks.decrypted", job_id=job_id,
+                       summary="encrypted chunks decrypted", detail={"chunk_count": len(chunk_texts)})
+        existing_persona = _existing_persona_material(user_id, enclave_url, token, store=store, job_id=job_id)
+        existing_voice = _existing_voice_workset(user_id, enclave_url, token, store=store, job_id=job_id)
     reducer_started_at = time.time()
     _trace_genesis(store, "genesis.worker.reducer.started", job_id=job_id,
                    summary="worker reducer started", detail={"chunk_count": len(chunk_texts)})
@@ -1901,7 +1921,8 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         reducer_output, garden_cards = _garden_reducer_output(
             store, job_id, runtime=runtime, token=token, chunk_texts=chunk_texts,
             source_kind=source_kind, existing_persona=existing_persona,
-            existing_voice=existing_voice)
+            existing_voice=existing_voice,
+            **({"managed": (prepared, witness)} if managed else {}))
     profile_source = (
         {**reducer_output, "memories": garden_cards} if garden_cards is not None else reducer_output
     )
@@ -1930,7 +1951,8 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         dur_ms=(time.time() - reducer_started_at) * 1000,
     )
     _trace_genesis(store, "genesis.worker.apply.started", job_id=job_id, summary="worker apply started")
-    applied = _apply_reducer_output(api_url, token, job_id, reducer_output)
+    applied = _apply_reducer_output(api_url, token, job_id, reducer_output,
+                                    **({"managed_witness": witness} if managed else {}))
     _trace_genesis(
         store,
         "genesis.worker.done",
@@ -1981,7 +2003,9 @@ def reap_stale_processing_jobs() -> list[dict]:
     # the rows it actually flipped; we then best-effort sync each one's
     # genesis_state blob. The job is already failed in the DB, so a blob-sync
     # hiccup doesn't un-reap it — it still counts as reaped.
-    for job in db.genesis_reap_stale_processing_jobs(stale_sec, error=error):
+    import genesis_managed_store as managed_store
+    managed_recovered = managed_store.recover(older_than=stale_sec)
+    for job in [*managed_recovered, *db.genesis_reap_stale_processing_jobs(stale_sec, error=error)]:
         user_id = str(job.get("user_id") or "")
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
@@ -1990,7 +2014,7 @@ def reap_stale_processing_jobs() -> list[dict]:
             user_id, reason="genesis reaper uses direct DB/blob helpers"
         )
         try:
-            service.write_genesis_state(store, job, status="failed")
+            service.write_genesis_state(store, job, status=job.get("status") or "failed")
         except Exception as e:  # noqa: BLE001
             print(f"[genesis:reaper] blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
         _trace_genesis(
@@ -2041,9 +2065,13 @@ def reclaim_orphaned_processing_jobs(live_worker_ids: list[str]) -> list[dict]:
         # from a live one, so touch nothing and let the time reaper backstop.
         return []
     changed: list[dict] = []
-    for job in db.genesis_reclaim_orphaned_processing_jobs(
+    import genesis_managed_store as managed_store
+    managed = managed_store.recover(live_workers=live_worker_ids, older_than=_genesis_worker_dead_sec())
+    for item in managed:
+        item["_reclaim_action"] = "requeued" if item["status"] == "uploaded" else "failed"
+    for job in [*managed, *db.genesis_reclaim_orphaned_processing_jobs(
             live_worker_ids, dead_sec=_genesis_worker_dead_sec(),
-            error="genesis_worker_lost"):
+            error="genesis_worker_lost")]:
         user_id = str(job.get("user_id") or "")
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
@@ -2214,6 +2242,9 @@ def tick(
     supervisor/test symmetry; this implementation only reports elapsed time.
     """
     start = time.time() if now is None else float(now())
+    if not str(enclave_url or "").strip():
+        return _managed_tick(api_url=api_url, mint_runtime_token=mint_runtime_token,
+                             worker_id=worker_id, max_jobs=max_jobs)
     jobs = db.genesis_claim_uploaded_jobs(worker_id=worker_id, limit=max_jobs)
     results: list[dict] = []
     failed = 0
@@ -2259,3 +2290,51 @@ def tick(
         "results": results,
         "elapsed_ms": max(0, int((end - start) * 1000)),
     }
+
+
+_MANAGED_SWEEPS = {}
+
+
+def _managed_tick(*, api_url, mint_runtime_token, worker_id, max_jobs):
+    from genesis import managed_eligibility
+    import genesis_managed_store as persistence
+    if not str(worker_id or "").strip():
+        return {"claimed":0,"processed":0,"failed":0,"results":[]}
+    sweep = _MANAGED_SWEEPS.setdefault(worker_id, managed_eligibility.Sweep())
+    results = []
+    for _ in range(max(0,min(int(max_jobs),16))):
+        claimed = sweep.claim(api_url=api_url,worker_id=worker_id,
+                              mint_token=lambda uid:_mint(mint_runtime_token,uid))
+        if claimed is None:
+            break
+        job, prepared, witness, token = claimed
+        uid,jid = job['user_id'],job['job_id']
+        try:
+            results.append(_process_job(job,api_url=api_url,enclave_url='',
+                mint_runtime_token=mint_runtime_token,managed=(prepared,witness,token)))
+        except Exception as exc:
+            # Authenticate readback: a timeout cannot fail an applying request,
+            # and a stale witness must never mutate a successor's status.
+            try:
+                phase, output = persistence.execution_state(uid,jid,witness)
+            except persistence.ClaimRejected:
+                results.append({'user_id':uid,'job_id':jid,'status':'unknown',
+                                'error_type':'ClaimRejected'})
+                continue
+            if phase == 'done':
+                results.append({'user_id':uid,'job_id':jid,'status':'done','applied':output})
+                continue
+            if phase == 'prepared':
+                reason = exc if isinstance(exc,persistence.DependencyUnavailable) else persistence.DependencyUnavailable('execution_admission')
+                changed = persistence.defer_prepared(uid,jid,witness,reason)
+                service.write_genesis_state(get_store_per_load_mode(uid, reason="managed deferral"), changed, status="uploaded")
+                status='uploaded'
+            elif phase == 'execution_started':
+                changed = persistence.fail(uid,jid,witness,'managed_execution_failed:'+type(exc).__name__)
+                service.write_genesis_state(get_store_per_load_mode(uid, reason="managed failure"), changed, status="failed")
+                status='failed'
+            else:
+                status=phase  # applying means unknown, not retry permission
+            results.append({'user_id':uid,'job_id':jid,'status':status,'error_type':type(exc).__name__})
+    return {'claimed':len(results),'processed':sum(r['status']=='done' for r in results),
+            'failed':sum(r['status']=='failed' for r in results),'results':results}

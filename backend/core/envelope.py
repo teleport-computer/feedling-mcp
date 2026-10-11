@@ -430,6 +430,7 @@ def _build_shared_envelope_for_store(
     *,
     item_id: str | None = None,
     content_kind: str = "text",
+    local_only: bool = False,
 ) -> tuple[dict | None, str]:
     if content_kind not in {"text", "binary"}:
         raise ValueError(f"invalid content_kind: {content_kind!r}")
@@ -454,6 +455,10 @@ def _build_shared_envelope_for_store(
             "owner_user_id": store.user_id,
             "visibility": "shared",
         }, ""
+
+    if local_only:
+        from genesis_managed_store import DependencyUnavailable
+        raise DependencyUnavailable("account_policy", "enclave_required")
 
     material = _model_api_key_encryption_material(store)
     if material[0] is None:

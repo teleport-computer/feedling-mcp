@@ -14,6 +14,18 @@ managed confidential-compute environment.
 Read [architecture and trust boundaries](/docs/architecture) first for the
 logical component, data-flow, and encryption model used by this guide.
 
+## Optional managed Genesis plaintext worker
+
+`FEEDLING_GENESIS_WORKER_ENABLED` remains opt-in and requires the runtime-token
+secret. An absent enclave URL selects strict per-job plaintext eligibility for
+managed uploaded/backfill jobs; it does not enable decrypting sealed records.
+The worker needs authenticated backend access to the user's configured provider
+credential and PostgreSQL. Configure these within your chosen host trust boundary:
+local plaintext processing exposes authorized import material to that host and
+the selected provider. See [managed import recovery](/docs/workflows/memory#managed-import-eligibility-and-recovery)
+for partial effects and retry costs. This does not change the Resident consumer
+queue or the direct plaintext import thread.
+
 ## Resident startup during enclave outages
 
 Hosted and self-hosted resident consumers retry the startup decrypt-source probe

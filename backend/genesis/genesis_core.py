@@ -445,7 +445,7 @@ def _public_job(job: dict) -> dict:
     public_metadata = {
         key: value
         for key, value in metadata.items()
-        if not str(key).startswith("plaintext_worker_")
+        if not str(key).startswith(("plaintext_worker_", "managed_worker_"))
     }
     return {**job, "metadata": public_metadata}
 
@@ -607,8 +607,14 @@ def put_chunk(
 def finalize(store, job_id: str, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
     if not _valid_job_id(job_id):
         return _bad("invalid_job_id", 400)
+    import genesis_managed_store as managed_store
+    existing = db.genesis_get_job(store.user_id, job_id)
+    if managed_store.MARKER in ((existing or {}).get("metadata") or {}):
+        return _bad("managed_claim_requires_outputs", 409)
     try:
         job, missing = service.finalize_upload(store, job_id)
+    except managed_store.ClaimRejected:
+        return _bad("managed_claim_requires_outputs", 409)
     except LookupError as e:
         return _bad(str(e), 404)
     if missing:
@@ -624,9 +630,14 @@ def finalize(store, job_id: str, payload: dict, *, api_key: str | None) -> tuple
             applied = service.apply_reducer_output(store, api_key, job_id, reducer_output)
             job = db.genesis_get_job(store.user_id, job_id) or job
             return _job_response(job, extra={"status": "done", "applied": applied}), 200
+        except managed_store.ClaimRejected:
+            return _bad("managed_claim_rejected", 409)
         except ValueError as e:
             return _bad(str(e), 400)
         except Exception as e:  # noqa: BLE001
+            current = db.genesis_get_job(store.user_id, job_id)
+            if managed_store.MARKER in ((current or {}).get("metadata") or {}):
+                return _bad("managed_apply_failed", 500)
             # T16: exc=e lets classify_genesis_error use e.status_code if this
             # ever wraps a ProviderError; string match is the fallback either way.
             failed = service.mark_failed(
@@ -642,6 +653,7 @@ def apply_outputs(
 ) -> tuple[dict, int]:
     if not _valid_job_id(job_id):
         return _bad("invalid_job_id", 400)
+    import genesis_managed_store as managed_store
     reducer_output = payload.get("reducer_output") if isinstance(payload.get("reducer_output"), dict) else payload
     if not isinstance(reducer_output, dict):
         return _bad("reducer_output_required", 400)
@@ -652,12 +664,20 @@ def apply_outputs(
             job_id,
             reducer_output,
             runtime_token=runtime_token,
+            **({"managed_witness": payload["managed_execution"]} if "managed_execution" in payload else {}),
         )
+    except managed_store.ClaimRejected:
+        return _bad("managed_claim_rejected", 409)
+    except managed_store.DependencyUnavailable:
+        return _bad("managed_dependency_unavailable", 409)
     except LookupError as e:
         return _bad(str(e), 404)
     except ValueError as e:
         return _bad(str(e), 400)
     except Exception as e:  # noqa: BLE001
+        current = db.genesis_get_job(store.user_id, job_id)
+        if managed_store.MARKER in ((current or {}).get("metadata") or {}):
+            return _bad("managed_apply_failed", 500)
         import debug_trace
         debug_trace.trace_event(
             store, subsystem="genesis", type="genesis.outputs.applied", actor="backend",

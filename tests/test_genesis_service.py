@@ -469,7 +469,7 @@ def test_apply_reducer_output_can_defer_job_completion(monkeypatch):
         "genesis_get_job",
         lambda *_args: {"job_id": "job_1", "status": "processing"},
     )
-    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id":"job_1","status":"processing"})
     monkeypatch.setattr(service.db, "genesis_upsert_output", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         service.db,

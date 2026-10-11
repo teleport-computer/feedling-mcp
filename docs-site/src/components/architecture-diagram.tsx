@@ -182,6 +182,7 @@ export function ArchitectureDiagram() {
               <Node title="Runtime V2 parent">
                 Runs alongside the backend inside the measured main CVM; coordinates PostgreSQL claims,
                 exact cancellation, per-slot watchdogs, capacity heartbeats, and one four-permit Enclave broker.
+                Its opt-in Genesis loop also admits strictly validated local plaintext imports without an enclave URL.
               </Node>
               <div aria-hidden="true" className="text-center text-lg leading-none text-fd-primary">
                 ↓

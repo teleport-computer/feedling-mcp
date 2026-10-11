@@ -86,6 +86,25 @@ inspecting the screen, and replying remain available. Screen-watch turns
 without a fresh frame, and foreground Chat turns where the user did send a
 message, keep the usual write surface.
 
+## Managed import eligibility and recovery
+
+An enabled managed Genesis worker without an enclave URL may process uploaded
+and persona-backfill jobs using locally readable plaintext and effective-off
+write policy. Required sealed or unavailable inputs keep the job `uploaded`.
+Job status/list output can include `output.managed_unavailable` with `reason`,
+`dependency` and `checked_at`; this describes a real eligibility check, contains
+no material or credentials, and is removed on a successful claim. Private worker
+execution metadata is omitted from API responses.
+
+A job interrupted before execution may be requeued. Once provider or artifact
+work may have begun, recovery records terminal failure instead of automatically
+replaying it. Committed cards, identity and other artifacts, plus available usage
+and attempt records, remain visible after later failure. Output application
+requires the current worker capability; clients cannot bypass it through inline
+finalize. Deliberate retry uses a new import job and may cost again or repeat
+previous effects. A timeout while apply is running is an unknown outcome until
+the job is read back; it is not permission to replay.
+
 ## Hosted profile refresh execution
 
 Runtime V2 generates its bounded Memory/User profile as low-priority Heavy-pool

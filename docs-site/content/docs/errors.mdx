@@ -231,3 +231,16 @@ diagnostics contain request/generation identifiers, status, duration, attempt
 count, provider/model, error class, and (on success) a nonzero count and short grid
 hash. Ordinary resident prompt/reply trace excerpts, raw parse-failure archives,
 and model-call logs are suppressed for the hidden generation scope.
+
+## Managed Genesis output errors
+
+| Error | HTTP | Meaning |
+| --- | --- | --- |
+| `managed_claim_requires_outputs` | 409 | Finalize cannot overwrite a managed job or apply inline output. |
+| `managed_claim_rejected` | 409 | The worker capability is missing, invalid or stale, or application is already in progress. |
+| `managed_dependency_unavailable` | 409 | Required write policy or an artifact dependency changed; no fallback writer is used. |
+| `managed_apply_failed` | 500 | Application failed or its outcome is uncertain. Read the job before taking further action. |
+
+A failure may follow already committed artifacts or provider usage. A timeout
+is not a retry grant. Deliberate retry requires a new import job and may repeat
+effects and incur cost again; see [managed import recovery](/docs/workflows/memory#managed-import-eligibility-and-recovery).
