@@ -79,6 +79,16 @@
     {
       "count": 1,
       "path": "backend/genesis/worker.py",
+      "reason": "managed deferral"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
+      "reason": "managed failure"
+    },
+    {
+      "count": 1,
+      "path": "backend/genesis/worker.py",
       "reason": "resident genesis reaper uses direct DB/blob helpers"
     },
     {
