@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Test runner compose recovery accepts strictly validated frozen-limit diagnostics
+  alongside the original intent and failure archive, while retaining the same
+  transaction, authorization checks, and one-attempt claim.
+
 - Test runner compose authorization has an explicit, operator-approved recovery
   path for an archived pre-send stop. It preserves the frozen transaction,
   records persistent target claims, and refuses automatic retries or repricing.
