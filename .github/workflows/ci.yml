@@ -3143,6 +3143,7 @@ jobs:
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           # Separate test account key (see deploy step above) — reads the live
           # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
@@ -3170,6 +3171,7 @@ jobs:
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           # Separate test account key (see deploy step above) — reads the live
           # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
@@ -3415,6 +3417,7 @@ jobs:
           # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
           # runner hash is harmless there). Override with TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml
@@ -3444,6 +3447,7 @@ jobs:
           # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
           # runner hash is harmless there). Override with TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml

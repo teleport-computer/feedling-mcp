@@ -11,7 +11,12 @@ use Forge broadcast or wrap authorization in a retry loop.
 
 The contract, owner and chain are checked before signing. The publisher simulates
 exact calldata, estimates gas and selects ceil(estimate × 1.20), capped at
-3,000,000 gas. Legacy transaction gas price is 3 × the current RPC quote, capped
+3,000,000 gas by default. The reviewed test main/runner workflow configures
+`FEEDLING_PUBLISH_MAX_GAS=8000000`: its existing authorization contract scans
+2,051 historical releases and the 2026-10-11 failed target estimates 6,108,259
+gas (7,329,911 with headroom). Configuration must be a positive integer no higher
+than the absolute 8,000,000 ceiling; production/pre keep the 3,000,000 default.
+An estimate beyond the configured cap still stops before signing. Legacy transaction gas price is 3 × the current RPC quote, capped
 at 100,000,000 wei. Before signing it repeats estimation, nonce and fee checks;
 the original price must still cover twice the fresh quote. This creates bounded
 fee headroom without replacing or repricing a transaction. Gas and fees may
@@ -53,7 +58,7 @@ Do not rerun a failed authorization or delete its evidence to unblock it. Retain
 the intent and receipt, query that exact transaction hash and receipt, both
 latest/pending signer nonces, and authorization for the exact chain/contract/hash.
 A coordinator must review those observations before authorizing any recovery.
-This ordinary publisher has no reset, replacement, cap override or recovery
+This ordinary publisher has no reset, replacement, unbounded cap override or recovery
 switch. Workflow artifacts retain evidence for 90 days; artifact deletion or
 expiry limits historical duplicate detection. Operators must preserve unresolved
 intents outside expiring CI artifacts before that deadline. Artifact lookup
