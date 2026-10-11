@@ -4092,6 +4092,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Bind matrix target to checked-out prod inventory
+        id: publisher-cvm
+        env:
+          REQUESTED_CVM_ID: ${{ matrix.cvm_id }}
+        run: |
+          IDS=$(deploy/list-prod-runner-cvm-ids.sh deploy/prod-runner-cvm-ids.txt)
+          touch "$GITHUB_OUTPUT"
+          printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
+            [ -n "$CVM_ID" ] || continue
+            [ "$CVM_ID" = "$REQUESTED_CVM_ID" ] || continue
+            echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+          done
+          if ! grep -q '^cvm_id=' "$GITHUB_OUTPUT"; then
+            echo "::error::Matrix CVM is absent from the pinned production inventory"
+            exit 1
+          fi
+
       - name: Install phala CLI
         run: npm install -g phala@1.1.19
 
@@ -4110,7 +4127,7 @@ jobs:
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.FEEDLING_APP_AUTH_CONTRACT }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.prod.runner.yaml
-          FEEDLING_CVM_ID:             ${{ matrix.cvm_id }}
+          FEEDLING_CVM_ID:             ${{ steps.publisher-cvm.outputs.cvm_id }}
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -r deploy/publisher-requirements.txt
@@ -4139,7 +4156,7 @@ jobs:
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.FEEDLING_APP_AUTH_CONTRACT }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.prod.runner.yaml
-          FEEDLING_CVM_ID:             ${{ matrix.cvm_id }}
+          FEEDLING_CVM_ID:             ${{ steps.publisher-cvm.outputs.cvm_id }}
         run: |
           ./deploy/publish-compose-hash.sh eth_sepolia
       - name: Preserve compose publisher evidence

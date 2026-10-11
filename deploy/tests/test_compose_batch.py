@@ -241,3 +241,41 @@ else:print((root/(url.split('/')[-1]+'.json')).read_text())
     assert stopped == (mode != "ok")
     if stopped:
         assert len(prepared) == 1  # no second intent was pre-signed
+
+
+@pytest.mark.parametrize(
+    "requested,accepted",
+    [
+        ("cvm-a", True),
+        ("cvm-b", True),
+        ("cvm", False),
+        ("elsewhere", False),
+        ("", False),
+    ],
+)
+def test_matrix_target_is_selected_from_pinned_inventory(tmp_path, requested, accepted):
+    import shutil
+
+    job = workflow()["publish-prod-runner-compose"]
+    step = next(s for s in job["steps"] if s.get("id") == "publisher-cvm")
+    assert step["env"]["REQUESTED_CVM_ID"] == "${{ matrix.cvm_id }}"
+    for publish in job["steps"]:
+        if publish.get("env", {}).get("FEEDLING_PUBLISH_PHASE"):
+            assert (
+                publish["env"]["FEEDLING_CVM_ID"]
+                == "${{ steps.publisher-cvm.outputs.cvm_id }}"
+            )
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    shutil.copy2(ROOT / "deploy/list-prod-runner-cvm-ids.sh", deploy)
+    (deploy / "prod-runner-cvm-ids.txt").write_text("# pinned\n cvm-a \ncvm-b\ncvm-a\n")
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "REQUESTED_CVM_ID": requested, "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) == accepted, result.stderr
+    assert output.read_text() == ("cvm_id=" + requested + "\n" if accepted else "")
