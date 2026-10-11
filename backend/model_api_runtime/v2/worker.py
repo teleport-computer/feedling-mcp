@@ -114,6 +114,7 @@ from perception.agent_fields import (
 )
 from perceptkit import prompts as perception_prompts
 from screen import screen_read_core
+from model_api_runtime.v2 import failure_provenance
 from model_api_runtime.v2 import wake_circuit
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -6017,6 +6018,18 @@ async def _run_trajectory_review_turn(
         return "failed"
     except Exception as exc:  # noqa: BLE001 — offline lane: bounded retry, no user surface
         code = _safe_failure_code("trajectory_review_failed", exc)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=str(job.get("trace_id") or ""),
+            exc=exc,
+            stage="trajectory_review",
+            lane="trajectory_review",
+            code=code,
+            classify=lambda: _turn_failure_error_class(exc),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         log.warning(
             "[v2.worker] trajectory review runner=%s source=%s failed code=%s",
             job_id,
@@ -9224,6 +9237,18 @@ async def _run_compaction(
         return "failed"
     except Exception as exc:  # noqa: BLE001 — maintenance stays user-invisible
         code = _safe_failure_code("compaction_failed", exc)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id="",
+            exc=exc,
+            stage="compaction",
+            lane="maintenance",
+            code=code,
+            classify=lambda: _turn_failure_error_class(exc),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -11946,6 +11971,18 @@ async def _run_wake(
         return "completed"
     except Exception as e:  # noqa: BLE001 — scheduled failures surface below
         code = _safe_failure_code("wake_failed", e)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=trace_id,
+            exc=e,
+            stage="wake",
+            lane=lane,
+            code=code,
+            classify=lambda: _turn_failure_error_class(e),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -17580,6 +17617,18 @@ async def process_job(
                     ),
                 )
         message = _safe_failure_code("turn_failed", failure_exc)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=str(job.get("trace_id") or ""),
+            exc=e,
+            stage="chat",
+            lane=lane,
+            code=message,
+            classify=lambda: _turn_failure_error_class(failure_exc),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         # A registered exception code (e.g. generated_image_too_large) is the
         # only clue to WHICH check raised; "turn_failed:valueerror" alone cost a
         # day on usr_7f30 (T620). Anything outside the allowlist is dropped —
@@ -18275,6 +18324,18 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
         raise
     except Exception as e:  # noqa: BLE001 — claimed work must always terminalize visibly
         message = _safe_failure_code("turn_setup_failed", e)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=str(job.get("trace_id") or ""),
+            exc=e,
+            stage="setup",
+            lane=lane,
+            code=message,
+            classify=lambda: _turn_failure_error_class(e),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         await _record_trajectory(
             recorder,
             "turn_exception",

@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 worker exception traces preserve content-free exception families,
+  valid provider HTTP status codes, and an explicit cause when available. These
+  best-effort observations do not count terminal failures or change retries.
+
 - Managed test workers expose restricted process flag diagnostics to authenticated
   operators. Missing evidence remains unknown; sampling does not change runtime
   behavior or grant execution permission.
