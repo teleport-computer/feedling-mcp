@@ -1148,6 +1148,18 @@ backend returns HTTP 200 whenever its worker can serve the request. The enclave
 probe reports readiness, release, and TLS posture from cached boot state without
 doing any cryptography. A `degraded` result still returns HTTP 200.
 
+For the fixed managed test fleet only, Runtime V2's existing bounded heartbeat
+sampler also reports allowlisted process diagnostics through the authenticated
+admin metrics route: capture/recall flags from Linux initial process environments,
+release SHA, parent/child PIDs and start ticks, and namespace hostname. It samples
+only the worker and children identified by its supervisors; unavailable or
+inconsistent observations remain unknown. No full environment, command line,
+credential, or user content is published. These observations are not hardware
+attestation, a Docker container identifier, or proof of later environment mutation.
+The manual test collector checks fresh observations against the expected release
+and worker boot identity; a successful read does not authorize model calls or
+change runtime flags. Other fleet inventories do not publish these diagnostics.
+
 `GET /healthz/runner` runs its blocking heartbeat database query on a
 per-backend-worker executor with two worker threads and a four-call outstanding
 admission cap, separate from ordinary ASGI blocking work. Connection acquisition
