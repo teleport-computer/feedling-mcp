@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Managed test workers expose restricted process flag diagnostics to authenticated
+  operators. Missing evidence remains unknown; sampling does not change runtime
+  behavior or grant execution permission.
+
 - Model route activation/test diagnostics now correlate the route and server
   request with probe timing and safe exception categories. Unknown HTTP phases
   remain explicit; this does not change timeouts, validation, or rollback behavior.

@@ -5967,20 +5967,34 @@ def _fleet_memory_snapshot(fleet) -> dict:
     The container's cgroup reading is taken once here and must not be summed
     with anything; per-process RSS and PSS are reported separately (PSS is the
     one that can be summed across processes)."""
+    from model_api_runtime.v2 import process_flags
+
     slots = []
+    flag_sampling = process_flags.enabled()
+    parent_pid = os.getpid()
+    full_sha = os.environ.get("FEEDLING_GIT_COMMIT", "")
     for key in fleet.keys():
         supervisor = fleet.supervisor(key)
         pid_fn = getattr(supervisor, "child_pid", None)
         pid = pid_fn() if callable(pid_fn) else None
-        slots.append({"slot": f"{key.pool}:{key.index}", "pid": pid,
-                      **v2_process_memory.process(pid)})
-    return {
+        slot = {"slot": f"{key.pool}:{key.index}", "pid": pid,
+                **v2_process_memory.process(pid)}
+        if flag_sampling:
+            slot["process_flags"] = process_flags.sample(pid, parent_pid, full_sha)
+        slots.append(slot)
+    result = {
         "sampled_at": round(time.time(), 1),
         "release": str(os.environ.get("FEEDLING_GIT_COMMIT", "dev"))[:12],
         "parent": {"pid": os.getpid(), **v2_process_memory.process(os.getpid())},
         "slots": slots,
         "cgroup_kb": v2_process_memory.cgroup_kb(),
     }
+    if flag_sampling:
+        result["process_flags"] = {
+            **process_flags.context(_CAPTURE_ENABLED),
+            "parent": process_flags.sample(parent_pid, parent_pid, full_sha),
+        }
+    return result
 
 
 # procfs reads (smaps_rollup walks each process's mappings) can be slow; they
