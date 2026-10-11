@@ -624,6 +624,22 @@ operator will respond to a leaked client credential.
   across an incompatible database migration without an explicit plan.
 - Re-run every enabled readiness check after upgrade and restore drills.
 
+## Runtime V2 exception observations
+
+The operator trace event `v2.failure.observed` records exceptions caught by chat,
+wake, turn setup, compaction, and trajectory-review workers. It links the job
+and available trace ID to closed exception-family and error-code categories.
+Only a valid HTTP status from a provider exception and its immediate explicit
+cause are retained; unknown categories stay unknown. Messages, class names,
+tracebacks, URLs, credentials, and provider response bodies are excluded from
+this event. Capture-specific failure handling is outside this event’s scope.
+
+These events follow existing trace controls and best-effort delivery. An event
+can precede a retry or a lost-lease transition, so it is an exception observation,
+not a terminal job outcome. Missing events do not prove success. Use durable
+job outcomes for completion rates; this event neither backfills historical
+failures nor changes public errors, retry policy, or model calls.
+
 ## Minimum security checklist
 
 - Run containers as non-root and keep the Docker socket out of application
