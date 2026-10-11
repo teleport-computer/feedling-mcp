@@ -263,7 +263,7 @@ def test_workflow_consumes_one_pinned_release_without_runner_branch_writes():
         ),
         (
             "deploy-prod-runner-cvm",
-            "notify-lark-prod-deploy",
+            "publish-prod-runner-compose",
             "main",
             "deploy/docker-compose.phala.yaml",
             "deploy/docker-compose.phala.prod.runner.yaml",
