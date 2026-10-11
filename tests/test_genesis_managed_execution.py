@@ -160,17 +160,20 @@ def test_memory_local_lock_precedes_database_checkout(prepared, monkeypatch):
     pool = db.get_pool()
     checkout = threading.Event()
     started = threading.Event()
+    observed_thread = threading.local()
 
     class ObservedPool:
         @contextmanager
         def connection(self):
-            checkout.set()
+            if getattr(observed_thread, "mutation", False):
+                checkout.set()
             with pool.connection() as conn:
                 yield conn
 
     monkeypatch.setattr(db, "get_pool", lambda: ObservedPool())
 
     def mutate():
+        observed_thread.mutation = True
         started.set()
         with execution.mutation_guard(store, "j", witness, memory=True) as (conn, _):
             write_probe(conn, store.user_id)
@@ -179,6 +182,9 @@ def test_memory_local_lock_precedes_database_checkout(prepared, monkeypatch):
         with store.memory_lock:
             task = threads.submit(mutate)
             assert started.wait(2)
+            # Unrelated database work must not look like the blocked mutation.
+            with db.get_pool().connection():
+                pass
             assert not checkout.wait(0.1)
         task.result(timeout=3)
     assert checkout.is_set() and read_probe(store.user_id) == ({"changed": True},)

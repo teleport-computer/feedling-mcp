@@ -724,6 +724,11 @@ jobs:
             tests/test_genesis_checkpoint.py \
             tests/test_genesis_worker.py \
             tests/test_genesis_reclaim_worker.py \
+            tests/test_genesis_managed_admission.py \
+            tests/test_genesis_managed_artifacts.py \
+            tests/test_genesis_managed_execution.py \
+            tests/test_genesis_managed_pipeline.py \
+            tests/test_genesis_managed_profile_races.py \
             -v
 
       - name: Redis retirement and recovery asset guards
