@@ -450,7 +450,16 @@ def test_workflow_runs_daily_against_prod_with_existing_secrets():
     assert triggers["schedule"] == [{"cron": "30 1 * * *"}]
     assert "workflow_dispatch" in triggers
     assert workflow["permissions"] == {"contents": "read"}
-    (job,) = workflow["jobs"].values()
+    assert set(workflow["jobs"]) == {"report", "test-worker-flags"}
+    job = workflow["jobs"]["report"]
+    assert job["if"] == (
+        "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' "
+        "&& inputs.operation != 'test-worker-flags')"
+    )
+    assert workflow["jobs"]["test-worker-flags"]["if"] == (
+        "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' "
+        "&& inputs.operation == 'test-worker-flags'"
+    )
     run_step = next(s for s in job["steps"]
                     if "tools/memory_pipeline_daily_report.py" in str(s.get("run", "")))
     env = run_step["env"]
