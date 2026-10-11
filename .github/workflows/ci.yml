@@ -17,6 +17,15 @@ on:
           - check-test-transport
           - diagnose-test-photo
           - restart-test-cvm
+          - reconcile-test-compose
+      recovery_authorization:
+        description: Exact operator-reviewed recovery authorization JSON
+        required: false
+        type: string
+      recovery_authorization_sha256:
+        description: SHA256 of exact reviewed authorization bytes
+        required: false
+        type: string
 
 # Pull-request validation is replaceable, but branch pushes may already be
 # between the main-CVM and runner-CVM mutations. Never cancel a release unit.
@@ -25,6 +34,53 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  reconcile-test-compose:
+    name: reconcile test compose authorization
+    needs: [compose-publisher-tests]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' && inputs.operation == 'reconcile-test-compose'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    # Same lock as the normal test runner deployment. No cancellation/retry.
+    concurrency:
+      group: deploy-test-runner-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned publisher dependencies
+        run: |
+          python -m pip install -r deploy/publisher-requirements.txt
+          npm install -g phala@1.1.19
+      - name: Reconcile only the approved frozen transaction
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.ETH_DEPLOYER_KEY }}
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          RECOVERY_OPERATION: ${{ inputs.operation }}
+          RECOVERY_HOLD: ${{ vars.TEST_COMPOSE_RECOVERY_HOLD }}
+          RECOVERY_AUTHORIZATION: ${{ inputs.recovery_authorization }}
+          RECOVERY_AUTHORIZATION_SHA256: ${{ inputs.recovery_authorization_sha256 }}
+          RECOVERY_EVIDENCE_DIR: ${{ runner.temp }}/compose-recovery-evidence
+        run: python deploy/reconcile_compose.py
+      - name: Preserve recovery outcome including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-recovery-evidence
+          if-no-files-found: error
+          retention-days: 90
+
   compose-publisher-tests:
     name: compose publisher offline boundaries
     runs-on: ubuntu-24.04
@@ -234,6 +290,7 @@ jobs:
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
   forge-test:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: forge test (contracts)
     runs-on: ubuntu-24.04
     defaults:
@@ -261,6 +318,7 @@ jobs:
   # Python — backend API tests (multi-tenant only; SINGLE_USER mode retired)
   # -------------------------------------------------------------------------
   python-tests:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: test_api.py (multi-tenant)
     runs-on: ubuntu-24.04
     env:
@@ -1230,6 +1288,7 @@ jobs:
           if-no-files-found: ignore
 
   runtime-v2-coverage:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     env:
@@ -1320,7 +1379,7 @@ jobs:
 
   ci-execution-evidence-report:
     name: CI execution evidence (report only)
-    if: always()
+    if: always() && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose')
     continue-on-error: true
     needs: [python-tests, runtime-v2-coverage]
     runs-on: ubuntu-24.04
@@ -1370,6 +1429,7 @@ jobs:
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------
   docker-build:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: docker compose build (hash-verified)
     runs-on: ubuntu-24.04
     steps:
@@ -1410,6 +1470,7 @@ jobs:
   # image intentionally does NOT carry trafilatura and is not checked here.
   # -------------------------------------------------------------------------
   docker-build-worker-deps:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: docker build (serve-worker deps in main image)
     runs-on: ubuntu-24.04
     steps:
@@ -1433,6 +1494,7 @@ jobs:
   # Syntax + quick static checks
   # -------------------------------------------------------------------------
   lint:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: syntax + static
     runs-on: ubuntu-24.04
     steps:
@@ -1633,6 +1695,7 @@ jobs:
   # DCAP parser — Python reference tests
   # -------------------------------------------------------------------------
   dcap-python:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: DCAP parser (python reference)
     runs-on: ubuntu-24.04
     steps:
@@ -2963,6 +3026,11 @@ jobs:
       group: deploy-test-cvm
       cancel-in-progress: false
     steps:
+      - name: Refuse automatic deployment during explicit compose recovery hold
+        if: vars.TEST_COMPOSE_RECOVERY_HOLD == 'true'
+        run: |
+          echo '::error::TEST_COMPOSE_RECOVERY_HOLD is active; no deploy/sign/broadcast permitted by this job'
+          exit 1
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -3250,6 +3318,11 @@ jobs:
       group: deploy-test-runner-cvm
       cancel-in-progress: false
     steps:
+      - name: Refuse automatic deployment during explicit compose recovery hold
+        if: vars.TEST_COMPOSE_RECOVERY_HOLD == 'true'
+        run: |
+          echo '::error::TEST_COMPOSE_RECOVERY_HOLD is active; no deploy/sign/broadcast permitted by this job'
+          exit 1
       # The ordering dependency is intentional: a runner from the new release
       # can require backend interfaces that the old main CVM does not have. Do
       # not deploy across a failed main-CVM release. Still start this job so the

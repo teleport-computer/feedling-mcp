@@ -624,6 +624,58 @@ operator will respond to a leaked client credential.
   across an incompatible database migration without an explicit plan.
 - Re-run every enabled readiness check after upgrade and restore drills.
 
+## Recovering a stopped test compose authorization
+
+A failed compose authorization does not prove that a transaction was never sent.
+The normal publisher refuses automatic retries after a prior intent or an
+ambiguous broadcast. Operators must reconcile the original run, archived intent,
+final journal, transaction and receipt, nonce, live compose hash, and on-chain
+authorization before approving a recovery.
+
+Before merging recovery tooling, an operator must set the repository variable
+`TEST_COMPOSE_RECOVERY_HOLD=true`. The normal test API and runner deployment jobs
+then fail explicitly at their first step, before any mutation; their results
+must not be reported as successful deployment. This avoids a tooling merge
+automatically replacing the frozen recovery target. Only the coordinating
+operator may clear the hold after the recovery decision and deployment review.
+The operator must read back the variable and drain existing running or queued
+deployments before merging: older workflow revisions do not contain this guard.
+HOLD is necessary for this recovery entrypoint but never substitutes for the
+separate explicit authorization.
+
+The CI manual operation `reconcile-test-compose` is restricted to the test runner
+on Sepolia. It accepts an exact, reviewed authorization document and its SHA-256,
+binding the original artifacts and transaction, the execution commit, a unique
+recovery ID, and an expiry no more than one hour after issuance. It only accepts
+the original pre-send `frozen_limits_insufficient` stop with no attempt markers.
+An already-authorized compose returns without signing or sending. Otherwise,
+recovery keeps the original transaction hash, nonce, gas limit, and fee; drift or
+unknown evidence stops execution. Recovery does not deploy or restart a CVM.
+
+The operation shares the normal test runner deployment lock, which does not
+cover all users of the signing account. Recovery therefore refuses any other
+active or queued repository workflow, incomplete workflow history, or a changed
+test branch head, and repeats these checks before signing and broadcasting.
+The coordinating operator must prevent new deployment admissions throughout the
+recovery window, including other branches and external uses of the signing key.
+The read checks are not an atomic lock against an administrator starting a new
+workflow. If exclusive use cannot be assured, stop recovery.
+Before loading the signer, it archives non-secret evidence in GitHub annotated tags and atomically
+creates a claim for the original chain/contract/compose target. This claim is
+shared across directories and recovery IDs and is never automatically removed.
+A claimed or ambiguously sent transaction cannot be retried by this entrypoint.
+Repository administrators must preserve the `compose-recovery-*` evidence and
+claim tags; deleting or rewriting them invalidates the recovery safety evidence.
+The execution token therefore needs repository contents-write and Actions-read
+permissions. Dispatch permission and operator approval remain trust boundaries:
+the document digest verifies exact approved bytes, not the identity of a human
+approver. Private keys and raw signed transactions are never archived.
+
+After authorization, independently verify the actual API and worker release and
+health before declaring the deployment complete. An absent naturally occurring
+diagnostic event remains unmeasured; do not generate paid or user-facing work to
+fill that gap.
+
 ## Runtime V2 exception observations
 
 The operator trace event `v2.failure.observed` records exceptions caught by chat,

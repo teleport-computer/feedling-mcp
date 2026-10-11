@@ -208,6 +208,31 @@ def publish(
             not gas <= frozen["gas"] <= gas_cap
             or not (price // 3) * 2 <= frozen["gas_price"] <= MAX_PRICE
         ):
+            # Preserve the frozen transaction and the exact pre-send comparison.
+            # These bounded numeric diagnostics distinguish gas from fee drift;
+            # a later RPC snapshot cannot reconstruct the failure-time values.
+            try:
+                journal.write(
+                    "frozen-limits-check",
+                    {
+                        "result": "STOP",
+                        "phase": "send_preflight",
+                        "estimate": estimate,
+                        "required_gas": gas,
+                        "frozen_gas": frozen["gas"],
+                        "gas_cap": gas_cap,
+                        "required_gas_price": (price // 3) * 2,
+                        "frozen_gas_price": frozen["gas_price"],
+                        "gas_price_cap": MAX_PRICE,
+                        "gas_sufficient": gas <= frozen["gas"] <= gas_cap,
+                        "fee_sufficient": (price // 3) * 2
+                        <= frozen["gas_price"]
+                        <= MAX_PRICE,
+                        "sends": 0,
+                    },
+                )
+            except OSError:
+                pass  # Diagnostic storage cannot replace the original safe stop.
             raise Stop("frozen_limits_insufficient")
         gas, price = frozen["gas"], frozen["gas_price"]
         if latest != frozen["nonce"]:
