@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Compose authorization publisher
 
 `publish-compose-hash.sh <chain>` and `make -C contracts add-hash` use
