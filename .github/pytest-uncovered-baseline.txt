@@ -52,7 +52,6 @@ tests/test_chat_core_introduction_trigger.py
 tests/test_chat_idempotency_unit.py
 tests/test_chat_notice_fanout.py
 tests/test_chat_poll_claim_cas.py
-tests/test_chat_poll_client_release.py
 tests/test_chat_poll_core.py
 tests/test_chat_poll_cross_worker_staleness.py
 tests/test_chat_poll_redelivery.py

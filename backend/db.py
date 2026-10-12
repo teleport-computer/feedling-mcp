@@ -582,6 +582,12 @@ def _list_supervisor_instance_heartbeats_from_pool(
             "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
             "max_children": r[4], "active_children": r[5],
             "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
+            # Legacy rows without provenance remain unknown. The label is a
+            # runner image declaration, not a measurement of consumer code.
+            "version_source": (
+                "image_env" if r[8] and payload.get("version_source") == "image_env"
+                else "unknown"
+            ),
             "ts": float(r[9]),
             "pi": bool(payload.get("pi")),
         })

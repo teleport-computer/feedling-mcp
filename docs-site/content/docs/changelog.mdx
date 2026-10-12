@@ -16,6 +16,11 @@ change must not be interpreted as an API guarantee.
   backend without requiring an enclave URL. Sealed or unavailable bodies fail
   without decrypt fallback; encrypted and unknown modes keep their existing path.
 
+- Resident version observations now retain each polling identity's declared
+  revision and its source. Unknown and stale reports stay explicit; unpacked
+  consumers no longer borrow an ancestor repository's SHA. Runner image labels
+  and consumer revision declarations do not attest loaded source.
+
 - Managed deployment detection retains pending code after failed or partial
   releases, compares against complete deployment evidence, and includes Resident
   consumer changes in test, pre, and production. Unknown history cannot silently
