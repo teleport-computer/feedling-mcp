@@ -34,17 +34,18 @@ import json, os, subprocess, sys
 from types import SimpleNamespace
 sys.path.insert(0, 'backend')
 git_value = sys.argv[1]
-subprocess.run = lambda *a, **k: SimpleNamespace(returncode=0, stdout=git_value)
+subprocess.run = lambda *a, **k: SimpleNamespace(returncode=0, stdout=os.getcwd() if '--show-toplevel' in a[0] else git_value)
 import tools.chat_resident_consumer as c
 before = c.RUNNING_COMMIT
 os.environ['FEEDLING_GIT_COMMIT'] = 'changed-after-start'
 c._consumer_commit = lambda: 'changed-checkout'
-print(json.dumps([before, c.RUNNING_COMMIT, c._HEADERS['X-Feedling-Consumer-Commit']]))
+print(json.dumps([before, c.RUNNING_COMMIT, c._HEADERS['X-Feedling-Consumer-Commit'], c._HEADERS['X-Feedling-Consumer-Commit-Source']]))
 '''
     result = subprocess.run([sys.executable, "-c", script, git_value], cwd=ROOT,
                             env=env, text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout.splitlines()[-1]) == [expected] * 3
+    source = ('consumer_env' if override is not None else 'image_env' if image is not None else 'git_checkout') if expected else 'unknown'
+    assert json.loads(result.stdout.splitlines()[-1]) == [expected] * 3 + [source]
 
 
 @pytest.mark.parametrize("build,expected", [(BUILD, BUILD), (None, None),
@@ -83,3 +84,41 @@ def test_main_wires_frozen_build_to_heartbeat(monkeypatch, build, expected):
         s.main()
     assert [p["version"] for p in captured] == [expected, expected]
     assert [p["ts"] for p in captured] == [100, 101]
+    assert [p["version_source"] for p in captured] == ["image_env" if expected else "unknown"] * 2
+
+
+def test_archive_does_not_borrow_parent_repository(monkeypatch):
+    import tempfile
+    monkeypatch.setenv('FEEDLING_API_URL', 'http://localhost:5001')
+    monkeypatch.setenv('FEEDLING_API_KEY', 'test_key_00000000')
+    import tools.chat_resident_consumer as c
+    with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+        monkeypatch.setattr(c, '__file__', str(Path(directory) / 'tools/chat_resident_consumer.py'))
+        assert c._consumer_commit() == ''
+
+
+def test_container_environment_does_not_borrow_supervisor_identity(monkeypatch):
+    from agent_runtime import spawners
+    monkeypatch.setenv('FEEDLING_GIT_COMMIT', BUILD)
+    monkeypatch.setenv('FEEDLING_CONSUMER_COMMIT', 'supervisor-override')
+    content = spawners.container_env_file_content({'driver': 'claude'}, user_id='usr_version_test')
+    assert 'FEEDLING_GIT_COMMIT=' not in content
+    assert 'FEEDLING_CONSUMER_COMMIT=' not in content
+
+
+def test_process_spawner_passes_its_own_image_declaration(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from agent_runtime import spawners
+    monkeypatch.setenv('FEEDLING_GIT_COMMIT', BUILD)
+    monkeypatch.delenv('FEEDLING_CONSUMER_COMMIT', raising=False)
+    monkeypatch.setattr(spawners, 'materialize_home', lambda *a, **k: None)
+    monkeypatch.setattr(spawners, '_genesis_persona_content', lambda *a, **k: '')
+    monkeypatch.setattr(spawners, '_web_visible_for_user', lambda *a: False)
+    captured = {}
+    def launch(argv, *, env):
+        captured.update(argv=argv, env=env)
+        return SimpleNamespace(pid=54321)
+    monkeypatch.setattr(spawners.subprocess, 'Popen', launch)
+    assert spawners.ProcessSpawner().spawn({'driver': 'claude'}, 'usr_version_test', str(tmp_path)) == 54321
+    assert captured['env']['FEEDLING_GIT_COMMIT'] == BUILD
+    assert captured['argv'][-1].endswith('tools/chat_resident_consumer.py')

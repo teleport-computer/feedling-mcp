@@ -1559,9 +1559,19 @@ FEEDLING_ENCLAVE_URL = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
 
 def _consumer_commit() -> str:
     try:
+        root = Path(__file__).resolve().parent.parent
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(root),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=2, check=False,
+        )
+        # An unpacked distribution may sit inside an unrelated git checkout.
+        # Never attribute that ancestor repository's revision to this consumer.
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != root:
+            return ""
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(Path(__file__).parent.parent),
+            cwd=str(root),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1573,26 +1583,27 @@ def _consumer_commit() -> str:
         return ""
 
 
-# The commit identity of the CODE THIS PROCESS IS RUNNING, captured once at
-# import. Never re-derive identity from the checkout after startup: an operator
-# — or an agent following a maintenance prompt — can move HEAD underneath a
-# live process (Seven's VPS, 2026-07-22). A live re-read would then report a
-# commit we are not actually running, and worse, let the self-update equality
-# check believe "already on target" and never re-exec into the new code.
-def _startup_commit() -> str:
-    # The runner image ships FEEDLING_GIT_COMMIT and no .git directory. An
-    # explicit consumer override still wins, including an explicit unknown.
-    # Only a checkout with neither variable may derive its startup identity
-    # from git; an unversioned image must not borrow an unrelated checkout SHA.
-    for name in ("FEEDLING_CONSUMER_COMMIT", "FEEDLING_GIT_COMMIT"):
+# Capture the declared distribution/checkout revision once. This is not a
+# measurement of loaded source bytes: env labels can be wrong and a checkout
+# can be dirty. Never re-read a moving checkout to identify a running process.
+def _startup_identity() -> tuple[str, str]:
+    for name, source in (("FEEDLING_CONSUMER_COMMIT", "consumer_env"),
+                         ("FEEDLING_GIT_COMMIT", "image_env")):
         value = os.environ.get(name)
         if value is not None:
             value = value.strip()
-            return "" if value.lower() in ("", "dev", "unknown") else value
-    return _consumer_commit()
+            if value.lower() in ("", "dev", "unknown"):
+                return "", "unknown"
+            return value, source
+    value = _consumer_commit()
+    return value, "git_checkout" if value else "unknown"
 
 
-RUNNING_COMMIT = _startup_commit()
+def _startup_commit() -> str:
+    return _startup_identity()[0]
+
+
+RUNNING_COMMIT, RUNNING_COMMIT_SOURCE = _startup_identity()
 
 # Poll-only compatibility claim: when the updater deliberately skips a backend
 # target because the release changes nothing this consumer loads, it advertises
@@ -1803,6 +1814,7 @@ _HEADERS = {
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
+    "X-Feedling-Consumer-Commit-Source": RUNNING_COMMIT_SOURCE,
     "X-Feedling-Agent-Entry-Signature": _agent_entry_signature(),
 }
 if AGENT_RUNTIME_METADATA["provider"]:

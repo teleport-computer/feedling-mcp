@@ -1304,7 +1304,7 @@ def test_supervisor_instance_payload_shape():
     assert p == {
         "ts": 123.5, "owner": "host:7", "host": "host", "host_all": True,
         "pi": False, "active_children": 3, "max_children": 4,
-        "shard_index": 1, "shard_count": 2, "version": "abc",
+        "shard_index": 1, "shard_count": 2, "version": "abc", "version_source": "unknown",
     }
 
 
