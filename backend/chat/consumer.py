@@ -136,6 +136,27 @@ def _mutate_consumer_state(
     return None
 
 
+def consumer_version_fields(info: dict) -> dict:
+    """Declared revision from this observation, never from another identity.
+
+    Older clients/rows may carry a commit without provenance. Missing labels
+    remain unknown; no backend build or expected-update target is substituted.
+    These self-reports do not attest loaded source.
+    """
+    commit = str(info.get("consumer_commit") or "").strip()
+    if commit.lower() in {"dev", "unknown"}:
+        commit = ""
+    source = str(info.get("consumer_commit_source") or "").strip()
+    if not commit:
+        source = "unknown"
+    elif not source:
+        source = "legacy"
+    elif source not in {"consumer_env", "image_env", "git_checkout", "legacy"}:
+        source = "unknown"
+    return {"consumer_commit": commit, "consumer_commit_source": source,
+            "consumer_version": str(info.get("consumer_version") or "").strip()}
+
+
 def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
     """Framework-neutral: consumer identity from a headers mapping + remote addr.
 
@@ -161,7 +182,6 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
     return {
         "consumer_name": name,
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
-        "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
         "consumer_capabilities": capabilities,
         "agent_provider": (
             headers.get("X-Feedling-Agent-Provider") or ""
@@ -176,7 +196,11 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         "agent_entry_signature": (
             headers.get("X-Feedling-Agent-Entry-Signature") or ""
         ).strip().lower()[:64],
-        "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
+        **consumer_version_fields({
+            "consumer_commit": headers.get("X-Feedling-Consumer-Commit"),
+            "consumer_commit_source": headers.get("X-Feedling-Consumer-Commit-Source"),
+            "consumer_version": headers.get("X-Feedling-Consumer-Version"),
+        }),
         # Poll-only compatibility claim: the running image intentionally
         # skipped an irrelevant target while remaining protocol-compatible.
         # Keep empty values so a later poll clears an obsolete claim.
@@ -274,6 +298,7 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
                 "consumer_id": consumer_id,
                 "consumer_name": consumer_name,
                 "responder": responder,
+                **consumer_version_fields(event_info),
                 "last_poll_at": now_iso,
                 "last_poll_epoch": now_epoch,
             }
@@ -561,7 +586,6 @@ def _consumer_validation_state(
         "official": official,
         "consumer_name": state.get("consumer_name", ""),
         "consumer_id": state.get("consumer_id", ""),
-        "consumer_version": state.get("consumer_version", ""),
         "consumer_capabilities": list(state.get("consumer_capabilities") or []),
         "agent_provider": state.get("agent_provider", ""),
         "agent_model": state.get("agent_model", ""),
@@ -572,7 +596,7 @@ def _consumer_validation_state(
             "agent_input_modalities_source", ""
         ),
         "agent_entry_signature": state.get("agent_entry_signature", ""),
-        "consumer_commit": state.get("consumer_commit", ""),
+        **consumer_version_fields(state),
         "consumer_compat_commit": state.get("consumer_compat_commit", ""),
         "update_stall_reason": state.get("update_stall_reason", ""),
         "last_poll_at": state.get("last_poll_at", ""),

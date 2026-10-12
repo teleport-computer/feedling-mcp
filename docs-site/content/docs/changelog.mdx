@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident version observations now retain each polling identity's declared
+  revision and its source. Unknown and stale reports stay explicit; unpacked
+  consumers no longer borrow an ancestor repository's SHA. Runner image labels
+  and consumer revision declarations do not attest loaded source.
+
 - Wake direct-text correction failures retain the configured model route,
   current-call duration, and transport retry evidence in operator error traces.
   Unknown retry evidence stays unknown; calls and failure behavior are unchanged.

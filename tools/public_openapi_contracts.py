@@ -127,8 +127,15 @@ CONSUMER_HEADERS = [
     _header(
         "X-Feedling-Consumer-Commit",
         _schema("string", maxLength=80),
-        "Resident consumer source revision.",
+        "Consumer-declared startup distribution/checkout revision; not loaded-source attestation.",
         example="a1b2c3d",
+    ),
+    _header(
+        "X-Feedling-Consumer-Commit-Source",
+        _schema("string", enum=["consumer_env", "image_env", "git_checkout", "unknown"]),
+        "Source of the consumer's frozen startup revision declaration. Optional for older clients; "
+        "missing provenance is not inferred from the backend release. None of these values proves loaded code.",
+        example="image_env",
     ),
     _header(
         "X-Feedling-Consumer-Capabilities",

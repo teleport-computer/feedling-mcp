@@ -1287,3 +1287,16 @@ model, performs no vector read and recall output is unchanged. When enabled:
   vector-contract error makes the whole turn use the unchanged lexical path; the
   content-free selection record carries the fallback reason and timings, never
   text or vectors.
+
+
+### Resident revision provenance
+
+Hosted supervisor heartbeats report the runner's declared image revision;
+Resident polls report a separately captured consumer startup revision and its
+source. Per-identity poll observations retain their own version and timestamp,
+including unknown or stale reports. These labels are not loaded-source
+attestations and cannot be replaced by the backend release or by a fresh
+supervisor heartbeat. See [version observations](/docs/self-hosting#resident-version-observations)
+for compatibility and process/container inheritance boundaries. This reporting
+uses the existing heartbeat payload and consumer-state storage; it adds no
+execution path or encryption trust boundary.
