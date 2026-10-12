@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Authenticated memory index requests expose content-free operator timing for
+  worker queue, core execution, and overlapping enclave calls. Missing or
+  unfinished segments remain unknown; request behavior is unchanged.
+
 - V2 model-call start and completion traces retain their job association. An
   offline failure-attribution tool counts distinct failed heartbeat jobs from
   bounded snapshots while preserving missing and conflicting observations.
