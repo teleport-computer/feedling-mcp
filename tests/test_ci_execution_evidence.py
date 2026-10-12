@@ -93,6 +93,33 @@ def test_job_env_does_not_use_runner_context_before_a_runner_exists():
     )
 
 
+
+def test_caption_hop_runs_once_via_consumer_with_execution_evidence_owner():
+    from tools import ci_executed_tests
+
+    root = CI_WORKFLOW.parents[2]
+    target = "tests/test_t534_caption_hop_trace.py"
+    workflow = yaml.safe_load(CI_WORKFLOW.read_text())
+    executing_steps = []
+    for job_name, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            script = step.get("run", "")
+            discovered = ci_executed_tests.executed_in_script(script)
+            discovered |= ci_executed_tests.dynamic_executed_in_script(script, root)
+            if target in discovered:
+                executing_steps.append((job_name, step.get("name")))
+    assert executing_steps == [("python-tests", "Run resident consumer regression suite")]
+
+    configured, owners = evidence.discover_configuration(
+        workflow=CI_WORKFLOW,
+        tests_dir=root / "tests",
+        baseline=root / ".github" / "pytest-uncovered-baseline.txt",
+        producer_mappings={"python-tests": {"python-tests"}},
+    )
+    assert target in configured
+    assert owners[target] == {"python-tests"}
+
+
 def test_comment_only_filename_is_configured_but_unassigned_unknown(tmp_path):
     paths = _fixture_repo(
         tmp_path,
