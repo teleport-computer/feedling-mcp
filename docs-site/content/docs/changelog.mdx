@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `io_cli chat-image` reads plaintext accounts' image bodies from the authenticated
+  backend without requiring an enclave URL. Sealed or unavailable bodies fail
+  without decrypt fallback; encrypted and unknown modes keep their existing path.
+
 - Wake direct-text correction failures retain the configured model route,
   current-call duration, and transport retry evidence in operator error traces.
   Unknown retry evidence stays unknown; calls and failure behavior are unchanged.

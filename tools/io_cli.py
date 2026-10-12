@@ -933,6 +933,64 @@ def cmd_photo_read(args):
     _emit(out)
 
 
+def _plaintext_chat_image(api_url, auth, msg):
+    """Normalize one backend row without decrypting sealed or unavailable bodies."""
+    mid = str(msg.get("id") or "")
+
+    def unavailable():
+        _emit({"ok": False, "message_id": mid,
+               "error_code": "chat_image_body_unavailable",
+               "error": "plaintext chat body is unavailable"}, 1)
+
+    if msg.get("body_omitted"):
+        status, body = _http_json(
+            "GET", f"{api_url}/v1/chat/messages/{urllib.parse.quote(mid, safe='')}/body", auth)
+        full = body.get("message") if status == 200 and isinstance(body, dict) else None
+        if not isinstance(full, dict):
+            unavailable()
+        for key in ("id", "message_id", "owner_user_id"):
+            expected = msg.get(key) if key == "owner_user_id" else mid
+            if full.get(key) is not None and expected is not None and full[key] != expected:
+                unavailable()
+        msg = {**msg, **full}
+    # A sealed row (even one carrying stray plaintext fields) is unreadable in
+    # this lane. Do not return its caption as a successful text-only message.
+    if msg.get("body_ct") is not None or msg.get("body_unavailable"):
+        unavailable()
+    out = {"id": mid, "role": msg.get("role")}
+    if msg.get("content_type") != "image":
+        if not isinstance(msg.get("body"), str):
+            unavailable()
+        return {**out, "content": msg["body"]}
+    try:
+        raw = base64.b64decode(msg["body_b64"], validate=True)
+        if not raw:
+            raise ValueError("empty image")
+        if msg.get("image_bundle_version") is not None:
+            # This codec is pure stdlib, like io_cli; no backend service imports.
+            from core.chat_images import decode_image_bundle
+            if msg["image_bundle_version"] != 1:
+                raise ValueError("unsupported image bundle")
+            images = decode_image_bundle(raw)
+            out["images"] = [{"image_b64": base64.b64encode(data).decode("ascii"),
+                              "image_mime": mime} for data, mime in images]
+        else:
+            out.update(image_b64=base64.b64encode(raw).decode("ascii"),
+                       image_mime=msg.get("image_mime") or "image/jpeg")
+    except (KeyError, ValueError, TypeError):
+        unavailable()
+    # Captions are independent envelopes. Mirror core.envelope's plaintext
+    # shape/owner checks without importing its crypto/service dependencies.
+    owner = str(msg.get("owner_user_id") or "")
+    caption_owner = str(msg.get("caption_owner_user_id") or owner)
+    caption = msg.get("caption_body")
+    readable_caption = (not msg.get("caption_body_ct")
+                        and (not owner or caption_owner == owner)
+                        and isinstance(caption, str))
+    out["content"] = caption if readable_caption else ""
+    return out
+
+
 def cmd_chat_image(args):
     """Pull one past chat message's decrypted image(s) as Read-able files.
 
@@ -944,19 +1002,28 @@ def cmd_chat_image(args):
     image WHEN the agent actually needs them, instead of eagerly decrypting every
     history image on every turn.
 
-    Decrypt source is the enclave's ``GET /v1/chat/history`` (same source the
-    resident consumer uses). It presents a dstack-gateway TEE cert the stdlib
-    client does not verify, so the call is made insecure=True (mirrors the
-    consumer's verify=False)."""
+    Effective plaintext accounts use backend history/body reads. Encrypted and
+    unknown accounts retain the enclave history compatibility path."""
     enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    api_url = _env("FEEDLING_API_URL").rstrip("/")
     auth = _auth_headers()
     mid = (args.message_id or "").strip()
-    if not enclave_url or not auth:
-        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    if not auth:
+        _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     if not mid:
         _emit({"ok": False, "error": "chat-image needs --id <message_id> (from the [image] placeholder in the recent-chat transcript)"}, 2)
+    plaintext = False
+    if api_url:
+        mode_status, account = _http_json("GET", f"{api_url}/v1/users/whoami", auth)
+        plaintext = (mode_status == 200 and isinstance(account, dict)
+                     and account.get("content_encryption_effective") == "off")
+    if not plaintext and not enclave_url:
+        _emit({"ok": False, "error": "FEEDLING_ENCLAVE_URL required for encrypted or unknown account mode"}, 2)
     qs = urllib.parse.urlencode({"since": 0, "limit": args.limit})
-    status, body = _http_json("GET", f"{enclave_url}/v1/chat/history?{qs}", auth, insecure=True)
+    if plaintext:
+        status, body = _http_json("GET", f"{api_url}/v1/chat/history?{qs}", auth)
+    else:
+        status, body = _http_json("GET", f"{enclave_url.rstrip('/')}/v1/chat/history?{qs}", auth, insecure=True)
     if status != 200:
         _emit({"ok": False, "http_status": status, "message_id": mid, "error": body}, 1)
     messages = (body.get("messages") or body.get("history") or []) if isinstance(body, dict) else []
@@ -968,6 +1035,8 @@ def cmd_chat_image(args):
             "error": "message not found in recent history",
             "hint": f"only the {args.limit} most recent messages are searched; raise --limit if the image is older",
         }, 1)
+    if plaintext:
+        msg = _plaintext_chat_image(api_url, auth, msg)
     if isinstance(msg.get("images"), list):
         out = _materialize_decrypted_image_bundle(f"chat_{mid}", msg)
         if out is None:
@@ -996,6 +1065,10 @@ def cmd_chat_image(args):
     # Save pixels to a Read-able file rather than emitting base64 the vision model
     # can't decode (see _materialize_decrypted_image).
     out = _materialize_decrypted_image(f"chat_{mid}", msg)
+    if plaintext and not out.get("image_file"):
+        _emit({"ok": False, "message_id": mid,
+               "error_code": "chat_image_body_unavailable",
+               "error": "could not save plaintext chat image"}, 1)
     _emit({"ok": True, "message_id": mid, **(out if isinstance(out, dict) else {"data": out})})
 
 
