@@ -669,6 +669,23 @@ operator will respond to a leaked client credential.
   across an incompatible database migration without an explicit plan.
 - Re-run every enabled readiness check after upgrade and restore drills.
 
+The managed `test`, `pre`, and `main` push workflow compares deployment paths
+against the last proven complete main-CVM and runner release, including required
+compose authorization. A later documentation fix therefore retains code that a
+failed or partial release never deployed. Resident consumer changes count in all
+three environments. The generated image-pin commit is validated before it is used
+as a comparison baseline; an arbitrary image edit is still a deployment change.
+
+Only a known baseline with unchanged deployment content may skip deployment.
+Missing or incomplete release history requires the normal deployment gates;
+unreadable GitHub metadata or a superseded event stops the detection job with
+`UNMEASURED`. History lookup is bounded to 20 earlier push runs from the latest
+50 entries; reruns conservatively require reconciliation. This CI evidence is not
+an independent measurement of live health or out-of-band changes. Existing HOLD,
+image/topology checks, release compare-and-swap, authorization, and single-attempt
+publisher claims still apply. No failed transaction is automatically re-signed
+or resent by the change detector.
+
 ## Recovering a stopped test compose authorization
 
 A failed compose authorization does not prove that a transaction was never sent.
