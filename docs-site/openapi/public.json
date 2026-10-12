@@ -1481,12 +1481,28 @@
             "name": "X-Feedling-Consumer-Commit",
             "in": "header",
             "required": false,
-            "description": "Resident consumer source revision.",
+            "description": "Consumer-declared startup distribution/checkout revision; not loaded-source attestation.",
             "schema": {
               "type": "string",
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Consumer-Commit-Source",
+            "in": "header",
+            "required": false,
+            "description": "Source of the consumer's frozen startup revision declaration. Optional for older clients; missing provenance is not inferred from the backend release. None of these values proves loaded code.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "consumer_env",
+                "image_env",
+                "git_checkout",
+                "unknown"
+              ]
+            },
+            "example": "image_env"
           },
           {
             "name": "X-Feedling-Consumer-Capabilities",
@@ -1640,12 +1656,28 @@
             "name": "X-Feedling-Consumer-Commit",
             "in": "header",
             "required": false,
-            "description": "Resident consumer source revision.",
+            "description": "Consumer-declared startup distribution/checkout revision; not loaded-source attestation.",
             "schema": {
               "type": "string",
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Consumer-Commit-Source",
+            "in": "header",
+            "required": false,
+            "description": "Source of the consumer's frozen startup revision declaration. Optional for older clients; missing provenance is not inferred from the backend release. None of these values proves loaded code.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "consumer_env",
+                "image_env",
+                "git_checkout",
+                "unknown"
+              ]
+            },
+            "example": "image_env"
           },
           {
             "name": "X-Feedling-Consumer-Capabilities",

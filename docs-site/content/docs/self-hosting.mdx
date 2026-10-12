@@ -26,6 +26,39 @@ the selected provider. See [managed import recovery](/docs/workflows/memory#mana
 for partial effects and retry costs. This does not change the Resident consumer
 queue or the direct plaintext import thread.
 
+## Resident version observations
+
+Consumers freeze a revision declaration at startup and send it with polls and
+responses in `X-Feedling-Consumer-Commit`. The optional
+`X-Feedling-Consumer-Commit-Source` identifies `consumer_env`
+(`FEEDLING_CONSUMER_COMMIT`), `image_env` (`FEEDLING_GIT_COMMIT`), or
+`git_checkout` (the consumer's own repository at startup), in that precedence
+order. Explicit empty, `dev`, or `unknown` environment values remain unknown;
+an unpacked distribution does not borrow an ancestor repository's revision.
+Changing the checkout or environment after import does not update this report.
+
+These are self-reported distribution/checkout labels, **not proof of loaded
+source bytes**. A dirty checkout or incorrect image label can disagree with the
+running code. The backend's expected update target and compatibility claim are
+separate and never fill a missing consumer revision. The process spawner
+inherits its runner environment; an isolated container instead uses its own
+image environment, without copying the supervisor's revision label.
+
+Each bounded `consumer_state.poll_consumers` entry stores the protocol version,
+commit, and source with that identity's poll timestamp. Operator diagnostics
+return those observations with age and `recent`; later polls from another
+identity or response activity do not refresh them. Missing version data in an
+old-client poll clears that identity's prior report. Old persisted observations
+without these fields remain unknown, even when a newer global writer has a
+version. A commit reported without provenance is labeled `legacy`.
+
+Supervisor heartbeats separately store their runner image declaration in
+`version`, with `version_source=image_env` in the heartbeat payload and readback.
+Absent or old provenance is `unknown`. A fresh heartbeat proves neither the
+consumer's revision nor that a child loaded that image's source. Deployment and
+coverage acceptance still require evidence for the intended environment and
+running children; these fields do not authorize a restart or deployment.
+
 ## Resident startup during enclave outages
 
 Hosted and self-hosted resident consumers retry the startup decrypt-source probe

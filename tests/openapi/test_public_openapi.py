@@ -103,6 +103,7 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-consumer-commit-source",
         "x-feedling-consumer-capabilities",
         "x-feedling-consumer-compat-commit",
         "x-feedling-decrypt-status",
@@ -113,6 +114,7 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-consumer-commit-source",
         "x-feedling-consumer-capabilities",
     },
     ("put", "/v1/genesis/imports/{job_id}/chunks/{seq}"): {

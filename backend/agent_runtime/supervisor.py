@@ -1487,7 +1487,7 @@ def _supervisor_heartbeat_payload(owner: str, *, host_all: bool,
 def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool,
                                  pi: bool, active_children: int, max_children: int,
                                  shard_index: int, shard_count: int, version: str | None,
-                                 ts: float) -> dict:
+                                 ts: float, version_source: str = "unknown") -> dict:
     """Rich per-owner heartbeat row (migration 0009). Beyond the legacy payload's
     host_all/pi, it carries this runner's live capacity (active vs max children)
     and shard config, so multiple runners report independently and the backend
@@ -1496,7 +1496,7 @@ def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool
             "host_all": bool(host_all), "pi": bool(pi),
             "active_children": int(active_children), "max_children": int(max_children),
             "shard_index": int(shard_index), "shard_count": int(shard_count),
-            "version": version}
+            "version": version, "version_source": version_source if version else "unknown"}
 
 
 def _runner_heartbeat_owner(cvm_id: str | None, *, hostname: str, pid: int) -> str:
@@ -1717,7 +1717,7 @@ def main() -> int:
             heartbeat_owner, host=hostname, host_all=host_all_active,
             pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
-            version=build_version, ts=ts)
+            version=build_version, version_source="image_env" if build_version else "unknown", ts=ts)
 
     # The heartbeat loop's shared 90s retention default removes legacy
     # PID-keyed rows before the 300s deployment grace ends.
