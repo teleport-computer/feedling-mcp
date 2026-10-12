@@ -753,6 +753,37 @@ health before declaring the deployment complete. An absent naturally occurring
 diagnostic event remains unmeasured; do not generate paid or user-facing work to
 fill that gap.
 
+## Memory index request timing
+
+Authenticated ASGI `POST /v1/memory/index` requests emit the best-effort operator
+trace `memory.index.timing` under existing trace controls. Its `trace_id` uses the
+existing access-log request ID when available. `detail.lane` is `index` or
+`search`; top-level `status` is `ok`, `error`, or `cancelled`, and
+`detail.http_status` is null when no route response status was obtained.
+
+Top-level `dur_ms` measures dispatch through response construction, after
+authentication and body parsing, and before telemetry emission. The bounded
+`detail.segments` object contains:
+
+- `queue_ms`: dispatch until the worker callable starts.
+- `core_ms`: elapsed execution of the existing index core, including enclave
+  calls. `core_state` is `not_started`, `running`, `completed`, or `failed`.
+- `upstream_ms`: summed elapsed synchronous enclave calls within that core;
+  `upstream_calls` counts calls started. `upstream_state` is `not_called`,
+  `running`, `completed`, or `failed`.
+
+Upstream time overlaps core time; do not add them. Return scheduling and response
+construction can make `dur_ms` exceed queue plus core. Missing, uncalled, or
+unfinished durations are null, not zero. Cancellation records the snapshot at
+route exit; a worker may still finish later. A completed core can return a handled
+error, so use the route status as well as segment states.
+
+These events contain no request content, credentials, URLs, or exception text.
+They do not change results, authentication, retries, timeouts, or worker limits.
+Trace delivery can be disabled or dropped; missing events do not imply no traffic
+or zero latency. The event does not establish the cause or frequency of historical
+slow requests and does not backfill them.
+
 ## Runtime V2 provider call errors
 
 V2 model-call `start`, `done`, and `error` events include the owning `job_id`
