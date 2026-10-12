@@ -829,7 +829,7 @@ def test_mcp_turn_usage_marks_failed_turns(monkeypatch):
     assert model_events[-1]["detail"]["status_code"] == 402
     assert model_events[-1]["detail"]["error_class"] == "quota_insufficient"
     assert model_events[-1]["detail"]["exception_type"] == "ProviderError"
-    assert not model_events[0].get("job_id")
+    assert model_events[0]["job_id"] == str(job["id"])
     assert model_events[-1]["job_id"] == str(job["id"])
     assert loaded_job_ids == [str(job["id"])]
     assert private_provider_body not in repr(model_events)

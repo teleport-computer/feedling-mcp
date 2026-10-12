@@ -755,6 +755,28 @@ fill that gap.
 
 ## Runtime V2 provider call errors
 
+V2 model-call `start`, `done`, and `error` events include the owning `job_id`
+when available. Correlate using user, job, runtime actor, and lane; a shared
+`trace_id` alone can mix separate jobs. This applies to newly emitted events,
+including retained tail events, and does not backfill older records.
+
+For an already approved, bounded local snapshot, run
+`python tools/wake_failure_attribution.py snapshot.json`. Its JSON input has
+`jobs` (`user_id`, `job_id`, `status`, `lane`) and flat `events`
+(`user_id`, `job_id`, `actor`, `lane`, `type`, `provider`, `model`).
+It counts distinct failed heartbeat jobs, accepts only matching `hosted_v2`
+observations, and returns aggregate observation and route-coverage counts.
+Duplicate events do not add jobs. Conflicting candidate job snapshots are counted
+separately and excluded from confirmed failures; candidate counts equal confirmed
+failures plus conflicts. Multiple observed routes remain explicit. It performs no database or provider calls and prints no
+identifiers or model names. Snapshot completeness and acquisition remain the
+operator's responsibility.
+
+A start records a logical attempt, not proof of an HTTP request. A done or error
+event describes one call, not the job's terminal cause or outcome. Missing or
+sampled-out events remain unknown; this tool cannot establish a no-call count,
+reconstruct historical failures, or change the legacy open-rate denominator.
+
 The operator event `agent.model.call.error` retains the configured provider and
 model, including failures during a wake direct-text correction. Its duration is
 elapsed time for the current logical provider call, not the whole wake. Transport

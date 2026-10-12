@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- V2 model-call start and completion traces retain their job association. An
+  offline failure-attribution tool counts distinct failed heartbeat jobs from
+  bounded snapshots while preserving missing and conflicting observations.
+
 - `io_cli chat-image` reads plaintext accounts' image bodies from the authenticated
   backend without requiring an enclave URL. Sealed or unavailable bodies fail
   without decrypt fallback; encrypted and unknown modes keep their existing path.
