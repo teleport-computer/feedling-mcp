@@ -1715,78 +1715,91 @@ jobs:
         run: cd tools/dcap && python3 -m unittest test_dcap_parse.py -v
 
   # =========================================================================
-  # DEPLOY — detect whether this push affects CVM image or compose
+  # DEPLOY — compare with a proven complete main + runner release
   #
   # The CVM is expensive to redeploy (on-chain tx + iOS consent modal) so
-  # we skip it for docs-only / ci-only commits.
+  # we skip unchanged deployment content only after verifying release history.
+  # Unknown/partial releases require the normal gates; unreadable history fails
+  # closed. A successful CI run alone is not deployment evidence.
   # =========================================================================
   detect-cvm-changes:
     name: detect CVM changes
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - uses: dorny/paths-filter@v3
+          fetch-depth: 0
+      - name: Compare with the last complete deployment
         id: filter
-        with:
-          filters: |
-            cvm:
-              - 'backend/**'
-              - 'tools/deploy_canary.py'
-              - 'deploy/attestation-gate.sh'
-              - 'deploy/Dockerfile'
-              - 'deploy/Dockerfile.agent-runner'
-              - 'deploy/docker-compose.phala.yaml'
-              - 'deploy/docker-compose.phala.prod.runner.yaml'
-              - 'deploy/e2b/runtime-v2/**'
-              - 'deploy/pin-runtime-release.sh'
-              - 'deploy/check-database-topology.py'
-              - 'deploy/prod-cvm-id.txt'
-              - 'deploy/prod-runner-cvm-ids.txt'
-              - 'deploy/list-prod-runner-cvm-ids.sh'
-              - 'deploy/check-prod-runner-topology.sh'
-              - 'deploy/check-v2-runner-fleet.py'
-              - 'deploy/publish-compose-hash.sh'
-              - 'deploy/compose_publisher.py'
-              - 'deploy/publisher-requirements.txt'
-              - '.github/workflows/ci.yml'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_PATHS: |
+            backend/**
+            tools/chat_resident_consumer.py
+            tools/deploy_canary.py
+            deploy/attestation-gate.sh
+            deploy/Dockerfile
+            deploy/Dockerfile.agent-runner
+            deploy/docker-compose.phala.yaml
+            deploy/docker-compose.phala.prod.runner.yaml
+            deploy/e2b/runtime-v2/**
+            deploy/pin-runtime-release.sh
+            deploy/check-database-topology.py
+            deploy/prod-cvm-id.txt
+            deploy/prod-runner-cvm-ids.txt
+            deploy/list-prod-runner-cvm-ids.sh
+            deploy/check-prod-runner-topology.sh
+            deploy/check-v2-runner-fleet.py
+            deploy/publish-compose-hash.sh
+            deploy/compose_publisher.py
+            deploy/publisher-requirements.txt
+            .github/workflows/ci.yml
+            deploy/deployment_changes.py
+        run: python3 deploy/deployment_changes.py
 
   detect-cvm-changes-test:
     name: detect CVM changes (test)
     if: github.ref == 'refs/heads/test' && github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - uses: dorny/paths-filter@v3
+          fetch-depth: 0
+      - name: Compare with the last complete deployment
         id: filter
-        with:
-          filters: |
-            cvm:
-              - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
-              - 'tools/deploy_canary.py'
-              - 'deploy/attestation-gate.sh'
-              - 'deploy/Dockerfile'
-              - 'deploy/Dockerfile.agent-runner'
-              - 'deploy/docker-compose.phala.test.yaml'
-              - 'deploy/docker-compose.phala.runner.yaml'
-              - 'deploy/e2b/runtime-v2/**'
-              - 'deploy/pin-runtime-release.sh'
-              - 'deploy/check-database-topology.py'
-              - 'deploy/test-cvm-id.txt'
-              - 'deploy/test-runner-cvm-id.txt'
-              - 'deploy/publish-compose-hash.sh'
-              - 'deploy/compose_publisher.py'
-              - 'deploy/publisher-requirements.txt'
-              - '.github/workflows/ci.yml'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_PATHS: |
+            backend/**
+            tools/chat_resident_consumer.py
+            tools/deploy_canary.py
+            deploy/attestation-gate.sh
+            deploy/Dockerfile
+            deploy/Dockerfile.agent-runner
+            deploy/docker-compose.phala.test.yaml
+            deploy/docker-compose.phala.runner.yaml
+            deploy/e2b/runtime-v2/**
+            deploy/pin-runtime-release.sh
+            deploy/check-database-topology.py
+            deploy/test-cvm-id.txt
+            deploy/test-runner-cvm-id.txt
+            deploy/publish-compose-hash.sh
+            deploy/compose_publisher.py
+            deploy/publisher-requirements.txt
+            .github/workflows/ci.yml
+            deploy/deployment_changes.py
+        run: python3 deploy/deployment_changes.py
 
   validate-test-runtime-prerequisites:
     name: validate test Runtime V2 deploy prerequisites
@@ -2309,34 +2322,40 @@ jobs:
     name: detect CVM changes (pre)
     if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - uses: dorny/paths-filter@v3
+          fetch-depth: 0
+      - name: Compare with the last complete deployment
         id: filter
-        with:
-          filters: |
-            cvm:
-              - 'backend/**'
-              - 'tools/deploy_canary.py'
-              - 'tools/prompt_cache_canary.py'
-              - 'deploy/attestation-gate.sh'
-              - 'deploy/Dockerfile'
-              - 'deploy/Dockerfile.agent-runner'
-              - 'deploy/docker-compose.phala.pre.yaml'
-              - 'deploy/docker-compose.phala.pre.runner.yaml'
-              - 'deploy/e2b/runtime-v2/**'
-              - 'deploy/pin-runtime-release.sh'
-              - 'deploy/check-database-topology.py'
-              - 'deploy/pre-cvm-id.txt'
-              - 'deploy/pre-runner-cvm-id.txt'
-              - 'deploy/publish-compose-hash.sh'
-              - 'deploy/compose_publisher.py'
-              - 'deploy/publisher-requirements.txt'
-              - '.github/workflows/ci.yml'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_PATHS: |
+            backend/**
+            tools/chat_resident_consumer.py
+            tools/deploy_canary.py
+            tools/prompt_cache_canary.py
+            deploy/attestation-gate.sh
+            deploy/Dockerfile
+            deploy/Dockerfile.agent-runner
+            deploy/docker-compose.phala.pre.yaml
+            deploy/docker-compose.phala.pre.runner.yaml
+            deploy/e2b/runtime-v2/**
+            deploy/pin-runtime-release.sh
+            deploy/check-database-topology.py
+            deploy/pre-cvm-id.txt
+            deploy/pre-runner-cvm-id.txt
+            deploy/publish-compose-hash.sh
+            deploy/compose_publisher.py
+            deploy/publisher-requirements.txt
+            .github/workflows/ci.yml
+            deploy/deployment_changes.py
+        run: python3 deploy/deployment_changes.py
 
   # Dual-runtime coexistence (2026-07-21 design, Task 11): the pre runner CVM
   # is V1 agent-runner again (P1 dual-fleet validation), and pooled Runtime V2
@@ -3013,11 +3032,9 @@ jobs:
       # deploy isn't done until the runner CVM(s) redeploy. It lives in the
       # notify-lark-prod-deploy job (needs: deploy-cvm + deploy-prod-runner-cvm).
 
-  # 手动重部署 test（代码没变、只想重新走一遍部署）：workflow_dispatch 不行——
-  # 下面的 if 要求 event_name == 'push'，且 detect-cvm-changes-test 的 paths-filter
-  # 必须命中。空 commit 同样无效。办法是对 filter 白名单里的文件（backend/**、
-  # deploy/docker-compose.phala.test.yaml、本文件……）做一处无害改动后 push 到 test，
-  # 且 commit message 不要带 [skip ci]。
+  # Only branch pushes enter deployment. The detector compares deployment content
+  # with the last proven complete release, so a docs-only fix after failed CI
+  # retains pending code changes. HOLD and publisher gates remain independent.
   deploy-test-cvm:
     name: deploy CVM (test)
     needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]

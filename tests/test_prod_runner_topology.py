@@ -138,7 +138,7 @@ def test_prod_inventory_and_fleet_gates_trigger_the_shared_preflight():
         "deploy/check-v2-runner-fleet.py",
     ):
         assert path in prod_filter
-    assert "tools/chat_resident_consumer.py" not in prod_filter
+    assert "tools/chat_resident_consumer.py" in prod_filter
 
     preflight = workflow.split("\n  validate-prod-runner-topology:\n", 1)[1].split(
         "\n  detect-cvm-changes-pre:\n", 1
