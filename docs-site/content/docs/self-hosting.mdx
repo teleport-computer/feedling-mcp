@@ -97,6 +97,14 @@ progress, but they cannot supply conversation context, Capture text, or a
 per-turn memory-selection anchor. Encrypted and unknown accounts keep their
 existing decrypt-service paths.
 
+`io_cli chat-image` also checks effective mode through the authenticated backend.
+For explicit `off`, it reads backend history and any omitted message body,
+decodes single images or multi-image bundles locally, and writes private image
+files. It requires no enclave URL in that mode. Sealed, malformed, or unavailable
+bodies fail without decrypt fallback; encrypted or unknown mode keeps the enclave
+history path. The backend's existing whoami public-attestation lookup is unchanged,
+so this CLI routing change does not establish zero backend-to-enclave traffic.
+
 This history policy is independent of the memory-selection switch below.
 Startup and health probes follow the account mode described above; other
 Resident operations, including the separate memory-selection fallback, may

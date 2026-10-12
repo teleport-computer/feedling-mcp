@@ -110,7 +110,6 @@ tests/test_introduction_db_atomic.py
 tests/test_introduction_enqueue_once.py
 tests/test_io_cli_catalog.py
 tests/test_io_cli_generate_image.py
-tests/test_io_cli_image.py
 tests/test_io_cli_mutating_verb_sourcing_rule.py
 tests/test_io_cli_onboarding.py
 tests/test_io_cli_parser.py

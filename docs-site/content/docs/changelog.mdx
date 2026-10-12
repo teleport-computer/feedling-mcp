@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `io_cli chat-image` reads plaintext accounts' image bodies from the authenticated
+  backend without requiring an enclave URL. Sealed or unavailable bodies fail
+  without decrypt fallback; encrypted and unknown modes keep their existing path.
+
 - Resident version observations now retain each polling identity's declared
   revision and its source. Unknown and stale reports stay explicit; unpacked
   consumers no longer borrow an ancestor repository's SHA. Runner image labels
