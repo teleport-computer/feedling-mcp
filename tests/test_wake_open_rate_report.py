@@ -169,3 +169,104 @@ def test_heartbeat_skip_reasons_match_the_worker():
     reasons = {v for k, v in vars(worker).items() if k.startswith("HEARTBEAT_SKIP_")}
     assert reasons == report.HEARTBEAT_SKIP_REASONS
     assert worker.HEARTBEAT_SKIPPED == "skipped"
+
+
+def test_failure_attribution_deduplicates_jobs_and_preserves_observation_limits():
+    from tools import wake_failure_attribution as failure
+
+    def job(identifier, **extra):
+        return dict(user_id="u", job_id=identifier, status="failed", lane="heartbeat", **extra)
+
+    def event(identifier, kind, **overrides):
+        return {
+            "user_id": "u", "job_id": identifier, "lane": "heartbeat",
+            "actor": "hosted_v2", "type": f"agent.model.call.{kind}",
+            "provider": "p", "model": "m", **overrides,
+        }
+
+    jobs = [job(k) for k in ("error", "done", "start", "absent", "multiple", "partial")]
+    events = [
+        event("error", "error"), event("done", "done"), event("start", "start"),
+        event("multiple", "done"), event("multiple", "error", model="other"),
+        event("partial", "start", model="unknown"), event("partial", "error"),
+        event("absent", "error", actor="vps_resident"),
+        event("absent", "done", user_id="other-user"),
+        event("absent", "error", lane="chat"),
+        event("", "done", trace_id="shared-trace"),
+    ]
+    out = failure.summarize({"jobs": jobs + jobs, "events": events + events})
+    assert out["failed_jobs"] == 6
+    assert out["evidence"] == {
+        "error_observed": 3, "done_without_error_observed": 1,
+        "start_only_observed": 1, "unobserved": 1,
+    }
+    assert out["routes"] == {
+        "single_route_observed": 3, "multiple_routes_observed": 1,
+        "unknown_or_partial_route": 2,
+    }
+    assert out["jobs_with_incomplete_route_evidence"] == 1
+    assert out["historical_cause_reconstructed"] is False
+    assert "other-user" not in str(out)
+
+
+@pytest.mark.parametrize("conflict_status,conflict_lane", [
+    ("completed", "heartbeat"), ("failed", "chat"), ("pending", "heartbeat"),
+])
+def test_failure_attribution_conflicting_job_snapshot_is_not_latest_wins(
+    conflict_status, conflict_lane,
+):
+    from tools import wake_failure_attribution as failure
+
+    rows = [
+        {"user_id": "u", "job_id": "j", "status": "failed", "lane": "heartbeat"},
+        {"user_id": "u", "job_id": "j", "status": conflict_status, "lane": conflict_lane},
+    ]
+    out = failure.summarize({"jobs": rows, "events": [{
+        "user_id": "u", "job_id": "j", "actor": "hosted_v2",
+        "lane": "heartbeat", "type": "agent.model.call.done", "model": "m", "provider": "p",
+    }]})
+    assert out["failed_jobs"] == 0
+    assert out["conflicting_candidate_jobs"] == 1
+    assert out["candidate_jobs"] == 1
+    assert sum(out["evidence"].values()) == 0
+    assert sum(out["routes"].values()) == 0
+    confirmed = {"user_id": "u", "job_id": "other", "status": "failed", "lane": "heartbeat"}
+    for variant in (rows + [confirmed], list(reversed(rows)) + [confirmed], rows * 2 + [confirmed] * 2):
+        result = failure.summarize({"jobs": variant, "events": []})
+        assert result["failed_jobs"] == 1
+        assert result["conflicting_candidate_jobs"] == 1
+        assert result["candidate_jobs"] == result["failed_jobs"] + result["conflicting_candidate_jobs"] == 2
+        assert sum(result["evidence"].values()) == result["failed_jobs"]
+        assert sum(result["routes"].values()) == result["failed_jobs"]
+
+
+def test_failure_attribution_cli_never_prints_input_content(tmp_path):
+    import json
+    import subprocess
+
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps({
+        "jobs": [{"user_id": "PRIVATE", "job_id": "PRIVATE", "lane": "heartbeat", "status": "failed"}],
+        "events": [], "ignored": "PRIVATE prompt key body",
+    }))
+    command = [sys.executable, str(ROOT / "tools/wake_failure_attribution.py"), str(snapshot)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["evidence"]["unobserved"] == 1
+    assert "PRIVATE" not in result.stdout + result.stderr
+    snapshot.write_text('{"PRIVATE": invalid}')
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2
+    assert not result.stdout
+    assert "PRIVATE" not in result.stderr
+
+
+@pytest.mark.parametrize("snapshot", [
+    {"jobs": [{"user_id": "", "job_id": "j", "status": "failed", "lane": "heartbeat"}], "events": []},
+    {"jobs": {}, "events": []},
+    {"jobs": [], "events": [None]},
+])
+def test_failure_attribution_rejects_invalid_snapshot(snapshot):
+    from tools import wake_failure_attribution as failure
+    with pytest.raises(ValueError):
+        failure.summarize(snapshot)

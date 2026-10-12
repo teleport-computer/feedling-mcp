@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- V2 model-call start and completion traces retain their job association. An
+  offline failure-attribution tool counts distinct failed heartbeat jobs from
+  bounded snapshots while preserving missing and conflicting observations.
+
 - Wake direct-text correction failures retain the configured model route,
   current-call duration, and transport retry evidence in operator error traces.
   Unknown retry evidence stays unknown; calls and failure behavior are unchanged.

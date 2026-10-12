@@ -3212,7 +3212,7 @@ class _ProviderRoundtripTrace:
                 trace_id=self.trace_id,
                 **(
                     {"job_id": self.job_id}
-                    if event_kind == "error" and self.job_id
+                    if self.job_id
                     else {}
                 ),
                 status=(

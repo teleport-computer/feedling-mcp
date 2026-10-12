@@ -1915,3 +1915,49 @@ def test_model_call_cause_rejects_unregistered_strings():
     assert public["detail"]["error_class"] == "unknown"
     assert persisted["exception_type"] == "RuntimeError"
     assert public["detail"]["exception_type"] != "RuntimeError"
+
+
+@pytest.mark.parametrize("event_kind", ["start", "done", "error"])
+@pytest.mark.parametrize("round_number", [1, 18])
+def test_model_call_trace_keeps_job_link_in_head_and_retained_tail(
+    event_kind, round_number,
+):
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda uid, kind, **fields: captured.append(
+        {"type": kind, **fields}
+    )
+    trace = worker._provider_tool_surface_callback(
+        deps, "u_job_link", "heartbeat", "shared-trace", "job-current",
+    )
+
+    async def record():
+        await trace.record_model_call(event_kind, {
+            "round": round_number, "provider": "anthropic", "model": "claude-test",
+            "error_class": "unknown", "prompt": "PRIVATE", "error": "PRIVATE",
+        })
+        await trace.emit_summary()
+
+    asyncio.run(record())
+    model_events = [e for e in captured if e["type"].startswith("agent.model.call.")]
+    assert len(model_events) == 1
+    assert model_events[0]["job_id"] == "job-current"
+    assert model_events[0]["trace_id"] == "shared-trace"
+    assert "PRIVATE" not in repr(captured)
+
+
+def test_model_call_trace_without_job_preserves_compatibility_and_fail_open():
+    captured = []
+    deps = _minimal_deps()
+    deps.emit_debug_trace = lambda uid, kind, **fields: captured.append(fields)
+    trace = worker._provider_tool_surface_callback(deps, "u_no_job", "heartbeat")
+    asyncio.run(trace.record_model_call("start", {"model": "test"}))
+    assert "job_id" not in captured[0]
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("PRIVATE emitter error")
+
+    deps.emit_debug_trace = unavailable
+    asyncio.run(trace.record_model_call("error", {"model": "test"}))
+    assert trace.model_call_events_observed == 2
+    assert trace.model_call_events_emitted == 1
