@@ -137,6 +137,17 @@ def _strip_timing(value):
     return value
 
 
+def _stop_service_and_join_encoders():
+    # stop()/Scheduler.close() signal shutdown; they do not join the worker.
+    # A retiring worker must not enter the next test's thread-count baseline.
+    workers = _encoder_threads()
+    query_service.stop()
+    for worker in workers:
+        worker.join(timeout=3)
+        assert not worker.is_alive(), "query encoder did not finish test cleanup"
+    assert not _encoder_threads(), "query encoder leaked across test boundaries"
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     for name in (recall_policy.HYBRID_ENV, recall_policy.MIN_COSINE_ENV, plaintext_recall.MODE_ENV,
@@ -144,7 +155,7 @@ def _env(monkeypatch):
                  query_service.OWNER_ENV):
         monkeypatch.delenv(name, raising=False)
     yield
-    query_service.stop()      # the service is a process singleton; tests must not leak it
+    _stop_service_and_join_encoders()  # singleton cleanup includes actual thread exit
 
 
 # --------------------------------------------------------------------------- #
@@ -936,6 +947,50 @@ def parent(monkeypatch):
     monkeypatch.setenv(query_service.OWNER_ENV, "")
     monkeypatch.setattr(serve_worker.atexit, "register", lambda *_a: None)
     return serve_worker
+
+
+def test_service_cleanup_waits_for_retiring_encoder_thread(monkeypatch):
+    exiting, release, joining = threading.Event(), threading.Event(), threading.Event()
+    original_next = query_service.Scheduler._next
+    errors = []
+
+    def delayed_exit(scheduler):
+        job = original_next(scheduler)
+        if job is None:
+            exiting.set()
+            assert release.wait(3)
+        return job
+
+    monkeypatch.setattr(query_service.Scheduler, "_next", delayed_exit)
+    query_service.reserve(port=0)
+    query_service.start(_embedder())
+    worker = query_service.active_scheduler()._thread
+    original_join = worker.join
+
+    def observed_join(timeout=None):
+        joining.set()
+        original_join(timeout)
+
+    monkeypatch.setattr(worker, "join", observed_join)
+
+    def cleanup():
+        try:
+            _stop_service_and_join_encoders()
+        except BaseException as exc:
+            errors.append(exc)
+
+    cleaner = threading.Thread(target=cleanup)
+    cleaner.start()
+    try:
+        assert exiting.wait(2) and joining.wait(2)
+        assert query_service.active_scheduler() is None
+        assert worker.is_alive() and cleaner.is_alive()
+    finally:
+        release.set()
+        cleaner.join(3)
+        original_join(3)
+    assert not cleaner.is_alive() and not worker.is_alive()
+    assert not errors and not _encoder_threads()
 
 
 def test_a_serve_restart_keeps_one_service_and_its_token(parent, monkeypatch):
