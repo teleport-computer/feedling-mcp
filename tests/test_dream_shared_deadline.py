@@ -378,6 +378,8 @@ def test_real_worker_budget_gate_before_write_and_no_new_cancel_after_write(monk
 
 
 def test_slotfleet_passes_same_spec_budget_to_spawn(monkeypatch):
+    import inspect
+    from test_v2_pool_fault_injection import _fleet_fault_target
     from model_api_runtime.v2 import pool_config, pool_supervisor
     seen = []
     class Supervisor:
@@ -389,6 +391,12 @@ def test_slotfleet_passes_same_spec_budget_to_spawn(monkeypatch):
     for spec, args in zip(config.slots, seen):
         assert args['spawn_args'][-1] == spec.absolute_budget_sec
         assert args['spawn_args'][-2] == 2  # existing DB pool argument
+        # Bind the real fault-test entry without starting or killing a process.
+        bound = inspect.signature(_fleet_fault_target).bind(
+            None, *args['spawn_args'], 'events-sentinel', 'generation-sentinel')
+        assert bound.arguments['_turn_absolute_budget_sec'] == spec.absolute_budget_sec
+        assert bound.arguments['events'] == 'events-sentinel'
+        assert bound.arguments['slot_generation'] == 'generation-sentinel'
 
 
 def test_dream_success_health_can_wait_for_write_admission(monkeypatch):
