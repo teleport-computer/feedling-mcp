@@ -750,14 +750,25 @@ def cmd_voice_transcript_list(args):
 def cmd_voice_transcript_read(args):
     """One archived call's words, paged. GET /v1/voice/transcripts/<call_id>.
 
-    The endpoint returns the envelope; decryption is the consumer's job, so this
-    verb goes through the same enclave decrypt path memory-fetch uses.
+    Effective-off accounts read their own plaintext envelope locally. Legacy
+    encrypted/unknown modes retain enclave decryption; failed mode reads stop.
     """
     api_url, auth = _require_backend()
     call_id = str(args.call_id or "").strip()
     if not call_id.startswith("vcall_"):
         _emit({"ok": False, "error": "voice-transcript-read needs a real call_id "
                                      "(run voice-transcript-list first)"}, 2)
+    mode_status, account = _http_json("GET", f"{api_url}/v1/users/whoami", auth)
+    if (mode_status != 200 or not isinstance(account, dict)
+            or not isinstance(account.get("user_id"), str)
+            or not account["user_id"].strip()
+            or ("content_encryption_effective" in account
+                and not isinstance(account["content_encryption_effective"], str))):
+        _emit({"ok": False, "http_status": mode_status,
+               "error": "account mode unavailable or malformed"}, 1)
+    # Missing/empty/unrecognized STRING values are the documented old-server
+    # compatibility case. Never normalize an unknown value into effective off.
+    plaintext = account.get("content_encryption_effective") == "off"
     status, body = _http_json(
         "GET", f"{api_url}/v1/voice/transcripts/{urllib.parse.quote(call_id)}", auth)
     if status != 200:
@@ -765,21 +776,36 @@ def cmd_voice_transcript_read(args):
     envelope = body.get("transcript") if isinstance(body, dict) else None
     if not isinstance(envelope, dict):
         _emit({"ok": False, "error": "transcript envelope missing"}, 1)
-    # 归档表存的是信封;明文只在 enclave 里出现。走通用 /v1/envelope/decrypt
-    # ——与 chat/memory 同一条 crypto 路径,不新增信任面。
-    enclave_url = _env("FEEDLING_ENCLAVE_URL")
-    if not enclave_url:
-        _emit({"ok": False, "error": "FEEDLING_ENCLAVE_URL not set; cannot decrypt transcript"}, 2)
-    dec_status, dec_body = _http_json(
-        "POST", f"{enclave_url.rstrip('/')}/v1/envelope/decrypt", auth,
-        payload={"envelope": envelope}, insecure=True)
-    if dec_status != 200 or not isinstance(dec_body, dict):
-        _emit({"ok": False, "http_status": dec_status,
-               "error": dec_body or "envelope decrypt failed"}, 1)
-    try:
-        text = base64.b64decode(dec_body.get("plaintext_b64") or "").decode("utf-8")
-    except Exception as exc:  # noqa: BLE001
-        _emit({"ok": False, "error": f"transcript decode failed: {str(exc)[:120]}"}, 1)
+    if plaintext:
+        if ("body_ct" in envelope
+                or envelope.get("owner_user_id") != account["user_id"]):
+            _emit({"ok": False, "error": "plaintext transcript unavailable"}, 1)
+        try:
+            if "body_b64" in envelope:
+                if "body" in envelope or not isinstance(envelope["body_b64"], str):
+                    raise ValueError("invalid binary body")
+                text = base64.b64decode(envelope["body_b64"], validate=True).decode("utf-8")
+            elif isinstance(envelope.get("body"), str):
+                text = envelope["body"]
+                text.encode("utf-8")  # Reject invalid Unicode surrogate bodies.
+            else:
+                raise ValueError("missing text body")
+        except (ValueError, UnicodeError):
+            _emit({"ok": False, "error": "plaintext transcript malformed"}, 1)
+    else:
+        enclave_url = _env("FEEDLING_ENCLAVE_URL")
+        if not enclave_url:
+            _emit({"ok": False, "error": "FEEDLING_ENCLAVE_URL not set; cannot decrypt transcript"}, 2)
+        dec_status, dec_body = _http_json(
+            "POST", f"{enclave_url.rstrip('/')}/v1/envelope/decrypt", auth,
+            payload={"envelope": envelope}, insecure=True)
+        if dec_status != 200 or not isinstance(dec_body, dict):
+            _emit({"ok": False, "http_status": dec_status,
+                   "error": dec_body or "envelope decrypt failed"}, 1)
+        try:
+            text = base64.b64decode(dec_body.get("plaintext_b64") or "").decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            _emit({"ok": False, "error": f"transcript decode failed: {str(exc)[:120]}"}, 1)
     offset = max(0, int(args.offset or 0))
     page = text[offset:offset + 6000]
     _emit({
