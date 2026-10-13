@@ -882,3 +882,33 @@ failures nor changes public errors, retry policy, or model calls.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.
+
+## Resident proactive failure claims
+
+The resident consumer can attach an optional `failure_diagnostic` to an existing
+`POST /v1/proactive/jobs/{job_id}/status` failure report. The request contains
+`v: 1` and one `reported_error_class` from the documented closed vocabulary.
+The backend records `source: consumer_reported` only after checking the original
+consumer identity against the current job row. This checks association, not the
+truth of a provider diagnosis: a client can report a valid category incorrectly,
+and a consumer identifier is not an execution-attempt token.
+
+Old clients need no changes. Missing diagnostics stay unknown; malformed claims,
+unknown versions/classes, extra keys and unavailable bindings degrade without
+changing the original status operation. Persisted objects contain only `v`,
+`reported_error_class`, `source` and `state`. States are `reported`, `missing`,
+`invalid`, `binding_unavailable` and `conflicting_reports`; all states other than
+`reported` have class `unknown` and source `none`. A later non-failure state clears
+the field to null. Repeated conflicting claims are retained as a conflict rather
+than choosing a cause. No exception bodies or credentials enter this new field.
+Existing job responses can expose it under the same tenant authorization.
+
+Operators can summarize an already authorized, bounded snapshot with
+`python tools/resident_failure_diagnostics.py snapshot.json`. Input has
+`schema_version: 1` and a `jobs` array whose entries contain `user_id`, `job_id`
+and the stored job `doc`. The tool never queries a service or database, and does
+not authenticate snapshot provenance. It limits input to 16 MiB and 100,000 rows,
+deduplicates by user/job, excludes conflicting job states from confirmed failures,
+and emits only fixed aggregate counts. These are reported categories, not verified
+causes or opening/delivery rates. Missing historical evidence is not reconstructed.
+The projection follows the existing proactive-job retention and deletion lifecycle.

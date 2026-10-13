@@ -1039,3 +1039,19 @@ It does not delete Memory Garden, Identity, API keys, user-authored
 metrics, or the account. Encrypted trajectory/review telemetry is retained under
 its separate retention policy and never re-enters the live prompt. Use account
 reset/deletion when the intended operation is complete data erasure.
+
+## Resident proactive failure diagnostics
+
+An exception from a resident proactive agent call may add a content-free
+`failure_diagnostic` claim to the existing job status update. The backend preserves
+its consumer-reported provenance; it does not treat a valid category as proof of
+provider fault or of the execution attempt. Old clients without this field remain
+compatible and unknown. Malformed or unbound diagnostics do not reject an otherwise
+valid legacy status update. Duplicate reports do not add attempts, conflicting
+reports remain unknown, and later non-failure states clear the projection.
+
+This optional job field does not change the existing `status_reason`, outcome
+statistics, account exemptions, background silence, notification, payment cooldown
+or retry policy. It is distinct from Runtime V2 trace attribution. See
+[Resident proactive failure claims](/docs/self-hosting#resident-proactive-failure-claims)
+for the wire vocabulary, retention and bounded offline reader.

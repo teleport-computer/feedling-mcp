@@ -16170,6 +16170,27 @@ def claim_proactive_job(job_id: str) -> bool:
     return bool(body.get("claimed"))
 
 
+# Versioned diagnostic claims; never an independently verified provider cause.
+# Kept local because this consumer is also distributed as a standalone file.
+_RESIDENT_FAILURE_DIAGNOSTIC_CLASSES = frozenset({
+    "auth_invalid", "quota_insufficient", "model_not_found",
+    "provider_account_expired", "rate_limited", "upstream_unavailable",
+    "provider_incompatible", "cli_config_invalid", "resident_agent_cli_logged_out",
+    "turn_timeout", "content_filtered", "context_overflow", "reply_parse_failed",
+    "provider_error_unclassified", "provider_empty_reply", "unknown",
+})
+
+
+def _proactive_failure_diagnostic(exc: BaseException) -> dict:
+    try:
+        reported = classify_agent_error(exc).error_class
+        if type(reported) is not str or reported not in _RESIDENT_FAILURE_DIAGNOSTIC_CLASSES:
+            reported = "unknown"
+    except Exception:
+        reported = "unknown"
+    return {"v": 1, "reported_error_class": reported}
+
+
 def update_proactive_job_status(
     job_id: str,
     status: str,
@@ -20538,7 +20559,8 @@ def _process_proactive_jobs(jobs: list) -> float:
                     e,
                 )
                 update_proactive_job_status(
-                    job_id, "failed", f"provider_payment_required: {e}"
+                    job_id, "failed", f"provider_payment_required: {e}",
+                    extra={"failure_diagnostic": _proactive_failure_diagnostic(e)},
                 )
                 _notify_agent_turn_failure(
                     e,
@@ -20550,7 +20572,10 @@ def _process_proactive_jobs(jobs: list) -> float:
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             _note_proactive_failure()
-            update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
+            update_proactive_job_status(
+                job_id, "failed", f"agent_call_failed: {e}",
+                extra={"failure_diagnostic": _proactive_failure_diagnostic(e)},
+            )
             _notify_agent_turn_failure(
                 e,
                 foreground=False,

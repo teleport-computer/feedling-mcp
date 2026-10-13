@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Resident proactive failure status updates accept an optional bounded diagnostic
+  claim. Job responses preserve its consumer-reported provenance, unknown and
+  conflict states; an offline reader summarizes authorized snapshots without
+  changing failure statistics or background behavior.
+
 - `io_cli voice-transcript-read` reads effective plaintext accounts' own archives
   locally, preserving full text and pagination without an enclave URL. Sealed or
   malformed archives fail without decrypt fallback. Failed or malformed mode

@@ -599,7 +599,10 @@ def job_status(store, job_id, payload: dict):
     # Older resident consumers report a failed Dream card read as "no cards";
     # never let that advance the Dream ledger while the garden has cards.
     patch = dream_scheduler.reclassify_unverified_no_cards_completion(store, current, patch)
-    job = store.update_proactive_job(job_id, patch)
+    from proactive.failure_diagnostics import report_context
+    job = store.update_proactive_job(
+        job_id, patch, failure_report_context=report_context(payload),
+    )
     if job is None:
         return {"error": "job_not_found"}, 404
     new_status = str(patch.get("status") or payload.get("status") or "").strip().lower()

@@ -19334,6 +19334,39 @@ def log_patch_item(user_id: str, stream: str, item_key: str, patch: dict,
     return row[0] if row is not None else None
 
 
+
+def log_patch_proactive_job(user_id: str, item_key: str, patch: dict,
+                            only_if_status: str | None = None, *,
+                            failure_report_context=None) -> dict | None:
+    """Merge the original job patch and a bounded claim in one row UPDATE.
+
+    Diagnostic binding is checked on each database's actual old row. Shadow
+    drift can therefore yield unknown instead of copying a primary claim.
+    """
+    from proactive.failure_diagnostics import ERROR_CLASSES, UPDATE_SQL, sql_inputs
+
+    candidate, consumer, present = sql_inputs(failure_report_context)
+    ordinary_patch = {k: v for k, v in patch.items() if k != "failure_diagnostic"}
+    params = [Jsonb(ordinary_patch), Jsonb(candidate), consumer, present,
+              Jsonb(sorted(ERROR_CLASSES)), user_id, "proactive_jobs",
+              user_id, "proactive_jobs", item_key]
+    sql = UPDATE_SQL
+    if only_if_status is not None:
+        sql += " AND target.doc->>'status' = %s"
+        params.append(only_if_status)
+    sql += " RETURNING target.doc"
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+    except Exception as e:
+        log.error("[db] log_patch_proactive_job(%s,%s) failed: %s", user_id, item_key, e)
+        return None
+    if row is not None:
+        from tee_shadow import mirror
+        mirror.execute(sql, tuple(params))
+    return row[0] if row is not None else None
+
+
 def log_trim(user_id: str, stream: str, max_rows: int,
              only_statuses: "list[str] | None" = None) -> None:
     """Keep only the newest ``max_rows`` rows of a stream.
