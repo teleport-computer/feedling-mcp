@@ -958,6 +958,7 @@ jobs:
             tests/test_io_cli_auth.py \
             tests/test_io_cli_image.py \
             tests/test_io_cli_plaintext_chat_image.py \
+            tests/test_io_cli_plaintext_voice.py \
             tests/test_io_cli_identity.py \
             tests/test_io_cli_identity_read.py \
             tests/test_io_cli_identity_write_full.py \

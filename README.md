@@ -622,3 +622,11 @@ coherent data set; see the
 | Read the agent skill (what your AI follows during bootstrap) | <https://github.com/teleport-computer/io-onboarding> |
 | Diagnose why chat messages aren't getting replies | `python tools/check_chat_pipeline.py` |
 | Run the multi-tenant isolation regression suite locally | `pytest tests/` |
+
+### Resident voice archive reads
+
+`io_cli voice-transcript-read --call-id <id>` reads authenticated plaintext
+archives without a content-decrypt service and preserves full-text pagination.
+Mode-request errors and malformed mode responses fail closed; encrypted and
+valid legacy unknown modes retain enclave compatibility. See the
+[resident trust and mode contract](docs-site/content/docs/self-hosting.mdx).
