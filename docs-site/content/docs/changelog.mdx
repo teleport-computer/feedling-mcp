@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Documentation type checking now completes MDX source generation after Next
+  route type generation, preventing interrupted background writes from reaching
+  the TypeScript check. Public API behavior is unchanged.
+
 - Runtime V2 Dream now shares its post-claim model deadline across retries and
   re-asks, retaining the Heavy slot limit and a nominal cleanup reserve. Budget
   exhaustion is distinguished from provider failure; later recovery attempts

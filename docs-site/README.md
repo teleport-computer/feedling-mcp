@@ -40,3 +40,11 @@ npm run build
 ```
 
 The deployable static site is written to `out/`.
+
+`types:check` generates the MDX source before and after Next route type generation.
+The final awaited MDX CLI completes after `next typegen` exits, so its background
+generation cannot leave an interrupted source file for TypeScript. Keep both
+passes and the real TypeScript check; no dependency or API contract changes are
+required. Run `node scripts/test-mdx-generation.mjs` for the controlled shutdown
+regression (requires the locked dependencies installed and exclusive use of this
+checkout's generated `.source` and `.next` directories).
