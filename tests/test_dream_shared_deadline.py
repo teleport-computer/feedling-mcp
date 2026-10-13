@@ -283,6 +283,8 @@ def test_lease_lost_skips_uniform_terminal_and_notifications(monkeypatch):
 
 def test_preprocessing_expired_gate_uses_owner_neutral_return(monkeypatch):
     from model_api_runtime.v2 import worker
+    # Pin P exactly; real monotonic uptime need not exceed 1140 on a fresh runner.
+    monkeypatch.setattr(dream_budget, 'time', SimpleNamespace(monotonic=lambda: 1140.0))
     events = []
     monkeypatch.setattr(worker.jobs_store, 'mark_failed', lambda *a, **kw: False)
     monkeypatch.setattr(worker, 'TurnMetrics', lambda **kw: SimpleNamespace(flush=lambda **kw: events.append(kw)))
