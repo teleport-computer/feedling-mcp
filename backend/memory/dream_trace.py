@@ -34,6 +34,7 @@ OUTCOMES = frozenset({
     "partial",
     "context_unavailable",
     "provider_failed",
+    "budget_exhausted",
     "empty_reply",
     "output_truncated",
     "parse_rejected",
@@ -99,6 +100,8 @@ def context_detail(*, runtime: str, component: str, outcome: str) -> dict:
 def reason_outcome(reason: object) -> str:
     """Collapse arbitrary parser/provider reasons into a content-free enum."""
     code = str(reason or "").strip()
+    if code == "dream_turn_budget_exhausted":
+        return "budget_exhausted"
     if code.startswith("provider_call_failed:"):
         return "provider_failed"
     if code == "empty_reply":

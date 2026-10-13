@@ -100,6 +100,7 @@ from core import store as core_store
 from core import wake_bus as core_wake_bus
 from memory import capture_failure
 from memory import extraction_trace as memory_extraction_trace
+from model_api_runtime.v2 import dream_budget
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
 from memgarden import timestamps as memory_timestamps
@@ -258,6 +259,8 @@ def _session_only_parse(_reply: str) -> tuple[None, str]:
 
 async def _extract_with_provider_health(
     user_id: str,
+    *,
+    success_out: Callable[[float], None] | None = None,
     **kwargs: Any,
 ) -> tuple[Any, str | None]:
     started = time.monotonic()
@@ -267,9 +270,17 @@ async def _extract_with_provider_health(
         await _record_provider_failure(user_id, exc)
         raise
     _items, reason = result
+    deadline = kwargs.get("absolute_deadline")
+    if not reason and deadline is not None and time.monotonic() >= deadline:
+        result = (None, dream_budget.EXHAUSTED)
+        reason = dream_budget.EXHAUSTED
+    if reason == dream_budget.EXHAUSTED:
+        return result  # internal admission budget says nothing about route health
     provider_failure = v2_extraction.provider_failure_code_from_reason(reason or "")
     if provider_failure is not None and provider_failure != "content_filtered":
         await _record_provider_failure_class(user_id, provider_failure)
+    elif not reason and success_out is not None:
+        success_out((time.monotonic() - started) * 1000.0)
     else:
         # Policy refusal and parse/semantic rejection prove the route answered;
         # provider-health tracks route liveness, not card quality.
@@ -1962,6 +1973,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_call_cancelled",
         "capture_provider_fence_incomplete",
         "capture_provider_result_invalid",
+        "dream_turn_budget_exhausted",
         "dream_blast_radius_exceeded",
         "dream_context_unavailable",
         "dream_kernel_outdated",
@@ -12786,6 +12798,36 @@ async def _emit_v2_dream_context_error(
         )
 
 
+async def _settle_dream_budget(
+    job_id, user_id, claimed_by, deps, tm, trace_id="", *,
+    counts=None, degraded_context=False, model_active=False,
+) -> str:
+    """A budget result is terminal only when this owner wins the durable fence."""
+    code = f"extraction_failed:{dream_budget.EXHAUSTED}"
+    owned = await asyncio.to_thread(
+        jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
+    )
+    if not owned:
+        return dream_budget.LEASE_LOST
+    budget = dream_budget.current.get()
+    if model_active:
+        await _emit_v2_dream_lifecycle(
+            deps, user_id, "memory.dream.model.error", job_id=str(job_id), trace_id=trace_id,
+            status="error", outcome="budget_exhausted",
+            started_at=budget.start if budget is not None else time.monotonic(),
+            degraded_context=degraded_context, counts=counts or {},
+        )
+    await _emit_v2_dream_lifecycle(
+        deps, user_id, "memory.dream.error", job_id=str(job_id), trace_id=trace_id,
+        status="error", outcome="budget_exhausted",
+        started_at=budget.start if budget is not None else time.monotonic(),
+        degraded_context=degraded_context, counts=counts or {},
+    )
+    if tm is not None:
+        tm.flush(failed=True, status=code)
+    return "failed"
+
+
 async def _run_extraction(
     job_id,
     user_id: str,
@@ -12809,10 +12851,18 @@ async def _run_extraction(
     capture_window: dict[str, Any] = {}
     dream_started = time.monotonic()
     dream_counts: dict[str, int] = {}
+    pending_provider_success: list[float] = []
+
+    async def _finish_provider_success() -> None:
+        if pending_provider_success:
+            latency = pending_provider_success.pop()
+            await _record_provider_success(user_id, latency_ms=latency)
+
     dream_degraded_context = False
     dream_stage = "context"
     dream_terminal_outcome = "failed"
     dream_model_attempts = 0
+    dream_model_active = False
     dream_context_reader_failed = False
     # Kernel verdict reason when Dream legitimately had nothing to consolidate
     # (the garden is below memgarden's minimum). "" = a real run.
@@ -13548,6 +13598,12 @@ async def _run_extraction(
                 await _ensure_capture_not_halted("legacy_provider_call")
                 items, reason = await _invoke_capture_provider()
         elif lane != "capture":
+            if dream_budget.exhausted():
+                return await _settle_dream_budget(
+                    job_id, user_id, claimed_by, deps, tm, trace_id,
+                    counts=dream_counts, degraded_context=dream_degraded_context,
+                    model_active=dream_model_active,
+                )
             dream_stage = "model"
             await _emit_v2_dream_lifecycle(
                 deps,
@@ -13561,6 +13617,7 @@ async def _run_extraction(
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
+            dream_model_active = True
             _report_turn_progress("extraction_provider_start")
             # dream 也走组件的会话（见上面 open_dream_session 那段）；
             # prompt/parse/parse_retry 只是占位，会话模式下 extract() 不看它们。
@@ -13572,6 +13629,10 @@ async def _run_extraction(
                 parse_retry=parse_retry,
                 session=_capture_session,
                 step_sink=_step_sink,
+                **({"success_out": pending_provider_success.append}
+                   if lane == "dream" and dream_budget.current.get() is not None else {}),
+                **({"absolute_deadline": dream_budget.current.get().provider_deadline}
+                   if lane == "dream" and dream_budget.current.get() is not None else {}),
                 timeout_sec=v2_extraction.wire_deadline_for_lane(lane),
                 wire_deadline_sec=v2_extraction.wire_deadline_for_lane(lane),
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
@@ -13615,6 +13676,14 @@ async def _run_extraction(
                      "truncated_cards": len(dream_disclosure.truncated_ids)},
                     best_effort=True,
                 )
+        if lane == "dream" and (
+            reason == dream_budget.EXHAUSTED or (not reason and dream_budget.exhausted())
+        ):
+            return await _settle_dream_budget(
+                job_id, user_id, claimed_by, deps, tm, trace_id,
+                counts=dream_counts, degraded_context=dream_degraded_context,
+                model_active=dream_model_active,
+            )
         if lane == "dream" and dream_skip_reason:
             await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
             await _emit_v2_dream_lifecycle(
@@ -13632,6 +13701,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
             if tm is not None:
                 tm.flush(failed=False, status="dream_skipped")
+            await _finish_provider_success()
             return "completed"
         if reason:
             if lane == "dream":
@@ -13650,6 +13720,7 @@ async def _run_extraction(
                 )
             raise RuntimeError(reason)
         if lane == "dream":
+            dream_model_active = False
             await _emit_v2_dream_lifecycle(
                 deps,
                 user_id,
@@ -13668,6 +13739,12 @@ async def _run_extraction(
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
+        if lane == "dream" and dream_budget.exhausted():
+            return await _settle_dream_budget(
+                job_id, user_id, claimed_by, deps, tm, trace_id,
+                counts=dream_counts, degraded_context=dream_degraded_context,
+                model_active=dream_model_active,
+            )
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
             await _emit_v2_dream_lifecycle(
@@ -13685,6 +13762,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
             if tm is not None:
                 tm.flush(failed=False, status="ok")
+            await _finish_provider_success()
             return "completed"
 
         if lane == "dream":
@@ -13897,6 +13975,12 @@ async def _run_extraction(
             return "completed"
 
         if lane == "dream":
+            if dream_budget.exhausted():
+                return await _settle_dream_budget(
+                    job_id, user_id, claimed_by, deps, tm, trace_id,
+                    counts=dream_counts, degraded_context=dream_degraded_context,
+                    model_active=dream_model_active,
+                )
             dream_stage = "write"
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
@@ -13960,6 +14044,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
         if tm is not None:
             tm.flush(failed=False, status="ok")
+        await _finish_provider_success()
         return "completed"
     except LostJobLease:
         # A stale owner must not mutate Capture state/backoff or replace the
@@ -14001,6 +14086,7 @@ async def _run_extraction(
             tm.flush(failed=True, status="turns_halted")
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
+        await _finish_provider_success()
         code = _extraction_failure_code(e)
         if lane == "dream" and not dream_terminal_emitted:
             if dream_terminal_outcome == "failed":
@@ -17773,6 +17859,8 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     # Execution only; queue-inclusive elapsed time is terminal.ts - enqueued.ts.
     started_ns = time.monotonic_ns()
     outcome = await _run_turn_body(job, deps, enclave_sem=enclave_sem)
+    if outcome == dream_budget.LEASE_LOST:
+        return outcome
     # Deliberately NOT a finally: a finally also runs for CancelledError and for
     # any unhandled BaseException, and would then emit outcome="failed" for a
     # turn that was merely drained -- inventing a failure that never happened.
@@ -17929,6 +18017,10 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     claimed_by = str(job.get("claimed_by") or "")
     lane = str(job.get("lane") or "chat")
     tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
+    if lane == "dream" and dream_budget.exhausted():
+        return await _settle_dream_budget(
+            job_id, user_id, claimed_by, deps, tm, str(job.get("trace_id") or "")
+        )
 
     async def _settle_legacy_traced_chat_failure(code: str) -> None:
         trace_id = str(job.get("trace_id") or "")
@@ -18313,6 +18405,8 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             tm=tm,
             trajectory_recorder=recorder,
         )
+        if outcome == dream_budget.LEASE_LOST:
+            return outcome
         await _record_trajectory(
             recorder,
             "turn_terminal",
@@ -18454,6 +18548,7 @@ async def _slot_loop(
     slot_generation: str = "g0",
     progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
     enclave_sem=None,
+    turn_absolute_budget_sec: float | None = None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -18547,12 +18642,17 @@ async def _slot_loop(
                 _signal_progress(stage, turn_start)
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
+            budget_token = dream_budget.current.set(
+                dream_budget.from_start(turn_start, turn_absolute_budget_sec)
+                if active_job.lane == "dream" and turn_absolute_budget_sec is not None else None
+            )
             try:
                 if enclave_sem is None:
                     await _run_turn(job, deps)
                 else:
                     await _run_turn(job, deps, enclave_sem=enclave_sem)
             finally:
+                dream_budget.current.reset(budget_token)
                 _TURN_PROGRESS_CB.reset(progress_token)
             _signal_progress("durable_completion", turn_start)
             active_job = None

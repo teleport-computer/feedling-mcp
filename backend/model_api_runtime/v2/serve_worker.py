@@ -6885,7 +6885,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     )
     fleet = v2_pool_supervisor.SlotFleet(
         config,
-        spawn_target=turn_child.main,
+        spawn_target=turn_child.main_with_turn_budget,
         worker_id=worker_id,
         poll_interval=poll_interval,
         db_pool_max=_runtime_db_pool_limits(config)[1],
