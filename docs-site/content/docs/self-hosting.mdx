@@ -105,6 +105,23 @@ bodies fail without decrypt fallback; encrypted or unknown mode keeps the enclav
 history path. The backend's existing whoami public-attestation lookup is unchanged,
 so this CLI routing change does not establish zero backend-to-enclave traffic.
 
+`io_cli voice-transcript-read --call-id <id>` reads an effective `off` account's
+own plaintext voice archive through the authenticated backend and decodes it
+locally, with no content-decrypt fallback or enclave URL requirement. It preserves
+full Unicode text, metadata, and 6000-character pages. Sealed legacy archives,
+mixed sealed/plaintext rows, foreign owners, malformed bodies, and failed reads
+remain unreadable; a preview is never substituted for the full transcript.
+
+This voice command stops if the mode request fails or its response has no valid
+user identity. A present null or non-string effective mode is also an error.
+Only an authenticated successful response with `on`, or a missing, empty, or
+unrecognized **string** effective mode, retains the legacy enclave path. Unknown
+strings are not normalized into `off`. This stricter error handling applies to
+this voice command; other CLI commands are unchanged. The existing whoami
+attestation lookup remains separate, so this is not a claim of zero backend
+attestation traffic. Plaintext archives are visible to the backend and resident
+host under their existing trust boundaries.
+
 This history policy is independent of the memory-selection switch below.
 Startup and health probes follow the account mode described above; other
 Resident operations, including the separate memory-selection fallback, may

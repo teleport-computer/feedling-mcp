@@ -17,6 +17,12 @@ change must not be interpreted as an API guarantee.
   conflict states; an offline reader summarizes authorized snapshots without
   changing failure statistics or background behavior.
 
+- `io_cli voice-transcript-read` reads effective plaintext accounts' own archives
+  locally, preserving full text and pagination without an enclave URL. Sealed or
+  malformed archives fail without decrypt fallback. Failed or malformed mode
+  responses stop the command; encrypted and valid legacy unknown modes retain
+  their existing decrypt path.
+
 - Documentation type checking now completes MDX source generation after Next
   route type generation, preventing interrupted background writes from reaching
   the TypeScript check. Public API behavior is unchanged.
