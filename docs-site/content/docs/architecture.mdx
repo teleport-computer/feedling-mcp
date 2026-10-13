@@ -833,6 +833,17 @@ broker shared across all children. All three pools still run inside one
 confidential VM and one service instance; process isolation limits a hung Job's
 failure domain but is not a sandbox for mutually hostile code.
 
+For Dream, the child uses the original post-claim monotonic start and the same
+slot budget supplied to the parent's watchdog. A task-local deadline reserves
+120 nominal seconds for cleanup; all model retries and re-asks consume its
+remaining time. This does not extend the Heavy slot's absolute limit or change
+its stall clock. The existing parent absolute-age calculation assumes a common
+host monotonic clock domain; this is not a distributed clock protocol. Explicit
+budget provenance separates a local deadline from an earlier provider failure.
+Database writes are not made atomic or safely cancelable by this timer, and
+existing watchdog recovery does not establish that Dream effects can be replayed
+without duplication. Pool topology and the enclave trust boundary are unchanged.
+
 Durable jobs, conversation state, reply cursors, ownership fences, deadlines,
 and terminal errors live in PostgreSQL. A watchdog restarts only the exact
 stalled slot, and PostgreSQL recovery settles that slot's exact claim before

@@ -19,6 +19,8 @@ from typing import Any, Awaitable, Callable, NamedTuple
 from memgarden.prompts.recall_fields import retrieval_cues
 
 import provider_client
+import provider_deadline
+import time
 import provider_refusal
 from notices import error_contract
 
@@ -273,6 +275,7 @@ async def extract(
     max_tokens: int = CAPTURE_MAX_OUTPUT_TOKENS,
     timeout_sec: float | None = None,
     wire_deadline_sec: float | None = None,
+    absolute_deadline: float | None = None,
     progress_cb: Callable[[str, int], None] | None = None,
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
@@ -348,6 +351,8 @@ async def extract(
         max_attempts: int = 3,
     ) -> tuple[str | None, str | None, dict[str, Any]]:
         """跑一次 provider，返回 reply、error 与 content-free 响应形状。"""
+        if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+            return None, "dream_turn_budget_exhausted", {}
         messages = [{"role": "user", "content": attempt_prompt}]
         if trajectory_out is not None:
             await trajectory_out(
@@ -359,6 +364,8 @@ async def extract(
                 messages,
                 max_tokens=budget,
                 max_attempts=max_attempts,
+                **({"absolute_deadline": absolute_deadline, "deadline_provenance": True}
+                   if absolute_deadline is not None else {}),
                 temperature=_TEMPERATURE,
                 timeout=base_timeout if retry_timeout is None else retry_timeout,
                 wire_deadline_sec=(
@@ -373,6 +380,17 @@ async def extract(
                 retry_output_truncation=False,
             )
         except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
+            if (isinstance(e, provider_deadline.ProviderAbsoluteDeadlineExceeded)
+                    and e.deadline_at == absolute_deadline):
+                late = e.late_result
+                if isinstance(late, dict) and usage_out is not None:
+                    usage_out(late.get("usage"))
+                if trajectory_out is not None:
+                    await trajectory_out("provider_error", {
+                        "error_class": "dream_turn_budget_exhausted",
+                        "provider_attempt_trace": provider_client.runtime_provider_attempt_trace(e),
+                    })
+                return None, "dream_turn_budget_exhausted", {}
             if provider_client.is_output_truncation_error(e):
                 # HTTP 200, success shape, no usable text, stop marker = output
                 # cap: typically a thinking model that spent the whole budget on
@@ -428,6 +446,8 @@ async def extract(
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if trajectory_out is not None:
             await trajectory_out("provider_response", {"response": result})
+        if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+            return None, "dream_turn_budget_exhausted", {}
         response_shape = _response_shape(
             (result or {}).get("stop_reason"), (result or {}).get("usage"), budget
         )

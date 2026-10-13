@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import provider_deadline
 import base64
 import contextvars
 import copy
@@ -3797,6 +3798,13 @@ async def _traced_async_json_post(
     }
     try:
         response = await _post_within_wire_deadline(post, request_payload)
+    except asyncio.CancelledError:
+        if provider_deadline.attempt_trace.get() is not None:
+            entry["error_class"] = "cancelled"
+            entry["outcome"] = "cancelled"
+            entry["duration_ms"] = _attempt_duration_ms(started_ns)
+            trace.append(entry)
+        raise
     except Exception as exc:  # noqa: BLE001 -- retain evidence, preserve exception
         status = getattr(exc, "status_code", None)
         entry["status"] = int(status) if isinstance(status, int) else None
@@ -6134,6 +6142,9 @@ async def chat_completion_async(
     attempt_trace: list[dict[str, Any]] | None = (
         [] if config.capture_attempt_trace else None
     )
+    deadline_trace = provider_deadline.attempt_trace.get()
+    if attempt_trace is not None and deadline_trace is not None:
+        attempt_trace = deadline_trace
     try:
         result = await _chat_completion_async_impl(
             config,
@@ -6276,6 +6287,7 @@ async def reliable_chat_completion_async(
     refusal_out: Any = None,
     retry_refusal: bool = True,
     absolute_deadline: float | None = None,
+    deadline_provenance: bool = False,
     retry_output_truncation: bool = True,
     wire_deadline_sec: float | None = None,
     **kwargs: Any,
@@ -6312,6 +6324,8 @@ async def reliable_chat_completion_async(
     read timeout does, so retry and classification are unchanged. For callers
     whose hosted watchdog stall budget must outlast one wire (Heavy pool).
     """
+    if deadline_provenance and (absolute_deadline is None or not math.isfinite(absolute_deadline)):
+        raise ValueError("deadline provenance requires a finite absolute_deadline")
     if wire_deadline_sec is not None:
         wire_deadline_sec = float(wire_deadline_sec)
         if not math.isfinite(wire_deadline_sec) or wire_deadline_sec <= 0:
@@ -6371,11 +6385,26 @@ async def reliable_chat_completion_async(
                 _WIRE_START_CB.reset(cb_token)
 
     for attempt in range(1, attempts + 1):
+        if deadline_provenance and time.monotonic() >= absolute_deadline:
+            exc = provider_deadline.ProviderAbsoluteDeadlineExceeded(absolute_deadline, "entry")
+            if provider_attempt_trace is not None:
+                _attach_provider_attempt_trace(exc, provider_attempt_trace)
+            raise exc
         started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
         try:
             attempt_kwargs = kwargs
-            if absolute_deadline is not None:
+            if deadline_provenance:
+                remaining = absolute_deadline - time.monotonic()
+                attempt_kwargs = dict(kwargs)
+                if "timeout" in attempt_kwargs and remaining > 0:
+                    attempt_kwargs["timeout"] = min(float(attempt_kwargs["timeout"]), remaining)
+                result = await provider_deadline.run_attempt(
+                    lambda: _with_wire_progress(
+                        chat_completion_async(*args, **attempt_kwargs), attempt
+                    ), absolute_deadline,
+                )
+            elif absolute_deadline is not None:
                 remaining = float(absolute_deadline) - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("provider absolute deadline exceeded")
@@ -6419,8 +6448,18 @@ async def reliable_chat_completion_async(
                 exc.provider_refusal = refusal
                 _attach_provider_attempt_trace(exc, _attempts_from_result(result))
                 raise exc
-            await provider_refusal.observe(refusal_out, result, attempt)
+            if deadline_provenance:
+                try:
+                    await provider_refusal.observe(refusal_out, result, attempt)
+                except Exception:
+                    pass
+            else:
+                await provider_refusal.observe(refusal_out, result, attempt)
             _progress("attempt_complete", attempt)
+            if deadline_provenance and time.monotonic() >= absolute_deadline:
+                raise provider_deadline.ProviderAbsoluteDeadlineExceeded(
+                    absolute_deadline, "late_success", result=result
+                )
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
                     provider_attempt_trace,
@@ -6459,9 +6498,36 @@ async def reliable_chat_completion_async(
                 result = _with_provider_attempt_trace(result, provider_attempt_trace)
             return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
-            await provider_refusal.observe(refusal_out, exc, attempt)
+            if isinstance(exc, provider_deadline.ProviderAbsoluteDeadlineExceeded):
+                retained = exc.deadline_attempt_trace
+                if not retained:
+                    retained = _attempts_from_result(exc.late_result)
+                    if not retained and exc.__cause__ is not None:
+                        retained = _attempts_from_exception(exc.__cause__)
+                # A late success after our observer already has its outer marker
+                # in provider_attempt_trace. Do not duplicate that entire chain.
+                retained = [item for item in retained if item.get("kind") == "http_attempt"]
+                if retained:
+                    _attach_provider_attempt_trace(exc, retained)
+            # Snapshot provider facts before any observer can cross P.
+            if deadline_provenance:
+                cls = classify_provider_error(exc)
+                intrinsic_terminal = (
+                    cls == "provider_config"
+                    or (not retry_output_truncation and is_output_truncation_error(exc))
+                    or (not retry_refusal and provider_refusal.project(
+                        getattr(exc, "provider_refusal", None)) is not None)
+                    or attempt >= attempts
+                )
+                try:
+                    await provider_refusal.observe(refusal_out, exc, attempt)
+                except Exception:
+                    pass  # observer failure never replaces the captured cause
+            else:
+                await provider_refusal.observe(refusal_out, exc, attempt)
             _progress("attempt_failed", attempt)
-            cls = classify_provider_error(exc)
+            if not deadline_provenance:
+                cls = classify_provider_error(exc)
             last_exc = exc
             deadline_exhausted = (
                 absolute_deadline is not None
@@ -6479,6 +6545,7 @@ async def reliable_chat_completion_async(
                 or refusal_terminal
                 or attempt >= attempts
                 or deadline_exhausted
+                or isinstance(exc, provider_deadline.ProviderAbsoluteDeadlineExceeded)
             )
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
@@ -6516,6 +6583,20 @@ async def reliable_chat_completion_async(
                         },
                     }
                 )
+            if deadline_provenance and (
+                isinstance(exc, provider_deadline.ProviderAbsoluteDeadlineExceeded)
+                or (deadline_exhausted and not intrinsic_terminal)
+            ):
+                budget_exc = exc if isinstance(
+                    exc, provider_deadline.ProviderAbsoluteDeadlineExceeded
+                ) else provider_deadline.ProviderAbsoluteDeadlineExceeded(
+                    absolute_deadline, "retry_admission"
+                )
+                if provider_attempt_trace is not None:
+                    _attach_provider_attempt_trace(budget_exc, provider_attempt_trace)
+                if budget_exc is exc:
+                    raise
+                raise budget_exc from exc
             if terminal:
                 exc.feedling_error_class = (
                     "content_filtered"
@@ -6541,8 +6622,11 @@ async def reliable_chat_completion_async(
                 if remaining <= 0 or delay >= remaining:
                     if remaining > 0:
                         await asyncio.sleep(remaining)
-                    deadline_exc = TimeoutError(
-                        "provider absolute deadline exceeded during retry backoff"
+                    deadline_exc = (
+                        provider_deadline.ProviderAbsoluteDeadlineExceeded(absolute_deadline, "backoff")
+                        if deadline_provenance else TimeoutError(
+                            "provider absolute deadline exceeded during retry backoff"
+                        )
                     )
                     deadline_exc.feedling_error_class = "transient_exhausted"
                     if provider_attempt_trace is not None:

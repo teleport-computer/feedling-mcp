@@ -323,6 +323,24 @@ with a payment-required response (402), the same concise prompt gets one
 fallback at the original budget and timeouts. An initial 402 remains a quota
 failure. This fallback can add a provider call; it cannot escalate again.
 
+Runtime V2 Dream shares one model deadline across reliable retries, format and
+semantic re-asks, truncation upgrades, and original-token-budget fallbacks. The
+clock starts immediately after the slot claims the job, before provider setup
+and memory reads. With the current 1,260-second Heavy limit, model work stops
+at 1,140 seconds from that start, leaving a nominal 120-second cleanup window.
+Preprocessing consumes the same budget. Configured attempts and token limits
+remain unchanged, but a depleted budget can prevent later recovery attempts.
+
+Budget exhaustion is an internal `dream_turn_budget_exhausted` failure and does
+not count as provider success or route failure. A confirmed terminal job records
+`extraction_failed:dream_turn_budget_exhausted`; a worker that has lost ownership
+does not publish a budget terminal result. Provider failures that happened before
+the deadline retain their own classification. Before starting memory writes,
+Dream checks the deadline again. Once writing begins, it does not add a new
+cancellation point. The cleanup window is not a database completion guarantee;
+the existing watchdog and claim recovery remain the last resort. Capture and
+other lanes do not inherit this Dream deadline.
+
 Runtime V2 Dream retains 180-second wire and phase timeouts; profile generation
 retains 90 seconds. Chat and wake provider timeouts are unchanged. The shared
 Heavy pool retains its limits of 210 seconds without progress and 1,260 seconds
