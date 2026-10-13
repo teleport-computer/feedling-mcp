@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # Feedling API documentation
 
 Static API documentation built with the official Fumadocs Next.js Static
