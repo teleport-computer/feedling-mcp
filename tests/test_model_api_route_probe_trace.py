@@ -25,7 +25,7 @@ def test_route_probe_safe_correlation_and_single_call(client, probe_user, monkey
     created = client.post('/v1/model_api/routes', headers=headers, json={
         'credential_id':str(cid), 'model':sentinel, 'context_window_tokens':65536, 'activate':False})
     rid = created.get_json()['route']['id']
-    _events(client, headers)
+    _events(client, headers, uid)
     debug_trace.clear_trace(SimpleNamespace(user_id=uid))
     calls = []
     def probe(config):
@@ -39,7 +39,7 @@ def test_route_probe_safe_correlation_and_single_call(client, probe_user, monkey
     response = client.post(f'/v1/model_api/routes/{rid}/{operation}', headers=headers)
     assert response.status_code == (400 if failure else 200)
     assert len(calls)==1 and calls[0].model==sentinel
-    events = _events(client, headers)
+    events = _events(client, headers, uid)
     assert len(events)==2
     assert {e['detail']['phase'] for e in events}=={'started','finished'}
     assert len({e['trace_id'] for e in events})==1
@@ -107,7 +107,7 @@ def test_credential_rotation_observes_one_probe_without_leaking_or_losing_old_ke
     before = db.model_api_credential_get(uid, cid)
     monkeypatch.setattr(setup_core.core_envelope, "_build_shared_envelope_for_store",
                         lambda *a, **k: ({"v": 1, "body_ct": "new-ct", "nonce": "new-n"}, None))
-    _events(client, headers)
+    _events(client, headers, uid)
     debug_trace.clear_trace(SimpleNamespace(user_id=uid))
     calls = []
 
@@ -133,7 +133,7 @@ def test_credential_rotation_observes_one_probe_without_leaking_or_losing_old_ke
         assert after["api_key_envelope"] != before["api_key_envelope"]
     assert db.model_api_active_route(uid)["id"] == active["id"]
     assert db.model_api_active_route(uid)["test_status"] == "ok"
-    events = _events(client, headers)
+    events = _events(client, headers, uid)
     assert len(events) == 2
     assert {e["detail"]["phase"] for e in events} == {"started", "finished"}
     assert len({e["trace_id"] for e in events}) == 1
@@ -176,7 +176,7 @@ def test_credential_patch_without_active_key_change_does_not_probe(
         cid = created.get_json()["route"]["credential_id"]
         assert cid != active["credential_id"]
         payload = {"api_key": "synthetic-replacement-key"}
-    _events(client, headers)
+    _events(client, headers, uid)
     debug_trace.clear_trace(SimpleNamespace(user_id=uid))
 
     def unexpected_probe(*args, **kwargs):
@@ -187,4 +187,4 @@ def test_credential_patch_without_active_key_change_does_not_probe(
     response = client.patch(f"/v1/model_api/credentials/{cid}", headers=headers, json=payload)
     assert response.status_code == 200
     assert db.model_api_active_route(uid)["id"] == active["id"]
-    assert not _events(client, headers)
+    assert not _events(client, headers, uid)

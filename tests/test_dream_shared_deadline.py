@@ -265,7 +265,8 @@ def test_claim_budget_context_is_reset_and_not_inherited_by_capture(monkeypatch)
         assert dream_budget.current.get() is None
     asyncio.run(scenario())
     assert seen[0].start == progress[0].turn_start
-    assert seen[0].provider_deadline == seen[0].start + 1140
+    assert seen[0].hard_deadline == seen[0].start + 1260
+    assert seen[0].provider_deadline == seen[0].hard_deadline - 120
     assert seen[1] is None
 
 
