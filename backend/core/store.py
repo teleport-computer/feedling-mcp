@@ -2249,6 +2249,7 @@ class UserStore:
         fields: dict,
         *,
         only_if_status: str | None = None,
+        failure_report_context=None,
     ) -> dict | None:
         """Patch one hidden proactive job in-place. Status has a real lifecycle
         so the debug dashboard can distinguish "not consumed" from "agent
@@ -2293,8 +2294,12 @@ class UserStore:
         if not patch:
             return None
         patch["updated_at"] = datetime.now().isoformat()
-        changed = db.log_patch_item(
-            self.user_id, "proactive_jobs", job_id, patch, only_if_status=only_if_status
+        from proactive.failure_diagnostics import ResidentFailureReportContext
+        if type(failure_report_context) is not ResidentFailureReportContext:
+            failure_report_context = None
+        changed = db.log_patch_proactive_job(
+            self.user_id, job_id, patch, only_if_status=only_if_status,
+            failure_report_context=failure_report_context,
         )
         if changed is not None:
             self.notify_proactive_job_waiters()

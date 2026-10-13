@@ -2608,6 +2608,21 @@ OPTIONAL_PRECISE_BODIES: set[Operation] = {
 
 
 SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
+    ("post", "/v1/proactive/jobs/{job_id}/status"): {
+        "required": False,
+        "content": {"application/json": {"schema": {
+            "type": "object", "additionalProperties": True,
+            "properties": {
+                "status": {"description": "Existing status update; diagnostic-only requests remain invalid."},
+                "reason": {"description": "Existing status reason; diagnostic categories do not replace it."},
+                "consumer_id": {"description": "Existing consumer identity. Diagnostic binding additionally requires the original value to be a nonempty, untrimmed string of at most 160 characters matching the stored consumer."},
+                "failure_diagnostic": {
+                    "description": "Optional consumer claim, accepted only as exactly {v: 1, reported_error_class: <allowed class>}. Missing, malformed, extra-key, unknown-version or unknown-class claims degrade to unknown without rejecting the original status update. This permissive schema describes that compatibility behavior, not a new strict request validator.",
+                    "examples": [{"v": 1, "reported_error_class": "quota_insufficient"}],
+                },
+            },
+        }}},
+    },
     ("post", "/v1/onboarding/archive"): {
         "required": True,
         "content": {
@@ -2659,6 +2674,18 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("post", "/v1/proactive/jobs/{job_id}/status"): (
+        "Update the authenticated user's job with the existing status semantics. "
+        "Resident proactive failed jobs may expose an optional failure_diagnostic object in the returned job: "
+        "v=1, reported_error_class, source (consumer_reported or none), and state "
+        "(reported, missing, invalid, binding_unavailable, conflicting_reports). Other states clear it to null. "
+        "Allowed reported classes: auth_invalid, quota_insufficient, model_not_found, provider_account_expired, "
+        "rate_limited, upstream_unavailable, provider_incompatible, cli_config_invalid, resident_agent_cli_logged_out, "
+        "turn_timeout, content_filtered, context_overflow, reply_parse_failed, provider_error_unclassified, "
+        "provider_empty_reply, unknown. Every non-reported state has class unknown and source none. "
+        "These are consumer statements, not verified provider causes or attempt identities. Old clients remain compatible; "
+        "no reason text is reclassified and outcome statistics, notifications, retry and cooldown behavior are unchanged."
+    ),
     ("post", "/v1/voice/cancel"): (
         "Idempotently end a voice call that will not be archived. The durable "
         "tombstone suppresses late resident and Hosted Runtime V2 replies "
