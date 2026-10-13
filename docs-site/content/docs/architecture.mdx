@@ -163,6 +163,13 @@ it does not create or configure the bucket or its lifecycle.
 5. The runner wraps the assistant result in the effective write shape before
    it is persisted. The original send remains asynchronous and returns `202`.
 
+For effective plaintext accounts, the resident `io_cli identity-read` fetches
+its authenticated raw identity envelope from the API and projects the card on
+the resident host. It does not call the decrypt service for this content.
+Owner checks, local-only metadata handling, failed reads and legacy day-count
+compatibility are specified in [self-hosting](/docs/self-hosting). This does not
+change the behavior of other identity consumers or the doctor probes.
+
 The model provider is an external plaintext recipient. For encrypted records,
 envelope encryption protects persisted content and the storage path; it does not hide the prompt
 from the model selected to process it. When visible push text is enabled, that

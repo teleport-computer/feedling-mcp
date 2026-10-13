@@ -2674,6 +2674,13 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("get", "/v1/identity/get"): (
+        "Read the authenticated user's raw identity envelope with server-computed days_with_user. "
+        "A missing row returns identity:null. Storage read or explicit enrichment failure returns "
+        "503 identity_read_unavailable; a stored non-object, including JSON null, returns "
+        "500 identity_storage_invalid. Errors contain fixed codes, not database exception details. "
+        "Successful encrypted and plaintext envelopes retain their storage shape; this endpoint does not decrypt."
+    ),
     ("post", "/v1/proactive/jobs/{job_id}/status"): (
         "Update the authenticated user's job with the existing status semantics. "
         "Resident proactive failed jobs may expose an optional failure_diagnostic object in the returned job: "
@@ -2930,6 +2937,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/identity/get"): {
+        "500": {
+            "description": "identity_storage_invalid: stored identity is not a JSON object (including JSON null).",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+        "503": {
+            "description": "identity_read_unavailable: storage read or explicit enrichment failed; not an absent identity.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+    },
     ("get", "/v1/worldbook/list"): {
         "200": {
             "description": (

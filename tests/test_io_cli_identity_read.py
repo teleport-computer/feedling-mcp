@@ -44,6 +44,8 @@ def _run(monkeypatch, *, enclave_url, responses):
 
     def _fake_http(method, url, auth, **kw):
         seen.append(url)
+        if url.endswith("/v1/users/whoami"):
+            return 200, {"user_id": "usr_identity", "content_encryption_effective": "on"}
         for needle, resp in responses.items():
             if needle in url:
                 return resp
@@ -64,7 +66,7 @@ def test_enclave_plaintext_is_returned_without_touching_the_backend(monkeypatch)
                            responses={"enclave.local": (200, _PLAINTEXT)})
     assert code == 0 and obj["ok"] is True
     assert obj["identity"]["agent_name"] == "裴晟"
-    assert not any("api.local" in u for u in seen)
+    assert not any("api.local/v1/identity/get" in u for u in seen)
 
 
 def test_enclave_failure_is_reported_not_papered_over_with_ciphertext(monkeypatch):

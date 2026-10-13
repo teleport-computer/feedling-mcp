@@ -1122,24 +1122,77 @@ def _is_readable_card(body) -> bool:
     return not str(identity.get("decrypt_status") or "").startswith("error")
 
 
+def _plaintext_identity_view(body, user_id):
+    """Materialize an authenticated off-account card without decrypt fallback."""
+    from identity import card_view
+
+    if (not isinstance(body, dict) or "identity" not in body
+            or ("user_id" in body and body["user_id"] != user_id)):
+        raise ValueError("identity response malformed")
+    stored = body["identity"]
+    if stored is None:
+        return {"identity": None, "user_id": user_id}
+    if not isinstance(stored, dict) or stored.get("owner_user_id") != user_id:
+        raise ValueError("identity owner mismatch")
+    base = card_view.envelope_base(stored)
+    if stored.get("visibility") == "local_only":
+        view = card_view.local_only_view(base)
+    else:
+        if "body_ct" in stored:
+            raise ValueError("sealed identity unavailable")
+        if "body_b64" in stored:
+            if "body" in stored or not isinstance(stored["body_b64"], str):
+                raise ValueError("identity binary body malformed")
+            raw = base64.b64decode(stored["body_b64"], validate=True).decode("utf-8")
+        elif isinstance(stored.get("body"), str):
+            raw = stored["body"]
+            raw.encode("utf-8")
+        else:
+            raise ValueError("identity body missing")
+        inner = json.loads(raw)
+        if not isinstance(inner, dict):
+            raise ValueError("identity body must be an object")
+        days = stored.get("days_with_user")
+        if not isinstance(days, int) or isinstance(days, bool) or days < 0:
+            raise ValueError("identity days unavailable")
+        # Use the backend's live value, including its relationship-anchor repair.
+        # Do not recompute with the CLI machine's clock or use stale inner days.
+        view = card_view.plaintext_view(base, inner, stored, days_with_user=days)
+    return {"identity": view, "user_id": user_id}
+
+
 def cmd_identity_read(args):
-    """Read the CURRENT identity card (decrypted) so a rewrite builds ON it, not over it.
+    """Read the current identity card before making a partial update.
 
-    Call this BEFORE writing/re-deriving identity from material a user hands you:
-    keep the fields the new material doesn't address (部分补全), only change what it
-    does. Decrypt source is the enclave's ``GET /v1/identity/get`` (TEE cert the
-    stdlib client doesn't verify → insecure=True, mirrors chat-image), falling back
-    to the backend when no enclave is configured.
-
-    The backend's same-named endpoint serves the raw E2E envelope on purpose (iOS
-    holds the user key and decrypts locally), so a fallback response is only
-    useful if it actually came back decrypted — hence ``_is_readable_card``. This
-    used to emit ``ok: True`` for an envelope, which made the agent describe its
-    own persona as unreadable encrypted fields AND discarded the enclave's status
-    code, destroying the evidence for why the decrypt path failed."""
+    Effective off uses authenticated backend storage and local canonical views.
+    Encrypted/unknown accounts retain the enclave-first compatibility path.
+    """
     auth = _auth_headers()
     if not auth:
         _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    api_url = _env("FEEDLING_API_URL").rstrip("/")
+    if api_url:
+        mode_status, account = _http_json("GET", f"{api_url}/v1/users/whoami", auth)
+        if (mode_status != 200 or not isinstance(account, dict)
+                or not isinstance(account.get("user_id"), str)
+                or not account["user_id"].strip()
+                or ("content_encryption_effective" in account
+                    and not isinstance(account["content_encryption_effective"], str))):
+            _emit({"ok": False, "http_status": mode_status,
+                   "error": "account mode unavailable or malformed"}, 1)
+        if account.get("content_encryption_effective") == "off":
+            status, body = _http_json("GET", f"{api_url}/v1/identity/get", auth)
+            if status != 200:
+                _emit({"ok": False, "http_status": status, "error": body}, 1)
+            try:
+                view = _plaintext_identity_view(body, account["user_id"])
+                # JSON escapes can introduce lone surrogates after raw-body
+                # validation; metadata also rides through the canonical view.
+                # Keep final output validation inside this command's error path.
+                json.dumps(view, ensure_ascii=False).encode("utf-8")
+            except (ValueError, TypeError, OverflowError, UnicodeError, ImportError):
+                _emit({"ok": False, "error": "plaintext identity unavailable or malformed"}, 1)
+            _emit({"ok": True, **view})
     enclave_url = _env("FEEDLING_ENCLAVE_URL")
     status, body = -1, {}
     enclave_status, enclave_body = None, None

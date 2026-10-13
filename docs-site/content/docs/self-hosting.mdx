@@ -117,10 +117,42 @@ user identity. A present null or non-string effective mode is also an error.
 Only an authenticated successful response with `on`, or a missing, empty, or
 unrecognized **string** effective mode, retains the legacy enclave path. Unknown
 strings are not normalized into `off`. This stricter error handling applies to
-this voice command; other CLI commands are unchanged. The existing whoami
+this voice command and the identity command described below. The existing whoami
 attestation lookup remains separate, so this is not a claim of zero backend
 attestation traffic. Plaintext archives are visible to the backend and resident
 host under their existing trust boundaries.
+
+`io_cli identity-read` uses the same strict authenticated mode check when a
+backend URL is configured. Effective `off` reads the existing backend identity
+endpoint and projects the caller's plaintext card locally, without an enclave
+URL or content-decrypt fallback. It validates the owner and rejects sealed,
+mixed, or malformed bodies. A `local_only` card returns metadata only. Valid
+empty or sparse JSON objects keep the canonical card defaults; a truly absent
+card returns `identity: null`. Profile fields and replacement metadata are
+preserved. Encrypted and valid unknown modes keep the enclave-first path;
+legacy enclave-only configuration also remains supported.
+
+The CLI uses the backend's `days_with_user`, including its existing memory-anchor
+repair, rather than the client machine's clock or a stale value embedded in the
+card. Ordinary anchored cards retain their day count. Legacy cards with no or
+invalid anchor, or a repaired earlier memory date, can differ from the old
+enclave projection. Auxiliary memory lookup remains best effort.
+
+`GET /v1/identity/get` still returns raw envelopes for authenticated clients in
+all modes. A missing row returns HTTP 200 with `identity: null`; a stored
+non-object (including JSON null) returns HTTP 500 `identity_storage_invalid`.
+A database read or explicit enrichment failure returns HTTP 503
+`identity_read_unavailable`, with no database exception details. Clients must
+not treat these failures as permission to initialize or replace a card.
+
+These failure guarantees apply to this endpoint and the new CLI read path.
+Existing Resident reads still have their own error handling. Legacy unmanaged
+Genesis reinitialization can continue after a failed read of a Genesis-owned
+card; this change does not fix or authorize that existing write behavior.
+`doctor` retains its separate five-probe behavior, including its enclave content
+probe. The whoami public-attestation lookup is unchanged. Plaintext identity
+content is visible to the backend and resident host within their existing trust
+boundaries; no new decryption service or plaintext API is added.
 
 This history policy is independent of the memory-selection switch below.
 Startup and health probes follow the account mode described above; other

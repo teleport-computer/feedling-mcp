@@ -41,6 +41,33 @@ def get_identity(store) -> tuple[dict, int]:
     return {"identity": enriched}, 200
 
 
+def get_identity_strict(store) -> tuple[dict, int]:
+    """HTTP read: distinguish a missing row from failed or malformed storage.
+
+    Keep legacy in-process readers and their best-effort loader unchanged.
+    The mapping retains row presence even when the stored JSON value is null.
+    """
+    import db
+
+    key = (store.user_id, "identity")
+    try:
+        rows = db.get_blobs_for_users(
+            [store.user_id], ["identity"], raise_on_error=True)
+    except Exception:
+        return {"error": "identity_read_unavailable"}, 503
+    if key not in rows:
+        return {"identity": None}, 200
+    data = rows[key]
+    if not isinstance(data, dict):
+        return {"error": "identity_storage_invalid"}, 500
+    try:
+        enriched = dict(data)
+        enriched["days_with_user"] = identity_service._live_days_with_user(data, store=store)
+    except Exception:
+        return {"error": "identity_read_unavailable"}, 503
+    return {"identity": enriched}, 200
+
+
 def run_actions(
     store, payload: dict, *, api_key: str | None, runtime_token: str,
     trusted_relationship_anchor: str | None = None,

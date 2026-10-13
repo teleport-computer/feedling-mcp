@@ -12,6 +12,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `io_cli identity-read` reads effective plaintext identities locally with owner
+  checks and no content-decrypt fallback. It uses backend relationship days,
+  including anchor repair, which can differ from legacy enclave counts. The
+  existing identity GET now distinguishes absent rows from unavailable reads
+  (503) and non-object storage (500), while preserving successful raw envelopes.
+  Doctor and legacy identity writers retain their existing behavior.
+
 - Resident proactive failure status updates accept an optional bounded diagnostic
   claim. Job responses preserve its consumer-reported provenance, unknown and
   conflict states; an offline reader summarizes authorized snapshots without

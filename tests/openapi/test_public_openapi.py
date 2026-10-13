@@ -1114,3 +1114,11 @@ def test_provider_probe_failure_contract_is_additive_and_shared():
             {'$ref': '#/components/schemas/ProviderTestFailedResponse'},
             {'$ref': '#/components/schemas/ErrorResponse'},
         ]
+
+
+def test_identity_read_distinguishes_missing_invalid_and_unavailable(public_schema):
+    operation = public_schema["paths"]["/v1/identity/get"]["get"]
+    assert "identity:null" in operation["description"]
+    assert "identity_storage_invalid" in operation["responses"]["500"]["description"]
+    assert "identity_read_unavailable" in operation["responses"]["503"]["description"]
+    assert "200" in operation["responses"]
