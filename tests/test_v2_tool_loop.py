@@ -3871,7 +3871,9 @@ def test_internal_image_processing_failure_is_handed_back_for_companion_reply(
 
 def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
     """说了没做要纠正,但**只纠正一次**;再撒谎照原样发出,不拿 runtime 跟模型较劲。"""
+    # Leave a third call available: a two-call ceiling masks a second bounce.
     provider = _ScriptedProvider([
+        {"reply": "图片已经生成", "tool_calls": [], "usage": {}},
         {"reply": "图片已经生成", "tool_calls": [], "usage": {}},
         {"reply": "图片已经生成", "tool_calls": [], "usage": {}},
     ])
@@ -3890,13 +3892,13 @@ def test_unbacked_image_claim_is_bounced_once_then_let_through(monkeypatch):
             fold_new_messages=_RecordingFold([]),
             add_usage=_noop_add_usage,
             on_image_reply=None,
-            max_calls=2,
+            max_calls=3,
         )
     )
 
     assert len(provider.calls) == 2, "谎报必须打回一次(而不是零次或无限次)"
     # 纠正指令确实注入了,而不是空转一轮
-    second_round = provider.calls[1]["config"] if False else provider.calls[1]
+    second_round = provider.calls[1]
     assert any(
         "不要用文字假装图已经存在" in str(m.get("content", ""))
         for m in second_round["messages"] if isinstance(m, dict)

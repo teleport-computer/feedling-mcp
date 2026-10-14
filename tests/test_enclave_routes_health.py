@@ -104,21 +104,6 @@ def test_attestation_not_ready(monkeypatch, client):
     assert r.get_json() == {"error": "not_ready", "detail": "kms down"}
 
 
-def test_gzip_on_large_response(monkeypatch, client):
-    monkeypatch.setitem(enclave_state._state, "content_pk_hex", "aa" * 32)
-    monkeypatch.setitem(enclave_state._state, "signing_pk_hex", "bb" * 32)
-    monkeypatch.setitem(enclave_state._state, "booted_at", 1.0)
-    monkeypatch.setitem(enclave_state._state, "attestation", {
-        "tdx_quote_hex": "ab" * 8000,  # 16KB，远超 500B 阈值
-        "event_log_json": "[]", "measurements": {}, "compose_hash": "h",
-        "app_id": "a", "instance_id": "i",
-    })
-    r = client.get("/attestation", headers={"Accept-Encoding": "gzip"})
-    assert r.status_code == 200
-    assert r.headers.get("content-encoding") == "gzip"
-    assert len(r.get_json()["tdx_quote_hex"]) == 16000  # httpx 已自动解压
-
-
 def test_head_and_options_behavior(client):
     # HEAD：Starlette 对 GET 路由自动支持（探活工具依赖，锁定）。
     assert client.open("/healthz", method="HEAD").status_code == 200

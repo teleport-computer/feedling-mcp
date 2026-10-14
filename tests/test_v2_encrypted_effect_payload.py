@@ -188,7 +188,7 @@ def test_identity_effect_mapping_freezes_relationship_anchor():
 
 
 def test_validate_identity_effect_accepts_frozen_anchor_metadata():
-    # The trusted frozen anchor must pass the decrypted-effect re-validation even
+    # The producer's canonical YYYY-MM-DD frozen anchor must pass re-validation even
     # though the model-facing top-level schema is additionalProperties=false — it
     # is stripped before that check, not fed to it.
     serve_worker._validate_decrypted_tool_effect(
@@ -218,15 +218,6 @@ def test_validate_identity_effect_rejects_non_canonical_frozen_anchor(bad):
             {"effect_id": "e", "patch": {"relationship_days": 90},
              "relationship_started_at": bad},
         )
-
-
-def test_validate_identity_effect_accepts_canonical_frozen_anchor():
-    # The canonical date the producer emits still passes.
-    serve_worker._validate_decrypted_tool_effect(
-        "identity",
-        {"effect_id": "e", "patch": {"relationship_days": 90},
-         "relationship_started_at": "2026-04-10"},
-    )  # must not raise
 
 
 # --- _validate_decrypted_tool_effect: identity op routing (Codex C1) ----------

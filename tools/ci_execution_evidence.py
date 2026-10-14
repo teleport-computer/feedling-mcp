@@ -1,18 +1,25 @@
 """Report-only CI evidence for which pytest files actually ran assertions.
 
-Pytest calls the two hook functions through ``tests/conftest.py`` only when the
+Pytest calls the observer hooks through ``tests/conftest.py`` only when the
 CI evidence environment is configured.  Each pytest process writes one atomic
 JSON manifest.  A downstream job combines those manifests with an explicit
 custom-runner attestation and compares them with the existing static coverage
 set.  Missing or invalid evidence is reported as unknown; Phase A never turns
-that absence into a hard failure.
+that absence into a hard failure.  Additive per-node receipts retain every
+observed phase's outcome and duration, including setup/teardown errors. Collected
+but unrun nodes have empty phases; absent phases are not zero durations. Parameterized
+node suffixes are replaced by stable SHA256 digests; source/function identifiers
+and allowlisted CI identity are recorded, never captured output
+or failure/skip messages. The existing file-level report contract stays intact.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -34,6 +41,47 @@ CONSUMER_RE = re.compile(
 OUTCOME_KEYS = ("passed", "failed", "skipped", "xfailed", "xpassed", "error")
 
 _pytest_outcomes: dict[str, dict[str, int]] = {}
+_pytest_nodes: dict[str, dict] = {}
+_session_id = None
+
+
+def pytest_sessionstart(session) -> None:
+    """Reset receipts when multiple pytest sessions run in one interpreter."""
+    global _session_id
+    _pytest_outcomes.clear()
+    _pytest_nodes.clear()
+    _session_id = uuid.uuid4().hex
+
+
+def pytest_collection_finish(session) -> None:
+    if _enabled_pytest_evidence() is None:
+        return
+    for item in session.items:
+        _pytest_nodes.setdefault(_receipt_nodeid(item.nodeid), {"phases": {}})
+
+
+def _receipt_nodeid(nodeid: str) -> str:
+    """Keep case identity without publishing pytest's parameter values/IDs.
+
+    Pytest appends bracketed parameter IDs to the source/function node ID.
+    Hash the full suffix, including any nested brackets in user-defined IDs,
+    so collection and reports resolve to the same stable identifier.
+    """
+    base, bracket, suffix = str(nodeid).partition("[")
+    if not bracket:
+        return str(nodeid)
+    digest = hashlib.sha256((bracket + suffix).encode("utf-8")).hexdigest()
+    return f"{base}[sha256:{digest}]"
+
+
+def _run_identity() -> dict:
+    # An allowlist of non-secret CI metadata; never serialize arbitrary env.
+    return {
+        "run_id": os.environ.get("GITHUB_RUN_ID") or None,
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT") or None,
+        "profile_enabled": os.environ.get("FEEDLING_CI_EXECUTION_PROFILE") or None,
+    }
+
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -73,6 +121,16 @@ def pytest_runtest_logreport(report) -> None:
     if path is None:
         return
 
+    if report.when in ("setup", "call", "teardown"):
+        duration = float(getattr(report, "duration", 0.0))
+        node = _pytest_nodes.setdefault(_receipt_nodeid(report.nodeid), {"phases": {}})
+        # Lists retain reruns/subtest reports rather than silently overwriting.
+        node["phases"].setdefault(report.when, []).append({
+            "outcome": report.outcome,
+            "duration_seconds": duration if math.isfinite(duration) and duration >= 0 else None,
+            "was_xfail": bool(getattr(report, "wasxfail", False)),
+        })
+
     outcome = None
     was_xfail = bool(getattr(report, "wasxfail", False))
     if report.when == "call":
@@ -110,6 +168,9 @@ def pytest_sessionfinish(session, exitstatus) -> None:
             "head_sha": head_sha,
             "job": job,
             "session_exitstatus": int(exitstatus),
+            "session_id": _session_id or uuid.uuid4().hex,
+            "identity": _run_identity(),
+            "nodes": dict(sorted(_pytest_nodes.items())),
             "files": dict(sorted(_pytest_outcomes.items())),
         }
         safe_job = re.sub(r"[^A-Za-z0-9_.-]+", "-", job).strip("-") or "job"
@@ -133,6 +194,7 @@ def write_attestation(*, output: Path, head_sha: str, job: str, runner: str) -> 
             "head_sha": head_sha,
             "job": job,
             "runner": runner,
+            "identity": _run_identity(),
             "outcome": "passed",
         },
     )

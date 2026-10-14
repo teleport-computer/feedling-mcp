@@ -6,6 +6,7 @@ pytest output, and evidence from the wrong checkout SHA.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -367,3 +368,86 @@ def test_custom_runner_requires_explicit_attestation(tmp_path):
 
     assert item["status"] == "executed"
     assert item["observed_jobs"]["python-tests"]["passed"] == 1
+
+
+def test_node_receipts_include_all_phases_and_unrun_nodes(tmp_path):
+    """Real pytest reports distinguish skip, fixture errors and fail-fast omissions."""
+    (tmp_path / "conftest.py").write_text(
+        "from tools.ci_execution_evidence import (pytest_sessionstart, "
+        "pytest_collection_finish, pytest_runtest_logreport, pytest_sessionfinish)\n"
+    )
+    (tmp_path / "test_receipts.py").write_text(
+        "import pytest\n"
+        "@pytest.fixture\ndef broken():\n    raise RuntimeError('SECRET fixture detail')\n"
+        "@pytest.fixture\ndef teardown_error():\n    yield\n    raise RuntimeError('SECRET teardown')\n"
+        "@pytest.mark.parametrize('value', ['private'], ids=['SECRET[param]'])\n"
+        "def test_parameterized(value):\n    assert value == 'private'\n"
+        "def test_pass():\n    pass\n"
+        "@pytest.mark.skip(reason='SECRET reason')\ndef test_skip():\n    pass\n"
+        "@pytest.mark.xfail(reason='SECRET xfail')\ndef test_xfail():\n    assert False\n"
+        "def test_setup_error(broken):\n    pass\n"
+        "def test_teardown_error(teardown_error):\n    pass\n"
+        "def test_fail():\n    assert False, 'SECRET assertion'\n"
+        "def test_unrun():\n    pass\n"
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    manifests = []
+    for profile in ("0", "1"):
+        output_dir = tmp_path / profile
+        env = os.environ.copy()
+        env.update({
+            "PYTHONPATH": str(repo_root),
+            evidence.EVIDENCE_DIR_ENV: str(output_dir),
+            evidence.HEAD_SHA_ENV: HEAD_SHA,
+            evidence.JOB_ENV: f"runtime-v2-coverage/profile={profile}",
+            "FEEDLING_CI_EXECUTION_PROFILE": profile,
+            "GITHUB_RUN_ID": "1234", "GITHUB_RUN_ATTEMPT": "2",
+        })
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "test_receipts.py", "-q", "--maxfail=3"],
+            cwd=tmp_path, env=env, capture_output=True, text=True,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        paths = list(output_dir.glob("*.json"))
+        assert len(paths) == 1
+        raw = paths[0].read_text()
+        assert "SECRET" not in raw
+        manifest = json.loads(raw)
+        assert manifest["head_sha"] == HEAD_SHA
+        assert manifest["job"] == f"runtime-v2-coverage/profile={profile}"
+        assert manifest["identity"] == {
+            "run_id": "1234", "run_attempt": "2", "profile_enabled": profile,
+        }
+        assert manifest["session_exitstatus"] == 1
+        nodes = manifest["nodes"]
+        assert len(nodes) == 8
+        parameter_nodes = [key for key in nodes if "::test_parameterized[" in key]
+        assert len(parameter_nodes) == 1
+        expected_digest = hashlib.sha256(b"[SECRET[param]]").hexdigest()
+        assert parameter_nodes[0] == f"test_receipts.py::test_parameterized[sha256:{expected_digest}]"
+        assert set(nodes[parameter_nodes[0]]["phases"]) == {"setup", "call", "teardown"}
+        def phases(name):
+            return nodes[f"test_receipts.py::test_{name}"]["phases"]
+        assert set(phases("pass")) == {"setup", "call", "teardown"}
+        assert phases("skip")["setup"][0]["outcome"] == "skipped"
+        assert "call" not in phases("skip")
+        assert phases("setup_error")["setup"][0]["outcome"] == "failed"
+        assert "call" not in phases("setup_error")
+        assert phases("teardown_error")["teardown"][0]["outcome"] == "failed"
+        assert phases("fail")["call"][0]["outcome"] == "failed"
+        assert phases("xfail")["call"][0]["was_xfail"] is True
+        assert phases("unrun") == {}
+        for node in nodes.values():
+            for reports in node["phases"].values():
+                for report in reports:
+                    assert report["duration_seconds"] >= 0
+        manifests.append(manifest)
+    assert manifests[0]["session_id"] != manifests[1]["session_id"]
+    assert set(manifests[0]["nodes"]) == set(manifests[1]["nodes"])
+
+
+def test_timing_profile_identity_matches_ci_matrix():
+    workflow = yaml.safe_load(CI_WORKFLOW.read_text())
+    job = workflow["jobs"]["runtime-v2-coverage"]
+    assert job["env"]["FEEDLING_CI_EXECUTION_PROFILE"] == "${{ matrix.profile_enabled }}"
+    assert set(str(value) for value in job["strategy"]["matrix"]["profile_enabled"]) == {"0", "1"}

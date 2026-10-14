@@ -1030,3 +1030,15 @@ def pytest_sessionfinish(session, exitstatus):
     observer = _load_ci_execution_evidence()
     if observer is not None:
         observer.pytest_sessionfinish(session, exitstatus)
+
+
+def pytest_sessionstart(session):
+    observer = _load_ci_execution_evidence()
+    if observer is not None:
+        observer.pytest_sessionstart(session)
+
+
+def pytest_collection_finish(session):
+    observer = _load_ci_execution_evidence()
+    if observer is not None:
+        observer.pytest_collection_finish(session)

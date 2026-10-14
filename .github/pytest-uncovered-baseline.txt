@@ -104,7 +104,6 @@ tests/test_history_import_notice.py
 tests/test_hosted_agent_runtime_cutover.py
 tests/test_hosted_agent_runtime_driver.py
 tests/test_hosted_runtime.py
-tests/test_image_generation_autonomy.py
 tests/test_image_resize.py
 tests/test_introduction_db_atomic.py
 tests/test_introduction_enqueue_once.py
@@ -207,7 +206,6 @@ tests/test_v2_kill_switch_web.py
 tests/test_v2_live_genesis_workers.py
 tests/test_v2_local_sandbox.py
 tests/test_v2_manual_wake_bridge.py
-tests/test_v2_no_cursor_ts.py
 tests/test_v2_no_dispatch_tiering.py
 tests/test_v2_optional_anchor.py
 tests/test_v2_p0_aba.py

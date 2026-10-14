@@ -236,6 +236,10 @@ result = chat_completion(runtime, messages)
 
 ## 6. 测试规范
 
+新增、保留与合并测试按 [测试保留标准](docs/testing/TESTING.md#01-测试的新增保留与合并标准)：
+标明当前需求/失效模式，证明相关缺陷能被检测，优先扩展已有用例。删除须记录保留 owner、
+输入与配置差异、缺陷检测和显式选择器证据；成本收益需实测，不以减少数量为目标。
+
 - **monkeypatch 打在符号的定义模块上**：
   `monkeypatch.setattr(provider_client, "chat_completion", fake)`、
   `setattr(core_enclave, "_get_enclave_info", fake)`。

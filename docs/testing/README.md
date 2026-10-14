@@ -151,6 +151,16 @@ python3 tools/e2e/p0.py --list     # 先看有哪些格子、key 齐不齐
 
 ---
 
+## 6. 新增或整理测试时，按什么标准？
+
+先说明当前需求或失效模式，再证明用例会因真实相关缺陷失败。优先扩展已有用例。
+合并或删除需要列出保留 owner、输入/fixture/配置差异、缺陷检测与选择器执行证据；
+相同测试体在不同认证、provider、profile 或 lane 下不自动算重复。
+运行与维护成本按证据评估，不以测试数下降为目标。
+完整标准见 [TESTING.md §0.1](TESTING.md#01-测试的新增保留与合并标准)。
+
+---
+
 ## 目录里其余文件是什么
 
 | 文件 | 是什么 | 什么时候看 |
@@ -246,3 +256,15 @@ git diff --name-only origin/test HEAD | grep -vE '^(你预期要改的路径)'
 ```
 **有输出就停下。** 正确做法是从 `origin/test` 起一棵临时 worktree、
 cherry-pick 你要的提交、再推 —— 改动面会缩回你真正改的那些。
+
+## CI per-case timing evidence
+
+The existing execution-evidence artifacts include each collected case's observed
+setup/call/teardown outcomes and durations, alongside source revision, job/profile,
+run, attempt and session identity. Parameter suffixes are represented by stable
+SHA256 digests so parameter values are not published in node identifiers.
+Missing phases are absent, not zero; collected but unrun cases have empty phases.
+Collection failures are represented by the session exit status: cases that never
+finish collection have no individual receipt. Use comparable configurations and
+attempts when ranking costs, and do not treat per-case durations as CI wall-time
+savings. Existing file-level execution summaries retain their report-only contract.
