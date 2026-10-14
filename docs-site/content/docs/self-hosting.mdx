@@ -302,6 +302,15 @@ is an encryption recipient, not an API credential. Plain-text-only chat messages
 **followups** require it. Authentication, bootstrap, and envelope validation
 still apply. A 400 response alone does not identify which validation failed.
 
+The official resident consumer requires a JSON success receipt containing a
+nonempty string reply `id` before counting a response write as accepted. An
+unreadable or missing receipt leaves delivery unconfirmed. For a foreground
+turn with no accepted reply or terminal rejection, the consumer retains the
+checkpoint and releases the turn for normal redelivery. A lost receipt can
+follow a real commit; existing server idempotency and terminal conflict handling
+still apply. Receipt acceptance proves server acknowledgment, not client display.
+
+
 Unrelated untracked files do not block self-update, but tracked edits still do.
 Checkout refuses to overwrite conflicting untracked or ignored files and logs
 their paths under `self-update checkout failed`; dependency installation and

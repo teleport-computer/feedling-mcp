@@ -16861,10 +16861,20 @@ def _handle_post_reply_response(resp) -> dict:
             body = {}
         raise ChatResponseRejected(int(resp.status_code), body)
     resp.raise_for_status()
+    # Both fresh and idempotent server commits return the persisted reply id.
+    # A successful HTTP status without that receipt is ambiguous: keep the
+    # caller's retry/checkpoint path instead of treating transport as delivery.
     try:
-        return resp.json()
+        body = resp.json()
     except Exception:
-        return {}
+        raise RuntimeError("chat_response_invalid_receipt") from None
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("id"), str)
+        or not body["id"].strip()
+    ):
+        raise RuntimeError("chat_response_invalid_receipt")
+    return body
 
 
 class ChatResponseRejected(RuntimeError):
