@@ -290,3 +290,30 @@ def test_failed_body_cannot_restart_into_trusted_success(local_probe, monkeypatc
             observed_status_code=None, observation_valid=False, post_attempt_count=1)
         assert server.count == 1
     assert pc._SETUP_PROBE_OBSERVER.get() is None
+
+
+@pytest.mark.parametrize('operation', ['setup', 'test'])
+@pytest.mark.parametrize('failure', [False, True])
+def test_legacy_probe_callback_contract_unchanged(monkeypatch, operation, failure):
+    from hosted import setup_core
+    calls = []
+    traces = []
+    def probe(config):
+        if failure:
+            raise pc.ProviderError('synthetic failure')
+        return {'reply': 'ok'}
+    monkeypatch.setattr(pc, 'test_provider_key', probe)
+    monkeypatch.setattr(ledger, 'record_runtime_attempt', lambda *a, **k: calls.append(k))
+    monkeypatch.setattr(setup_core, '_emit_model_api_probe_trace', lambda *a, **k: traces.append(k))
+    def run():
+        return setup_core._test_provider_key_observed(SimpleNamespace(user_id='synthetic'),
+            pc.ProviderConfig('openai_compatible', 'synthetic', 'synthetic'), operation=operation)
+    if failure:
+        with pytest.raises(pc.ProviderError):
+            run()
+    else:
+        assert run()['reply'] == 'ok'
+    assert len(calls) == 1 and len(traces) == 2
+    assert calls[0]['dur_ms'] >= 0
+    assert all('probe_http' not in row for row in calls + traces)
+    assert pc._SETUP_PROBE_OBSERVER.get() is None
