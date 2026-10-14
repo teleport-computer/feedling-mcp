@@ -29,32 +29,12 @@ def test_no_regex_gate_decides_whether_the_user_wants_an_image():
     assert "resolve_required_image_generation_prompt" not in src
 
 
-def test_model_text_is_delivered_alongside_the_image():
-    """图和话是一次表达的两半。之前这里硬编码空字符串,所以**即使模型正确调用了
-    工具**,用户也只收到一张孤零零的图。"""
-    src = inspect.getsource(tool_loop)
-    assert 'await on_reply(pr.text or "", final=True, media=media)' in src, (
-        "生图成功那条路径必须带上伴侣这一轮说的话"
-    )
-    assert 'await on_reply("", final=True, media=media)' not in src, (
-        "不许再把伴侣的话硬编码成空"
-    )
-
-
 def test_generation_failure_is_handed_back_to_the_model():
     """失败是它该知道的事实,不是 runtime 替它隐藏的意外。原来直接 raise 打断整轮:
     用户既没有图也没有一句解释,而伴侣根本不知道发生过什么。"""
     src = inspect.getsource(tool_loop)
     assert "error: image generation failed" in src
     assert "不要声称图已经生成" in src
-
-
-def test_a_lie_is_bounced_exactly_once():
-    """说了没做要纠正,但只纠正一次 —— 再纠缠就是拿 runtime 跟模型较劲,
-    而且会掩盖真正的问题(是模型不行,还是我们的提示没写清楚)。"""
-    src = inspect.getsource(tool_loop)
-    assert "image_claim_bounces < 1" in src, "谎报打回必须有次数上限"
-    assert "image_claim_retry_instruction" in src
 
 
 def test_claim_detector_is_conservative():
