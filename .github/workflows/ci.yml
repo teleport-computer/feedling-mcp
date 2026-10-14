@@ -1306,6 +1306,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       FEEDLING_CI_EXECUTION_JOB: runtime-v2-coverage/profile=${{ matrix.profile_enabled }}
+      FEEDLING_CI_EXECUTION_PROFILE: "${{ matrix.profile_enabled }}"
     strategy:
       fail-fast: false
       matrix:
