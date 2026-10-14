@@ -630,3 +630,14 @@ archives without a content-decrypt service and preserves full-text pagination.
 Mode-request errors and malformed mode responses fail closed; encrypted and
 valid legacy unknown modes retain enclave compatibility. See the
 [resident trust and mode contract](docs-site/content/docs/self-hosting.mdx).
+
+### Resident identity reads
+
+`io_cli identity-read` reads an effective `off` account's own plaintext card
+locally, preserving canonical profile fields and backend-computed relationship
+days. Sealed, mixed, malformed or foreign cards fail without decrypt fallback;
+local-only cards expose metadata only. Mode-fetch failures stop the command.
+The existing identity GET returns 503 for read failures and 500 for non-object
+storage, rather than reporting an absent card. Legacy day-count differences,
+old-client limitations and unchanged doctor behavior are described in the
+[resident trust and mode contract](docs-site/content/docs/self-hosting.mdx).
