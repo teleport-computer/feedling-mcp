@@ -963,6 +963,7 @@ jobs:
             tests/test_io_cli_doctor_mode.py \
             tests/test_identity_strict_read.py \
             tests/test_identity_read_consumers.py \
+            tests/test_genesis_identity_init_safety.py \
             tests/test_io_cli_identity.py \
             tests/test_io_cli_identity_read.py \
             tests/test_io_cli_identity_write_full.py \

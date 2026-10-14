@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Genesis identity initialization preserves existing cards when storage or
+  decryption reads fail, and refuses stale writes that lose a concurrent
+  creation or update. Successful first initialization remains supported.
+
+
 - `io_cli doctor` now uses authenticated account mode for readiness. Plaintext
   accounts skip the enclave content probe; legacy modes retain it. The
   `io_cli.doctor.v2` output keeps five boolean check keys and adds required/skip
