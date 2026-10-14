@@ -12,12 +12,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- `io_cli doctor` now uses authenticated account mode for readiness. Plaintext
+  accounts skip the enclave content probe; legacy modes retain it. The
+  `io_cli.doctor.v2` output keeps five boolean check keys and adds required/skip
+  metadata, so a skipped `false` does not fail readiness. Mode-fetch errors stop
+  later probes. Whoami attestation compatibility and public API shapes are
+  unchanged; this does not promise zero enclave network requests.
+
 - `io_cli identity-read` reads effective plaintext identities locally with owner
   checks and no content-decrypt fallback. It uses backend relationship days,
   including anchor repair, which can differ from legacy enclave counts. The
   existing identity GET now distinguishes absent rows from unavailable reads
   (503) and non-object storage (500), while preserving successful raw envelopes.
-  Doctor and legacy identity writers retain their existing behavior.
+  Legacy identity writers retain their existing behavior.
 
 - Resident proactive failure status updates accept an optional bounded diagnostic
   claim. Job responses preserve its consumer-reported provenance, unknown and
