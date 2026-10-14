@@ -1087,6 +1087,8 @@ jobs:
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
             tests/test_chat_images.py \
+            tests/test_image_generation_autonomy.py \
+            tests/test_v2_no_cursor_ts.py \
             tests/test_v2_multimodal_e2e.py \
             tests/test_v2_serve_worker_images.py \
             tests/test_v2_worker_images.py \
