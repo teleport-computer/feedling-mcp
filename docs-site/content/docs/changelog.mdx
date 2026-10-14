@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Capture and Dream preserve bounded provider exception and explicit-cause
+  categories in their existing restricted failure trajectories. The diagnostic
+  does not change error codes, requests, retries, budgets, or memory writes,
+  and does not attribute historical failures to an upstream provider.
+
 - `io_cli doctor` now uses authenticated account mode for readiness. Plaintext
   accounts skip the enclave content probe; legacy modes retain it. The
   `io_cli.doctor.v2` output keeps five boolean check keys and adds required/skip

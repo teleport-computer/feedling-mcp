@@ -18,7 +18,7 @@ import provider_client
 from notices import catalog
 
 log = logging.getLogger(__name__)
-_STAGES = frozenset({"wake", "chat", "setup", "compaction", "trajectory_review"})
+_STAGES = frozenset({"wake", "chat", "setup", "compaction", "trajectory_review", "extraction_provider"})
 _LANES = frozenset(
     {
         "chat",
