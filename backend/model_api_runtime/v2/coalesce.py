@@ -144,6 +144,9 @@ def coalesce_pending(
         # actually typed; the failure-language pick reads them (T743).
         for key in (
             "has_image",
+            "_recall_row_proof",
+            "_recall_source_json",
+            "_recall_attachment_proof",
             "caption",
             "unreadable",
             "image_mime",

@@ -429,14 +429,17 @@ def test_mode_shadow_keeps_the_enclave_result_and_compares(worker, monkeypatch):
     assert emitted[0][1]["verdict"] in {"incomparable", "comparable"}
 
 
-def test_mode_on_serves_plaintext_locally_and_falls_back_to_the_enclave(worker, monkeypatch):
+def test_exact_off_local_and_exact_on_compatibility(worker, monkeypatch):
+    from memory import recall_candidates, recall_contract
     serve_worker, calls = worker
     monkeypatch.setenv(plaintext_recall.MODE_ENV, "on")
+    monkeypatch.setattr(serve_worker.accounts_registry, "effective_content_encryption", lambda uid: "off")
     monkeypatch.setattr(serve_worker, "_plaintext_recall_deps", lambda: _deps(_rows(WINDOWS["cn"])))
+    monkeypatch.setattr(recall_candidates, "read_owned", lambda uid, deadline:
+                        recall_contract.candidate_batch(_moments(), uid))
     out = serve_worker._read_context_memories(UID, through_seq=1)
     assert calls == [] and "cat_cn" in [c["id"] for c in out["context_memories"]]
-    monkeypatch.setattr(serve_worker, "_plaintext_recall_deps",
-                        lambda: _deps(_rows(WINDOWS["cn"]), mode="on"))
+    monkeypatch.setattr(serve_worker.accounts_registry, "effective_content_encryption", lambda uid: "on")
     out = serve_worker._read_context_memories(UID, through_seq=1)
     assert len(calls) == 1 and out["context_memories"] == [{"id": "e"}]
 
@@ -1049,3 +1052,21 @@ def test_a_slow_load_across_a_restart_starts_one_loader_and_one_service(parent, 
     assert loads == [1] and len(_encoder_threads()) == before + 1
     reply = query_client.from_env().encode(["x"], time.monotonic() + 5)
     assert len(reply.vectors) == 1
+
+
+@pytest.mark.parametrize('strict', [False, True], ids=['encrypted_compatibility', 'effective_off'])
+def test_query_encoder_http_auth_failure_is_hard_only_for_strict_off(service, monkeypatch, strict):
+    from memory import recall_contract
+    _, port, _ = service
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, '0.2')
+    monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, '1')
+    deps = _deps(_rows(WINDOWS['cn']), encoder=query_client.Client(port, 'wrong-token'))
+    def run():
+        return plaintext_recall._hybrid_state(_moments(), UID, 'query', 'query', deps,
+            time.monotonic()+2, time.monotonic(), strict=strict)
+    if strict:
+        with pytest.raises(recall_contract.RecallFailure, match='vector_authorization_failed'):
+            run()
+    else:
+        state, encoder = run()
+        assert state['fallback_reason'] == 'encode_failed' and encoder is None

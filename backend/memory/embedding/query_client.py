@@ -56,7 +56,8 @@ class Client:
                 reason = str(json.loads(exc.read().decode("utf-8")).get("error") or "")
             except Exception:
                 reason = ""
-            raise recall_policy.Fallback(reason if reason in _KNOWN else "encode_failed") from None
+            raise recall_policy.Fallback(reason if reason in _KNOWN else "encode_failed",
+                                         authorization_failed=exc.code in {401, 403}) from None
         except (socket.timeout, TimeoutError):
             raise recall_policy.Fallback("deadline_exceeded") from None
         except urllib.error.URLError as exc:

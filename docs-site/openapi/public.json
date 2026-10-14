@@ -4822,7 +4822,7 @@
     "/v1/memory/turn-selection": {
       "post": {
         "summary": "Resident Turn Selection",
-        "description": "Per-turn memory selection for a plaintext resident account: the cards picked for this message, selected by the backend with the lexical ranker on the same history page the enclave read used (before_seq = seq + 1, limit 4). Returns 409 not_served when the account is not plaintext or the feature is off (the enclave was not called; the resident keeps its enclave path), 503 recall_unavailable on exhausted budget, capacity, or selection failure (at most one backend enclave fallback when budget remains; the consumer must not retry), and 422 message_not_in_window when the message is not in that page.",
+        "description": "Fixed-frontier plaintext recall. Exact off never calls enclave content. Full candidate owner validation precedes exclusions. Invalid same-owner optional payloads yield typed recall_unavailable with uid/message/seq binding; required content, owner/auth and unknown-stage failures are hard. Rollout off/shadow is unavailable for off accounts. Successful encrypted/legacy modes return 409 for compatibility; a plaintext consumer must never follow that response to enclave. 422 preserves the fixed message binding failure.",
         "operationId": "resident_turn_selection_v1_memory_turn_selection_post",
         "responses": {
           "200": {
@@ -4833,6 +4833,9 @@
                   "type": "object",
                   "required": [
                     "source",
+                    "user_id",
+                    "message_id",
+                    "seq",
                     "messages",
                     "context_memories",
                     "context_memory_trace",
@@ -4842,10 +4845,57 @@
                     "source": {
                       "type": "string",
                       "enum": [
-                        "local",
-                        "enclave_fallback",
-                        "enclave_shadow"
+                        "local"
                       ]
+                    },
+                    "user_id": {
+                      "type": "string"
+                    },
+                    "message_id": {
+                      "type": "string"
+                    },
+                    "seq": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "required_references": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "required_attachments": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "seq",
+                          "sha256"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "seq": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
                     },
                     "messages": {
                       "type": "array",
@@ -4920,7 +4970,7 @@
             }
           },
           "409": {
-            "description": "not_served: feature off or account not plaintext; enclave was not contacted.",
+            "description": "not_served: successful encrypted/legacy account mode. Off consumers must not fall back.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4950,11 +5000,129 @@
             }
           },
           "503": {
-            "description": "recall_unavailable: deadline, capacity, or selection failure; do not retry the enclave.",
+            "description": "Typed optional unavailability requires matching operation binding; all content/binding errors remain hard failures.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "type": "object",
+                      "required": [
+                        "error",
+                        "category",
+                        "detail",
+                        "user_id",
+                        "message_id",
+                        "seq",
+                        "context_memories",
+                        "context_memory_log"
+                      ],
+                      "properties": {
+                        "error": {
+                          "const": "recall_unavailable"
+                        },
+                        "category": {
+                          "const": "recall_unavailable"
+                        },
+                        "detail": {
+                          "type": "string",
+                          "enum": [
+                            "candidate_read_unavailable",
+                            "candidate_payload_invalid",
+                            "selection_unavailable",
+                            "local_disabled",
+                            "shadow_not_supported_for_off"
+                          ]
+                        },
+                        "user_id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "message_id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "seq": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "required_references": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "required_attachments": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "seq",
+                              "sha256"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "seq": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "sha256": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "context_memories": {
+                          "type": "array",
+                          "maxItems": 0,
+                          "items": {
+                            "type": "object"
+                          }
+                        },
+                        "context_memory_log": {
+                          "type": "object",
+                          "properties": {
+                            "mode": {
+                              "const": "unavailable"
+                            },
+                            "reason": {
+                              "type": "string"
+                            },
+                            "counts": {
+                              "type": "object",
+                              "properties": {
+                                "selected": {
+                                  "type": "null"
+                                },
+                                "candidate_pool": {
+                                  "type": "null"
+                                },
+                                "injected": {
+                                  "const": 0
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             }
@@ -11779,6 +11947,11 @@
           "seq"
         ],
         "properties": {
+          "include_references": {
+            "type": "boolean",
+            "default": true,
+            "description": "Read explicit references attached to this message. Set false for a historical wake anchor whose references are not used in the prompt."
+          },
           "message_id": {
             "type": "string",
             "minLength": 1,

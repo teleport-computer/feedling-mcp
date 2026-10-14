@@ -1828,6 +1828,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["message_id", "seq"],
         "properties": {
+            "include_references": {"type": "boolean", "default": True, "description": "Read explicit references attached to this message. Set false for a historical wake anchor whose references are not used in the prompt."},
             "message_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775806},
         },
@@ -2739,7 +2740,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/bootstrap/status"): "Return server-observed onboarding progress. Resident routes include decrypt_source_ready, decrypt_health, and decrypt_health_policy; a fresh resident poll report is required for new-account completion.",
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report read-source status (including backend readiness for effective-off accounts) and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
-    ("post", "/v1/memory/turn-selection"): "Per-turn memory selection for a plaintext resident account: the cards picked for this message, selected by the backend with the lexical ranker on the same history page the enclave read used (before_seq = seq + 1, limit 4). Returns 409 not_served when the account is not plaintext or the feature is off (the enclave was not called; the resident keeps its enclave path), 503 recall_unavailable on exhausted budget, capacity, or selection failure (at most one backend enclave fallback when budget remains; the consumer must not retry), and 422 message_not_in_window when the message is not in that page.",
+    ("post", "/v1/memory/turn-selection"): "Fixed-frontier plaintext recall. Exact off never calls enclave content. Full candidate owner validation precedes exclusions. Invalid same-owner optional payloads yield typed recall_unavailable with uid/message/seq binding; required content, owner/auth and unknown-stage failures are hard. Rollout off/shadow is unavailable for off accounts. Successful encrypted/legacy modes return 409 for compatibility; a plaintext consumer must never follow that response to enclave. 422 preserves the fixed message binding failure.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): (
@@ -2986,10 +2987,19 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "description": "Selection and content-free page identity, with the complete selection trace.",
             "content": {"application/json": {"schema": {
                 "type": "object",
-                "required": ["source", "messages", "context_memories", "context_memory_trace",
+                "required": ["source", "user_id", "message_id", "seq", "messages", "context_memories", "context_memory_trace",
                              "context_memory_log"],
                 "properties": {
-                    "source": {"type": "string", "enum": ["local", "enclave_fallback", "enclave_shadow"]},
+                    "source": {"type": "string", "enum": ["local"]},
+                    "user_id": {"type": "string"},
+                    "message_id": {"type": "string"},
+                    "seq": {"type": "integer", "minimum": 1},
+                    "required_references": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+                    "required_attachments": {"type": "array", "items": {
+                         "type": "object", "required": ["id", "seq", "sha256"],
+                         "properties": {"id": {"type": "string"}, "seq": {"type": "integer", "minimum": 1},
+                                        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+                         "additionalProperties": False}},
                     "messages": {"type": "array", "items": {
                         "type": "object", "required": ["id", "role", "seq"],
                         "properties": {"id": {"type": "string"}, "role": {"type": "string"},
@@ -3006,11 +3016,41 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                   "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}}
            for code, description in {
                "400": "request_invalid: invalid message_id, seq, or body.",
-               "409": "not_served: feature off or account not plaintext; enclave was not contacted.",
+               "409": "not_served: successful encrypted/legacy account mode. Off consumers must not fall back.",
                "413": "request_too_large: body exceeds 1024 bytes.",
                "422": "message_not_in_window: message does not belong to the fixed user-bound page.",
-               "503": "recall_unavailable: deadline, capacity, or selection failure; do not retry the enclave.",
+               "503": "Optional unavailability only when category=recall_unavailable carries matching user_id/message_id/seq. Missing category or a content/binding error is a hard failure; never retry enclave.",
            }.items()},
+        "503": {
+            "description": "Typed optional unavailability requires matching operation binding; all content/binding errors remain hard failures.",
+            "content": {"application/json": {"schema": {"anyOf": [
+                {"$ref": "#/components/schemas/ErrorResponse"},
+                {"type": "object",
+                 "required": ["error", "category", "detail", "user_id", "message_id", "seq", "context_memories", "context_memory_log"],
+                 "properties": {
+                     "error": {"const": "recall_unavailable"},
+                     "category": {"const": "recall_unavailable"},
+                     "detail": {"type": "string", "enum": ["candidate_read_unavailable", "candidate_payload_invalid", "selection_unavailable", "local_disabled", "shadow_not_supported_for_off"]},
+                     "user_id": {"type": "string", "minLength": 1},
+                     "message_id": {"type": "string", "minLength": 1},
+                     "seq": {"type": "integer", "minimum": 1},
+                     "required_references": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+                    "required_attachments": {"type": "array", "items": {
+                         "type": "object", "required": ["id", "seq", "sha256"],
+                         "properties": {"id": {"type": "string"}, "seq": {"type": "integer", "minimum": 1},
+                                        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+                         "additionalProperties": False}},
+                    "context_memories": {"type": "array", "maxItems": 0, "items": {"type": "object"}},
+                     "context_memory_log": {"type": "object", "properties": {
+                         "mode": {"const": "unavailable"},
+                         "reason": {"type": "string"},
+                         "counts": {"type": "object", "properties": {
+                             "selected": {"type": "null"},
+                             "candidate_pool": {"type": "null"},
+                             "injected": {"const": 0}}}}},
+                 }},
+            ]}}},
+        },
     },
     ("get", "/v1/chat/poll"): {
         "200": {

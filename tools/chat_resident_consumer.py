@@ -2964,35 +2964,181 @@ def _plaintext_account() -> bool:
     return value == "off"
 
 
-def _turn_selection_from_backend(mid: str, seq: int):
-    """Ask the backend for this turn's picks (plaintext accounts, T788).
+_RECALL_SCOPE_ACTIVE = ContextVar("recall_scope_active", default=False)
+_RECALL_OPERATION_ACCOUNT = ContextVar("recall_operation_account", default=None)
+_RECALL_FOREGROUND_TRANSCRIPT = ContextVar("recall_foreground_transcript", default=None)
 
-    Returns the response dict, ``None`` (unknown — never retry the enclave:
-    the backend may already have fallen back, and it is the only side that
-    does), or ``_BACKEND_DEFERS_TO_ENCLAVE`` when the backend guarantees it did
-    not call the enclave (encrypted account, mode off, or an older backend
-    without the route)."""
-    if not _plaintext_account():
+
+def _recall_scope(fn):
+    from functools import wraps
+    @wraps(fn)
+    def scoped(*args, **kwargs):
+        scope_token = _RECALL_SCOPE_ACTIVE.set(True)
+        account_token = _RECALL_OPERATION_ACCOUNT.set(None)
+        history_token = _RECALL_FOREGROUND_TRANSCRIPT.set(None)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _RECALL_FOREGROUND_TRANSCRIPT.reset(history_token)
+            _RECALL_OPERATION_ACCOUNT.reset(account_token)
+            _RECALL_SCOPE_ACTIVE.reset(scope_token)
+    return scoped
+
+
+def _bind_recall_account(account):
+    if not _RECALL_SCOPE_ACTIVE.get():
+        return
+    bound = _RECALL_OPERATION_ACCOUNT.get()
+    if bound is not None and bound != account:
+        raise _RecallInputError("account_mode_changed")
+    _RECALL_OPERATION_ACCOUNT.set(account)
+
+
+class _RecallInputError(RuntimeError):
+    """Required content or recall provenance failed; never a no-card success."""
+
+
+def _recall_account():
+    # Fresh operation identity; never the best-effort encryption-key cache.
+    try:
+        response = _HTTP.get(f"{FEEDLING_API_URL}/v1/users/whoami",
+                             headers=_HEADERS, timeout=10)
+        if response.status_code != 200:
+            raise _RecallInputError("account_unconfirmed")
+        body = response.json()
+        uid = body.get("user_id") if isinstance(body, dict) else None
+        if not isinstance(uid, str) or not uid.strip():
+            raise _RecallInputError("account_unconfirmed")
+        raw = body.get("content_encryption_effective", "")
+        if not isinstance(raw, str):
+            raise _RecallInputError("account_mode_invalid")
+        mode = raw if raw in {"off", "on"} else "unknown"
+        return uid, mode
+    except _RecallInputError:
+        raise
+    except Exception as exc:
+        raise _RecallInputError("account_unconfirmed") from exc
+
+
+def _require_recall_content(msg, uid):
+    # Verify source envelopes, not a prompt's nonempty content field. Backlog
+    # collapse preserves its source rows so every absorbed message is checked.
+    rows = msg.get("_backlog_original_rows") or (msg,)
+    for row in rows:
+        if (not isinstance(row, dict) or row.get("owner_user_id") != uid
+                or not isinstance(row.get("seq"), int) or isinstance(row.get("seq"), bool)
+                or row["seq"] < 1 or not (row.get("id") or row.get("message_id"))):
+            raise _RecallInputError("turn_binding_invalid")
+        if row.get("body_unavailable") or row.get("unreadable"):
+            raise _RecallInputError("unreadable_current_message")
+        status = row.get("quoted_memory_status") or {}
+        if not isinstance(status, dict) or status.get("unavailable"):
+            raise _RecallInputError("required_reference_unavailable")
+        try:
+            sealed = bool(row.get("body_ct") or row.get("K_enclave"))
+            if row.get("visibility") == "local_only":
+                raise _RecallInputError("unreadable_current_message")
+            if not sealed and not row.get("body_omitted"):
+                ctype = row.get("content_type", "text")
+                maximum = 26_214_400 if ctype == "file" else (18_000_064 if row.get("image_bundle_version") else 2_000_000)
+                if ctype in {"image", "file"}:
+                    encoded = row.get("body_b64")
+                    if isinstance(encoded, str) and len(encoded) > (maximum + 2)//3*4:
+                        raise _RecallInputError("attachment_storage_invalid")
+                raw = _core_envelope.read_plaintext_envelope_body(row, owner_user_id=uid)
+                if ctype in {"image", "file"} and not 0 < len(raw) <= maximum:
+                    raise _RecallInputError("attachment_storage_invalid")
+                if ctype == "image":
+                    if row.get("image_bundle_version"):
+                        images = _chat_images.decode_image_bundle(raw)
+                        if any(len(body) > 2_000_000 for body, _ in images):
+                            raise _RecallInputError("attachment_storage_invalid")
+                    elif (row.get("image_mime") or "image/jpeg") not in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}:
+                        raise _RecallInputError("attachment_storage_invalid")
+                if row.get("content_type", "text") not in {"image", "file"}:
+                    raw.decode("utf-8")
+            caption = _core_envelope.caption_envelope_from_row(row)
+            if caption is not None:
+                if caption.get("owner_user_id") != uid:
+                    raise _RecallInputError("caption_owner_invalid")
+                if not caption.get("body_ct") and not caption.get("K_enclave"):
+                    _core_envelope.read_plaintext_envelope_body(caption, owner_user_id=uid).decode("utf-8")
+            if sealed:
+                if caption is None or caption.get("body_ct") or caption.get("K_enclave"):
+                    raise _RecallInputError("unreadable_current_message")
+                text = _core_envelope.read_plaintext_envelope_body(caption, owner_user_id=uid).decode("utf-8")
+                if not text.strip() or row.get("content") != text or row.get("content_type") != "text":
+                    raise _RecallInputError("unreadable_current_message")
+            if row.get("body_omitted") and not sealed and (caption is None or caption.get("body_ct") or caption.get("K_enclave")):
+                raise _RecallInputError("unreadable_current_message")
+        except _RecallInputError:
+            raise
+        except Exception as exc:
+            raise _RecallInputError("content_storage_invalid") from exc
+
+
+def _require_recall_history(history, uid, *, before_seq=None):
+    if not isinstance(history, list):
+        raise _RecallInputError("history_unconfirmed")
+    selected = []
+    for row in history:
+        if (not isinstance(row, dict) or row.get("owner_user_id") != uid
+                or not isinstance(row.get("seq"), int) or isinstance(row.get("seq"), bool)
+                or row["seq"] < 1):
+            raise _RecallInputError("history_binding_unconfirmed")
+        if before_seq is not None and row["seq"] >= before_seq:
+            continue
+        if row.get("body_unavailable_reason") == "unreadable_history":
+            continue
+        if row.get("content_type", "text") in {"image", "file"}:
+            # Historical continuity uses caption text, never attachment bytes.
+            try:
+                caption = _core_envelope.caption_envelope_from_row(row)
+                text = ""
+                if caption is not None:
+                    text = _core_envelope.read_plaintext_envelope_body(caption, owner_user_id=uid).decode("utf-8")
+                if str(row.get("content") or "") != text:
+                    raise ValueError("caption projection changed")
+            except Exception as exc:
+                raise _RecallInputError("caption_unconfirmed") from exc
+        else:
+            _require_recall_content(row, uid)
+        selected.append(row)
+    return selected
+
+
+def _turn_selection_from_backend(mid: str, seq: int, *, account=None, include_references=True):
+    uid, mode = account if account is not None else _recall_account()
+    if mode != "off":
         return _BACKEND_DEFERS_TO_ENCLAVE
     try:
-        resp = _HTTP.post(
+        response = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/memory/turn-selection",
-            json={"message_id": mid, "seq": seq},
+            json={"message_id": mid, "seq": seq, **({"include_references": False} if not include_references else {})},
             headers={**_HEADERS, "X-Recall-Deadline-Ms": str(TURN_SELECTION_DEADLINE_MS)},
-            timeout=TURN_SELECTION_DEADLINE_MS / 1000.0 + 2.0,
-        )
-    except Exception as exc:  # noqa: BLE001 — outcome on the server is unknown
-        log.debug("per-turn memory selection (backend) failed: %s", exc)
-        return None
-    if resp.status_code in (404, 409):
-        return _BACKEND_DEFERS_TO_ENCLAVE
-    if resp.status_code != 200:
-        return None
-    try:
-        data = resp.json()
-    except Exception:  # noqa: BLE001
-        return None
-    return data if isinstance(data, dict) else None
+            timeout=TURN_SELECTION_DEADLINE_MS / 1000.0 + 2.0)
+        if response.status_code == 404:
+            return {"_recall_unavailable": "route_missing"}
+        data = response.json()
+        if not isinstance(data, dict):
+            raise _RecallInputError("recall_response_invalid")
+        if response.status_code == 503 and data.get("category") == "recall_unavailable":
+            reasons = {"candidate_read_unavailable", "candidate_payload_invalid", "selection_unavailable",
+                       "local_disabled", "shadow_not_supported_for_off"}
+            if (data.get("detail") not in reasons or data.get("user_id") != uid
+                    or data.get("seq") != seq or data.get("message_id") != mid):
+                raise _RecallInputError("recall_binding_invalid")
+            return {"_recall_unavailable": data["detail"], "required_attachments": data.get("required_attachments"),
+                    "required_references": data.get("required_references")}
+        if response.status_code != 200:
+            raise _RecallInputError("recall_input_unconfirmed")
+        if data.get("user_id") != uid or data.get("seq") != seq or data.get("message_id") != mid:
+            raise _RecallInputError("recall_binding_invalid")
+        return data
+    except _RecallInputError:
+        raise
+    except Exception as exc:
+        raise _RecallInputError("recall_input_unconfirmed") from exc
 
 
 def _turn_selection_from_enclave(seq: int):
@@ -3024,19 +3170,72 @@ def _auto_memory_fetch_for_turn(msg: dict) -> dict | None:
     unknown; an empty pick list on a healthy response ⇒ selected 0.
     Returns ``{"picks", "selected", "pool"}``.
     """
-    if isinstance(msg, dict) and msg.get("body_unavailable_reason") == "unreadable_history":
+    account = _recall_account()
+    _bind_recall_account(account)
+    def unconfirmed():
+        if account[1] == "off":
+            raise _RecallInputError("recall_input_unconfirmed")
         return None
+    if account[1] == "off":
+        _require_recall_content(msg, account[0])
+        if msg.get("content_type") in {"image", "file"} and not msg.get("body_omitted"):
+            raw = _core_envelope.read_plaintext_envelope_body(msg, owner_user_id=account[0])
+            # Consume exactly the source bytes validated above, never a stale
+            # decoded image/file field carried alongside the envelope.
+            canonical = {**msg, "body_b64": base64.b64encode(raw).decode("ascii")}
+            for field in ("images", "image_b64", "file_b64"):
+                canonical.pop(field, None)
+            canonical = _hydrate_plaintext_binary_body(canonical)
+            if canonical.get("body_unavailable"):
+                raise _RecallInputError("attachment_storage_invalid")
+            msg.update(canonical)
+    if isinstance(msg, dict) and msg.get("body_unavailable_reason") == "unreadable_history":
+        return unconfirmed()
     seq = msg.get("seq") if isinstance(msg, dict) else None
     if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
-        return None
+        return unconfirmed()
     mid = str(msg.get("id") or msg.get("message_id") or "").strip()
     if not mid:
-        return None
-    data = _turn_selection_from_backend(mid, seq)
+        return unconfirmed()
+    reference_options = {"include_references": False} if msg.get("_recall_historical_anchor") else {}
+    data = _turn_selection_from_backend(mid, seq, account=account, **reference_options)
+    if account[1] == "off":
+        requested = [value.strip() for value in str(msg.get("quoted_memory_ids") or "").split(",")[:8] if value.strip()]
+        if requested:
+            cards = data.get("required_references") if isinstance(data, dict) else None
+            if (not isinstance(cards, list) or any(not isinstance(card, dict) for card in cards)
+                    or [card.get("id") for card in cards] != list(dict.fromkeys(requested))):
+                raise _RecallInputError("required_reference_unconfirmed")
+            quoted = []
+            for card in cards:
+                text = "\n".join(card[key] for key in ("title", "description", "summary", "content")
+                                 if isinstance(card.get(key), str) and card[key].strip())
+                if not text:
+                    raise _RecallInputError("required_reference_unconfirmed")
+                quoted.append({**card, "text": text})
+            msg["quoted_memories"] = quoted
+            msg["quoted_memory_status"] = {"unavailable": 0}
+        else:
+            msg["quoted_memories"] = []
+            msg["quoted_memory_status"] = {}
+    if account[1] == "off" and msg.get("content_type") in {"image", "file"}:
+        if not isinstance(data, dict):
+            raise _RecallInputError("attachment_unconfirmed")
+        # A route-missing result has only the consumer's independent T proof;
+        # every new-server result binds its canonical attachment bytes to ours.
+        if data.get("_recall_unavailable") != "route_missing":
+            proofs = data.get("required_attachments")
+            raw = _core_envelope.read_plaintext_envelope_body(msg, owner_user_id=account[0])
+            expected = {"id": mid, "seq": seq, "sha256": hashlib.sha256(raw).hexdigest()}
+            if not isinstance(proofs, list) or expected not in proofs:
+                raise _RecallInputError("attachment_binding_invalid")
+    if isinstance(data, dict) and data.get("_recall_unavailable"):
+        return {"picks": None, "selected": None, "pool": None,
+                "unavailable_reason": data["_recall_unavailable"]}
     if data is _BACKEND_DEFERS_TO_ENCLAVE:
         data = _turn_selection_from_enclave(seq)
     if not isinstance(data, dict):
-        return None
+        return unconfirmed()
     page = data.get("messages") or data.get("history") or []
     newest_user = ""
     page_ids: set = set()
@@ -3051,13 +3250,13 @@ def _auto_memory_fetch_for_turn(msg: dict) -> dict | None:
     # The enclave selected against the newest user message of *this* page: the
     # page must contain this message and it must be that newest user message.
     if mid not in page_ids or newest_user != mid:
-        return None
+        return unconfirmed()
     rec = data.get("context_memory_log") if isinstance(data.get("context_memory_log"), dict) else {}
     if str(rec.get("mode") or "") == "failed":
-        return None
+        return unconfirmed()
     cards = data.get("context_memories")
     if not isinstance(cards, list):
-        return None
+        return unconfirmed()
     picks = _stash_auto_memories(cards, data.get("context_memory_trace") or rec) or []
     counts = rec.get("counts") if isinstance(rec.get("counts"), dict) else {}
     pool = counts.get("candidate_pool")
@@ -3119,6 +3318,7 @@ def _auto_memory_block_for(msg: dict, trace_id: str) -> tuple[str, list[str]]:
     _RECALL_TURN_STATE.update({
         "selected": (None if entry is None else entry.get("selected")),
         "candidate_pool": (entry or {}).get("pool"),
+        "unavailable_reason": (entry or {}).get("unavailable_reason"),
         # rendered for this turn; ``injected``/``injected_chars`` are settled by
         # the arrival check on the final driver payload, not here.
         "injected": 0, "injected_ids": list(auto_ids), "injected_chars": 0,
@@ -4029,7 +4229,8 @@ def _fetch_plaintext_or_mixed_history(
 
     Other modes retain mixed-page per-row decryption and sealed-page bulk reads.
     """
-    plaintext_only = _plaintext_account()
+    operation_account = _RECALL_OPERATION_ACCOUNT.get()
+    plaintext_only = operation_account[1] == "off" if operation_account is not None else _plaintext_account()
     params: dict = {"limit": limit, "since": since}
     if not include_image_body:
         params["include_image_body"] = "false"
@@ -4046,6 +4247,10 @@ def _fetch_plaintext_or_mixed_history(
         data = resp.json()
         if plaintext_only:
             rows = _validated_backend_history_rows(data)
+            if operation_account is not None:
+                for row in rows:
+                    if row.get("owner_user_id") != operation_account[0]:
+                        raise _RecallInputError("history_owner_unconfirmed")
         else:
             rows = data.get("messages") or data.get("history") or []
     except Exception as exc:
@@ -4101,7 +4306,7 @@ def _fetch_plaintext_or_mixed_history(
             # Failed R2 hydration can return neither body nor an omission flag.
             # It is still unreadable history, not an attachment placeholder or
             # a usable recall anchor. Do not infer plaintext from its metadata.
-            resolved = _unreadable_history_row(row)
+            resolved = {**row, "body_unavailable": True, "body_unavailable_reason": "content_storage_invalid"}
         else:
             resolved = {**row, "body_unavailable": True}
         if resolved.get("seq") is None and row.get("seq") is not None:
@@ -4119,14 +4324,26 @@ def _is_sealed_history_body(row: dict) -> bool:
 
 
 def _unreadable_history_row(row: dict) -> dict:
-    # Keep cursor/identity metadata, but no content or route capable of reading
-    # a sealed or unresolved body. The marker survives a later mode refresh.
+    # Excluded body metadata cannot re-enable media fetching or references.
     result = {key: value for key, value in row.items() if key not in {
         "body", "body_b64", "text", "plaintext", "image_b64", "file_b64",
-        "images", "vision_route_id",
+        "images", "vision_route_id", "quoted_memory_ids", "quoted_memories",
     } and not key.startswith("caption_")}
-    return {**result, "content": "", "body_unavailable": True,
-            "body_unavailable_reason": "unreadable_history"}
+    caption_text = ""
+    if row.get("visibility") != "local_only":
+        try:
+            caption = _core_envelope.caption_envelope_from_row(row)
+            if caption is not None and not caption.get("body_ct") and not caption.get("K_enclave"):
+                caption_text = _core_envelope.read_plaintext_envelope_body(
+                    caption, owner_user_id=str(row.get("owner_user_id") or "")).decode("utf-8")
+                result.update({key: value for key, value in row.items() if key.startswith("caption_")})
+        except Exception as exc:
+            # Malformed plaintext captions are hard required-content failures,
+            # never a reason to fetch the excluded body from enclave.
+            raise _RecallInputError("caption_storage_invalid") from exc
+    return {**result, "content": caption_text, "content_type": "text",
+            "body_unavailable": not bool(caption_text.strip()),
+            "body_unavailable_reason": "sealed_caption_only" if caption_text.strip() else "unreadable_history"}
 
 
 def _hydrate_backend_history_body(row: dict, *, plaintext_only: bool) -> dict:
@@ -14071,7 +14288,7 @@ _foreground_agent_trace_id: ContextVar[str] = ContextVar(
 )
 
 
-def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
+def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None, *, before_seq=None) -> str:
     """Short plaintext transcript of recent chat turns STRICTLY older than the
     current turn, for injecting cross-turn continuity into foreground messages.
 
@@ -14091,8 +14308,12 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
         # on EVERY foreground turn.
         history = get_decrypted_history(since=0, limit=fetch_limit, include_image_body=False)
     except Exception as e:  # noqa: BLE001 — continuity is best-effort, never fatal
+        if (_RECALL_OPERATION_ACCOUNT.get() or (None, None))[1] == "off":
+            raise _RecallInputError("history_unconfirmed") from e
         log.warning("foreground chat context fetch failed: %s", e)
         return ""
+    if (_RECALL_OPERATION_ACCOUNT.get() or (None, None))[1] == "off":
+        history = _require_recall_history(history, _RECALL_OPERATION_ACCOUNT.get()[0], before_seq=before_seq)
     if not history:
         return ""
     messages = [
@@ -14134,7 +14355,9 @@ def _foreground_agent_message(
         "injected_count": 0,
         "total_chars": 0,
     }
-    transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
+    transcript = _RECALL_FOREGROUND_TRANSCRIPT.get()
+    if transcript is None:
+        transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
     if not transcript:
         return content
     session_meta = _load_agent_session_meta(check_bounds=False)
@@ -17068,6 +17291,8 @@ def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[di
 
 
 def _proactive_chat_context_from_history(history: list[dict] | None, *, limit: int, now: float) -> ProactiveChatContext:
+    if (_RECALL_OPERATION_ACCOUNT.get() or (None, None))[1] == "off":
+        history = _require_recall_history(history, _RECALL_OPERATION_ACCOUNT.get()[0])
     messages = _clean_messages_for_proactive_context(history)
     if not messages:
         return ProactiveChatContext()
@@ -17114,8 +17339,9 @@ def _proactive_chat_context_from_history(history: list[dict] | None, *, limit: i
         # Keep the anchor even when stale-tail truncation omits that user row.
         # Historical quoted_memories are not explicit references in this wake.
         memory_anchor=(
-            {"id": last_user.get("id") or last_user.get("message_id"),
-             "seq": last_user.get("seq")}
+            {**last_user, "quoted_memories": [], "quoted_memory_status": {},
+             "quoted_memory_ids": "", "_recall_historical_anchor": True,
+             "_backlog_original_rows": tuple(selected)}
             if last_user else None
         ),
     )
@@ -20400,6 +20626,7 @@ def _process_dream_jobs(jobs: list) -> float:
     return latest
 
 
+@_recall_scope
 def _process_proactive_jobs(jobs: list) -> float:
     """Realize hidden proactive jobs through the same configured agent entry.
     The user-turn priority gate lives in ``_process_resident_jobs`` (it must
@@ -20503,28 +20730,41 @@ def _process_proactive_jobs(jobs: list) -> float:
         # ── 闸已放行,现在才付昂贵的上下文构建 ────────────────────────
         _recall_turn_reset()
         trace_id = str(job.get("trace_id") or job_id)
-        # Introduction deliberately has no recent-chat fetch/user anchor.
-        recent_context = ProactiveChatContext()
-        if is_introduction:
-            screen_payloads = []
-            screen_paths = []
-            message = _message_for_introduction_job(job)
-        else:
-            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-            recent_context = _coerce_proactive_chat_context(recent_chat_context_for_proactive())
-            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
-            # (its prompt deliberately omits the board).
-            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
-            message = _message_for_proactive_job(
-                job,
-                screen_text=screen_text,
-                recent_chat_context=recent_context,
-                perception_digest=perception_digest,
-            )
-        # T582: select against the latest user in the existing history snapshot,
-        # never the wake text or a newer assistant row. No anchor/fetch failure
-        # stays unknown, and the shared final-driver hook settles actual arrival.
-        auto_text, _auto_ids = _auto_memory_block_for(recent_context.memory_anchor or {}, trace_id)
+        try:
+            _bind_recall_account(_recall_account())
+        except _RecallInputError as exc:
+            update_proactive_job_status(job_id, "failed", str(exc))
+            continue
+        try:
+            # Introduction deliberately has no recent-chat fetch/user anchor.
+            recent_context = ProactiveChatContext()
+            if is_introduction:
+                screen_payloads = []
+                screen_paths = []
+                message = _message_for_introduction_job(job)
+            else:
+                screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
+                recent_context = _coerce_proactive_chat_context(recent_chat_context_for_proactive())
+                # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
+                # (its prompt deliberately omits the board).
+                perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
+                message = _message_for_proactive_job(
+                    job,
+                    screen_text=screen_text,
+                    recent_chat_context=recent_context,
+                    perception_digest=perception_digest,
+                )
+            # T582: select against the latest user in the existing history snapshot,
+            # never the wake text or a newer assistant row. No anchor/fetch failure
+            # stays unknown, and the shared final-driver hook settles actual arrival.
+            if is_introduction:
+                _recall_account()  # Authorized no-history path still authenticates.
+                auto_text, _auto_ids = "", []
+            else:
+                auto_text, _auto_ids = _auto_memory_block_for(recent_context.memory_anchor or {}, trace_id)
+        except _RecallInputError as exc:
+            update_proactive_job_status(job_id, "failed", str(exc))
+            continue
         if auto_text:
             message = f"{auto_text}\n\n{message}"
         update_proactive_job_status(job_id, "realizing")
@@ -21169,6 +21409,8 @@ def _collapse_eligible(msg: dict) -> bool:
         return False
     if str(msg.get("content_type") or "text") != "text":
         return False
+    if msg.get("quoted_memory_ids") or msg.get("quoted_memories"):
+        return False  # Explicit references retain their own current-message binding.
     if msg.get("body_unavailable"):
         return False
     if not str(msg.get("content") or "").strip():
@@ -21240,6 +21482,7 @@ def _collapse_stale_backlog(messages: list) -> list:
             replacement = dict(newest)
             replacement["content"] = merged
             replacement["_backlog_absorbed_keys"] = sorted(merged_ids)
+            replacement["_backlog_original_rows"] = tuple(eligible)
             out.append(replacement)
         elif key in merged_ids:
             pass  # consumed by the merged carrier; seen-marking deferred
@@ -21257,6 +21500,7 @@ def _collapse_stale_backlog(messages: list) -> list:
     return out
 
 
+@_recall_scope
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     global _last_user_message_wall, _screen_runtime_unsupported
@@ -21390,6 +21634,20 @@ def _process_messages(messages: list) -> float:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)
             continue
+
+        try:
+            auto_text, auto_ids = _auto_memory_block_for(msg, str(msg.get("trace_id") or msg.get("id") or key))
+            if (_RECALL_OPERATION_ACCOUNT.get() or (None, None))[1] == "off":
+                # Freeze any transcript this driver needs before media work.
+                transcript = ""
+                if _foreground_history_injection_enabled():
+                    transcript = _recent_chat_context_for_foreground(before_ts=ts, before_seq=msg.get("seq"))
+                _RECALL_FOREGROUND_TRANSCRIPT.set(transcript)
+        except _RecallInputError as exc:
+            _unmark_seen([key, *(msg.get("_backlog_absorbed_keys") or [])])
+            _emit_debug_trace("context", "context.recall_failed", status="error", trace_id=str(msg.get("trace_id") or msg.get("id") or key),
+                              summary="Required turn content unavailable", detail={"reason": str(exc)})
+            break
 
         content = str(msg.get("content") or "").strip()
         if str(msg.get("content_type", "text")) == "image":
@@ -21735,7 +21993,6 @@ def _process_messages(messages: list) -> float:
             )
         # T512: the enclave's per-turn picks finally reach the prompt. Above the
         # user-quoted block (explicit reference sits closest to the message).
-        auto_text, auto_ids = _auto_memory_block_for(msg, trace_id)
         if auto_text:
             content = f"{auto_text}\n\n{content}"
 

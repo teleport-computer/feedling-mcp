@@ -5,49 +5,63 @@ document_lifecycle: current
 canonical_owner: self
 ---
 
-Memory separates ciphertext storage from enclave-authorized read projections.
-Automatic card selection runs in the decrypt service by default; with the
-operator switch `FEEDLING_V2_PLAINTEXT_RECALL` enabled, Runtime V2 selects cards
-for plaintext accounts next to the data using the same selection code. A
-plaintext account's remaining sealed cards are not selected on that path.
-Resident consumers can likewise get plaintext accounts' per-turn cards from the
-backend (`POST /v1/memory/turn-selection`, operator switch
-`FEEDLING_RESIDENT_PLAINTEXT_RECALL`, off by default), selected with the lexical
-ranker on the same history page; encrypted accounts keep the decrypt-service
-path.
+Automatic recall distinguishes required conversation content from optional
+memory candidates. An authenticated account whose effective mode is exactly
+`off` uses local recall only: rollout settings, old sealed data, unavailable
+services and missing routes never authorize an enclave content retry. Encrypted
+accounts and successful legacy mode responses retain their compatibility path.
+Whoami can still fetch public attestation metadata; zero content-decrypt calls
+does not mean zero network requests.
 
-The upgraded Resident history reader separately uses only the backend for
-accounts explicitly reporting `content_encryption_effective=off`. Old sealed
-history remains unreadable and is excluded from conversation context and
-Capture input; such a row cannot initiate per-turn selection. History or body
-read failures do not trigger enclave retries. A failed history page remains
-distinct from an empty page so the poll checkpoint can retry. This does not
-change the selection route's compatibility fallbacks described below, or the
-history path for encrypted and unknown accounts.
+Resident uses `POST /v1/memory/turn-selection` and
+`FEEDLING_RESIDENT_PLAINTEXT_RECALL`; V2 uses
+`FEEDLING_V2_PLAINTEXT_RECALL`. For an effective-off account, rollout `on` runs
+local selection. Rollout `off` or `shadow` reports recall unavailability after
+validating required conversation content. Resident stays lexical; V2 can use
+its existing lexical fallback when the optional vector service is unavailable.
 
-For this resident route, `off` returns `409 not_served` without contacting the
-decrypt service; `shadow` returns the decrypt service's result and schedules a
-bounded local comparison; `on` serves the local lexical result, with at most
-one backend-owned decrypt-service fallback when budget remains. A consumer
-falls back itself only for `404` (an older backend) or `409`. A timeout, `503`,
-authentication error, or other failure is an unknown result, not an empty pick,
-and the consumer does not issue another decrypt request.
+Candidate reads use a dedicated read-only transaction and the complete original
+candidate universe. Every raw envelope's owner is checked before archive,
+local-only or sealed exclusions and before the existing sort and limit. A bad
+same-owner candidate payload discards the whole recall result, rather than
+injecting the other cards or blocking an otherwise valid conversation.
+Unavailability reports unknown selected/pool counts (`null`) and zero injected
+cards. A valid empty pool or genuine zero matches remains a successful zero.
 
-The request body is limited to 1024 bytes, including streamed requests. The
-`X-Recall-Deadline-Ms` budget starts after authentication and covers body reads,
-worker queueing, account-mode checks, and selection/fallback waiting. It defaults
-to 3000 ms, is capped at 4000 ms, and reserves 150 ms for returning the response;
-an exhausted budget is never extended. Authentication, network transit and
-serialization are outside this budget. Timed-out work retains its concurrency
-permit until it actually exits: this bounds outstanding work rather than
-cancelling a running database query or CPU operation. Diagnostics are best
-effort and use bounded background jobs, so they cannot delay a selected result.
+Missing or conflicting owners, authorization failures, invalid turn bindings,
+required message/caption/reference failures and unclassified shared SQL errors
+stop the turn before provider dispatch. They are not optional no-card results.
+The Resident route uses a typed `503 recall_unavailable` only for a proved
+optional failure, with its authenticated user, message and sequence binding.
+Consumers validate that binding and their own required content. A bare `503`,
+unknown `409`, malformed response or unknown-stage timeout does not establish
+that it is safe to continue. A missing route never switches an off operation to
+the enclave. A message outside the fixed window is a binding failure.
 
-Shadow comparison uses the enclave's frozen input fingerprints. An active
-hybrid selection is recorded as a policy difference; a lexical fallback can be
-compared after removing only hybrid-policy fields. If sealed cards were present,
-the comparison uses the enclave's normalized result from the same original
-inputs with those cards excluded. Missing evidence is not counted as agreement.
+The page frontier, order and original limit remain fixed; exclusions do not
+refill from older messages or use future messages. Old sealed bodies/captions
+are excluded read-only, without migration or decryption. An unreadable current
+message cannot be replaced with an earlier user message. Required plaintext
+corruption is not treated as a sealed-data exclusion.
+
+For an attachment actually used by the turn, an omitted body or image placeholder
+is insufficient. A bounded canonical plaintext read verifies the same owner,
+message, sequence and storage version before media processing. Reads remain in
+the original operation budget and do not retry or expand the page. Media uses
+the validated bytes; the bytes are not added to the recall query. The authenticated
+Resident response binds required attachment bytes through `required_attachments`
+(`id`, `seq`, `sha256`), which the consumer checks against its own validated input.
+A changed source, missing body or integrity failure stops the turn.
+
+
+The request body remains limited to 1024 bytes, including streamed requests.
+The `X-Recall-Deadline-Ms` budget covers body reads, worker queueing, mode checks
+and recall stages after authentication. It defaults to 3000 ms, is capped at
+4000 ms and reserves 150 ms for returning the response. A timed-out operation
+retains its permit until actual termination and cannot publish a late result
+or start replacement work. Timeout before required-content or full owner
+validation completes is a hard failure. Known isolated optional failures can
+continue only with independently validated turn content.
 
 Keyword search (`memory_search`, and `memory_index` with a query) for a
 plaintext account ranks the account's plaintext cards in the backend with the
@@ -194,7 +208,8 @@ metadata is described below. Index discovery is allowed once per V2
 loop; after a bounded overview, fetch visible IDs or use a more specific search.
 
 Recall diagnostics distinguish card selection from actual prompt injection.
-Each V2 chat/wake turn can read enclave-selected cards from a sequence-bounded
+Each V2 chat/wake turn can read locally selected cards for plaintext accounts,
+or enclave-selected cards for encrypted accounts, from a sequence-bounded
 history window. Automatic recall in both runtimes first selects relevant cards
 using the latest non-empty user message alone. It then fills remaining seats
 using the latest two non-empty user messages joined newest first, deduplicating
@@ -1117,3 +1132,5 @@ the turn stays lexical. Any failure inside the per-turn budget
 (`FEEDLING_MEMORY_RECALL_HYBRID_BUDGET_MS`, default 2000) makes the whole turn
 use the lexical result, and the selection record's `hybrid` entry names the
 reason. `memory_search` and `memory_index` are unaffected.
+
+Explicit references used by an off-account turn are required content. The server reads their persisted, owner-bound plaintext rows before optional selection; missing, sealed, malformed, or foreign-owner references fail the turn. Both successful selection and typed optional unavailability carry `required_references`, in the requested order with duplicate IDs removed. The consumer verifies these IDs against the current message before rendering the cards. A historical wake anchor can set `include_references: false` because its old references are not part of that wake prompt. This does not disable validation of references actually used in the prompt.

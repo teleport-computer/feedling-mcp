@@ -12,6 +12,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Plaintext automatic recall no longer falls back to enclave content reads.
+  Required conversation and owner/binding failures stop the turn; a malformed
+  same-owner optional memory makes the whole recall result unavailable without
+  blocking valid conversation. Unavailable counts remain unknown, distinct
+  from a healthy zero-match result. Candidate ordering and the fixed message
+  frontier are retained; old sealed content is excluded without migration.
+  Required attachment bytes are bound to the same message version before media
+  processing. Explicit references are required content and keep their own
+  message when stale backlog is collapsed. Turn selection returns attachment
+  fingerprints and required reference cards; historical wake anchors may omit
+  unused old references with `include_references: false`.
+
 - `io_cli doctor` now uses authenticated account mode for readiness. Plaintext
   accounts skip the enclave content probe; legacy modes retain it. The
   `io_cli.doctor.v2` output keeps five boolean check keys and adds required/skip

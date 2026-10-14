@@ -6,18 +6,11 @@ now answers instead, with the lexical ranker only (Seven 2026-09-30: no vectors
 for residents for now), on exactly the page the consumer's enclave read used:
 ``before_seq = seq + 1``, ``limit = 4``, no ``context_recent``, trace on.
 
-``FEEDLING_RESIDENT_PLAINTEXT_RECALL`` (``off`` by default, read at call time,
-changed by redeploying):
-
-- ``off``: 409 ``not_served``; the enclave was not called.
-- ``shadow``: the enclave's answer is returned; the local lexical selection runs
-  in the background and records a content-free comparison.
-- ``on``: the local answer is returned; if it is unavailable the backend itself
-  falls back to the enclave once (it is the only side that falls back).
-
-Status contract for the consumer: 200 carries ``source``; 409 and a missing
-route mean "the backend did not touch the enclave"; 503 ``recall_unavailable``
-and any other failure mean "unknown, do not retry the enclave".
+Effective-off operations never call the enclave. Rollout off/shadow returns
+classified optional unavailability after required content validation; on uses
+isolated local candidates. Unknown-stage, ownership and required-content
+failures are hard failures. Only successfully resolved encrypted/legacy modes
+return the compatibility delegation response.
 """
 from __future__ import annotations
 
@@ -31,7 +24,7 @@ from chat import chat_core
 from core import enclave as core_enclave
 from core import runtime_token
 from core import store as core_store
-from memory import memory_core, plaintext_recall
+from memory import memory_core, plaintext_recall, recall_contract, recall_operation
 
 MODE_ENV = "FEEDLING_RESIDENT_PLAINTEXT_RECALL"
 MODES = ("off", "shadow", "on")
@@ -77,7 +70,7 @@ def deadline_seconds(header_value) -> float:
 
 
 def parse_request(body) -> tuple[dict | None, str]:
-    if not isinstance(body, dict) or set(body) - {"message_id", "seq"}:
+    if not isinstance(body, dict) or set(body) - {"message_id", "seq", "include_references"}:
         return None, "invalid_body"
     message_id = body.get("message_id")
     seq = body.get("seq")
@@ -85,7 +78,12 @@ def parse_request(body) -> tuple[dict | None, str]:
         return None, "invalid_message_id"
     if isinstance(seq, bool) or not isinstance(seq, int) or not 0 < seq < 2**63 - 1:
         return None, "invalid_seq"
-    return {"message_id": message_id.strip(), "seq": seq}, ""
+    if "include_references" in body and not isinstance(body["include_references"], bool):
+        return None, "invalid_body"
+    parsed = {"message_id": message_id.strip(), "seq": seq}
+    if "include_references" in body:
+        parsed["include_references"] = body["include_references"]
+    return parsed, ""
 
 
 # ------------------------------------------------------------------ reads
@@ -96,14 +94,19 @@ def _store(user_id: str):
 
 
 def _history_page(user_id: str, through_seq: int) -> list:
+    from memory.recall_attachments import HistoryPage
+    raw_page = []
     body, status = chat_core.history(
         _store(user_id),
         query={"limit": str(PAGE_LIMIT), "before_seq": str(int(through_seq) + 1),
                "include_image_body": "0"},
-        user_agent="resident-plaintext-recall", remote_addr="")
+        user_agent="resident-plaintext-recall", remote_addr="", raw_page_observer=lambda rows: raw_page.extend(json.loads(json.dumps(rows))))
     if status != 200 or not isinstance(body, dict):
         raise plaintext_recall.NotServedHere("history_unavailable")
-    return list(body.get("messages") or [])
+    rows = body.get("messages")
+    if not isinstance(rows, list):
+        raise recall_contract.RecallFailure("history_shape_invalid")
+    return HistoryPage(rows, raw_page)
 
 
 def _list_moments(user_id: str, limit: int) -> list:
@@ -322,61 +325,25 @@ def select_for_turn(store, request: dict, deadline_s: float) -> tuple[dict, int]
     started = time.monotonic()
     user_id = store.user_id
     current = mode()
-    if current == "off":
-        return {"error": "not_served", "detail": "mode_off"}, 409
     end = started + max(0.0, deadline_s)
     account_status, effective = plaintext_recall.run_bounded(
         lambda: accounts_registry.effective_content_encryption(user_id),
         end - time.monotonic(), _ACCOUNT_PERMIT)
     if account_status != "ok":
-        return {"error": "recall_unavailable", "detail": "account_" + account_status}, 503
-    if effective != "off":
-        return {"error": "not_served", "detail": "account_encrypted"}, 409
-    seq = request["seq"]
-
-    if current == "shadow":
-        status, payload = _enclave_with_budget(user_id, seq, end - time.monotonic(), input_fp=True)
-        elapsed = (time.monotonic() - started) * 1000.0
-        if status != "ok":
-            _trace(store, source="enclave_shadow", outcome="unavailable", elapsed_ms=elapsed,
-                   reason=status)
-            return {"error": "recall_unavailable", "detail": "enclave_" + status}, 503
-        if not message_in_page(payload.get("messages"), request["message_id"]):
-            _trace(store, source="enclave_shadow", outcome="message_not_in_window",
-                   elapsed_ms=elapsed)
-            return {"error": "message_not_in_window"}, 422
-        _submit_shadow(store, user_id, seq, payload.get("context_input_diagnostics"))
-        _trace(store, source="enclave_shadow", outcome="ok", elapsed_ms=elapsed)
-        return _response("enclave_shadow", payload, payload.get("messages")), 200
-
-    # on
-    page: list = []
-    local_status, local = plaintext_recall.run_bounded(
-        lambda: local_select(user_id, seq, page), max(0.0, end - time.monotonic()), _LOCAL_PERMIT)
-    if local_status == "ok":
-        rows = list(page)
-        elapsed = (time.monotonic() - started) * 1000.0
-        if not message_in_page(rows, request["message_id"]):
-            _trace(store, source="local", outcome="message_not_in_window", elapsed_ms=elapsed)
-            return {"error": "message_not_in_window"}, 422
-        _trace(store, source="local", outcome="ok", elapsed_ms=elapsed,
-               detail={"local_ms": local.elapsed_ms})
-        return _response("local", local.payload, rows), 200
-    if local_status == "error" and isinstance(local, plaintext_recall.NotServedHere):
-        reason = local.reason
-    elif local_status == "error":
-        reason = f"local_{type(local).__name__}"[:60]
-    else:
-        reason = local_status
-    status, payload = _enclave_with_budget(user_id, seq, end - time.monotonic())
-    elapsed = (time.monotonic() - started) * 1000.0
-    if status != "ok":
-        _trace(store, source="enclave_fallback", outcome="unavailable", elapsed_ms=elapsed,
-               reason=f"{reason}|enclave_{status}")
-        return {"error": "recall_unavailable", "detail": "local_and_enclave_unavailable"}, 503
-    if not message_in_page(payload.get("messages"), request["message_id"]):
-        _trace(store, source="enclave_fallback", outcome="message_not_in_window",
-               elapsed_ms=elapsed, reason=reason)
-        return {"error": "message_not_in_window"}, 422
-    _trace(store, source="enclave_fallback", outcome="ok", elapsed_ms=elapsed, reason=reason)
-    return _response("enclave_fallback", payload, payload.get("messages")), 200
+        return {"error": "input_read_unconfirmed", "category": "content_read_failed"}, 503
+    try:
+        effective = recall_contract.exact_mode(effective)
+        if effective == "off":
+            payload, status = recall_operation.select_off(
+                user_id, request["seq"], deps(), deadline=end, permit=_LOCAL_PERMIT,
+                rollout=current, message_id=request["message_id"],
+                include_references=request.get("include_references", True),
+                query_args=plaintext_recall.RESIDENT_QUERY_ARGS, hybrid=False)
+            _trace(store, source="local", outcome="ok" if status == 200 else "unavailable",
+                   elapsed_ms=(time.monotonic() - started) * 1000,
+                   reason=payload.get("detail", ""))
+            return payload, status
+    except recall_contract.RecallFailure as exc:
+        return {"error": exc.reason, "category": exc.category}, (422 if exc.reason == "message_not_in_window" else 503)
+    # Only successful on/legacy unknown may delegate to encrypted compatibility.
+    return {"error": "not_served", "detail": "account_encrypted"}, 409
