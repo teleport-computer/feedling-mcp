@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Model route activation, route tests, and active credential key changes record
+  bounded HTTP/1.1 header/body phase evidence in existing probe diagnostics.
+  HTTP/2 and unavailable observations remain unknown. Validation, buffered reads,
+  90-second operation timeouts, and existing request counts are unchanged.
+
 - `io_cli identity-read` reads effective plaintext identities locally with owner
   checks and no content-decrypt fallback. It uses backend relationship days,
   including anchor repair, which can differ from legacy enclave counts. The

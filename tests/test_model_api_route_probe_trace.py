@@ -188,3 +188,78 @@ def test_credential_patch_without_active_key_change_does_not_probe(
     assert response.status_code == 200
     assert db.model_api_active_route(uid)["id"] == active["id"]
     assert not _events(client, headers, uid)
+
+
+from test_provider_probe_http import loopback, local_probe
+
+
+@pytest.mark.parametrize('operation', ['activate', 'test', 'credential_patch'])
+@pytest.mark.parametrize('mode', ['headers', 'body', 'ok', 'json', '404'])
+def test_real_route_probe_phase_and_persistence(client, probe_user, monkeypatch,
+                                               local_probe, operation, mode):
+    uid, headers = probe_user
+    real_probe = provider_client.test_provider_key
+    monkeypatch.setattr(provider_client, 'test_provider_key', lambda cfg: {})
+    with loopback(mode) as server:
+        initial = client.post('/v1/model_api/setup', headers=headers, json={
+            'provider': 'openai_compatible', 'model': 'PRIVATE_PHASE_MODEL',
+            'api_key': 'synthetic-old-key', 'base_url': f'http://127.0.0.1:{server.port}/v1',
+            'context_window_tokens': 65536})
+        assert initial.status_code == 200
+        active = db.model_api_active_route(uid)
+        cid = active['credential_id']
+        before = db.model_api_credential_get(uid, cid)
+        created = client.post('/v1/model_api/routes', headers=headers, json={
+            'credential_id': str(cid), 'model': 'PRIVATE_PHASE_NEW_MODEL',
+            'context_window_tokens': 65536, 'activate': False})
+        rid = created.get_json()['route']['id']
+        _events(client, headers, uid)
+        debug_trace.clear_trace(SimpleNamespace(user_id=uid))
+        monkeypatch.setattr(provider_client, 'test_provider_key', real_probe)
+        monkeypatch.setattr(setup_core.core_envelope, '_build_shared_envelope_for_store',
+                            lambda *a, **k: ({'v': 1, 'body_ct': 'new-ct', 'nonce': 'new-n'}, None))
+        if operation == 'credential_patch':
+            response = client.patch(f'/v1/model_api/credentials/{cid}', headers=headers,
+                                    json={'api_key': 'PRIVATE_PHASE_NEW_KEY'})
+            lane = operation
+        else:
+            response = client.post(f'/v1/model_api/routes/{rid}/{operation}', headers=headers)
+            lane = 'route_' + operation
+        assert response.status_code == (200 if mode == 'ok' else 400)
+        assert server.count == 1
+        if mode != 'ok':
+            assert db.model_api_active_route(uid)['id'] == active['id']
+            assert db.model_api_credential_get(uid, cid)['api_key_envelope'] == before['api_key_envelope']
+        events = _events(client, headers, uid)
+        assert len(events) == 2
+        finished = next(e for e in events if e['detail']['phase'] == 'finished')
+        expected = {'headers': 'response_headers', 'body': 'response_body'}.get(mode, 'buffered_complete')
+        assert finished['detail']['http_phase'] == expected
+        with db.get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT doc FROM user_logs WHERE user_id=%s AND stream='provider_attempts'", (uid,))
+                rows = [row[0] for row in cur.fetchall() if row[0].get('lane') == lane]
+        assert len(rows) == 1
+        assert rows[0]['probe_http'] == finished['detail']['probe_http']
+        assert rows[0]['parent_message_id'] == finished['trace_id']
+        assert 'PRIVATE_PHASE_' not in json.dumps(rows) + json.dumps(events)
+        if mode in {'headers', 'body'}:
+            assert rows[0]['status_code'] is None
+
+
+def test_phase_ledger_survives_trace_gate_off(client, probe_user, monkeypatch, local_probe):
+    uid, headers = probe_user
+    monkeypatch.setenv('FEEDLING_V1_FLOW_TRACE', '0')
+    with loopback('body') as server:
+        with pytest.raises(provider_client.ProviderError):
+            setup_core._test_provider_key_observed(SimpleNamespace(user_id=uid),
+                provider_client.ProviderConfig('openai_compatible', 'synthetic', 'synthetic',
+                    f'http://127.0.0.1:{server.port}/v1'), operation='route_test')
+        assert server.count == 1
+    assert db.query_trace_events(user_id=uid, subsystem='model_api') == []
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT doc FROM user_logs WHERE user_id=%s AND stream='provider_attempts'", (uid,))
+            rows = [row[0] for row in cur.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]['probe_http']['phase'] == 'response_body'
