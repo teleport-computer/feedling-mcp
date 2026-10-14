@@ -12,8 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- Resident consumers now reject successful HTTP responses without a valid JSON
-  reply ID receipt. Unconfirmed foreground writes retain the existing retry
+- Resident consumers now reject unrecognized HTTP success responses without a
+  valid JSON reply ID receipt. Recognized terminal voice dispositions settle
+  without counting a posted reply or success. Unconfirmed foreground writes
+  retain the existing retry
   path instead of being counted as accepted delivery. Server idempotency and
   terminal conflict behavior are unchanged; this does not prove client display.
 

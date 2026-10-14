@@ -302,9 +302,15 @@ is an encryption recipient, not an API credential. Plain-text-only chat messages
 **followups** require it. Authentication, bootstrap, and envelope validation
 still apply. A 400 response alone does not identify which validation failed.
 
+The server may also return HTTP 200 with `status: ignored` and one of
+`voice_call_finalized`, `voice_call_cancelled`, or `voice_call_finalizing` as
+`reason`. These closed voice dispositions settle the turn without counting a
+posted reply or delivery success; they do not block later messages.
+
 The official resident consumer requires a JSON success receipt containing a
 nonempty string reply `id` before counting a response write as accepted. An
-unreadable or missing receipt leaves delivery unconfirmed. For a foreground
+unreadable or missing receipt outside the terminal dispositions above leaves
+delivery unconfirmed. For a foreground
 turn with no accepted reply or terminal rejection, the consumer retains the
 checkpoint and releases the turn for normal redelivery. A lost receipt can
 follow a real commit; existing server idempotency and terminal conflict handling
