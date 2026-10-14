@@ -2089,50 +2089,67 @@ def cmd_onboard_start(args):
     _emit({"ok": status in (200, 201), "http_status": status}, 0 if status in (200, 201) else 1)
 
 
-def _doctor_summary(checks):
-    """Pure: fold a {check_name: bool} map into {ok, checks, failed[]}."""
-    failed = [k for k, v in (checks or {}).items() if not v]
-    return {"ok": not failed, "checks": checks, "failed": failed}
+def _doctor_summary(checks, *, required=None, skipped=None, account_mode="unknown"):
+    """Keep probe booleans truthful; only required probes determine readiness."""
+    required = list(checks) if required is None else list(required)
+    failed = [key for key in required if not checks.get(key, False)]
+    return {"schema": "io_cli.doctor.v2", "ok": not failed, "checks": checks,
+            "failed": failed, "required_checks": required,
+            "skipped_checks": dict(skipped or {}), "account_mode": account_mode}
 
 
 def cmd_doctor(args):
-    """Five-probe environment health check, read-only. GET/POST against api/enclave.
+    """Read-only, account-aware readiness; whoami metadata remains compatible.
 
-    Purpose: surface environment failures early (sandbox no-net, bad key, enclave
-    down) rather than let onboarding fail opaquely deep in a later step. Every
-    probe is a pure read (no chat message sent, no card written).
-
-    Fresh-account judgment (no identity/memory/chat yet): checked against the
-    actual handlers — GET /v1/identity/get (backend identity_core.get_identity,
-    and its enclave decrypt-and-serve proxy) both return 200 with
-    ``identity: None`` when nothing has been written yet, never 404; POST
-    /v1/memory/index returns 200 with an empty items list on a fresh account;
-    GET /v1/chat/history returns 200 with an empty list. So a plain 2xx check
-    already treats "reachable but nothing there yet" as a pass — no fresh-account
-    special-casing needed. A genuine connection failure / 401 / 5xx is what
-    fails a check.
+    A successful probe means HTTP reachability, not decrypted-body validation.
+    Effective off skips the enclave content probe. Successful legacy unknown
+    modes retain it; a failed or malformed mode read stops all later probes.
     """
     auth = _auth_headers()
-    api_url = _env("FEEDLING_API_URL")
-    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    api_url = _env("FEEDLING_API_URL").rstrip("/")
+    enclave_url = _env("FEEDLING_ENCLAVE_URL").rstrip("/")
+    checks = dict.fromkeys(("api", "enclave", "identity", "memory", "chat"), False)
+    account = None
+    if api_url and auth:
+        try:
+            status, account = _http_json(
+                "GET", f"{api_url}/v1/users/whoami", auth, timeout=10)
+            checks["api"] = (
+                status == 200 and isinstance(account, dict)
+                and isinstance(account.get("user_id"), str)
+                and bool(account["user_id"].strip())
+                and ("content_encryption_effective" not in account
+                     or isinstance(account["content_encryption_effective"], str)))
+        except Exception:
+            checks["api"] = False
+    if not checks["api"]:
+        out = _doctor_summary(
+            checks, required=["api"], account_mode="unavailable",
+            skipped={key: "account_mode_unavailable" for key in checks if key != "api"})
+        out["error"] = "account_mode_unavailable"
+        _emit(out, 1)
+        return
+
+    mode = account.get("content_encryption_effective")
+    mode = mode if mode in ("off", "on") else "unknown"
+    required = [key for key in checks if key != "enclave" or mode != "off"]
+    skipped = {"enclave": "not_required_for_plaintext"} if mode == "off" else {}
 
     def _ok(method, url, insecure=False, payload=None):
         try:
-            s, _ = _http_json(method, url, auth, payload=payload, insecure=insecure, timeout=10)
-            return 200 <= s < 300
+            status, _ = _http_json(method, url, auth, payload=payload,
+                                   insecure=insecure, timeout=10)
+            return 200 <= status < 300
         except Exception:
             return False
 
-    checks = {
-        "api": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/users/whoami"),
-        "enclave": bool(enclave_url) and _ok("GET", f"{enclave_url.rstrip('/')}/v1/identity/get", insecure=True),
-        "identity": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/identity/get"),
-        # /v1/memory/index is POST-only (a readside query, not a mutation) — a
-        # GET here would 405 every time, always failing the check.
-        "memory": bool(api_url) and _ok("POST", f"{api_url.rstrip('/')}/v1/memory/index", payload={"limit": 1}),
-        "chat": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/chat/history?limit=1"),
-    }
-    out = _doctor_summary(checks)
+    if mode != "off":
+        checks["enclave"] = bool(enclave_url) and _ok(
+            "GET", f"{enclave_url}/v1/identity/get", insecure=True)
+    checks["identity"] = _ok("GET", f"{api_url}/v1/identity/get")
+    checks["memory"] = _ok("POST", f"{api_url}/v1/memory/index", payload={"limit": 1})
+    checks["chat"] = _ok("GET", f"{api_url}/v1/chat/history?limit=1")
+    out = _doctor_summary(checks, required=required, skipped=skipped, account_mode=mode)
     _emit(out, 0 if out["ok"] else 1)
 
 
@@ -2551,7 +2568,7 @@ def main():
     obs.set_defaults(func=cmd_onboard_start)
 
     dr = sub.add_parser("doctor",
-                        help="[setup] Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
+                        help="[setup] Account-aware readiness (five check keys; plaintext skips enclave content probe).")
     dr.set_defaults(func=cmd_doctor)
 
     rv2 = sub.add_parser(
