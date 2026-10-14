@@ -639,5 +639,18 @@ days. Sealed, mixed, malformed or foreign cards fail without decrypt fallback;
 local-only cards expose metadata only. Mode-fetch failures stop the command.
 The existing identity GET returns 503 for read failures and 500 for non-object
 storage, rather than reporting an absent card. Legacy day-count differences,
-old-client limitations and unchanged doctor behavior are described in the
+old-client limitations and account-aware doctor behavior are described in the
 [resident trust and mode contract](docs-site/content/docs/self-hosting.mdx).
+
+### Resident readiness diagnostics
+
+`io_cli doctor` authenticates and reads the account mode first. Exact `off`
+requires backend API, identity, memory and chat probes; it skips the enclave
+content probe. Output schema `io_cli.doctor.v2` preserves all five boolean
+`checks` keys, adds `required_checks`, `skipped_checks` and `account_mode`, and
+computes `ok`, `failed` and exit status from required probes only. A skipped
+enclave check remains `false`, with reason `not_required_for_plaintext`.
+Use `ok` or the exit status for readiness, not `all(checks.values())`.
+Successful legacy unknown modes still require the enclave; failed or malformed
+mode reads stop later probes. The whoami public-attestation lookup remains
+compatible, so this is not a guarantee of zero enclave network requests.

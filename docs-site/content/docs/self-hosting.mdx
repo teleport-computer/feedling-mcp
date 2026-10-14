@@ -149,8 +149,28 @@ These failure guarantees apply to this endpoint and the new CLI read path.
 Existing Resident reads still have their own error handling. Legacy unmanaged
 Genesis reinitialization can continue after a failed read of a Genesis-owned
 card; this change does not fix or authorize that existing write behavior.
-`doctor` retains its separate five-probe behavior, including its enclave content
-probe. The whoami public-attestation lookup is unchanged. Plaintext identity
+`doctor` first requires an authenticated, well-formed whoami response. Exact
+`off` requires backend API, identity, memory and chat probes, and does not run
+the enclave identity content probe. Exact `on`, a missing mode field, or any
+other string (including empty, whitespace and `OFF`) preserves the five-probe
+compatibility contract. Explicit null/non-string modes, malformed identities,
+and failed mode requests fail before later probes; they never imply plaintext.
+
+Doctor output uses schema `io_cli.doctor.v2`. The five boolean `checks` keys
+(`api`, `enclave`, `identity`, `memory`, `chat`) remain present. New
+`required_checks` and `skipped_checks` explain readiness: for plaintext,
+`checks.enclave` is `false` and its skip reason is
+`not_required_for_plaintext`; it is not counted in `failed`. `ok` and exit status
+use only required checks. Consumers that previously required all check values
+to be true must use `ok` or the exit status instead. On mode-read failure,
+`account_mode` is `unavailable`, `api` fails, other probes are marked skipped
+with `account_mode_unavailable`, and the command exits nonzero. Probe failures
+are never marked skipped. Empty identity/history responses can pass these
+reachability checks; success does not prove raw content is readable.
+
+The whoami public-attestation lookup is unchanged: configured cache misses may
+still request enclave metadata. Skipping the content probe does not guarantee
+zero enclave network traffic. Plaintext identity
 content is visible to the backend and resident host within their existing trust
 boundaries; no new decryption service or plaintext API is added.
 
