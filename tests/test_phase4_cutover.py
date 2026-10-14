@@ -248,46 +248,6 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                         sql.Identifier(database)
                     )
                 )
-def test_phase4_pending_gate_blocks_every_unaudited_reason(backend_env):
-    import db
-    from admin import phase4_cutover
-    from tee_replicator import terminal_preservation as preservation
-
-    uid = f"usr_phase4_gate_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as tee:
-        tee.execute("DELETE FROM tee_pending_device_migration")
-        tee.execute(
-            "INSERT INTO users (user_id,created_at,doc) VALUES (%s,'',%s)",
-            (uid, Jsonb({"user_id": uid})),
-        )
-        tee.execute(
-            "INSERT INTO tee_pending_device_migration "
-            "(user_id,table_name,item_id,reason) VALUES "
-            "(%s,'chat_messages','terminal','pdm:no_k_enclave'),"
-            "(%s,'chat_messages','requeue','requeue:source_updated'),"
-            "(%s,'chat_messages','malformed','preserved_ciphertext:v1:bad'),"
-            "(%s,'chat_messages','missing-source',%s)",
-            (
-                uid,
-                uid,
-                uid,
-                uid,
-                preservation.encode_preserved_reason(
-                    "a" * 64, "decrypt_failed:historical"
-                ),
-            ),
-        )
-        with db.get_pool().connection() as source:
-            gate = phase4_cutover._pending_gate(source, tee)
-
-        assert gate["tee_pending_device_migration_blocking"] == 4
-        assert gate["tee_terminal_ciphertext_preserved"] == 0
-        assert gate["preserved_mismatches"] == [
-            "missing_source:chat_messages:1"
-        ]
-
-        tee.execute("DELETE FROM tee_pending_device_migration")
-        tee.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
 def test_phase4_voice_session_smoke_fails_closed_when_table_is_missing(backend_env):

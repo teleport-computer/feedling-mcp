@@ -2663,7 +2663,10 @@ def test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db(monkeyp
 
 
 def test_chat_still_works_and_takes_the_chat_path(monkeypatch):
-    """Guard against the dispatch fix accidentally starving the real chat turn."""
+    """BUG-2: the lane != "chat" dispatch bail-out must not starve interactive chat.
+
+    Pairs with test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db.
+    """
     uid = "u_w_chat_still_works"
     conftest.seed_user(uid)
     _reset(uid)
@@ -2947,29 +2950,6 @@ def test_metadata_compaction_refreshes_turn_progress(monkeypatch):
         "deterministic_compaction_batch_start",
         "deterministic_compaction_batch_complete",
     ]
-
-
-def test_chat_lane_still_takes_the_chat_path(monkeypatch):
-    """Regression guard for the BUG-2 dispatch fix: the `lane != "chat"` bail-out must not
-    starve the real interactive chat turn. Pairs with
-    test_unhandled_lane_never_writes_a_bubble_and_fails_loudly_in_the_db."""
-    uid = "u_w_chat_still_works"
-    conftest.seed_user(uid)
-    _reset(uid)
-    jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("w")
-
-    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
-    _script_provider(monkeypatch, [_text_round("REPLY")])
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
-    written = {}
-    monkeypatch.setattr(worker, "_write_encrypted_reply",
-                        lambda store, text: written.update(text=text) or {"id": "r"})
-
-    status = asyncio.run(worker.process_job(
-        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
-    assert status == "completed"
-    assert written == {"text": "REPLY"}
 
 
 # --- 真实模型自称块进入回合 system 位（prod usr_6bb6…，2026-07-25）----------

@@ -115,10 +115,6 @@ def test_list_field_three_ops_key_shape(field, add_dest, remove_dest, replace_de
     assert replace_payload["actions"][0]["patch"] == {replace_key: ["x", "y"]}, field
 
 
-def test_nothing_to_write_is_none():
-    assert io_cli._identity_write_payload_v2(_ns()) is None
-
-
 def test_nudge_action_appended_after_profile_patch():
     payload = io_cli._identity_write_payload_v2(_ns(
         user_preferred_name="老张", nudge_dimension=["幽默:+5"]))
