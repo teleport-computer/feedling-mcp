@@ -1176,6 +1176,8 @@ jobs:
             tests/test_tcp_connect_monitor.py \
             tests/test_distillation_ledger.py \
             tests/test_e2e_tools.py \
+            tests/test_release_window_slice.py \
+            tests/test_runtime_drain_witness.py \
             tests/test_e2e_p0_fallback_gate.py \
             tests/test_e2e_relay_model_preflight.py \
             tests/test_e2e_deep_target_gate.py \
@@ -1233,6 +1235,9 @@ jobs:
             tests/test_resident_failure_diagnostics.py \
             tests/test_resident_cli_output_cap.py \
             tests/test_agent_runtime_supervisor.py \
+            tests/test_resident_admission_fence.py \
+            tests/test_resident_admission_isolation.py \
+            tests/test_resident_admission_reads.py \
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_p0_pool_safety.py \

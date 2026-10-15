@@ -211,7 +211,7 @@ def test_load_keys_parses_pool_file(monkeypatch, tmp_path) -> None:
 
 
 def test_p0_blocking_verdict() -> None:
-    assert not p0.p0_blocks_release([])
+    assert p0.p0_blocks_release([])
     assert not p0.p0_blocks_release([
         {"cell": "missing-key", "result": "skip"},
         {"cell": "memory-late", "result": "ok"},
@@ -265,6 +265,9 @@ def _provision_wire(monkeypatch, tmp_path, register_errors=(), *, who_error=None
     requests, sleeps, clients = [], [], []
     errors = iter(register_errors)
     real_client = httpx.Client
+    # Synthetic oracle only: lifecycle tests do not call the real admin endpoint.
+    monkeypatch.setattr(client_mod, "admin_confirms_absent",
+                        lambda *_a, **_kw: (True, "synthetic attestation"))
     monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
     capture_sleeps(monkeypatch, client_mod, sleeps)
 
@@ -278,6 +281,8 @@ def _provision_wire(monkeypatch, tmp_path, register_errors=(), *, who_error=None
                 return httpx.Response(error, json={"error": "registration_failed"})
             return httpx.Response(201, json={"user_id": "e2e-user", "api_key": "fake-key"})
         if request.url.path == "/v1/users/whoami":
+            if any(r.url.path == "/v1/account/reset" for r in requests):
+                return httpx.Response(401, json={"error": "unauthorized"})
             assert list((tmp_path / "orphans").glob("*.json"))
             if who_error is not None:
                 raise who_error
@@ -304,7 +309,7 @@ def test_provision_retries_only_registration_connect_failures(monkeypatch, tmp_p
         assert client.user_id == "e2e-user"
         assert client._orphan_file.exists()
     paths = [r.url.path for r in requests]
-    assert paths == ["/v1/users/register"] * (failures + 1) + ["/v1/users/whoami", "/v1/account/reset"]
+    assert paths == ["/v1/users/register"] * (failures + 1) + ["/v1/users/whoami", "/v1/account/reset", "/v1/users/whoami"]
     bodies = [r.content for r in requests if r.url.path == "/v1/users/register"]
     assert len(set(bodies)) == 1  # Same public key and registration payload on each attempt.
     assert json.loads(bodies[0])["access_mode"] == "model_api"
@@ -358,7 +363,7 @@ def test_provision_does_not_retry_after_account_creation(monkeypatch, tmp_path, 
     assert exc.value is error
     assert [r.url.path for r in requests] == ["/v1/users/register", "/v1/users/whoami", "/v1/account/reset"]
     assert sleeps == []
-    assert not list((tmp_path / "orphans").glob("*.json"))
+    assert list((tmp_path / "orphans").glob("*.json"))  # reset alone cannot erase evidence
     assert all(c.is_closed for c in clients)
 
 
@@ -398,7 +403,7 @@ def test_deep_registration_retry_does_not_restart_provisioned_run(monkeypatch, t
     assert setups == ["e2e-user"]
     assert [r.url.path for r in requests] == (
         ["/v1/users/register"] * 2 + ["/v1/users/whoami"]
-        + ([] if setup_fails else ["/v1/account/reset"]))
+        + ([] if setup_fails else ["/v1/account/reset", "/v1/users/whoami"]))
     assert sleeps == [3]
     assert all(c.is_closed for c in clients)
 
@@ -505,7 +510,7 @@ def test_send_chat_uses_plaintext_envelope_when_effective_off() -> None:
     assert client._failure_locators["trace_id"] == {envelope_id}
 
 
-def test_orphan_manifest_created_0600_and_removed_on_teardown(monkeypatch, tmp_path) -> None:
+def test_orphan_manifest_created_0600_and_kept_without_absence_proof(monkeypatch, tmp_path) -> None:
     import tools.e2e.client as client_mod
 
     monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
@@ -527,8 +532,10 @@ def test_orphan_manifest_created_0600_and_removed_on_teardown(monkeypatch, tmp_p
 
     client._http = OKHTTP()  # type: ignore[assignment]
     client._orphan_file = path
-    client.teardown()
-    assert not path.exists()                          # manifest gone with the account
+    monkeypatch.setattr(client_mod, "admin_confirms_absent", lambda *_a, **_kw: (False, "unattested"))
+    with pytest.raises(RuntimeError, match="absence unverified"):
+        client.teardown()
+    assert path.exists()                          # manifest gone with the account
 
 
 def test_failed_context_preserves_account_and_private_diagnostic_site(
@@ -879,7 +886,7 @@ def test_cleanup_orphans_semantics(monkeypatch, tmp_path) -> None:
 
     assert rc == 1
     remaining = {f.name for f in orphans.glob("*.json")}
-    assert remaining == {"usr_401.json", "usr_flap.json", "usr_prod.json", "corrupt.json"}
+    assert remaining == {"usr_ok200.json", "usr_gone404.json", "usr_401.json", "usr_flap.json", "usr_prod.json", "corrupt.json"}
     assert not any("api.feedling.app/v1" in u and "test-api" not in u for u in posted)
 
 
@@ -1027,7 +1034,7 @@ def test_cleanup_orphans_fails_closed_on_orphan_user_id_mismatch(
     assert site.exists()
 
 
-def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
+def test_expired_failure_cleanup_keeps_site_after_unattested_admin_404(
     monkeypatch, tmp_path,
 ) -> None:
     import json as _json
@@ -1062,9 +1069,9 @@ def test_expired_failure_cleanup_requires_admin_404_then_removes_site(
         404, {"error": "user_not_found"},
     ))
 
-    assert p0._cleanup_expired_failures() == 0
-    assert not (orphans / "usr_expired.json").exists()
-    assert not site.exists()
+    assert p0._cleanup_expired_failures() == 1
+    assert (orphans / "usr_expired.json").exists()
+    assert site.exists()
 
 
 # ── T589/T592: reset is not idempotent — a retry after a lost 200 must not crash,
@@ -1155,7 +1162,7 @@ def test_teardown_401_never_trusts_whoami_on_the_same_key(monkeypatch, tmp_path)
     assert all(not url.endswith("/v1/users/whoami") for _, url in http.calls)
 
 
-def test_admin_confirms_absent_only_404_is_true(monkeypatch, tmp_path) -> None:
+def test_admin_process_local_404_does_not_attest_absence(monkeypatch, tmp_path) -> None:
     import tools.e2e.client as client_mod
     token = tmp_path / "tok"; token.write_text("t")
     seen = {}
@@ -1164,7 +1171,7 @@ def test_admin_confirms_absent_only_404_is_true(monkeypatch, tmp_path) -> None:
         seen["url"] = url; seen["headers"] = kw.get("headers"); seen["kwargs"] = dict(kw)
         return FakeResponse(seen.pop("status"), {})
     monkeypatch.setattr(client_mod.httpx, "get", fake_get)
-    for status, expect in ((404, True), (200, False), (500, False)):
+    for status, expect in ((404, False), (200, False), (500, False)):
         seen["status"] = status
         got, _detail = client_mod.admin_confirms_absent(TEST_API, "usr_x", token_file=token)
         assert got is expect, status
@@ -1217,3 +1224,180 @@ def test_live_web_gate_has_no_machine_specific_paths(monkeypatch):
     live, path = _live_web_gate_module()
     assert live.ADMIN == "postgresql://u@db.example:5432/postgres"
     assert "/Users/" not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("verdict", ["skip", "warn", "instrument_stale", "fallback", "fail", None])
+def test_release_required_cell_must_finish_ok(verdict):
+    assert p0.p0_blocks_release(
+        [{"cell": "required", "result": verdict}], required_cells={"required"})
+
+
+def test_release_coverage_missing_duplicate_and_optional_cells():
+    good = {"cell": "required", "result": "ok", "steps": [("assertion", "ok", "verified")]}
+    assert p0.p0_blocks_release([good], required_cells={"required", "missing"})
+    assert p0.p0_blocks_release([good, good], required_cells={"required"})
+    assert not p0.p0_blocks_release(
+        [good, {"cell": "optional", "result": "skip"}], required_cells={"required"})
+
+
+def test_required_cell_outside_selection_rejected_before_execution(monkeypatch):
+    monkeypatch.setattr(p0, "load_keys", lambda: {})
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--only", "vps-codex",
+                                     "--required", "vps-claude-code"])
+    with pytest.raises(SystemExit) as exc:
+        p0.main()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("url", [
+    "https://test-api.feedling.app:4444/unreviewed",
+    "https://test-api.feedling.app:4444", "http://test-api.feedling.app",
+    "https://test-api.feedling.app/path", "https://user@test-api.feedling.app",
+    "https://test-api.feedling.app?x=y", "https://test-api.feedling.app#x",
+    "https://test-api.feedling.app:bad", None, True,
+])
+def test_test_target_rejects_unreviewed_origin(url):
+    with pytest.raises(RuntimeError):
+        client_mod._refuse_prod(url)
+
+
+def test_client_uses_certificate_verification(monkeypatch):
+    captured = []
+    real = client_mod.httpx.Client
+    def factory(**kwargs):
+        captured.append(kwargs)
+        return real(**kwargs)
+    monkeypatch.setattr(client_mod.httpx, "Client", factory)
+    client = _client()
+    client._http.close()
+    assert captured == [{"timeout": 60, "verify": True}]
+
+
+@pytest.mark.parametrize("failure", ["ownership", "capture", "cleanup", "none"])
+def test_release_cleanup_is_owned_evidence_first_and_fail_closed(monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(client_mod, "_ORPHANS_DIR", tmp_path / "orphans")
+    c = _client()
+    c._release_run_id = "new-run"
+    c._release_evidence_dir = tmp_path / "evidence"
+    c._orphan_file = client_mod._write_orphan_manifest(
+        c.api_url, c.user_id, c.api_key,
+        release_run_id="other-run" if failure == "ownership" else "new-run")
+    calls = []
+    def teardown():
+        calls.append("teardown")
+        evidence = c._release_evidence_dir / "new-run" / f"{c.user_id}.json"
+        body = json.loads(evidence.read_text())
+        assert set(body) == {"schema", "run_id", "user_id", "api_url", "failed", "cleanup_state"}
+        assert body["failed"] is True
+        assert evidence.stat().st_mode & 0o777 == 0o600
+        if failure == "cleanup":
+            raise RuntimeError("absence unverified")
+    monkeypatch.setattr(c, "teardown", teardown)
+    if failure == "capture":
+        monkeypatch.setattr(client_mod, "_write_private_json", lambda *_a: (_ for _ in ()).throw(OSError("disk full")))
+    try:
+        with pytest.raises((RuntimeError, OSError)):
+            c._release_cleanup(failed=True)
+        assert calls == []  # Metadata alone never authorizes destructive cleanup.
+        assert c._orphan_file.exists()
+    finally:
+        c._http.close()
+
+
+def test_setup_transport_failure_is_not_retried(monkeypatch):
+    c = _client()
+    c._http.close()
+    fake = _http_with_script([httpx.ReadTimeout("lost setup response")])
+    c._http = fake
+    with pytest.raises(httpx.ReadTimeout):
+        c.post("/v1/model_api/setup", json={})
+    assert len(fake.calls) == 1
+
+
+def test_release_cli_refuses_before_any_execution(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["p0.py", "--release", "--cleanup-orphans"])
+    monkeypatch.setattr(p0, "load_keys", lambda: pytest.fail("key loading forbidden"))
+    monkeypatch.setattr(p0, "_cleanup_orphans", lambda: pytest.fail("cleanup forbidden"))
+    with pytest.raises(SystemExit) as exc:
+        p0.main()
+    assert exc.value.code == 2
+
+
+def test_release_hosted_requires_exact_model_before_key_lookup(monkeypatch):
+    with pytest.raises(ValueError, match="exact model"):
+        hosted.run_hosted_cell(config.HOSTED_CELLS[0], {}, release_run_id="new-run")
+
+
+@pytest.mark.parametrize('key_status', [200, 401, 500])
+def test_successful_reset_requires_absence_and_old_key_revocation(monkeypatch, tmp_path, key_status):
+    monkeypatch.setattr(client_mod, '_ORPHANS_DIR', tmp_path / 'orphans')
+    c = _client()
+    c._http.close()
+    c._orphan_file = client_mod._write_orphan_manifest(c.api_url, c.user_id, c.api_key)
+    c._http = _http_with_script([(200, {}), (key_status, {})])
+    monkeypatch.setattr(client_mod, 'admin_confirms_absent', lambda *_a, **_kw: (True, 'synthetic durable absence'))
+    if key_status == 401:
+        c.teardown()
+        assert c._deleted and not c._orphan_file.exists()
+    else:
+        with pytest.raises(RuntimeError, match='old key'):
+            c.teardown()
+        assert not c._deleted and c._orphan_file.exists()
+
+
+def test_exact_model_does_not_expand_to_configured_fallbacks(monkeypatch):
+    cell = config.HOSTED_CELLS[0]
+    seen = []
+    def preflight(provider, base, key, models):
+        seen.extend(models)
+        return 'stale', 'synthetic absent model; no account created'
+    monkeypatch.setattr(hosted, 'relay_model_preflight', preflight)
+    result = hosted.run_hosted_cell(cell, {cell.key_env: 'synthetic-key'}, exact_model='exact-reviewed-model')
+    assert seen == ['exact-reviewed-model']
+    assert result['result'] == hosted.RESULT_INSTRUMENT_STALE
+
+
+@pytest.fixture(autouse=True)
+def forbid_unmocked_network(monkeypatch):
+    """This suite is offline; new cleanup branches must not escape mock transports."""
+    import socket
+    def refused(*_a, **_kw):
+        raise AssertionError("unit test attempted real network; mock the boundary")
+    monkeypatch.setattr(socket.socket, "connect", refused)
+    monkeypatch.setattr(socket.socket, "connect_ex", refused)
+    monkeypatch.setattr(socket, "getaddrinfo", refused)
+
+
+@pytest.mark.parametrize("steps", [None, [], [("a", "fail", "bad")],
+    [("a", "fallback", "bad")], [("a", "skip", "missing")],
+    [("a", "warn", "unmeasured")], [("a", "ok")], [None]])
+def test_required_top_level_ok_cannot_hide_unverified_steps(steps):
+    assert p0.p0_blocks_release(
+        [{"cell": "required", "result": "ok", "steps": steps}],
+        required_cells={"required"})
+
+
+def test_release_hosted_api_cannot_reach_preflight(monkeypatch, tmp_path):
+    monkeypatch.setattr(hosted, "relay_model_preflight", lambda *_a: pytest.fail("preflight reached"))
+    cell = config.HOSTED_CELLS[0]
+    with pytest.raises(RuntimeError, match="INSTRUMENT_GAP"):
+        hosted.run_hosted_cell(cell, {cell.key_env: "synthetic"}, exact_model="exact",
+                               release_run_id="new-run", release_evidence_dir=tmp_path)
+
+
+def test_release_provision_cannot_construct_transport(monkeypatch, tmp_path):
+    monkeypatch.setattr(client_mod.httpx, "Client", lambda **_kw: pytest.fail("transport reached"))
+    with pytest.raises(RuntimeError, match="INSTRUMENT_GAP"):
+        E2EClient.provision(route="model_api", release_run_id="new-run", release_evidence_dir=tmp_path)
+
+
+def test_explicit_required_assertions_keep_optional_warning_separate():
+    result = {"cell": "required", "result": "ok", "steps": [
+        ("chat", "ok", "verified"), ("optional_memory", "warn", "pending") ]}
+    assert not p0.p0_blocks_release([result], required_cells={"required"},
+                                   required_assertions={"required": {"chat"}})
+    assert p0.p0_blocks_release([result], required_cells={"required"},
+                               required_assertions={"required": {"missing"}})
+    result["steps"].append(("chat", "ok", "duplicate"))
+    assert p0.p0_blocks_release([result], required_cells={"required"},
+                               required_assertions={"required": {"chat"}})

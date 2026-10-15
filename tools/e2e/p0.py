@@ -5,7 +5,8 @@
   python3 tools/e2e/p0.py --only anthropic-official,vps-claude-code
   python3 tools/e2e/p0.py --list              # show cells and key status
 
-Exit code: 0 = no hard failures (skips/warns allowed), 1 = at least one FAIL
+Exit code: 0 = nonempty results without hard failures; optional skips/warns allowed.
+Required cells (--required) must each return ok; empty coverage exits 1.
 (protocol §8: any P0 fail blocks test→main). Test env only; every account
 from a successful cell is deleted in teardown; failed cells retain a bounded
 diagnostic site for seven days.
@@ -41,6 +42,10 @@ _ADMIN_TOKEN_FILE = Path.home() / ".feedling" / "data-track-admin-token"
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="", help="comma-separated cell names")
+    ap.add_argument("--required", default="",
+                    help="comma-separated release-required cells; each must finish ok")
+    ap.add_argument("--release", action="store_true",
+                    help="release mode: fail closed until upstream/lease enforcement is bound")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--cleanup-orphans", action="store_true",
                     help="delete accounts left behind by crashed runs (leak manifest)")
@@ -48,6 +53,14 @@ def main() -> int:
                     help=("delete preserved failure sites after their "
                           f"{FAILURE_RETENTION_DAYS}-day retention"))
     args = ap.parse_args()
+
+    if args.release:
+        # No client-side turn counter can cap provider retry/tool/background calls.
+        # Refuse BEFORE key loading, provisioning, subprocesses or cleanup.
+        try:
+            client_mod.require_release_execution()
+        except RuntimeError as exc:
+            ap.error(str(exc))
 
     if args.cleanup_orphans:
         return _cleanup_orphans()
@@ -57,9 +70,13 @@ def main() -> int:
     pool = load_keys()
     only = {s.strip() for s in args.only.split(",") if s.strip()}
     known_cells = {cell.name for cell in [*HOSTED_CELLS, *VPS_CELLS]}
-    unknown = sorted(only - known_cells)
+    required = {s.strip() for s in args.required.split(",") if s.strip()}
+    unknown = sorted((only | required) - known_cells)
     if unknown:
         ap.error(f"unknown cell(s): {', '.join(unknown)}")
+
+    if only and required - only:
+        ap.error("required cells must be included in --only")
 
     if args.list:
         for cell in HOSTED_CELLS:
@@ -100,7 +117,7 @@ def main() -> int:
     for r in results:
         detail = cell_detail(r["steps"])
         print(f"| {r['cell']} | {_ICON.get(r['result'], r['result'])} {r['result']} | {detail[:80]} |")
-    hard_fail = p0_blocks_release(results)
+    hard_fail = p0_blocks_release(results, required_cells=required)
     print("=" * 62)
     print("阻断判定:", "❌ P0 FAIL — 不许 test→main" if hard_fail else "✅ P0 通过")
     return 1 if hard_fail else 0
@@ -121,19 +138,46 @@ def cell_detail(steps: list[tuple]) -> str:
     return detail.replace("|", "\\|").replace("\n", " ")
 
 
-def p0_blocks_release(results: list[dict]) -> bool:
+def p0_blocks_release(results: list[dict], *,
+                      required_cells: set[str] | None = None,
+                      required_assertions: dict[str, set[str]] | None = None) -> bool:
     """A single failed cell blocks test-to-main promotion.
 
     `fallback` 同样阻断:用户实际收到的是失败话术，那不是一次成功的发布。
     它与 `fail` 分开只为让报表说清「回来了但是坏的」和「压根没回来」——
     阻断力相同，可读性不同。
     """
+    if not results:
+        return True
+    for cell in required_cells or ():
+        matches = [r for r in results if r.get("cell") == cell]
+        if len(matches) != 1 or matches[0].get("result") != "ok":
+            return True
+        steps = matches[0].get("steps")
+        if not isinstance(steps, list) or not steps:
+            return True
+        if any(not isinstance(step, (tuple, list)) or len(step) != 3
+               or not isinstance(step[0], str) for step in steps):
+            return True
+        if any(step[1] in ("fail", VERDICT_FALLBACK) for step in steps):
+            return True
+        assertions = (required_assertions or {}).get(cell)
+        if assertions is None:
+            if any(step[1] != "ok" for step in steps):
+                return True
+        else:
+            if not assertions:
+                return True
+            for name in assertions:
+                evidence = [step for step in steps if step[0] == name]
+                if len(evidence) != 1 or evidence[0][1] != "ok":
+                    return True
     return any(result.get("result") in ("fail", VERDICT_FALLBACK)
                for result in results)
 
 
 def _admin_confirms_absent(api_url: str, user_id: str) -> tuple[bool | None, str]:
-    """Return True only for admin 404; None when no local admin token exists.
+    """Diagnostic oracle: current process-local admin 404 is insufficient.
 
     Single definition lives in client.admin_confirms_absent (teardown uses the
     same oracle after a 401 on reset); this name stays for existing callers.
@@ -225,7 +269,7 @@ def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
             r = _httpx.post(f"{api_url}/v1/account/reset",
                             headers={"X-API-Key": api_key},
                             json={"confirm": "delete-all-data"},
-                            timeout=30, verify=False)
+                            timeout=30, verify=True)
         except _httpx.TransportError as e:
             print(f"  ⏳ {user_id}: transport error ({e}); kept for next sweep")
             remaining += 1
@@ -233,11 +277,18 @@ def _cleanup_orphans(*, only_user_ids: set[str] | None = None) -> int:
         if r.status_code in (200, 404):
             state = "deleted" if r.status_code == 200 else "already gone (404)"
             verified, verify_detail = _admin_confirms_absent(api_url, user_id)
-            if verified is False:
+            if verified is not True:
                 print(f"  ❌ {user_id}: {state}, but {verify_detail}; kept")
                 remaining += 1
                 continue
-            suffix = f"; {verify_detail}" if verified else "; reset response is deletion proof"
+            old_key = _httpx.get(f"{api_url}/v1/users/whoami",
+                                 headers={"X-API-Key": api_key}, timeout=30,
+                                 verify=True)
+            if old_key.status_code != 401:
+                print(f"  ❌ {user_id}: old key revocation unverified; kept")
+                remaining += 1
+                continue
+            suffix = f"; {verify_detail}; old key 401"
             print(f"  ✅ {user_id}: {state}{suffix}")
             f.unlink(missing_ok=True)
             _remove_failure_evidence(user_id)

@@ -10736,6 +10736,15 @@ def audit_resident_active_model_routes(*, apply: bool = False) -> list[dict]:
 
 
 def list_agent_runtime_enabled_users() -> list[dict]:
+    """Best-effort compatibility reader; supervisor discovery is strict."""
+    try:
+        return list_agent_runtime_enabled_users_strict()
+    except Exception as e:
+        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
+        return []
+
+
+def list_agent_runtime_enabled_users_strict() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
     不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
@@ -10759,55 +10768,50 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     """
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
-    try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT r.user_id,
-                  CASE LOWER(c.provider)
-                    WHEN 'anthropic' THEN 'claude'
-                    WHEN 'claude'    THEN 'claude'
-                    WHEN 'deepseek'  THEN 'claude'
-                    WHEN 'openai'    THEN 'codex'
-                    ELSE 'pi'
-                  END AS driver,
-                  LOWER(c.provider) AS provider,
-                  r.model AS model,
-                  c.base_url AS base_url,
-                  c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
-                  r.vision_test_status AS vision_test_status
-                FROM model_api_routes r
-                JOIN model_api_credentials c ON c.id = r.credential_id
-                WHERE r.is_active
-                  AND r.test_status = 'ok'
-                  AND LOWER(c.provider) = ANY(%s)
-                  AND EXISTS (
-                    SELECT 1 FROM user_blobs route_blob
-                    WHERE route_blob.user_id = r.user_id
-                      AND route_blob.kind = 'onboarding_route'
-                      AND LOWER(COALESCE(route_blob.doc->>'route', '')) = 'model_api'
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM v2_runtime_state vrs
-                    WHERE vrs.user_id = r.user_id
-                      AND vrs.hosted_runtime_state IN ('v2', 'draining')
-                  )
-                ORDER BY r.user_id
-                """,
-                (providers,),
-            ).fetchall()
-        return [{"user_id": uid, "driver": driver, "provider": provider,
-                 "model": model, "base_url": base_url,
-                 "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort,
-                 "vision_test_status": str(vision_test_status or "untested")}
-                for uid, driver, provider, model, base_url, supports_responses,
-                reasoning_effort, vision_test_status in rows]
-    except Exception as e:
-        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
-        return []
-
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.user_id,
+              CASE LOWER(c.provider)
+                WHEN 'anthropic' THEN 'claude'
+                WHEN 'claude'    THEN 'claude'
+                WHEN 'deepseek'  THEN 'claude'
+                WHEN 'openai'    THEN 'codex'
+                ELSE 'pi'
+              END AS driver,
+              LOWER(c.provider) AS provider,
+              r.model AS model,
+              c.base_url AS base_url,
+              c.supports_responses AS supports_responses,
+              COALESCE(r.reasoning_effort, '') AS reasoning_effort,
+              r.vision_test_status AS vision_test_status
+            FROM model_api_routes r
+            JOIN model_api_credentials c ON c.id = r.credential_id
+            WHERE r.is_active
+              AND r.test_status = 'ok'
+              AND LOWER(c.provider) = ANY(%s)
+              AND EXISTS (
+                SELECT 1 FROM user_blobs route_blob
+                WHERE route_blob.user_id = r.user_id
+                  AND route_blob.kind = 'onboarding_route'
+                  AND LOWER(COALESCE(route_blob.doc->>'route', '')) = 'model_api'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM v2_runtime_state vrs
+                WHERE vrs.user_id = r.user_id
+                  AND vrs.hosted_runtime_state IN ('v2', 'draining')
+              )
+            ORDER BY r.user_id
+            """,
+            (providers,),
+        ).fetchall()
+    return [{"user_id": uid, "driver": driver, "provider": provider,
+             "model": model, "base_url": base_url,
+             "supports_responses": bool(supports_responses),
+             "reasoning_effort": reasoning_effort,
+             "vision_test_status": str(vision_test_status or "untested")}
+            for uid, driver, provider, model, base_url, supports_responses,
+            reasoning_effort, vision_test_status in rows]
 
 def claim_and_enqueue_introduction(
     user_id: str,
@@ -18111,59 +18115,69 @@ def model_api_route_get_with_envelope(user_id: str, route_id: str) -> dict | Non
 
 
 def model_api_active_route(user_id: str) -> dict | None:
-    """带 api_key_envelope —— 供 config_store 走 enclave 解密。"""
+    """Best-effort compatibility reader; admission uses the strict variant."""
     try:
-        with get_pool().connection() as conn:
-            row = conn.execute(
-                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
-                "FROM model_api_routes r "
-                "JOIN model_api_credentials c ON c.id = r.credential_id "
-                "WHERE r.user_id = %s AND r.is_active",
-                (user_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        out = _route_row_to_dict(row)
-        # envelope is appended AFTER _ROUTE_COLUMNS, so read it by tail index — this
-        # stays correct if _ROUTE_COLUMNS ever grows again (it just did: created_at/
-        # updated_at), unlike a hardcoded positional index.
-        out["api_key_envelope"] = row[-1]
-        return out
+        return model_api_active_route_strict(user_id)
     except Exception as e:
         log.error("[db] model_api_active_route(%s) failed: %s", user_id, e)
         return None
 
 
+def model_api_active_route_strict(user_id: str) -> dict | None:
+    """Read the active route/envelope; missing row is None, errors propagate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+            "FROM model_api_routes r "
+            "JOIN model_api_credentials c ON c.id = r.credential_id "
+            "WHERE r.user_id = %s AND r.is_active",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    out = _route_row_to_dict(row)
+    # envelope is appended AFTER _ROUTE_COLUMNS, so read it by tail index — this
+    # stays correct if _ROUTE_COLUMNS ever grows again (it just did: created_at/
+    # updated_at), unlike a hardcoded positional index.
+    out["api_key_envelope"] = row[-1]
+    return out
+
+
 def model_api_active_route_version(user_id: str) -> dict | None:
+    """Best-effort compatibility reader; admission uses the strict variant."""
+    try:
+        return model_api_active_route_version_strict(user_id)
+    except Exception as e:
+        log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_active_route_version_strict(user_id: str) -> dict | None:
     """Return the active route's exact visual-capability fence.
 
     The microsecond timestamp is an internal compare-and-swap token, not a public
     route field. Setup probes and Hosted V1 failure learning use it so delayed
     provider results cannot mark a route the user changed in the meantime.
     """
-    try:
-        with get_pool().connection() as conn:
-            row = conn.execute(
-                "SELECT r.id::text,c.provider,r.model,c.base_url,"
-                "to_char(r.updated_at AT TIME ZONE 'UTC',"
-                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
-                "FROM model_api_routes r "
-                "JOIN model_api_credentials c ON c.id=r.credential_id "
-                "WHERE r.user_id=%s AND r.is_active",
-                (user_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "route_id": str(row[0]),
-            "provider": str(row[1] or ""),
-            "model": str(row[2] or ""),
-            "base_url": str(row[3] or ""),
-            "updated_at_token": str(row[4] or ""),
-        }
-    except Exception as e:
-        log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT r.id::text,c.provider,r.model,c.base_url,"
+            "to_char(r.updated_at AT TIME ZONE 'UTC',"
+            "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+            "FROM model_api_routes r "
+            "JOIN model_api_credentials c ON c.id=r.credential_id "
+            "WHERE r.user_id=%s AND r.is_active",
+            (user_id,),
+        ).fetchone()
+    if row is None:
         return None
+    return {
+        "route_id": str(row[0]),
+        "provider": str(row[1] or ""),
+        "model": str(row[2] or ""),
+        "base_url": str(row[3] or ""),
+        "updated_at_token": str(row[4] or ""),
+    }
 
 
 def model_api_active_route_vision_verdict(user_id: str) -> dict | None:
