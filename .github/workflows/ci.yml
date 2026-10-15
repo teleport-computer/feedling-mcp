@@ -1103,6 +1103,7 @@ jobs:
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_provider_client.py \
+            tests/test_provider_probe_http.py \
             tests/test_provider_assistant_prefill.py \
             tests/test_provider_tools_gemini.py \
             tests/test_provider_tools_local_markers.py \

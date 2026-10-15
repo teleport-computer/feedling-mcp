@@ -192,6 +192,38 @@ def record_attempts_payload(store, payload: dict) -> tuple[dict, int]:
     }, 200
 
 
+_PROBE_LANES = frozenset({"route_activate", "route_test", "credential_patch"})
+
+
+def project_probe_http(value: Any) -> dict | None:
+    """Closed setup-only metadata; never coerce provider-controlled strings."""
+    if type(value) is not dict:
+        return None
+    phase = value.get("phase")
+    headers = value.get("headers_seen")
+    status = value.get("observed_status_code")
+    count = value.get("post_attempt_count")
+    valid = value.get("observation_valid")
+    if (type(value.get("version")) is not int or value["version"] != 1
+            or type(phase) is not str or phase not in {
+                "unknown", "response_headers", "response_body", "buffered_complete"}
+            or type(valid) is not bool
+            or (headers is not None and type(headers) is not bool)
+            or (status is not None and (type(status) is not int or not 100 <= status <= 599))
+            or type(count) is not int or not 0 <= count <= 1000000):
+        return None
+    if (not valid and (phase != "unknown" or headers is not None or status is not None)
+            or valid and (headers is None or count == 0)
+            or headers is True and status is None
+            or status is not None and headers is not True
+            or phase in {"response_body", "buffered_complete"} and headers is not True
+            or phase == "response_headers" and headers is not False):
+        return None
+    return {"version": 1, "phase": phase, "headers_seen": headers,
+            "observed_status_code": status, "observation_valid": valid,
+            "post_attempt_count": count}
+
+
 def record_runtime_attempt(
     user_id: str,
     *,
@@ -213,6 +245,7 @@ def record_runtime_attempt(
     provider_request_id: str = "",
     ts: float | None = None,
     attempt_trace: Any = None,
+    probe_http: Any = None,
 ) -> bool:
     """Append one server-side provider attempt. Never raises.
 
@@ -266,6 +299,10 @@ def record_runtime_attempt(
             ),
             "dur_ms": _duration_ms(dur_ms),
         }
+        if runtime == "hosted_setup" and lane in _PROBE_LANES:
+            safe_probe = project_probe_http(probe_http)
+            if safe_probe is not None:
+                doc["probe_http"] = safe_probe
         if lane in {"capture", "dream"}:
             metadata = provider_attempt_metadata.project(attempt_trace)
             doc.update(metadata if metadata is not None else {
