@@ -14,6 +14,7 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlsplit
@@ -480,6 +481,169 @@ def _http_client() -> httpx.Client:
         if _shared_client is None:
             _shared_client = _build_shared_client()
     return _shared_client
+
+
+_SETUP_PROBE_OPERATIONS = frozenset({"route_activate", "route_test", "credential_patch"})
+_SETUP_PROBE_OBSERVER: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "setup_probe_http_observer", default=None
+)
+
+
+class _ProbeHTTPObservation:
+    """Constant-space H1 facts, never request/response objects or wire content.
+
+    HTTPX buffers before returning. HTTPcore's request-local trace is the only
+    observation here; missing traces and unverified H2 remain unknown.
+    """
+
+    def __init__(self):
+        self.count = 0
+        self.reset()
+
+    def reset(self):
+        self.valid = True
+        self.phase = "unknown"
+        self.headers = None
+        self.status = None
+        self.pending = None
+        self.failed_id = None
+        self.failed_phase = None
+        self.body_complete = False
+
+    def trace(self, event, info):
+        try:
+            self._trace(event, info)
+        except Exception:
+            self.valid = False  # Sticky until the next original POST.
+
+    def _trace(self, event, info):
+        if not self.valid:
+            return
+        if event.startswith("http2."):
+            self.valid = False  # No verified H2 phase attribution in this release.
+            return
+        # Connection, send, and cleanup events cannot establish response facts.
+        if event.startswith(("connection.", "proxy.")) or event in {
+            "http11.send_request_headers.started", "http11.send_request_headers.complete",
+            "http11.send_request_headers.failed", "http11.send_request_body.started",
+            "http11.send_request_body.complete", "http11.send_request_body.failed",
+            "http11.response_closed.started", "http11.response_closed.complete",
+            "http11.response_closed.failed",
+        }:
+            return
+        parts = event.split(".")
+        if len(parts) != 3 or parts[0] != "http11" or parts[1] not in {
+            "receive_response_headers", "receive_response_body",
+        } or parts[2] not in {"started", "complete", "failed"}:
+            self.valid = False
+            return
+        _, stage, action = parts
+        if self.failed_id is not None:
+            self.valid = False  # A failed response stage is terminal for this POST.
+            return
+        if action == "started":
+            if self.pending is not None:
+                self.valid = False
+                return
+            # CONNECT shares extensions. Read only the method, never the URL.
+            target = info["request"].method == b"POST"
+            self.pending = (stage, target)
+            if target:
+                if stage == "receive_response_headers":
+                    if self.headers is not None:
+                        self.valid = False
+                    self.headers = False
+                elif self.headers is not True or self.body_complete:
+                    self.valid = False
+            return
+        if self.pending is None or self.pending[0] != stage:
+            self.valid = False
+            return
+        _, target = self.pending
+        self.pending = None
+        if not target:
+            return
+        if action == "failed":
+            # HTTPX maps core errors with `raise ... from ...`. Retain only an
+            # identity integer to match the final cause chain, never the error.
+            self.failed_id = id(info["exception"])
+            self.failed_phase = ("response_headers" if stage.endswith("headers")
+                                 else "response_body")
+        elif stage == "receive_response_headers":
+            status = info["return_value"][1]
+            if type(status) is not int or not 100 <= status <= 599:
+                self.valid = False
+                return
+            self.headers, self.status = True, status
+        else:
+            self.body_complete = True
+
+    def finish(self, exc=None):
+        if not self.valid:
+            return
+        if exc is None:
+            if self.headers is True and self.body_complete:
+                self.phase = "buffered_complete"
+            return
+        seen = set()
+        while exc is not None and id(exc) not in seen:
+            seen.add(id(exc))
+            if id(exc) == self.failed_id:
+                self.phase = self.failed_phase
+                return
+            exc = exc.__cause__
+
+    def snapshot(self):
+        valid = self.valid and self.headers is not None
+        return {
+            "version": 1, "phase": self.phase if valid else "unknown",
+            "headers_seen": self.headers if valid else None,
+            "observed_status_code": self.status if valid else None,
+            "observation_valid": valid, "post_attempt_count": self.count,
+        }
+
+
+@contextmanager
+def observe_setup_probe(operation):
+    """Scope only the three route probes; always restore nested caller context."""
+    try:
+        observation = _ProbeHTTPObservation() if operation in _SETUP_PROBE_OPERATIONS else None
+    except Exception:
+        observation = None
+    token = _SETUP_PROBE_OBSERVER.set(observation)
+    try:
+        yield observation
+    finally:
+        _SETUP_PROBE_OBSERVER.reset(token)
+
+
+def _probe_json_post(*args, **kwargs):
+    observation = _SETUP_PROBE_OBSERVER.get()
+    client = _http_client()
+    if observation is None:
+        return client.post(*args, **kwargs)
+    try:
+        observation.reset()
+        observation.count += 1
+        if kwargs.get("extensions"):
+            observation.valid = False  # Preserve another extension owner.
+        else:
+            kwargs["extensions"] = {"trace": observation.trace}
+    except Exception:
+        observation.valid = False
+    try:
+        response = client.post(*args, **kwargs)
+    except BaseException as exc:
+        try:
+            observation.finish(exc)
+        except Exception:
+            observation.valid = False
+        raise
+    try:
+        observation.finish()
+    except Exception:
+        observation.valid = False
+    return response
 
 
 @dataclass(frozen=True)
@@ -3211,7 +3375,7 @@ def _chat_completion_openai_responses(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 url, headers=headers, json=request_payload, timeout=timeout
             )
         except httpx.HTTPError as e:
@@ -4186,7 +4350,7 @@ def _chat_completion_openai_compatible(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 f"{base_url.rstrip('/')}/chat/completions",
                 headers=_headers(ProviderConfig(provider, model, key, base_url)),
                 json=request_payload,
@@ -4416,7 +4580,7 @@ def _chat_completion_anthropic(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 f"{base_url.rstrip('/')}/messages",
                 headers={
                     "x-api-key": key,
@@ -4711,7 +4875,7 @@ def _chat_completion_bedrock(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 url, headers=headers, json=request_payload, timeout=timeout
             )
         except httpx.HTTPError as exc:
@@ -4903,7 +5067,7 @@ def _chat_completion_gemini(
     )
 
     try:
-        resp = _http_client().post(url, headers=headers, json=payload, timeout=timeout)
+        resp = _probe_json_post(url, headers=headers, json=payload, timeout=timeout)
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
