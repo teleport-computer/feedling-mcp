@@ -1,3 +1,7 @@
+---
+document_lifecycle: current
+canonical_owner: self
+---
 # E2E release preparation boundaries
 
 The existing P0 entry point supports `--required` to name a reviewed subset of
