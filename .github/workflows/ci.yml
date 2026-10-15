@@ -932,6 +932,7 @@ jobs:
             tests/test_enclave_reqlog.py \
             tests/test_enclave_routes_frames.py \
             tests/test_enclave_routes_health.py \
+            tests/test_enclave_declared_metadata.py \
             tests/test_enclave_routes_identity.py \
             tests/test_enclave_routes_storage.py \
             tests/test_enclave_runtime_token.py \

@@ -126,3 +126,17 @@ def test_head_and_options_behavior(client):
     r = client.open("/healthz", method="OPTIONS")
     assert r.status_code == 405
     assert "GET" in r.headers.get("allow", "")
+
+
+def test_attestation_serializes_unknown_metadata_as_null(monkeypatch, client):
+    from enclave import config
+    monkeypatch.setattr(config, 'RELEASE', dict(config.RELEASE, image_digest=None))
+    monkeypatch.setattr(config, 'APP_AUTH', dict(config.APP_AUTH, deploy_tx=None))
+    monkeypatch.setitem(enclave_state._state, 'attestation', {
+        'tdx_quote_hex': 'cc', 'event_log_json': '[]', 'measurements': {},
+        'compose_hash': 'h', 'app_id': 'app', 'instance_id': 'instance',
+    })
+    body = client.get('/attestation').get_json()
+    assert body['enclave_release']['image_digest'] is None
+    assert body['app_auth']['deploy_tx'] is None
+    assert client.get('/healthz').get_json()['release']['image_digest'] is None
