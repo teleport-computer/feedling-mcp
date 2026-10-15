@@ -351,8 +351,14 @@ def test_empty_backend_history_claims_use_account_mode_through_processing(
     messages = c.get_decrypted_history(1000, include_image_body=False)
     assert len(messages) == threshold
     assert len(requests) == 1 and requests[0].url.host == "api.test"
+    monkeypatch.setattr(c, "_recall_account", lambda: ("usr_test", mode))
     configured = mode == "off" or bool(url)
     for index, message in enumerate(messages, 1):
+        if mode == "off":
+            # Unbound raw rows cannot advance a foreground cursor or invoke a provider.
+            assert c._process_messages([message]) == 0.0
+            assert message["id"] not in c._seen_ids
+            continue
         assert c._process_messages([message]) == message["ts"]
         assert c._decrypt_read_failures["count"] == (index if configured else 0)
         expected = (
@@ -360,16 +366,9 @@ def test_empty_backend_history_claims_use_account_mode_through_processing(
             if index >= threshold else ("backend_ready" if mode == "off" else "ok")
         ) if configured else "unconfigured"
         assert c._decrypt_health["status"] == expected
-    assert calls == []  # Empty text still skips replies and advances the cursor.
+    assert calls == []  # Unbound off-mode input cannot advance; legacy empty text still skips.
     if mode == "off":
-        assert "backend history" in caplog.text
-        assert "set FEEDLING_ENCLAVE_URL" not in caplog.text
-        clock[0] += 1
-        c._probe_decrypt_reachability()  # Actual successful backend history probe.
-        assert c._decrypt_health == {"status": "backend_degraded", "checked_at": clock[0]}
-        for status in ("backend_unreachable", "unconfigured", "backend_ready"):
-            clock[0] += 1
-            c._apply_infra_health(status)
-            assert c._decrypt_health["status"] == "backend_degraded"
+        assert c._decrypt_health["status"] == "backend_ready"
+        return
     elif not url:
         assert "set FEEDLING_ENCLAVE_URL" in caplog.text

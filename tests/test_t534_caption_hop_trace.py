@@ -316,3 +316,15 @@ def test_cli_carrier_hop_measures_the_real_driver_payload(monkeypatch, tmp_path,
     )
     # 只查本探针自己的事件:别的既有 trace 事件是否带正文不在本单范围
     assert caption not in repr(carrier_hops), "载体探针泄漏了 caption 字面"
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(crc, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

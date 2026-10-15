@@ -4320,7 +4320,7 @@ def _fetch_plaintext_or_mixed_history(
 def _is_sealed_history_body(row: dict) -> bool:
     # An omitted body's body_ct_len alone is ambiguous: an inline plaintext
     # binary upload may omit body_size_bytes. Resolve it on the backend.
-    return bool(row.get("body_ct"))
+    return bool(row.get("body_ct") or row.get("K_enclave"))
 
 
 def _unreadable_history_row(row: dict) -> dict:
@@ -21643,10 +21643,10 @@ def _process_messages(messages: list) -> float:
                 if _foreground_history_injection_enabled():
                     transcript = _recent_chat_context_for_foreground(before_ts=ts, before_seq=msg.get("seq"))
                 _RECALL_FOREGROUND_TRANSCRIPT.set(transcript)
-        except _RecallInputError as exc:
+        except _RecallInputError:
             _unmark_seen([key, *(msg.get("_backlog_absorbed_keys") or [])])
             _emit_debug_trace("context", "context.recall_failed", status="error", trace_id=str(msg.get("trace_id") or msg.get("id") or key),
-                              summary="Required turn content unavailable", detail={"reason": str(exc)})
+                              summary="Required turn content unavailable", detail={"reason": "required_content_unavailable"})
             break
 
         content = str(msg.get("content") or "").strip()

@@ -303,3 +303,15 @@ def test_verify_ping_replies_bind_reply_to_ping_id():
     ]
     assert len(posts) == 3, f"expected 3 verify_ping post_reply calls, got {len(posts)}"
     assert all("reply_to_message_id=_ping_id" in ln for ln in posts), posts
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(c, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

@@ -304,3 +304,15 @@ def test_reader_row_limit(monkeypatch):
     monkeypatch.setattr(reader, 'MAX_RECORDS', 0)
     with pytest.raises(ValueError, match='^invalid snapshot$'):
         reader.summarize({'schema_version': 1, 'jobs': [{}]})
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(consumer, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

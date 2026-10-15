@@ -1326,3 +1326,15 @@ def test_foreground_paired_rename_via_action_is_forwarded_and_reported_done(monk
     action_calls = [c for c in calls if "/v1/identity/actions" in c[0] or "/v1/memory/actions" in c[0]]
     assert len(action_calls) == 1
     assert posted == ["改好了。"]
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(crc, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

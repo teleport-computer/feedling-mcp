@@ -1568,3 +1568,15 @@ def test_canvas_requirement_accepts_html_at_stage_and_completion(monkeypatch, tm
             assert resident._missing_outbound_file_suffixes(('.io.html',), staged) is None
     finally:
         resident._finish_outbound_file_turn('canvas-t625')
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(resident, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

@@ -475,3 +475,15 @@ def test_agent_call_failure_retries_injection_next_turn_then_stops_after_commit(
     assert "CATALOG_TEXT" not in seen_messages[2]
     assert crc._io_cli_catalog_injected_session_id == "sess-1"
     assert crc._io_cli_catalog_pending_session_id is None
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(crc, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

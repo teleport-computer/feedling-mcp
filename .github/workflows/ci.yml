@@ -582,6 +582,7 @@ jobs:
             tests/test_recall_isolated_candidates.py \
             tests/test_recall_turn_projection.py \
             tests/test_recall_review_regressions.py \
+            tests/test_recall_resident_identity.py \
             tests/test_recall_references.py \
             tests/test_recall_attachments.py \
             tests/test_recall_observability.py \
