@@ -16,6 +16,10 @@ change must not be interpreted as an API guarantee.
   decryption reads fail, and refuses stale writes that lose a concurrent
   creation or update. Successful first initialization remains supported.
 
+- Model route activation, route tests, and active credential key changes record
+  bounded HTTP/1.1 header/body phase evidence in existing probe diagnostics.
+  HTTP/2 and unavailable observations remain unknown. Validation, buffered reads,
+  90-second operation timeouts, and existing request counts are unchanged.
 
 - `io_cli doctor` now uses authenticated account mode for readiness. Plaintext
   accounts skip the enclave content probe; legacy modes retain it. The
