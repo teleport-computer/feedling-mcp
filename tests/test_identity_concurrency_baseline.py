@@ -256,7 +256,7 @@ def test_init_identity_if_absent_stamps_replaced_at_on_update(client, monkeypatc
     monkeypatch.setattr(
         genesis_service,
         "_existing_identity_plain_for_update",
-        lambda *_a, **_k: (None, "identity_plain_not_available"),
+        lambda *_a, **_k: (_plain_identity(), ""),
     )
 
     status = genesis_service.init_identity_if_absent(

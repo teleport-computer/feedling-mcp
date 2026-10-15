@@ -17033,6 +17033,17 @@ def _post_reply_with_bootstrap_retry(send: Callable[[], Any]) -> Any:
     return response
 
 
+def _is_voice_terminal_receipt(body) -> bool:
+    """Closed server dispositions: consumed without persisting a reply."""
+    return (
+        isinstance(body, dict)
+        and body.get("status") == "ignored"
+        and body.get("reason") in (
+            "voice_call_finalized", "voice_call_cancelled", "voice_call_finalizing",
+        )
+    )
+
+
 def _handle_post_reply_response(resp) -> dict:
     """Inspect a /v1/chat/response response.
 
@@ -17084,10 +17095,22 @@ def _handle_post_reply_response(resp) -> dict:
             body = {}
         raise ChatResponseRejected(int(resp.status_code), body)
     resp.raise_for_status()
+    # Both fresh and idempotent server commits return the persisted reply id.
+    # A successful HTTP status without that receipt is ambiguous: keep the
+    # caller's retry/checkpoint path instead of treating transport as delivery.
     try:
-        return resp.json()
+        body = resp.json()
     except Exception:
-        return {}
+        raise RuntimeError("chat_response_invalid_receipt") from None
+    if resp.status_code == 200 and _is_voice_terminal_receipt(body):
+        return body
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("id"), str)
+        or not body["id"].strip()
+    ):
+        raise RuntimeError("chat_response_invalid_receipt")
+    return body
 
 
 class ChatResponseRejected(RuntimeError):
@@ -21217,6 +21240,8 @@ def _process_proactive_jobs(jobs: list) -> float:
                     post_kwargs["thinking_model"] = turn.thinking_model
                     post_kwargs["thinking_native"] = turn.thinking_native
                 result = post_reply(reply, **post_kwargs)
+                if _is_voice_terminal_receipt(result):
+                    raise RuntimeError(result["reason"])
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
@@ -22881,6 +22906,11 @@ def _process_messages(messages: list) -> float:
                     result = post_reply(reply, **post_kwargs)
                     rejected.dropped_kinds = dropped_kinds
                     dropped_attachments_error = rejected
+                if _is_voice_terminal_receipt(result):
+                    terminal_response_error = True
+                    terminal_response_errors.add(result["reason"])
+                    log.info("reply terminally skipped reason=%s; advancing past message", result["reason"])
+                    continue
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") in {
                         "already_answered",

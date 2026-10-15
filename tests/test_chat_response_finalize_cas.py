@@ -718,3 +718,89 @@ def test_finalize_reply_once_explain_uses_parent_primary_key(store):
     # 外加确认确实走了某种索引访问路径。
     assert "Seq Scan on chat_messages" not in plan, f"finalize 退化成全表扫描：\n{plan}"
     assert "Index" in plan, f"finalize 没走任何索引访问路径：\n{plan}"
+
+
+@pytest.mark.parametrize("identity_failure_first", [False, True])
+@pytest.mark.parametrize("commit_before_bad_receipt", [False, True])
+def test_consumer_bad_receipt_recovers_without_losing_or_duplicating_reply(
+    store, monkeypatch, commit_before_bad_receipt, identity_failure_first,
+):
+    """Real consumer + reply CAS/DB: ambiguous HTTP success is not completion."""
+    import json
+    import httpx
+
+    monkeypatch.setenv("FEEDLING_API_URL", "http://localhost:5001")
+    monkeypatch.setenv("FEEDLING_API_KEY", "test_key_00000000")
+    from tools import chat_resident_consumer as crc
+
+    parent = store.append_chat("user", "chat", _envelope(store.user_id, "receipt_parent"))
+    traces, requests, committed_ids, identity_requests = [], [], [], []
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: "visible reply")
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_whoami_cache", {
+        "user_id": store.user_id, "user_pk": b"u" * 32, "enclave_pk": b"e" * 32,
+        "content_encryption_effective": "on",
+    })
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: _envelope(store.user_id, kw["item_id"]))
+    monkeypatch.setattr(chat_core.chat_consumer, "_record_consumer_event", lambda *a, **kw: None)
+
+    def transport(request):
+        if request.url.path == "/v1/users/whoami":
+            identity_requests.append(request)
+            if identity_failure_first and len(identity_requests) == 1:
+                return httpx.Response(503, request=request)
+            for key, value in crc._HEADERS.items():
+                assert request.headers[key] == value
+            return httpx.Response(200, json={
+                "user_id": store.user_id, "content_encryption_effective": "on",
+            }, request=request)
+        assert request.url.path == "/v1/chat/response"
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if len(requests) > 1 or commit_before_bad_receipt:
+            body, status = chat_core.write_response(
+                store, payload, consumer_id="resident-receipt", consumer_info={},
+                allow_verify_reply=False,
+            )
+            assert status == 200, body
+            committed_ids.append(body["id"])
+        if len(requests) == 1:
+            return httpx.Response(200, content=b"invalid-json", request=request)
+        return httpx.Response(status, json=body, request=request)
+
+    msg = {"id": parent["id"], "role": "user", "content": "hello", "ts": parent["ts"]}
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        if identity_failure_first:
+            assert crc._process_messages([msg]) == 0.0
+            assert not requests
+            assert crc._msg_key(msg) not in crc._seen_ids
+            assert db.chat_get_strict(store.user_id, parent["id"]).get("reply_status") != "replied"
+            assert not any(a[1] == "agent.turn.success" for a, _ in traces)
+        assert crc._process_messages([msg]) == 0.0
+        assert crc._msg_key(msg) not in crc._seen_ids
+        assert not any(a[1] == "agent.turn.success" for a, _ in traces)
+        first_parent = db.chat_get_strict(store.user_id, parent["id"])
+        assert (first_parent.get("reply_status") == "replied") == commit_before_bad_receipt
+        assert crc._process_messages([msg]) == parent["ts"]
+    assert len(identity_requests) == 2 + int(identity_failure_first)
+    assert len(requests) == 2
+    delivery_id = requests[0]["resident_delivery_id"]
+    assert requests[1]["resident_delivery_id"] == delivery_id
+    assert set(committed_ids) == {delivery_id}
+    saved_parent = db.chat_get_strict(store.user_id, parent["id"])
+    assert saved_parent["reply_status"] == "replied"
+    assert saved_parent["reply_message_id"] == delivery_id
+    assert db.chat_get_strict(store.user_id, delivery_id)["reply_to_message_id"] == parent["id"]
+    with db.get_pool().connection() as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM chat_messages WHERE user_id=%s AND doc->>'reply_to_message_id'=%s",
+            (store.user_id, parent["id"]),
+        ).fetchone()[0]
+    assert count == 1

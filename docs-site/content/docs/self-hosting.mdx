@@ -302,6 +302,21 @@ is an encryption recipient, not an API credential. Plain-text-only chat messages
 **followups** require it. Authentication, bootstrap, and envelope validation
 still apply. A 400 response alone does not identify which validation failed.
 
+The server may also return HTTP 200 with `status: ignored` and one of
+`voice_call_finalized`, `voice_call_cancelled`, or `voice_call_finalizing` as
+`reason`. These closed voice dispositions settle the turn without counting a
+posted reply or delivery success; they do not block later messages.
+
+The official resident consumer requires a JSON success receipt containing a
+nonempty string reply `id` before counting a response write as accepted. An
+unreadable or missing receipt outside the terminal dispositions above leaves
+delivery unconfirmed. For a foreground
+turn with no accepted reply or terminal rejection, the consumer retains the
+checkpoint and releases the turn for normal redelivery. A lost receipt can
+follow a real commit; existing server idempotency and terminal conflict handling
+still apply. Receipt acceptance proves server acknowledgment, not client display.
+
+
 Unrelated untracked files do not block self-update, but tracked edits still do.
 Checkout refuses to overwrite conflicting untracked or ignored files and logs
 their paths under `self-update checkout failed`; dependency installation and
@@ -906,6 +921,22 @@ can precede a retry or a lost-lease transition, so it is an exception observatio
 not a terminal job outcome. Missing events do not prove success. Use durable
 job outcomes for completion rates; this event neither backfills historical
 failures nor changes public errors, retry policy, or model calls.
+
+Capture and Dream attach a separate `provider_failure` object to their existing
+restricted `turn_exception` trajectory when a provider exception becomes the
+returned extraction failure. The object retains only the same closed exception
+families, immediate explicit cause, and valid provider HTTP status. It is bound
+to the exact exception raised for that returned failure; a later health or usage
+error with the same error code does not inherit it. Provider messages, payloads,
+and implicit exception context are excluded.
+
+This adds no trace event or storage lookup. Existing trajectory access controls,
+encryption, enablement, and best-effort delivery still apply. Refusal, output
+truncation, recoverable output-budget fallback, and Dream's shared deadline keep
+their existing diagnostics. `observation_only` does not prove a durable failure
+transition or an upstream root cause, and a missing object is not proof that no
+local exception occurred. This does not backfill old failures or change requests,
+retries, budgets, public errors, or memory-write behavior.
 
 ## Minimum security checklist
 

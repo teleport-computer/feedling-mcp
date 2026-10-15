@@ -2,6 +2,7 @@
 Regression tests for tools/chat_resident_consumer.py
 =====================================================
 
+
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
@@ -17038,3 +17039,135 @@ def test_off_history_proof_excludes_future_and_rejects_invalid_used_caption():
 def test_explicit_references_are_not_absorbed_into_another_backlog_anchor():
     row = dict(id='reference-backlog', role='user', content='Explain this', quoted_memory_ids='reference')
     assert not crc._collapse_eligible(row)
+
+
+@pytest.mark.parametrize("encryption", ["on", "off"])
+@pytest.mark.parametrize("receipt", [b"not-json-SECRET", b"null", b"[]", b"{}", b'{"ok":true}', b'{"id":""}', b'{"id":42}', b'{"status":"ignored","reason":"unknown"}', b'{"reason":"voice_call_finalized"}', b'{"status":"ignored","reason":[]}'])
+def test_reply_receipt_failure_retains_turn_until_valid_receipt(monkeypatch, encryption, receipt):
+    """Exercise real post_reply/HTTP decoding, then prove the same turn can recover."""
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    traces, requests = [], []
+    responses = iter([receipt, b'{"id":"durable-reply","ts":100.5,"v":1}'])
+
+    def transport(request):
+        assert request.url.path == "/v1/chat/response"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=next(responses), request=request)
+
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_whoami_cache", {
+        "user_id": "usr_receipt", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32,
+        "content_encryption_effective": encryption,
+    })
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {
+        "v": 1, "id": kw.get("item_id") or "reply", "body_ct": "sealed",
+    })
+    msg = {"id": "receipt-parent", "role": "user", "content": "hello", "ts": 100.0}
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        with patch.object(crc, "call_agent", return_value="visible reply") as agent:
+            assert crc._process_messages([msg]) == 0.0
+            assert crc._msg_key(msg) not in crc._seen_ids
+            assert not any(a[1] == "agent.turn.success" for a, _ in traces)
+            assert crc._process_messages([msg]) == 100.0
+            assert agent.call_count == 2
+    assert len(requests) == 2
+    assert all(r["reply_to_message_id"] == msg["id"] for r in requests)
+    if encryption == "on":
+        assert requests[0]["resident_delivery_id"] == requests[1]["resident_delivery_id"]
+    assert sum(a[1] == "agent.turn.success" for a, _ in traces) == 1
+
+
+@pytest.mark.parametrize("body", [b"SECRET-not-json", b"null", b"[]", b"{}", b'{"id":false}', b'{"id":"  "}'])
+def test_invalid_reply_receipt_error_does_not_expose_body(body):
+    import httpx
+
+    response = httpx.Response(200, content=body, request=httpx.Request("POST", "https://example.invalid/v1/chat/response"))
+    with pytest.raises(RuntimeError, match="chat_response_invalid_receipt") as caught:
+        crc._handle_post_reply_response(response)
+    assert str(caught.value) == "chat_response_invalid_receipt"
+
+
+@pytest.mark.parametrize("receipt", [b"{}", b"bad-json"])
+def test_proactive_invalid_receipt_is_failed_not_posted(monkeypatch, receipt):
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    _wire_proactive_harness(monkeypatch, replies=["visible wake"], post_result=None)
+    statuses = []
+    response = httpx.Response(200, content=receipt, request=httpx.Request("POST", "https://example.invalid/v1/chat/response"))
+    monkeypatch.setattr(crc, "post_reply", lambda *a, **kw: crc._handle_post_reply_response(response))
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **kw: statuses.append((a, kw)))
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=202.0)])
+    assert list(crc._worldbook_signal_window) == []
+    assert not any(a[1] == "posted" for a, _ in statuses)
+    assert statuses[-1][0][1:] == ("failed", "chat_response_invalid_receipt")
+
+
+@pytest.mark.parametrize("encryption", ["on", "off"])
+@pytest.mark.parametrize("reason", ["voice_call_finalized", "voice_call_cancelled", "voice_call_finalizing"])
+def test_voice_terminal_receipt_settles_foreground_without_success(monkeypatch, encryption, reason):
+    """Real post_reply/HTTP decoder must settle terminal voice and continue the batch."""
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    traces, requests = [], []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_whoami_cache", {
+        "user_id": "usr_receipt", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32,
+        "content_encryption_effective": encryption,
+    })
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {
+        "v": 1, "id": kw.get("item_id") or "reply", "body_ct": "sealed",
+    })
+    msgs = [{"id": f"voice-terminal-{i}", "role": "user", "content": "hello", "ts": ts}
+            for i, ts in enumerate([100.0, 200.0])]
+
+    def transport(request):
+        assert request.url.path == "/v1/chat/response"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"status": "ignored", "reason": reason}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        with patch.object(crc, "call_agent", return_value="visible reply") as agent:
+            assert crc._process_messages(msgs) == 200.0
+            assert agent.call_count == 2
+    assert [r["reply_to_message_id"] for r in requests] == [m["id"] for m in msgs]
+    assert all(crc._msg_key(m) in crc._seen_ids for m in msgs)
+    assert not any(a[1] == "agent.turn.success" for a, _ in traces)
+    deliveries = [kw["detail"] for a, kw in traces if a[1] == "agent.turn.reply_delivery"]
+    assert len(deliveries) == 2
+    assert all(d["outcome"] == "skipped" and d["accepted_reply_count"] == 0
+               and d["terminal_errors"] == [reason] for d in deliveries)
+
+
+@pytest.mark.parametrize("reason", ["voice_call_finalized", "voice_call_cancelled", "voice_call_finalizing"])
+def test_proactive_voice_terminal_receipt_is_not_posted(monkeypatch, reason):
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    _wire_proactive_harness(monkeypatch, replies=["visible wake"], post_result=None)
+    statuses = []
+    response = httpx.Response(200, json={"status": "ignored", "reason": reason},
+                             request=httpx.Request("POST", "https://example.invalid/v1/chat/response"))
+    monkeypatch.setattr(crc, "post_reply", lambda *a, **kw: crc._handle_post_reply_response(response))
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **kw: statuses.append((a, kw)))
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=202.0)])
+    assert list(crc._worldbook_signal_window) == []
+    assert not any(a[1] == "posted" for a, _ in statuses)
+    assert statuses[-1][0][1:] == ("failed", reason)

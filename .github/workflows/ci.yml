@@ -896,7 +896,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (81 files)
+      - name: Run CI security tier 2 (82 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -969,6 +969,7 @@ jobs:
             tests/test_io_cli_doctor_mode.py \
             tests/test_identity_strict_read.py \
             tests/test_identity_read_consumers.py \
+            tests/test_genesis_identity_init_safety.py \
             tests/test_io_cli_identity.py \
             tests/test_io_cli_identity_read.py \
             tests/test_io_cli_identity_write_full.py \

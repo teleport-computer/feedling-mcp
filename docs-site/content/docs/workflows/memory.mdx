@@ -119,6 +119,17 @@ finalize. Deliberate retry uses a new import job and may cost again or repeat
 previous effects. A timeout while apply is running is an unknown outcome until
 the job is read back; it is not permission to replay.
 
+## Genesis identity initialization
+
+Genesis distinguishes a missing identity from an unavailable identity read.
+Database or decryption failures do not authorize creating a default replacement,
+including when Genesis originally created the card. Existing profile fields are
+preserved when the card can be read. Creation and updates use conditional writes;
+a concurrent creator or updater wins without being overwritten by a stale import.
+Failed reads or conflicting writes do not record a successful identity artifact
+or emit a successful identity-write event. Previously committed import artifacts
+remain committed; this does not make the entire import atomic or authorize replay.
+
 ## Hosted profile refresh execution
 
 Runtime V2 generates its bounded Memory/User profile as low-priority Heavy-pool

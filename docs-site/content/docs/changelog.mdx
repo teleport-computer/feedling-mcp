@@ -24,6 +24,23 @@ change must not be interpreted as an API guarantee.
   fingerprints and required reference cards; historical wake anchors may omit
   unused old references with `include_references: false`.
 
+
+- Genesis identity initialization preserves existing cards when storage or
+  decryption reads fail, and refuses stale writes that lose a concurrent
+  creation or update. Successful first initialization remains supported.
+
+- Resident consumers now reject unrecognized HTTP success responses without a
+  valid JSON reply ID receipt. Recognized terminal voice dispositions settle
+  without counting a posted reply or success. Unconfirmed foreground writes
+  retain the existing retry
+  path instead of being counted as accepted delivery. Server idempotency and
+  terminal conflict behavior are unchanged; this does not prove client display.
+
+- Capture and Dream preserve bounded provider exception and explicit-cause
+  categories in their existing restricted failure trajectories. The diagnostic
+  does not change error codes, requests, retries, budgets, or memory writes,
+  and does not attribute historical failures to an upstream provider.
+
 - Model route activation, route tests, and active credential key changes record
   bounded HTTP/1.1 header/body phase evidence in existing probe diagnostics.
   HTTP/2 and unavailable observations remain unknown. Validation, buffered reads,

@@ -1543,12 +1543,27 @@ def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
     return payload
 
 
+def _identity_snapshot_for_write(store: UserStore) -> dict | None:
+    """Only a successful missing-row lookup permits Genesis initialization.
+
+    Keep this strict read scoped to Genesis writers; other legacy readers still
+    have their own best-effort contracts. Never include stored content in errors.
+    """
+    stored = db.get_blob_strict(store.user_id, "identity")
+    if stored is not None and (not isinstance(stored, dict) or not stored):
+        raise ValueError("identity_snapshot_invalid")
+    return stored
+
+
 def _existing_identity_plain_for_update(
     store: UserStore,
     api_key: str | None,
     runtime_token: str = "",
+    *,
+    stored: dict | None = None,
 ) -> tuple[dict | None, str]:
-    stored = identity_service._load_identity(store)
+    if stored is None:
+        stored = identity_service._load_identity(store)
     shape = core_envelope.classify_envelope_shape(stored)
     if shape in ("plaintext_text", "plaintext_binary"):
         try:
@@ -1594,7 +1609,7 @@ def init_identity_if_absent(
     runtime_token: str = "",
     *, managed=None,
 ) -> str:
-    existing = managed.read_identity() if managed else identity_service._load_identity(store)
+    existing = managed.read_identity() if managed else _identity_snapshot_for_write(store)
     payload = _identity_payload_from_output(output)
     if not payload:
         return "not_provided"
@@ -1602,11 +1617,13 @@ def init_identity_if_absent(
     base_payload = {"agent_name": "", "self_introduction": "", "dimensions": []}
     if existing:
         existing_plain, err = ((managed.identity_plain(existing), "") if managed else
-                               _existing_identity_plain_for_update(store, api_key, runtime_token))
+                               _existing_identity_plain_for_update(store, api_key, runtime_token, stored=existing))
         if existing_plain is not None:
             base_payload = _identity_payload_from_existing_plain(existing_plain)
-        elif str(existing.get("relationship_anchor_source") or "") != GENESIS_SOURCE:
-            return "already_initialized"
+        else:
+            # An existing but unreadable card is never an empty base payload,
+            # regardless of who originally created it.
+            return "identity_plain_unavailable"
 
     # Genesis owns the derived name/dimensions. Preserve the profile fields that
     # the live agent writes after respawn, especially self_introduction/signature.
@@ -1668,26 +1685,18 @@ def init_identity_if_absent(
     }
     if envelope.get("K_enclave"):
         identity_doc["K_enclave"] = envelope["K_enclave"]
-    # Legacy-only KNOWN RESIDUAL (managed writes use strict CAS below; same shape as identity/actions.py's
-    # _identity_relationship_days_set, see that comment): this is a plain
-    # overwrite, not the CAS `_save_identity_cas` used by profile_patch /
-    # dimension_nudge / replace_identity_preserving_anchor, and it isn't under
-    # identity_mutation_lock either. The `existing`/`base_payload` snapshot
-    # above was read at the TOP of this function, so a concurrent
-    # profile_patch/dimension_nudge CAS win landing after that read (this
-    # function's own enclave round trip for `_existing_identity_plain_for_update`
-    # included) can be silently clobbered here — and this can happen even when
-    # a card ALREADY exists (the `existing and relationship_anchor_source ==
-    # GENESIS_SOURCE` re-init branch above), not just on first init. Low
-    # real-world likelihood (genesis init/re-init is a one-shot onboarding
-    # path, not a hot path) but worth flagging alongside the C1 fix rather
-    # than presenting profile_patch/dimension_nudge/rewrap as the only
-    # writers on this row — relationship_days_set (identity/actions.py) has
-    # the same residual.
     if managed:
         managed.write(store.user_id, "identity", identity_doc)
     else:
-        identity_service._save_identity(store, identity_doc)
+        # Bind the merge to the raw snapshot taken before any plaintext read.
+        # Atomic create also protects a genuine miss from a concurrent creator.
+        # No retry here: a loser reports failure without clobbering the winner
+        # or emitting successful bootstrap/change events.
+        saved = (identity_service._save_identity_cas(store, existing, identity_doc)
+                 if existing is not None else
+                 identity_service._save_identity_create_if_absent(store, identity_doc))
+        if not saved:
+            return "identity_write_conflict"
     if managed:
         managed.after_identity = "updated" if existing else "initialized"
         return managed.after_identity
@@ -1882,7 +1891,7 @@ def replace_identity_preserving_anchor(
     clobbering it. This retires the prior plain-overwrite behavior noted as a
     KNOWN RESIDUAL in identity/actions.py::_identity_replace_action.
     """
-    if not identity_service._load_identity(store):
+    if _identity_snapshot_for_write(store) is None:
         init_output = dict(output)
         anchor = output.get("relationship_anchor")
         if isinstance(anchor, dict):
@@ -1937,11 +1946,11 @@ def replace_identity_preserving_anchor(
             # as identity/actions.py::_load_identity_snapshot_for_write; a
             # write landing during the enclave call must fail the CAS, not be
             # silently clobbered by it).
-            snapshot = identity_service._load_identity(store)
+            snapshot = _identity_snapshot_for_write(store)
             if not snapshot:
                 return "identity_not_initialized"
             existing_plain, _plain_err = _existing_identity_plain_for_update(
-                store, api_key, runtime_token)
+                store, api_key, runtime_token, stored=snapshot)
             if existing_plain is None:
                 return "identity_plain_unavailable"
 
