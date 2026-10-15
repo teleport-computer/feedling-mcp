@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Capture and Dream preserve bounded provider exception and explicit-cause
+  categories in their existing restricted failure trajectories. The diagnostic
+  does not change error codes, requests, retries, budgets, or memory writes,
+  and does not attribute historical failures to an upstream provider.
+
 - Model route activation, route tests, and active credential key changes record
   bounded HTTP/1.1 header/body phase evidence in existing probe diagnostics.
   HTTP/2 and unavailable observations remain unknown. Validation, buffered reads,
