@@ -16,6 +16,13 @@ change must not be interpreted as an API guarantee.
   decryption reads fail, and refuses stale writes that lose a concurrent
   creation or update. Successful first initialization remains supported.
 
+- Resident consumers now reject unrecognized HTTP success responses without a
+  valid JSON reply ID receipt. Recognized terminal voice dispositions settle
+  without counting a posted reply or success. Unconfirmed foreground writes
+  retain the existing retry
+  path instead of being counted as accepted delivery. Server idempotency and
+  terminal conflict behavior are unchanged; this does not prove client display.
+
 - Capture and Dream preserve bounded provider exception and explicit-cause
   categories in their existing restricted failure trajectories. The diagnostic
   does not change error codes, requests, retries, budgets, or memory writes,
