@@ -315,3 +315,25 @@ def test_log_append_numbered_assigns_before_append_and_mirrors(monkeypatch):
     assert executed[2][1][4].obj["attempt_n"] == 3
     assert mirrored[0][1][2] == 91
     assert mirrored[0][1][5].obj["attempt_n"] == 3
+
+
+def test_probe_projection_rejects_open_values_and_is_setup_only(monkeypatch):
+    import copy
+    good = dict(version=1, phase='response_body', headers_seen=True,
+                observed_status_code=200, observation_valid=True, post_attempt_count=1)
+    assert provider_attempt_ledger.project_probe_http(dict(good, private='SECRET')) == good
+    for key, value in [('phase', 'SECRET'), ('phase', []), ('headers_seen', 'true'),
+                       ('observed_status_code', True), ('observed_status_code', '200'),
+                       ('post_attempt_count', -1), ('post_attempt_count', True),
+                       ('observation_valid', 1), ('version', True)]:
+        invalid = dict(good, **{key: value})
+        assert provider_attempt_ledger.project_probe_http(invalid) is None
+    stored = []
+    monkeypatch.setattr(provider_attempt_ledger.db, 'log_append_numbered',
+                        lambda *a, **k: stored.append(copy.deepcopy(a[2])) or True)
+    for runtime, lane in [('hosted_setup', 'route_activate'), ('hosted_setup', 'route_test'),
+                          ('hosted_setup', 'credential_patch'), ('hosted_setup', 'setup'),
+                          ('v2', 'route_test')]:
+        assert provider_attempt_ledger.record_runtime_attempt('synthetic', parent_key='probe',
+            trigger='model_api_probe', outcome='ok', runtime=runtime, lane=lane, probe_http=good)
+        assert ('probe_http' in stored[-1]) == (runtime == 'hosted_setup' and lane != 'setup')
