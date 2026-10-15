@@ -37,7 +37,7 @@ jobs:
   reconcile-test-compose:
     name: reconcile test compose authorization
     needs: [compose-publisher-tests]
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' && inputs.operation == 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' && inputs.operation == 'reconcile-test-compose') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -82,6 +82,7 @@ jobs:
           retention-days: 90
 
   compose-publisher-tests:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') }}
     name: compose publisher offline boundaries
     runs-on: ubuntu-24.04
     permissions:
@@ -103,12 +104,7 @@ jobs:
   # dispatch-only and branch-locked so it can never target prod by accident.
   maintain-test-cvm:
     name: maintain CVM (test)
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/test' &&
-      (inputs.operation == 'check-test-transport' ||
-       inputs.operation == 'diagnose-test-photo' ||
-       inputs.operation == 'restart-test-cvm')
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' && (inputs.operation == 'check-test-transport' || inputs.operation == 'diagnose-test-photo' || inputs.operation == 'restart-test-cvm')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -290,7 +286,7 @@ jobs:
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
   forge-test:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: forge test (contracts)
     runs-on: ubuntu-24.04
     defaults:
@@ -318,7 +314,7 @@ jobs:
   # Python — backend API tests (multi-tenant only; SINGLE_USER mode retired)
   # -------------------------------------------------------------------------
   python-tests:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: test_api.py (multi-tenant)
     runs-on: ubuntu-24.04
     env:
@@ -1314,7 +1310,7 @@ jobs:
           if-no-files-found: ignore
 
   runtime-v2-coverage:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     env:
@@ -1405,7 +1401,7 @@ jobs:
 
   ci-execution-evidence-report:
     name: CI execution evidence (report only)
-    if: always() && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose')
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (always() && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose')) }}
     continue-on-error: true
     needs: [python-tests, runtime-v2-coverage]
     runs-on: ubuntu-24.04
@@ -1455,7 +1451,7 @@ jobs:
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------
   docker-build:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: docker compose build (hash-verified)
     runs-on: ubuntu-24.04
     steps:
@@ -1496,7 +1492,7 @@ jobs:
   # image intentionally does NOT carry trafilatura and is not checked here.
   # -------------------------------------------------------------------------
   docker-build-worker-deps:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: docker build (serve-worker deps in main image)
     runs-on: ubuntu-24.04
     steps:
@@ -1520,7 +1516,7 @@ jobs:
   # Syntax + quick static checks
   # -------------------------------------------------------------------------
   lint:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: syntax + static
     runs-on: ubuntu-24.04
     steps:
@@ -1721,7 +1717,7 @@ jobs:
   # DCAP parser — Python reference tests
   # -------------------------------------------------------------------------
   dcap-python:
-    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose') }}
     name: DCAP parser (python reference)
     runs-on: ubuntu-24.04
     steps:
@@ -1742,7 +1738,7 @@ jobs:
   # =========================================================================
   detect-cvm-changes:
     name: detect CVM changes
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/main' && github.event_name == 'push') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -1783,7 +1779,7 @@ jobs:
 
   detect-cvm-changes-test:
     name: detect CVM changes (test)
-    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/test' && github.event_name == 'push') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -1822,10 +1818,7 @@ jobs:
   validate-test-runtime-prerequisites:
     name: validate test Runtime V2 deploy prerequisites
     needs: [detect-cvm-changes-test]
-    if: |
-      github.ref == 'refs/heads/test' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/test' && github.event_name == 'push' && needs.detect-cvm-changes-test.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -2074,10 +2067,7 @@ jobs:
   validate-prod-runner-topology:
     name: validate prod deploy prerequisites
     needs: [detect-cvm-changes]
-    if: |
-      github.ref == 'refs/heads/main' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect-cvm-changes.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -2338,7 +2328,7 @@ jobs:
           done
   detect-cvm-changes-pre:
     name: detect CVM changes (pre)
-    if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/pre' && github.event_name == 'push') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -2387,10 +2377,7 @@ jobs:
   validate-pre-runtime-prerequisites:
     name: validate pre Runtime V2 deploy prerequisites
     needs: [detect-cvm-changes-pre]
-    if: |
-      github.ref == 'refs/heads/pre' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes-pre.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/pre' && github.event_name == 'push' && needs.detect-cvm-changes-pre.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -2646,11 +2633,7 @@ jobs:
   prod-plaintext-shadow-gate2:
     name: authorize PROD plaintext shadow Gate 2
     needs: [detect-cvm-changes, validate-prod-runner-topology]
-    if: |
-      github.ref == 'refs/heads/main' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes.outputs.cvm == 'true' &&
-      vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED == '1'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect-cvm-changes.outputs.cvm == 'true' && vars.PROD_FEEDLING_PLAINTEXT_SHADOW_ENABLED == '1') }}
     runs-on: ubuntu-24.04
     environment: prod-plaintext-shadow-gate2
     permissions:
@@ -2683,11 +2666,7 @@ jobs:
   deploy-cvm:
     name: deploy CVM
     needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology, prod-plaintext-shadow-gate2]
-    if: |
-      always() && !failure() && !cancelled() &&
-      github.ref == 'refs/heads/main' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (always() && !failure() && !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect-cvm-changes.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -3056,10 +3035,7 @@ jobs:
   deploy-test-cvm:
     name: deploy CVM (test)
     needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
-    if: |
-      github.ref == 'refs/heads/test' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/test' && github.event_name == 'push' && needs.detect-cvm-changes-test.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -3347,11 +3323,7 @@ jobs:
   deploy-test-runner-cvm:
     name: deploy runner CVM (test)
     needs: [deploy-test-cvm, detect-cvm-changes-test]
-    if: |
-      github.ref == 'refs/heads/test' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes-test.outputs.cvm == 'true' &&
-      !cancelled()
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/test' && github.event_name == 'push' && needs.detect-cvm-changes-test.outputs.cvm == 'true' && !cancelled()) }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -3586,10 +3558,7 @@ jobs:
   deploy-pre-cvm:
     name: deploy CVM (pre)
     needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-pre, validate-pre-runtime-prerequisites]
-    if: |
-      github.ref == 'refs/heads/pre' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes-pre.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/pre' && github.event_name == 'push' && needs.detect-cvm-changes-pre.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -3852,10 +3821,7 @@ jobs:
   deploy-pre-runner-cvm:
     name: deploy runner CVM (pre)
     needs: [deploy-pre-cvm, detect-cvm-changes-pre]
-    if: |
-      github.ref == 'refs/heads/pre' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes-pre.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (github.ref == 'refs/heads/pre' && github.event_name == 'push' && needs.detect-cvm-changes-pre.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -4049,12 +4015,7 @@ jobs:
   deploy-prod-runner-cvm:
     name: deploy runner CVM (prod)
     needs: [deploy-cvm, detect-cvm-changes]
-    if: |
-      always() &&
-      needs.deploy-cvm.result == 'success' &&
-      github.ref == 'refs/heads/main' &&
-      github.event_name == 'push' &&
-      needs.detect-cvm-changes.outputs.cvm == 'true'
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (always() && needs.deploy-cvm.result == 'success' && github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect-cvm-changes.outputs.cvm == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -4196,7 +4157,7 @@ jobs:
   publish-prod-runner-compose:
     name: authorize prod runner (${{ matrix.cvm_id }})
     needs: [deploy-prod-runner-cvm]
-    if: ${{ always() && !cancelled() && needs.deploy-prod-runner-cvm.result == 'success' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (always() && !cancelled() && needs.deploy-prod-runner-cvm.result == 'success') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -4299,7 +4260,7 @@ jobs:
   notify-lark-prod-deploy:
     name: notify Lark (prod deploy finished)
     needs: [deploy-cvm, deploy-prod-runner-cvm, publish-prod-runner-compose]
-    if: ${{ always() && needs.deploy-cvm.result != 'skipped' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport') && (always() && needs.deploy-cvm.result != 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Notify Lark deploy finished
@@ -4387,3 +4348,380 @@ jobs:
             | curl -fsS -X POST "$LARK_BOT_WEBHOOK" \
                 -H "Content-Type: application/json" \
                 --data-binary @-
+
+  t826-kms-readonly:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/fleet/p1-t826-kms-readonly-entry' && inputs.operation == 'check-test-transport' && github.run_attempt == 1 && github.actor == 'sevenfloor7' && github.actor_id == '68056729' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    concurrency:
+      group: t826-kms-read-once
+      cancel-in-progress: false
+    steps:
+      - name: Materialize exact reviewed local programs (no checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -m 700 "$RUNNER_TEMP/t826-kms-reviewed"
+          cd "$RUNNER_TEMP/t826-kms-reviewed"
+          cat > collect_kms.py <<'PY_PROGRAM'
+          """Review-only proposal. No network on import or default invocation."""
+          import argparse
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import ssl
+          import subprocess
+          import sys
+          import urllib.request
+          import urllib.error
+          
+          TARGET = '5bfa1543-c5b4-42ca-842d-fd88984e5edf'
+          APP = '173c7f49aeb54acb424676b17b17f78e5e2b2938'
+          COMPOSE = '5466361e92de57e4dcd4fdb1de476d76b81f22f55fa477bdcb8801accf6c1866'
+          VERSIONS = ('2026-01-21', '2025-10-28')
+          MAX_BYTES = 65536
+          ROOT = Path(__file__).resolve().parent
+          
+          
+          def field(data, path, kind):
+              value = data
+              for key in path.split('.'):
+                  if not isinstance(value, dict):
+                      return {'state': 'null_parent' if value is None else 'invalid_parent'}
+                  if key not in value:
+                      return {'state': 'missing'}
+                  value = value[key]
+              if value is None:
+                  return {'state': 'null'}
+              valid = False
+              if kind == 'address':
+                  valid = isinstance(value, str) and re.fullmatch(r'0x[0-9a-fA-F]{40}', value) is not None
+              elif kind == 'chain':
+                  valid = type(value) is int and 0 < value < 2**53
+              elif kind == 'kms_type':
+                  valid = value in ('phala', 'ethereum', 'base', 'legacy') if isinstance(value, str) else False
+              return {'state': 'value', 'value': value} if valid else {'state': 'invalid'}
+          
+          
+          def project(status, raw, version):
+              base = {'requested_api_version': version, 'http_status': status, 'target': TARGET}
+              if status != 200:
+                  return dict(base, result='HTTP_ERROR')
+              if len(raw) > MAX_BYTES:
+                  return dict(base, result='OVERSIZE')
+              try:
+                  data = json.loads(raw)
+              except (ValueError, UnicodeError):
+                  return dict(base, result='INVALID_JSON')
+              if not isinstance(data, dict):
+                  return dict(base, result='INVALID_OBJECT')
+              # Both schemas expose vm_uuid. Legacy id is numeric; new id is opaque.
+              # Neither is treated as a UUID substitute. Missing UUID fails closed.
+              identity = {}
+              for key, expected in [('vm_uuid', TARGET), ('app_id', APP), ('compose_hash', COMPOSE)]:
+                  if key not in data:
+                      identity[key] = {'state': 'missing'}
+                  elif data[key] is None:
+                      identity[key] = {'state': 'null'}
+                  elif not isinstance(data[key], str):
+                      identity[key] = {'state': 'invalid'}
+                  else:
+                      val = data[key].removeprefix('0x') if key == 'compose_hash' else data[key]
+                      identity[key] = {'state': 'match' if val == expected else 'mismatch'}
+              base['identity'] = identity
+              if identity['vm_uuid']['state'] != 'match' or identity['app_id']['state'] != 'match':
+                  return dict(base, result='TARGET_OR_APP_UNVERIFIED')
+              if identity['compose_hash']['state'] in ('mismatch', 'invalid'):
+                  return dict(base, result='COMPOSE_UNVERIFIED')
+              paths = {'kms_type': 'kms_type', 'kms_info.chain_id': 'chain',
+                       'kms_info.dstack_app_address': 'address', 'kms_info.dstack_kms_address': 'address',
+                       'contract_address': 'address', 'kms_info.kms_contract_address': 'address',
+                       'app_auth_contract_address': 'address'}
+              fields = {k: field(data, k, v) for k, v in paths.items()}
+              return dict(base, result='PROJECTED_NOT_AUTHORIZATION_VERIFIED', app_id=APP,
+                          compose_hash=identity['compose_hash'], fields=fields)
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          
+          def transport(version):
+              # Only called after explicit execution entry. Never read local profiles.
+              token = os.environ.get('TEST_PHALA_CLOUD_API_KEY', '')
+              if not token or '\n' in token or '\r' in token:
+                  raise ValueError('credential unavailable')
+              request = urllib.request.Request(
+                  'https://cloud-api.phala.com/api/v1/cvms/' + TARGET,
+                  headers={'X-API-Key': token, 'X-Phala-Version': version, 'Accept': 'application/json'}, method='GET')
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+                                                  urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+              try:
+                  with opener.open(request, timeout=15) as response:
+                      return response.status, response.read(MAX_BYTES + 1)
+              except urllib.error.HTTPError as exc:
+                  # Never read an error/redirect response body or Location header.
+                  return exc.code, b''
+          
+          
+          def collect(version, fetch):
+              try:
+                  status, raw = fetch(version)
+                  return project(status, raw, version)
+              except (TimeoutError, subprocess.TimeoutExpired):
+                  return {'result': 'TIMEOUT', 'requested_api_version': version}
+              except Exception:
+                  # No exception text, URL, headers, body or token reaches output.
+                  return {'result': 'REQUEST_OR_SCHEMA_ERROR', 'requested_api_version': version}
+          
+          
+          def bounded_worker(version):
+              proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--worker', '--api-version', version],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=25, check=False)
+              if proc.returncode != 0 or len(proc.stdout) > MAX_BYTES:
+                  raise ValueError('worker failed')
+              # worker already projects; passing back through project would reject safe schema.
+              return json.loads(proc.stdout)
+          
+          
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--execute', action='store_true')
+              parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+              parser.add_argument('--api-version', choices=VERSIONS, default=VERSIONS[0])
+              args = parser.parse_args()
+              if not (args.execute or args.worker):
+                  print('REVIEW_ONLY: no request; execution requires separately approved CI entry')
+                  return
+              if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('T826_KMS_READ_APPROVED') != 'yes':
+                  parser.error('approved CI context required')
+              destination = ROOT / 'observation'
+              if args.worker:
+                  if not (destination / 'request-consumed').is_file():
+                      parser.error('consumed marker required')
+                  # Additional exclusive worker claim prevents direct worker replay.
+                  try:
+                      with (destination / 'worker-started').open('x') as f:
+                          f.write('single worker attempt\n')
+                  except FileExistsError:
+                      parser.error('worker already consumed')
+                  print(json.dumps(collect(args.api_version, transport)))
+                  return
+              destination.mkdir(mode=0o700, exist_ok=False)
+              (destination / 'request-consumed').write_text('T826 fixed test CVM GET; do not replay\n')
+              try:
+                  result = bounded_worker(args.api_version)
+              except subprocess.TimeoutExpired:
+                  result = {'result': 'TIMEOUT', 'requested_api_version': args.api_version}
+              except Exception:
+                  result = {'result': 'WORKER_ERROR', 'requested_api_version': args.api_version}
+              (destination / 'RESULT.json').write_text(json.dumps(result, indent=2) + '\n')
+              print(result['result'])
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY_PROGRAM
+          printf '%s  collect_kms.py\n' 'a7636ba931e25be7ac9d8050be25edb7df835ad6044f2656c49f1b4ef713b337' | sha256sum --check --status
+          cat > run_guard.py <<'PY_PROGRAM'
+          """Fail-closed run identity and complete pagination gate; no Phala credential access."""
+          import json
+          import os
+          import re
+          import ssl
+          import sys
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          
+          REPO = 'teleport-computer/feedling-mcp'
+          BRANCH = 'fleet/p1-t826-kms-readonly-entry'
+          ACTOR = 'sevenfloor7'
+          ACTOR_ID = 68056729
+          OPERATION = 'check-test-transport'
+          LIMIT = 1000
+          
+          
+          class Refused(Exception):
+              pass
+          
+          
+          def need(condition, reason):
+              if not condition:
+                  raise Refused(reason)
+          
+          
+          def verify(current, pages, expected_id, expected_sha):
+              need(type(expected_id) is int and expected_id > 0, 'invalid_current_id')
+              need(isinstance(expected_sha,str) and re.fullmatch('[0-9a-f]{40}', expected_sha), 'invalid_expected_sha')
+              need(isinstance(current,dict), 'invalid_current')
+              need(current.get('id') == expected_id, 'wrong_current_id')
+              need(current.get('head_sha') == expected_sha, 'wrong_current_sha')
+              need(current.get('head_branch') == BRANCH, 'wrong_current_ref')
+              need(current.get('event') == 'workflow_dispatch', 'wrong_current_event')
+              need(current.get('run_attempt') == 1, 'repeat_attempt')
+              need(current.get('path') == '.github/workflows/ci.yml', 'wrong_workflow')
+              need(current.get('repository',{}).get('full_name') == REPO, 'wrong_repo')
+              for key in ('actor','triggering_actor'):
+                  actor=current.get(key,{})
+                  need(actor.get('id') == ACTOR_ID and actor.get('login') == ACTOR,'wrong_actor')
+              need(isinstance(pages,list) and len(pages)>0,'missing_pages')
+              total=pages[0].get('total_count')
+              need(type(total) is int and 0<total<LIMIT,'invalid_or_capped_count')
+              need(len(pages)==(total+99)//100,'missing_or_extra_pages')
+              rows=[]
+              for index,page in enumerate(pages):
+                  need(page.get('page_number')==index+1,'page_order_or_gap')
+                  need(page.get('total_count')==total,'count_changed')
+                  batch=page.get('workflow_runs')
+                  need(isinstance(batch,list) and len(batch)==min(100,total-100*index),'incomplete_page')
+                  rows.extend(batch)
+              ids=[r.get('id') for r in rows]
+              need(all(type(i) is int and i>0 for i in ids) and len(set(ids))==total,'duplicate_or_invalid_ids')
+              for row in rows:
+                  need(row.get('head_branch')==BRANCH and row.get('event')=='workflow_dispatch','unfiltered_run')
+                  need(row.get('path')=='.github/workflows/ci.yml','wrong_list_workflow')
+              need(len(rows)==1, 'prior_or_duplicate_branch_dispatch')
+              candidates=[r for r in rows if r.get('head_sha')==expected_sha]
+              need(len(candidates)==1 and candidates[0].get('id')==expected_id,'not_unique_current_dispatch')
+              # Reject inconsistency between list and current-run views, including a rerun race.
+              row=candidates[0]
+              for key in ('id','head_sha','head_branch','event','path','run_attempt','actor'):
+                  need(row.get(key)==current.get(key),'current_list_mismatch')
+              return {'result':'PASS','run_id':expected_id,'head_sha':expected_sha,'ref':BRANCH,
+                      'actor_id':ACTOR_ID,'attempt':1,'pages':len(pages),'total_count':total}
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs):
+                  return None
+          
+          
+          def get_json(path, token):
+              opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect(),
+                  urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+              req=urllib.request.Request('https://api.github.com'+path,method='GET',headers={
+                  'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json',
+                  'X-GitHub-Api-Version':'2022-11-28'})
+              with opener.open(req,timeout=10) as resp:
+                  need(resp.status==200,'http_error')
+                  raw=resp.read(2_000_001)
+                  need(len(raw)<=2_000_000,'response_too_large')
+                  return json.loads(raw)
+          
+          
+          def main():
+              result={'result':'REFUSED'}
+              try:
+                  need(os.environ.get('GITHUB_ACTIONS')=='true','not_ci')
+                  need(os.environ.get('GITHUB_EVENT_NAME')=='workflow_dispatch','wrong_event')
+                  need(os.environ.get('GITHUB_REF')=='refs/heads/'+BRANCH,'wrong_ref')
+                  need(os.environ.get('GITHUB_REPOSITORY')==REPO,'wrong_repository')
+                  need(os.environ.get('GITHUB_RUN_ATTEMPT')=='1','repeat_attempt')
+                  need(os.environ.get('GITHUB_ACTOR')==ACTOR and os.environ.get('GITHUB_ACTOR_ID')==str(ACTOR_ID),'wrong_actor')
+                  need(os.environ.get('OPERATION')==OPERATION,'wrong_operation')
+                  sha=os.environ.get('EXPECTED_COMMIT','')
+                  need(re.fullmatch('[0-9a-f]{40}',sha) is not None and sha==os.environ.get('GITHUB_SHA'),'wrong_expected_commit')
+                  runid=int(os.environ.get('GITHUB_RUN_ID','0'))
+                  token=os.environ.get('GH_TOKEN','');need(bool(token),'missing_read_token')
+                  current=get_json(f'/repos/{REPO}/actions/runs/{runid}',token)
+                  prefix=f'/repos/{REPO}/actions/workflows/ci.yml/runs?'+urllib.parse.urlencode({'branch':BRANCH,'event':'workflow_dispatch','per_page':100})
+                  first=get_json(prefix+'&page=1',token)
+                  total=first.get('total_count');need(type(total) is int and 0<total<LIMIT,'invalid_or_capped_count')
+                  first['page_number']=1;pages=[first]
+                  for number in range(2,(total+99)//100+1):
+                      page=get_json(prefix+f'&page={number}',token);page['page_number']=number;pages.append(page)
+                  # Recheck count and current identity after pagination; no retries on change.
+                  last=get_json(prefix+'&page=1',token)
+                  need(last.get('total_count')==total and last.get('workflow_runs')==first.get('workflow_runs'),'snapshot_changed')
+                  result=verify(current,pages,runid,sha)
+              except Refused as exc:
+                  result={'result':'REFUSED','reason':str(exc)}
+              except Exception:
+                  result={'result':'REFUSED','reason':'request_or_schema_error'}
+              Path('GUARD-RESULT.json').write_text(json.dumps(result,indent=2)+'\n')
+              if result['result']!='PASS':
+                  print('run guard REFUSED');return 1
+              print('run guard PASS');return 0
+          
+          
+          if __name__=='__main__':sys.exit(main())
+          PY_PROGRAM
+          printf '%s  run_guard.py\n' '671de5cb9be9009349786ba76ef34b809e98ae6aec878506de6bd411454ec93c' | sha256sum --check --status
+          cat > bounded_guard.py <<'PY_PROGRAM'
+          """Bound the GitHub guard and preserve a safe failure result before cloud credentials."""
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          
+          
+          def execute(runner=subprocess.run):
+              path=Path('GUARD-RESULT.json')
+              # Fresh working directory required: never accept a stale PASS.
+              if path.exists():
+                  print('run guard refused existing result');return 1
+              failure=None
+              try:
+                  result=runner([sys.executable,'-B','run_guard.py'],stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=150,check=False)
+                  if result.returncode!=0:failure='guard_nonzero_exit'
+              except subprocess.TimeoutExpired:failure='guard_outer_timeout'
+              except Exception:failure='guard_launch_error'
+              if failure:
+                  if not path.exists():
+                      with path.open('x') as f:json.dump({'result':'REFUSED','reason':failure},f)
+                  print('run guard failed');return 1
+              try:
+                  data=json.loads(path.read_text())
+                  if data.get('result')!='PASS':raise ValueError()
+                  with open(os.environ['GITHUB_OUTPUT'],'a') as out:out.write('allowed=true\n')
+              except Exception:
+                  if not path.exists():
+                      with path.open('x') as f:json.dump({'result':'REFUSED','reason':'guard_missing_result'},f)
+                  print('run guard refused');return 1
+              print('run guard PASS');return 0
+          
+          if __name__=='__main__':sys.exit(execute())
+          PY_PROGRAM
+          printf '%s  bounded_guard.py\n' 'aa53e888dd7b76d8b56b0b1495b53d94388ef2a8b4d32d464b6ee5439584199b' | sha256sum --check --status
+      - name: Validate existing run identity and complete dispatch history
+        id: run_guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT: ${{ inputs.recovery_authorization }}
+          OPERATION: ${{ inputs.operation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/t826-kms-reviewed"
+          python3 -B bounded_guard.py
+      - name: Single bounded fixed-target GET
+        if: success() && steps.run_guard.outputs.allowed == 'true'
+        env:
+          TEST_PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          T826_KMS_READ_APPROVED: 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/t826-kms-reviewed"
+          printf '%s  collect_kms.py\n' 'a7636ba931e25be7ac9d8050be25edb7df835ad6044f2656c49f1b4ef713b337' | sha256sum --check --status
+          python3 -B collect_kms.py --execute --api-version 2026-01-21
+      - name: Preserve only safe guard/projection and consumed markers
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: t826-kms-${{ github.run_id }}-1
+          path: |
+            ${{ runner.temp }}/t826-kms-reviewed/GUARD-RESULT.json
+            ${{ runner.temp }}/t826-kms-reviewed/observation/RESULT.json
+            ${{ runner.temp }}/t826-kms-reviewed/observation/request-consumed
+            ${{ runner.temp }}/t826-kms-reviewed/observation/worker-started
+          if-no-files-found: warn
+          retention-days: 30
