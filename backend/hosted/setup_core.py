@@ -122,6 +122,7 @@ def _emit_model_api_probe_trace(
     dur_ms: float | None = None,
     route_context: dict | None = None,
     exception_type: str = "unknown",
+    probe_http: dict | None = None,
 ) -> None:
     event_type = {
         "started": "model_api.provider_probe.started",
@@ -142,11 +143,16 @@ def _emit_model_api_probe_trace(
     }
     if route_context is not None:
         detail.update({key: route_context.get(key) for key in ("route_id", "request_id")})
-        detail["http_phase"] = "unknown"  # No transport-phase measurement here.
+        detail["http_phase"] = "unknown"  # Started/unobserved probes have no phase facts.
         detail["exception_type"] = exception_type if exception_type in {
             "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout",
             "ConnectError", "ReadError", "ProviderError",
         } else "unknown"
+    if operation in {"route_activate", "route_test", "credential_patch"}:
+        safe_probe = provider_attempt_ledger.project_probe_http(probe_http)
+        if safe_probe is not None:
+            detail["probe_http"] = safe_probe
+            detail["http_phase"] = safe_probe["phase"]
     if usage:
         detail["usage"] = dict(usage)
     if error_class:
@@ -198,6 +204,12 @@ def _probe_exception_type(exc: BaseException) -> str:
     return "ProviderError" if isinstance(exc, provider_client.ProviderError) else "unknown"
 
 
+def _probe_http_snapshot(observation):
+    if observation is None:
+        return None
+    return provider_attempt_ledger.project_probe_http(observation.snapshot())
+
+
 def _test_provider_key_observed(
     store,
     config: provider_client.ProviderConfig,
@@ -223,9 +235,13 @@ def _test_provider_key_observed(
         phase="started",
         route_context=route_context,
     )
+    observation = None
+    probe_http = None
     try:
-        result = provider_client.test_provider_key(config)
+        with provider_client.observe_setup_probe(operation) as observation:
+            result = provider_client.test_provider_key(config)
     except provider_client.ProviderError as exc:
+        probe_http = _probe_observation(_probe_http_snapshot, observation)
         outcome, error_class = _model_api_probe_error(exc)
         if route_context is not None:
             error_class = provider_client.classify_provider_error(exc)
@@ -238,6 +254,7 @@ def _test_provider_key_observed(
             provider=config.provider,
             model=observed_model,
             lane=operation,
+            **({"probe_http": probe_http} if probe_http is not None else {}),
             runtime="hosted_setup",
             error_class=error_class,
             status_code=exc.status_code,
@@ -252,6 +269,7 @@ def _test_provider_key_observed(
             phase="finished",
             route_context=route_context,
             exception_type=_probe_exception_type(exc),
+            **({"probe_http": probe_http} if probe_http is not None else {}),
             status="error",
             outcome_class="operational_failure",
             error_class=error_class,
@@ -260,6 +278,7 @@ def _test_provider_key_observed(
         )
         raise
 
+    probe_http = _probe_observation(_probe_http_snapshot, observation)
     usage = _model_api_probe_usage(result)
     _probe_observation(provider_attempt_ledger.record_runtime_attempt,
         store.user_id,
@@ -269,6 +288,7 @@ def _test_provider_key_observed(
         provider=config.provider,
         model=observed_model,
         lane=operation,
+        **({"probe_http": probe_http} if probe_http is not None else {}),
         runtime="hosted_setup",
         input_tokens=usage["input_tokens"],
         output_tokens=usage["output_tokens"],
@@ -287,6 +307,7 @@ def _test_provider_key_observed(
         phase="finished",
         route_context=route_context,
         usage=usage,
+        **({"probe_http": probe_http} if probe_http is not None else {}),
         dur_ms=(time.monotonic() - started) * 1000.0,
     )
     return result

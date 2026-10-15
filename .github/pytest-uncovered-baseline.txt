@@ -56,7 +56,6 @@ tests/test_chat_poll_core.py
 tests/test_chat_poll_cross_worker_staleness.py
 tests/test_chat_poll_redelivery.py
 tests/test_chat_poll_resident_seen.py
-tests/test_chat_response_finalize_cas.py
 tests/test_chat_response_verify_reload.py
 tests/test_chat_route_debug_trace.py
 tests/test_chat_skipped_message_never_redelivered.py
