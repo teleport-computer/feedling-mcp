@@ -22,16 +22,14 @@ Data source (admin-gated, content-free by construction):
   two Beijing calendar days (``admin.lane_rollup_summary``). ``route`` is
   ``resident`` (V1: hosted resident + self-hosted VPS) or ``model_api``
   (V2 pooled worker). ``failure_codes`` are already sanitized to
-  ``^[a-z0-9_:-]{1,120}$``. Dream skips (garden too small) come from the same
+  ``^[a-z0-9_:-]{1,120}$``. Dream declared skips come from the same
   cells' ``silent_declared``. ``--fixture`` reads this summary JSON shape.
 
-Failure semantics are the admin lane views' (``admin.data_track``): the
-failure rate is ``operational failures / (real completions + operational
-failures)``. Control outcomes (V1 ``skipped``, V2 ``capture_disabled`` /
-``dream_disabled`` / ``turns_halted`` …) and failures proven to be the user's
-own account (``notices.catalog`` user-unavailable sets) are shown on their own
-informational line and never page anyone. V1 reads the frozen outcome columns;
-V2 classifies ``failure_codes`` exactly like ``jobs_store.terminal_outcome_class``.
+Result semantics: the summary supplies conserved observed terminal buckets,
+including skips, expiry, replacement and unmeasured splits. Completed status
+is not proof that content was generated. A separate overlapping operational
+classification retains the existing alert thresholds and rate denominator.
+All sanitized non-success codes and account exclusions are displayed.
 
 Day boundary: the rollup freezes **Beijing** (Asia/Shanghai) days, so the
 report covers the previous Beijing day, not a UTC day. Recomputing UTC days
@@ -98,7 +96,7 @@ GROUP_UNKNOWN = "unknown"
 GROUP_ORDER = (GROUP_USER, GROUP_PROVIDER, GROUP_OURS, GROUP_UNKNOWN)
 GROUP_LABELS = {
     # Operational failures whose code blames an account/config problem but is
-    # not proven to be the user's own (those are on the "不算失败" line).
+    # not in the closed user-unavailable exclusion set.
     GROUP_USER: "账号/配置类",
     GROUP_PROVIDER: "模型服务",
     GROUP_OURS: "我们这边",
@@ -174,7 +172,7 @@ def incomplete_notes(report: dict) -> list[str]:
     templates = {
         "missing_lane": "{lane} 没取到数据",
         "truncated": "{lane} 行数超过翻页上限，只统计了一部分",
-        "partial": "{lane} · {route} 当天统计还没冻结，数字可能偏少、失败原因记为未知",
+        "partial": "{lane} · {route} 覆盖不足或尚未冻结，数字可能偏少，缺失不代表零",
         "unclassified": "{lane} · {route} 失败分类缺失，按原始失败计（可能含跳过/用户账号问题）",
     }
     return [templates[item["kind"]].format(
@@ -197,8 +195,10 @@ def _users(stats: Mapping[str, Any], key: str) -> str:
 #: change in retry policy moves the rate by itself; the two user counts on each
 #: line count a repeatedly failing user once (a retry that succeeds still moves
 #: them from 零成功 to 受影响, which is a real change).
-RATE_CAVEAT = ("口径：失败率按次数算；同一用户一晚可重试多次（做梦 2026-09-16 起最多 4 次），"
-               "坏掉的用户会被放大——看「受影响 / 零成功」人数更准")
+RATE_CAVEAT = ("口径：按终态任务/记录计数，不是模型调用、metric 或生成卡片数；同一用户可有多次尝试。"
+               "受影响/零成功为运维分类人数，零成功仅指当日无完成，不证明卡死。"
+               "运维失败率=运维失败/(扣除声明跳过的完成+运维失败)，排除控制结果、账号不可用和 superseded；"
+               "分类缺失时沿用保守告警口径，不代表已证实失败。")
 
 
 def evaluate_attention(report: dict) -> list[str]:
@@ -208,8 +208,10 @@ def evaluate_attention(report: dict) -> list[str]:
             cur = report['cells'][f'{lane}/{route}']['day']
             prev = report['cells'][f'{lane}/{route}']['previous']
             where = f"{LANE_LABELS[lane].split()[0]} · {ROUTE_LABELS[route]}"
+            if cur.get('evidence_notes') or 'outcomes' not in cur:
+                reasons.append(f"{where}：结果分型缺少证据或计数异常，见明细")
             if cur['stuck_users'] >= STUCK_USERS_ATTENTION:
-                reasons.append(f"{where}：完全卡死 {cur['stuck_users']} 人"
+                reasons.append(f"{where}：有运维失败且零完成 {cur['stuck_users']} 人"
                                f"（有失败、零成功，阈值 {STUCK_USERS_ATTENTION}）")
             ours = cur['causes'][GROUP_OURS]
             if ours['users'] >= OUR_SIDE_USERS_ATTENTION:
@@ -219,10 +221,10 @@ def evaluate_attention(report: dict) -> list[str]:
             if rate is not None and cur['attempts'] >= MIN_ATTEMPTS_FOR_RATE:
                 prev_rate = prev['failure_rate']
                 if rate >= FAILURE_RATE_ATTENTION:
-                    reasons.append(f"{where}：失败率 {_pct(rate)}")
+                    reasons.append(f"{where}：运维失败率 {_pct(rate)}（分母 {cur['attempts']}）")
                 elif (prev_rate is not None and prev['attempts'] >= MIN_ATTEMPTS_FOR_RATE
                       and (rate - prev_rate) * 100 >= FAILURE_RATE_JUMP_PP):
-                    reasons.append(f"{where}：失败率 {_pct(rate)}，前一天 {_pct(prev_rate)}")
+                    reasons.append(f"{where}：运维失败率 {_pct(rate)}，前一天 {_pct(prev_rate)}")
             if (prev['active_users'] >= ACTIVE_DROP_MIN_PREVIOUS and not cur['partial']
                     and cur['active_users'] < prev['active_users'] * ACTIVE_DROP_RATIO):
                 reasons.append(f"{where}：活跃用户 {cur['active_users']} 人，"
@@ -237,9 +239,9 @@ def evaluate_attention(report: dict) -> list[str]:
     return reasons
 
 
-def _top_codes(codes: Mapping[str, int]) -> str:
+def _all_codes(codes: Mapping[str, int]) -> str:
     return "、".join(f"{code} {n}" for code, n in
-                    sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))[:2])
+                    sorted(codes.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _cause_line(stats: dict) -> str:
@@ -249,20 +251,7 @@ def _cause_line(stats: dict) -> str:
         if not cause['attempts']:
             continue
         parts.append(f"{GROUP_LABELS[group]} {cause['attempts']} 次/{cause['users']} 人"
-                     f"（{_top_codes(cause['codes'])}）")
-    return "；".join(parts)
-
-
-def _not_counted_line(stats: dict) -> str:
-    parts = []
-    if stats['user_unavailable']:
-        parts.append(f"确认是用户自己账号问题 {stats['user_unavailable']} 次/"
-                     f"{stats['user_unavailable_users']} 人"
-                     f"（{_top_codes(stats['user_unavailable_codes'])}）")
-    if stats['control']:
-        parts.append(f"跳过/关闭等控制结果 {stats['control']} 次")
-    if stats['skipped']:
-        parts.append(f"花园太小跳过 {stats['skipped']} 次")
+                     f"（{_all_codes(cause['codes'])}）")
     return "；".join(parts)
 
 
@@ -272,6 +261,11 @@ def render_message(report: dict) -> str:
     lines = []
     head = "[需要关注]" if attention else "[正常]"
     lines.append(f"{head} 记忆管线日报 {report['day']}（北京时间）")
+    next_day = (date.fromisoformat(report['day']) + timedelta(days=1)).isoformat()
+    lines.append(f"窗口：[{report['day']} 00:00, {next_day} 00:00) Asia/Shanghai；按终态时刻")
+    lines.append("来源：V2 agent_jobs；V1 user_logs（终态时间缺失/无效回退记录时间）。"
+                 "不含非终态与未覆盖记录，不与可变 metric/trace 相加；V1非成功原列包含 skipped。")
+    lines.append("原因范围：非成功码未关联具体终态；completed 内跳过的原因未提供，不推断为花园太小。")
     if attention:
         lines.extend(f"- {reason}" for reason in attention)
     for lane in LANES:
@@ -280,21 +274,48 @@ def render_message(report: dict) -> str:
         for route in ROUTES:
             cur = report['cells'][f'{lane}/{route}']['day']
             prev = report['cells'][f'{lane}/{route}']['previous']
-            if not cur['active_users'] and not prev['active_users']:
-                lines.append(f"  {ROUTE_LABELS[route]}：当天没有任务")
-                continue
-            lines.append(f"  {ROUTE_LABELS[route]}：活跃 {cur['active_users']} 人｜"
-                         f"成功 {cur['completed']}｜失败 {cur['operational']}"
-                         f"（{_pct(cur['failure_rate'])}，前一天 {_pct(prev['failure_rate'])}）｜"
-                         f"受影响 {_users(cur, 'failed_users')} 人"
-                         f"（前一天 {_users(prev, 'failed_users')}）｜"
+            outcomes = cur.get("outcomes")
+            lines.append(f"  {ROUTE_LABELS[route]}：观测用户 {cur['active_users']} 人")
+            if outcomes is None:
+                lines.append("    结果明细未知：旧版汇总未提供互斥终态，不能还原失败/过期/跳过")
+                lines.append(f"    旧口径扣除声明跳过的完成 {cur['completed']}｜声明跳过 {cur['skipped']}｜"
+                             f"非成功合计 {cur['failed_raw']}")
+            else:
+                labels = (("processed", "处理完成（不证明生成）"), ("skipped", "跳过（未生成）"),
+                          ("failed", "失败终态"), ("expired", "过期"),
+                          ("superseded", "被替代"), ("unknown_completed", "完成语义未知"),
+                          ("unknown_non_success", "失败/跳过未分型"))
+                lines.append("    互斥结果：" + "｜".join(
+                    f"{label} {outcomes[key]}" for key, label in labels)
+                    + f"｜合计 {cur['observed_total']}")
+                codes = _all_codes(cur.get('reason_codes', {}))
+                lines.append("    非成功原因码（完整；与结果同批，不另加总）：" + (codes or "无记录"))
+                if cur.get('evidence_notes'):
+                    notes = {
+                        "v1_status_split_unmeasured": "V1终态分类未测量或不守恒",
+                        "resident_dream_silence_ambiguous": "Resident Dream声明沉默不能证明处理或跳过",
+                        "completion_skip_split_unmeasured": "完成/跳过拆分未测量或不一致",
+                        "reason_counts_exceed_non_success": "原因码次数超过非成功总数",
+                    }
+                    lines.append("    证据限制：" + "、".join(
+                        notes.get(note, "未知证据限制") for note in cur['evidence_notes']))
+            lines.append(f"    运维分类（与上方结果重叠）：运维失败 {cur['operational']}｜"
+                         f"控制结果 {cur['control']}｜账号不可用 {cur['user_unavailable']}；"
+                         f"运维失败率 {_pct(cur['failure_rate'])}（分母 {cur['attempts']}，"
+                         f"前一天 {_pct(prev['failure_rate'])}）")
+            lines.append(f"    受影响 {_users(cur, 'failed_users')} 人（前一天 {_users(prev, 'failed_users')}）｜"
                          f"零成功 {cur['stuck_users']} 人（前一天 {prev['stuck_users']}）")
             causes = _cause_line(cur)
             if causes:
-                lines.append(f"    失败原因：{causes}")
-            not_counted = _not_counted_line(cur)
-            if not_counted:
-                lines.append(f"    不算失败：{not_counted}")
+                lines.append(f"    运维原因分组：{causes}")
+            if cur['user_unavailable']:
+                lines.append("    账号不可用排除码（完整）：" + _all_codes(cur['user_unavailable_codes']))
+            cov = (report.get('coverage', {}).get(lane, {}).get(route) or {})
+            lines.append(f"    覆盖：起点 {cov.get('backfill_from') or '未知'}，"
+                         f"完整起点 {cov.get('partial_before') or '未知'}，"
+                         f"冻结至 {cov.get('through_day') or '未知'}；"
+                         f"跳过拆分水位 {cov.get('voice_from') or '未知'}，"
+                         f"V1分类水位 {cov.get('outcomes_from') or '未知'}")
     stuck = [f"{LANE_LABELS[lane].split()[0]} {report['live_stuck'][lane]}"
              for lane in LANES if report['live_stuck'].get(lane) is not None]
     if stuck:

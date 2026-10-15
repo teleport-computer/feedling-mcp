@@ -54,8 +54,8 @@ def _stuck_rows(n, code="lease_timeout"):
 def test_stuck_users_threshold_boundary():
     below = _report(_stuck_rows(report_tool.STUCK_USERS_ATTENTION - 1))
     at = _report(_stuck_rows(report_tool.STUCK_USERS_ATTENTION))
-    assert not any("完全卡死" in r for r in report_tool.evaluate_attention(below))
-    assert any("完全卡死 10 人" in r for r in report_tool.evaluate_attention(at))
+    assert not any("有运维失败且零完成" in r for r in report_tool.evaluate_attention(below))
+    assert any("有运维失败且零完成 10 人" in r for r in report_tool.evaluate_attention(at))
 
 
 def test_our_side_users_threshold_boundary():
@@ -117,7 +117,7 @@ def test_quiet_healthy_day_is_marked_normal():
     rows = [_row(f"usr_{i:016x}", completed=5) for i in range(3)]
     text = report_tool.render_message(_report(rows))
     assert text.splitlines()[0].startswith("[正常]")
-    assert "V1 resident：当天没有任务" in text
+    assert "V1 resident：观测用户 0 人" in text
 
 
 def test_each_route_line_shows_affected_and_zero_success_users():
@@ -125,8 +125,8 @@ def test_each_route_line_shows_affected_and_zero_success_users():
             _row("usr_b", failed=1, completed=2, codes={"lease_timeout": 1}),
             _row("usr_c", completed=3)]
     text = report_tool.render_message(_report(rows))
-    line = next(l for l in text.splitlines() if l.strip().startswith("V2 model_api：活跃"))
-    assert "失败 5（" in line
+    line = text
+    assert "失败终态 5｜过期 0" in line
     assert "受影响 2 人（前一天 0）｜零成功 1 人（前一天 0）" in line
 
 
@@ -137,7 +137,7 @@ def test_rate_caveat_is_printed_once_on_every_message():
     busy = report_tool.render_message(_report(_stuck_rows(3)))
     for text in (quiet, busy):
         assert text.count(report_tool.RATE_CAVEAT) == 1
-    assert "2026-09-16" in report_tool.RATE_CAVEAT
+    assert "同一用户可有多次尝试" in report_tool.RATE_CAVEAT
     assert "受影响" in report_tool.RATE_CAVEAT and "零成功" in report_tool.RATE_CAVEAT
 
 
@@ -149,7 +149,7 @@ def test_backend_without_failed_users_renders_dash_not_zero():
         for side in ("day", "previous"):
             cell[side].pop("failed_users")
     text = report_tool.render_message(report)
-    line = next(l for l in text.splitlines() if l.strip().startswith("V2 model_api：活跃"))
+    line = text
     assert "受影响 - 人（前一天 -）｜零成功 2 人（前一天 0）" in line
 
 
@@ -499,7 +499,7 @@ def test_thresholds_keep_defaults_and_follow_env_overrides(monkeypatch):
         assert report_tool.LIVE_STUCK_JOBS_ATTENTION == 20
         assert report_tool.OUR_SIDE_USERS_ATTENTION == 5
         # The override reaches the rule, not just the constant.
-        assert any("完全卡死 3 人" in r for r in report_tool.evaluate_attention(_report(_stuck_rows(3))))
+        assert any("有运维失败且零完成 3 人" in r for r in report_tool.evaluate_attention(_report(_stuck_rows(3))))
 
         # nan compares False with everything (the rule would silently never
         # fire) and inf is just as unreachable: both keep the default.
