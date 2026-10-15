@@ -145,6 +145,9 @@ class LaneRouteStats:
     user_unavailable_users: set = field(default_factory=set)
     user_unavailable_codes: Counter = field(default_factory=Counter)
     skipped: int = 0
+    outcomes: Counter = field(default_factory=Counter)
+    reason_codes: Counter = field(default_factory=Counter)
+    evidence_notes: set = field(default_factory=set)
     #: Users with at least one operational failure that day (受影响). A user
     #: whose night retried several times (dream: up to 4x since 2026-09-16)
     #: adds 4 to ``operational`` but 1 here — repeated failures never count a
@@ -183,7 +186,8 @@ def _add_cause(stats: LaneRouteStats, group: str, uid: str, code: str, n: int) -
 
 
 def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
-                  day: str, v1_outcomes_measured: bool = True) -> LaneRouteStats:
+                  day: str, v1_outcomes_measured: bool = True,
+                  skips_measured: bool = True) -> LaneRouteStats:
     """Fold lane-rollup rows of one (lane, route, day) into counts.
 
     Per row, terminal non-successes (``failed`` + ``expired``; ``superseded`` is
@@ -218,7 +222,8 @@ def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
         uid = str(row.get("user_id") or "")
         completed_raw = _int(row.get("completed"))
         failed = _int(row.get("failed")) + _int(row.get("expired"))
-        if not completed_raw and not failed:
+        superseded = _int(row.get("superseded"))
+        if not completed_raw and not failed and not superseded:
             continue
         frozen = row.get("frozen") is not False
         if not frozen:
@@ -256,6 +261,53 @@ def aggregate_day(rows: Iterable[Mapping[str, Any]], *, lane: str, route: str,
                 # them (a row frozen before a code joined the set) stay put.
                 user_codes = {}
             remaining = {c: n for c, n in codes.items() if c not in user_codes}
+
+        # A parallel, conserved result axis. Never add the operational split
+        # to these buckets: it describes the same non-success records.
+        result = stats.outcomes
+        result["superseded"] += superseded
+        result["expired"] += _int(row.get("expired"))
+        if route == "resident":
+            # The V1 producer's control class is exactly status=skipped.
+            # Old/unfrozen cells lose that status distinction; don't call
+            # their entire failed/error/skipped aggregate a failure.
+            declared = _int(row.get("silent_declared"))
+            if skip_lane:
+                # V1's voice selector measures completed+wake_result=sleep,
+                # not Dream's status=skipped. Current Dream producers do not
+                # write sleep; historical silence cannot prove a Dream run or
+                # a no-generation skip. Keep it unknown, apart from controls.
+                if (completed_raw and not skips_measured) or declared > completed_raw:
+                    result["unknown_completed"] += completed_raw
+                    stats.evidence_notes.add("completion_skip_split_unmeasured")
+                else:
+                    result["processed"] += completed_raw - declared
+                    result["unknown_completed"] += declared
+                    if declared:
+                        stats.evidence_notes.add("resident_dream_silence_ambiguous")
+            else:
+                result["processed"] += completed_raw
+            if measured and control <= _int(row.get("failed")):
+                result["skipped"] += control
+                result["failed"] += _int(row.get("failed")) - control
+            else:
+                result["unknown_non_success"] += _int(row.get("failed"))
+                if failed:
+                    stats.evidence_notes.add("v1_status_split_unmeasured")
+        else:
+            result["failed"] += _int(row.get("failed"))
+            declared = _int(row.get("silent_declared"))
+            if skip_lane and ((completed_raw and not skips_measured) or declared > completed_raw):
+                result["unknown_completed"] += completed_raw
+                stats.evidence_notes.add("completion_skip_split_unmeasured")
+            else:
+                result["processed"] += completed
+                result["skipped"] += skipped
+        stats.reason_codes.update(codes)
+        if sum(codes.values()) < failed:
+            stats.reason_codes["no_code"] += failed - sum(codes.values())
+        elif sum(codes.values()) > failed:
+            stats.evidence_notes.add("reason_counts_exceed_non_success")
 
         stats.operational += operational
         stats.control += control
@@ -314,6 +366,12 @@ def serialize_stats(stats: LaneRouteStats) -> dict:
         "completed", "failed_raw", "operational", "control", "user_unavailable",
         "skipped", "failed_users", "stuck_users", "partial", "unclassified",
         "attempts", "failure_rate")}
+    result["outcomes"] = {key: stats.outcomes[key] for key in (
+        "processed", "skipped", "failed", "expired", "superseded",
+        "unknown_completed", "unknown_non_success")}
+    result["observed_total"] = sum(stats.outcomes.values())
+    result["reason_codes"] = dict(stats.reason_codes)
+    result["evidence_notes"] = sorted(stats.evidence_notes)
     result["active_users"] = len(stats.users)
     result["user_unavailable_users"] = len(stats.user_unavailable_users)
     result["user_unavailable_codes"] = dict(stats.user_unavailable_codes)
@@ -351,13 +409,18 @@ def build_summary(sources: Mapping[str, Any], *, day: str) -> dict:
         all_coverage[lane] = coverage
         outcomes_from = str((coverage.get("resident") or {}).get("outcomes_from") or "")
         for route in ROUTES:
+            voice_from = str((coverage.get(route) or {}).get("voice_from") or "")
             cur = aggregate_day(rows, lane=lane, route=route, day=day,
-                                v1_outcomes_measured=bool(outcomes_from) and outcomes_from <= day)
+                                v1_outcomes_measured=bool(outcomes_from) and outcomes_from <= day,
+                                skips_measured=bool(voice_from) and voice_from <= day)
             prev = aggregate_day(rows, lane=lane, route=route, day=previous_day,
                                  v1_outcomes_measured=(bool(outcomes_from)
-                                                       and outcomes_from <= previous_day))
+                                                       and outcomes_from <= previous_day),
+                                 skips_measured=bool(voice_from) and voice_from <= previous_day)
             through = str((coverage.get(route) or {}).get("through_day") or "")
-            if not through or through < day:
+            start = str((coverage.get(route) or {}).get("partial_before")
+                        or (coverage.get(route) or {}).get("backfill_from") or "")
+            if not through or through < day or not start or day < start:
                 cur.partial = True
             today[(lane, route)] = cur
             previous[(lane, route)] = prev

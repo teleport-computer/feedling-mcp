@@ -9,13 +9,36 @@
         "operational": 14,
         "control": 9,
         "user_unavailable": 24,
+        "skipped": 0,
+        "failed_users": 5,
+        "stuck_users": 2,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 153,
+        "failure_rate": 0.0915032679738562,
+        "outcomes": {
+          "processed": 139,
+          "skipped": 9,
+          "failed": 38,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 186,
+        "reason_codes": {
+          "capture_agent_call_failed:quota_insufficient": 24,
+          "capture_agent_call_failed:resident_agent_cli_logged_out": 8,
+          "capture_memory_actions_failed": 3,
+          "runtime_failed": 3,
+          "capture_window_unavailable": 9
+        },
+        "evidence_notes": [],
+        "active_users": 26,
         "user_unavailable_users": 4,
         "user_unavailable_codes": {
           "capture_agent_call_failed:quota_insufficient": 24
         },
-        "skipped": 0,
-        "failed_users": 5,
-        "stuck_users": 2,
         "causes": {
           "user_account": {
             "attempts": 8,
@@ -43,12 +66,7 @@
               "runtime_failed": 3
             }
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 26,
-        "attempts": 153,
-        "failure_rate": 0.0915032679738562
+        }
       },
       "previous": {
         "completed": 150,
@@ -56,13 +74,32 @@
         "operational": 0,
         "control": 0,
         "user_unavailable": 20,
+        "skipped": 0,
+        "failed_users": 0,
+        "stuck_users": 0,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 150,
+        "failure_rate": 0.0,
+        "outcomes": {
+          "processed": 150,
+          "skipped": 0,
+          "failed": 20,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 170,
+        "reason_codes": {
+          "capture_agent_call_failed:quota_insufficient": 20
+        },
+        "evidence_notes": [],
+        "active_users": 23,
         "user_unavailable_users": 4,
         "user_unavailable_codes": {
           "capture_agent_call_failed:quota_insufficient": 20
         },
-        "skipped": 0,
-        "failed_users": 0,
-        "stuck_users": 0,
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -84,12 +121,7 @@
             "users": 0,
             "codes": {}
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 23,
-        "attempts": 150,
-        "failure_rate": 0.0
+        }
       }
     },
     "capture/model_api": {
@@ -99,13 +131,38 @@
         "operational": 72,
         "control": 10,
         "user_unavailable": 24,
+        "skipped": 0,
+        "failed_users": 14,
+        "stuck_users": 8,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 244,
+        "failure_rate": 0.29508196721311475,
+        "outcomes": {
+          "processed": 172,
+          "skipped": 0,
+          "failed": 100,
+          "expired": 6,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 278,
+        "reason_codes": {
+          "extraction_failed:json_decode_error": 24,
+          "lease_timeout": 24,
+          "extraction_failed:auth_invalid": 24,
+          "extraction_failed:upstream_unavailable": 12,
+          "extraction_failed:rate_limited": 6,
+          "no_code": 6,
+          "capture_disabled": 10
+        },
+        "evidence_notes": [],
+        "active_users": 35,
         "user_unavailable_users": 4,
         "user_unavailable_codes": {
           "extraction_failed:auth_invalid": 24
         },
-        "skipped": 0,
-        "failed_users": 14,
-        "stuck_users": 8,
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -135,12 +192,7 @@
               "no_code": 6
             }
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 35,
-        "attempts": 244,
-        "failure_rate": 0.29508196721311475
+        }
       },
       "previous": {
         "completed": 234,
@@ -148,13 +200,34 @@
         "operational": 8,
         "control": 0,
         "user_unavailable": 4,
+        "skipped": 0,
+        "failed_users": 8,
+        "stuck_users": 0,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 242,
+        "failure_rate": 0.03305785123966942,
+        "outcomes": {
+          "processed": 234,
+          "skipped": 0,
+          "failed": 12,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 246,
+        "reason_codes": {
+          "extraction_failed:json_decode_error": 4,
+          "lease_timeout": 4,
+          "extraction_failed:auth_invalid": 4
+        },
+        "evidence_notes": [],
+        "active_users": 30,
         "user_unavailable_users": 4,
         "user_unavailable_codes": {
           "extraction_failed:auth_invalid": 4
         },
-        "skipped": 0,
-        "failed_users": 8,
-        "stuck_users": 0,
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -179,12 +252,7 @@
             "users": 0,
             "codes": {}
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 30,
-        "attempts": 242,
-        "failure_rate": 0.03305785123966942
+        }
       }
     },
     "dream/resident": {
@@ -194,13 +262,32 @@
         "operational": 0,
         "control": 0,
         "user_unavailable": 2,
+        "skipped": 0,
+        "failed_users": 0,
+        "stuck_users": 0,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 6,
+        "failure_rate": 0.0,
+        "outcomes": {
+          "processed": 6,
+          "skipped": 0,
+          "failed": 2,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 8,
+        "reason_codes": {
+          "dream_agent_call_failed:auth_invalid": 2
+        },
+        "evidence_notes": [],
+        "active_users": 8,
         "user_unavailable_users": 2,
         "user_unavailable_codes": {
           "dream_agent_call_failed:auth_invalid": 2
         },
-        "skipped": 0,
-        "failed_users": 0,
-        "stuck_users": 0,
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -222,12 +309,7 @@
             "users": 0,
             "codes": {}
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 8,
-        "attempts": 6,
-        "failure_rate": 0.0
+        }
       },
       "previous": {
         "completed": 6,
@@ -235,13 +317,32 @@
         "operational": 0,
         "control": 0,
         "user_unavailable": 2,
+        "skipped": 0,
+        "failed_users": 0,
+        "stuck_users": 0,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 6,
+        "failure_rate": 0.0,
+        "outcomes": {
+          "processed": 6,
+          "skipped": 0,
+          "failed": 2,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 8,
+        "reason_codes": {
+          "dream_agent_call_failed:auth_invalid": 2
+        },
+        "evidence_notes": [],
+        "active_users": 8,
         "user_unavailable_users": 2,
         "user_unavailable_codes": {
           "dream_agent_call_failed:auth_invalid": 2
         },
-        "skipped": 0,
-        "failed_users": 0,
-        "stuck_users": 0,
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -263,12 +364,7 @@
             "users": 0,
             "codes": {}
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 8,
-        "attempts": 6,
-        "failure_rate": 0.0
+        }
       }
     },
     "dream/model_api": {
@@ -278,13 +374,32 @@
         "operational": 0,
         "control": 0,
         "user_unavailable": 3,
+        "skipped": 8,
+        "failed_users": 0,
+        "stuck_users": 0,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 3,
+        "failure_rate": 0.0,
+        "outcomes": {
+          "processed": 3,
+          "skipped": 8,
+          "failed": 3,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 14,
+        "reason_codes": {
+          "provider_setup:model_api_not_tested": 3
+        },
+        "evidence_notes": [],
+        "active_users": 14,
         "user_unavailable_users": 3,
         "user_unavailable_codes": {
           "provider_setup:model_api_not_tested": 3
         },
-        "skipped": 8,
-        "failed_users": 0,
-        "stuck_users": 0,
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -306,12 +421,7 @@
             "users": 0,
             "codes": {}
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 14,
-        "attempts": 3,
-        "failure_rate": 0.0
+        }
       },
       "previous": {
         "completed": 14,
@@ -319,11 +429,28 @@
         "operational": 0,
         "control": 0,
         "user_unavailable": 0,
-        "user_unavailable_users": 0,
-        "user_unavailable_codes": {},
         "skipped": 0,
         "failed_users": 0,
         "stuck_users": 0,
+        "partial": false,
+        "unclassified": false,
+        "attempts": 14,
+        "failure_rate": 0.0,
+        "outcomes": {
+          "processed": 14,
+          "skipped": 0,
+          "failed": 0,
+          "expired": 0,
+          "superseded": 0,
+          "unknown_completed": 0,
+          "unknown_non_success": 0
+        },
+        "observed_total": 14,
+        "reason_codes": {},
+        "evidence_notes": [],
+        "active_users": 14,
+        "user_unavailable_users": 0,
+        "user_unavailable_codes": {},
         "causes": {
           "user_account": {
             "attempts": 0,
@@ -345,12 +472,7 @@
             "users": 0,
             "codes": {}
           }
-        },
-        "partial": false,
-        "unclassified": false,
-        "active_users": 14,
-        "attempts": 14,
-        "failure_rate": 0.0
+        }
       }
     }
   },
