@@ -1,8 +1,4 @@
-"""Bounded old/new read-error comparison. Captures intent, never writes a card.
-
-The legacy Genesis re-init residual is deliberately observable here. Equal
-behavior is not an assertion that re-init after a read failure is safe.
-"""
+"""Read-error consumers preserve identity; T817 historical residual is now fixed."""
 import json
 from types import SimpleNamespace
 
@@ -47,13 +43,14 @@ def error_chain(monkeypatch):
     auth.reset_cache()
 
 
-def test_genesis_legacy_residual_old_and_new_intent_equal(monkeypatch, error_chain, capsys):
+def test_genesis_old_and_new_read_failures_both_preserve_identity(monkeypatch, error_chain, capsys):
     mode, calls, observed = error_chain
     store = SimpleNamespace(user_id='usr_comparison')
     stored = {'id': 'identity_fixture', 'v': 1, 'owner_user_id': store.user_id,
               'body_ct': 'sealed', 'visibility': 'shared', 'created_at': 'fixed',
               'relationship_anchor_source': genesis.GENESIS_SOURCE}
     monkeypatch.setattr(service, '_load_identity', lambda store: dict(stored))
+    monkeypatch.setattr(genesis.db, 'get_blob_strict', lambda uid, kind: dict(stored))
     intents = []
     def build(store, raw, **kw):
         intents.append(('build', json.loads(raw)))
@@ -84,14 +81,9 @@ def test_genesis_legacy_residual_old_and_new_intent_equal(monkeypatch, error_cha
             outcomes.append({'backend_status': status, 'source': source, 'normalized': error,
                              'enclave_status': observed[-1][0], 'result': result, 'intents': list(intents)})
         assert pair[0] == pair[1]
-        if source == genesis.GENESIS_SOURCE:
-            assert pair[0][0] == 'updated'
-            assert [kind for kind, _ in pair[0][1]] == ['build', 'write']
-            assert pair[0][1][1][1]['self_introduction'] == ''  # existing residual, NOT safe
-        else:
-            assert pair == [('already_initialized', []), ('already_initialized', [])]
+        assert pair == [('identity_plain_unavailable', []), ('identity_plain_unavailable', [])]
     with capsys.disabled():
-        print('LEGACY_GENESIS_RESIDUAL_OBSERVATION=' + json.dumps(outcomes, ensure_ascii=False))
+        print('GENESIS_READ_FAILURE_PRESERVATION=' + json.dumps(outcomes, ensure_ascii=False))
     assert set(calls) == {'/v1/users/whoami', '/v1/identity/get'}
 
 
@@ -102,6 +94,7 @@ def test_safe_update_consumers_stop_before_build(monkeypatch, error_chain, statu
     store = SimpleNamespace(user_id='usr_comparison')
     stored = {'id': 'fixture', 'owner_user_id': store.user_id, 'body_ct': 'sealed', 'visibility': 'shared'}
     monkeypatch.setattr(service, '_load_identity', lambda store: dict(stored))
+    monkeypatch.setattr(genesis.db, 'get_blob_strict', lambda uid, kind: dict(stored))
     def forbidden(*a, **kw):
         raise AssertionError('read failure must not build or save')
     monkeypatch.setattr(genesis.core_envelope, '_build_shared_envelope_for_store', forbidden)

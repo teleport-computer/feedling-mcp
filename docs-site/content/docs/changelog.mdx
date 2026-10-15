@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Genesis identity initialization preserves existing cards when storage or
+  decryption reads fail, and refuses stale writes that lose a concurrent
+  creation or update. Successful first initialization remains supported.
+
 - Resident consumers now reject unrecognized HTTP success responses without a
   valid JSON reply ID receipt. Recognized terminal voice dispositions settle
   without counting a posted reply or success. Unconfirmed foreground writes
