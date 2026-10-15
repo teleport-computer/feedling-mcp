@@ -12848,6 +12848,19 @@ async def _run_extraction(
     """
     extraction_status_recorded = False
     extraction_failure_detail: dict[str, Any] = {}
+    provider_failure_snapshot: dict[str, Any] | None = None
+    returned_provider_error: RuntimeError | None = None
+
+    def _observe_provider_failure(exc: BaseException, code: str) -> None:
+        nonlocal provider_failure_snapshot
+        # Pure, bounded projection only: no emitter/store lookup or retained
+        # exception. The existing turn_exception event owns any later I/O.
+        provider_failure_snapshot = failure_provenance.build_detail(
+            exc, stage="extraction_provider", lane=lane,
+            code=f"extraction_failed:{code}", error_class=code,
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
+
     capture_window: dict[str, Any] = {}
     dream_started = time.monotonic()
     dream_counts: dict[str, int] = {}
@@ -13480,6 +13493,7 @@ async def _run_extraction(
                         v2_extraction.CAPTURE_TRUNCATION_MAX_ATTEMPTS
                     ),
                     failure_detail_out=extraction_failure_detail.update,
+                    provider_failure_observer=_observe_provider_failure,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -13640,6 +13654,7 @@ async def _run_extraction(
                     v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
                 ),
                 failure_detail_out=extraction_failure_detail.update,
+                provider_failure_observer=_observe_provider_failure,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
@@ -13718,7 +13733,16 @@ async def _run_extraction(
                     degraded_context=dream_degraded_context,
                     counts=dream_counts,
                 )
-            raise RuntimeError(reason)
+            failure = RuntimeError(reason)
+            if (
+                provider_failure_snapshot is not None
+                and v2_extraction.provider_failure_code_from_reason(reason) is not None
+                and provider_failure_snapshot["error_code"] == _extraction_failure_code(failure)
+            ):
+                # Bind the exact exception raised for this returned reason.
+                # A health/usage/lifecycle error with the same code is different.
+                returned_provider_error = failure
+            raise failure
         if lane == "dream":
             dream_model_active = False
             await _emit_v2_dream_lifecycle(
@@ -14124,6 +14148,8 @@ async def _run_extraction(
             "error_code": code,
         }
         failure_payload.update(extraction_failure_detail)
+        if e is returned_provider_error and provider_failure_snapshot is not None:
+            failure_payload["provider_failure"] = provider_failure_snapshot
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",

@@ -922,6 +922,22 @@ not a terminal job outcome. Missing events do not prove success. Use durable
 job outcomes for completion rates; this event neither backfills historical
 failures nor changes public errors, retry policy, or model calls.
 
+Capture and Dream attach a separate `provider_failure` object to their existing
+restricted `turn_exception` trajectory when a provider exception becomes the
+returned extraction failure. The object retains only the same closed exception
+families, immediate explicit cause, and valid provider HTTP status. It is bound
+to the exact exception raised for that returned failure; a later health or usage
+error with the same error code does not inherit it. Provider messages, payloads,
+and implicit exception context are excluded.
+
+This adds no trace event or storage lookup. Existing trajectory access controls,
+encryption, enablement, and best-effort delivery still apply. Refusal, output
+truncation, recoverable output-budget fallback, and Dream's shared deadline keep
+their existing diagnostics. `observation_only` does not prove a durable failure
+transition or an upstream root cause, and a missing object is not proof that no
+local exception occurred. This does not backfill old failures or change requests,
+retries, budgets, public errors, or memory-write behavior.
+
 ## Minimum security checklist
 
 - Run containers as non-root and keep the Docker socket out of application
