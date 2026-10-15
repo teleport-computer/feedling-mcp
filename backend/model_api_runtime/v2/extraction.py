@@ -280,6 +280,7 @@ async def extract(
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
     failure_detail_out: Callable[[dict], None] | None = None,
+    provider_failure_observer: Callable[[BaseException, str], None] | None = None,
     refusal_out: Callable[[dict], Awaitable[None]] | None = None,
     parse_retry: ParseRetry | None = None,
     session: Any = None,
@@ -427,6 +428,18 @@ async def extract(
             error_code = (
                 _OUTPUT_BUDGET_REJECTED if budget_rejected else _provider_failure_code(e)
             )
+            # Project the original exception before returning a reason string.
+            # Observation is synchronous and optional; it cannot change retries,
+            # replace the failure, or retain the exception in an I/O queue.
+            if (
+                provider_failure_observer is not None
+                and not budget_rejected
+                and error_code != "content_filtered"
+            ):
+                try:
+                    provider_failure_observer(e, error_code)
+                except Exception:
+                    pass
             if trajectory_out is not None:
                 await trajectory_out(
                     "provider_error",
