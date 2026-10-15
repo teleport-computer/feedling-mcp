@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Test enclave attestation metadata now explicitly declares the test AppAuth
+  contract and compose path. Unavailable image digests and deployment
+  transactions are null instead of development placeholders or historical
+  transaction data. These declarations do not prove effective KMS policy.
+
 - Hosted Resident startup now revalidates configuration under the same per-user
   lock as Model API deletion. Stale discovery results cannot start a consumer
   after deletion; already admitted consumers retain ownership until their owner

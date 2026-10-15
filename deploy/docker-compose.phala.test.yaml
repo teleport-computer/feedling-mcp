@@ -153,6 +153,14 @@ services:
     restart: unless-stopped
     environment:
       <<: &enclave-environment
+        # Declared test metadata; NOT proof of effective platform KMS policy.
+        # Both enclave listeners inherit these literals. Unavailable digest and
+        # deployment transaction remain null in the attestation response.
+        FEEDLING_APP_AUTH_CONTRACT: "0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5"
+        FEEDLING_APP_AUTH_CHAIN_ID: "11155111"
+        FEEDLING_APP_AUTH_DEPLOY_TX: ""
+        FEEDLING_IMAGE_DIGEST: ""
+        FEEDLING_COMPOSE_YAML_URL: "https://github.com/teleport-computer/feedling-mcp/raw/test/deploy/docker-compose.phala.test.yaml"
         FEEDLING_DATA_DIR: "/data"
         FEEDLING_FLASK_URL: "http://backend:5001"
         # Stage-D runtime token secret — lets the enclave verify a caller's runtime

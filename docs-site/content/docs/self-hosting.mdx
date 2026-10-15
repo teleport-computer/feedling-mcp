@@ -1007,3 +1007,26 @@ whole recall result unavailable; an ownership, authorization, required-content
 or unknown shared-read failure stops the turn. See the [memory workflow](./workflows/memory)
 for fixed-frontier, unavailable-count and deadline behavior. Whoami public
 attestation metadata remains compatible and may still make network requests.
+
+### Attestation release and policy metadata
+
+`/attestation` includes declared `enclave_release` and `app_auth` metadata.
+These fields are configuration claims, not independent proof of the loaded
+image digest or the effective platform KMS/AppAuth binding. The quote's
+REPORT_DATA binds the content public key, TLS fingerprint and version; it does
+not directly bind these metadata fields. Verify platform policy separately.
+
+The test compose explicitly declares the test AppAuth contract on Sepolia
+(chain 11155111) for both enclave listeners. Its compose URL names the mutable
+`test` branch for navigation; it is not an immutable release proof. Use the
+measured compose hash and recorded release/pin evidence for that purpose.
+Missing or malformed `enclave_release.image_digest` and `app_auth.deploy_tx`
+are JSON `null`, including empty values and development placeholders. Consumers
+must handle null and must not create a transaction link without a transaction.
+A configured digest or transaction remains a declaration, not verification.
+
+The existing deployment attestation gate compares the content public key with
+its baseline. The canary compares that key with the backend advertisement and
+checks an encrypt/decrypt round trip. Neither verifies AppAuth contract/chain,
+image digest, compose URL, or DCAP quote validity. A successful gate or canary
+must not be presented as complete policy verification.
