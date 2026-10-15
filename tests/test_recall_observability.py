@@ -151,6 +151,33 @@ def test_other_pool_rows_do_not_repeat_the_sample(monkeypatch):
     assert "memory" not in state and "query_encoder" not in state and "embedding_model" not in state
 
 
+@pytest.mark.parametrize("pool", ["foreground", "wake", "heavy"])
+def test_failed_drain_reading_preserves_heartbeat_but_cannot_prove_cleanup(monkeypatch, pool):
+    from tools.release_window import drain
+
+    def broken_witness():
+        raise RuntimeError("private details must not enter heartbeat")
+
+    fleet = _Fleet([os.getpid()])
+    for key in fleet.keys():
+        key.pool = pool
+        fleet.supervisor(key).drain_witness = broken_witness
+    state = _one_heartbeat(monkeypatch, fleet, pool=pool)
+    assert state["slots"]["configured"] == 1
+    assert state["drain"] == {
+        "parent_generation": state["drain"]["parent_generation"],
+        "unavailable": "RuntimeError",
+    }
+    scope = {"parent_generation": state["drain"]["parent_generation"],
+             "worker_ids": {p: "w1:" + p for p in drain.POOLS},
+             "pool_slots": {p: 1 for p in drain.POOLS}}
+    metrics = {"worker_heartbeat_count": 3, "worker_heartbeats": [
+        {"worker_id": "w1:" + p, "pool": p, "kind": "turn", "age_sec": 0,
+         "beat_at_epoch": time.time(), "runtime_state": state} for p in drain.POOLS]}
+    with pytest.raises(RuntimeError, match="drain slots incomplete"):
+        drain.Proof(metrics, scope, time.time())
+
+
 def test_a_slow_procfs_read_never_stalls_the_loop_or_piles_up_threads(monkeypatch):
     """A blocked /proc read: other coroutines keep running, the foreground row is
     still written (memory marked timeout, then busy), only one reader thread

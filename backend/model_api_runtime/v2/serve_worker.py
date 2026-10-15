@@ -6198,11 +6198,19 @@ async def _fleet_heartbeat_loop(
                         "restarting": max(0, configured - capacity),
                     }
                 }
-                runtime_state['drain'] = {
-                    'parent_generation': _DRAIN_PARENT_GENERATION,
-                    'slots': [fleet.supervisor(key).drain_witness()
-                              for key in fleet.keys() if key.pool == pool],
-                }
+                try:
+                    runtime_state['drain'] = {
+                        'parent_generation': _DRAIN_PARENT_GENERATION,
+                        'slots': [fleet.supervisor(key).drain_witness()
+                                  for key in fleet.keys() if key.pool == pool],
+                    }
+                except Exception as exc:
+                    # An unavailable drain reading must fail cleanup proof,
+                    # without suppressing the rest of the fleet heartbeat.
+                    runtime_state['drain'] = {
+                        'parent_generation': _DRAIN_PARENT_GENERATION,
+                        'unavailable': type(exc).__name__,
+                    }
                 if pool == "foreground":
                     # T779 step 2c: memory and encoder state measured from the
                     # database (no shell access to the test machine).
