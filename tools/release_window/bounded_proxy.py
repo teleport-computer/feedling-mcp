@@ -8,6 +8,7 @@ confirmed billed request. Output limits are forwarded to the fixed provider.
 """
 import argparse
 import hmac
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -18,9 +19,11 @@ import time
 
 import httpx
 
-from tools.release_window.contract import validate_manifest, digest, cost_reservation, cost_ceiling
+from tools.release_window.contract import validate_manifest, digest, cost_reservation, cost_ceiling, count_cost_reservation
+from tools.release_window.receipts import verify_input_count
 
 UPSTREAM = "https://api.openai.com/v1/responses"
+COUNT_ENDPOINT = UPSTREAM + "/input_tokens"
 
 
 class Refused(Exception):
@@ -74,7 +77,7 @@ def payload(raw, limits):
         raise Refused("output_limit")
     # This acceptance slice proves text dialogues, not callable-tool execution.
     # Disable model-initiated function calls as well as rejecting hosted tools.
-    value.update(tool_choice='none', max_output_tokens=min(requested, limits["output_tokens_per_start"]), store=False, stream=False)
+    value.update(tool_choice='none', max_output_tokens=min(requested, limits["output_tokens_per_start"], 1024), store=False, stream=False)
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
     if len(encoded) > limits["request_bytes"]:
         raise Refused("input_bytes")
@@ -86,6 +89,7 @@ class Run:
         if len(token) < 32 or not upstream_key or token == upstream_key:
             raise ValueError("distinct fixture token and upstream key required")
         self.manifest = validate_manifest(manifest)
+        verify_input_count(self.manifest)
         self.limits = self.manifest["limits"] | {"model": self.manifest["model"]}
         self.manifest_digest = digest(self.manifest)
         self.phase = "setup"
@@ -96,6 +100,7 @@ class Run:
         self.deadline = clock() + self.limits["wall_seconds"]
         self.lock = threading.Lock()
         self.attempts = self.input_bytes = 0
+        self.count_requests = 0
         self.reserved_input_tokens = self.reserved_nanodollars = 0
         self.billing = self.manifest["billing"]
         self.stopped = False
@@ -172,6 +177,16 @@ class Run:
                     or (self.attempts + 1) * self.limits["output_tokens_per_start"] > self.limits["total_output_tokens"]):
                 self._fail('total_budget')
                 raise Refused("total_budget")
+            count = self._count(body)
+            if count > input_reservation:
+                self._fail('input_count_exceeds_ceiling')
+                raise Refused('input_count_exceeds_ceiling')
+            if self.closing.is_set() or self.clock() >= self.deadline:
+                self._fail('closed_or_deadline_after_count')
+                raise Refused('closed_or_deadline_after_count')
+            if self.reserved_nanodollars + money_reservation > cost_ceiling(self.billing):
+                self._fail('token_or_monetary_budget')
+                raise Refused('token_or_monetary_budget')
             self.attempts += 1
             self.phase_starts[self.phase] += 1
             self.input_bytes += len(body)
@@ -180,15 +195,22 @@ class Run:
             self.record({"event": "send_reserved", "attempt": self.attempts,
                          "phase": self.phase, "input_bytes": len(body), "total_input_bytes": self.input_bytes,
                          "input_tokens_reserved": input_reservation,
+                         "input_tokens_counted": count,
+                         "payload_sha256": hashlib.sha256(body).hexdigest(),
                          "total_input_tokens_reserved": self.reserved_input_tokens,
                          "output_tokens_reserved": self.limits['output_tokens_per_start'],
                          "nanodollars_reserved": money_reservation,
                          "total_nanodollars_reserved": self.reserved_nanodollars,
                          "billing_state": "RESERVED_NOT_SETTLED"})
+            try:
+                verify_input_count(self.manifest)
+            except Exception:
+                self._fail('input_count_authorization_changed')
+                raise Refused('input_count_authorization_changed') from None
             # Durable logging may block. Recheck immediately before dispatch;
             # an unsent reservation remains consumed, never recycled as zero.
             remaining = self.deadline - self.clock()
-            if remaining <= 0:
+            if remaining <= 0 or self.closing.is_set():
                 self._fail('deadline_after_reservation')
                 self.record({"event": "reserved_not_sent", "attempt": self.attempts,
                              "reason": "deadline", "usage": "UNKNOWN"})
@@ -241,6 +263,55 @@ class Run:
                              "provider_received": "UNKNOWN"})
                 raise Refused("upstream_failed_stopped") from None
 
+    def _count(self, body):
+        """Under the forwarding lock: reserve count request before network.
+
+        Send the entire final bytes, never a lossy input-only projection. An
+        endpoint rejecting any final field stops the run; no stripped retry.
+        """
+        try:
+            verify_input_count(self.manifest)
+            config = self.manifest['input_count']
+            fee = count_cost_reservation(self.manifest)
+            if (self.count_requests >= config['max_requests']
+                    or self.reserved_nanodollars + fee > cost_ceiling(self.billing)):
+                raise Refused('count_budget')
+            self.count_requests += 1
+            self.reserved_nanodollars += fee
+            self.record({'event':'count_reserved', 'count_request':self.count_requests,
+                'phase':self.phase, 'payload_sha256':hashlib.sha256(body).hexdigest(),
+                'input_bytes':len(body), 'nanodollars_reserved':fee})
+            # Durable reservation can block past authorization expiry or source
+            # revocation. Counting itself requires current authority at dispatch.
+            verify_input_count(self.manifest)
+            remaining = self.deadline - self.clock()
+            if remaining <= 0 or self.closing.is_set():
+                raise Refused('count_deadline_or_closed')
+            count_deadline = min(self.deadline, self.clock() + config['timeout_seconds'])
+            with self.client.stream('POST', COUNT_ENDPOINT, content=body,
+                    headers={'Authorization':'Bearer '+self.key, 'Content-Type':'application/json'},
+                    timeout=min(config['timeout_seconds'], remaining)) as response:
+                raw = bytearray()
+                for chunk in response.iter_bytes():
+                    raw.extend(chunk)
+                    if len(raw) > 4096 or self.clock() >= count_deadline:
+                        raise Refused('count_size_or_timeout')
+                if response.status_code != 200 or self.clock() >= count_deadline:
+                    raise Refused('count_http_or_timeout')
+                result = json.loads(raw)
+                if (not isinstance(result, dict) or result.get('object') != 'response.input_tokens'
+                        or type(result.get('input_tokens')) is not int or result['input_tokens'] < 0):
+                    raise Refused('count_unknown')
+                # Revalidate expiry/source evidence after a potentially slow exchange.
+                verify_input_count(self.manifest)
+                self.record({'event':'count_measured', 'count_request':self.count_requests,
+                    'payload_sha256':hashlib.sha256(body).hexdigest(),
+                    'input_tokens':result['input_tokens']})
+                return result['input_tokens']
+        except Exception:
+            self._fail('input_count_failed')
+            raise Refused('input_count_failed') from None
+
     def close(self):
         self.closing.set()  # Close admission before waiting for active forwarding.
         if not self.lock.acquire(timeout=self.limits["drain_seconds"]):
@@ -257,6 +328,7 @@ class Run:
                              "failure_reason": self.failure_reason,
                              "total_input_tokens_reserved": self.reserved_input_tokens,
                              "total_nanodollars_reserved": self.reserved_nanodollars,
+                             "count_reservations": self.count_requests,
                              "send_reservations": self.attempts, "manifest_digest": self.manifest_digest, "usage": "UNKNOWN"})
             finally:
                 self.journal.close()
@@ -267,7 +339,10 @@ class Run:
 def verify_closed_admission(journal):
     rows = [json.loads(line) for line in Path(journal).read_text().splitlines()]
     reserved = [row for row in rows if row.get("event") == "send_reserved"]
+    counts = [row for row in rows if row.get('event') == 'count_reserved']
     failures = [row for row in rows if row.get('event') == 'run_failed']
+    if not rows or rows[-1].get('count_reservations') != len(counts):
+        raise RuntimeError('count reservation ledger mismatch')
     if (not rows or rows[0].get("event") != "limits"
             or rows[-1].get("event") != "admission_closed"
             or type(rows[-1].get("local_in_flight")) is not int
@@ -281,9 +356,10 @@ def verify_closed_admission(journal):
         raise RuntimeError('paid failure ledger mismatch')
     for total, field in (('total_input_tokens_reserved','input_tokens_reserved'),
                          ('total_nanodollars_reserved','nanodollars_reserved')):
+        entries = reserved + (counts if total == 'total_nanodollars_reserved' else [])
         if (type(rows[-1].get(total)) is not int
-                or any(type(r.get(field)) is not int or r[field] < 0 for r in reserved)
-                or rows[-1][total] != sum(r[field] for r in reserved)):
+                or any(type(r.get(field)) is not int or r[field] < 0 for r in entries)
+                or rows[-1][total] != sum(r[field] for r in entries)):
             raise RuntimeError('reservation ledger mismatch')
     return rows[-1]
 

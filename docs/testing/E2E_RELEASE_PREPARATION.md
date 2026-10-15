@@ -67,7 +67,7 @@ validates a manifest without network. `--run` is the separate execution opt-in;
 actual values, model availability, remaining funded credit, exact deployment,
 and receipt hashes must be independently frozen before using it. No live result
 is included in this implementation. The first slice is `openai-official-v2-text`
-with fixed `gpt-5.2-mini`, using the actual OpenAI `/responses` encoding. It does
+with explicitly bound `gpt-5.4-mini`, using the actual OpenAI `/responses` encoding. It does
 not reduce the remaining Hosted/VPS required matrix.
 
 This adapts the prior T801/T802 bounded relay and two-dialogue executor, not a
@@ -174,19 +174,47 @@ execution prerequisites, not a claim that the current environment is verified.
 
 #### Input, cost and read budgets
 
-The implemented input method reserves a verified provider-enforced input hard
-cap covering the complete request and any provider-added context. Wire bytes
-are not input tokens. A separately verified full-request tokenizer or proven
-upper bound is another possible design, but is not implemented here. Missing
-proof of the selected hard cap refuses execution; a cap larger than a proposal
-requires a different verified counting design or separately reviewed plan, not
-an automatic increase in paid limits.
+The `responses_input_tokens` method sends the entire transformed, immutable
+request bytes to `POST /v1/responses/input_tokens`, including instructions,
+history, function schemas, arguments and outputs. The official
+[token counting guide](https://developers.openai.com/api/docs/guides/token-counting)
+says counts include structural tokens such as roles and message boundaries.
+Only a successful integer count within `enforced_input_tokens_max` permits
+inference. That field is now a checked local ceiling, not a claim of a provider
+hard cap. The relay reserves that ceiling conservatively and sends the identical
+bytes to `/responses`; it never strips fields or retries a failed count.
+Wire bytes remain a separate limit. Stored conversation references, previous
+response IDs, remote prompts and hosted tools are rejected. The configured
+output cap must be at most 1024, including reasoning and visible output.
+
+Counting is a separate, potentially charged request. `input_count` requires an
+explicit `enabled` boolean, positive `max_requests` no greater than inference
+starts, a 1–20 second timeout, and a decimal USD per-request cost ceiling. Missing
+configuration or `enabled: false` cannot execute. A reviewed `input_count_receipt`
+(and hash) binds model, run, account, all other receipt hashes, counting limits,
+validity interval, endpoint and full final-payload compatibility. It requires
+hashed source files for fees, authorization and payload compatibility. Receipt
+hashes establish integrity, not the truth or authority of their contents.
+The executor verifies these before network, claim consumption or fixture creation;
+the relay verifies them again before and after every count. A durable count
+reservation consumes its own request and monetary budget before sending, without
+refund on failure. Counting and inference share the same lock and deadline;
+closing, expiry, unknown counts, errors, timeouts and excess counts stop inference.
+
+**Live prerequisites remain unresolved:** the fetched guide did not establish
+count-endpoint pricing, and the API reference could not be fetched. Acceptance
+of every final request field (including output/stream/store/reasoning controls)
+is not established here. There is no supplied enabling receipt or actual request
+in this change. Mock tests do not establish live compatibility, funding or
+permission. Keep counting disabled until those facts and execution authority
+are independently reviewed; do not substitute a partial payload or assume free
+counting. No automatic model fallback exists.
 
 The billing receipt binds the exact model, uncached input rate, all billable
 output/reasoning, additional per-start fees, exclusive account funding and its
 remaining eligible balance. Each start reserves worst-case input/output cost,
 rounded upward to integer nanodollars, before dispatch. Unknown outcomes and
-timeouts do not refund reservations. No current rates, balances or server caps
+timeouts do not refund reservations. No current rates, balances or verified input counts
 are supplied by this repository. This short text slice forces `tool_choice`
 `none`; it does not establish tool-execution regression coverage.
 

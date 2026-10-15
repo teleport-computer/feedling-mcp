@@ -257,6 +257,7 @@ def cleanup(owner, run, reads, *, admin=None, connector=receipts.connect, clock=
 
 def execute(manifest, out, *, connector=receipts.connect):
     manifest = validate_manifest(manifest)
+    receipts.verify_input_count(manifest)  # before claim, network or fixture creation
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     _write_private_json(out/'manifest.json', manifest)
     # Named receipts must exist; their authority/applicability is independently

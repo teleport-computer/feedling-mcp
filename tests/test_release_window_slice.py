@@ -14,13 +14,14 @@ from tools.release_window import bounded_proxy as proxy, bounded_v2 as v2, contr
 def manifest():
     return dict(api_url='https://test-api.feedling.app', lane='openai-official-v2-text',
         drain_scope=dict(parent_generation='synthetic-parent',resident_owners=['synthetic-resident'],exclusive_test_runner=True,config_action='delete-model-api',worker_ids={p:'synthetic:'+p for p in ('foreground','wake','heavy')},pool_slots={p:1 for p in ('foreground','wake','heavy')}),
-        model='gpt-5.2-mini', run_id='synthetic-never-run', expected_release='a'*40,
+        model='gpt-5.4-mini', run_id='synthetic-never-run', expected_release='a'*40,
         relay_origin='https://synthetic-relay.invalid', relay_port=8789, claim_path='/synthetic/run.claim',
         receipt_sha256={k:'f'*64 for k in contract.RECEIPTS},
         funded_budget_receipt='/synthetic/funds', model_availability_receipt='/synthetic/model',
         execution_approval_receipt='/synthetic/approval', billing_contract_receipt='/synthetic/billing',
-        execution_environment_receipt='/synthetic/environment',
-        billing=dict(model='gpt-5.2-mini',currency='USD',input_bound_kind='verified_server_hard_cap',
+        execution_environment_receipt='/synthetic/environment', input_count_receipt='/synthetic/count',
+        input_count=dict(enabled=True,max_requests=4,timeout_seconds=5,usd_per_request_cap='0'),
+        billing=dict(model='gpt-5.4-mini',currency='USD',input_bound_kind='responses_input_tokens',
                      enforced_input_tokens_max=8192,output_cap_includes_reasoning=True,exclusive_funding=True,
                      account_scope='synthetic-only',uncached_input_usd_per_million='1',
                      billable_output_usd_per_million='1',extra_usd_per_start='0',
@@ -33,19 +34,24 @@ def manifest():
 
 
 def body():
-    return json.dumps({'model':'gpt-5.2-mini','input':[{'role':'user','content':[{'type':'input_text','text':'synthetic'}]}],
+    return json.dumps({'model':'gpt-5.4-mini','input':[{'role':'user','content':[{'type':'input_text','text':'synthetic'}]}],
                        'max_output_tokens':500, 'store':False}).encode()
 
 
-def make_run(tmp_path, handler=None, reviewed_manifest=None, **kwargs):
+def make_run(tmp_path, handler=None, reviewed_manifest=None, count_handler=None, **kwargs):
     calls=[]
+    reviewed_manifest = reviewed_manifest or manifest()
+    bind_synthetic_count(reviewed_manifest, tmp_path)
     def dispatch(req):
+        if req.url == proxy.COUNT_ENDPOINT:
+            if count_handler: return count_handler(req)
+            return httpx.Response(200,json={"object":"response.input_tokens","input_tokens":3})
         calls.append(req)
         if handler:
             return handler(req)
         return httpx.Response(200, json={'usage':{'input_tokens':3,'output_tokens':2,'total_tokens':5},'output':[]})
     run=proxy.Run(token='synthetic'*8,upstream_key='not-a-real-key',journal=tmp_path/'proxy.jsonl',
-                  manifest=reviewed_manifest or manifest(),transport=httpx.MockTransport(dispatch),**kwargs)
+                  manifest=reviewed_manifest,transport=httpx.MockTransport(dispatch),**kwargs)
     return run,calls
 
 
@@ -62,10 +68,10 @@ def test_allocation_must_cover_declared_actual_starts():
 
 def test_real_backend_gpt5_builder_matches_responses_protocol():
     from provider_client import _build_openai_responses_payload
-    payload,url,_=_build_openai_responses_payload(model='gpt-5.2-mini',base_url='https://synthetic-relay.invalid/v1',
+    payload,url,_=_build_openai_responses_payload(model='gpt-5.4-mini',base_url='https://synthetic-relay.invalid/v1',
         key='synthetic',messages=[{'role':'user','content':'hello'}],max_tokens=500,response_format=None)
     assert url.endswith('/v1/responses')
-    encoded=json.loads(proxy.payload(json.dumps(payload).encode(),manifest()['limits']|{'model':'gpt-5.2-mini'}))
+    encoded=json.loads(proxy.payload(json.dumps(payload).encode(),manifest()['limits']|{'model':'gpt-5.4-mini'}))
     assert encoded['max_output_tokens']==300 and encoded['store'] is False
 
 
@@ -80,7 +86,7 @@ def test_phase_and_total_journal_are_real_caps(tmp_path):
     assert all(r.url==proxy.UPSTREAM for r in calls)
     assert all(json.loads(r.content)['max_output_tokens']==300 for r in calls)
     receipt=proxy.verify_closed_admission(tmp_path/'proxy.jsonl')
-    assert receipt['send_reservations']==4 and receipt['manifest_digest']==contract.digest(contract.validate_manifest(manifest()))
+    assert receipt['send_reservations']==4 and receipt['manifest_digest']==contract.digest(run.manifest)
     text=(tmp_path/'proxy.jsonl').read_text()
     assert 'not-a-real-key' not in text and '"text"' not in text
     with pytest.raises(FileExistsError):make_run(tmp_path)
@@ -94,7 +100,7 @@ def test_parallel_requests_cannot_exceed_phase_cap(tmp_path):
     with ThreadPoolExecutor(max_workers=4) as pool:
         outcomes=list(pool.map(send,range(4)))
     run.close()
-    assert outcomes.count(200)==1 and len(calls)==1
+    assert outcomes.count(200)==1 and len(calls)==1 and run.count_requests==1
 
 
 def test_error_stops_retries_and_deadline_stops_before_dispatch(tmp_path):
@@ -165,7 +171,7 @@ def test_cleanup_real_failure_keeps_owner_marker(tmp_path,monkeypatch,bad):
         def post(self,*a,**kw):events.append('reset');return httpx.Response(200)
         def get(self,*a,**kw):events.append('oldkey');return httpx.Response(200 if bad=='old_key' else 401)
     receipts._write_private_json(tmp_path/'scenario-result.json',{'status':'INCOMPLETE'})
-    owner=SimpleNamespace(out=tmp_path,manifest=manifest(),client=Client(),binding=lambda:{},verify=lambda:events.append('verify'),
+    owner=SimpleNamespace(out=tmp_path,manifest=run.manifest,client=Client(),binding=lambda:{},verify=lambda:events.append('verify'),
         save=lambda name,data:events.append((name,data)))
     empty=dict(member=True,pending=0,claimed=0,running=0,resident_lease_active=False,job_leases=0)
     rows=[empty,empty|{'member':bad=='membership','job_leases':1 if bad=='lease' else 0}]
@@ -180,7 +186,7 @@ def test_cleanup_evidence_failure_stops_before_reset(tmp_path,monkeypatch):
     run,_=make_run(tmp_path)
     def fail(*a,**kw):raise OSError('private disk unavailable')
     receipts._write_private_json(tmp_path/'scenario-result.json',{'status':'INCOMPLETE'})
-    owner=SimpleNamespace(out=tmp_path,manifest=manifest(),binding=lambda:{},client=SimpleNamespace(post=lambda *a,**k:pytest.fail('reset')),verify=lambda:None,save=fail)
+    owner=SimpleNamespace(out=tmp_path,manifest=run.manifest,binding=lambda:{},client=SimpleNamespace(post=lambda *a,**k:pytest.fail('reset')),verify=lambda:None,save=fail)
     monkeypatch.setattr(v2,'snapshot',lambda *a,**kw:dict(pending=0,claimed=0,running=0,resident_lease_active=False,job_leases=0))
     monkeypatch.setattr(v2,'runtime_drain',lambda *a,**kw:{})
     with pytest.raises(OSError):v2.cleanup(owner,run,v2.Reads(10),admin=object())
@@ -217,7 +223,7 @@ def test_synthetic_complete_exercise_and_cleanup(tmp_path,monkeypatch):
     def save(name,data):
         saved[name]=data
         receipts._write_private_json(tmp_path/(name+'.json'),data)
-    owner=SimpleNamespace(client=Client(),out=tmp_path,manifest=manifest(),binding=lambda:{},verify=lambda:None,save=save)
+    owner=SimpleNamespace(client=Client(),out=tmp_path,manifest=run.manifest,binding=lambda:{},verify=lambda:None,save=save)
     def observe(*a,**kw):
         return dict(member=not state.get('deleted',False),pending=0,claimed=0,running=0,
                     resident_lease_active=False,job_leases=0,runtime_mode='db_action_v2',runtime_state='v2')
@@ -236,7 +242,7 @@ def test_synthetic_complete_exercise_and_cleanup(tmp_path,monkeypatch):
 
 def test_missing_safe_scenario_stops_before_reset(tmp_path):
     run,_=make_run(tmp_path)
-    owner=SimpleNamespace(out=tmp_path,manifest=manifest(),verify=lambda:None)
+    owner=SimpleNamespace(out=tmp_path,manifest=run.manifest,verify=lambda:None)
     with pytest.raises(RuntimeError,match='scenario evidence missing'):
         v2.cleanup(owner,run,v2.Reads(10),admin=object())
     run.close()
@@ -259,6 +265,8 @@ def executor_fixture(tmp_path,monkeypatch,*,exercise=None,configure=None,respons
     original_run=proxy.Run
     def make(**kw):
         def dispatch(req):
+            if req.url == proxy.COUNT_ENDPOINT:
+                return httpx.Response(200,json={'object':'response.input_tokens','input_tokens':3})
             state['calls'].append(req)
             if response:return response(req,len(state['calls']))
             return httpx.Response(200,json={'usage':{'input_tokens':1,'output_tokens':1,'total_tokens':2}})
@@ -389,6 +397,7 @@ def bind_synthetic_billing(m):
     p.write_text(json.dumps({**{k:m[k] for k in ('run_id','api_url','expected_release','drain_scope')},
         'valid_from_epoch':time.time()-60,'valid_until_epoch':time.time()+3600,'evidence':evidence}))
     m['receipt_sha256']['execution_environment_receipt']=hashlib.sha256(p.read_bytes()).hexdigest()
+    bind_synthetic_count(m, p.parent)
 
 
 @pytest.mark.parametrize('which',['input','money'])
@@ -522,3 +531,141 @@ def test_historical_thirty_reads_cannot_create_a_runnable_manifest():
     m=manifest();m['limits']['read_requests']=30
     with pytest.raises(ValueError,match='minimum_complete_path_reads'):
         contract.validate_manifest(m)
+
+
+def bind_synthetic_count(m, directory):
+    import hashlib
+    import time
+    p = directory / 'input-count-synthetic.json'
+    proof = directory / 'input-count-synthetic-evidence.txt'
+    proof.write_text('SYNTHETIC MOCK ONLY: not real authorization, pricing or compatibility evidence')
+    evidence = {'path':str(proof), 'sha256':hashlib.sha256(proof.read_bytes()).hexdigest()}
+    m['input_count_receipt'] = str(p)
+    value = dict(run_id=m['run_id'],model=m['model'],account_scope=m['billing']['account_scope'],
+        input_count=m['input_count'],endpoint=proxy.COUNT_ENDPOINT,
+        exact_final_payload_supported=True,authorized=True,
+        receipt_sha256={k:v for k,v in m['receipt_sha256'].items() if k != 'input_count_receipt'},
+        valid_from_epoch=time.time()-60,valid_until_epoch=time.time()+3600,
+        fee_evidence=evidence,payload_compatibility_evidence=evidence,authorization_evidence=evidence)
+    p.write_text(json.dumps(value))
+    m['receipt_sha256']['input_count_receipt']=hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def test_whole_final_bytes_counted_and_dispatched(tmp_path):
+    seen=[]
+    def count(req):
+        seen.append(req.content)
+        return httpx.Response(200,json={'object':'response.input_tokens','input_tokens':8192})
+    run,calls=make_run(tmp_path,count_handler=count)
+    value=json.loads(body())
+    value.update(instructions='system instructions', tools=[{'type':'function','name':'synthetic',
+        'parameters':{'type':'object','properties':{'text':{'type':'string'}}}}])
+    value['input'] += [{'type':'function_call','name':'synthetic','call_id':'x','arguments':'{"text":"history"}'},
+                       {'type':'function_call_output','call_id':'x','output':'tool result'}]
+    for phase in contract.PHASES:
+        if phase != 'setup':run.set_phase(phase)
+        value['instructions'] += phase
+        run.forward(json.dumps(value).encode())
+    run.close()
+    assert len(seen)==4 and seen == [r.content for r in calls]
+    for raw in seen:
+        v=json.loads(raw)
+        assert v['tools']==value['tools'] and v['input']==value['input']
+        assert v['store'] is False and v['tool_choice']=='none' and v['max_output_tokens']==300
+    assert proxy.verify_closed_admission(tmp_path/'proxy.jsonl')['count_reservations']==4
+
+
+@pytest.mark.parametrize('kind',['unknown','boolean','negative','oversize','http','timeout','late','overbound','close'])
+def test_count_failure_never_dispatches_inference(tmp_path,kind):
+    clock=[0]
+    def count(req):
+        if kind=='timeout':raise httpx.ReadTimeout('synthetic')
+        if kind=='late':clock[0]=6
+        if kind=='close':run.closing.set()
+        if kind=='oversize':return httpx.Response(200,content=b'x'*4097)
+        return httpx.Response(503 if kind=='http' else 200,json={
+            'object':'unknown' if kind=='unknown' else 'response.input_tokens',
+            'input_tokens':True if kind=='boolean' else -1 if kind=='negative' else 8193 if kind=='overbound' else 3})
+    run,calls=make_run(tmp_path,count_handler=count,clock=lambda:clock[0])
+    with pytest.raises(proxy.Refused):run.forward(body())
+    with pytest.raises(proxy.Refused):run.forward(body())
+    assert not calls and run.count_requests==1 and run.attempts==0
+    run.close()
+
+
+@pytest.mark.parametrize('field,value',[('previous_response_id','old'),('conversation','old'),('prompt',{'id':'remote'}),
+    ('tools',[{'type':'web_search'}])])
+def test_hidden_context_rejected_before_count(tmp_path,field,value):
+    run,calls=make_run(tmp_path,count_handler=lambda _:pytest.fail('count must not run'))
+    v=json.loads(body());v[field]=value
+    with pytest.raises(proxy.Refused):run.forward(json.dumps(v).encode())
+    assert run.count_requests==0 and not calls
+    run.close()
+
+
+def test_count_fee_consumed_and_request_cap_shared_across_phases(tmp_path):
+    m=manifest();m['input_count'].update(max_requests=1,usd_per_request_cap='0.01')
+    run,calls=make_run(tmp_path,reviewed_manifest=m)
+    run.forward(body());run.set_phase('dialogue_1')
+    with pytest.raises(proxy.Refused):run.forward(body())
+    run.close()
+    receipt=proxy.verify_closed_admission(tmp_path/'proxy.jsonl')
+    assert len(calls)==1 and receipt['total_nanodollars_reserved']==18492000
+    assert receipt['count_reservations']==1
+
+
+def test_count_disabled_before_any_executor_side_effect(tmp_path,monkeypatch):
+    m=manifest();m['input_count']['enabled']=False
+    monkeypatch.setattr(v2.httpx,'Client',lambda *a,**k:pytest.fail('network forbidden'))
+    with pytest.raises(RuntimeError,match='disabled'):v2.execute(m,tmp_path/'run')
+    assert not (tmp_path/'run').exists()
+
+
+def test_output_including_reasoning_cannot_exceed_1024():
+    m=manifest();m['limits']['output_tokens_per_start']=1025
+    with pytest.raises(ValueError,match='reasoning_and_visible'):contract.validate_manifest(m)
+
+
+def test_count_receipt_expiry_and_model_binding_fail_closed(tmp_path):
+    m=manifest();bind_synthetic_count(m,tmp_path)
+    with pytest.raises(RuntimeError,match='expired'):receipts.verify_input_count(m,now=0)
+    m['model']='gpt-5.2-mini'
+    with pytest.raises(RuntimeError,match='binding'):receipts.verify_input_count(m)
+
+
+def test_count_evidence_revoked_during_exchange_prevents_inference(tmp_path):
+    def count(req):
+        (tmp_path/'input-count-synthetic-evidence.txt').write_text('revoked')
+        return httpx.Response(200,json={'object':'response.input_tokens','input_tokens':3})
+    run,calls=make_run(tmp_path,count_handler=count)
+    with pytest.raises(proxy.Refused):run.forward(body())
+    assert not calls and run.attempts==0
+    run.close()
+
+
+@pytest.mark.parametrize('change', ['expiry', 'evidence'])
+def test_count_authority_changed_during_reservation_prevents_all_dispatch(tmp_path, monkeypatch, change):
+    counted=[]
+    def count(req):
+        counted.append(req.content)
+        return httpx.Response(200,json={'object':'response.input_tokens','input_tokens':3})
+    m=manifest();m['input_count']['usd_per_request_cap']='0.01'
+    run,calls=make_run(tmp_path,reviewed_manifest=m,count_handler=count)
+    receipt=json.loads(Path(run.manifest['input_count_receipt']).read_text())
+    record=run.record
+    def delayed_record(row):
+        record(row)
+        if row['event']=='count_reserved':
+            if change=='expiry':
+                monkeypatch.setattr(receipts.time,'time',lambda:receipt['valid_until_epoch']+1)
+            else:
+                Path(receipt['authorization_evidence']['path']).write_text('revoked during reservation')
+    run.record=delayed_record
+    with pytest.raises(proxy.Refused,match='input_count_failed'):run.forward(body())
+    with pytest.raises(proxy.Refused):run.forward(body())
+    run.close()
+    assert counted==[] and calls==[]
+    closed=proxy.verify_closed_admission(tmp_path/'proxy.jsonl')
+    assert closed['count_reservations']==1 and closed['send_reservations']==0
+    assert closed['total_nanodollars_reserved']==10000000
+    assert closed['total_input_tokens_reserved']==0
