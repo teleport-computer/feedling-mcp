@@ -403,7 +403,7 @@ def _self_heal_if_stale(store: UserStore, since: float, *, label: str = "chat/hi
     return True
 
 
-def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tuple[dict, int]:
+def history(store: UserStore, *, query, user_agent: str, remote_addr: str, raw_page_observer=None) -> tuple[dict, int]:
     try:
         limit = int(query.get("limit", 200))
     except (TypeError, ValueError):
@@ -549,6 +549,11 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
             has_more_older = len(all_msgs) > len(msgs)
             has_more_newer = False
             page_mode = "latest-cache-fallback"
+
+    if raw_page_observer is not None:
+        # Private in-process recall channel, after limit/sentinel selection and
+        # before public projection removes canonical attachment coordinates.
+        raw_page_observer(msgs)
 
     # Pull this page's R2-offloaded bodies concurrently before rendering; without
     # it each one costs a serial round-trip inside _chat_history_item.

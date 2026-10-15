@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from contextlib import nullcontext
 import hashlib
 import inspect
 import itertools
@@ -98,6 +99,8 @@ from core import provider_usage
 from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory import recall_contract
+
 from memory import capture_failure
 from memory import extraction_trace as memory_extraction_trace
 from model_api_runtime.v2 import dream_budget
@@ -1884,7 +1887,9 @@ def _known_exception_detail(exc: BaseException) -> str:
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
-    if isinstance(exc, WorkspacePromptUnavailable):
+    if isinstance(exc, recall_contract.RecallFailure):
+        kind = "recall_binding_failed" if exc.category == "binding_error" else "required_content_unavailable"
+    elif isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         candidate = str(exc.error_code or "")
@@ -2223,6 +2228,8 @@ class TurnDeps:
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
     read_context_memories: Callable[..., dict] | None = None
+    read_recall_mode: Callable[[str], str] | None = None
+    prepare_recall_attachments: Callable[..., dict] | None = None
     # Production chat preserves one visible reply per user message. Later sends
     # stay queued behind the current turn instead of being folded into it.
     ordered_chat_replies: bool = False
@@ -3438,7 +3445,7 @@ def _turn_coordinates(lane, job_id, trace_id, attempt) -> dict:
             "attempt": int(attempt or 0)}
 
 
-async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None):
+async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None, *, required_rows=(), required_ids=(), prompt_through_seq=None, semaphore_held=False):
     """Best-effort selection with an explicit unavailable state, never fake 0.
 
     ``coordinates`` (optional) only labels diagnostics about this read; the
@@ -3449,14 +3456,51 @@ async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coo
     if coordinates is not None:
         kwargs["coordinates"] = coordinates
     try:
-        async with enclave_sem:
+        if getattr(deps, "prepare_recall_attachments", None) is not None:
+            from memory import plaintext_recall
+            deadline = time.monotonic() + plaintext_recall.local_timeout_seconds()
+            proofs = await asyncio.to_thread(
+                deps.prepare_recall_attachments, user_id, required_rows,
+                required_ids=required_ids, deadline=deadline)
+            for row in required_rows:
+                proof = proofs.get(row.get("id"))
+                if proof is not None:
+                    row["_recall_attachment_proof"] = proof
+            kwargs["deadline"] = deadline
+            kwargs["attachment_proofs"] = proofs
+            kwargs["source_snapshots"] = {
+                row["id"]: json.loads(row["_recall_source_json"])
+                for row in required_rows if isinstance(row.get("_recall_source_json"), str)
+            }
+        async with (nullcontext() if semaphore_held else enclave_sem):
             payload = await asyncio.to_thread(
                 deps.read_context_memories, user_id, **kwargs
             )
         if not isinstance(payload, dict):
             raise ValueError("context_memory_response_not_object")
+        if recall_contract.operation_mode(user_id) == "off" and payload.get("account_mode") != "off":
+            raise recall_contract.RecallFailure("recall_binding_invalid", category="binding_error")
+        if payload.get("account_mode") == "off":
+            recall_contract.validate_prompt_rows(required_rows, user_id, prompt_through_seq or through_seq,
+                                                required_ids=required_ids)
+            if not required_rows:
+                raise recall_contract.RecallFailure("turn_content_unconfirmed")
+            for row in required_rows:
+                proof = row.get("_recall_attachment_proof")
+                if proof is not None and row.get("id") == payload.get("message_id"):
+                    expected = {"id": proof.message_id, "seq": proof.seq,
+                                "sha256": hashlib.sha256(proof.body).hexdigest()}
+                    if expected not in (payload.get("required_attachments") or []):
+                        raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
+            if payload.get("user_id") != user_id or payload.get("seq") != through_seq:
+                raise recall_contract.RecallFailure("recall_binding_invalid", category="binding_error")
         return payload
+    except recall_contract.RecallFailure:
+        raise
     except Exception as exc:
+        if (recall_contract.operation_mode(user_id) == "off" or
+                any(isinstance(row.get("_recall_row_proof"), recall_contract.TurnRowProof) for row in required_rows)):
+            raise recall_contract.RecallFailure("recall_input_unconfirmed") from exc
         log.warning("[v2.memory] selection unavailable: %s", type(exc).__name__)
         return {}
 
@@ -8932,6 +8976,7 @@ async def _read_seq_adaptive_prompt_context(
     active_image_ids: set[str] | None = None,
     vision_fallback_state: VisionFallbackState | None = None,
     tail_cap: int | None = None,
+    before_media=None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
 
@@ -9005,6 +9050,21 @@ async def _read_seq_adaptive_prompt_context(
                 watermark_seq=watermark_seq,
                 required_tail=tail,
             )
+        if before_media is not None:
+            # The raw prompt rows still carry reader-created content proofs.
+            # Complete required-content and candidate-owner checks before any
+            # dedicated image observer can dispatch a provider request.
+            await before_media([*_flatten_turns(optional_tail_turns), *tail], True)
+        tail = await asyncio.to_thread(
+            _inject_tail_files,
+            tail,
+            user_id=user_id,
+            read_files=deps.read_files,
+        )
+        optional_rows = _flatten_turns(optional_tail_turns)
+        if optional_rows:
+            optional_rows = await asyncio.to_thread(
+                _inject_tail_files, optional_rows, user_id=user_id, read_files=deps.read_files)
         tail = await asyncio.to_thread(
             _inject_tail_images,
             tail,
@@ -9016,16 +9076,10 @@ async def _read_seq_adaptive_prompt_context(
             vision_fallback_state=vision_fallback_state,
             emit_debug_trace=deps.emit_debug_trace,
         )
-        tail = await asyncio.to_thread(
-            _inject_tail_files,
-            tail,
-            user_id=user_id,
-            read_files=deps.read_files,
-        )
         if optional_tail_turns:
             optional_rows = await asyncio.to_thread(
                 _inject_tail_images,
-                _flatten_turns(optional_tail_turns),
+                optional_rows,
                 user_id=user_id,
                 read_images=deps.read_images,
                 active_image_ids=active_image_ids,
@@ -9033,12 +9087,6 @@ async def _read_seq_adaptive_prompt_context(
                 main_provider_config=provider_config,
                 vision_fallback_state=vision_fallback_state,
                 emit_debug_trace=deps.emit_debug_trace,
-            )
-            optional_rows = await asyncio.to_thread(
-                _inject_tail_files,
-                optional_rows,
-                user_id=user_id,
-                read_files=deps.read_files,
             )
             optional_tail_turns = _group_complete_turns(optional_rows)
     profile_selection = await _select_profile_prompt_for_turn(
@@ -9877,6 +9925,18 @@ async def _run_wake(
         user_profile = ""
         coverage_hole_notice = ""
         wake_snapshot_seq = 0
+        turn_memory_payload = None
+
+        async def _validate_wake_before_media(raw_rows, semaphore_held=False):
+            nonlocal turn_memory_payload
+            if turn_memory_payload is None:
+                turn_memory_payload = await _load_turn_memory_context(
+                    deps, user_id, wake_snapshot_seq, enclave_sem,
+                    coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
+                    required_rows=raw_rows, semaphore_held=semaphore_held)
+            elif turn_memory_payload.get("account_mode") == "off":
+                recall_contract.validate_prompt_rows(raw_rows, user_id, wake_snapshot_seq)
+
         compact_through_seq = None
         if seq_context:
             wake_snapshot_seq = await asyncio.to_thread(
@@ -9916,6 +9976,7 @@ async def _run_wake(
                 deps=deps,
                 through_seq=wake_snapshot_seq,
                 target_turns=_WAKE_TAIL_MAX_TURNS,
+                before_media=_validate_wake_before_media,
                 provider_config=provider_config,
                 enclave_sem=enclave_sem,
                 claimed_by=claimed_by,
@@ -11576,10 +11637,8 @@ async def _run_wake(
                     type(exc).__name__.lower(),
                 )
 
-        turn_memory_payload = await _load_turn_memory_context(
-            deps, user_id, wake_snapshot_seq, enclave_sem,
-            coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
-        )
+        if turn_memory_payload is None:
+            await _validate_wake_before_media(wake_tail)
         turn_memory_observation: dict = {}
 
         wake_reply_language = infer_reply_language(
@@ -11677,6 +11736,7 @@ async def _run_wake(
                     deps=deps,
                     through_seq=wake_snapshot_seq,
                     target_turns=_WAKE_TAIL_MAX_TURNS,
+                before_media=_validate_wake_before_media,
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -14289,6 +14349,24 @@ def _inject_tail_images(
     so a later turn never re-sends old pixels or repeats a paid observer call.
     """
     active_ids = set(active_image_ids or ())
+    from memory import recall_attachments
+    proofs = {}
+    for row in tail:
+        mid = str(row.get("id") or "")
+        if mid in active_ids and row.get("has_image") and row.get("_recall_row_proof") is not None:
+            proof = row.get("_recall_attachment_proof")
+            if not isinstance(proof, recall_attachments.AttachmentProof):
+                raise recall_contract.RecallFailure("attachment_unconfirmed")
+            proofs[mid] = proof
+
+    def bound_images(ids):
+        result = {mid: recall_attachments.image_payload(proofs[mid], user_id, mid)
+                  for mid in ids if mid in proofs}
+        remaining_ids = [mid for mid in ids if mid not in proofs]
+        if remaining_ids and read_images is not None:
+            result.update(read_images(user_id, remaining_ids) or {})
+        return result
+
 
     def image_items(payload: dict | None) -> list[dict]:
         if not isinstance(payload, dict):
@@ -14325,6 +14403,7 @@ def _inject_tail_images(
         {
             "message_id": str(row["id"]),
             "route_id": str(row.get("vision_route_id") or ""),
+            **({"_recall_attachment_proof": proofs[str(row["id"])]} if str(row["id"]) in proofs else {}),
         }
         for row in targets
         if str(row.get("vision_route_id") or "")
@@ -14481,7 +14560,7 @@ def _inject_tail_images(
             try:
                 # Deliberate second read: this is the auditable disclosure gate.
                 # Successful dedicated targets are absent from this exact list.
-                fallback_fetched = read_images(user_id, selected_ids) or {}
+                fallback_fetched = bound_images(selected_ids)
             except Exception:  # noqa: BLE001 — preserve dedicated identity
                 raise_dedicated("vision fallback image read failed")
             if any(
@@ -14510,7 +14589,7 @@ def _inject_tail_images(
     fetched: dict[str, dict] = {}
     if wanted and read_images is not None:
         try:
-            fetched = read_images(user_id, wanted) or {}
+            fetched = bound_images(wanted)
         except Exception as exc:  # noqa: BLE001 — preserve follow-main behavior
             log.warning("[v2.worker] read_images failed for %s: %s", user_id, exc)
 
@@ -14594,14 +14673,23 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
     让模型不会误以为自己已经读过附件。两种情况都不产生 UI error chip。
     """
     if read_files is None:
+        if any(r.get("has_file") and r.get("_recall_row_proof") is not None for r in tail):
+            raise recall_contract.RecallFailure("attachment_read_failed")
         return tail
     targets = [r for r in tail if r.get("has_file") and r.get("id")]
     if not targets:
         return tail
     wanted = [str(r["id"]) for r in targets[-_TAIL_FILE_LIMIT:]]
+    proofs = {str(row["id"]): row["_recall_attachment_proof"] for row in targets
+              if row.get("_recall_attachment_proof") is not None and str(row["id"]) in wanted}
+    if any(row.get("_recall_row_proof") is not None and str(row["id"]) in wanted
+           and str(row["id"]) not in proofs for row in targets):
+        raise recall_contract.RecallFailure("attachment_unconfirmed")
     try:
-        fetched = read_files(user_id, wanted) or {}
+        fetched = (read_files(user_id, wanted, proofs=proofs) if proofs else read_files(user_id, wanted)) or {}
     except Exception as e:  # noqa: BLE001
+        if proofs:
+            raise recall_contract.RecallFailure("attachment_read_failed") from e
         log.warning("[v2.worker] read_files failed for %s: %s", user_id, e)
         return tail
 
@@ -14610,6 +14698,8 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         got = fetched.get(str(row.get("id"))) if row.get("has_file") else None
         text = str((got or {}).get("text") or "")
         error = str((got or {}).get("error") or "")
+        if str(row.get("id")) in proofs and (error or not text):
+            raise recall_contract.RecallFailure("attachment_read_failed")
         if error:
             marker = core_util.text_of(row.get("content")) or "[file]"
             out.append(
@@ -14805,6 +14895,7 @@ async def process_job(
     )
     provider_reply_signal = _ProviderReplySignal()
 
+    recall_mode_token = None
     try:
         if not claimed_by or not await asyncio.to_thread(
             jobs_store.mark_running, job_id, claimed_by=claimed_by
@@ -14813,6 +14904,7 @@ async def process_job(
         lease_keepalive_task = asyncio.create_task(
             _keep_active_job_lease(job_id, claimed_by, lease_keepalive_stop)
         )
+
 
         async def _renew_lease() -> None:
             if not await asyncio.to_thread(
@@ -14894,6 +14986,16 @@ async def process_job(
             )
 
         await _ensure_runtime_mode()
+
+        if lane in {"chat", "heartbeat", "scheduled", "manual_wake", "screen_watch"} and deps.read_recall_mode is not None:
+            try:
+                mode = await asyncio.to_thread(deps.read_recall_mode, user_id)
+                recall_mode_token = recall_contract.bind_operation_mode(user_id, mode)
+            except recall_contract.RecallFailure:
+                raise
+            except Exception as exc:
+                raise recall_contract.RecallFailure("account_unconfirmed") from exc
+
 
         if lane == "maintenance":
             # 自成一体的压缩路径：自己的 try/except（见 `_run_compaction`），绝不落到本
@@ -15200,6 +15302,25 @@ async def process_job(
             tm.flush(failed=False, status=jobs_store.CHAT_TURN_STATUS_OK)
             return "completed"
 
+        turn_memory_payload = None
+
+        async def _validate_chat_before_media(raw_rows, semaphore_held=False):
+            nonlocal turn_memory_payload
+            required = [*raw_rows, *coalesced]
+            if turn_memory_payload is None:
+                turn_memory_payload = await _load_turn_memory_context(
+                    deps, user_id, cursor_seq, enclave_sem,
+                    coordinates=_turn_coordinates(
+                        lane, job["id"], job.get("trace_id"), job.get("attempt_count")),
+                    required_rows=required,
+                    required_ids=[row["id"] for row in coalesced],
+                    prompt_through_seq=max(int(cursor_seq), int(through_seq)),
+                    semaphore_held=semaphore_held)
+            elif turn_memory_payload.get("account_mode") == "off":
+                recall_contract.validate_prompt_rows(
+                    required, user_id, max(int(cursor_seq), int(through_seq)),
+                    required_ids=[row["id"] for row in coalesced])
+
         # Load after recovery and empty-input finalization so a workspace outage
         # cannot block a reply that was already committed by a previous worker.
         # It still precedes every provider/prompt-coverage call, preventing an
@@ -15357,6 +15478,7 @@ async def process_job(
                 deps=deps,
                 through_seq=through_seq,
                 target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
+                before_media=_validate_chat_before_media,
                 provider_config=provider_config,
                 enclave_sem=enclave_sem,
                 claimed_by=claimed_by,
@@ -15378,6 +15500,7 @@ async def process_job(
                 )
         else:
             summary, tail = "", []
+            await _validate_chat_before_media([])
 
         # World Book is independently rebuilt from authoritative entries and a
         # frozen real-chat window, never from the compacted/budgeted replay.
@@ -17101,11 +17224,7 @@ async def process_job(
         if ordered_chat_replies:
             turn_trusted_system_blocks += (context.ORDERED_REPLY_TARGET_POLICY,)
 
-        turn_memory_payload = await _load_turn_memory_context(
-            deps, user_id, cursor_seq, enclave_sem,
-            coordinates=_turn_coordinates(
-                lane, job["id"], job.get("trace_id"), job.get("attempt_count")),
-        )
+
         turn_memory_observation: dict = {}
 
         caption_probe = _AttachmentCaptionProbe()
@@ -17199,6 +17318,7 @@ async def process_job(
                     deps=deps,
                     through_seq=through_seq,
                     target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
+                before_media=_validate_chat_before_media,
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -17809,6 +17929,8 @@ async def process_job(
         tm.flush(failed=True, status=message)
         return "failed"
     finally:
+        if recall_mode_token is not None:
+            recall_contract.reset_operation_mode(recall_mode_token)
         lease_keepalive_stop.set()
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()

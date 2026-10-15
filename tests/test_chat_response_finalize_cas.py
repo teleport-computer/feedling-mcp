@@ -720,9 +720,10 @@ def test_finalize_reply_once_explain_uses_parent_primary_key(store):
     assert "Index" in plan, f"finalize 没走任何索引访问路径：\n{plan}"
 
 
+@pytest.mark.parametrize("identity_failure_first", [False, True])
 @pytest.mark.parametrize("commit_before_bad_receipt", [False, True])
 def test_consumer_bad_receipt_recovers_without_losing_or_duplicating_reply(
-    store, monkeypatch, commit_before_bad_receipt,
+    store, monkeypatch, commit_before_bad_receipt, identity_failure_first,
 ):
     """Real consumer + reply CAS/DB: ambiguous HTTP success is not completion."""
     import json
@@ -733,7 +734,7 @@ def test_consumer_bad_receipt_recovers_without_losing_or_duplicating_reply(
     from tools import chat_resident_consumer as crc
 
     parent = store.append_chat("user", "chat", _envelope(store.user_id, "receipt_parent"))
-    traces, requests, committed_ids = [], [], []
+    traces, requests, committed_ids, identity_requests = [], [], [], []
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
@@ -750,6 +751,15 @@ def test_consumer_bad_receipt_recovers_without_losing_or_duplicating_reply(
     monkeypatch.setattr(chat_core.chat_consumer, "_record_consumer_event", lambda *a, **kw: None)
 
     def transport(request):
+        if request.url.path == "/v1/users/whoami":
+            identity_requests.append(request)
+            if identity_failure_first and len(identity_requests) == 1:
+                return httpx.Response(503, request=request)
+            for key, value in crc._HEADERS.items():
+                assert request.headers[key] == value
+            return httpx.Response(200, json={
+                "user_id": store.user_id, "content_encryption_effective": "on",
+            }, request=request)
         assert request.url.path == "/v1/chat/response"
         payload = json.loads(request.content)
         requests.append(payload)
@@ -767,12 +777,19 @@ def test_consumer_bad_receipt_recovers_without_losing_or_duplicating_reply(
     msg = {"id": parent["id"], "role": "user", "content": "hello", "ts": parent["ts"]}
     with httpx.Client(transport=httpx.MockTransport(transport)) as client:
         monkeypatch.setattr(crc, "_HTTP", client)
+        if identity_failure_first:
+            assert crc._process_messages([msg]) == 0.0
+            assert not requests
+            assert crc._msg_key(msg) not in crc._seen_ids
+            assert db.chat_get_strict(store.user_id, parent["id"]).get("reply_status") != "replied"
+            assert not any(a[1] == "agent.turn.success" for a, _ in traces)
         assert crc._process_messages([msg]) == 0.0
         assert crc._msg_key(msg) not in crc._seen_ids
         assert not any(a[1] == "agent.turn.success" for a, _ in traces)
         first_parent = db.chat_get_strict(store.user_id, parent["id"])
         assert (first_parent.get("reply_status") == "replied") == commit_before_bad_receipt
         assert crc._process_messages([msg]) == parent["ts"]
+    assert len(identity_requests) == 2 + int(identity_failure_first)
     assert len(requests) == 2
     delivery_id = requests[0]["resident_delivery_id"]
     assert requests[1]["resident_delivery_id"] == delivery_id

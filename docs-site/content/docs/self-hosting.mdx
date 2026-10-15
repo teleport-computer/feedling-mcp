@@ -995,3 +995,15 @@ deduplicates by user/job, excludes conflicting job states from confirmed failure
 and emits only fixed aggregate counts. These are reported categories, not verified
 causes or opening/delivery rates. Missing historical evidence is not reconstructed.
 The projection follows the existing proactive-job retention and deletion lifecycle.
+
+
+### Plaintext automatic recall boundaries
+
+For an authenticated effective-off account, automatic recall has no enclave
+content fallback, including rollout `off`/`shadow`, old sealed input and local
+failure. Required turn content and subject ownership are validated separately
+from optional candidate payloads. An invalid same-owner candidate makes the
+whole recall result unavailable; an ownership, authorization, required-content
+or unknown shared-read failure stops the turn. See the [memory workflow](./workflows/memory)
+for fixed-frontier, unavailable-count and deadline behavior. Whoami public
+attestation metadata remains compatible and may still make network requests.

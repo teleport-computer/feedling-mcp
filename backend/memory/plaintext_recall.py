@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from core import envelope as core_envelope
 from core import history_view, plaintext_row
-from memory import recall_select
+from memory import recall_contract, recall_select
 from memory.embedding import recall_policy
 
 MODE_ENV = "FEEDLING_V2_PLAINTEXT_RECALL"
@@ -212,7 +212,7 @@ class LocalResult:
     elapsed_ms: float
 
 
-def _hybrid_state(cards_moments, user_id, current, combined, deps, deadline, started):
+def _hybrid_state(cards_moments, user_id, current, combined, deps, deadline, started, *, strict=False):
     state = {"deadline": deadline, "started": started, "embedder": None, "model_id": None,
              "stored": None, "fallback_reason": None, "vectors_ms": None,
              "vectors_requested": 0, "vectors_rejected": 0}
@@ -244,6 +244,10 @@ def _hybrid_state(cards_moments, user_id, current, combined, deps, deadline, sta
                 if status == "timeout":
                     raise recall_policy.Fallback("deadline_exceeded")
                 if status == "error":
+                    if isinstance(value, recall_contract.RecallFailure):
+                        raise value
+                    if strict and not isinstance(value, recall_policy.Fallback):
+                        raise recall_contract.RecallFailure("vector_read_unconfirmed") from value
                     if isinstance(value, recall_policy.Fallback):
                         raise value
                     # A database error on the vector read keeps this turn on the
@@ -255,6 +259,8 @@ def _hybrid_state(cards_moments, user_id, current, combined, deps, deadline, sta
             stored, rejected = recall_policy.decode_vectors(payload, reply.model_id, reply.dim)
             wanted = set(ids)
             foreign = [mid for mid in stored if mid not in wanted]
+            if strict and foreign:
+                raise recall_contract.RecallFailure("vector_owner_conflict", category="binding_error")
             for mid in foreign:
                 del stored[mid]
             state["stored"], state["vectors_rejected"] = stored, rejected + len(foreign)
@@ -262,6 +268,8 @@ def _hybrid_state(cards_moments, user_id, current, combined, deps, deadline, sta
             if time.monotonic() > deadline:
                 raise recall_policy.Fallback("deadline_exceeded")
         except recall_policy.Fallback as exc:
+            if strict and exc.authorization_failed:
+                raise recall_contract.RecallFailure("vector_authorization_failed", category="binding_error") from exc
             state["fallback_reason"] = exc.reason
             encoder = None
     return state, encoder

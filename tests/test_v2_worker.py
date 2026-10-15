@@ -3124,3 +3124,164 @@ def test_t768_attachment_folded_in_mid_turn_is_counted_once(monkeypatch):
                 "caption_chars": len(_T768_CAPTION), "delivered_chars": len(_T768_CAPTION), "undetermined_chars": 0}
     assert budgets[1]["attachment_captions"] == expected
     assert budgets[2]["attachment_captions"] == expected
+
+
+@pytest.mark.parametrize('media', [False, True], ids=['text', 'media'])
+@pytest.mark.parametrize('lane', ['chat', 'heartbeat'])
+@pytest.mark.parametrize('fault', ['candidate_payload', 'candidate_owner', 'required_body'])
+def test_off_recall_real_reader_controls_provider_dispatch(monkeypatch, lane, fault, media, *, success=False, lose_lease=False):
+    """Exercise owned jobs and the SQL candidate adapter, not a final outcome stub."""
+    from model_api_runtime.v2 import serve_worker
+    from memory import plaintext_recall
+    uid = f'u_t820_{lane}_{fault}'
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job('t820-boundary')
+    raw = dict(id='required', seq=1, ts=1.0, role='user', v=1,
+               owner_user_id=uid, source='user', body='current question')
+    if media:
+        raw.pop('body')
+        raw.update(content_type='image', body_b64='c3ludGhldGljLWltYWdl', vision_route_id='synthetic-route')
+        if fault == 'invalid_b64': raw['body_b64'] = '!'
+        if fault == 'oversize': raw['body_b64'] = 'A' * 2_666_672
+        if fault == 'sealed': raw['body_ct'] = 'sealed'
+        if fault == 'foreign_attachment': raw['owner_user_id'] = 'foreign'
+    if fault == 'required_body':
+        raw['body'] = 123
+    if media or (success and lane == 'chat'):
+        from psycopg.types.json import Jsonb
+        with db.get_pool().connection() as conn:
+            raw['seq'] = conn.execute(
+                'INSERT INTO chat_messages (user_id,msg_id,ts,doc) VALUES (%s,%s,%s,%s) RETURNING seq',
+                (uid, raw['id'], raw['ts'], Jsonb({k:v for k,v in raw.items() if k != 'seq'}))).fetchone()[0]
+    raw_snapshot = dict(raw)
+    if media and fault in {'missing_attachment', 'changed_attachment', 'seq_attachment'}:
+        with db.get_pool().connection() as conn:
+            if fault == 'missing_attachment':
+                conn.execute('DELETE FROM chat_messages WHERE user_id=%s', (uid,))
+            else:
+                conn.execute("UPDATE chat_messages SET doc=jsonb_set(doc,'{caption_body}',%s) WHERE user_id=%s", (Jsonb('changed'),uid))
+        if fault == 'seq_attachment': raw_snapshot['seq'] += 1
+    candidate = dict(id='optional', owner_user_id=('foreign' if fault == 'candidate_owner' else uid),
+                     body='{', visibility='shared', occurred_at='2026-01-01')
+    assert db.memory_upsert(uid, candidate['id'], candidate['occurred_at'], candidate)
+    monkeypatch.setattr(serve_worker.accounts_registry, 'effective_content_encryption', lambda _: 'off')
+    monkeypatch.setattr(serve_worker, '_mint_runtime_token', lambda _: 'synthetic-unused')
+    def page(_uid, seq):
+        if not media: return [raw]
+        from memory.recall_attachments import HistoryPage
+        public = {k:v for k,v in raw_snapshot.items() if k != 'body_b64'}
+        public.update(body_omitted=True, body_omitted_reason='image')
+        return HistoryPage([public], [raw_snapshot])
+    if not fault.startswith('between_proofs_'):
+        monkeypatch.setattr(serve_worker, '_plaintext_history_page', page)
+    monkeypatch.setattr(plaintext_recall, 'mode', lambda: 'on')
+    monkeypatch.setattr(worker.db, 'chat_max_seq', lambda _: raw['seq'])
+    monkeypatch.setattr(worker.db, 'chat_seqs_after_seq', lambda *a, **k: [raw['seq']])
+    calls, media_calls = [], []
+    async def provider(config, messages, **kwargs):
+        calls.append(messages)
+        raise provider_client.ProviderError('synthetic terminal stop', status_code=401)
+    monkeypatch.setattr(provider_client, 'chat_completion_async', provider)
+    failures = []
+    original_failure_code = worker._safe_failure_code
+    def failure_code(prefix, exc):
+        failures.append(repr(exc))
+        return original_failure_code(prefix, exc)
+    monkeypatch.setattr(worker, '_safe_failure_code', failure_code)
+    written = []
+    if success:
+        monkeypatch.setattr(worker.core_envelope, '_build_shared_envelope_for_store',
+            lambda store, raw, **kwargs: ({'id':kwargs.get('item_id', 'synthetic-reply'), 'owner_user_id':uid, 'v':1, 'body':raw.decode('utf-8')}, None))
+        monkeypatch.setattr(worker, '_write_encrypted_reply',
+            lambda store, text: written.append(text) or {'id': 'synthetic-reply'})
+        calls = _script_provider(monkeypatch, [_text_round('Validated reply') if lane == 'chat' else _stay_silent_round()])
+    def read(*args, **kwargs):
+        return serve_worker._decrypt_chat_rows_inner(uid, [raw], user_only=(lane == 'chat'),
+                                                     preserve_unreadable=True)
+    def read_context(user, **kwargs):
+        if fault.startswith('between_proofs_'):
+            field = fault.removeprefix('between_proofs_')
+            values = {'body_b64':'c2Vjb25k', 'caption_body':'changed caption', 'image_mime':'image/webp'}
+            changed = {k:v for k,v in raw.items() if k != 'seq'}
+            changed[field] = values[field]
+            with db.get_pool().connection() as conn:
+                conn.execute('UPDATE chat_messages SET doc=%s WHERE user_id=%s AND msg_id=%s',
+                             (Jsonb(changed), uid, raw['id']))
+        payload = serve_worker._read_context_memories(user, **kwargs)
+        if lose_lease:
+            with db.get_pool().connection() as conn:
+                conn.execute("UPDATE agent_jobs SET claimed_by='replacement-owner' WHERE id=%s", (job['id'],))
+        return payload
+    def apply_effects(user):
+        def transactional_reply(effect_type, payload, connection):
+            serve_worker._sink_reply_in_transaction(user, payload, connection)
+            # Exercise the real durable sink; no auxiliary mirror/network work.
+            return lambda: None
+        return v2_effect_outbox.apply_pending_effects(user,
+            dispatch=_reply_effect_dispatch(user), dispatch_reply_in_transaction=transactional_reply)
+    deps = worker.TurnDeps(
+        read_messages=read,
+        read_messages_after_seq=lambda _uid, after_seq: read() if after_seq < raw['seq'] else [],
+        read_context_memories=read_context,
+        read_summary_with_seq=(lambda _: ('', 0.0, 0, 0)) if lane != 'chat' or media else None,
+        read_tail_after_seq=read if lane != 'chat' or media else None,
+        read_vision_observations=lambda *a, **k: media_calls.append(a) or {'required': 'synthetic observation'},
+        read_recall_mode=lambda _: 'off',
+        prepare_recall_attachments=serve_worker._prepare_recall_attachments,
+        has_genuine_user_history=lambda _: True,
+        resolve_provider=lambda _: (_BYOK, {}), mint_enclave_token=lambda _: 'synthetic-unused',
+        apply_pending_effects=apply_effects,
+    )
+    result = asyncio.run(worker.process_job(job, deps, provider_config=_BYOK,
+                                           api_key=None, runtime_token='synthetic-unused'))
+    # An image-only historical wake has no textual continuity to realize; the
+    # normal wake path completes without a provider call after validation.
+    empty_wake = media and lane == 'heartbeat' and fault == 'candidate_payload'
+    if lose_lease:
+        assert result != 'completed'
+        assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+        with db.get_pool().connection() as conn:
+            state = conn.execute('SELECT status,claimed_by FROM agent_jobs WHERE id=%s', (job['id'],)).fetchone()
+        assert state[0] != 'completed' and state[1] == 'replacement-owner'
+        return
+    assert result == ('completed' if empty_wake or success else 'failed'), failures
+    assert len(calls) == (1 if fault == 'candidate_payload' and not empty_wake else 0)
+    with db.get_pool().connection() as conn:
+        state = conn.execute('SELECT status FROM agent_jobs WHERE id=%s', (job['id'],)).fetchone()
+    assert (state[0] == 'completed') == (empty_wake or success)
+    assert len(media_calls) == (1 if media and lane == 'chat' and fault == 'candidate_payload' else 0)
+    if fault != 'candidate_payload':
+        assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+        assert not jobs_store.get_runtime_state(uid).get('last_replied_ts')
+    if success and lane == 'chat':
+        assert v2_cursor.load_seq(core_store.get_store(uid)) == raw['seq']
+    if calls:
+        assert not any(str(m.get('content', '')).startswith('# 相关记忆') for m in (calls[0]['messages'] if success else calls[0]))
+
+
+@pytest.mark.parametrize('lane', ['chat', 'heartbeat'])
+@pytest.mark.parametrize('fault', ['missing_attachment', 'changed_attachment', 'seq_attachment',
+                                  'foreign_attachment', 'invalid_b64', 'oversize', 'sealed'])
+def test_off_v2_attachment_negative_lifecycle(monkeypatch, lane, fault):
+    test_off_recall_real_reader_controls_provider_dispatch(monkeypatch, lane, fault, True)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'heartbeat'])
+def test_off_v2_optional_failure_continues_successful_lifecycle(monkeypatch, lane):
+    test_off_recall_real_reader_controls_provider_dispatch(
+        monkeypatch, lane, 'candidate_payload', False, success=True)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'heartbeat'])
+def test_off_optional_failure_cannot_finish_replaced_lease(monkeypatch, lane):
+    test_off_recall_real_reader_controls_provider_dispatch(
+        monkeypatch, lane, 'candidate_payload', False, success=True, lose_lease=True)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'heartbeat'])
+@pytest.mark.parametrize('field', ['body_b64', 'caption_body', 'image_mime'])
+def test_off_attachment_version_change_blocks_actual_dispatch(monkeypatch, lane, field):
+    test_off_recall_real_reader_controls_provider_dispatch(
+        monkeypatch, lane, 'between_proofs_'+field, True)

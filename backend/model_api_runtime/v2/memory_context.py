@@ -88,7 +88,7 @@ def render(payload: dict, *, profile: str = "", rows: list[dict] = ()) -> dict:
         size += len(entry) + 1
     block = "\n".join([HEADER, NOTICE, *parts, FOOTER]) if parts else ""
     log = payload.get("context_memory_log") or {}
-    known = isinstance(cards, list) and isinstance(log, dict) and log.get("mode") != "failed"
+    known = isinstance(cards, list) and isinstance(log, dict) and log.get("mode") not in {"failed", "unavailable"}
     view = {"block": block, "ids": ids, "chars": len(block),
             "selected": len(cards) if known else None,
             "selection_status": "ok" if known else "unavailable"}
