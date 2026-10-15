@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Hosted Resident startup now revalidates configuration under the same per-user
+  lock as Model API deletion. Stale discovery results cannot start a consumer
+  after deletion; already admitted consumers retain ownership until their owner
+  confirms exit. Runtime V2 drain observations distinguish unknown process state
+  from idle, including parent and slot generations.
+
 - Plaintext automatic recall no longer falls back to enclave content reads.
   Required conversation and owner/binding failures stop the turn; a malformed
   same-owner optional memory makes the whole recall result unavailable without

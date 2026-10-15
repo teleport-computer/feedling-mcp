@@ -91,6 +91,27 @@ but process separation on a generic host is not equivalent to a hardware-backed
 confidential-VM boundary. See [self-hosting](/docs/self-hosting) before choosing a
 deployment topology.
 
+### Hosted runtime admission and drain evidence
+
+Hosted Resident supervisors serialize lease acquisition and process startup with
+per-user Model API configuration mutations. They revalidate the active tested
+route and runtime generation before startup; configuration deletion cannot
+complete between that validation and process tracking. A process admitted before
+a later deletion is stopped by its owning supervisor. Its lease remains owned
+until that supervisor confirms exit; lease expiry alone is not an exit receipt.
+Deleting Model API configuration fences V2 work and removes routes, but is not a
+synchronous assertion that every previously admitted process has exited.
+
+Runtime V2 parent observations include process and slot generations, monotonic
+progress times, and explicit unknown states for missing or invalid snapshots.
+A new database heartbeat can still contain an old idle snapshot. Bounded test
+acceptance therefore requires a post-fence heartbeat, a later iteration from the
+same parent, and child idle progress after that later sample. The test harness
+uses this proof only for an explicitly reviewed exclusive test runner and all
+its configured pools; it does not certify unrelated shared runners. Missing,
+restarted, busy, or unknown execution evidence prevents account cleanup.
+These observations contain process metadata, not conversation content.
+
 ## Components and responsibilities
 
 | Component | Primary responsibility | Data it can handle |

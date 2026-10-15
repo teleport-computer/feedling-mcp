@@ -1690,7 +1690,7 @@ def test_turn_heartbeat_advertises_slot_capacity(monkeypatch):
     )
 
 
-def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free(
+def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_content_free(
     monkeypatch,
 ):
     from model_api_runtime.v2 import pool_supervisor
@@ -1716,6 +1716,14 @@ def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free
         def snapshots(self):
             return {key: None for key in self.keys()}
 
+        def supervisor(self, key):
+            from types import SimpleNamespace
+            return SimpleNamespace(drain_witness=lambda: {
+                'slot_id':f'{key.pool}-{key.index}', 'slot_generation':'synthetic-boot',
+                'pid':123, 'sample_monotonic':10, 'progress_monotonic':None,
+                'state':'unknown',
+            })
+
         def broker_snapshot(self):
             return {
                 "limit": 4,
@@ -1732,13 +1740,13 @@ def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free
 
     monkeypatch.setattr(jobs_store, "record_worker_heartbeat", _record)
     asyncio.run(
-        serve_worker._fleet_heartbeat_loop(
+        asyncio.wait_for(serve_worker._fleet_heartbeat_loop(
             "worker",
             "foreground",
             _Fleet(),
             stop,
             interval=0.01,
-        )
+        ), timeout=2)
     )
 
     state = calls[0][1]["runtime_state"]
@@ -1748,7 +1756,6 @@ def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free
         "user_id",
         "job_id",
         "claimed_by",
-        "slot_generation",
         "provider_url",
         "message_text",
         "memory_content",
@@ -1756,6 +1763,9 @@ def test_foreground_fleet_heartbeat_runtime_state_is_bounded_and_identifier_free
     ):
         assert forbidden not in encoded
 
+    assert len(state['drain']['slots']) == 4
+    assert all(s['state']=='unknown' for s in state['drain']['slots'])
+    assert state['drain']['parent_generation']
 
 # ------------------------------------------------------------------
 # FIX 3: "v2_jobs" immediate-wake bridge (wake_bus notify -> asyncio.Event)

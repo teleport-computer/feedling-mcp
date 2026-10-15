@@ -18,11 +18,20 @@ patched, so this file is in conftest's ``_PURE_UNIT`` set.
 import sys
 import threading
 import time as _time
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from agent_runtime import supervisor as supervisor_mod
+
+
+@pytest.fixture(autouse=True)
+def stable_admission_version(monkeypatch):
+    # This suite isolates TTL/concurrency; real version/envelope fencing is
+    # covered by test_resident_admission_fence with actual admission helpers.
+    monkeypatch.setattr(supervisor_mod.admission,'capture',lambda uid,entry:(1,'route','credential','version','digest'))
+    monkeypatch.setattr(supervisor_mod.admission,'envelope_matches',lambda binding,env:True)
 
 
 def _enabled(*uids):
