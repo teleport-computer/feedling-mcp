@@ -216,3 +216,42 @@ def resident_guard(manifest, *, connector=connect, read_budget=None):
                    or not 0 <= float(r[2]) <= 30 for r in rows)):
         raise RuntimeError('Resident guarded release/inventory unconfirmed')
     return {'owners':sorted(expected),'release':manifest['expected_release'], 'fresh':True}
+
+
+def verify_input_count(manifest, *, now=None):
+    """Review-bound authorization/fee facts; hashes do not create authority.
+
+    Disabled is the default operational posture until the endpoint's fee and
+    exact-payload compatibility have actually been established and reviewed.
+    """
+    if manifest['input_count']['enabled'] is not True:
+        raise RuntimeError('input counting disabled: authorization/fee facts required')
+    path = Path(manifest['input_count_receipt'])
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError('input count receipt missing')
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != manifest['receipt_sha256']['input_count_receipt']:
+        raise RuntimeError('input count receipt changed')
+    value = json.loads(raw)
+    expected = dict(run_id=manifest['run_id'], model=manifest['model'],
+        account_scope=manifest['billing']['account_scope'],
+        input_count=manifest['input_count'], endpoint='https://api.openai.com/v1/responses/input_tokens',
+        exact_final_payload_supported=True, authorized=True,
+        receipt_sha256={k:v for k,v in manifest['receipt_sha256'].items() if k != 'input_count_receipt'})
+    if any(value.get(k) != v for k,v in expected.items()):
+        raise RuntimeError('input count authorization binding mismatch')
+    at = time.time() if now is None else now
+    start, end = value.get('valid_from_epoch'), value.get('valid_until_epoch')
+    if (type(start) not in (int,float) or type(end) not in (int,float)
+            or not math.isfinite(start) or not math.isfinite(end) or not start <= at < end):
+        raise RuntimeError('input count authorization expired')
+    # Keep reviewable source facts separate from assertions in this receipt.
+    for name in ('fee_evidence', 'payload_compatibility_evidence', 'authorization_evidence'):
+        item = value.get(name)
+        if not isinstance(item, dict) or not isinstance(item.get('path'), str):
+            raise RuntimeError('input count evidence missing')
+        source = Path(item['path'])
+        if (not source.is_absolute() or source.is_symlink() or not source.is_file()
+                or hashlib.sha256(source.read_bytes()).hexdigest() != item.get('sha256')):
+            raise RuntimeError('input count evidence changed')
+    return value
