@@ -573,17 +573,17 @@ async def extract(
                     _record_truncation_failure(shape)
                     return None, "output_truncated"
                 seen_truncation = True
-            # An empty reply cut at the output cap (thinking spent the budget)
-            # is still a truncation: the component decides whether to re-ask.
-            last_truncated_shape = shape if truncated and not reply else None
+            # Keep the final cut-off response shape even when it has partial text.
+            # The component may have no retry left after a format/semantic retry.
+            last_truncated_shape = shape if truncated else None
             session.feed(reply or "", truncated=truncated)
             await _emit_component_steps()
         outcome = session.result()
         # 收尾那一步（丢掉仍不合格的卡）发生在 result() 里，要再翻一次才看得见。
         await _emit_component_steps()
         if outcome.error and last_truncated_shape is not None:
-            # The component had no retry left for that empty, cut-off reply, so
-            # it parsed "" — report the real cause, not a bogus format error.
+            # Parsing an incomplete final reply must not hide its known output cap.
+            # Successfully parsed results retain the component's existing policy.
             _record_truncation_failure(last_truncated_shape)
             return None, "output_truncated"
         if outcome.error:

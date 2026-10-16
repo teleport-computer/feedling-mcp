@@ -340,7 +340,10 @@ and phase timeouts. Only a reply stopped at the output limit triggers a larger
 re-ask: twice the configured Capture budget (3,000 by default), capped by the
 shared provider output ceiling, with 180-second wire and phase timeouts. A
 second truncated reply ends the job with `output_truncated`; the budget does
-not keep increasing. Format or semantic re-asks retain the original limits.
+not keep increasing. If the component has no re-ask remaining and its final
+output-limited reply cannot be parsed, the job also records `output_truncated`,
+including when that reply contains partial text. A successfully parsed result
+keeps the component’s existing handling. Format or semantic re-asks retain the original limits.
 Only already-truncated jobs can spend more output tokens on this re-ask;
 normal jobs keep their existing budget and number of calls.
 
