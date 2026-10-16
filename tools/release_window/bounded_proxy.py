@@ -37,6 +37,9 @@ def payload(raw, limits):
         value = json.loads(raw)
     except (ValueError, UnicodeError):
         raise Refused("json") from None
+    if limits['model'] == 'openai/gpt-4o-mini':
+        from .openrouter_bound import payload as or_payload
+        return or_payload(value, limits)
     allowed = {"model", "input", "instructions", "tools", "tool_choice",
                "parallel_tool_calls", "max_output_tokens", "store", "reasoning",
                "prompt_cache_key", "stream"}
@@ -103,6 +106,9 @@ class Run:
         self.count_requests = 0
         self.reserved_input_tokens = self.reserved_nanodollars = 0
         self.billing = self.manifest["billing"]
+        self.is_openrouter = self.manifest["lane"] == "openrouter-v2-text"
+        self.upstream = "https://openrouter.ai/api/v1/chat/completions" if self.is_openrouter else UPSTREAM
+        self.relay_path = "/v1/chat/completions" if self.is_openrouter else "/v1/responses"
         self.stopped = False
         self.failure_reason = None
         self.billing_bound_breached = False
@@ -195,7 +201,8 @@ class Run:
             self.record({"event": "send_reserved", "attempt": self.attempts,
                          "phase": self.phase, "input_bytes": len(body), "total_input_bytes": self.input_bytes,
                          "input_tokens_reserved": input_reservation,
-                         "input_tokens_counted": count,
+                         "input_tokens_counted": None if self.is_openrouter else count,
+                         "input_bound_kind": self.billing["input_bound_kind"],
                          "payload_sha256": hashlib.sha256(body).hexdigest(),
                          "total_input_tokens_reserved": self.reserved_input_tokens,
                          "output_tokens_reserved": self.limits['output_tokens_per_start'],
@@ -216,7 +223,7 @@ class Run:
                              "reason": "deadline", "usage": "UNKNOWN"})
                 raise Refused("deadline_after_reservation")
             try:
-                with self.client.stream("POST", UPSTREAM, content=body,
+                with self.client.stream("POST", self.upstream, content=body,
                         headers={"Authorization": "Bearer " + self.key,
                                  "Content-Type": "application/json"},
                         timeout=min(20.0, remaining)) as response:
@@ -231,6 +238,8 @@ class Run:
                     try:
                         value = json.loads(result)
                         usage = value.get("usage") if isinstance(value, dict) else None
+                        if self.is_openrouter and isinstance(usage, dict):
+                            usage = {"input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens"), "total_tokens": usage.get("total_tokens")}
                     except (ValueError, UnicodeError):
                         usage = None
                     # Project numbers only, never provider text or unknown fields.
@@ -271,6 +280,8 @@ class Run:
         """
         try:
             verify_input_count(self.manifest)
+            if self.is_openrouter:
+                return 128000  # Whole model context reservation, NOT a measured count.
             config = self.manifest['input_count']
             fee = count_cost_reservation(self.manifest)
             if (self.count_requests >= config['max_requests']
@@ -376,7 +387,7 @@ def handler(run):
             try:
                 if not run.auth(self.headers.get("Authorization")):
                     status = 401
-                elif self.path != "/v1/responses":
+                elif self.path != run.relay_path:
                     status = 404
                 else:
                     paid = self.headers.get('X-T779-Probe') is None
