@@ -221,9 +221,13 @@ def resident_guard(manifest, *, connector=connect, read_budget=None):
 def verify_input_count(manifest, *, now=None):
     """Review-bound authorization/fee facts; hashes do not create authority.
 
-    Disabled is the default operational posture until the endpoint's fee and
+    The fixed OpenRouter lane verifies a context-bound receipt instead.
+    For OpenAI, disabled is the default operational posture until the endpoint's fee and
     exact-payload compatibility have actually been established and reviewed.
     """
+    if manifest.get('lane') == 'openrouter-v2-text':
+        from .openrouter_bound import verify
+        return verify(manifest, now=now)
     if manifest['input_count']['enabled'] is not True:
         raise RuntimeError('input counting disabled: authorization/fee facts required')
     path = Path(manifest['input_count_receipt'])

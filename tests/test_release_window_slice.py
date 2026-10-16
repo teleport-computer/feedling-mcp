@@ -669,3 +669,171 @@ def test_count_authority_changed_during_reservation_prevents_all_dispatch(tmp_pa
     assert closed['count_reservations']==1 and closed['send_reservations']==0
     assert closed['total_nanodollars_reserved']==10000000
     assert closed['total_input_tokens_reserved']==0
+
+# Fixed OpenRouter lane: no real transport, credentials or enabling receipt.
+def or_manifest(tmp_path):
+    import hashlib, time
+    from tools.release_window import openrouter_bound as ob
+    m=manifest()
+    m.update(lane=contract.OR_LANE,model=contract.OR_MODEL,
+             input_count=dict(enabled=False,max_requests=0,timeout_seconds=0,usd_per_request_cap='0'))
+    m.pop('input_count_receipt')
+    m['billing'].update(model=contract.OR_MODEL,input_bound_kind='fixed_provider_context',
+        enforced_input_tokens_max=128000,uncached_input_usd_per_million='0.15',
+        billable_output_usd_per_million='0.60',max_cost_usd='0.12',funded_remaining_usd='0.595560704',task_cap_usd='0.12')
+    m['limits'].update(input_tokens_per_start=128000,total_input_tokens=512000)
+    m['receipt_sha256']={}
+    for name in contract.receipt_names(m):
+        p=tmp_path/name;p.write_text('{}');m[name]=str(p)
+        m['receipt_sha256'][name]=hashlib.sha256(p.read_bytes()).hexdigest()
+    e=tmp_path/'synthetic-evidence';e.write_text('SYNTHETIC NOT AUTHORITY')
+    source={'path':str(e),'sha256':hashlib.sha256(e.read_bytes()).hexdigest()}
+    data=dict(run_id=m['run_id'],model=m['model'],endpoint=ob.ENDPOINT,
+        account_scope=m['billing']['account_scope'],billing=m['billing'],limits=m['limits'],
+        provider_policy=ob.POLICY,context_tokens=128000,context_is_full_billable_input_upper_bound=True,
+        output_limit_includes_all_billable_tokens=True,no_extra_fees_or_byok=True,
+        errors_do_not_exceed_reserved_cost=True,authorized=True,
+        receipt_sha256={k:v for k,v in m['receipt_sha256'].items() if k!='input_bound_receipt'},
+        valid_from_epoch=time.time()-60,valid_until_epoch=time.time()+600,
+        **{k:source for k in ('context_evidence','pricing_evidence','funding_evidence','authorization_evidence')})
+    p=Path(m['input_bound_receipt']);p.write_text(json.dumps(data))
+    m['receipt_sha256']['input_bound_receipt']=hashlib.sha256(p.read_bytes()).hexdigest()
+    return m
+
+
+def or_body(**changes):
+    v=dict(model='openai/gpt-4o-mini',messages=[dict(role='user',content='synthetic')],max_tokens=1024)
+    v.update(changes);return json.dumps(v).encode()
+
+
+def or_run(tmp_path, handler=None):
+    m=or_manifest(tmp_path);calls=[]
+    def dispatch(req):
+        calls.append(req)
+        return handler(req) if handler else httpx.Response(200,json={'usage':{'prompt_tokens':7,'completion_tokens':2,'total_tokens':9}})
+    return proxy.Run(token='synthetic'*8,upstream_key='fake-or-key',journal=tmp_path/'ledger',manifest=m,
+        transport=httpx.MockTransport(dispatch)),calls
+
+
+def test_or_exact_route_price_policy_and_no_count(tmp_path):
+    from tools.release_window import openrouter_bound as ob
+    run,calls=or_run(tmp_path)
+    for phase in contract.PHASES:
+        if phase!='setup':run.set_phase(phase)
+        run.forward(or_body())
+    with pytest.raises(proxy.Refused):run.forward(or_body())
+    run.close()
+    assert len(calls)==4 and all(str(r.url)==ob.ENDPOINT for r in calls)
+    v=json.loads(calls[0].content)
+    assert v['provider']==ob.POLICY and v['tool_choice']=='none' and v['n']==1 and v['max_tokens']==300
+    assert run.count_requests==0 and run.reserved_input_tokens==512000
+    # Full context reservation, never charged as a measured token count.
+    assert run.reserved_nanodollars==4*(19200000+180000)
+    rows=[json.loads(x) for x in (tmp_path/'ledger').read_text().splitlines()]
+    assert all(x['input_tokens_counted'] is None for x in rows if x['event']=='send_reserved')
+    assert proxy.verify_closed_admission(tmp_path/'ledger')['count_reservations']==0
+    assert 'fake-or-key' not in (tmp_path/'ledger').read_text()
+
+
+@pytest.mark.parametrize('change',[
+    {'model':'openai/gpt-4o'}, {'models':['other']}, {'provider':{'allow_fallbacks':True}},
+    {'plugins':[{'id':'web'}]}, {'stream':True}, {'n':2}, {'reasoning':{'effort':'high'}},
+    {'messages':[{'role':'user','content':[{'type':'image_url','image_url':{'url':'https://invalid'}}]}]},
+    {'messages':[{'role':'user','content':'x','tool_calls':None}]},
+    {'tools':[{'type':'web_search'}]}, {'max_tokens':True},
+])
+def test_or_rejects_escape_fields_before_any_send(tmp_path,change):
+    run,calls=or_run(tmp_path)
+    with pytest.raises(proxy.Refused):run.forward(or_body(**change))
+    run.close();assert calls==[] and run.attempts==0
+
+
+@pytest.mark.parametrize('kind',['redirect','error','unknown_usage','excess_input','excess_output','timeout'])
+def test_or_first_uncertain_or_failed_request_consumes_then_stops(tmp_path,kind):
+    def respond(req):
+        if kind=='timeout':raise httpx.ReadTimeout('synthetic')
+        if kind=='redirect':return httpx.Response(302,headers={'Location':'https://other.invalid'})
+        if kind=='error':return httpx.Response(429,json={'error':'synthetic'})
+        if kind=='unknown_usage':return httpx.Response(200,json={})
+        i,o=(128001,2) if kind=='excess_input' else (7,1025)
+        return httpx.Response(200,json={'usage':{'prompt_tokens':i,'completion_tokens':o,'total_tokens':i+o}})
+    run,calls=or_run(tmp_path,respond)
+    try:run.forward(or_body())
+    except proxy.Refused:pass
+    reserved=run.reserved_nanodollars
+    with pytest.raises(proxy.Refused):run.forward(or_body())
+    run.close();assert len(calls)==1 and run.attempts==1 and reserved>0 and run.reserved_nanodollars==reserved
+
+
+def test_or_authority_change_during_reservation_blocks_dispatch(tmp_path):
+    run,calls=or_run(tmp_path);record=run.record
+    def delayed(row):
+        record(row)
+        if row['event']=='send_reserved':Path(run.manifest['execution_approval_receipt']).write_text('revoked')
+    run.record=delayed
+    with pytest.raises(proxy.Refused):run.forward(or_body())
+    assert run.attempts==1 and run.reserved_nanodollars>0 and calls==[]
+    run.close()
+
+
+def test_or_full_context_cost_never_uses_wire_byte_estimate(tmp_path):
+    m=or_manifest(tmp_path);m['billing']['enforced_input_tokens_max']=1000
+    with pytest.raises(ValueError,match='full_context_reservation'):contract.validate_manifest(m)
+    m=or_manifest(tmp_path);m['billing']['funded_remaining_usd']='0.0001'
+    with pytest.raises(ValueError,match='one_start_funded'):contract.validate_manifest(m)
+
+
+def test_or_expiry_after_all_evidence_reads(tmp_path,monkeypatch):
+    from tools.release_window import openrouter_bound as ob
+    m=or_manifest(tmp_path);data=json.loads(Path(m['input_bound_receipt']).read_text())
+    monkeypatch.setattr(ob.time,'time',lambda:data['valid_until_epoch']+1)
+    with pytest.raises(RuntimeError,match='expired'):ob.verify(m)
+
+
+def test_or_parallel_arrivals_share_setup_cap(tmp_path):
+    run,calls=or_run(tmp_path)
+    def send(_):
+        try:return run.forward(or_body())[0]
+        except proxy.Refused:return 0
+    with ThreadPoolExecutor(max_workers=4) as pool:results=list(pool.map(send,range(4)))
+    run.close();assert results.count(200)==1 and len(calls)==1
+
+
+def test_or_real_backend_chat_builder_matches_fixed_lane(tmp_path):
+    from provider_client import _build_openai_compat_payload
+    m=or_manifest(tmp_path)
+    built=_build_openai_compat_payload(provider='openai_compatible',model=m['model'],
+        messages=[{'role':'user','content':'synthetic'}],temperature=0.2,max_tokens=500,
+        response_format=None,extra_body=None,include_reasoning=True)
+    encoded=json.loads(proxy.payload(json.dumps(built).encode(),m['limits']|{'model':m['model']}))
+    assert encoded['messages']==built['messages'] and encoded['max_tokens']==300
+    assert 'reasoning' not in encoded and 'session_id' not in encoded
+
+
+@pytest.mark.parametrize('mode', ['expired', 'revoked'])
+def test_or_initial_authority_failure_is_irreversible(tmp_path, monkeypatch, mode):
+    from tools.release_window import openrouter_bound as ob
+    run, calls = or_run(tmp_path)
+    receipt = Path(run.manifest['execution_approval_receipt'])
+    saved = receipt.read_bytes()
+    try:
+        with monkeypatch.context() as patch:
+            if mode == 'expired':
+                patch.setattr(ob.time, 'time', lambda: 10**12)
+            else:
+                receipt.write_text('PRIVATE_REVOKED_SYNTHETIC')
+            with pytest.raises(proxy.Refused, match='input_count_failed'):
+                run.forward(or_body())
+            assert run.stopped and calls == []
+        receipt.write_bytes(saved)
+        ob.verify(run.manifest)  # Authority is valid again, but this run stays stopped.
+        with pytest.raises(proxy.Refused, match='stopped_or_deadline'):
+            run.forward(or_body())
+        assert calls == [] and run.attempts == 0 and run.count_requests == 0
+        rows = [json.loads(x) for x in (tmp_path/'ledger').read_text().splitlines()]
+        failures = [x for x in rows if x['event'] == 'run_failed']
+        assert failures == [{'event': 'run_failed', 'reason': 'input_count_failed', 'phase': 'setup'}]
+        assert 'PRIVATE_REVOKED_SYNTHETIC' not in (tmp_path/'ledger').read_text()
+    finally:
+        receipt.write_bytes(saved)
+        run.close()

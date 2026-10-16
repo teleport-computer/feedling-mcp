@@ -278,3 +278,37 @@ Runnable manifests with fewer than the 48 source-path minimum read units are
 rejected before fixture creation. This is only a lower bound: the independently
 reviewed plan must still include finite polling and cleanup headroom. Synthetic
 unit fixtures using 64 reads are not real execution approval or a funded plan.
+
+### Fixed OpenRouter text candidate
+
+The separately reviewed `openrouter-v2-text` lane targets only
+`openai/gpt-4o-mini` through OpenRouter Chat Completions. The fixture is configured
+as `openai_compatible` against the owned relay; the relay takes the existing
+`E2E_KEY_OPENROUTER` credential. Provider selection is fixed to OpenAI with
+fallback disabled, required parameter support and price ceilings of USD0.15/M
+input, USD0.60/M output and zero per-request surcharge. Hosted plugins,
+multimodal inputs, hidden conversation references and alternate models are
+rejected. Function schemas/history remain in the input; tool execution is
+forced off. This lane does not certify tools, Hosted Resident or VPS behavior.
+
+It reserves the complete128000-token model context per upstream start, not a
+byte-to-token estimate or a measured input count. No count endpoint is called.
+At1024 maximum total output tokens, each reservation is USD0.0198144; six starts
+reserve USD0.1188864. The local cap is at most USD0.12 and cannot exceed the
+reviewed eligible funding/task cap. Setup, continuation and background starts
+consume the same phase/total budgets; unknown outcomes do not refund them.
+
+An `input_bound_receipt` replaces the OpenAI count receipt for this lane. It must
+bind independently reviewed full billable context/output limits, pricing,
+error/timeout fee bounds, no additional fees/BYOK, actual existing funding and
+execution authority. Evidence is rechecked after durable reservation and before
+dispatch, including expiry. No enabling receipt is included with the code.
+Published context and list prices do not alone establish error charging,
+exclusive funding, account capability or live execution readiness. A balance
+snapshot is not an exclusive allocation. If any of these facts is unproven,
+execution remains closed; the implementation is available for local review.
+
+The existing owned fixture, bounded selection/dialogue, admission closure,
+worker drain, durable absence and old-key rejection cleanup remain required.
+The OpenRouter lane uses the same cleanup path; changing provider does not
+reuse a consumed marker or waive route/environment identity.

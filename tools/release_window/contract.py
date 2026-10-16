@@ -1,4 +1,4 @@
-"""One explicit OpenAI V2 slice. Structural validation is not live approval."""
+"""Two fixed provider V2 text slices. Structural validation is not live approval."""
 from decimal import Decimal, ROUND_CEILING
 import hashlib
 import json
@@ -6,6 +6,12 @@ import re
 from urllib.parse import urlsplit
 
 RECEIPTS = ('funded_budget_receipt', 'model_availability_receipt', 'execution_approval_receipt', 'billing_contract_receipt', 'execution_environment_receipt', 'input_count_receipt')
+
+OR_LANE = 'openrouter-v2-text'
+OR_MODEL = 'openai/gpt-4o-mini'
+
+def receipt_names(value):
+    return RECEIPTS[:-1] + ('input_bound_receipt',) if value.get('lane') == OR_LANE else RECEIPTS
 
 PHASES = ('setup', 'dialogue_1', 'dialogue_2', 'background')
 
@@ -19,16 +25,17 @@ def validate_manifest(value):
     need(isinstance(value, dict), 'manifest')
     value = json.loads(json.dumps(value))
     need(value.get('api_url') == 'https://test-api.feedling.app', 'test_origin')
-    need(value.get('lane') == 'openai-official-v2-text', 'lane')
-    need(value.get('model') == 'gpt-5.4-mini', 'fixed_model')
+    is_or = value.get('lane') == OR_LANE
+    need(value.get('lane') in ('openai-official-v2-text', OR_LANE), 'lane')
+    need(value.get('model') == (OR_MODEL if is_or else 'gpt-5.4-mini'), 'fixed_model')
     need(isinstance(value.get('run_id'), str) and re.fullmatch(r'[a-zA-Z0-9_-]{8,80}', value['run_id']), 'run_id')
     need(isinstance(value.get('expected_release'), str) and re.fullmatch('[0-9a-f]{40}', value['expected_release']), 'release')
-    for name in RECEIPTS:
+    for name in receipt_names(value):
         need(isinstance(value.get(name), str) and value[name].strip(), name)
     need(isinstance(value.get('claim_path'), str) and value['claim_path'].startswith('/'), 'exclusive_claim_path')
     hashes = value.get('receipt_sha256')
     need(isinstance(hashes, dict), 'receipt_sha256')
-    for name in RECEIPTS:
+    for name in receipt_names(value):
         need(isinstance(hashes.get(name), str) and re.fullmatch('[0-9a-f]{64}', hashes[name]), name+'_sha256')
     origin = value.get('relay_origin')
     need(isinstance(origin, str), 'relay_origin')
@@ -56,20 +63,23 @@ def validate_manifest(value):
                  'total_output_tokens', 'wall_seconds', 'drain_seconds', 'cleanup_seconds', 'poll_seconds', 'read_requests'):
         need(type(limits.get(name)) is int and limits[name] > 0, name)
     need(limits['output_tokens_per_start'] <= 1024, 'reasoning_and_visible_output_cap')
-    count = value.get('input_count')
-    need(isinstance(count, dict), 'input_count')
-    need(type(count.get('enabled')) is bool, 'input_count_enabled')
-    need(type(count.get('max_requests')) is int and 0 < count['max_requests'] <= limits['starts'], 'count_requests')
-    need(type(count.get('timeout_seconds')) is int and 0 < count['timeout_seconds'] <= 20, 'count_timeout')
-    fee = count.get('usd_per_request_cap')
-    need(isinstance(fee, str) and re.fullmatch(r'[0-9]{1,9}(?:\.[0-9]{1,9})?', fee), 'count_fee_cap')
+    if is_or:
+        need(value.get('input_count') == {'enabled':False,'max_requests':0,'timeout_seconds':0,'usd_per_request_cap':'0'}, 'no_count_route')
+    else:
+        count = value.get('input_count')
+        need(isinstance(count, dict), 'input_count')
+        need(type(count.get('enabled')) is bool, 'input_count_enabled')
+        need(type(count.get('max_requests')) is int and 0 < count['max_requests'] <= limits['starts'], 'count_requests')
+        need(type(count.get('timeout_seconds')) is int and 0 < count['timeout_seconds'] <= 20, 'count_timeout')
+        fee = count.get('usd_per_request_cap')
+        need(isinstance(fee, str) and re.fullmatch(r'[0-9]{1,9}(?:\.[0-9]{1,9})?', fee), 'count_fee_cap')
     billing = value.get('billing')
     # Source-path minimum including cleanup, not a recommended execution cap.
     # Reviewed plans must additionally budget finite convergence/drain polling.
     need(limits['read_requests'] >= 48, 'minimum_complete_path_reads')
     need(isinstance(billing,dict), 'billing')
     need(billing.get('model') == value['model'] and billing.get('currency') == 'USD', 'exact_model_currency')
-    need(billing.get('input_bound_kind') == 'responses_input_tokens', 'verified_input_bound')
+    need(billing.get('input_bound_kind') == ('fixed_provider_context' if is_or else 'responses_input_tokens'), 'verified_input_bound')
     need(type(billing.get('enforced_input_tokens_max')) is int
          and 0 < billing['enforced_input_tokens_max'] <= limits['input_tokens_per_start'], 'input_hard_cap_fits')
     need(billing.get('output_cap_includes_reasoning') is True, 'billable_output_bound')
@@ -82,6 +92,11 @@ def validate_manifest(value):
         need(Decimal(amount) >= 0 if field == 'extra_usd_per_start' else Decimal(amount) > 0, field)
     need(limits['total_input_tokens'] >= billing['enforced_input_tokens_max'], 'input_reservations')
     need(cost_reservation(billing, limits['output_tokens_per_start']) + count_cost_reservation(value) <= cost_ceiling(billing), 'one_start_funded')
+    if is_or:
+        need(billing['enforced_input_tokens_max'] == 128000, 'full_context_reservation')
+        need(billing['uncached_input_usd_per_million'] == '0.15' and billing['billable_output_usd_per_million'] == '0.60' and billing['extra_usd_per_start'] == '0', 'fixed_or_prices')
+        need(limits['starts'] <= 6 and limits['wall_seconds'] <= 600, 'or_batch_cap')
+        need(cost_ceiling(billing) <= 120000000, 'or_money_cap')
     allocations = limits.get('allocations')
     need(isinstance(allocations, dict) and set(allocations) == set(PHASES), 'allocations')
     phases = limits.get('phase_starts')

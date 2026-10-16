@@ -17,7 +17,7 @@ import httpx
 from tools.e2e.client import E2EClient, _write_private_json, FALLBACK_TEXTS
 from tools.e2e.continuity_probe import _replies_for
 from . import bounded_proxy as proxy, receipts, drain
-from .contract import validate_manifest, digest, RECEIPTS
+from .contract import validate_manifest, digest, RECEIPTS, receipt_names
 
 def check_candidate(health, metrics, expected):
     if health.get("status") != "healthy" or health.get("release", {}).get("git_commit") != expected:
@@ -72,7 +72,7 @@ def exercise(owner, run, reads, *, connector=receipts.connect, sleep=time.sleep)
     owner.verify()
     if c.content_encryption_effective != 'off':
         raise RuntimeError('plaintext fixture required')
-    r = c.post('/v1/model_api/setup', json={'provider': 'openai', 'model': run.manifest['model'],
+    r = c.post('/v1/model_api/setup', json={'provider': 'openai_compatible' if run.manifest['lane'] == 'openrouter-v2-text' else 'openai', 'model': run.manifest['model'],
         'api_key': run.token, 'base_url': run.manifest['relay_origin'] + '/v1'}, _retries=1, timeout=30)
     r.raise_for_status()
     setup = r.json()
@@ -262,7 +262,7 @@ def execute(manifest, out, *, connector=receipts.connect):
     _write_private_json(out/'manifest.json', manifest)
     # Named receipts must exist; their authority/applicability is independently
     # reviewed before invoking --run. Shapes/hashes here do not create approval.
-    for name in RECEIPTS:
+    for name in receipt_names(manifest):
         source = Path(manifest[name])
         if not source.is_file() or source.is_symlink():
             raise RuntimeError('reviewed receipt unavailable')
@@ -308,13 +308,13 @@ def _execute_claimed(manifest, out, connector, result, progress):
         _write_private_json(out/'resident-guard-preflight.json', receipts.resident_guard(manifest, connector=connector, read_budget=reads))
         try:
             progress['stage'] = 'relay_start'
-            run = proxy.Run(token=secrets.token_urlsafe(32), upstream_key=os.environ['E2E_KEY_OPENAI'],
+            run = proxy.Run(token=secrets.token_urlsafe(32), upstream_key=os.environ['E2E_KEY_OPENROUTER' if manifest['lane'] == 'openrouter-v2-text' else 'E2E_KEY_OPENAI'],
                             journal=out/'proxy.jsonl', manifest=manifest)
             server = proxy.ThreadingHTTPServer(('127.0.0.1', manifest['relay_port']), proxy.handler(run))
             thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
             with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as relay:
                 reads.use()
-                probe = relay.post(manifest['relay_origin']+'/v1/responses', content=b'{}',
+                probe = relay.post(manifest['relay_origin']+run.relay_path, content=b'{}',
                     headers={'Authorization':'Bearer '+run.token,'X-T779-Probe':run.probe_nonce})
                 with run.lock:
                     if not (run.probe_received and run.attempts == 0 and probe.status_code == 200
