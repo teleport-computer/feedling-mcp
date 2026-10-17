@@ -33,6 +33,12 @@ ios/vendor/dcap-qvl/target/
 
 # Local agent mailbox runtime (messages, inboxes, pane config)
 .agents/
+!.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/feedling-db-query/
+!.agents/skills/feedling-db-query/SKILL.md
 buildServer.json
 deploy/backups/
 
