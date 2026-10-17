@@ -362,9 +362,14 @@ def _drive_real_enqueue(monkeypatch, runtime_mode):
     from perception import service
 
     legacy_jobs, v2_jobs = [], []
+    def append_proactive_job(job):
+        legacy_jobs.append(job)
+        return job
+
     user_store = types.SimpleNamespace(
         proactive_activation_ready=lambda: True,
-        append_proactive_job=lambda job: legacy_jobs.append(job),
+        append_proactive_job=append_proactive_job,
+        append_proactive_job_strict=append_proactive_job,
     )
     monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
     monkeypatch.setattr(core_store, "get_store_per_load_mode",
@@ -376,10 +381,10 @@ def _drive_real_enqueue(monkeypatch, runtime_mode):
     monkeypatch.setattr(core_wake_bus, "notify", lambda *_a: None)
     monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda uid: None)
 
-    port = FeedlingWakePort(
-        submit=lambda ev: service._fire_wake_event_v2(ev) or True)
-    before, _, after = _between_now(lambda: port.wake(_late_photo_event(), None))
-    return legacy_jobs, v2_jobs, before, after
+    port = FeedlingWakePort(submit=service._fire_wake_event_v2)
+    before, receipt, after = _between_now(
+        lambda: port.wake(_late_photo_event(), None))
+    return legacy_jobs, v2_jobs, receipt, before, after
 
 
 def test_v1_job_is_visible_past_a_cursor_that_moved_on_after_first_receipt(monkeypatch):
@@ -387,20 +392,22 @@ def test_v1_job_is_visible_past_a_cursor_that_moved_on_after_first_receipt(monke
     job 推到 T0 之后；现在重投 —— job 必须排在游标后面，不然永远读不到。"""
     from hosted import config_store as hosted_config_store
     cursor = T0.timestamp() + 60
-    legacy, v2, before, after = _drive_real_enqueue(
+    legacy, v2, receipt, before, after = _drive_real_enqueue(
         monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT)
     assert v2 == []
     assert len(legacy) == 1
+    assert receipt.runtime_ref == f"resident-job:{legacy[0]['job_id']}"
     assert before <= legacy[0]["ts"] <= after
     assert legacy[0]["ts"] > cursor
 
 
 def test_v2_job_timestamp_is_the_delivery_time(monkeypatch):
     from hosted import config_store as hosted_config_store
-    legacy, v2, before, after = _drive_real_enqueue(
+    legacy, v2, receipt, before, after = _drive_real_enqueue(
         monkeypatch, hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2)
     assert legacy == []
     assert len(v2) == 1
+    assert receipt.runtime_ref == "v2-job:1"
     assert before <= v2[0]["context_ts"] <= after
     assert v2[0]["context_doc"]["created_at"] == v2[0]["context_ts"]
 
