@@ -1,55 +1,25 @@
 ---
 name: feedling-db-query
 description: >-
-  Query Feedling IO PostgreSQL in test, pre, or prod with read-only SQL. Use for
-  查数据库、查 SQL、查用户数据、核对主库、RDS/TEE PostgreSQL 查询、memory_moments、
-  chat_messages、user_blobs、proactive_jobs and tee_sync_runs. For CVM logs,
+  Query Feedling IO TEE PostgreSQL in test, pre, or prod with read-only SQL. Use for
+  查 TEE 数据库、查 SQL、查用户数据、核对 TEE 主库、memory_moments、
+  chat_messages、user_blobs and world_book_entries. For CVM logs,
   CPU, memory, deployment or SSH, use feedling-ops-recon instead.
 ---
 
-# Feedling IO 数据库查询
+# Feedling IO TEE 数据库查询
 
-## 先确认要查哪一个库
+## 先确认环境与主库状态
 
-三套环境各有 PostgreSQL。旧 AWS RDS 和 Phala TEE PostgreSQL 可能同时存在；
-`feedling-io-db-<env>` 这个名字也不能证明它是影子库还是主库。
-`docs/CURRENT_STATE.md` 和 `deploy/DEPLOYMENTS.md` 是接线说明，不能代替线上状态。
+test、pre、prod 各有独立的 TEE PostgreSQL。`feedling-io-db-<env>` 这个名字
+不能证明它是当前主库。`docs/CURRENT_STATE.md` 和 `deploy/DEPLOYMENTS.md`
+是接线说明，不能代替线上状态。
 
-1. 明确环境（test/pre/prod）及要查的是**当前主库**、旧 RDS 快照，还是 TEE 库。
+1. 明确环境（test/pre/prod）及查询目的。
 2. 查目标环境 `/healthz` 的 `release.git_commit`，对照该 commit 的部署配置与
    `FEEDLING_DATABASE_SCHEMA`、实际注入的 `DATABASE_URL` 目标；不要输出密码。
-   如果无法获取 live 配置，只能陈述已知记录，不能把本地 `.env` 当成线上主库证明。
+   如果无法获取 live 配置，不要把 TEE 库直接称为当前主库。
 3. test 自 `82c4c019` 起记录为 TEE 主库。prod/pre 仍按各自线上 release 和配置核实。
-
-本地 `.env` 的 `TEST_DATABASE_URL`、`PRE_DATABASE_URL`、`PROD_DATABASE_URL`
-可能仍指向旧 RDS。先只看主机名，再决定是否连接：
-
-```bash
-python3 - <<'PY'
-from pathlib import Path
-from urllib.parse import urlsplit
-
-for line in Path('.env').read_text().splitlines():
-    key, sep, value = line.partition('=')
-    if sep and key in {'TEST_DATABASE_URL', 'PRE_DATABASE_URL', 'PROD_DATABASE_URL'}:
-        print(f'{key}: {urlsplit(value).hostname}')
-PY
-```
-
-## 查 RDS
-
-仅在确认目标就是该连接串指向的 RDS 后使用。`.env` 有明文凭证，别 `cat` 整份文件、
-回显 DSN、开启 shell trace，或把密码写进提交文件。以 prod 为例，换环境时替换变量名：
-
-```bash
-psql "$(sed -n 's/^PROD_DATABASE_URL=//p' .env | head -1)" \
-  -X -v ON_ERROR_STOP=1 \
-  -c 'begin read only; select current_database(), current_user, now(); commit;'
-```
-
-RDS 常用控制/排查表有 `users`、`proactive_jobs`（含 `status_reason`）、
-`tee_sync_runs` 和 `user_logs`。先用 `\d public.<table>` 核对现役 schema，
-再写具体查询；不要假定 RDS 与 TEE 的行结构相同。
 
 ## 查 TEE PostgreSQL
 
