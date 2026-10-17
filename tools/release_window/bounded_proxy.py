@@ -235,8 +235,17 @@ class Run:
                             raise Refused("response_size_or_deadline")
                         chunks.append(chunk)
                     result = b"".join(chunks)
+                    provider_failed = False
                     try:
                         value = json.loads(result)
+                        if self.is_openrouter and isinstance(value, dict):
+                            choices = value.get('choices')
+                            provider_failed = value.get('error') is not None or (
+                                isinstance(choices, list) and any(
+                                    isinstance(choice, dict) and (
+                                        choice.get('error') is not None
+                                        or choice.get('finish_reason') == 'error')
+                                    for choice in choices))
                         usage = value.get("usage") if isinstance(value, dict) else None
                         if self.is_openrouter and isinstance(usage, dict):
                             usage = {"input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens"), "total_tokens": usage.get("total_tokens")}
@@ -259,10 +268,10 @@ class Run:
                                  "billing_bound_breached": breached})
                     # A transport/provider error may invite product retries; stop
                     # the paid boundary on the first error instead.
-                    if (response.status_code != 200 or not complete
+                    if (response.status_code != 200 or provider_failed or not complete
                             or measured['input_tokens'] > input_reservation
                             or measured['output_tokens'] > self.limits['output_tokens_per_start']):
-                        self._fail('provider_error' if response.status_code != 200 else
+                        self._fail('provider_error' if response.status_code != 200 or provider_failed else
                                    'usage_unknown' if not complete else 'billing_bound_breached')
                     return response.status_code, result
             except Exception as exc:

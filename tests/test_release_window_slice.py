@@ -837,3 +837,43 @@ def test_or_initial_authority_failure_is_irreversible(tmp_path, monkeypatch, mod
     finally:
         receipt.write_bytes(saved)
         run.close()
+
+
+@pytest.mark.parametrize('marker', [
+    {'error': {'message': 'PRIVATE_PROVIDER_ERROR'}},
+    {'choices': [{'error': {'message': 'PRIVATE_PROVIDER_ERROR'}}]},
+    {'choices': [{'finish_reason': 'error'}]},
+])
+def test_or_200_error_marker_irreversibly_stops_paid_run(tmp_path, marker):
+    run, calls = or_run(tmp_path, lambda req: httpx.Response(200, json={
+        'usage': {'prompt_tokens': 7, 'completion_tokens': 2, 'total_tokens': 9}, **marker}))
+    try:
+        status, _ = run.forward(or_body())
+        assert status == 200 and run.stopped and run.failure_reason == 'provider_error'
+        reserved = proxy.cost_reservation(run.billing, run.limits['output_tokens_per_start'])
+        assert run.attempts == 1 and run.reserved_nanodollars == reserved > 0
+        with pytest.raises(proxy.Refused, match='phase_order'):
+            run.set_phase('dialogue_1')
+        with pytest.raises(proxy.Refused, match='stopped_or_deadline'):
+            run.forward(or_body())
+        assert len(calls) == 1 and run.reserved_nanodollars == reserved
+        ledger = (tmp_path/'ledger').read_text()
+        assert 'PRIVATE_PROVIDER_ERROR' not in ledger
+        assert [r for r in map(json.loads, ledger.splitlines()) if r['event'] == 'run_failed'] == [
+            {'event': 'run_failed', 'reason': 'provider_error', 'phase': 'setup'}]
+    finally:
+        run.close()
+
+
+def test_or_success_with_null_error_can_advance_phase(tmp_path):
+    run, calls = or_run(tmp_path, lambda req: httpx.Response(200, json={
+        'usage': {'prompt_tokens': 7, 'completion_tokens': 2, 'total_tokens': 9},
+        'error': None, 'choices': [{'error': None, 'finish_reason': 'stop',
+                                  'message': {'role': 'assistant', 'content': 'synthetic'}}]}))
+    try:
+        assert run.forward(or_body())[0] == 200 and not run.stopped
+        run.set_phase('dialogue_1')
+        assert run.forward(or_body())[0] == 200 and not run.stopped
+        assert len(calls) == 2
+    finally:
+        run.close()
