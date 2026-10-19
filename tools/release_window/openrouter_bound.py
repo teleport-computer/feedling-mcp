@@ -71,18 +71,21 @@ def verify(manifest, *, now=None):
         if hashlib.sha256(raw).hexdigest()!=expected:
             raise RuntimeError('or_evidence_changed')
         return raw
+    from .contract import admission_policy
+    policy = admission_policy(manifest)
     hashes=manifest['receipt_sha256']
     value=json.loads(read_bound(manifest['input_bound_receipt'],hashes['input_bound_receipt']))
     expected={'run_id':manifest['run_id'],'model':MODEL,'endpoint':ENDPOINT,
               'account_scope':manifest['billing']['account_scope'],
               'billing':manifest['billing'],'limits':manifest['limits'],
-              'provider_policy':POLICY,'context_tokens':128000,
+              'provider_policy':POLICY,'admission_policy':policy,'context_tokens':128000,
               'context_is_full_billable_input_upper_bound':True,
               'output_limit_includes_all_billable_tokens':True,
               'no_extra_fees_or_byok':True,'errors_do_not_exceed_reserved_cost':True,
               'authorized':True,
               'receipt_sha256':{k:v for k,v in hashes.items() if k!='input_bound_receipt'}}
-    if any(value.get(k)!=v for k,v in expected.items()):
+    if any(value.get(k)!=v for k,v in expected.items()) or admission_policy(
+            {'lane': manifest['lane'], 'admission_policy': value.get('admission_policy')}) != policy:
         raise RuntimeError('or_evidence_binding')
     for name,h in expected['receipt_sha256'].items():
         read_bound(manifest[name],h)

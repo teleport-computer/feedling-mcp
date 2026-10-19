@@ -1,4 +1,17 @@
-"""Two fixed provider V2 text slices. Structural validation is not live approval."""
+"""Two fixed provider V2 text slices. Structural validation is not live approval.
+
+OpenRouter compatibility: unversioned historical manifests/receipts remain
+archival evidence and are rejected for execution. A newly reviewed package must
+explicitly bind LEGACY_ADMISSION (original per-phase allocation enforcement) or
+SHARED_ADMISSION in both manifest and input-bound receipt. Do not edit or reuse
+an old claim/receipt to migrate it. The official OpenAI lane is unchanged.
+
+Shared v2 counts every actual forward, including profile format corrections,
+wrapper reissues and delivery-loss reissues, against the same six-start cap.
+Only relay transport retries are zero; logical retries are not claimed zero.
+Phases remain ordered observations, with no guaranteed dialogue allocation.
+Observed errors stop all further admission; uncertain reservations never refund.
+"""
 from decimal import Decimal, ROUND_CEILING
 import hashlib
 import json
@@ -9,6 +22,32 @@ RECEIPTS = ('funded_budget_receipt', 'model_availability_receipt', 'execution_ap
 
 OR_LANE = 'openrouter-v2-text'
 OR_MODEL = 'openai/gpt-4o-mini'
+
+# Explicit execution contracts. Historical unversioned OR artifacts are not
+# executable with this tool; they must never be silently upgraded.
+LEGACY_ADMISSION = {
+    'version': 'or-phase-cap-v1', 'phase': 'enforced',
+    'relay_transport_retries': 0,
+    'product_reissues': 'count_all_actual_forwards_within_phase_and_total',
+}
+SHARED_ADMISSION = {
+    'version': 'or-shared-cap-v2', 'phase': 'observational',
+    'relay_transport_retries': 0,
+    'product_reissues': 'count_all_actual_forwards_within_shared_total',
+}
+
+def admission_policy(value):
+    policy = value.get('admission_policy')
+    if value.get('lane') == OR_LANE:
+        # JSON equality alone treats False as 0; require exact JSON types too.
+        if not isinstance(policy, dict) or not any(
+            digest(policy) == digest(p) for p in (LEGACY_ADMISSION, SHARED_ADMISSION)
+        ):
+            raise ValueError('REQUIRED_INPUT:admission_policy')
+        return policy
+    if 'admission_policy' in value:
+        raise ValueError('REQUIRED_INPUT:admission_policy_lane')
+    return None
 
 def receipt_names(value):
     return RECEIPTS[:-1] + ('input_bound_receipt',) if value.get('lane') == OR_LANE else RECEIPTS
@@ -26,6 +65,8 @@ def validate_manifest(value):
     value = json.loads(json.dumps(value))
     need(value.get('api_url') == 'https://test-api.feedling.app', 'test_origin')
     is_or = value.get('lane') == OR_LANE
+    policy = admission_policy(value)
+    shared = policy == SHARED_ADMISSION
     need(value.get('lane') in ('openai-official-v2-text', OR_LANE), 'lane')
     need(value.get('model') == (OR_MODEL if is_or else 'gpt-5.4-mini'), 'fixed_model')
     need(isinstance(value.get('run_id'), str) and re.fullmatch(r'[a-zA-Z0-9_-]{8,80}', value['run_id']), 'run_id')
@@ -97,23 +138,33 @@ def validate_manifest(value):
         need(billing['uncached_input_usd_per_million'] == '0.15' and billing['billable_output_usd_per_million'] == '0.60' and billing['extra_usd_per_start'] == '0', 'fixed_or_prices')
         need(limits['starts'] <= 6 and limits['wall_seconds'] <= 600, 'or_batch_cap')
         need(cost_ceiling(billing) <= 120000000, 'or_money_cap')
-    allocations = limits.get('allocations')
-    need(isinstance(allocations, dict) and set(allocations) == set(PHASES), 'allocations')
-    phases = limits.get('phase_starts')
-    need(isinstance(phases, dict) and set(phases) == set(PHASES), 'phase_starts')
-    for name in PHASES:
-        row = allocations[name]
-        need(isinstance(row, dict) and set(row) == {'primary', 'retry', 'background'}, 'allocation_'+name)
-        need(all(type(x) is int and x >= 0 for x in row.values()), 'allocation_numbers')
-        need(sum(row.values()) == phases[name], 'allocation_sum')
-        need(row['primary'] >= (0 if name == 'background' else 1), 'primary_start')
-        need(type(phases[name]) is int and phases[name] >= (0 if name == 'background' else 1), name)
-    # Each phase includes ALL actual starts while it is open, including retries,
-    # continuations and background work. Classification never bypasses a cap.
-    need(limits['starts'] == sum(phases.values()), 'phase_total')
+    if shared:
+        need('allocations' not in limits and 'phase_starts' not in limits, 'shared_no_phase_quotas')
+        need(limits['starts'] == 6 and limits['input_tokens_per_start'] == 128000
+             and limits['total_input_tokens'] == 768000
+             and limits['output_tokens_per_start'] == 1024
+             and limits['total_output_tokens'] == 6144, 'shared_fixed_caps')
+        need(billing['max_cost_usd'] == '0.1188864'
+             and cost_ceiling(billing) == 118886400, 'shared_funded_cap')
+    else:
+        allocations = limits.get('allocations')
+        need(isinstance(allocations, dict) and set(allocations) == set(PHASES), 'allocations')
+        phases = limits.get('phase_starts')
+        need(isinstance(phases, dict) and set(phases) == set(PHASES), 'phase_starts')
+        for name in PHASES:
+            row = allocations[name]
+            need(isinstance(row, dict) and set(row) == {'primary', 'retry', 'background'}, 'allocation_'+name)
+            need(all(type(x) is int and x >= 0 for x in row.values()), 'allocation_numbers')
+            need(sum(row.values()) == phases[name], 'allocation_sum')
+            need(row['primary'] >= (0 if name == 'background' else 1), 'primary_start')
+            need(type(phases[name]) is int and phases[name] >= (0 if name == 'background' else 1), name)
+        # Each phase includes ALL actual starts while it is open, including retries,
+        # continuations and background work. Classification never bypasses a cap.
+        need(limits['starts'] == sum(phases.values()), 'phase_total')
     need(limits['total_output_tokens'] >= limits['starts'] * limits['output_tokens_per_start'], 'output_reservations')
     need(limits['total_bytes'] >= limits['request_bytes'], 'input_total')
-    limits['phase_starts'] = {name: phases[name] for name in PHASES}
+    if not shared:
+        limits['phase_starts'] = {name: phases[name] for name in PHASES}
     return value
 
 
