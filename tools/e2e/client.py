@@ -266,7 +266,8 @@ class E2EClient:
                   archive_language: str = "zh-Hans",
                   release_run_id: str | None = None,
                   release_evidence_dir: Path | None = None,
-                  defer_failure_cleanup: bool = False) -> "E2EClient":
+                  defer_failure_cleanup: bool = False,
+                  http_guard=None) -> "E2EClient":
         _refuse_prod(api_url)
         if release_run_id is not None:
             require_release_execution()
@@ -275,6 +276,8 @@ class E2EClient:
         api_key = ""
         manifest: Path | None = None
         with httpx.Client(timeout=30, verify=True) as boot:
+            if http_guard is not None:
+                http_guard.bind(boot)
             try:
                 # register is NOT idempotent (each call mints a new account), so we
                 # retry only connection establishment failures: ConnectError or
@@ -285,13 +288,18 @@ class E2EClient:
                 reg_body = {"public_key": pk_b64, "archive_language": archive_language,
                             "access_mode": route, "label": "e2e-p0"}
                 for _attempt in range(3):
+                    if http_guard is not None:
+                        http_guard.remaining()
                     try:
                         r = boot.post(f"{api_url}/v1/users/register", json=reg_body)
                         break
                     except (httpx.ConnectError, httpx.ConnectTimeout):
                         if _attempt == 2:
                             raise
-                        time.sleep(3 * (_attempt + 1))
+                        delay = 3 * (_attempt + 1)
+                        if http_guard is not None:
+                            delay = min(delay, http_guard.remaining())
+                        time.sleep(delay)
                 r.raise_for_status()
                 body = r.json()
                 user_id, api_key = body["user_id"], body["api_key"]
@@ -303,6 +311,9 @@ class E2EClient:
                 # rest. If the manifest itself cannot be written, the except
                 # arm best-effort resets rather than proceeding untracked.
                 manifest = _write_orphan_manifest(api_url, user_id, api_key, release_run_id=release_run_id)
+                if http_guard is not None and hasattr(http_guard, 'recovery_callback'):
+                    http_guard.recovery_callback({'ownership': 'REGISTRATION_RECEIPT_AVAILABLE',
+                        'recovery_manifest': str(manifest), 'user_id': user_id})
                 who = boot.get(f"{api_url}/v1/users/whoami",
                                headers={"X-API-Key": api_key})
                 who.raise_for_status()
