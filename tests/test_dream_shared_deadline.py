@@ -156,14 +156,17 @@ def _session():
     )[0]
 
 
-@pytest.mark.parametrize("replies,expected_tokens", [
-    ([("{\"consolidations\": []}", "stop", 200)], [12000]),
-    ([('{"consolidations": invalid}', "stop", 200), ('{"consolidations": []}', "stop", 200)], [12000, 12000]),
-    ([('{"consolidations": invalid}', "stop", 200), ("partial", "length", 200), ('{"consolidations": []}', "stop", 200)], [12000, 12000, 24000]),
-    ([("partial", "length", 200), ("rejected", "stop", 402), ('{"consolidations": []}', "stop", 200)], [12000, 24000, 12000]),
-    ([('{"consolidations": invalid}', "stop", 200), ("partial", "length", 200), ("rejected", "stop", 402), ('{"consolidations": []}', "stop", 200)], [12000, 12000, 24000, 12000]),
+@pytest.mark.parametrize("replies,expected_tokens,expected_result", [
+    ([("{\"consolidations\": []}", "stop", 200)], [12000], ([], None)),
+    ([('{"consolidations": invalid}', "stop", 200), ('{"consolidations": []}', "stop", 200)], [12000, 12000], ([], None)),
+    ([('{"consolidations": invalid}', "stop", 200), ("partial", "length", 200), ('{"consolidations": []}', "stop", 200)], [12000, 12000], (None, "output_truncated")),
+    ([("partial", "length", 200), ("rejected", "stop", 402), ('{"consolidations": []}', "stop", 200)], [12000, 24000, 12000], ([], None)),
+    ([('{"consolidations": invalid}', "stop", 200), ("partial", "length", 200), ("rejected", "stop", 402), ('{"consolidations": []}', "stop", 200)], [12000, 12000], (None, "output_truncated")),
 ])
-def test_real_session_all_reasks_share_deadline(monkeypatch, clock, replies, expected_tokens):
+def test_real_session_all_reasks_share_deadline(monkeypatch, clock, replies, expected_tokens, expected_result):
+    # Format and truncation consume the same session retry budget. Once format
+    # has used it, neither a third success nor a budget-rejection fallback may
+    # be requested. Every admitted request still shares the absolute deadline.
     seen, deadlines = [], []
     original = pc.reliable_chat_completion_async
     async def observe(*a, **kw):
@@ -190,7 +193,7 @@ def test_real_session_all_reasks_share_deadline(monkeypatch, clock, replies, exp
                 max_tokens=12000, truncation_retry_max_tokens=24000,
                 timeout_sec=180, wire_deadline_sec=180, absolute_deadline=10,
             )
-    assert run(clock, scenario()) == ([], None)
+    assert run(clock, scenario()) == expected_result
     assert seen == expected_tokens
     assert deadlines == [(10, 3)] * len(expected_tokens)
 
