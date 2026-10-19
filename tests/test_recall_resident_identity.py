@@ -41,7 +41,11 @@ def test_real_operation_identity_never_falls_back_to_cached_account(monkeypatch,
     assert str(error.value) in {'account_unconfirmed','account_mode_invalid'}
 
 
-def test_foreground_recall_failure_never_emits_exception_text(monkeypatch):
+@pytest.mark.parametrize('reason', sorted(crc._RECALL_INPUT_TRACE_REASONS) + [
+    'private-dsn-secret', 'account_unconfirmed:private-dsn-secret',
+    'account_unconfirmed\nprivate-dsn-secret', {'secret':'private-dsn-secret'}, None,
+])
+def test_foreground_recall_failure_never_emits_exception_text(monkeypatch, reason):
     events=[]
     monkeypatch.setattr(crc,'_seen_ids',set())
     monkeypatch.setattr(crc,'_seen_ids_order',[])
@@ -49,14 +53,15 @@ def test_foreground_recall_failure_never_emits_exception_text(monkeypatch):
     monkeypatch.setattr(crc,'_clear_proactive_failure',lambda:None)
     monkeypatch.setattr(crc,'_resident_chat_runtime_v2_enabled',lambda:False)
     monkeypatch.setattr(crc,'_emit_debug_trace',lambda *a,**kw:events.append((a,kw)))
-    def fail(*a,**kw):raise crc._RecallInputError('private-dsn-secret')
+    def fail(*a,**kw):raise crc._RecallInputError(reason)
     monkeypatch.setattr(crc,'_auto_memory_block_for',fail)
     monkeypatch.setattr(crc,'call_agent',lambda *a,**kw:pytest.fail('provider called'))
     monkeypatch.setattr(crc,'post_reply',lambda *a,**kw:pytest.fail('reply posted'))
     assert crc._process_messages([{'id':'privacy-negative','seq':1,'ts':1,'role':'user','source':'chat','content':'hello'}])==0
     failure=[kw for args,kw in events if args[1]=='context.recall_failed']
     assert len(failure)==1
-    assert failure[0]['detail']=={'reason':'required_content_unavailable'}
+    expected = reason if type(reason) is str and reason in crc._RECALL_INPUT_TRACE_REASONS else 'unknown'
+    assert failure[0]['detail']=={'reason':'required_content_unavailable','input_reason':expected}
     assert 'private-dsn-secret' not in json.dumps(events)
     assert 'privacy-negative' not in crc._seen_ids
 
@@ -102,3 +107,12 @@ def test_missing_sealed_attachment_reaches_provider_only_as_plain_caption(monkey
     else:
         assert 'sealed-projection' not in crc._seen_ids
         assert '/v1/memory/turn-selection' not in requests
+
+
+def test_recall_trace_does_not_stringify_unknown_exception_arguments():
+    class Private:
+        def __str__(self):
+            pytest.fail('private exception argument was stringified')
+    assert crc._classify_recall_input_error(crc._RecallInputError(Private())).input_reason == 'unknown'
+    assert crc._classify_recall_input_error(crc._RecallInputError('account_unconfirmed', 'secret')).input_reason == 'unknown'
+    assert crc._classify_recall_input_error(crc._RecallInputError()).input_reason == 'unknown'
