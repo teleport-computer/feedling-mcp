@@ -97,6 +97,9 @@ SANITIZER_RESULT_FIELDS: dict[str, frozenset[str]] = {
     # classifier. ``tests/test_v2_worker_failure_detail.py`` pins the set to the
     # module's raise sites.
     "classify_generated_image_reject": frozenset({"code"}),
+    # Resident required-input classifier: exact source-defined enum or unknown.
+    # No other attribute or the object itself is safe to serialize.
+    "_classify_recall_input_error": frozenset({"input_reason"}),
 }
 
 # Producers that may still carry exception text, each with the reason it is
@@ -1267,3 +1270,11 @@ def test_no_trace_field_carries_exception_text():
         "field; replace it with a closed category (and type(e).__name__ if the "
         f"class is needed), or declare the site with a reason: {leaked}"
     )
+
+
+def test_recall_classifier_only_grants_its_closed_field():
+    prefix = "try:\n    work()\nexcept Exception as exc:\n    failure = _classify_recall_input_error(exc)\n"
+    for value in ("str(exc)", "exc.args", "failure", "failure.detail", "failure.args", "failure.reason"):
+        assert _scan_snippet(prefix + "    _emit_debug_trace('context', 'failure', detail={'input_reason': " + value + "})\n")
+    assert not _scan_snippet(prefix + "    _emit_debug_trace('context', 'failure', detail={'input_reason': failure.input_reason})\n")
+    assert _scan_snippet(prefix + "    failure.input_reason = str(exc)\n    _emit_debug_trace('context', 'failure', detail={'input_reason': failure.input_reason})\n")
