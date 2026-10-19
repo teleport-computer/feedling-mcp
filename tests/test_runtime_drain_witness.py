@@ -110,7 +110,7 @@ def test_cleanup_waits_for_fence_parent_progress_and_resident_exit(tmp_path, mon
         assert events.index('relay-close')<events.index('fence')<events.index('runtime-drained')<events.index('reset')
     assert recovery.exists()
 
-@pytest.mark.parametrize('bad',[None,'old_release','missing','extra','stale'])
+@pytest.mark.parametrize('bad',[None,'old_release','missing','extra','stale','future'])
 def test_resident_guard_checks_actual_separate_runner_inventory(bad):
     from tools.release_window import receipts
     manifest={'drain_scope':{'resident_owners':['resident-1']},'expected_release':'a'*40}
@@ -119,6 +119,11 @@ def test_resident_guard_checks_actual_separate_runner_inventory(bad):
     if bad=='missing':result=[]
     if bad=='extra':result.append(('unreviewed','a'*40,1))
     if bad=='stale':result=[('resident-1','a'*40,31)]
+    if bad=='future':result=[('resident-1','a'*40,-0.021555)]
+    from datetime import datetime, timezone
+    updated = datetime(2026,1,1,tzinfo=timezone.utc)
+    sampled = datetime(2026,1,1,0,0,1,tzinfo=timezone.utc)
+    result = [(*r, updated, sampled) for r in result]
     queries=[]
     class Conn:
         def __enter__(self):return self
@@ -130,7 +135,11 @@ def test_resident_guard_checks_actual_separate_runner_inventory(bad):
     if bad:
         with pytest.raises(RuntimeError,match='unconfirmed'):receipts.resident_guard(manifest,connector=Conn)
     else:
-        assert receipts.resident_guard(manifest,connector=Conn)['fresh']
+        receipt = receipts.resident_guard(manifest,connector=Conn)
+        assert receipt['fresh']
+        assert receipt['samples'] == [{'owner':'resident-1','version':'a'*40,'age_sec':1.0,'updated_at_db':updated.isoformat(),'sampled_at_db':sampled.isoformat()}]
+        from datetime import datetime
+        assert datetime.fromisoformat(receipt['received_at_local_utc']).utcoffset().total_seconds()==0
     assert queries[0][0]=='SET TRANSACTION READ ONLY'
     assert queries[1][1]==(['resident-1'],)
 
@@ -148,3 +157,26 @@ def test_explicit_select_budget_is_charged_before_each_database_read():
         guarded.execute('SELECT 3')
     assert executed==['SET TRANSACTION READ ONLY','SELECT 1','  select 2']
     assert budget.remaining==0
+
+
+def test_drain_evidence_records_checked_causal_values_without_metrics_content():
+    import json
+    initial=metrics(90,10,9)
+    initial['worker_heartbeats'][0]['private_prompt']='do-not-record'
+    proof=drain.Proof(initial,scope(),100)
+    proof.observe(metrics(101,11,9))
+    proof.observe(metrics(102,12,9))
+    assert proof.observe(metrics(104,14,13)) is not None
+    evidence=proof.evidence
+    assert evidence['fence_epoch']==100
+    for pool in drain.POOLS:
+        chain=evidence['pools'][pool]
+        assert chain['initial']['beat_at_epoch']==90
+        assert chain['after_beat']['beat_at_epoch']==101
+        assert chain['barrier']['slots'][0]['sample_monotonic']==12
+        assert chain['final']['slots'][0]['progress_monotonic']==13
+        assert chain['final']['parent_generation']=='parent-1'
+    initial['worker_heartbeats'][0]['runtime_state']['drain']['slots'][0]['pid']=999
+    assert evidence['pools']['foreground']['initial']['slots'][0]['pid']==123
+    assert 'do-not-record' not in json.dumps(evidence)
+    assert 'private_prompt' not in json.dumps(evidence)

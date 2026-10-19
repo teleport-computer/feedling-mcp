@@ -87,6 +87,16 @@ def payload(raw, limits):
     return encoded
 
 
+# Closed diagnostic vocabulary: never persist exception text or caller field names.
+PAYLOAD_REFUSAL_REASONS = frozenset({
+    'function_call_shape', 'function_output_shape', 'input', 'input_bytes',
+    'input_item', 'json', 'message_shape', 'model_or_stream', 'no_hosted_tools',
+    'output_limit', 'shape', 'text_only', 'or_input_bytes', 'or_message',
+    'or_messages', 'or_no_hosted_tools', 'or_output_limit', 'or_shape',
+    'or_stream', 'or_text_only', 'or_tool_history',
+})
+
+
 class Run:
     def __init__(self, *, token, upstream_key, journal, manifest, transport=None, clock=time.monotonic):
         if len(token) < 32 or not upstream_key or token == upstream_key:
@@ -166,8 +176,12 @@ class Run:
                 raise Refused('admission_closed')
             try:
                 body = payload(raw, self.limits)
-            except Refused:
+            except Refused as exc:
                 self._fail('payload_refused')
+                # Stop first; a diagnostic write failure cannot reopen admission.
+                code = exc.args[0] if len(exc.args) == 1 else None
+                reason = code if type(code) is str and code in PAYLOAD_REFUSAL_REASONS else 'unclassified'
+                self.record({'event': 'payload_rejected', 'reason': reason, 'phase': self.phase})
                 raise
             if self.stopped or self.clock() >= self.deadline:
                 self._fail('stopped_or_deadline')

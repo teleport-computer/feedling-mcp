@@ -206,7 +206,8 @@ def resident_guard(manifest, *, connector=connect, read_budget=None):
         with conn.transaction():
             conn.execute('SET TRANSACTION READ ONLY')
             rows = conn.execute(
-                "SELECT owner,version,EXTRACT(EPOCH FROM (clock_timestamp()-updated_at)) "
+                "SELECT owner,version,EXTRACT(EPOCH FROM (clock_timestamp()-updated_at)), "
+                "updated_at,clock_timestamp() "
                 "FROM agent_runtime_supervisor_heartbeats "
                 "WHERE updated_at >= clock_timestamp()-interval '90 seconds' "
                 "OR owner=ANY(%s)", (sorted(expected),)).fetchall()
@@ -215,7 +216,12 @@ def resident_guard(manifest, *, connector=connect, read_budget=None):
             or any(r[1] != manifest['expected_release'] or not math.isfinite(float(r[2]))
                    or not 0 <= float(r[2]) <= 30 for r in rows)):
         raise RuntimeError('Resident guarded release/inventory unconfirmed')
-    return {'owners':sorted(expected),'release':manifest['expected_release'], 'fresh':True}
+    return {'owners': sorted(expected), 'release': manifest['expected_release'], 'fresh': True,
+            'received_at_local_utc': datetime.now(timezone.utc).isoformat(),
+            'age_source': 'DB clock_timestamp minus updated_at; not local clock age',
+            'samples': [{'owner': r[0], 'version': r[1], 'age_sec': float(r[2]),
+                         'updated_at_db': r[3].isoformat(), 'sampled_at_db': r[4].isoformat()}
+                        for r in rows]}
 
 
 def verify_input_count(manifest, *, now=None):
